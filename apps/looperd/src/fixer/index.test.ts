@@ -1215,6 +1215,93 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("restarts from discover-pr after push remote-head changes to refresh expected head", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      views: [
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "new-head",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "commit-1",
+        },
+        { comments: [], checks: [], headSha: "commit-1" },
+        { comments: [], checks: [], headSha: "commit-1" },
+      ],
+    });
+    const git = new FakeGitGateway({
+      pushError:
+        "Remote head changed for feature/fixer: expected abc123, got new-head",
+    });
+    git.prepareWorktree = async (input) => {
+      git.prepareCalls += 1;
+      if (git.prepareCalls === 2 && input.expectedHeadSha !== "new-head") {
+        throw new RemoteHeadChangedError(
+          input.branch,
+          input.expectedHeadSha,
+          "new-head",
+        );
+      }
+      return { headSha: input.expectedHeadSha, clean: true };
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("fixed-on-old-head"),
+      completedAgentResult("fixed-on-new-head"),
+    ]);
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("fixer-1");
+    if (!firstClaim) throw new Error("Expected first fixer claim");
+
+    const first = await runner.processClaimedItem(firstClaim);
+    expect(first.status).toBe("failed");
+    expect(first.failureKind).toBe("retryable_after_resume");
+    expect(agent.starts).toHaveLength(1);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    git.pushError = undefined;
+    const retryClaim = fixture.queue.claimNext("fixer-1");
+    if (!retryClaim) throw new Error("Expected retry fixer claim");
+
+    const retry = await runner.processClaimedItem(retryClaim);
+    expect(retry.status).toBe("success");
+    expect(agent.starts).toHaveLength(2);
+    expect(git.prepareCalls).toBe(2);
+    expect(github.viewCalls).toBeGreaterThanOrEqual(4);
+
+    fixture.store.close();
+  });
+
   test("retries resolve-comments head changes from discover-pr with fresh PR detail", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({

@@ -469,6 +469,102 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("restarts from discover when PR head changes before publish", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    let viewCalls = 0;
+    github.viewPullRequest = async () => {
+      viewCalls += 1;
+      const headSha = viewCalls >= 2 ? "new-head" : "abc123";
+      return {
+        number: 42,
+        title: "Review me",
+        body: "PR body",
+        url: "https://example.test/pr/42",
+        state: "OPEN",
+        isDraft: false,
+        reviewDecision: undefined,
+        headRefName: "feature",
+        baseRefName: "main",
+        headSha,
+        baseSha: "base123",
+        author: "octocat",
+        reviewRequests: ["octocat"],
+        comments: [],
+        reviews: [],
+        checks: [{ conclusion: "SUCCESS" }],
+      };
+    };
+    github.capturePullRequestSnapshot = async (input) => ({
+      id: `snapshot:${input.prNumber}:${input.capturedAt}`,
+      projectId: input.projectId,
+      repo: input.repo,
+      prNumber: input.prNumber,
+      headSha: viewCalls >= 2 ? "new-head" : "abc123",
+      baseSha: "base123",
+      title: "Review me",
+      body: "PR body",
+      author: "octocat",
+      diffRef: "gh:diff",
+      checksSummary: "SUCCESS",
+      unresolvedThreadCount: 0,
+      reviewState: null,
+      payloadJson: JSON.stringify({ diff: "diff --git a/a.ts b/a.ts" }),
+      capturedAt: input.capturedAt ?? "2026-04-11T12:00:00.000Z",
+      createdAt: input.capturedAt ?? "2026-04-11T12:00:00.000Z",
+    });
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Review old head"),
+      completedAgentResult("Review new head"),
+    ]);
+    const logs = createCapturingLogger();
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: logs.logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+    const firstResult = await runner.processClaimedItem(firstClaim);
+
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(firstResult.summary).toContain("PR head changed before publish");
+    expect(agent.starts).toHaveLength(1);
+    expect(github.submitCalls).toHaveLength(0);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(agent.starts).toHaveLength(2);
+    expect(github.submitCalls).toHaveLength(1);
+    expect(github.submitCalls[0]?.body).toContain("Review new head");
+    expect(
+      JSON.parse(
+        fixture.store.loops.getById(retryResult.loopId)?.metadataJson ?? "{}",
+      ),
+    ).toMatchObject({
+      lastPublishedHeadSha: "new-head",
+    });
+
+    fixture.store.close();
+  });
+
   test("auto-discovery enqueues only when current user is requested", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({

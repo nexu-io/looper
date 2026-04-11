@@ -2097,6 +2097,10 @@ function shouldRestartFromDiscovery(input: {
     return true;
   }
 
+  if (input.failedStep === "push") {
+    return (input.failureSummary ?? "").includes("Remote head changed");
+  }
+
   if (input.failedStep !== "resolve-comments") {
     return false;
   }

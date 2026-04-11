@@ -787,12 +787,24 @@ export class ReviewerLoopRunner {
         ? "COMMENT"
         : pendingReview.event;
 
-    try {
-      const repo = requireString(input.queueItem.repo, "queueItem.repo");
-      const prNumber = requireNumber(
-        input.queueItem.prNumber,
-        "queueItem.prNumber",
+    const repo = requireString(input.queueItem.repo, "queueItem.repo");
+    const prNumber = requireNumber(
+      input.queueItem.prNumber,
+      "queueItem.prNumber",
+    );
+    const detail = await this.options.github.viewPullRequest({
+      repo,
+      prNumber,
+      cwd: input.project.repoPath,
+    });
+    if (detail.headSha && detail.headSha !== pendingReview.headSha) {
+      throw new ReviewerLoopError(
+        `PR head changed before publish: expected ${pendingReview.headSha}, got ${detail.headSha}`,
+        "retryable_after_resume",
       );
+    }
+
+    try {
       await this.options.github.submitReview({
         repo,
         prNumber,
@@ -846,11 +858,22 @@ export class ReviewerLoopRunner {
     const nowIso = this.nowIso();
     const checkpoint = parseCheckpoint(latestRun?.checkpointJson);
     const lastCompletedStep = asReviewerStep(latestRun?.lastCompletedStep);
+    const failedStep = asReviewerStep(latestRun?.currentStep);
+    const restartFromDiscover = shouldRestartFromDiscover({
+      latestRunStatus: latestRun?.status,
+      failedStep,
+      failureSummary: latestRun?.summary ?? latestRun?.errorMessage,
+    });
+    const resumedStep = lastCompletedStep
+      ? (nextReviewerStep(lastCompletedStep) ?? "discover")
+      : "discover";
     const startStep =
       latestRun &&
       (latestRun.status === "failed" || latestRun.status === "interrupted") &&
-      lastCompletedStep
-        ? (nextReviewerStep(lastCompletedStep) ?? "discover")
+      (restartFromDiscover || lastCompletedStep)
+        ? restartFromDiscover
+          ? "discover"
+          : resumedStep
         : "discover";
     const resumed =
       Boolean(latestRun) &&
@@ -862,10 +885,21 @@ export class ReviewerLoopRunner {
       loopId: loop.id,
       status: "running",
       currentStep: startStep,
-      lastCompletedStep: resumed ? (lastCompletedStep ?? null) : null,
+      lastCompletedStep: resumed
+        ? restartFromDiscover
+          ? null
+          : (lastCompletedStep ?? null)
+        : null,
       checkpointJson: JSON.stringify(
         resumed
-          ? { ...checkpoint, resumePolicy: "advance_from_checkpoint" }
+          ? {
+              ...(restartFromDiscover
+                ? { resumePolicy: "replay_step" }
+                : checkpoint),
+              resumePolicy: restartFromDiscover
+                ? "replay_step"
+                : "advance_from_checkpoint",
+            }
           : { resumePolicy: "replay_step" },
       ),
       summary: null,
@@ -1084,6 +1118,24 @@ export class ReviewerLoopRunner {
   private nowIso(): string {
     return this.now().toISOString();
   }
+}
+
+function shouldRestartFromDiscover(input: {
+  latestRunStatus?: string | null;
+  failedStep: ReviewerStep | null;
+  failureSummary?: string | null;
+}): boolean {
+  if (
+    input.latestRunStatus !== "failed" &&
+    input.latestRunStatus !== "interrupted"
+  ) {
+    return false;
+  }
+
+  return (
+    input.failedStep === "publish" &&
+    (input.failureSummary ?? "").includes("PR head changed before publish")
+  );
 }
 
 function buildPullRequestTargetId(repo: string, prNumber: number): string {
