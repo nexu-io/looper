@@ -2,7 +2,7 @@
 
 ## Phase 0 - 范围与约束先定死
 
-- [ ] 明确 v1 固定采用 `same_pr` 策略
+- [x] 明确 v1 固定采用 `same_pr` 策略
 - [ ] 明确双 PR (`separate_pr`) 仅作为 Phase 2 可配置方向，不进入当前实现范围
 - [ ] 明确 Phase 1 不实现 Ralph Loop 单 run 内部循环，直接复用现有外部循环
 - [ ] 明确 Planner discover 规则：`looper:plan` + assign 给当前 GitHub 用户
