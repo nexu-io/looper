@@ -68,6 +68,23 @@ class FakeGitHubGateway {
     ];
   }
 
+  public async listOpenIssues() {
+    return [];
+  }
+
+  public async viewIssue() {
+    return {
+      number: 123,
+      title: "Planner issue",
+      body: "body",
+      url: "https://example.test/issues/123",
+      state: "OPEN",
+      author: "octocat",
+      assignees: ["octocat"],
+      labels: ["looper:plan"],
+    };
+  }
+
   public async viewPullRequest() {
     const fixerResponses = [
       {
@@ -155,6 +172,10 @@ class FakeGitHubGateway {
       url: "https://example.test/pr/101",
     };
   }
+
+  public async addPullRequestLabels(): Promise<void> {}
+
+  public async addPullRequestReviewers(): Promise<void> {}
 
   public async resolveReviewThread(input: {
     repo: string;

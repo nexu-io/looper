@@ -13,8 +13,8 @@ import {
   GitWorktreeGateway,
   NotificationGateway,
 } from "../infra/index";
-import { ProjectManager } from "../projects/index";
 import { PlannerLoopRunner } from "../planner/index";
+import { ProjectManager } from "../projects/index";
 import { ReviewerLoopRunner } from "../reviewer/index";
 import { SchedulerQueue } from "../scheduler/index";
 import { type LooperdApiServer, createLooperdApiServer } from "../server/index";
@@ -63,6 +63,8 @@ export interface CreateLooperdRuntimeOptions {
   logger: Logger;
   github?: Pick<
     GhCliGitHubGateway,
+    | "listOpenIssues"
+    | "viewIssue"
     | "listOpenPullRequests"
     | "getCurrentUserLogin"
     | "viewPullRequest"
@@ -70,6 +72,8 @@ export interface CreateLooperdRuntimeOptions {
     | "capturePullRequestSnapshot"
     | "submitReview"
     | "createPullRequest"
+    | "addPullRequestLabels"
+    | "addPullRequestReviewers"
   >;
   git?: Pick<
     GitWorktreeGateway,
@@ -179,7 +183,29 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
       if (github && git && agentExecutor) {
         this.plannerRunner =
-          this.options.plannerRunner ?? new PlannerLoopRunner();
+          this.options.plannerRunner ??
+          new PlannerLoopRunner({
+            store,
+            scheduler: this.scheduler,
+            git,
+            github,
+            agentExecutor,
+            logger: this.options.logger,
+            onAgentExecutionStarted: (input) =>
+              this.notifySystemEvent({
+                projectId: input.projectId,
+                loopId: input.loopId,
+                runId: input.runId,
+                level: "info",
+                title: "Looper Planner",
+                subtitle: input.subtitle,
+                body: input.body,
+                entityType: "agent_execution",
+                entityId: input.executionId,
+                dedupeKey: input.dedupeKey,
+              }),
+            allowAutoPush: this.options.config.defaults.allowAutoPush,
+          });
       }
 
       if (github && agentExecutor && this.options.enableReviewer !== false) {
@@ -384,6 +410,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.server = undefined;
       this.scheduler = undefined;
       this.git = undefined;
+      this.plannerRunner = undefined;
       this.reviewerRunner = undefined;
       this.fixerRunner = undefined;
       this.workerRunner = undefined;
@@ -404,6 +431,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
     const now = new Date().toISOString();
 
     for (const project of this.options.config.projects) {
+      const existing = this.store.projects.getById(project.id);
+      const metadata = parseProjectMetadata(existing?.metadataJson);
       this.store.projects.upsert({
         id: project.id,
         name: project.name,
@@ -412,10 +441,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
           project.baseBranch ?? this.options.config.defaults.baseBranch,
         archived: false,
         metadataJson: JSON.stringify({
+          ...metadata,
           worktreeRoot: project.worktreeRoot ?? null,
           source: "config",
         }),
-        createdAt: now,
+        createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       });
     }

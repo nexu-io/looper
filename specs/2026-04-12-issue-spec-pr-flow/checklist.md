@@ -5,9 +5,9 @@
 - [x] 明确 v1 固定采用 `same_pr` 策略
 - [ ] 明确双 PR (`separate_pr`) 仅作为 Phase 2 可配置方向，不进入当前实现范围
 - [ ] 明确 Phase 1 不实现 Ralph Loop 单 run 内部循环，直接复用现有外部循环
-- [ ] 明确 Planner discover 规则：`looper:plan` + assign 给当前 GitHub 用户
-- [ ] 明确 repo → project 映射规则：一个 repo 只能命中一个 active project，否则拒绝认领
-- [ ] 明确 spec 文件约定：`specs/<issue-number>-<slug>/spec.md`
+- [x] 明确 Planner discover 规则：`looper:plan` + assign 给当前 GitHub 用户
+- [x] 明确 repo → project 映射规则：一个 repo 只能命中一个 active project，否则拒绝认领
+- [x] 明确 spec 文件约定：`specs/<issue-number>-<slug>/spec.md`
 - [ ] 明确 Worker 读取 spec 的来源优先级：PR body / metadata 中的显式 `specPath`
 - [ ] 明确 v1 implementation 阶段状态机：Worker 开始时移除 `looper:spec-ready`
 - [ ] 明确 v1 implementation 阶段不新增 implementation label，直接复用现有 reviewer / review-request 机制
@@ -43,22 +43,22 @@
 
 ## Phase 3 - Planner Loop
 
-- [ ] 新增 `apps/looperd/src/planner/index.ts`
-- [ ] 实现 `discover-issues`
-- [ ] 在 discover 中接入 `looper:plan` + assignee + repo/project 唯一映射校验
-- [ ] 实现 repo → projectId 反向查找：基于 project metadata 中缓存的 `repo` 字段或 startup 解析结果
-- [ ] 实现 `prepare-worktree`
-- [ ] 复用现有 worktree / git 基础设施创建 planner branch
-- [ ] 实现 `write-spec`
-- [ ] 定义 planner agent prompt 模板，包含：issue 标题、issue body、repo 上下文、spec 文件路径约定、AGENTS.md 内容（如存在）
-- [ ] 让 planner 将 spec 写到 `specs/<issue-number>-<slug>/spec.md`
-- [ ] 实现 `publish`
-- [ ] `publish` 内串行完成 push / open PR / add `looper:spec-reviewing` / add reviewers
-- [ ] `publish` 中每个子操作（push / open PR / add label / add reviewers）需独立幂等，支持中途失败后 resume
-- [ ] 在 PR body 或 metadata 中写入显式 `specPath`
+- [x] 新增 `apps/looperd/src/planner/index.ts`
+- [x] 实现 `discover-issues`
+- [x] 在 discover 中接入 `looper:plan` + assignee + repo/project 唯一映射校验
+- [x] 实现 repo → projectId 反向查找：基于 project metadata 中缓存的 `repo` 字段或 startup 解析结果
+- [x] 实现 `prepare-worktree`
+- [x] 复用现有 worktree / git 基础设施创建 planner branch
+- [x] 实现 `write-spec`
+- [x] 定义 planner agent prompt 模板，包含：issue 标题、issue body、repo 上下文、spec 文件路径约定、AGENTS.md 内容（如存在）
+- [x] 让 planner 将 spec 写到 `specs/<issue-number>-<slug>/spec.md`
+- [x] 实现 `publish`
+- [x] `publish` 内串行完成 push / open PR / add `looper:spec-reviewing` / add reviewers
+- [x] `publish` 中每个子操作（push / open PR / add label / add reviewers）需独立幂等，支持中途失败后 resume
+- [x] 在 PR body 或 metadata 中写入显式 `specPath`
 - [ ] 明确 Planner 完成后如何触发 Worker：创建新的 worker loop with `pull_request` target
-- [ ] 实现 `notify`
-- [ ] 为 Planner loop 补齐 checkpoint / resume / failure 路径测试
+- [x] 实现 `notify`
+- [x] 为 Planner loop 补齐 checkpoint / resume / failure 路径测试
 
 ## Phase 4 - API / CLI 接入 Planner
 
