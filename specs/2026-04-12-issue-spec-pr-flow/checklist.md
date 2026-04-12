@@ -4,7 +4,7 @@
 
 - [x] 明确 v1 固定采用 `same_pr` 策略
 - [x] 明确双 PR (`separate_pr`) 仅作为 Phase 2 可配置方向，不进入当前实现范围
-- [ ] 明确 Phase 1 不实现 Ralph Loop 单 run 内部循环，直接复用现有外部循环
+- [x] 明确 Phase 1 不实现 Ralph Loop 单 run 内部循环，直接复用现有外部循环
 - [x] 明确 Planner discover 规则：`looper:plan` + assign 给当前 GitHub 用户
 - [x] 明确 repo → project 映射规则：一个 repo 只能命中一个 active project，否则拒绝认领
 - [x] 明确 spec 文件约定：`specs/<issue-number>-<slug>/spec.md`
