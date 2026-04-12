@@ -93,6 +93,7 @@ describe("createMigrationRunner", () => {
     );
 
     const db = new Database(fixture.dbPath, { create: true });
+    const initialForeignKeys = db.query("PRAGMA foreign_keys;").get();
     const runner = createMigrationRunner(db, {
       migrationsDir: fixture.migrationsDir,
       now: () => new Date("2026-04-11T10:20:30.000Z"),
@@ -106,6 +107,59 @@ describe("createMigrationRunner", () => {
       "0001_init",
     ]);
     expect(runner.listPending()).toEqual(["0002_broken"]);
+
+    db.close(false);
+  });
+
+  test("runs foreign key pragma migrations without losing child rows", async () => {
+    const fixture = await createFixture("looper-migrate-fk-");
+
+    await Bun.write(
+      join(fixture.migrationsDir, "0001_init.sql"),
+      [
+        "CREATE TABLE parents (id TEXT PRIMARY KEY, label TEXT NOT NULL);",
+        "CREATE TABLE children (",
+        "  id TEXT PRIMARY KEY,",
+        "  parent_id TEXT NOT NULL,",
+        "  label TEXT NOT NULL,",
+        "  FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE",
+        ");",
+        "INSERT INTO parents (id, label) VALUES ('p_1', 'alpha');",
+        "INSERT INTO children (id, parent_id, label) VALUES ('c_1', 'p_1', 'child');",
+      ].join("\n"),
+    );
+    await Bun.write(
+      join(fixture.migrationsDir, "0002_rebuild_parents.sql"),
+      [
+        "PRAGMA foreign_keys = OFF;",
+        "CREATE TABLE parents_v2 (id TEXT PRIMARY KEY, label TEXT NOT NULL, extra TEXT);",
+        "INSERT INTO parents_v2 (id, label, extra) SELECT id, label, NULL FROM parents;",
+        "DROP TABLE parents;",
+        "ALTER TABLE parents_v2 RENAME TO parents;",
+        "PRAGMA foreign_keys = ON;",
+      ].join("\n"),
+    );
+
+    const db = new Database(fixture.dbPath, { create: true });
+    const initialForeignKeys = db.query("PRAGMA foreign_keys;").get();
+    const runner = createMigrationRunner(db, {
+      migrationsDir: fixture.migrationsDir,
+      now: () => new Date("2026-04-11T10:20:30.000Z"),
+    });
+
+    const result = runner.runPending();
+
+    expect(result.appliedIds).toEqual(["0001_init", "0002_rebuild_parents"]);
+    expect(
+      db
+        .query("SELECT id, parent_id, label FROM children WHERE id = ?1")
+        .get("c_1"),
+    ).toEqual({
+      id: "c_1",
+      parent_id: "p_1",
+      label: "child",
+    });
+    expect(db.query("PRAGMA foreign_keys;").get()).toEqual(initialForeignKeys);
 
     db.close(false);
   });

@@ -293,7 +293,7 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0004_worker_project_target");
+    expect(health.migration.latestAppliedId).toBe("0005_planner_issue_target");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
@@ -462,7 +462,7 @@ describe("SqliteStore", () => {
     store.initialize({ autoMigrate: true });
 
     expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
-      "0004_worker_project_target",
+      "0005_planner_issue_target",
     );
     expect(store.loops.getById("loop_worker_1")).toMatchObject({
       targetType: "project",

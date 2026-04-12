@@ -85,14 +85,31 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
       );
 
       try {
-        this.db.transaction(() => {
-          this.db.exec(sql);
-          this.db
-            .query(
-              "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-            )
-            .run(migration.id, this.now().toISOString());
-        })();
+        if (usesForeignKeyPragma(sql)) {
+          const previousForeignKeysSetting = readForeignKeysSetting(this.db);
+
+          try {
+            this.db.exec(sql);
+            this.db
+              .query(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+              )
+              .run(migration.id, this.now().toISOString());
+          } finally {
+            this.db.exec(
+              `PRAGMA foreign_keys = ${previousForeignKeysSetting ? "ON" : "OFF"}`,
+            );
+          }
+        } else {
+          this.db.transaction(() => {
+            this.db.exec(sql);
+            this.db
+              .query(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+              )
+              .run(migration.id, this.now().toISOString());
+          })();
+        }
       } catch (error) {
         throw new Error(
           `Migration failed (${migration.fileName}): ${(error as Error).message}`,
@@ -144,6 +161,19 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
       )
       .all() as Array<{ id: string; appliedAt: string }>;
   }
+}
+
+function usesForeignKeyPragma(sql: string): boolean {
+  return /PRAGMA\s+foreign_keys\s*=\s*(ON|OFF)\s*;/i.test(sql);
+}
+
+function readForeignKeysSetting(db: Database): boolean {
+  const row = db.query("PRAGMA foreign_keys;").get() as Record<
+    string,
+    unknown
+  > | null;
+  const value = row ? Object.values(row)[0] : undefined;
+  return value === 1 || value === "1";
 }
 
 function resolveDefaultMigrationsDir(): string {

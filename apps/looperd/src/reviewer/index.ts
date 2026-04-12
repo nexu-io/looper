@@ -4,17 +4,17 @@ import type { Logger } from "../bootstrap/logger";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError } from "../infra/command";
+import type {
+  GitHubPullRequestDetail,
+  GitHubPullRequestSummary,
+  SubmitReviewInput,
+} from "../infra/github";
 import {
   SPEC_READY_LABEL,
   SPEC_REVIEWING_LABEL,
   isSpecReviewClean,
   resolvePullRequestPhase,
 } from "../infra/spec-pr";
-import type {
-  GitHubPullRequestDetail,
-  GitHubPullRequestSummary,
-  SubmitReviewInput,
-} from "../infra/github";
 import type { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
