@@ -73,6 +73,7 @@ export interface CreateLooperdRuntimeOptions {
     | "submitReview"
     | "createPullRequest"
     | "addPullRequestLabels"
+    | "removePullRequestLabels"
     | "addPullRequestReviewers"
   >;
   git?: Pick<
@@ -92,6 +93,7 @@ export interface CreateLooperdRuntimeOptions {
   workerRunner?: WorkerLoopRunner;
   enableReviewer?: boolean;
   enableFixer?: boolean;
+  enablePlanner?: boolean;
 }
 
 const MIGRATIONS_DIR = resolveMigrationsDir();
@@ -692,7 +694,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
   }
 
   private async discoverIssues(): Promise<void> {
-    if (!this.store || !this.plannerRunner) {
+    if (
+      !this.store ||
+      !this.plannerRunner ||
+      this.options.enablePlanner !== true
+    ) {
       return;
     }
 
@@ -723,6 +729,13 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
       if (this.fixerRunner) {
         await this.fixerRunner.discoverPullRequests({
+          projectId: project.id,
+          repo,
+        });
+      }
+
+      if (this.workerRunner) {
+        await this.workerRunner.discoverPullRequests({
           projectId: project.id,
           repo,
         });

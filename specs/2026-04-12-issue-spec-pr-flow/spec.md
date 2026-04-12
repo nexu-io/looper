@@ -245,6 +245,7 @@ specs/123-worker-pr-target/spec.md
 
 - Planner 必须把最终 spec 路径写入 PR body 或 PR metadata
 - Worker 不依赖模糊搜索，而是优先读取该显式 specPath
+- v1 Worker 读取优先级：loop / queue metadata 中的显式 `specPath` > PR body 中的 `Spec: <path>` 显式记录
 
 这能减少“PR 里到底哪份 spec 才是本轮执行依据”的歧义。
 
@@ -258,6 +259,61 @@ specs/123-worker-pr-target/spec.md
 
 - `looper:spec-reviewing`
 - `looper:spec-ready`
+
+### 5.2 implementation 阶段最小状态机
+
+v1 implementation 阶段保持最小状态机：
+
+1. Worker discover 命中 `looper:spec-ready`
+2. Worker 开始执行时立即移除 `looper:spec-ready`，避免重复认领
+3. Worker 在同一 PR 上继续实现、validate、push
+4. v1 不新增 implementation label，直接复用现有 reviewer / review-request 机制
+5. Worker push 后主动补 reviewer，使 Reviewer 自动重新介入
+
+### 5.3 spec review clean 条件与 label 切换
+
+spec review clean 的判定与现有 fixer 语义保持一致：
+
+- `unresolvedThreadCount === 0`
+- 且不存在 `CHANGES_REQUESTED` / `REQUEST_CHANGES` review 决议
+
+满足条件时，在现有 `pr:<repo>:<prNumber>` 锁内执行幂等切换：
+
+- 移除 `looper:spec-reviewing`
+- 添加 `looper:spec-ready`
+
+### 5.4 manual intervention 兜底
+
+v1 不引入额外 implementation label，也不强制引入 `looper:needs-human` label 作为状态机节点。
+需要人工介入时，直接复用现有内部 `manual_intervention` / `paused` 路径。
+
+### 5.5 Planner 触发 Worker 的方式
+
+Planner 在 publish 阶段不会直接启动 Worker run。
+v1 的 handoff 方式是：
+
+- Planner 打开 spec PR 并添加 `looper:spec-reviewing`
+- Reviewer / Fixer 在 clean 后切换到 `looper:spec-ready`
+- Runtime 中的 Worker discover 扫描 `looper:spec-ready`，并按需创建 `worker + pull_request` loop
+
+### 5.6 手动触发与默认行为
+
+Phase 4 暴露最小手动触发入口：
+
+- API: `POST /api/v1/planners`
+- CLI: `looper plan --project <projectId> --issue <number>`
+
+在完整链路验收完成前，Planner 的自动 issue discover 默认关闭；需要显式启用 runtime planner discovery。
+
+### 5.7 不收敛阈值与降级策略
+
+v1 复用现有 queue retry / pause 语义，不新增独立收敛状态机。
+
+- retryable failure：继续走已有重试与 checkpoint resume
+- manual intervention：直接进入现有 `paused` / `manual_intervention` 路径
+- review / fix 长期不收敛：以现有 `retryMaxAttempts` 为阈值，超过后降级为人工介入
+
+这保证 planner / reviewer / fixer / worker 都沿用一致的恢复路径。
 - `looper:needs-human`（建议新增，兜底异常）
 
 推荐流转：

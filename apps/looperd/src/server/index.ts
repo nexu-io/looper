@@ -5,6 +5,7 @@ import type { LooperConfig } from "../config/index";
 import {
   assertUniqueActiveLoop,
   createLoop,
+  defineIssueLoopTarget,
   defineProjectLoopTarget,
   definePullRequestLoopTarget,
 } from "../domain/index";
@@ -120,6 +121,9 @@ export function createLooperdApi(context: LooperdApiContext): LooperdApi {
             break;
           case pathname === "/api/v1/workers":
             data = await buildWorkersCreateResponse(context, request);
+            break;
+          case pathname === "/api/v1/planners":
+            data = await buildPlannersCreateResponse(context, request);
             break;
           case pathname === "/api/v1/projects":
             data = await buildProjectsRouteResponse(context, request);
@@ -293,6 +297,7 @@ function buildStatusResponse(context: LooperdApiContext) {
       activeRuns: runs.filter((run) => run.status === "running").length,
     },
     loops: {
+      planner: summarizeLoopType(loops, "planner"),
       reviewer: summarizeLoopType(loops, "reviewer"),
       worker: summarizeLoopType(loops, "worker"),
       fixer: summarizeLoopType(loops, "fixer"),
@@ -590,6 +595,83 @@ async function buildWorkersCreateResponse(
   return {
     ...loop,
     ...payload,
+  };
+}
+
+async function buildPlannersCreateResponse(
+  context: LooperdApiContext,
+  request: Request,
+) {
+  assertMethod(request, ["POST"], "/api/v1/planners");
+
+  if (!isCodingAgentConfigured(context.config)) {
+    throw new ApiError(
+      "AGENT_NOT_CONFIGURED",
+      400,
+      "Cannot create planner loop without config.agent.vendor",
+    );
+  }
+
+  const body = await parseJsonBody(request);
+  const projectId = readRequiredString(body, "projectId");
+  const issueNumber = readOptionalPositiveInteger(body, "issueNumber");
+  const project = context.store.projects.getById(projectId);
+  if (!project) {
+    throw new ApiError(
+      "PROJECT_NOT_FOUND",
+      404,
+      `Project not found: ${projectId}`,
+    );
+  }
+  if (!issueNumber) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      "issueNumber must be a positive integer",
+    );
+  }
+
+  const projectMetadata = parseMetadata(project.metadataJson);
+  const repo = readString(projectMetadata.repo);
+  if (!repo) {
+    throw new ApiError("VALIDATION_FAILED", 400, "project repo is required");
+  }
+
+  const now = new Date().toISOString();
+  const targetId = `issue:${repo}:${issueNumber}`;
+  const loop = createLoopRecord({
+    context,
+    projectId,
+    type: "planner",
+    targetType: "issue",
+    targetId,
+    repo,
+    issueNumber,
+    status: "running",
+    now,
+    metadataJson: JSON.stringify({ issueNumber }),
+  });
+
+  new SchedulerQueue({
+    store: context.store,
+    retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
+    retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
+    now: () => new Date(now),
+  }).enqueue({
+    projectId,
+    loopId: loop.id,
+    type: "planner",
+    targetType: "issue",
+    targetId,
+    repo,
+    dedupeKey: `planner:${repo}:${issueNumber}`,
+    lockKey: `issue:${repo}:${issueNumber}`,
+    payloadJson: JSON.stringify({ issueNumber }),
+  });
+
+  return {
+    ...loop,
+    issueNumber,
   };
 }
 
@@ -960,6 +1042,7 @@ function createLoopRecord(input: {
   targetId?: string;
   repo?: string;
   prNumber?: number;
+  issueNumber?: number;
   status: string;
   now: string;
   metadataJson?: string | null;
@@ -968,10 +1051,15 @@ function createLoopRecord(input: {
   const target =
     input.targetType === "project"
       ? defineProjectLoopTarget(readRequiredValue(input.targetId, "targetId"))
-      : definePullRequestLoopTarget(
-          readRequiredValue(input.repo, "repo"),
-          readRequiredNumber(input.prNumber, "prNumber"),
-        );
+      : input.targetType === "issue"
+        ? defineIssueLoopTarget(
+            readRequiredValue(input.repo, "repo"),
+            readRequiredNumber(input.issueNumber, "issueNumber"),
+          )
+        : definePullRequestLoopTarget(
+            readRequiredValue(input.repo, "repo"),
+            readRequiredNumber(input.prNumber, "prNumber"),
+          );
 
   const loop = createLoop({
     id: randomUUID(),
@@ -1012,8 +1100,13 @@ function createLoopRecord(input: {
     targetId:
       target.targetType === "project"
         ? `project:${target.projectId}`
-        : `pr:${target.repo}:${target.prNumber}`,
-    repo: target.targetType === "pull_request" ? target.repo : null,
+        : target.targetType === "issue"
+          ? `issue:${target.repo}:${target.issueNumber}`
+          : `pr:${target.repo}:${target.prNumber}`,
+    repo:
+      target.targetType === "pull_request" || target.targetType === "issue"
+        ? target.repo
+        : null,
     prNumber: target.targetType === "pull_request" ? target.prNumber : null,
     status: loop.status,
     configJson: null,
@@ -1040,10 +1133,27 @@ function toLoopTarget(loop: ReturnType<Store["loops"]["list"]>[number]) {
     );
   }
 
+  if (loop.targetType === "issue") {
+    return defineIssueLoopTarget(
+      readRequiredValue(loop.repo ?? undefined, "repo"),
+      readRequiredNumber(
+        parseIssueNumber(loop.targetId) ?? undefined,
+        "issueNumber",
+      ),
+    );
+  }
+
   return definePullRequestLoopTarget(
     readRequiredValue(loop.repo ?? undefined, "repo"),
     readRequiredNumber(loop.prNumber ?? undefined, "prNumber"),
   );
+}
+
+function parseIssueNumber(
+  targetId: string | null | undefined,
+): number | undefined {
+  const match = /^issue:[^:]+\/[^:]+:(\d+)$/.exec(targetId ?? "");
+  return match ? Number(match[1]) : undefined;
 }
 
 function readRequiredValue(

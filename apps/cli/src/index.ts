@@ -214,6 +214,8 @@ async function dispatch(context: CliContext): Promise<void> {
       return;
     case "work":
       return runWorkCreate(context);
+    case "plan":
+      return runPlannerCreate(context);
     case "task":
       throw new Error("task commands were removed; use looper work instead");
     case "worker":
@@ -317,6 +319,15 @@ function createCli(runtime: CliRuntime) {
     )
     .action(async (options) => {
       await dispatch(createContext(runtime, ["work"], options));
+    });
+
+  cli
+    .command("plan", "Create a planner run")
+    .option("--project <projectId>", "Project id")
+    .option("--issue <number>", "Issue number")
+    .example((name) => `  $ ${name} plan --project project_1 --issue 123`)
+    .action(async (options) => {
+      await dispatch(createContext(runtime, ["plan"], options));
     });
 
   cli
@@ -642,7 +653,9 @@ async function runLoopList(context: CliContext) {
       target:
         loop.targetType === "project"
           ? String(loop.targetId ?? "-")
-          : `${loop.repo}#${loop.prNumber}`,
+          : loop.targetType === "issue"
+            ? String(loop.targetId ?? "-")
+            : `${loop.repo}#${loop.prNumber}`,
       projectId: loop.projectId as string,
     })),
   );
@@ -733,6 +746,31 @@ async function runWorkCreate(context: CliContext) {
   printSection(context.write, "Worker started", [
     ["id", data.id as string],
     ["title", data.title as string],
+    ["status", data.status as string],
+  ]);
+}
+
+async function runPlannerCreate(context: CliContext) {
+  const issueNumber = Number(requireFlag(context.args, "issue"));
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+    throw new Error("--issue must be a positive integer");
+  }
+
+  const data = await context.client.post<Record<string, unknown>>(
+    "/api/v1/planners",
+    {
+      projectId: requireFlag(context.args, "project"),
+      issueNumber,
+    },
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  printSection(context.write, "Planner started", [
+    ["id", data.id as string],
+    ["issueNumber", data.issueNumber as number],
     ["status", data.status as string],
   ]);
 }

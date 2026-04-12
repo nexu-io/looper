@@ -8,6 +8,14 @@ import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { ProtectedBranchError } from "../infra/git";
+import type {
+  GitHubPullRequestDetail,
+  GitHubPullRequestSummary,
+} from "../infra/github";
+import {
+  SPEC_READY_LABEL,
+  parseSpecPathFromPullRequestBody,
+} from "../infra/spec-pr";
 import type { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
@@ -37,8 +45,18 @@ export interface WorkerGitGateway {
     worktreeRoot: string;
     branch: string;
     baseBranch: string;
+    prNumber?: number;
     protectedBranches?: string[];
   }): Promise<WorktreeRecord>;
+  prepareWorktree(input: {
+    worktreePath: string;
+    branch: string;
+    expectedHeadSha?: string;
+    remote?: string;
+  }): Promise<{
+    headSha?: string;
+    clean: boolean;
+  }>;
   push(input: {
     worktreePath: string;
     branch: string;
@@ -48,6 +66,17 @@ export interface WorkerGitGateway {
 }
 
 export interface WorkerGitHubGateway {
+  listOpenPullRequests(input: {
+    repo: string;
+    cwd?: string;
+    limit?: number;
+    label?: string;
+  }): Promise<GitHubPullRequestSummary[]>;
+  viewPullRequest(input: {
+    repo: string;
+    prNumber: number;
+    cwd?: string;
+  }): Promise<GitHubPullRequestDetail>;
   createPullRequest(input: {
     repo: string;
     headBranch: string;
@@ -56,6 +85,18 @@ export interface WorkerGitHubGateway {
     body?: string;
     cwd?: string;
   }): Promise<{ number?: number; url: string }>;
+  removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void>;
+  addPullRequestReviewers(input: {
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+    cwd?: string;
+  }): Promise<void>;
 }
 
 export interface WorkerAgentExecution {
@@ -117,6 +158,11 @@ interface WorkerInput {
   specPath?: string | null;
   repo: string;
   baseBranch: string;
+  executionMode: "create-pr" | "push-existing";
+  prNumber?: number;
+  branch?: string;
+  headSha?: string;
+  reviewers?: string[];
 }
 
 interface WorkerCheckpoint {
@@ -351,6 +397,66 @@ export class WorkerLoopRunner {
     }
   }
 
+  public async discoverPullRequests(input: {
+    projectId: string;
+    repo: string;
+    limit?: number;
+  }): Promise<{
+    queueItems: QueueItemRecord[];
+    createdLoopIds: string[];
+    skipped: number;
+  }> {
+    const project = this.getProject(input.projectId);
+    const openPullRequests = await this.options.github.listOpenPullRequests({
+      repo: input.repo,
+      cwd: project.repoPath,
+      limit: input.limit,
+      label: SPEC_READY_LABEL,
+    });
+
+    const queueItems: QueueItemRecord[] = [];
+    const createdLoopIds: string[] = [];
+    let skipped = 0;
+
+    for (const pullRequest of openPullRequests) {
+      if (
+        pullRequest.isDraft ||
+        normalizePrState(pullRequest.state) !== "open"
+      ) {
+        skipped += 1;
+        continue;
+      }
+
+      const loop = this.ensureLoopForPullRequest({
+        projectId: project.id,
+        repo: input.repo,
+        prNumber: pullRequest.number,
+      });
+      if (loop.created) {
+        createdLoopIds.push(loop.record.id);
+      }
+
+      queueItems.push(
+        this.options.scheduler.enqueue({
+          projectId: project.id,
+          loopId: loop.record.id,
+          type: "worker",
+          targetType: "pull_request",
+          targetId: buildPullRequestTargetId(input.repo, pullRequest.number),
+          repo: input.repo,
+          prNumber: pullRequest.number,
+          dedupeKey: buildWorkerPullRequestDedupeKey(
+            input.repo,
+            pullRequest.number,
+          ),
+          lockKey: buildPullRequestLockKey(input.repo, pullRequest.number),
+        }),
+      );
+    }
+
+    return { queueItems, createdLoopIds, skipped };
+  }
+
   private async executeStep(input: {
     step: WorkerStep;
     checkpoint: WorkerCheckpoint;
@@ -381,13 +487,62 @@ export class WorkerLoopRunner {
     loop: LoopRecord;
     project: ProjectRecord;
   }): Promise<WorkerCheckpoint> {
-    const work =
+    let work =
       input.checkpoint.work ??
       this.resolveWorkerInput(
         input.queueItem.payloadJson,
         input.loop.metadataJson,
+        input.loop,
       );
-    const lockKey = input.queueItem.lockKey ?? `worker:${input.loop.id}`;
+    if (input.loop.targetType === "pull_request") {
+      const repo = input.loop.repo ?? input.queueItem.repo;
+      const prNumber = input.loop.prNumber ?? input.queueItem.prNumber;
+      if (!repo || !prNumber) {
+        throw new WorkerLoopError(
+          "pull_request worker loop requires repo and prNumber",
+          "non_retryable",
+        );
+      }
+
+      const detail = await this.options.github.viewPullRequest({
+        repo,
+        prNumber,
+        cwd: input.project.repoPath,
+      });
+      await this.options.github.removePullRequestLabels({
+        repo,
+        prNumber,
+        labels: [SPEC_READY_LABEL],
+        cwd: input.project.repoPath,
+      });
+      work = {
+        ...work,
+        title: detail.title || work.title,
+        repo,
+        prNumber,
+        baseBranch: detail.baseRefName ?? work.baseBranch,
+        branch: detail.headRefName,
+        headSha: detail.headSha,
+        executionMode: "push-existing",
+        specPath:
+          work.specPath ??
+          parseSpecPathFromPullRequestBody(detail.body) ??
+          null,
+        reviewers: detail.reviewRequests,
+      };
+      if (!work.specPath) {
+        throw new WorkerLoopError(
+          `No explicit spec path found for ${repo}#${prNumber}`,
+          "manual_intervention",
+        );
+      }
+    }
+
+    const lockKey =
+      input.queueItem.lockKey ??
+      (work.executionMode === "push-existing" && work.prNumber
+        ? buildPullRequestLockKey(work.repo, work.prNumber)
+        : `worker:${input.loop.id}`);
     const acquired = this.options.scheduler.acquireBusinessLock({
       key: lockKey,
       owner: input.queueItem.id,
@@ -423,15 +578,33 @@ export class WorkerLoopRunner {
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
       configuredRoot ?? join(input.project.repoPath, ".looper-worktrees");
-    const branch = `looper/worker/${slugify(input.loop.id)}`;
+    const branch =
+      work.executionMode === "push-existing"
+        ? (work.branch ?? `pr-${work.prNumber}`)
+        : `looper/worker/${slugify(input.loop.id)}`;
     const worktree = await this.options.git.createWorktree({
       projectId: input.project.id,
       repoPath: input.project.repoPath,
       worktreeRoot,
       branch,
       baseBranch: work.baseBranch,
+      prNumber: work.prNumber,
       protectedBranches: [work.baseBranch],
     });
+
+    if (work.executionMode === "push-existing") {
+      const prepared = await this.options.git.prepareWorktree({
+        worktreePath: worktree.worktreePath,
+        branch: worktree.branch,
+        expectedHeadSha: work.headSha,
+      });
+      if (!prepared.clean) {
+        throw new WorkerLoopError(
+          `Worker worktree is dirty for branch ${worktree.branch}`,
+          "manual_intervention",
+        );
+      }
+    }
 
     this.updateLoopMetadata(input.loop.id, {
       worktreeId: worktree.id,
@@ -495,7 +668,7 @@ export class WorkerLoopRunner {
     const work = requireWork(input.checkpoint);
     const worktree = requireWorktree(input.checkpoint);
     const prompt = await buildWorkerPrompt({
-      projectRepoPath: input.project.repoPath,
+      repoRootPath: worktree.path,
       work,
       plan: input.checkpoint.plan?.items ?? [],
     });
@@ -565,7 +738,11 @@ export class WorkerLoopRunner {
     project: ProjectRecord;
     loop: LoopRecord;
   }): Promise<WorkerCheckpoint> {
-    if (input.checkpoint.pullRequest || input.loop.prNumber) {
+    const work = requireWork(input.checkpoint);
+    if (
+      work.executionMode === "create-pr" &&
+      (input.checkpoint.pullRequest || input.loop.prNumber)
+    ) {
       const metadata = parseJsonObject(input.loop.metadataJson);
       return {
         ...input.checkpoint,
@@ -576,13 +753,46 @@ export class WorkerLoopRunner {
       };
     }
 
-    const work = requireWork(input.checkpoint);
     const worktree = requireWorktree(input.checkpoint);
     if (input.checkpoint.validation?.passed === false) {
       throw new WorkerLoopError(
         input.checkpoint.validation.summary ?? "Validation failed",
         "manual_intervention",
       );
+    }
+    if (work.executionMode === "push-existing") {
+      try {
+        await this.options.git.push({
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          protectedBranches: [work.baseBranch],
+        });
+        if ((work.reviewers ?? []).length > 0 && work.prNumber) {
+          await this.options.github.addPullRequestReviewers({
+            repo: work.repo,
+            prNumber: work.prNumber,
+            reviewers: work.reviewers ?? [],
+            cwd: input.project.repoPath,
+          });
+        }
+
+        return {
+          ...input.checkpoint,
+          pullRequest: {
+            number: work.prNumber,
+            url:
+              readString(parseJsonObject(input.loop.metadataJson).prUrl) ?? "",
+          },
+          resumePolicy: "advance_from_checkpoint",
+        };
+      } catch (error) {
+        throw new WorkerLoopError(
+          error instanceof Error
+            ? error.message
+            : "Failed to push existing pull request",
+          "retryable_after_resume",
+        );
+      }
     }
     if (this.openPrStrategy === "manual") {
       return {
@@ -643,6 +853,7 @@ export class WorkerLoopRunner {
   private resolveWorkerInput(
     payloadJson?: string | null,
     metadataJson?: string | null,
+    loop?: LoopRecord,
   ): WorkerInput {
     const payload = parseJsonObject(payloadJson);
     const metadata = parseJsonObject(metadataJson);
@@ -650,21 +861,96 @@ export class WorkerLoopRunner {
     const source = { ...worker, ...payload };
 
     const title = readString(source.title) ?? "Worker run";
-    const repo = readRequiredStringValue(source.repo, "worker.repo");
-    const baseBranch = readRequiredStringValue(
-      source.baseBranch,
-      "worker.baseBranch",
-    );
     const prompt = readString(source.prompt);
     const specPath = readString(source.specPath);
-    if (!prompt && !specPath) {
+    const executionMode =
+      readString(source.executionMode) === "push-existing" ||
+      loop?.targetType === "pull_request"
+        ? "push-existing"
+        : "create-pr";
+    const repo =
+      readString(source.repo) ??
+      (executionMode === "push-existing" ? (loop?.repo ?? null) : null);
+    const baseBranch =
+      readString(source.baseBranch) ??
+      (executionMode === "push-existing"
+        ? (readString(parseJsonObject(loop?.metadataJson).baseBranch) ?? "main")
+        : null);
+    if (executionMode === "create-pr" && !prompt && !specPath) {
       throw new WorkerLoopError(
         "worker.prompt or worker.specPath is required",
         "non_retryable",
       );
     }
+    if (!repo) {
+      throw new WorkerLoopError("worker.repo is required", "non_retryable");
+    }
+    if (!baseBranch) {
+      throw new WorkerLoopError(
+        "worker.baseBranch is required",
+        "non_retryable",
+      );
+    }
 
-    return { title, repo, baseBranch, prompt, specPath };
+    return {
+      title,
+      repo,
+      baseBranch,
+      prompt,
+      specPath,
+      executionMode,
+      prNumber: readNumber(source.prNumber),
+      branch: readString(source.branch) ?? undefined,
+      headSha: readString(source.headSha) ?? undefined,
+      reviewers: readStringArray(source.reviewers),
+    };
+  }
+
+  private ensureLoopForPullRequest(input: {
+    projectId: string;
+    repo: string;
+    prNumber: number;
+  }): { record: LoopRecord; created: boolean } {
+    const existing = this.options.store.loops
+      .list()
+      .find(
+        (loop) =>
+          loop.type === "worker" &&
+          loop.projectId === input.projectId &&
+          loop.targetType === "pull_request" &&
+          loop.repo === input.repo &&
+          loop.prNumber === input.prNumber,
+      );
+    const nowIso = this.nowIso();
+    if (existing) {
+      const updated = {
+        ...existing,
+        status: existing.status === "running" ? existing.status : "queued",
+        nextRunAt: nowIso,
+        updatedAt: nowIso,
+      };
+      this.options.store.loops.upsert(updated);
+      return { record: updated, created: false };
+    }
+
+    const loop: LoopRecord = {
+      id: randomUUID(),
+      projectId: input.projectId,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: buildPullRequestTargetId(input.repo, input.prNumber),
+      repo: input.repo,
+      prNumber: input.prNumber,
+      status: "queued",
+      configJson: null,
+      metadataJson: JSON.stringify({ executionMode: "push-existing" }),
+      lastRunAt: null,
+      nextRunAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    this.options.store.loops.upsert(loop);
+    return { record: loop, created: true };
   }
 
   private createRunContext(loop: LoopRecord): ResumedRunContext {
@@ -1022,20 +1308,25 @@ function slugify(value: string): string {
 }
 
 async function buildWorkerPrompt(input: {
-  projectRepoPath: string;
+  repoRootPath: string;
   work: WorkerInput;
   plan: string[];
 }): Promise<string> {
   const specBlock = await readSpecBlock(
-    input.projectRepoPath,
+    input.repoRootPath,
     input.work.specPath,
   );
   return appendCompletionInstruction(
     [
-      `Create a pull request for: ${input.work.title}`,
+      input.work.executionMode === "push-existing"
+        ? `Continue implementing on existing pull request ${input.work.repo}#${input.work.prNumber}.`
+        : `Create a pull request for: ${input.work.title}`,
       input.work.prompt ? `User prompt:\n${input.work.prompt}` : null,
       `Repository: ${input.work.repo}`,
       `Base branch: ${input.work.baseBranch}`,
+      input.work.executionMode === "push-existing" && input.work.specPath
+        ? `Do not modify the spec file at ${input.work.specPath}.`
+        : null,
       specBlock,
       input.plan.length > 0
         ? ["Execution plan:", ...input.plan.map((item) => `- ${item}`)].join(
@@ -1084,4 +1375,37 @@ function buildPullRequestBody(input: {
   ]
     .filter((value): value is string => Boolean(value))
     .join("\n");
+}
+
+function buildPullRequestTargetId(repo: string, prNumber: number): string {
+  return `pr:${repo}:${prNumber}`;
+}
+
+function buildWorkerPullRequestDedupeKey(
+  repo: string,
+  prNumber: number,
+): string {
+  return `worker:${repo}:${prNumber}`;
+}
+
+function buildPullRequestLockKey(repo: string, prNumber: number): string {
+  return `pr:${repo}:${prNumber}`;
+}
+
+function normalizePrState(value: string | undefined): "open" | "other" {
+  return value?.toLowerCase() === "open" ? "open" : "other";
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value)
+    ? value
+    : undefined;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .map((item) => readString(item))
+        .filter((item): item is string => Boolean(item))
+    : [];
 }

@@ -65,6 +65,16 @@ async function createFixture() {
 class FakeGitHubGateway implements FixerGitHubGateway {
   public viewCalls = 0;
   public resolvedThreadIds: string[] = [];
+  public addedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
 
   constructor(
     private readonly options: {
@@ -88,6 +98,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       title: `PR ${pr.number}`,
       state: pr.state ?? "OPEN",
       isDraft: pr.isDraft ?? false,
+      labels: [],
       reviewRequests: [],
     }));
   }
@@ -113,6 +124,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       state: "OPEN",
       isDraft: false,
       reviewDecision: "CHANGES_REQUESTED",
+      labels: [],
       headRefName: "feature/fixer",
       baseRefName: "main",
       headSha: next.headSha ?? "abc123",
@@ -135,6 +147,32 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       throw new Error(failure);
     }
     this.resolvedThreadIds.push(input.threadId);
+  }
+
+  public async addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }) {
+    this.addedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+  }
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }) {
+    this.removedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
   }
 }
 
@@ -1535,6 +1573,7 @@ describe("FixerLoopRunner", () => {
       state: "OPEN",
       isDraft: false,
       reviewDecision: "CHANGES_REQUESTED",
+      labels: [],
       headRefName: "feature/fixer",
       baseRefName: "main",
       headSha: "abc123",

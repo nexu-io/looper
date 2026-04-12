@@ -52,9 +52,22 @@ class FakeGitHubGateway {
     [];
   public createPullRequestCalls = 0;
   public resolvedThreadIds: string[] = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public reviewerRequests: Array<{
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+  }> = [];
   private fixerViewIndex = 0;
 
-  public async listOpenPullRequests() {
+  public async listOpenPullRequests(input?: { label?: string }) {
+    if (input?.label === "looper:spec-ready") {
+      return [];
+    }
     return [
       {
         number: 42,
@@ -62,6 +75,7 @@ class FakeGitHubGateway {
         state: "OPEN",
         isDraft: false,
         reviewDecision: "CHANGES_REQUESTED",
+        labels: [],
         author: "octocat",
         reviewRequests: ["octocat"],
       },
@@ -115,6 +129,7 @@ class FakeGitHubGateway {
       state: "OPEN",
       isDraft: false,
       reviewDecision: "CHANGES_REQUESTED",
+      labels: [],
       headRefName: "feature/runtime",
       baseRefName: "main",
       headSha: "abc123",
@@ -175,7 +190,21 @@ class FakeGitHubGateway {
 
   public async addPullRequestLabels(): Promise<void> {}
 
-  public async addPullRequestReviewers(): Promise<void> {}
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }): Promise<void> {
+    this.removedLabels.push(input);
+  }
+
+  public async addPullRequestReviewers(input: {
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+  }): Promise<void> {
+    this.reviewerRequests.push(input);
+  }
 
   public async resolveReviewThread(input: {
     repo: string;
@@ -624,6 +653,7 @@ describe("createLooperdRuntime", () => {
       git: new FakeGitGateway(),
       agentExecutor: new FakeAgentExecutor([]),
       plannerRunner: plannerRunner as never,
+      enablePlanner: true,
       enableReviewer: false,
       enableFixer: false,
     });

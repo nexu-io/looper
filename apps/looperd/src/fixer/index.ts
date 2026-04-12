@@ -6,6 +6,12 @@ import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { RemoteHeadChangedError } from "../infra/git";
+import {
+  SPEC_READY_LABEL,
+  SPEC_REVIEWING_LABEL,
+  hasLabel,
+  isSpecReviewClean,
+} from "../infra/spec-pr";
 import type {
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
@@ -54,6 +60,18 @@ export interface FixerGitHubGateway {
   resolveReviewThread(input: {
     repo: string;
     threadId: string;
+    cwd?: string;
+  }): Promise<void>;
+  addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void>;
+  removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
     cwd?: string;
   }): Promise<void>;
 }
@@ -1342,6 +1360,23 @@ export class FixerLoopRunner {
         prNumber,
         cwd: input.project.repoPath,
       });
+      if (
+        hasLabel(detail.labels, SPEC_REVIEWING_LABEL) &&
+        isSpecReviewClean(detail)
+      ) {
+        await this.options.github.removePullRequestLabels({
+          repo,
+          prNumber,
+          labels: [SPEC_REVIEWING_LABEL],
+          cwd: input.project.repoPath,
+        });
+        await this.options.github.addPullRequestLabels({
+          repo,
+          prNumber,
+          labels: [SPEC_READY_LABEL],
+          cwd: input.project.repoPath,
+        });
+      }
       return {
         ...input.checkpoint,
         recheck: {

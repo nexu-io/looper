@@ -32,7 +32,7 @@ async function createFixture() {
     repoPath: "/tmp/looper",
     baseBranch: "main",
     archived: false,
-    metadataJson: null,
+    metadataJson: JSON.stringify({ repo: "acme/looper" }),
     createdAt: now,
     updatedAt: now,
   });
@@ -156,6 +156,7 @@ describe("createLooperdApi", () => {
       data: {
         storage: { schemaVersion: string };
         scheduler: { queuedItems: number; totalRuns: number };
+        loops: { planner: { running: number } };
         safety: {
           allowAutoCommit: boolean;
           allowAutoPush: boolean;
@@ -169,10 +170,11 @@ describe("createLooperdApi", () => {
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
     expect(statusBody.data.storage.schemaVersion).toBe(
-      "0004_worker_project_target",
+      "0005_planner_issue_target",
     );
     expect(statusBody.data.scheduler.queuedItems).toBe(1);
     expect(statusBody.data.scheduler.totalRuns).toBe(1);
+    expect(statusBody.data.loops.planner.running).toBe(0);
     expect(statusBody.data.safety.allowAutoCommit).toBe(true);
     expect(statusBody.data.safety.allowAutoPush).toBe(true);
     expect(statusBody.data.safety.allowAutoApprove).toBe(false);
@@ -454,6 +456,24 @@ describe("createLooperdApi", () => {
     expect(createLoopBody.data.repo).toBe("acme/looper");
     expect(createLoopBody.data.prNumber).toBe(43);
     expect(createLoopBody.data.status).toBe("running");
+
+    const createPlannerResponse = await api.handle(
+      new Request("http://localhost/api/v1/planners", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          issueNumber: 123,
+        }),
+      }),
+    );
+    const createPlannerBody = (await createPlannerResponse.json()) as {
+      data: { type: string; issueNumber: number; status: string };
+    };
+    expect(createPlannerResponse.status).toBe(200);
+    expect(createPlannerBody.data.type).toBe("planner");
+    expect(createPlannerBody.data.issueNumber).toBe(123);
+    expect(createPlannerBody.data.status).toBe("running");
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

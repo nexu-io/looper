@@ -3,3 +3,4 @@ node_modules/
 dist/
 apps/*/dist/
 *.tsbuildinfo
+.looper-worktrees/

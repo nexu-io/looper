@@ -4,6 +4,12 @@ import type { Logger } from "../bootstrap/logger";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError } from "../infra/command";
+import {
+  SPEC_READY_LABEL,
+  SPEC_REVIEWING_LABEL,
+  isSpecReviewClean,
+  resolvePullRequestPhase,
+} from "../infra/spec-pr";
 import type {
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
@@ -37,6 +43,7 @@ export interface ReviewerGitHubGateway {
     repo: string;
     cwd?: string;
     limit?: number;
+    label?: string;
   }): Promise<GitHubPullRequestSummary[]>;
   getCurrentUserLogin(input?: { cwd?: string }): Promise<string | undefined>;
   viewPullRequest(input: {
@@ -52,6 +59,18 @@ export interface ReviewerGitHubGateway {
     capturedAt?: string;
   }): Promise<PullRequestSnapshotRecord>;
   submitReview(input: SubmitReviewInput): Promise<void>;
+  addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void>;
+  removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void>;
 }
 
 export interface ReviewerAgentExecution {
@@ -108,6 +127,7 @@ interface ReviewerCheckpoint {
     state?: string;
     isDraft?: boolean;
     reviewDecision?: string;
+    labels?: string[];
     headSha?: string;
     baseSha?: string;
     author?: string;
@@ -174,28 +194,26 @@ export class ReviewerLoopRunner {
       cwd: project.repoPath,
       limit: input.limit,
     });
+    const specReviewPullRequests =
+      await this.options.github.listOpenPullRequests({
+        repo: input.repo,
+        cwd: project.repoPath,
+        limit: input.limit,
+        label: SPEC_REVIEWING_LABEL,
+      });
     const currentLogin = await this.resolveCurrentGhLogin(project.repoPath);
-    if (!currentLogin) {
-      return {
-        queueItems: [],
-        createdLoopIds: [],
-        skipped: openPullRequests.length,
-      };
-    }
 
     const queueItems: QueueItemRecord[] = [];
     const createdLoopIds: string[] = [];
     let skipped = 0;
+    const seen = new Set<string>();
 
-    for (const pullRequest of openPullRequests) {
-      if (
-        pullRequest.isDraft ||
-        normalizePrState(pullRequest.state) !== "open" ||
-        !isCurrentUserRequested(pullRequest.reviewRequests, currentLogin)
-      ) {
-        skipped += 1;
-        continue;
+    const enqueuePullRequest = (pullRequest: GitHubPullRequestSummary) => {
+      const dedupe = `${input.repo}#${pullRequest.number}`;
+      if (seen.has(dedupe)) {
+        return;
       }
+      seen.add(dedupe);
 
       const loop = this.ensureLoopForPullRequest({
         projectId: project.id,
@@ -219,6 +237,32 @@ export class ReviewerLoopRunner {
           dedupeKey: buildReviewerDedupeKey(input.repo, pullRequest.number),
         }),
       );
+    };
+
+    for (const pullRequest of openPullRequests) {
+      if (
+        pullRequest.isDraft ||
+        normalizePrState(pullRequest.state) !== "open" ||
+        !currentLogin ||
+        !isCurrentUserRequested(pullRequest.reviewRequests, currentLogin)
+      ) {
+        skipped += 1;
+        continue;
+      }
+
+      enqueuePullRequest(pullRequest);
+    }
+
+    for (const pullRequest of specReviewPullRequests) {
+      if (
+        pullRequest.isDraft ||
+        normalizePrState(pullRequest.state) !== "open"
+      ) {
+        skipped += 1;
+        continue;
+      }
+
+      enqueuePullRequest(pullRequest);
     }
 
     return { queueItems, createdLoopIds, skipped };
@@ -548,6 +592,7 @@ export class ReviewerLoopRunner {
         state: detail.state,
         isDraft: detail.isDraft,
         reviewDecision: detail.reviewDecision,
+        labels: detail.labels,
         headSha: detail.headSha,
         baseSha: detail.baseSha,
         author: detail.author,
@@ -791,6 +836,7 @@ export class ReviewerLoopRunner {
       prNumber,
       cwd: input.project.repoPath,
     });
+    const phase = resolvePullRequestPhase({ labels: detail.labels });
     if (detail.headSha && detail.headSha !== pendingReview.headSha) {
       throw new ReviewerLoopError(
         `PR head changed before publish: expected ${pendingReview.headSha}, got ${detail.headSha}`,
@@ -815,6 +861,21 @@ export class ReviewerLoopRunner {
         error instanceof Error ? error.message : "Failed to publish review",
         "retryable_after_resume",
       );
+    }
+
+    if (phase === "spec" && isSpecReviewClean(detail)) {
+      await this.options.github.removePullRequestLabels({
+        repo,
+        prNumber,
+        labels: [SPEC_REVIEWING_LABEL],
+        cwd: input.project.repoPath,
+      });
+      await this.options.github.addPullRequestLabels({
+        repo,
+        prNumber,
+        labels: [SPEC_READY_LABEL],
+        cwd: input.project.repoPath,
+      });
     }
 
     this.updateLoop(input.loop, {
@@ -1250,10 +1311,17 @@ function buildReviewPrompt(input: {
 }): string {
   const parsedPayload = parseJsonObject(input.snapshot.payloadJson);
   const diff = readString(parsedPayload.diff);
+  const phase = resolvePullRequestPhase({ labels: input.detail?.labels });
+  const phaseInstruction =
+    phase === "spec"
+      ? "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
+      : "This is an implementation review. Focus on code correctness, safety, tests, and maintainability.";
 
   return appendCompletionInstruction(
     [
       `Review pull request ${input.repo}#${input.prNumber}.`,
+      `Phase: ${phase}`,
+      phaseInstruction,
       input.snapshot.title ? `Title: ${input.snapshot.title}` : null,
       input.snapshot.body ? `Body:\n${input.snapshot.body}` : null,
       input.detail?.author ? `Author: ${input.detail.author}` : null,

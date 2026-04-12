@@ -125,6 +125,38 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
+  test("creates planner work item from issue number", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(
+      ["plan", "--project", "project_1", "--issue", "123"],
+      {
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          requests.push({
+            url: String(input),
+            body: init?.body as string | null,
+          });
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_1",
+              data: {
+                id: "loop_plan_1",
+                issueNumber: 123,
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/planners");
+    expect(requests[0]?.body).toContain('"issueNumber":123');
+  });
+
   test("adds project and requests discovery", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(["project", "add", "/tmp/repos/looper"], {

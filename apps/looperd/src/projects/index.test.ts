@@ -52,6 +52,7 @@ describe("ProjectManager", () => {
             title: "PR 1",
             isDraft: false,
             state: "OPEN",
+            labels: [],
             reviewRequests: [],
           },
           {
@@ -59,6 +60,7 @@ describe("ProjectManager", () => {
             title: "Draft PR",
             isDraft: true,
             state: "OPEN",
+            labels: [],
             reviewRequests: [],
           },
         ],

@@ -16,6 +16,7 @@ export interface GitHubPullRequestSummary {
   state?: string;
   isDraft: boolean;
   reviewDecision?: string;
+  labels: string[];
   headRefName?: string;
   baseRefName?: string;
   author?: string;
@@ -108,6 +109,7 @@ export class GhCliGitHubGateway {
         "state",
         "isDraft",
         "reviewDecision",
+        "labels",
         "headRefName",
         "baseRefName",
         "author",
@@ -124,6 +126,7 @@ export class GhCliGitHubGateway {
       state: asOptionalString(item.state),
       isDraft: Boolean(item.isDraft),
       reviewDecision: asOptionalString(item.reviewDecision),
+      labels: extractLabelNames(item.labels),
       headRefName: asOptionalString(item.headRefName),
       baseRefName: asOptionalString(item.baseRefName),
       author: extractAuthor(item.author),
@@ -243,6 +246,7 @@ export class GhCliGitHubGateway {
           "state",
           "isDraft",
           "reviewDecision",
+          "labels",
           "headRefName",
           "baseRefName",
           "headRefOid",
@@ -267,6 +271,7 @@ export class GhCliGitHubGateway {
       state: asOptionalString(parsed.state),
       isDraft: Boolean(parsed.isDraft),
       reviewDecision: asOptionalString(parsed.reviewDecision),
+      labels: extractLabelNames(parsed.labels),
       headRefName: asOptionalString(parsed.headRefName),
       baseRefName: asOptionalString(parsed.baseRefName),
       headSha: asOptionalString(parsed.headRefOid),
