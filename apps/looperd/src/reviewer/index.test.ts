@@ -66,7 +66,6 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     body?: string;
   }> = [];
   public submitFailuresRemaining = 0;
-  public viewFailuresRemaining = 0;
 
   constructor(
     private readonly options: {
@@ -116,11 +115,6 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
   }
 
   public async viewPullRequest() {
-    if (this.viewFailuresRemaining > 0) {
-      this.viewFailuresRemaining -= 1;
-      throw new Error("temporary GitHub lookup failure");
-    }
-
     return {
       number: 42,
       title: "Review me",
@@ -471,77 +465,6 @@ describe("ReviewerLoopRunner", () => {
     ).toMatchObject({
       lastPublishedHeadSha: "abc123",
     });
-
-    fixture.store.close();
-  });
-
-  test("retries publish when PR head recheck fails before submit", async () => {
-    const fixture = await createFixture();
-    const github = new FakeGitHubGateway();
-    const originalViewPullRequest = github.viewPullRequest.bind(github);
-    let viewCalls = 0;
-    github.viewPullRequest = async () => {
-      viewCalls += 1;
-      if (viewCalls === 2) {
-        throw new Error("temporary GitHub lookup failure");
-      }
-
-      return originalViewPullRequest();
-    };
-    const agent = new FakeAgentExecutor([
-      completedAgentResult("Please add tests"),
-    ]);
-    const logs = createCapturingLogger();
-    const runner = new ReviewerLoopRunner({
-      store: fixture.store,
-      scheduler: fixture.queue,
-      github,
-      agentExecutor: agent,
-      logger: logs.logger,
-      now: () => fixture.now,
-    });
-
-    await runner.discoverPullRequests({
-      projectId: "project_1",
-      repo: "acme/looper",
-    });
-    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
-    if (!firstClaim) {
-      throw new Error("Expected first reviewer claim");
-    }
-    const firstResult = await runner.processClaimedItem(firstClaim);
-
-    expect(firstResult.status).toBe("failed");
-    expect(firstResult.failureKind).toBe("retryable_after_resume");
-    expect(firstResult.summary).toBe("temporary GitHub lookup failure");
-    expect(agent.starts).toHaveLength(1);
-    expect(github.submitCalls).toHaveLength(0);
-
-    const firstRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
-    const firstCheckpoint = JSON.parse(firstRun?.checkpointJson ?? "{}");
-    expect(firstRun?.lastCompletedStep).toBe("review");
-    expect(firstCheckpoint.pendingReview.body).toContain("Please add tests");
-    const failedLog = logs.entries.find(
-      (entry) =>
-        entry.level === "error" && entry.message === "reviewer run failed",
-    );
-    expect(failedLog?.context).toMatchObject({
-      failureKind: "retryable_after_resume",
-      currentStep: "publish",
-    });
-
-    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
-    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
-    if (!retryClaim) {
-      throw new Error("Expected retry reviewer claim");
-    }
-    const retryResult = await runner.processClaimedItem(retryClaim);
-
-    expect(retryResult.status).toBe("success");
-    expect(retryResult.failureKind).toBeUndefined();
-    expect(agent.starts).toHaveLength(1);
-    expect(github.submitCalls).toHaveLength(1);
-    expect(github.submitCalls[0]?.body).toContain("Please add tests");
 
     fixture.store.close();
   });

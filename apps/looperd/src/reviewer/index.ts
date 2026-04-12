@@ -786,19 +786,19 @@ export class ReviewerLoopRunner {
       input.queueItem.prNumber,
       "queueItem.prNumber",
     );
-    try {
-      const detail = await this.options.github.viewPullRequest({
-        repo,
-        prNumber,
-        cwd: input.project.repoPath,
-      });
-      if (detail.headSha && detail.headSha !== pendingReview.headSha) {
-        throw new ReviewerLoopError(
-          `PR head changed before publish: expected ${pendingReview.headSha}, got ${detail.headSha}`,
-          "retryable_after_resume",
-        );
-      }
+    const detail = await this.options.github.viewPullRequest({
+      repo,
+      prNumber,
+      cwd: input.project.repoPath,
+    });
+    if (detail.headSha && detail.headSha !== pendingReview.headSha) {
+      throw new ReviewerLoopError(
+        `PR head changed before publish: expected ${pendingReview.headSha}, got ${detail.headSha}`,
+        "retryable_after_resume",
+      );
+    }
 
+    try {
       await this.options.github.submitReview({
         repo,
         prNumber,
