@@ -8,9 +8,10 @@ import type {
 } from "../storage/types";
 
 export const QUEUE_LOOP_PRIORITIES = {
-  reviewer: 1,
-  fixer: 2,
-  worker: 3,
+  planner: 1,
+  reviewer: 2,
+  fixer: 3,
+  worker: 4,
 } as const;
 
 export type QueueLoopType = keyof typeof QUEUE_LOOP_PRIORITIES;

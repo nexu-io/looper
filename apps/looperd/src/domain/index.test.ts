@@ -11,6 +11,7 @@ import {
   createPrLockKey,
   createProject,
   createRun,
+  defineIssueLoopTarget,
   defineProjectLoopTarget,
   definePullRequestLoopTarget,
 } from "./index";
@@ -35,6 +36,24 @@ describe("domain invariants", () => {
     });
   });
 
+  test("creates a valid planner loop for an issue target", () => {
+    const loop = createLoop({
+      id: "loop_planner_1",
+      projectId: "project_1",
+      type: "planner",
+      target: defineIssueLoopTarget("acme/looper", 123),
+      status: "idle",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(loop.target).toEqual({
+      targetType: "issue",
+      repo: "acme/looper",
+      issueNumber: 123,
+    });
+  });
+
   test("rejects reviewer loops that do not target a pull request", () => {
     expect(() =>
       createLoop({
@@ -47,6 +66,20 @@ describe("domain invariants", () => {
         updatedAt: now,
       }),
     ).toThrow("reviewer loops must target a pull request");
+  });
+
+  test("allows worker loops to target an existing pull request", () => {
+    expect(() =>
+      createLoop({
+        id: "loop_worker_pr_1",
+        projectId: "project_1",
+        type: "worker",
+        target: definePullRequestLoopTarget("acme/looper", 42),
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).not.toThrow();
   });
 
   test("rejects duplicate active loops for the same project, type, and target", () => {
@@ -137,6 +170,10 @@ describe("domain invariants", () => {
 
     expect(() =>
       assertStepBelongsToLoopType("reviewer", "review"),
+    ).not.toThrow();
+
+    expect(() =>
+      assertStepBelongsToLoopType("planner", "write-spec"),
     ).not.toThrow();
   });
 

@@ -523,6 +523,99 @@ describe("createLooperdRuntime", () => {
     await runtime.stop("test");
   });
 
+  test("auto-discovers and processes planner work on startup", async () => {
+    const fixture = await createFixture();
+    fixture.config.agent.vendor = "opencode";
+    const now = new Date(Date.now() - 1_000).toISOString();
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_planner_1",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:powerformer/looper:123",
+      repo: "powerformer/looper",
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const scheduler = new SchedulerQueue({
+      store: seedStore,
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 0,
+    });
+    scheduler.enqueue({
+      id: "queue_planner_1",
+      projectId: "project_1",
+      loopId: "loop_planner_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:powerformer/looper:123",
+      repo: "powerformer/looper",
+      dedupeKey: "planner:powerformer/looper:123",
+      payloadJson: JSON.stringify({ issueNumber: 123 }),
+      availableAt: now,
+    });
+    seedStore.close();
+
+    let discoverCalls = 0;
+    const processedQueueItemIds: string[] = [];
+    const plannerRunner = {
+      discoverIssues: async () => {
+        discoverCalls += 1;
+        return { queueItems: [], createdLoopIds: [], skipped: 0 };
+      },
+      processClaimedItem: async (queueItem: { id: string; type: string }) => {
+        processedQueueItemIds.push(queueItem.id);
+        return {
+          loopId: "loop_planner_1",
+          runId: "run_planner_1",
+          queueItemId: queueItem.id,
+          status: "success" as const,
+          summary: "planned",
+        };
+      },
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([]),
+      plannerRunner: plannerRunner as never,
+      enableReviewer: false,
+      enableFixer: false,
+    });
+
+    await runtime.start();
+    await Bun.sleep(50);
+
+    expect(discoverCalls).toBeGreaterThan(0);
+    expect(processedQueueItemIds).toEqual(["queue_planner_1"]);
+
+    await runtime.stop("test");
+  });
+
   test("sends failure notification for failed reviewer run", async () => {
     const fixture = await createFixture();
     fixture.config.agent.vendor = "opencode";

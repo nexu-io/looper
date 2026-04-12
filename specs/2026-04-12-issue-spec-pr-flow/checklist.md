@@ -28,18 +28,18 @@
 
 ## Phase 2 - Domain / Scheduler / Runtime 基础改造
 
-- [ ] 在 `apps/looperd/src/domain/index.ts` 增加 `planner` loop type
-- [ ] 在 `apps/looperd/src/domain/index.ts` 增加 `issue` target type
-- [ ] 在 domain 中新增 `IssueLoopTarget` 接口（含 `repo` + `issueNumber`），并扩展 `LoopTarget` union
-- [ ] 在 domain 中新增 `PLANNER_STEPS` 定义，并将其加入 `LOOP_STEPS_BY_TYPE` 和 `LoopStep` union
-- [ ] 调整 `assertLoopTypeMatchesTarget`：允许 `worker + pull_request`，允许 `planner + issue`
-- [ ] 检查并更新 loop target key / unique active loop 相关约束测试
-- [ ] 在 `scheduler/index.ts` 的 `QUEUE_LOOP_PRIORITIES` 中增加 `planner` 及其优先级值
-- [ ] 确定 `planner` 在 `QUEUE_LOOP_PRIORITIES` 中的优先级数值（建议高于 reviewer）
-- [ ] 确保 project 的 `repo` 字段在 startup 时被解析并持久化，供 Planner discover 做 repo → project 反向查找
-- [ ] 在 runtime `processScheduledWork` 中增加 `planner` 分支（与 reviewer/fixer/worker 并列）
-- [ ] 在 runtime 中新增 `discoverIssues` 调用 Planner discover
-- [ ] 为 domain / scheduler / runtime 基础改造补齐单测
+- [x] 在 `apps/looperd/src/domain/index.ts` 增加 `planner` loop type
+- [x] 在 `apps/looperd/src/domain/index.ts` 增加 `issue` target type
+- [x] 在 domain 中新增 `IssueLoopTarget` 接口（含 `repo` + `issueNumber`），并扩展 `LoopTarget` union
+- [x] 在 domain 中新增 `PLANNER_STEPS` 定义，并将其加入 `LOOP_STEPS_BY_TYPE` 和 `LoopStep` union
+- [x] 调整 `assertLoopTypeMatchesTarget`：允许 `worker + pull_request`，允许 `planner + issue`
+- [x] 检查并更新 loop target key / unique active loop 相关约束测试
+- [x] 在 `scheduler/index.ts` 的 `QUEUE_LOOP_PRIORITIES` 中增加 `planner` 及其优先级值
+- [x] 确定 `planner` 在 `QUEUE_LOOP_PRIORITIES` 中的优先级数值（建议高于 reviewer）
+- [x] 确保 project 的 `repo` 字段在 startup 时被解析并持久化，供 Planner discover 做 repo → project 反向查找
+- [x] 在 runtime `processScheduledWork` 中增加 `planner` 分支（与 reviewer/fixer/worker 并列）
+- [x] 在 runtime 中新增 `discoverIssues` 调用 Planner discover
+- [x] 为 domain / scheduler / runtime 基础改造补齐单测
 
 ## Phase 3 - Planner Loop
 

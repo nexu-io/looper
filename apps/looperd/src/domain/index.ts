@@ -1,7 +1,7 @@
-export const LOOP_TYPES = ["reviewer", "worker", "fixer"] as const;
+export const LOOP_TYPES = ["planner", "reviewer", "worker", "fixer"] as const;
 export type LoopType = (typeof LOOP_TYPES)[number];
 
-export const LOOP_TARGET_TYPES = ["project", "pull_request"] as const;
+export const LOOP_TARGET_TYPES = ["project", "pull_request", "issue"] as const;
 export type LoopTargetType = (typeof LOOP_TARGET_TYPES)[number];
 
 export const LOOP_STATUSES = [
@@ -25,6 +25,15 @@ export const RUN_STATUSES = [
   "parse_failed",
 ] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
+
+export const PLANNER_STEPS = [
+  "discover-issues",
+  "prepare-worktree",
+  "write-spec",
+  "publish",
+  "notify",
+] as const;
+export type PlannerStep = (typeof PLANNER_STEPS)[number];
 
 export const REVIEWER_STEPS = [
   "discover",
@@ -60,15 +69,17 @@ export const FIXER_STEPS = [
 ] as const;
 export type FixerStep = (typeof FIXER_STEPS)[number];
 
-export type LoopStep = ReviewerStep | WorkerStep | FixerStep;
+export type LoopStep = PlannerStep | ReviewerStep | WorkerStep | FixerStep;
 
 const ALL_LOOP_STEPS = [
+  ...PLANNER_STEPS,
   ...REVIEWER_STEPS,
   ...WORKER_STEPS,
   ...FIXER_STEPS,
 ] as const;
 
 const LOOP_STEPS_BY_TYPE: Readonly<Record<LoopType, readonly LoopStep[]>> = {
+  planner: PLANNER_STEPS,
   reviewer: REVIEWER_STEPS,
   worker: WORKER_STEPS,
   fixer: FIXER_STEPS,
@@ -159,7 +170,16 @@ export interface PullRequestLoopTarget {
   prNumber: number;
 }
 
-export type LoopTarget = ProjectLoopTarget | PullRequestLoopTarget;
+export interface IssueLoopTarget {
+  targetType: "issue";
+  repo: string;
+  issueNumber: number;
+}
+
+export type LoopTarget =
+  | ProjectLoopTarget
+  | PullRequestLoopTarget
+  | IssueLoopTarget;
 
 export interface Loop {
   id: string;
@@ -349,12 +369,34 @@ export function definePullRequestLoopTarget(
   };
 }
 
+export function defineIssueLoopTarget(
+  repo: string,
+  issueNumber: number,
+): IssueLoopTarget {
+  assertNonEmpty(repo, "target.repo");
+  assertPositiveInteger(issueNumber, "target.issueNumber");
+
+  return {
+    targetType: "issue",
+    repo,
+    issueNumber,
+  };
+}
+
 export function assertLoopTypeMatchesTarget(
   loopType: LoopType,
   target: LoopTarget,
 ): void {
-  if (loopType === "worker" && target.targetType !== "project") {
-    throw new Error("worker loops must target a project");
+  if (
+    loopType === "worker" &&
+    target.targetType !== "project" &&
+    target.targetType !== "pull_request"
+  ) {
+    throw new Error("worker loops must target a project or pull request");
+  }
+
+  if (loopType === "planner" && target.targetType !== "issue") {
+    throw new Error("planner loops must target an issue");
   }
 
   if (
@@ -435,6 +477,10 @@ export function assertStepBelongsToLoopType(
 export function getLoopTargetKey(target: LoopTarget): string {
   if (target.targetType === "project") {
     return `project:${target.projectId}`;
+  }
+
+  if (target.targetType === "issue") {
+    return `issue:${target.repo}:${target.issueNumber}`;
   }
 
   return `pull_request:${target.repo}:${target.prNumber}`;

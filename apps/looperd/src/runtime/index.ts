@@ -14,6 +14,7 @@ import {
   NotificationGateway,
 } from "../infra/index";
 import { ProjectManager } from "../projects/index";
+import { PlannerLoopRunner } from "../planner/index";
 import { ReviewerLoopRunner } from "../reviewer/index";
 import { SchedulerQueue } from "../scheduler/index";
 import { type LooperdApiServer, createLooperdApiServer } from "../server/index";
@@ -81,6 +82,7 @@ export interface CreateLooperdRuntimeOptions {
     | "cleanupWorktree"
   >;
   agentExecutor?: RuntimeAgentExecutor;
+  plannerRunner?: PlannerLoopRunner;
   reviewerRunner?: ReviewerLoopRunner;
   fixerRunner?: FixerLoopRunner;
   workerRunner?: WorkerLoopRunner;
@@ -110,6 +112,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
   private server?: LooperdApiServer;
   private scheduler?: SchedulerQueue;
   private git?: CreateLooperdRuntimeOptions["git"];
+  private plannerRunner?: PlannerLoopRunner;
   private reviewerRunner?: ReviewerLoopRunner;
   private fixerRunner?: FixerLoopRunner;
   private workerRunner?: WorkerLoopRunner;
@@ -173,6 +176,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
           }))
         : undefined;
       this.git = git;
+
+      if (github && git && agentExecutor) {
+        this.plannerRunner =
+          this.options.plannerRunner ?? new PlannerLoopRunner();
+      }
 
       if (github && agentExecutor && this.options.enableReviewer !== false) {
         this.reviewerRunner =
@@ -641,6 +649,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
     this.schedulerTickRunning = true;
     try {
+      await this.discoverIssues();
       await this.discoverPullRequests();
       await this.processScheduledWork();
     } catch (error) {
@@ -650,6 +659,14 @@ class BasicLooperdRuntime implements LooperdRuntime {
     } finally {
       this.schedulerTickRunning = false;
     }
+  }
+
+  private async discoverIssues(): Promise<void> {
+    if (!this.store || !this.plannerRunner) {
+      return;
+    }
+
+    await this.plannerRunner.discoverIssues();
   }
 
   private async discoverPullRequests(): Promise<void> {
@@ -696,7 +713,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
       const next = this.scheduler.listScheduled(1)[0];
       if (
         !next ||
-        (next.type !== "reviewer" &&
+        (next.type !== "planner" &&
+          next.type !== "reviewer" &&
           next.type !== "fixer" &&
           next.type !== "worker")
       ) {
@@ -706,6 +724,43 @@ class BasicLooperdRuntime implements LooperdRuntime {
       const claimed = this.scheduler.claimNext(`looperd-${next.type}`);
       if (!claimed) {
         return;
+      }
+
+      if (claimed.type === "planner" && this.plannerRunner) {
+        try {
+          const result = await this.plannerRunner.processClaimedItem(claimed);
+          if (
+            result.status === "failed" &&
+            shouldNotifyRunFailure(claimed.type, result)
+          ) {
+            void this.notifySystemEvent({
+              projectId: claimed.projectId ?? undefined,
+              loopId: result.loopId,
+              runId: result.runId,
+              level: "failure",
+              title: "Looper Planner",
+              subtitle: claimed.targetId,
+              body: `Run failed: ${result.summary}`,
+              entityType: "run",
+              entityId: result.runId,
+              dedupeKey: `runtime.run.failed:planner:${result.runId}`,
+            });
+          }
+        } catch (error) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: claimed.loopId ?? undefined,
+            level: "failure",
+            title: "Looper Planner",
+            subtitle: claimed.targetId,
+            body: `Scheduling failed: ${error instanceof Error ? error.message : String(error)}`,
+            entityType: "queue_item",
+            entityId: claimed.id,
+            dedupeKey: `runtime.queue.failed:planner:${claimed.id}`,
+          });
+          throw error;
+        }
+        continue;
       }
 
       if (claimed.type === "reviewer" && this.reviewerRunner) {
@@ -923,7 +978,7 @@ function readMetadataString(value: unknown): string | null {
 }
 
 function shouldNotifyRunFailure(
-  type: "reviewer" | "fixer" | "worker",
+  type: "planner" | "reviewer" | "fixer" | "worker",
   result: { failureKind?: string; summary: string },
 ): boolean {
   if (type === "fixer" && result.failureKind === "retryable_after_resume") {

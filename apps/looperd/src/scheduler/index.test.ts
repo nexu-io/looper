@@ -8,6 +8,7 @@ import {
   SchedulerQueue,
   computeBackoffDelayMs,
   computeNextAttemptAt,
+  getQueuePriority,
 } from "./index";
 
 async function createStore() {
@@ -160,6 +161,16 @@ describe("SchedulerQueue", () => {
 });
 
 describe("scheduler backoff helpers", () => {
+  test("prioritizes planner work ahead of reviewer, fixer, and worker loops", () => {
+    expect(getQueuePriority("planner")).toBeLessThan(
+      getQueuePriority("reviewer"),
+    );
+    expect(getQueuePriority("reviewer")).toBeLessThan(
+      getQueuePriority("fixer"),
+    );
+    expect(getQueuePriority("fixer")).toBeLessThan(getQueuePriority("worker"));
+  });
+
   test("computes exponential retry delays", () => {
     expect(computeBackoffDelayMs(5_000, 1)).toBe(5_000);
     expect(computeBackoffDelayMs(5_000, 2)).toBe(10_000);
