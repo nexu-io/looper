@@ -17,14 +17,14 @@
 
 ## Phase 1 - GitHub Gateway 基础能力
 
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加 issue list 能力
-- [ ] `listIssues` 必须支持 `labels` + `assignee` 过滤参数（spec discovery 依赖）
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加 issue detail/view 能力（建议）
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加 PR add label 能力
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加 PR remove label 能力
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加 PR add reviewer 能力
-- [ ] 在 `apps/looperd/src/infra/github.ts` 增加按 label 过滤 open PR 的能力
-- [ ] 为新增 GitHub gateway 能力补齐单测
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加 issue list 能力
+- [x] `listIssues` 必须支持 `labels` + `assignee` 过滤参数（spec discovery 依赖）
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加 issue detail/view 能力（建议）
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加 PR add label 能力
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加 PR remove label 能力
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加 PR add reviewer 能力
+- [x] 在 `apps/looperd/src/infra/github.ts` 增加按 label 过滤 open PR 的能力
+- [x] 为新增 GitHub gateway 能力补齐单测
 
 ## Phase 2 - Domain / Scheduler / Runtime 基础改造
 

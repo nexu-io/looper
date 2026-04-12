@@ -26,6 +26,8 @@ describe("GhCliGitHubGateway", () => {
     await writeFile(
       scriptPath,
       `#!/bin/sh\nprintf '%s\n' "$*" >> "${logPath}"\nif [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n  printf '[{"number":42,"title":"Review me","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]'
+elif [ "$1" = "issue" ] && [ "$2" = "list" ]; then\n  printf '[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]'
+elif [ "$1" = "issue" ] && [ "$2" = "view" ]; then\n  printf '{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}'
 elif [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n  printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
 elif [ "$1" = "pr" ] && [ "$2" = "diff" ]; then\n  printf 'diff --git a/a.ts b/a.ts\n'
 elif [ "$1" = "api" ] && [ "$2" = "user" ]; then\n  printf 'reviewer\n'
@@ -40,7 +42,19 @@ else\n  exit 0\nfi\n`,
       ghPath: scriptPath,
       cwd: rootDir,
     });
-    const prs = await gateway.listOpenPullRequests({ repo: "acme/looper" });
+    const prs = await gateway.listOpenPullRequests({
+      repo: "acme/looper",
+      label: "phase-1",
+    });
+    const issues = await gateway.listOpenIssues({
+      repo: "acme/looper",
+      assignee: "reviewer",
+      label: "phase-1",
+    });
+    const issueDetail = await gateway.viewIssue({
+      repo: "acme/looper",
+      issueNumber: 8,
+    });
     const snapshot = await gateway.capturePullRequestSnapshot({
       projectId: "project_1",
       repo: "acme/looper",
@@ -56,9 +70,27 @@ else\n  exit 0\nfi\n`,
       repo: "acme/looper",
       threadId: "thread-1",
     });
+    await gateway.addPullRequestLabels({
+      repo: "acme/looper",
+      prNumber: 42,
+      labels: ["phase-1", "ready"],
+    });
+    await gateway.removePullRequestLabels({
+      repo: "acme/looper",
+      prNumber: 42,
+      labels: ["needs-work"],
+    });
+    await gateway.addPullRequestReviewers({
+      repo: "acme/looper",
+      prNumber: 42,
+      reviewers: ["reviewer"],
+    });
 
     expect(prs[0]?.number).toBe(42);
     expect(prs[0]?.reviewRequests).toEqual(["OctoCat"]);
+    expect(issues[0]?.assignees).toEqual(["reviewer"]);
+    expect(issues[0]?.labels).toEqual(["phase-1", "gateway"]);
+    expect(issueDetail.number).toBe(8);
     expect(snapshot.headSha).toBe("abc123");
     expect(snapshot.reviewState).toBe("CHANGES_REQUESTED");
     const detail = await gateway.viewPullRequest({
@@ -80,6 +112,22 @@ else\n  exit 0\nfi\n`,
     const log = await readFile(logPath, "utf8");
     expect(log).toContain(
       "pr review 42 --repo acme/looper --comment --body Looks good",
+    );
+    expect(log).toContain(
+      "pr list --repo acme/looper --state open --limit 30 --label phase-1",
+    );
+    expect(log).toContain(
+      "issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label phase-1",
+    );
+    expect(log).toContain("issue view 8 --repo acme/looper");
+    expect(log).toContain(
+      "pr edit 42 --repo acme/looper --add-label phase-1,ready",
+    );
+    expect(log).toContain(
+      "pr edit 42 --repo acme/looper --remove-label needs-work",
+    );
+    expect(log).toContain(
+      "pr edit 42 --repo acme/looper --add-reviewer reviewer",
     );
     expect(log).toContain("threadId=thread-1");
   });

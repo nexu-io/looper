@@ -31,6 +31,19 @@ export interface GitHubPullRequestDetail extends GitHubPullRequestSummary {
   checks: unknown[];
 }
 
+export interface GitHubIssueSummary {
+  number: number;
+  title: string;
+  body?: string;
+  url?: string;
+  state?: string;
+  author?: string;
+  assignees: string[];
+  labels: string[];
+}
+
+export interface GitHubIssueDetail extends GitHubIssueSummary {}
+
 export interface SubmitReviewInput {
   repo: string;
   prNumber: number;
@@ -71,33 +84,38 @@ export class GhCliGitHubGateway {
     repo: string;
     cwd?: string;
     limit?: number;
+    label?: string;
   }): Promise<GitHubPullRequestSummary[]> {
-    const result = await this.runGh(
+    const args = [
+      "pr",
+      "list",
+      "--repo",
+      input.repo,
+      "--state",
+      "open",
+      "--limit",
+      String(input.limit ?? 30),
+    ];
+    if (input.label) {
+      args.push("--label", input.label);
+    }
+    args.push(
+      "--json",
       [
-        "pr",
-        "list",
-        "--repo",
-        input.repo,
-        "--state",
-        "open",
-        "--limit",
-        String(input.limit ?? 30),
-        "--json",
-        [
-          "number",
-          "title",
-          "url",
-          "state",
-          "isDraft",
-          "reviewDecision",
-          "headRefName",
-          "baseRefName",
-          "author",
-          "reviewRequests",
-        ].join(","),
-      ],
-      input.cwd,
+        "number",
+        "title",
+        "url",
+        "state",
+        "isDraft",
+        "reviewDecision",
+        "headRefName",
+        "baseRefName",
+        "author",
+        "reviewRequests",
+      ].join(","),
     );
+
+    const result = await this.runGh(args, input.cwd);
 
     return asArray(result.stdout).map((item) => ({
       number: Number(item.number),
@@ -111,6 +129,97 @@ export class GhCliGitHubGateway {
       author: extractAuthor(item.author),
       reviewRequests: extractReviewRequestLogins(item.reviewRequests),
     }));
+  }
+
+  public async listOpenIssues(input: {
+    repo: string;
+    cwd?: string;
+    limit?: number;
+    assignee?: string;
+    label?: string;
+  }): Promise<GitHubIssueSummary[]> {
+    const args = [
+      "issue",
+      "list",
+      "--repo",
+      input.repo,
+      "--state",
+      "open",
+      "--limit",
+      String(input.limit ?? 30),
+    ];
+    if (input.assignee) {
+      args.push("--assignee", input.assignee);
+    }
+    if (input.label) {
+      args.push("--label", input.label);
+    }
+    args.push(
+      "--json",
+      [
+        "number",
+        "title",
+        "body",
+        "url",
+        "state",
+        "author",
+        "assignees",
+        "labels",
+      ].join(","),
+    );
+
+    const result = await this.runGh(args, input.cwd);
+
+    return asArray(result.stdout).map((item) => ({
+      number: Number(item.number),
+      title: String(item.title),
+      body: asOptionalString(item.body),
+      url: asOptionalString(item.url),
+      state: asOptionalString(item.state),
+      author: extractAuthor(item.author),
+      assignees: extractActorLogins(item.assignees),
+      labels: extractLabelNames(item.labels),
+    }));
+  }
+
+  public async viewIssue(input: {
+    repo: string;
+    issueNumber: number;
+    cwd?: string;
+  }): Promise<GitHubIssueDetail> {
+    const result = await this.runGh(
+      [
+        "issue",
+        "view",
+        String(input.issueNumber),
+        "--repo",
+        input.repo,
+        "--json",
+        [
+          "number",
+          "title",
+          "body",
+          "url",
+          "state",
+          "author",
+          "assignees",
+          "labels",
+        ].join(","),
+      ],
+      input.cwd,
+    );
+    const parsed = asObject(result.stdout);
+
+    return {
+      number: Number(parsed.number),
+      title: String(parsed.title),
+      body: asOptionalString(parsed.body),
+      url: asOptionalString(parsed.url),
+      state: asOptionalString(parsed.state),
+      author: extractAuthor(parsed.author),
+      assignees: extractActorLogins(parsed.assignees),
+      labels: extractLabelNames(parsed.labels),
+    };
   }
 
   public async viewPullRequest(input: {
@@ -247,6 +356,78 @@ export class GhCliGitHubGateway {
     }
 
     await this.runGh(args, input.cwd);
+  }
+
+  public async addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void> {
+    if (input.labels.length === 0) {
+      return;
+    }
+
+    await this.runGh(
+      [
+        "pr",
+        "edit",
+        String(input.prNumber),
+        "--repo",
+        input.repo,
+        "--add-label",
+        input.labels.join(","),
+      ],
+      input.cwd,
+    );
+  }
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void> {
+    if (input.labels.length === 0) {
+      return;
+    }
+
+    await this.runGh(
+      [
+        "pr",
+        "edit",
+        String(input.prNumber),
+        "--repo",
+        input.repo,
+        "--remove-label",
+        input.labels.join(","),
+      ],
+      input.cwd,
+    );
+  }
+
+  public async addPullRequestReviewers(input: {
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+    cwd?: string;
+  }): Promise<void> {
+    if (input.reviewers.length === 0) {
+      return;
+    }
+
+    await this.runGh(
+      [
+        "pr",
+        "edit",
+        String(input.prNumber),
+        "--repo",
+        input.repo,
+        "--add-reviewer",
+        input.reviewers.join(","),
+      ],
+      input.cwd,
+    );
   }
 
   public async createPullRequest(
@@ -589,6 +770,31 @@ function extractReviewRequestLogin(value: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+function extractActorLogins(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => extractAuthor(item))
+    .filter((login): login is string => Boolean(login));
+}
+
+function extractLabelNames(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return undefined;
+      }
+      return asOptionalString((item as Record<string, unknown>).name);
+    })
+    .filter((name): name is string => Boolean(name));
 }
 
 function parsePrNumberFromUrl(url: string): number | undefined {
