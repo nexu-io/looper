@@ -10,9 +10,9 @@ import type {
   SubmitReviewInput,
 } from "../infra/github";
 import {
-  hasLabel,
   SPEC_READY_LABEL,
   SPEC_REVIEWING_LABEL,
+  hasLabel,
   isSpecReviewClean,
   resolvePullRequestPhase,
 } from "../infra/spec-pr";
@@ -857,6 +857,28 @@ export class ReviewerLoopRunner {
         body: pendingReview.body,
         cwd: input.project.repoPath,
       });
+
+      const shouldPromoteSpecLabel =
+        (phase === "spec" || checkpointPhase === "spec") &&
+        isSpecReviewClean(detail);
+      if (shouldPromoteSpecLabel) {
+        if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
+          await this.options.github.removePullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_REVIEWING_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
+        if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
+          await this.options.github.addPullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_READY_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
+      }
     } catch (error) {
       if (error instanceof ReviewerLoopError) {
         throw error;
@@ -866,28 +888,6 @@ export class ReviewerLoopRunner {
         error instanceof Error ? error.message : "Failed to publish review",
         "retryable_after_resume",
       );
-    }
-
-    const shouldPromoteSpecLabel =
-      (phase === "spec" || checkpointPhase === "spec") &&
-      isSpecReviewClean(detail);
-    if (shouldPromoteSpecLabel) {
-      if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
-        await this.options.github.removePullRequestLabels({
-          repo,
-          prNumber,
-          labels: [SPEC_REVIEWING_LABEL],
-          cwd: input.project.repoPath,
-        });
-      }
-      if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
-        await this.options.github.addPullRequestLabels({
-          repo,
-          prNumber,
-          labels: [SPEC_READY_LABEL],
-          cwd: input.project.repoPath,
-        });
-      }
     }
 
     this.updateLoop(input.loop, {

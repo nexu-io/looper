@@ -82,7 +82,13 @@ class FakeGitHubGateway implements FixerGitHubGateway {
     private readonly options: {
       listPrs?: Array<{ number: number; isDraft?: boolean; state?: string }>;
       views: Array<
-        "error" | { comments?: unknown[]; checks?: unknown[]; headSha?: string }
+        | "error"
+        | {
+            comments?: unknown[];
+            checks?: unknown[];
+            headSha?: string;
+            reviewDecision?: string;
+          }
       >;
       resolveFailures?: Record<string, string>;
       labels?: string[];
@@ -128,8 +134,8 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       body: "body",
       state: "OPEN",
       isDraft: false,
-      reviewDecision: "CHANGES_REQUESTED",
-      labels: [],
+      reviewDecision: next.reviewDecision,
+      labels: [...this.currentLabels],
       headRefName: "feature/fixer",
       baseRefName: "main",
       headSha: next.headSha ?? "abc123",
