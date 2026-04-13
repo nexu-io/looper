@@ -1006,6 +1006,32 @@ describe("createLooperdRuntime", () => {
       createdAt: now,
       updatedAt: now,
     });
+    seedStore.queue.upsert({
+      id: "queue_reviewer_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "reviewer:acme/looper:42",
+      priority: 2,
+      status: "running",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: "executor_1",
+      claimedAt: now,
+      startedAt: now,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
     seedStore.locks.acquire({
       key: "pr:acme/looper:42",
       owner: "reviewer-loop",
@@ -1041,6 +1067,14 @@ describe("createLooperdRuntime", () => {
     verifyStore.initialize();
     expect(verifyStore.runs.getById("run_1")?.status).toBe("interrupted");
     expect(verifyStore.loops.getById("loop_1")?.status).toBe("queued");
+    expect(verifyStore.queue.getById("queue_reviewer_1")?.claimedBy).not.toBe(
+      "executor_1",
+    );
+    const requeueEvent = verifyStore.events
+      .listByEntity("loop", "loop_1")
+      .find((event) => event.eventType === "looperd.recovery.loop_requeued");
+    expect(requeueEvent).toBeDefined();
+    expect(requeueEvent?.payloadJson).toContain('"recoveredQueueItems":1');
     expect(verifyStore.locks.get("pr:acme/looper:42")).toBeNull();
     expect(
       verifyStore.events

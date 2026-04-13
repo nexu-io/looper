@@ -86,6 +86,7 @@ export interface Store {
       errorKind: QueueFailureKind;
       updatedAt: string;
     }): void;
+    requeueRunningByLoop(loopId: string, queuedAt: string): number;
     cancelByLoop(loopId: string, finishedAt: string, reason?: string): number;
   };
 

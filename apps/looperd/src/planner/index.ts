@@ -441,11 +441,9 @@ export class PlannerLoopRunner {
         status:
           failedQueueItem?.status === "queued"
             ? "queued"
-            : failedQueueItem?.status === "cancelled"
+            : failure.kind === "manual_intervention"
               ? "paused"
-              : failure.kind === "manual_intervention"
-                ? "paused"
-                : "failed",
+              : "failed",
         lastRunAt: this.nowIso(),
         nextRunAt:
           failedQueueItem?.status === "queued"

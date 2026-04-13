@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
 import type { OpenPrStrategy } from "../config/index";
+import { createPrLockKey } from "../domain/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
@@ -373,11 +374,9 @@ export class WorkerLoopRunner {
         status:
           failedQueueItem?.status === "queued"
             ? "queued"
-            : failedQueueItem?.status === "cancelled"
+            : failure.kind === "manual_intervention"
               ? "paused"
-              : failure.kind === "manual_intervention"
-                ? "paused"
-                : "failed",
+              : "failed",
         lastRunAt: this.nowIso(),
         nextRunAt:
           failedQueueItem?.status === "queued"
@@ -454,10 +453,14 @@ export class WorkerLoopRunner {
           repo: input.repo,
           prNumber: pullRequest.number,
           dedupeKey: buildWorkerPullRequestDedupeKey(
+            project.id,
             input.repo,
             pullRequest.number,
           ),
-          lockKey: buildPullRequestLockKey(input.repo, pullRequest.number),
+          lockKey: buildWorkerPullRequestLockKey(
+            input.repo,
+            pullRequest.number,
+          ),
         }),
       );
     }
@@ -550,7 +553,7 @@ export class WorkerLoopRunner {
     const lockKey =
       input.queueItem.lockKey ??
       (work.executionMode === "push-existing" && work.prNumber
-        ? buildPullRequestLockKey(work.repo, work.prNumber)
+        ? buildWorkerPullRequestLockKey(work.repo, work.prNumber)
         : `worker:${input.loop.id}`);
     const acquired = this.options.scheduler.acquireBusinessLock({
       key: lockKey,
@@ -1418,14 +1421,15 @@ function buildPullRequestTargetId(repo: string, prNumber: number): string {
 }
 
 function buildWorkerPullRequestDedupeKey(
+  projectId: string,
   repo: string,
   prNumber: number,
 ): string {
-  return `worker:${repo}:${prNumber}`;
+  return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
-function buildPullRequestLockKey(repo: string, prNumber: number): string {
-  return `pr:${repo}:${prNumber}`;
+function buildWorkerPullRequestLockKey(repo: string, prNumber: number): string {
+  return createPrLockKey(repo, prNumber);
 }
 
 function normalizePrState(value: string | undefined): "open" | "other" {

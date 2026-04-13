@@ -27,6 +27,11 @@ interface CliDeps {
   stderr?: Writer;
   env?: Record<string, string | undefined>;
   cwd?: string;
+  isStdoutTty?: boolean;
+  launchShellImpl?: (options: {
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => Promise<number>;
 }
 
 interface CliContext {
@@ -37,6 +42,9 @@ interface CliContext {
   client: ApiClient;
   readFileImpl: (path: string, encoding: "utf8") => Promise<string>;
   showHelp: (commandName?: string) => void;
+  env: Record<string, string | undefined>;
+  isStdoutTty: boolean;
+  launchShell: (cwd: string) => Promise<number>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -187,6 +195,13 @@ export async function runCli(
       client,
       readFileImpl: deps.readFileImpl ?? readFile,
       showHelp: () => {},
+      env,
+      isStdoutTty: deps.isStdoutTty ?? Boolean(process.stdout.isTTY),
+      launchShell: async (shellCwd) =>
+        (deps.launchShellImpl ?? launchInteractiveShell)({
+          cwd: shellCwd,
+          env,
+        }),
     };
 
     const cli = createCli(runtime);
@@ -1018,7 +1033,27 @@ async function runJump(context: CliContext) {
     return;
   }
 
+  if (context.isStdoutTty) {
+    await context.launchShell(data.worktree.path);
+    return;
+  }
+
   context.write(`cd -- ${quoteShellArg(data.worktree.path)}`);
+}
+
+async function launchInteractiveShell(options: {
+  cwd: string;
+  env: Record<string, string | undefined>;
+}): Promise<number> {
+  const shell = options.env.SHELL || "/bin/zsh";
+  const subprocess = Bun.spawn([shell, "-i"], {
+    cwd: options.cwd,
+    env: options.env,
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  return await subprocess.exited;
 }
 
 async function runLogs(context: CliContext) {

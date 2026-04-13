@@ -626,6 +626,22 @@ export class SqliteStore implements Store {
           input.updatedAt,
         );
     },
+    requeueRunningByLoop: (loopId: string, queuedAt: string): number => {
+      const result = this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'queued',
+               available_at = ?2,
+               claimed_by = NULL,
+               claimed_at = NULL,
+               started_at = NULL,
+               finished_at = NULL,
+               updated_at = ?2
+           WHERE loop_id = ?1 AND status = 'running'`,
+        )
+        .run(loopId, queuedAt);
+      return result.changes;
+    },
     cancelByLoop: (
       loopId: string,
       finishedAt: string,

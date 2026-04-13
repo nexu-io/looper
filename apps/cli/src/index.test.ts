@@ -482,6 +482,7 @@ describe("runCli", () => {
 
     const defaultLines: string[] = [];
     const defaultExit = await runCli(["jump", "12"], {
+      isStdoutTty: false,
       stdout: (line) => defaultLines.push(line),
       loadConfigImpl: async () => createConfig() as never,
       fetchImpl,
@@ -491,6 +492,7 @@ describe("runCli", () => {
 
     const pathLines: string[] = [];
     const pathExit = await runCli(["jump", "12", "--print-path"], {
+      isStdoutTty: false,
       stdout: (line) => pathLines.push(line),
       loadConfigImpl: async () => createConfig() as never,
       fetchImpl,
@@ -500,6 +502,7 @@ describe("runCli", () => {
 
     const jsonLines: string[] = [];
     const jsonExit = await runCli(["jump", "12", "--json"], {
+      isStdoutTty: false,
       stdout: (line) => jsonLines.push(line),
       loadConfigImpl: async () => createConfig() as never,
       fetchImpl,
@@ -514,6 +517,7 @@ describe("runCli", () => {
     const shellExit = await runCli(
       ["jump", "12", "--shell-integration", "bash"],
       {
+        isStdoutTty: false,
         stdout: (line) => shellLines.push(line),
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl,
@@ -526,6 +530,7 @@ describe("runCli", () => {
     const shellNoIdExit = await runCli(
       ["jump", "--shell-integration", "bash"],
       {
+        isStdoutTty: false,
         stdout: (line) => shellNoIdLines.push(line),
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl,
@@ -536,6 +541,45 @@ describe("runCli", () => {
 
     expect(requests).toHaveLength(3);
     expect(requests[0]).toContain("/api/v1/runs/active/12");
+  });
+
+  test("jump opens an interactive shell when stdout is a tty", async () => {
+    const launched: Array<{ cwd: string; shell?: string }> = [];
+    const exitCode = await runCli(["jump", "12"], {
+      env: { SHELL: "/bin/zsh" },
+      isStdoutTty: true,
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_jump_tty",
+            data: {
+              seq: 12,
+              loopId: "loop_12",
+              projectId: "project_1",
+              worktree: {
+                id: "wt_12",
+                path: "/tmp/looper-worktrees/loop-12",
+                branch: "feature/loop-12",
+              },
+            },
+          }),
+        ),
+      launchShellImpl: async (options) => {
+        launched.push({ cwd: options.cwd, shell: options.env.SHELL });
+        return 0;
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(launched).toEqual([
+      {
+        cwd: "/tmp/looper-worktrees/loop-12",
+        shell: "/bin/zsh",
+      },
+    ]);
   });
 
   test("supports logs output modes and no-agent message", async () => {

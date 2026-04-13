@@ -509,9 +509,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
     const runStopped = Boolean(activeRun && executionTerminated);
     const stopped =
-      stopRequested ||
-      runStopped ||
-      (!activeRun && cancelledQueueItems > 0);
+      stopRequested || runStopped || (!activeRun && cancelledQueueItems > 0);
 
     this.appendEvent({
       id: randomUUID(),
@@ -670,6 +668,10 @@ class BasicLooperdRuntime implements LooperdRuntime {
           lastRunAt: latestRun.endedAt ?? latestRun.startedAt,
           updatedAt: nowIso,
         });
+        const recoveredQueueItems = this.store.queue.requeueRunningByLoop(
+          loop.id,
+          nowIso,
+        );
         summary.loopsRequeued += 1;
         this.appendEvent({
           id: randomUUID(),
@@ -680,6 +682,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
           payloadJson: JSON.stringify({
             previousStatus: loop.status,
             nextRunAt: nowIso,
+            recoveredQueueItems,
           }),
           createdAt: nowIso,
         });
