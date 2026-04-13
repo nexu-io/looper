@@ -202,7 +202,9 @@ describe("runCli", () => {
           }
 
           workerRequestCount += 1;
-          return new Response(JSON.stringify({ ok: true, requestId: "unexpected" }));
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
         },
       },
     );
