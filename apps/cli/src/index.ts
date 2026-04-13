@@ -865,11 +865,6 @@ async function resolveProjectForWork(
     return project;
   }
 
-  const projectFromCwd = inferProjectFromCwd(context.cwd, projects);
-  if (projectFromCwd) {
-    return projectFromCwd;
-  }
-
   if (hint?.repo) {
     const matches = projects.filter((project) => project.repo === hint.repo);
     if (matches.length === 1) {
@@ -883,6 +878,11 @@ async function resolveProjectForWork(
         `Multiple projects match repo ${hint.repo}; pass --project <projectId>`,
       );
     }
+  }
+
+  const projectFromCwd = inferProjectFromCwd(context.cwd, projects);
+  if (projectFromCwd) {
+    return projectFromCwd;
   }
 
   throw new Error(

@@ -354,6 +354,61 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"issueNumber":123');
   });
 
+  test("prefers qualified issue repo over cwd project", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--issue", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_qualified_issue_repo_priority",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/other",
+                    repo: "acme/other",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_qualified_issue_repo_priority",
+            data: {
+              id: "loop_worker_issue_repo_priority",
+              title: "Implement acme/other#123",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.body).toContain('"projectId":"project_2"');
+    expect(requests[1]?.body).toContain('"repo":"acme/other"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
   test("creates reviewer loop from PR reference", async () => {
     const requests: string[] = [];
     const exitCode = await runCli(
@@ -492,6 +547,60 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(requests[1]?.url).toContain("/api/v1/planners");
     expect(requests[1]?.body).toContain('"projectId":"project_1"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("prefers qualified planner issue repo over cwd project", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["plan", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_repo_priority",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/other",
+                    repo: "acme/other",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_plan_repo_priority",
+            data: {
+              id: "loop_plan_repo_priority",
+              issueNumber: 123,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/planners");
+    expect(requests[1]?.body).toContain('"projectId":"project_2"');
     expect(requests[1]?.body).toContain('"issueNumber":123');
   });
 
