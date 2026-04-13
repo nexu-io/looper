@@ -522,6 +522,18 @@ describe("runCli", () => {
     expect(shellExit).toBe(0);
     expect(shellLines).toEqual(['lj() { eval "$(looper jump "$@")"; }']);
 
+    const shellNoIdLines: string[] = [];
+    const shellNoIdExit = await runCli(
+      ["jump", "--shell-integration", "bash"],
+      {
+        stdout: (line) => shellNoIdLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      },
+    );
+    expect(shellNoIdExit).toBe(0);
+    expect(shellNoIdLines).toEqual(['lj() { eval "$(looper jump "$@")"; }']);
+
     expect(requests).toHaveLength(3);
     expect(requests[0]).toContain("/api/v1/runs/active/12");
   });

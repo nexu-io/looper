@@ -398,11 +398,12 @@ function createCli(runtime: CliRuntime) {
     });
 
   cli
-    .command("jump <id>", "Print shell command for a loop worktree")
+    .command("jump [id]", "Print shell command for a loop worktree")
     .option("--print-path", "Print the worktree path only")
     .option("--shell-integration <shell>", "Print shell integration helper")
     .example((name) => `  $ eval \"$(${name} jump 12)\"`)
     .example((name) => `  $ ${name} jump 12 --print-path`)
+    .example((name) => `  $ ${name} jump --shell-integration bash`)
     .action(async (id, options) => {
       await dispatch(createContext(runtime, ["jump", id], options));
     });
