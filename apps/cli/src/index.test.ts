@@ -205,6 +205,83 @@ describe("runCli", () => {
     );
   });
 
+  test("normalizes /private-prefixed cwd aliases when detecting worker project", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(
+      ["work", "--issue", "123", "--repo", "acme/looper"],
+      {
+        cwd: "/private/tmp/repos/looper/packages/cli",
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          requests.push({
+            url,
+            body: init?.body as string | null,
+          });
+
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_private_1",
+                data: {
+                  items: [{ id: "project_1", repoPath: "/tmp/repos/looper" }],
+                },
+              }),
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_work_private_1",
+              data: {
+                id: "loop_private_1",
+                title: "Implement acme/looper#123",
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+  });
+
+  test("errors when worker cwd matches multiple equally specific projects", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(
+      ["work", "--issue", "123", "--repo", "acme/looper"],
+      {
+        cwd: "/tmp/repos/looper/packages/cli",
+        stderr: (line) => errors.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_ambiguous_1",
+              data: {
+                items: [
+                  { id: "project_1", repoPath: "/tmp/repos/looper" },
+                  { id: "project_2", repoPath: "/tmp/repos/looper" },
+                ],
+              },
+            }),
+          ),
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "--project is required (multiple projects matched cwd /tmp/repos/looper/packages/cli)",
+    );
+  });
+
   test("rejects invalid worker issue number", async () => {
     const errors: string[] = [];
     const exitCode = await runCli(
@@ -378,6 +455,33 @@ describe("runCli", () => {
     expect(requests[0]?.url).toContain("/api/v1/projects");
     expect(requests[1]?.url).toContain("/api/v1/planners");
     expect(requests[1]?.body).toContain('"projectId":"project_1"');
+  });
+
+  test("errors when planner cwd matches multiple equally specific projects", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(["plan", "--issue", "123"], {
+      cwd: "/tmp/repos/looper",
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_projects_ambiguous_2",
+            data: {
+              items: [
+                { id: "project_1", repoPath: "/tmp/repos/looper" },
+                { id: "project_2", repoPath: "/tmp/repos/looper" },
+              ],
+            },
+          }),
+        ),
+    });
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "--project is required (multiple projects matched cwd /tmp/repos/looper)",
+    );
   });
 
   test("adds project and requests discovery", async () => {

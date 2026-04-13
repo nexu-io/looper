@@ -1294,7 +1294,7 @@ async function resolveCommandProjectId(context: CliContext): Promise<string> {
     return explicitProjectId;
   }
 
-  const cwd = resolve(context.cwd);
+  const cwd = normalizeComparablePath(context.cwd);
   const data = await context.client.get<{
     items: Array<{ id: string; repoPath: string }>;
   }>("/api/v1/projects");
@@ -1306,20 +1306,43 @@ async function resolveCommandProjectId(context: CliContext): Promise<string> {
     throw new Error(`--project is required (no project matched cwd ${cwd})`);
   }
 
-  matches.sort((left, right) => right.repoPath.length - left.repoPath.length);
-  const match = matches[0];
+  const rankedMatches = matches
+    .map((project) => ({
+      project,
+      normalizedRepoPath: normalizeComparablePath(project.repoPath),
+    }))
+    .sort(
+      (left, right) =>
+        right.normalizedRepoPath.length - left.normalizedRepoPath.length,
+    );
+  const match = rankedMatches[0];
   if (!match) {
     throw new Error(`--project is required (no project matched cwd ${cwd})`);
   }
 
-  return match.id;
+  const ambiguousMatch = rankedMatches.find(
+    (candidate) =>
+      candidate.project.id !== match.project.id &&
+      candidate.normalizedRepoPath.length === match.normalizedRepoPath.length,
+  );
+  if (ambiguousMatch) {
+    throw new Error(
+      `--project is required (multiple projects matched cwd ${cwd})`,
+    );
+  }
+
+  return match.project.id;
 }
 
 function isWithinProjectRepo(cwd: string, repoPath: string): boolean {
-  const normalizedRepoPath = resolve(repoPath);
+  const normalizedRepoPath = normalizeComparablePath(repoPath);
   return (
     cwd === normalizedRepoPath || cwd.startsWith(`${normalizedRepoPath}${sep}`)
   );
+}
+
+function normalizeComparablePath(path: string): string {
+  return resolve(path).replace(/^\/private/, "");
 }
 
 function parsePullRequestRef(value: string): PullRequestRef {
