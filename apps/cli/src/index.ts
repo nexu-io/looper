@@ -864,6 +864,16 @@ async function resolveProjectForWork(
     if (!project) {
       throw new Error(`Project not found: ${explicitProjectId}`);
     }
+    if (
+      hint?.repo &&
+      hint.requireRepoMatch &&
+      project.repo !== null &&
+      project.repo !== hint.repo
+    ) {
+      throw new Error(
+        `Project ${explicitProjectId} is for repo ${project.repo}, but ${hint.repo} was requested`,
+      );
+    }
     return project;
   }
 

@@ -604,6 +604,47 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"issueNumber":123');
   });
 
+  test("rejects explicit project when qualified issue repo does not match", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      ["work", "--issue", "acme/other#123", "--project", "project_1"],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_explicit_mismatch_issue",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(workerRequestCount).toBe(0);
+  });
+
   test("fails planner creation when qualified issue repo has no matching project", async () => {
     let plannerRequestCount = 0;
     const exitCode = await runCli(["plan", "acme/other#123"], {
@@ -637,6 +678,47 @@ describe("runCli", () => {
         );
       },
     });
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
+  });
+
+  test("rejects explicit project when qualified planner issue repo does not match", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(
+      ["plan", "acme/other#123", "--project", "project_1"],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_plan_projects_explicit_mismatch",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          plannerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
+        },
+      },
+    );
 
     expect(exitCode).toBe(1);
     expect(plannerRequestCount).toBe(0);
