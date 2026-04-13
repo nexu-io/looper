@@ -645,6 +645,80 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("discovery does not requeue paused pull-request worker loops", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      id: "loop_worker_paused_pr",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "paused",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        executionMode: "push-existing",
+        prUrl: "https://example.test/acme/looper/pull/77",
+      }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (): Promise<
+      Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
+    > => {
+      return [
+        {
+          number: 77,
+          title: "Existing PR",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: ["looper:spec-ready"],
+          headRefName: "feature/existing-pr",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: ["octocat"],
+        },
+      ];
+    };
+
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git: new FakeGitGateway(fixture.worktreeRoot),
+      github,
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Implemented existing PR", ["abc123"]),
+      ]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_worker_paused_pr")?.status).toBe(
+      "paused",
+    );
+
+    fixture.store.close();
+  });
+
   test("keeps spec-ready label when pull_request mode has no resolved spec path", async () => {
     const fixture = await createFixture();
     configurePullRequestWorkerLoop(fixture, 78);

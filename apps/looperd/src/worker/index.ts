@@ -934,10 +934,15 @@ export class WorkerLoopRunner {
       );
     const nowIso = this.nowIso();
     if (existing) {
+      const shouldPreservePausedState = existing.status === "paused";
       const updated = {
         ...existing,
-        status: existing.status === "running" ? existing.status : "queued",
-        nextRunAt: nowIso,
+        status: shouldPreservePausedState
+          ? existing.status
+          : existing.status === "running"
+            ? existing.status
+            : "queued",
+        nextRunAt: shouldPreservePausedState ? existing.nextRunAt : nowIso,
         updatedAt: nowIso,
       };
       this.options.store.loops.upsert(updated);
