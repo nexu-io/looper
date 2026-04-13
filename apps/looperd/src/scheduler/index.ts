@@ -125,6 +125,10 @@ export class SchedulerQueue {
       return null;
     }
 
+    if (item.status === "cancelled") {
+      return item;
+    }
+
     const nowIso = this.now().toISOString();
     const nextAttempts = item.attempts + 1;
 

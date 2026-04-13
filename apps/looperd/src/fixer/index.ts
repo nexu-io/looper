@@ -605,7 +605,12 @@ export class FixerLoopRunner {
         });
       } else {
         this.updateLoop(loop, {
-          status: failure.kind === "manual_intervention" ? "paused" : "failed",
+          status:
+            failedQueueItem?.status === "cancelled"
+              ? "paused"
+              : failure.kind === "manual_intervention"
+                ? "paused"
+                : "failed",
           lastRunAt: this.nowIso(),
           nextRunAt: null,
         });

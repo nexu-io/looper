@@ -159,6 +159,83 @@ describe("SchedulerQueue", () => {
       await rm(rootDir, { recursive: true, force: true });
     }
   });
+
+  test("does not retry queue items that were already cancelled", async () => {
+    const { rootDir, store } = await createStore();
+
+    try {
+      const queue = new SchedulerQueue({
+        store,
+        retryMaxAttempts: 3,
+        retryBaseDelayMs: 5_000,
+        now: () => new Date("2026-04-11T13:00:00.000Z"),
+      });
+
+      store.projects.upsert({
+        id: "project_1",
+        name: "Looper",
+        repoPath: "/tmp/looper",
+        baseBranch: "main",
+        archived: false,
+        metadataJson: null,
+        createdAt: "2026-04-11T13:00:00.000Z",
+        updatedAt: "2026-04-11T13:00:00.000Z",
+      });
+      store.loops.upsert({
+        id: "loop_1",
+        seq: 1,
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: null,
+        prNumber: null,
+        status: "paused",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: null,
+        createdAt: "2026-04-11T13:00:00.000Z",
+        updatedAt: "2026-04-11T13:00:00.000Z",
+      });
+
+      const item = queue.enqueue({
+        loopId: "loop_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        dedupeKey: "worker:loop_1",
+      });
+
+      store.queue.markRetry({
+        id: item.id,
+        availableAt: "2026-04-11T13:00:05.000Z",
+        attempts: 1,
+        errorMessage: "stopping",
+        errorKind: "retryable_transient",
+        updatedAt: "2026-04-11T13:00:00.000Z",
+      });
+      store.queue.cancelByLoop(
+        "loop_1",
+        "2026-04-11T13:00:01.000Z",
+        "loop paused",
+      );
+
+      const failed = queue.fail(
+        item.id,
+        "retryable_transient",
+        "agent exited after stop",
+      );
+
+      expect(failed?.status).toBe("cancelled");
+      expect(failed?.attempts).toBe(1);
+      expect(failed?.availableAt).toBe("2026-04-11T13:00:05.000Z");
+      expect(failed?.lastError).toBe("loop paused");
+    } finally {
+      store.close();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("scheduler backoff helpers", () => {

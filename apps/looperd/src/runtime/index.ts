@@ -448,7 +448,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
       nextRunAt: null,
       updatedAt: nowIso,
     });
-    this.store.queue.cancelByLoop(loop.id, nowIso, input.reason);
+    const cancelledQueueItems = this.store.queue.cancelByLoop(
+      loop.id,
+      nowIso,
+      input.reason,
+    );
 
     const activeExecution = this.store.agentExecutions
       .listActive()
@@ -503,6 +507,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
       });
     }
 
+    const stopped =
+      stopRequested ||
+      cancelledQueueItems > 0 ||
+      Boolean(activeRun && (!activeExecution?.pid || executionTerminated));
+
     this.appendEvent({
       id: randomUUID(),
       eventType: "loop.stopped",
@@ -519,13 +528,13 @@ class BasicLooperdRuntime implements LooperdRuntime {
         executionId: activeExecution?.id,
         vendor: activeExecution?.vendor,
         pid: activeExecution?.pid ?? null,
-        stopped: stopRequested,
+        stopped,
       }),
       createdAt: nowIso,
     });
 
     return {
-      stopped: stopRequested,
+      stopped,
       loopId: loop.id,
       runId: activeRun?.id,
       executionId: activeExecution?.id,

@@ -373,9 +373,11 @@ export class WorkerLoopRunner {
         status:
           failedQueueItem?.status === "queued"
             ? "queued"
-            : failure.kind === "manual_intervention"
+            : failedQueueItem?.status === "cancelled"
               ? "paused"
-              : "failed",
+              : failure.kind === "manual_intervention"
+                ? "paused"
+                : "failed",
         lastRunAt: this.nowIso(),
         nextRunAt:
           failedQueueItem?.status === "queued"
