@@ -547,6 +547,7 @@ async function buildActiveRunRouteResponse(
 
   if (subresource === "stop") {
     assertMethod(request, ["POST"], pathname);
+    assertActiveRunExists(context, loop.id);
     if (!context.runtimeControl) {
       throw new ApiError(
         "RUNTIME_CONTROL_UNAVAILABLE",
@@ -565,6 +566,13 @@ async function buildActiveRunRouteResponse(
 }
 
 function buildActiveRunDetailResponse(
+  context: LooperdApiContext,
+  loopId: string,
+): ActiveRunView {
+  return assertActiveRunExists(context, loopId);
+}
+
+function assertActiveRunExists(
   context: LooperdApiContext,
   loopId: string,
 ): ActiveRunView {
@@ -1707,8 +1715,8 @@ function parseOutputJson(outputJson?: string | null): {
 } {
   const parsed = asObject(parsePayloadJson(outputJson ?? "null"));
   return {
-    stdout: readString(parsed.stdout) ?? "",
-    stderr: readString(parsed.stderr) ?? "",
+    stdout: typeof parsed.stdout === "string" ? parsed.stdout : "",
+    stderr: typeof parsed.stderr === "string" ? parsed.stderr : "",
   };
 }
 

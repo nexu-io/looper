@@ -1133,8 +1133,8 @@ describe("createLooperdApi", () => {
     expect(logsWithAgentBody.data.seq).toBe(1);
     expect(logsWithAgentBody.data.loopId).toBe("loop_1");
     expect(logsWithAgentBody.data.agent).toMatchObject({
-      stdout: "out1\nout2",
-      stderr: "err1",
+      stdout: "out1\nout2\n",
+      stderr: "err1\n",
     });
 
     const logsWithoutAgentResponse = await api.handle(
@@ -1235,6 +1235,57 @@ describe("createLooperdApi", () => {
         reason: "Stopped by user via selector 1",
       },
     ]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects stop for selectors without an active run", async () => {
+    const stopCalls: Array<{ loopId: string; reason: string }> = [];
+    const { api, store, rootDir } = await createFixture({
+      runtimeControl: {
+        stopLoop: async (input) => {
+          stopCalls.push(input);
+          return {
+            loopId: input.loopId,
+            stopped: true,
+          };
+        },
+      },
+    });
+
+    store.loops.upsert({
+      id: "loop_2",
+      seq: 2,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "paused",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:00.000Z",
+    });
+
+    const stopResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/2/stop", {
+        method: "POST",
+      }),
+    );
+    const stopBody = (await stopResponse.json()) as {
+      ok: boolean;
+      error: { code: string; message: string };
+    };
+
+    expect(stopResponse.status).toBe(404);
+    expect(stopBody.ok).toBe(false);
+    expect(stopBody.error.code).toBe("ACTIVE_RUN_NOT_FOUND");
+    expect(stopCalls).toEqual([]);
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

@@ -526,7 +526,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
     });
 
     return {
-      stopped: true,
+      stopped: killed,
       loopId: loop.id,
       runId: activeRun?.id,
       executionId: activeExecution?.id,
