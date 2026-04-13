@@ -1047,6 +1047,7 @@ async function buildLoopsCreateResponse(
     targetId: readOptionalString(body, "targetId") ?? undefined,
     repo: readOptionalString(body, "repo") ?? undefined,
     prNumber: readOptionalPositiveInteger(body, "prNumber") ?? undefined,
+    issueNumber: readOptionalPositiveInteger(body, "issueNumber") ?? undefined,
     status,
     now: new Date().toISOString(),
   });
@@ -1068,13 +1069,18 @@ function createLoopRecord(input: {
   metadataJson?: string | null;
 }) {
   const { context } = input;
+  const issueNumber =
+    input.issueNumber ??
+    (input.targetType === "issue"
+      ? parseIssueNumber(input.targetId)
+      : undefined);
   const target =
     input.targetType === "project"
       ? defineProjectLoopTarget(readRequiredValue(input.targetId, "targetId"))
       : input.targetType === "issue"
         ? defineIssueLoopTarget(
             readRequiredValue(input.repo, "repo"),
-            readRequiredNumber(input.issueNumber, "issueNumber"),
+            readRequiredNumber(issueNumber, "issueNumber"),
           )
         : definePullRequestLoopTarget(
             readRequiredValue(input.repo, "repo"),

@@ -475,6 +475,36 @@ describe("createLooperdApi", () => {
     expect(createPlannerBody.data.issueNumber).toBe(123);
     expect(createPlannerBody.data.status).toBe("running");
 
+    const createGenericPlannerResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "planner",
+          targetType: "issue",
+          targetId: "issue:acme/looper:124",
+          repo: "acme/looper",
+        }),
+      }),
+    );
+    const createGenericPlannerBody =
+      (await createGenericPlannerResponse.json()) as {
+        data: {
+          type: string;
+          targetType: string;
+          targetId: string;
+          repo: string;
+        };
+      };
+    expect(createGenericPlannerResponse.status).toBe(200);
+    expect(createGenericPlannerBody.data.type).toBe("planner");
+    expect(createGenericPlannerBody.data.targetType).toBe("issue");
+    expect(createGenericPlannerBody.data.targetId).toBe(
+      "issue:acme/looper:124",
+    );
+    expect(createGenericPlannerBody.data.repo).toBe("acme/looper");
+
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });

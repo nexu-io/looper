@@ -459,7 +459,7 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
-  test("discovers spec-review PRs by label and promotes clean reviews", async () => {
+  test("discovers spec-review PRs by label without promoting after comment review", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       labels: ["looper:spec-reviewing"],
@@ -491,6 +491,76 @@ describe("ReviewerLoopRunner", () => {
 
     const result = await runner.processClaimedItem(claimed);
     expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "COMMENT",
+      }),
+    ]);
+    expect(github.removedLabels).toEqual([]);
+    expect(github.addedLabels).toEqual([]);
+
+    fixture.store.close();
+  });
+
+  test("promotes spec-review PRs only after approving review", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    github.submitFailuresRemaining = 1;
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Spec looks ready to implement"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      allowAutoApprove: true,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+    expect(firstResult.status).toBe("failed");
+
+    const failedRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
+    if (!failedRun) {
+      throw new Error("Expected failed reviewer run");
+    }
+    const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
+    failedCheckpoint.pendingReview.event = "APPROVE";
+    fixture.store.runs.upsert({
+      ...failedRun,
+      checkpointJson: JSON.stringify(failedCheckpoint),
+    });
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls.at(-1)).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "APPROVE",
+    });
     expect(github.removedLabels).toEqual([
       {
         repo: "acme/looper",
@@ -592,6 +662,7 @@ describe("ReviewerLoopRunner", () => {
       reviewRequests: [],
       currentUserLogin: "someone-else",
     });
+    github.submitFailuresRemaining = 1;
     github.addLabelFailuresRemaining = 1;
     const agent = new FakeAgentExecutor([
       completedAgentResult("Spec looks ready to implement"),
@@ -603,6 +674,7 @@ describe("ReviewerLoopRunner", () => {
       agentExecutor: agent,
       logger: createCapturingLogger().logger,
       now: () => fixture.now,
+      allowAutoApprove: true,
     });
 
     await runner.discoverPullRequests({
@@ -617,10 +689,33 @@ describe("ReviewerLoopRunner", () => {
 
     expect(firstResult.status).toBe("failed");
     expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.removedLabels).toHaveLength(0);
+    expect(github.addedLabels).toHaveLength(0);
+
+    const failedRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
+    if (!failedRun) {
+      throw new Error("Expected failed reviewer run");
+    }
+    const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
+    failedCheckpoint.pendingReview.event = "APPROVE";
+    fixture.store.runs.upsert({
+      ...failedRun,
+      checkpointJson: JSON.stringify(failedCheckpoint),
+    });
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const promoteClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!promoteClaim) {
+      throw new Error("Expected promotion reviewer claim");
+    }
+    const promoteResult = await runner.processClaimedItem(promoteClaim);
+
+    expect(promoteResult.status).toBe("failed");
+    expect(promoteResult.failureKind).toBe("retryable_after_resume");
     expect(github.removedLabels).toHaveLength(1);
     expect(github.addedLabels).toHaveLength(0);
 
-    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    fixture.now.setTime(new Date("2026-04-11T12:00:15.000Z").getTime());
     const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
     if (!retryClaim) {
       throw new Error("Expected retry reviewer claim");

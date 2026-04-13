@@ -859,6 +859,7 @@ export class ReviewerLoopRunner {
       });
 
       const shouldPromoteSpecLabel =
+        reviewEvent === "APPROVE" &&
         (phase === "spec" || checkpointPhase === "spec") &&
         isSpecReviewClean(detail);
       if (shouldPromoteSpecLabel) {
