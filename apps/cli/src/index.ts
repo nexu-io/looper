@@ -958,7 +958,21 @@ function inferProjectFromCwd(
     .filter((project) => project.matchLength >= 0)
     .sort((left, right) => right.matchLength - left.matchLength);
 
-  return matches[0]?.project ?? null;
+  const bestMatch = matches[0];
+  if (!bestMatch) {
+    return null;
+  }
+
+  const equallySpecificMatches = matches.filter(
+    (match) => match.matchLength === bestMatch.matchLength,
+  );
+  if (equallySpecificMatches.length > 1) {
+    throw new Error(
+      "Multiple projects match the current working directory; pass --project <projectId>",
+    );
+  }
+
+  return bestMatch.project;
 }
 
 function pathMatchLength(candidatePath: string, rootPath: string): number {

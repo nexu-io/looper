@@ -1586,12 +1586,23 @@ function resolveWorkerProject(
   }
 
   if (input.repo && input.prNumber) {
-    const snapshot = context.store.pullRequestSnapshots.getLatest(
-      input.repo,
-      input.prNumber,
+    const snapshots = context.store.pullRequestSnapshots.list().filter(
+      (snapshot) =>
+        snapshot.repo === input.repo && snapshot.prNumber === input.prNumber,
     );
-    if (snapshot) {
-      const project = context.store.projects.getById(snapshot.projectId);
+    const projectIds = [
+      ...new Set(snapshots.map((snapshot) => snapshot.projectId)),
+    ];
+    if (projectIds.length > 1) {
+      throw new ApiError(
+        "PROJECT_AMBIGUOUS",
+        409,
+        `Multiple projects match pull request ${input.repo}#${input.prNumber}; pass projectId explicitly`,
+      );
+    }
+    const projectId = projectIds[0];
+    if (projectId) {
+      const project = context.store.projects.getById(projectId);
       if (project) {
         return project;
       }

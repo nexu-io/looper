@@ -162,6 +162,64 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"projectId":"project_inferred"');
   });
 
+  test("fails work create when cwd matches multiple projects equally", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      [
+        "work",
+        "--spec",
+        "spec.md",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/looper",
+        "--base-branch",
+        "main",
+      ],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_ambiguous_cwd",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/project-one",
+                      repo: "acme/looper",
+                      worktreeRoot: "/tmp/repos/looper",
+                    },
+                    {
+                      id: "project_2",
+                      repoPath: "/tmp/repos/project-two",
+                      repo: "acme/looper-alt",
+                      worktreeRoot: "/tmp/repos/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(workerRequestCount).toBe(0);
+  });
+
   test("fails work create when --repo has no matching project instead of falling back to cwd", async () => {
     let workerRequestCount = 0;
     const exitCode = await runCli(
@@ -716,6 +774,51 @@ describe("runCli", () => {
                     id: "project_1",
                     repoPath: "/tmp/repos/looper",
                     repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        plannerRequestCount += 1;
+        return new Response(
+          JSON.stringify({ ok: true, requestId: "unexpected" }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
+  });
+
+  test("fails planner creation when cwd matches multiple projects equally", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(["plan", "123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      stderr: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_ambiguous_cwd",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/project-one",
+                    repo: "acme/looper",
+                    worktreeRoot: "/tmp/repos/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/project-two",
+                    repo: "acme/looper-alt",
+                    worktreeRoot: "/tmp/repos/looper",
                   },
                 ],
               },

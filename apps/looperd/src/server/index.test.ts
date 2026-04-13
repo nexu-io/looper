@@ -507,6 +507,41 @@ describe("createLooperdApi", () => {
       status: "queued",
     });
 
+    store.pullRequestSnapshots.upsert({
+      id: "snapshot_2",
+      projectId: "project_2",
+      repo: "acme/looper",
+      prNumber: 42,
+      headSha: "def456",
+      baseSha: "base123",
+      title: "Runtime foundation",
+      body: "Adds recovery and API",
+      author: "octocat",
+      diffRef: null,
+      checksSummary: "green",
+      unresolvedThreadCount: 1,
+      reviewState: "changes_requested",
+      payloadJson: JSON.stringify({ title: "Runtime foundation" }),
+      capturedAt: "2026-04-11T12:05:00.000Z",
+      createdAt: "2026-04-11T12:05:00.000Z",
+    });
+
+    const ambiguousPrWorkerResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const ambiguousPrWorkerBody = (await ambiguousPrWorkerResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(ambiguousPrWorkerResponse.status).toBe(409);
+    expect(ambiguousPrWorkerBody.error.code).toBe("PROJECT_AMBIGUOUS");
+
     store.loops.upsert({
       id: "loop_planner_issue_125",
       projectId: "project_1",
