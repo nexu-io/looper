@@ -2,7 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { cac } from "cac";
 
 import {
@@ -43,6 +43,7 @@ interface CliContext {
   readFileImpl: (path: string, encoding: "utf8") => Promise<string>;
   showHelp: (commandName?: string) => void;
   env: Record<string, string | undefined>;
+  cwd: string;
   isStdoutTty: boolean;
   launchShell: (cwd: string) => Promise<number>;
 }
@@ -196,6 +197,7 @@ export async function runCli(
       readFileImpl: deps.readFileImpl ?? readFile,
       showHelp: () => {},
       env,
+      cwd,
       isStdoutTty: deps.isStdoutTty ?? Boolean(process.stdout.isTTY),
       launchShell: async (shellCwd) =>
         (deps.launchShellImpl ?? launchInteractiveShell)({
@@ -841,7 +843,7 @@ async function runWorkCreate(context: CliContext) {
   const data = await context.client.post<Record<string, unknown>>(
     "/api/v1/workers",
     {
-      projectId: requireFlag(context.args, "project"),
+      projectId: await resolveCommandProjectId(context),
       ...(issueNumber == null
         ? { title: requireFlag(context.args, "title") }
         : hasFlag(context.args, "title")
@@ -879,7 +881,7 @@ async function runPlannerCreate(context: CliContext) {
   const data = await context.client.post<Record<string, unknown>>(
     "/api/v1/planners",
     {
-      projectId: requireFlag(context.args, "project"),
+      projectId: await resolveCommandProjectId(context),
       issueNumber,
     },
   );
@@ -1284,6 +1286,40 @@ function requireFlag(args: ParsedArgs, name: string): string {
     throw new Error(`--${name} is required`);
   }
   return value;
+}
+
+async function resolveCommandProjectId(context: CliContext): Promise<string> {
+  const explicitProjectId = getFlag(context.args, "project");
+  if (explicitProjectId && explicitProjectId !== "true") {
+    return explicitProjectId;
+  }
+
+  const cwd = resolve(context.cwd);
+  const data = await context.client.get<{
+    items: Array<{ id: string; repoPath: string }>;
+  }>("/api/v1/projects");
+  const matches = data.items.filter((project) =>
+    isWithinProjectRepo(cwd, project.repoPath),
+  );
+
+  if (matches.length === 0) {
+    throw new Error(`--project is required (no project matched cwd ${cwd})`);
+  }
+
+  matches.sort((left, right) => right.repoPath.length - left.repoPath.length);
+  const match = matches[0];
+  if (!match) {
+    throw new Error(`--project is required (no project matched cwd ${cwd})`);
+  }
+
+  return match.id;
+}
+
+function isWithinProjectRepo(cwd: string, repoPath: string): boolean {
+  const normalizedRepoPath = resolve(repoPath);
+  return (
+    cwd === normalizedRepoPath || cwd.startsWith(`${normalizedRepoPath}${sep}`)
+  );
 }
 
 function parsePullRequestRef(value: string): PullRequestRef {

@@ -129,6 +129,82 @@ describe("runCli", () => {
     expect(requests[0]?.body).not.toContain('"title":');
   });
 
+  test("detects worker project from cwd when --project is omitted", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(
+      ["work", "--issue", "123", "--repo", "acme/looper"],
+      {
+        cwd: "/tmp/repos/looper/packages/cli",
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          requests.push({
+            url,
+            body: init?.body as string | null,
+          });
+
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_1",
+                data: {
+                  items: [
+                    { id: "project_other", repoPath: "/tmp/repos/other" },
+                    { id: "project_1", repoPath: "/tmp/repos/looper" },
+                  ],
+                },
+              }),
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_work_cwd_1",
+              data: {
+                id: "loop_2",
+                title: "Implement acme/looper#123",
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.url).toContain("/api/v1/workers");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+  });
+
+  test("errors when worker cwd does not match a project and --project is omitted", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(["work", "--issue", "123"], {
+      cwd: "/tmp/repos/missing",
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_projects_2",
+            data: {
+              items: [{ id: "project_1", repoPath: "/tmp/repos/looper" }],
+            },
+          }),
+        ),
+    });
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "--project is required (no project matched cwd /tmp/repos/missing)",
+    );
+  });
+
   test("rejects invalid worker issue number", async () => {
     const errors: string[] = [];
     const exitCode = await runCli(
@@ -256,6 +332,52 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(requests[0]?.url).toContain("/api/v1/planners");
     expect(requests[0]?.body).toContain('"issueNumber":123');
+  });
+
+  test("detects planner project from cwd when --project is omitted", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["plan", "--issue", "123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_3",
+              data: {
+                items: [{ id: "project_1", repoPath: "/tmp/repos/looper" }],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_plan_cwd_1",
+            data: {
+              id: "loop_plan_1",
+              issueNumber: 123,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.url).toContain("/api/v1/planners");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
   });
 
   test("adds project and requests discovery", async () => {
