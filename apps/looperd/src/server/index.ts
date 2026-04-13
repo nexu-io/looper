@@ -538,16 +538,19 @@ async function buildActiveRunRouteResponse(
     throw new ApiError("VALIDATION_FAILED", 400, "run selector is required");
   }
 
+  const activeRunBySelector = resolveActiveRunBySelector(context, selector);
   const loop = resolveLoop(context, selector);
 
   if (!subresource) {
     assertMethod(request, ["GET"], pathname);
-    return buildActiveRunDetailResponse(context, loop.id);
+    return (
+      activeRunBySelector ?? buildActiveRunDetailResponse(context, loop.id)
+    );
   }
 
   if (subresource === "stop") {
     assertMethod(request, ["POST"], pathname);
-    assertActiveRunExists(context, loop.id);
+    activeRunBySelector ?? assertActiveRunExists(context, loop.id);
     if (!context.runtimeControl) {
       throw new ApiError(
         "RUNTIME_CONTROL_UNAVAILABLE",
@@ -588,6 +591,28 @@ function assertActiveRunExists(
   }
 
   return item;
+}
+
+function resolveActiveRunBySelector(
+  context: LooperdApiContext,
+  selector: string,
+): ActiveRunView | null {
+  const normalized = selector.trim();
+  const run = context.store.runs.getById(normalized);
+  if (!run) {
+    return null;
+  }
+
+  const activeRun = assertActiveRunExists(context, run.loopId);
+  if (activeRun.runId !== run.id) {
+    throw new ApiError(
+      "ACTIVE_RUN_NOT_FOUND",
+      404,
+      `Active run not found: ${selector}`,
+    );
+  }
+
+  return activeRun;
 }
 
 async function buildWorkersCreateResponse(

@@ -1334,4 +1334,80 @@ describe("createLooperdApi", () => {
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });
+
+  test("rejects stale runId selectors when a newer run is active", async () => {
+    const stopCalls: Array<{ loopId: string; reason: string }> = [];
+    const { api, store, rootDir } = await createFixture({
+      runtimeControl: {
+        stopLoop: async (input) => {
+          stopCalls.push(input);
+          return {
+            loopId: input.loopId,
+            stopped: true,
+          };
+        },
+      },
+    });
+
+    store.runs.upsert({
+      id: "run_1",
+      loopId: "loop_1",
+      status: "completed",
+      currentStep: "review",
+      lastCompletedStep: "review",
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:00:20.000Z",
+      endedAt: "2026-04-11T12:00:20.000Z",
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:20.000Z",
+    });
+    store.runs.upsert({
+      id: "run_2",
+      loopId: "loop_1",
+      status: "running",
+      currentStep: "ship",
+      lastCompletedStep: "review",
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:30.000Z",
+      lastHeartbeatAt: "2026-04-11T12:00:40.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:00:30.000Z",
+      updatedAt: "2026-04-11T12:00:40.000Z",
+    });
+
+    const detailResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/run_1"),
+    );
+    const detailBody = (await detailResponse.json()) as {
+      ok: boolean;
+      error: { code: string; message: string };
+    };
+
+    expect(detailResponse.status).toBe(404);
+    expect(detailBody.ok).toBe(false);
+    expect(detailBody.error.code).toBe("ACTIVE_RUN_NOT_FOUND");
+
+    const stopResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/run_1/stop", {
+        method: "POST",
+      }),
+    );
+    const stopBody = (await stopResponse.json()) as {
+      ok: boolean;
+      error: { code: string; message: string };
+    };
+
+    expect(stopResponse.status).toBe(404);
+    expect(stopBody.ok).toBe(false);
+    expect(stopBody.error.code).toBe("ACTIVE_RUN_NOT_FOUND");
+    expect(stopCalls).toEqual([]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
 });
