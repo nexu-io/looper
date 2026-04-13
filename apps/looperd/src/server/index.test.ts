@@ -714,6 +714,38 @@ describe("createLooperdApi", () => {
       updatedAt: "2026-04-11T12:02:30.000Z",
     });
 
+    store.loops.upsert({
+      id: "loop_planner_1",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:02:45.000Z",
+      nextRunAt: "2026-04-11T12:02:45.000Z",
+      createdAt: "2026-04-11T12:02:45.000Z",
+      updatedAt: "2026-04-11T12:02:45.000Z",
+    });
+    store.runs.upsert({
+      id: "run_planner_1",
+      loopId: "loop_planner_1",
+      status: "running",
+      currentStep: "plan",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:02:45.000Z",
+      lastHeartbeatAt: "2026-04-11T12:02:50.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:02:45.000Z",
+      updatedAt: "2026-04-11T12:02:50.000Z",
+    });
+
     // fallback label should use project id when project metadata is unavailable
     store.loops.upsert({
       id: "loop_worker_fallback",
@@ -852,7 +884,12 @@ describe("createLooperdApi", () => {
           runId: string;
           type: string;
           currentStep: string | null;
-          target: { type: string; label: string; projectId?: string };
+          target: {
+            type: string;
+            label: string;
+            projectId?: string;
+            issueNumber?: number;
+          };
           agent: {
             executionId: string;
             activeCount: number;
@@ -867,6 +904,7 @@ describe("createLooperdApi", () => {
       "run_worker_1",
       "run_fixer_1",
       "run_1",
+      "run_planner_1",
       "run_worker_fallback",
     ]);
 
@@ -914,6 +952,20 @@ describe("createLooperdApi", () => {
       },
     });
 
+    const planner = body.data.items.find(
+      (item) => item.runId === "run_planner_1",
+    );
+    expect(planner).toMatchObject({
+      type: "planner",
+      currentStep: "plan",
+      target: {
+        type: "issue",
+        issueNumber: 77,
+        label: "acme/looper#77",
+      },
+      agent: null,
+    });
+
     const fallbackTaskTarget = body.data.items.find(
       (item) => item.runId === "run_worker_fallback",
     );
@@ -940,7 +992,7 @@ describe("createLooperdApi", () => {
     const projectFilteredBody = (await projectFiltered.json()) as {
       data: { items: Array<{ runId: string }> };
     };
-    expect(projectFilteredBody.data.items).toHaveLength(4);
+    expect(projectFilteredBody.data.items).toHaveLength(5);
 
     const prFiltered = await api.handle(
       new Request(

@@ -722,6 +722,12 @@ interface ActiveRunView {
         label: string;
       }
     | {
+        type: "issue";
+        repo: string;
+        issueNumber: number;
+        label: string;
+      }
+    | {
         type: "pull_request";
         repo: string;
         prNumber: number;
@@ -838,6 +844,20 @@ function tryBuildActiveRunTarget(
       type: "project",
       projectId,
       label: project?.name?.trim() || projectId,
+    };
+  }
+
+  if (loop.targetType === "issue") {
+    const issueNumber = parseIssueNumber(loop.targetId);
+    if (!loop.repo || !issueNumber) {
+      return null;
+    }
+
+    return {
+      type: "issue",
+      repo: loop.repo,
+      issueNumber,
+      label: `${loop.repo}#${issueNumber}`,
     };
   }
 

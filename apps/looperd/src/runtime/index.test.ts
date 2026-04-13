@@ -1197,4 +1197,82 @@ describe("createLooperdRuntime", () => {
     verifyStore.close();
     await runtime.stop("test");
   });
+
+  test("clears cached repo metadata when configured repoPath changes", async () => {
+    const fixture = await createFixture();
+    const oldRepoPath = join(fixture.rootDir, "old-repo");
+    const newRepoPath = join(fixture.rootDir, "new-repo");
+    await Promise.all([
+      mkdir(oldRepoPath, { recursive: true }),
+      mkdir(newRepoPath, { recursive: true }),
+    ]);
+
+    fixture.config.projects = [
+      {
+        id: "project_1",
+        name: "Looper",
+        repoPath: newRepoPath,
+        baseBranch: "main",
+      },
+    ];
+
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: oldRepoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({
+        repo: "stale/looper",
+        worktreeRoot: "/tmp/worktrees",
+      }),
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    seedStore.close();
+
+    const git = new FakeGitGateway();
+    const detectedPaths: string[] = [];
+    git.detectGitHubRepo = async (repoPath: string) => {
+      detectedPaths.push(repoPath);
+      return "fresh/looper";
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git,
+      agentExecutor: new FakeAgentExecutor([]),
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+
+    const verifyStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+    });
+    verifyStore.initialize();
+
+    const project = verifyStore.projects.getById("project_1");
+    expect(detectedPaths).toContain(newRepoPath);
+    expect(project?.repoPath).toBe(newRepoPath);
+    expect(project?.metadataJson).toBe(
+      JSON.stringify({
+        repo: "fresh/looper",
+        worktreeRoot: null,
+        source: "config",
+      }),
+    );
+
+    verifyStore.close();
+    await runtime.stop("test");
+  });
 });

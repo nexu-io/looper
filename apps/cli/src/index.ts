@@ -84,6 +84,12 @@ interface ActiveRunItem {
         label: string;
       }
     | {
+        type: "issue";
+        repo: string;
+        issueNumber: number;
+        label: string;
+      }
+    | {
         type: "pull_request";
         repo: string;
         prNumber: number;

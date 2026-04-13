@@ -435,6 +435,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
     for (const project of this.options.config.projects) {
       const existing = this.store.projects.getById(project.id);
       const metadata = parseProjectMetadata(existing?.metadataJson);
+      const repoPathChanged =
+        existing !== null && existing.repoPath !== project.repoPath;
       this.store.projects.upsert({
         id: project.id,
         name: project.name,
@@ -444,6 +446,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
         archived: false,
         metadataJson: JSON.stringify({
           ...metadata,
+          repo: repoPathChanged ? null : readMetadataString(metadata.repo),
           worktreeRoot: project.worktreeRoot ?? null,
           source: "config",
         }),

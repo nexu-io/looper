@@ -308,14 +308,15 @@ describe("runCli", () => {
                   runId: "run_1",
                   loopId: "loop_1",
                   projectId: "project_1",
-                  type: "worker",
+                  type: "planner",
                   status: "running",
-                  currentStep: "execute",
+                  currentStep: "plan",
                   startedAt: "2026-04-11T12:00:00.000Z",
                   target: {
-                    type: "project",
-                    projectId: "project_1",
-                    label: "project_1",
+                    type: "issue",
+                    repo: "acme/looper",
+                    issueNumber: 77,
+                    label: "acme/looper#77",
                   },
                   agent: {
                     active: true,
@@ -339,6 +340,8 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(requests[0]).toContain("/api/v1/runs/active");
     expect(lines.join("\n")).toContain('"runId": "run_1"');
+    expect(lines.join("\n")).toContain('"type": "issue"');
+    expect(lines.join("\n")).toContain('"issueNumber": 77');
     expect(lines.join("\n")).toContain('"activeCount": 1');
   });
 
