@@ -162,7 +162,7 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"projectId":"project_inferred"');
   });
 
-  test("fails work create when cwd matches multiple projects equally", async () => {
+  test("prefers a unique --repo match over an ambiguous cwd match", async () => {
     let workerRequestCount = 0;
     const exitCode = await runCli(
       [
@@ -210,14 +210,22 @@ describe("runCli", () => {
 
           workerRequestCount += 1;
           return new Response(
-            JSON.stringify({ ok: true, requestId: "unexpected" }),
+            JSON.stringify({
+              ok: true,
+              requestId: "req_worker_repo_match",
+              data: {
+                id: "loop_repo_match",
+                title: "Implement CLI flow",
+                status: "running",
+              },
+            }),
           );
         },
       },
     );
 
-    expect(exitCode).toBe(1);
-    expect(workerRequestCount).toBe(0);
+    expect(exitCode).toBe(0);
+    expect(workerRequestCount).toBe(1);
   });
 
   test("fails work create when --repo has no matching project instead of falling back to cwd", async () => {

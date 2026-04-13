@@ -1586,10 +1586,12 @@ function resolveWorkerProject(
   }
 
   if (input.repo && input.prNumber) {
-    const snapshots = context.store.pullRequestSnapshots.list().filter(
-      (snapshot) =>
-        snapshot.repo === input.repo && snapshot.prNumber === input.prNumber,
-    );
+    const snapshots = context.store.pullRequestSnapshots
+      .list()
+      .filter(
+        (snapshot) =>
+          snapshot.repo === input.repo && snapshot.prNumber === input.prNumber,
+      );
     const projectIds = [
       ...new Set(snapshots.map((snapshot) => snapshot.projectId)),
     ];
