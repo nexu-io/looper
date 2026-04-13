@@ -457,12 +457,12 @@ class BasicLooperdRuntime implements LooperdRuntime {
       .listByLoop(loop.id)
       .find((run) => run.status === "running");
 
-    let killed = false;
+    let stopRequested = false;
 
     if (activeExecution?.pid) {
       try {
         process.kill(activeExecution.pid, "SIGTERM");
-        killed = true;
+        stopRequested = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
           this.options.logger.warn("failed to stop active agent execution", {
@@ -474,27 +474,18 @@ class BasicLooperdRuntime implements LooperdRuntime {
         }
       }
 
-      if (killed) {
-        const pid = activeExecution.pid;
-        setTimeout(() => {
-          try {
-            process.kill(pid, "SIGKILL");
-          } catch {
-            // ignore process that already exited
-          }
-        }, 5_000);
-      }
-
       this.store.agentExecutions.upsert({
         ...activeExecution,
-        status: killed ? "killed" : activeExecution.status,
-        errorMessage: input.reason,
-        endedAt: killed ? nowIso : activeExecution.endedAt,
+        status: stopRequested ? "cancelling" : activeExecution.status,
+        errorMessage: stopRequested
+          ? input.reason
+          : activeExecution.errorMessage,
+        endedAt: activeExecution.endedAt,
         updatedAt: nowIso,
       });
     }
 
-    if (activeRun) {
+    if (activeRun && !activeExecution?.pid) {
       this.store.runs.upsert({
         ...activeRun,
         status: "cancelled",
@@ -520,13 +511,13 @@ class BasicLooperdRuntime implements LooperdRuntime {
         executionId: activeExecution?.id,
         vendor: activeExecution?.vendor,
         pid: activeExecution?.pid ?? null,
-        stopped: killed,
+        stopped: stopRequested,
       }),
       createdAt: nowIso,
     });
 
     return {
-      stopped: killed,
+      stopped: stopRequested,
       loopId: loop.id,
       runId: activeRun?.id,
       executionId: activeExecution?.id,
