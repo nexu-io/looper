@@ -93,7 +93,6 @@ describe("createMigrationRunner", () => {
     );
 
     const db = new Database(fixture.dbPath, { create: true });
-    const initialForeignKeys = db.query("PRAGMA foreign_keys;").get();
     const runner = createMigrationRunner(db, {
       migrationsDir: fixture.migrationsDir,
       now: () => new Date("2026-04-11T10:20:30.000Z"),
