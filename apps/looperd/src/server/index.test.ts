@@ -451,9 +451,53 @@ describe("createLooperdApi", () => {
     expect(createWorkerFromPrBody.data.repo).toBe("acme/looper");
     expect(createWorkerFromPrBody.data.prNumber).toBe(42);
     expect(
-      store.queue.findActiveByDedupe("worker:acme/looper:42"),
+      store.queue.findActiveByDedupe("worker:project_1:acme/looper:42"),
     ).toMatchObject({
       loopId: createWorkerFromPrBody.data.id,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      prNumber: 42,
+      status: "queued",
+    });
+
+    store.projects.upsert({
+      id: "project_2",
+      name: "Looper mirror",
+      repoPath: "/tmp/looper-mirror",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "acme/looper" }),
+      createdAt: "2026-04-11T12:04:00.000Z",
+      updatedAt: "2026-04-11T12:04:00.000Z",
+    });
+
+    const createWorkerFromSamePrSecondProjectResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_2",
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const createWorkerFromSamePrSecondProjectBody =
+      (await createWorkerFromSamePrSecondProjectResponse.json()) as {
+        data: {
+          id: string;
+          status: string;
+          repo: string;
+          prNumber: number;
+        };
+      };
+    expect(createWorkerFromSamePrSecondProjectResponse.status).toBe(200);
+    expect(
+      store.queue.findActiveByDedupe("worker:project_2:acme/looper:42"),
+    ).toMatchObject({
+      loopId: createWorkerFromSamePrSecondProjectBody.data.id,
+      projectId: "project_2",
       type: "worker",
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
@@ -507,7 +551,7 @@ describe("createLooperdApi", () => {
     expect(createWorkerFromIssueBody.data.prNumber).toBe(77);
     expect(createWorkerFromIssueBody.data.specPath).toBe("specs/issue-125.md");
     expect(
-      store.queue.findActiveByDedupe("worker:acme/looper:77"),
+      store.queue.findActiveByDedupe("worker:project_1:acme/looper:77"),
     ).toMatchObject({
       loopId: createWorkerFromIssueBody.data.id,
       type: "worker",

@@ -452,6 +452,7 @@ export class WorkerLoopRunner {
           repo: input.repo,
           prNumber: pullRequest.number,
           dedupeKey: buildWorkerPullRequestDedupeKey(
+            project.id,
             input.repo,
             pullRequest.number,
           ),
@@ -1415,10 +1416,11 @@ function buildPullRequestTargetId(repo: string, prNumber: number): string {
 }
 
 function buildWorkerPullRequestDedupeKey(
+  projectId: string,
   repo: string,
   prNumber: number,
 ): string {
-  return `worker:${repo}:${prNumber}`;
+  return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
 function buildPullRequestLockKey(repo: string, prNumber: number): string {

@@ -801,6 +801,7 @@ async function buildWorkCreateBody(context: CliContext) {
     const ref = parseOptionalRepoNumberRef(pr, "pull request");
     const project = await resolveProjectForWork(context, {
       repo: ref.repo ?? repo,
+      requireRepoMatch: Boolean(ref.repo),
     });
     const resolvedRepo = ref.repo ?? repo ?? project.repo;
     if (!resolvedRepo) {
@@ -821,6 +822,7 @@ async function buildWorkCreateBody(context: CliContext) {
     const ref = parseOptionalRepoNumberRef(issue, "issue");
     const project = await resolveProjectForWork(context, {
       repo: ref.repo ?? repo,
+      requireRepoMatch: Boolean(ref.repo),
     });
     const resolvedRepo = ref.repo ?? repo ?? project.repo;
     if (!resolvedRepo) {
@@ -851,7 +853,7 @@ async function buildWorkCreateBody(context: CliContext) {
 
 async function resolveProjectForWork(
   context: CliContext,
-  hint?: { repo?: string },
+  hint?: { repo?: string; requireRepoMatch?: boolean },
 ): Promise<ProjectSummary> {
   const projects = await listProjects(context);
   const explicitProjectId = getFlag(context.args, "project");
@@ -876,6 +878,11 @@ async function resolveProjectForWork(
     if (matches.length > 1) {
       throw new Error(
         `Multiple projects match repo ${hint.repo}; pass --project <projectId>`,
+      );
+    }
+    if (hint.requireRepoMatch) {
+      throw new Error(
+        `Project not found for repo ${hint.repo}; pass --project <projectId>`,
       );
     }
   }
@@ -959,6 +966,7 @@ async function runPlannerCreate(context: CliContext) {
   const issueRef = parseOptionalRepoNumberRef(issueText, "issue");
   const project = await resolveProjectForWork(context, {
     repo: issueRef.repo ?? repo,
+    requireRepoMatch: Boolean(issueRef.repo),
   });
 
   const data = await context.client.post<Record<string, unknown>>(

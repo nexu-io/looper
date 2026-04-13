@@ -628,7 +628,7 @@ async function buildWorkersCreateResponse(
     repo,
     ...(effectivePrNumber ? { prNumber: effectivePrNumber } : {}),
     dedupeKey: effectivePrNumber
-      ? buildWorkerPullRequestDedupeKey(repo, effectivePrNumber)
+      ? buildWorkerPullRequestDedupeKey(projectId, repo, effectivePrNumber)
       : `worker:${loop.id}`,
     lockKey: effectivePrNumber
       ? buildPullRequestLockKey(repo, effectivePrNumber)
@@ -1735,10 +1735,11 @@ function deriveWorkerTitle(input: {
 }
 
 function buildWorkerPullRequestDedupeKey(
+  projectId: string,
   repo: string,
   prNumber: number,
 ): string {
-  return `worker:${repo}:${prNumber}`;
+  return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
 function buildPullRequestLockKey(repo: string, prNumber: number): string {

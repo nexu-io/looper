@@ -604,6 +604,44 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"issueNumber":123');
   });
 
+  test("fails planner creation when qualified issue repo has no matching project", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(["plan", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      stderr: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_missing_qualified_repo",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        plannerRequestCount += 1;
+        return new Response(
+          JSON.stringify({ ok: true, requestId: "unexpected" }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
+  });
+
   test("adds project and requests discovery", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(["project", "add", "/tmp/repos/looper"], {
