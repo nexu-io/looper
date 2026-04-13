@@ -26,6 +26,8 @@ export interface Store {
   loops: {
     upsert(record: LoopRecord): void;
     getById(id: string): LoopRecord | null;
+    getBySeq(seq: number): LoopRecord | null;
+    allocateSeq(): number;
     list(): LoopRecord[];
   };
 
@@ -91,6 +93,7 @@ export interface Store {
     upsert(record: AgentExecutionRecord): void;
     getById(id: string): AgentExecutionRecord | null;
     list(): AgentExecutionRecord[];
+    listByRunId(runId: string): AgentExecutionRecord[];
     listActive(): AgentExecutionRecord[];
   };
 

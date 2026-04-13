@@ -395,7 +395,7 @@ describe("runCli", () => {
       expect(exitCode).toBe(0);
       expect(lines[0]).toContain("type");
       expect(lines[0]).toContain("target");
-      expect(lines[0]).toContain("run");
+      expect(lines[0]).toContain("#");
       expect(lines[0]).toContain("step");
       expect(lines[0]).toContain("agent");
       expect(lines[0]).toContain("pid");
@@ -403,7 +403,6 @@ describe("runCli", () => {
       expect(lines[0]).toContain("age");
       expect(lines[2]).toContain("worker");
       expect(lines[2]).toContain("project_1");
-      expect(lines[2]).toContain("run_worker_1");
       expect(lines[2]).toContain("execute");
       expect(lines[2]).toContain("opencode");
       expect(lines[2]).toContain("2222");
@@ -457,5 +456,211 @@ describe("runCli", () => {
     expect(requests[0]).toContain(
       "/api/v1/runs/active?type=reviewer&projectId=project_1",
     );
+  });
+
+  test("supports jump output modes", async () => {
+    const requests: string[] = [];
+    const fetchImpl = (async (input) => {
+      requests.push(String(input));
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          requestId: "req_jump",
+          data: {
+            seq: 12,
+            loopId: "loop_12",
+            projectId: "project_1",
+            worktree: {
+              id: "wt_12",
+              path: "/tmp/looper-worktrees/loop-12",
+              branch: "feature/loop-12",
+            },
+          },
+        }),
+      );
+    }) as typeof fetch;
+
+    const defaultLines: string[] = [];
+    const defaultExit = await runCli(["jump", "12"], {
+      stdout: (line) => defaultLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(defaultExit).toBe(0);
+    expect(defaultLines.at(-1)).toBe("cd -- '/tmp/looper-worktrees/loop-12'");
+
+    const pathLines: string[] = [];
+    const pathExit = await runCli(["jump", "12", "--print-path"], {
+      stdout: (line) => pathLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(pathExit).toBe(0);
+    expect(pathLines).toEqual(["/tmp/looper-worktrees/loop-12"]);
+
+    const jsonLines: string[] = [];
+    const jsonExit = await runCli(["jump", "12", "--json"], {
+      stdout: (line) => jsonLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(jsonExit).toBe(0);
+    expect(jsonLines.join("\n")).toContain('"seq": 12');
+    expect(jsonLines.join("\n")).toContain(
+      '"path": "/tmp/looper-worktrees/loop-12"',
+    );
+
+    const shellLines: string[] = [];
+    const shellExit = await runCli(
+      ["jump", "12", "--shell-integration", "bash"],
+      {
+        stdout: (line) => shellLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      },
+    );
+    expect(shellExit).toBe(0);
+    expect(shellLines).toEqual(['lj() { eval "$(looper jump "$@")"; }']);
+
+    expect(requests).toHaveLength(3);
+    expect(requests[0]).toContain("/api/v1/runs/active/12");
+  });
+
+  test("supports logs output modes and no-agent message", async () => {
+    const requests: string[] = [];
+    const fetchImpl = (async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/api/v1/loops/99/logs")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_logs_empty",
+            data: {
+              seq: 99,
+              loopId: "loop_99",
+              loopType: "worker",
+              loopStatus: "running",
+              run: null,
+              agent: null,
+            },
+          }),
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          requestId: "req_logs",
+          data: {
+            seq: 12,
+            loopId: "loop_12",
+            loopType: "worker",
+            loopStatus: "running",
+            run: {
+              runId: "run_12",
+              status: "running",
+              currentStep: "execute",
+            },
+            agent: {
+              executionId: "agent_12",
+              vendor: "opencode",
+              status: "running",
+              pid: 888,
+              stdout: "one\ntwo\nthree\n",
+              stderr: "err-one\nerr-two\n",
+            },
+          },
+        }),
+      );
+    }) as typeof fetch;
+
+    const defaultLines: string[] = [];
+    expect(
+      await runCli(["logs", "12"], {
+        stdout: (line) => defaultLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(defaultLines.join("\n")).toContain("Loop #12 · worker · running");
+    expect(defaultLines.join("\n")).toContain("three");
+
+    const stderrLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--stderr", "--tail", "1"], {
+        stdout: (line) => stderrLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(stderrLines.join("\n")).toContain("err-two");
+    expect(stderrLines.join("\n")).not.toContain("err-one");
+
+    const fullLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--full"], {
+        stdout: (line) => fullLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(fullLines.join("\n")).toContain("one");
+    expect(fullLines.join("\n")).toContain("three");
+
+    const jsonLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--json"], {
+        stdout: (line) => jsonLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(jsonLines.join("\n")).toContain('"seq": 12');
+    expect(jsonLines.join("\n")).toContain('"executionId": "agent_12"');
+
+    const noAgentLines: string[] = [];
+    expect(
+      await runCli(["logs", "99"], {
+        stdout: (line) => noAgentLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(noAgentLines.join("\n")).toContain(
+      "No agent output for the current step.",
+    );
+  });
+
+  test("stops active run using numeric selector", async () => {
+    const requests: Array<{ url: string; method?: string }> = [];
+    const lines: string[] = [];
+    const exitCode = await runCli(["stop", "12"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_stop",
+            data: {
+              loopId: "loop_12",
+              runId: "run_12",
+              executionId: "agent_12",
+              vendor: "opencode",
+              pid: 888,
+              stopped: true,
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]).toMatchObject({ method: "POST" });
+    expect(requests[0]?.url).toContain("/api/v1/runs/active/12/stop");
+    expect(lines.join("\n")).toContain("Loop stopped");
+    expect(lines.join("\n")).toContain("loop_12");
   });
 });

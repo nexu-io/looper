@@ -30,6 +30,73 @@ async function createStoreFixture() {
 }
 
 describe("SqliteStore", () => {
+  test("resolves loops by seq and allocates past seeded sequence values", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({
+      dbPath: fixture.dbPath,
+      backupDir: fixture.backupDir,
+    });
+
+    store.initialize({ autoMigrate: true });
+
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_3",
+      seq: 3,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_7",
+      seq: 7,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(store.loops.getBySeq(7)?.id).toBe("loop_7");
+
+    const db = new Database(fixture.dbPath);
+    db.query("DELETE FROM counters WHERE name = 'loop_seq'").run();
+    db.close();
+
+    expect(store.loops.allocateSeq()).toBe(8);
+    expect(store.loops.allocateSeq()).toBe(9);
+
+    store.close();
+  });
+
   test("initializes schema, writes records, and reports health", async () => {
     const fixture = await createStoreFixture();
     const store = new SqliteStore({
@@ -53,6 +120,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "reviewer",
       targetType: "pull_request",
@@ -293,7 +361,7 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0005_planner_issue_target");
+    expect(health.migration.latestAppliedId).toBe("0006_loop_seq_handles");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
@@ -462,7 +530,7 @@ describe("SqliteStore", () => {
     store.initialize({ autoMigrate: true });
 
     expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
-      "0005_planner_issue_target",
+      "0006_loop_seq_handles",
     );
     expect(store.loops.getById("loop_worker_1")).toMatchObject({
       targetType: "project",
@@ -512,6 +580,7 @@ describe("SqliteStore", () => {
       store.withTransaction((tx) => {
         tx.loops.upsert({
           id: "loop_rollback",
+          seq: 1,
           projectId: "project_1",
           type: "worker",
           targetType: "project",
@@ -598,6 +667,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_paused",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -691,6 +761,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",

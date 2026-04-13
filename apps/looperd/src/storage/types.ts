@@ -64,6 +64,7 @@ export interface ProjectRecord {
 
 export interface LoopRecord {
   id: string;
+  seq: number;
   projectId: string;
   type: string;
   targetType: string;

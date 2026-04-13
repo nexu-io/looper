@@ -319,6 +319,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
         logger: this.options.logger,
         store,
         projects,
+        runtimeControl: {
+          stopLoop: (input) => this.stopLoop(input),
+        },
         getStartedAt: () => this.startedAt,
         getRecoverySummary: () => ({ ...this.recoverySummary }),
       });
@@ -419,6 +422,117 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.store = undefined;
       this.resolveShutdown();
     }
+  }
+
+  private async stopLoop(input: { loopId: string; reason: string }): Promise<{
+    stopped: boolean;
+    loopId: string;
+    runId?: string;
+    executionId?: string;
+    vendor?: string;
+    pid?: number | null;
+  }> {
+    if (!this.store) {
+      throw new Error("Runtime is not started");
+    }
+
+    const loop = this.store.loops.getById(input.loopId);
+    if (!loop) {
+      throw new Error(`Loop not found: ${input.loopId}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    this.store.loops.upsert({
+      ...loop,
+      status: "paused",
+      nextRunAt: null,
+      updatedAt: nowIso,
+    });
+    this.store.queue.cancelByLoop(loop.id, nowIso, input.reason);
+
+    const activeExecution = this.store.agentExecutions
+      .listActive()
+      .find((execution) => execution.loopId === loop.id);
+    const activeRun = this.store.runs
+      .listByLoop(loop.id)
+      .find((run) => run.status === "running");
+
+    let killed = false;
+
+    if (activeExecution?.pid) {
+      try {
+        process.kill(activeExecution.pid, "SIGTERM");
+        killed = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+          this.options.logger.warn("failed to stop active agent execution", {
+            loopId: loop.id,
+            executionId: activeExecution.id,
+            pid: activeExecution.pid,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      if (killed) {
+        const pid = activeExecution.pid;
+        setTimeout(() => {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // ignore process that already exited
+          }
+        }, 5_000);
+      }
+
+      this.store.agentExecutions.upsert({
+        ...activeExecution,
+        status: killed ? "killed" : activeExecution.status,
+        errorMessage: input.reason,
+        endedAt: killed ? nowIso : activeExecution.endedAt,
+        updatedAt: nowIso,
+      });
+    }
+
+    if (activeRun) {
+      this.store.runs.upsert({
+        ...activeRun,
+        status: "cancelled",
+        errorMessage: input.reason,
+        endedAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+
+    this.appendEvent({
+      id: randomUUID(),
+      eventType: "loop.stopped",
+      projectId: loop.projectId,
+      loopId: loop.id,
+      runId: activeRun?.id ?? null,
+      entityType: "loop",
+      entityId: loop.id,
+      actorType: "user",
+      actorId: "cli",
+      actorDisplayName: "cli",
+      payloadJson: JSON.stringify({
+        reason: input.reason,
+        executionId: activeExecution?.id,
+        vendor: activeExecution?.vendor,
+        pid: activeExecution?.pid ?? null,
+        stopped: killed,
+      }),
+      createdAt: nowIso,
+    });
+
+    return {
+      stopped: true,
+      loopId: loop.id,
+      runId: activeRun?.id,
+      executionId: activeExecution?.id,
+      vendor: activeExecution?.vendor,
+      pid: activeExecution?.pid ?? null,
+    };
   }
 
   public async waitForShutdown(): Promise<void> {

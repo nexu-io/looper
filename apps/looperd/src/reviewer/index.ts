@@ -1128,6 +1128,7 @@ export class ReviewerLoopRunner {
 
     const loop: LoopRecord = {
       id: randomUUID(),
+      seq: this.options.store.loops.allocateSeq(),
       projectId: input.projectId,
       type: "reviewer",
       targetType: "pull_request",

@@ -1074,6 +1074,7 @@ export class PlannerLoopRunner {
 
     const loop: LoopRecord = {
       id: randomUUID(),
+      seq: this.options.store.loops.allocateSeq(),
       projectId: input.project.id,
       type: "planner",
       targetType: "issue",

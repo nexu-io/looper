@@ -8,7 +8,11 @@ import { createDefaultLooperConfig } from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
-async function createFixture() {
+async function createFixture(options?: {
+  runtimeControl?: {
+    stopLoop(input: { loopId: string; reason: string }): Promise<unknown>;
+  };
+}) {
   const rootDir = await mkdtemp(join(tmpdir(), "looperd-api-"));
   const config = createDefaultLooperConfig(rootDir);
   config.storage.dbPath = `${rootDir}/state/looper.sqlite`;
@@ -38,6 +42,7 @@ async function createFixture() {
   });
   store.loops.upsert({
     id: "loop_1",
+    seq: 1,
     projectId: "project_1",
     type: "reviewer",
     targetType: "pull_request",
@@ -139,6 +144,21 @@ async function createFixture() {
     store,
     getStartedAt: () => new Date(now),
     getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    runtimeControl: options?.runtimeControl as
+      | {
+          stopLoop(input: {
+            loopId: string;
+            reason: string;
+          }): Promise<{
+            stopped: boolean;
+            loopId: string;
+            runId?: string;
+            executionId?: string;
+            vendor?: string;
+            pid?: number | null;
+          }>;
+        }
+      | undefined,
   });
 
   return { api, store, rootDir };
@@ -169,9 +189,7 @@ describe("createLooperdApi", () => {
 
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
-    expect(statusBody.data.storage.schemaVersion).toBe(
-      "0005_planner_issue_target",
-    );
+    expect(statusBody.data.storage.schemaVersion).toBe("0006_loop_seq_handles");
     expect(statusBody.data.scheduler.queuedItems).toBe(1);
     expect(statusBody.data.scheduler.totalRuns).toBe(1);
     expect(statusBody.data.loops.planner.running).toBe(0);
@@ -198,6 +216,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_2",
+      seq: 2,
       projectId: "project_1",
       type: "fixer",
       targetType: "pull_request",
@@ -281,6 +300,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_no_snapshot",
+      seq: 3,
       projectId: "project_1",
       type: "reviewer",
       targetType: "pull_request",
@@ -573,6 +593,7 @@ describe("createLooperdApi", () => {
     const { api, store, rootDir } = await createFixture();
     store.loops.upsert({
       id: "loop_fixer_no_agent",
+      seq: 4,
       projectId: "project_1",
       type: "fixer",
       targetType: "pull_request",
@@ -682,6 +703,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_worker_1",
+      seq: 5,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -714,6 +736,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_fixer_1",
+      seq: 6,
       projectId: "project_1",
       type: "fixer",
       targetType: "pull_request",
@@ -746,6 +769,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_planner_1",
+      seq: 7,
       projectId: "project_1",
       type: "planner",
       targetType: "issue",
@@ -779,6 +803,7 @@ describe("createLooperdApi", () => {
     // fallback label should use project id when project metadata is unavailable
     store.loops.upsert({
       id: "loop_worker_fallback",
+      seq: 8,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -1034,6 +1059,181 @@ describe("createLooperdApi", () => {
     };
     expect(prFilteredBody.data.items.map((item) => item.runId)).toEqual([
       "run_fixer_1",
+    ]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("resolves loop routes by seq and returns logs envelopes", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    store.agentExecutions.upsert({
+      id: "agent_exec_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      runId: "run_1",
+      vendor: "opencode",
+      status: "running",
+      pid: 777,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 2,
+      lastHeartbeatAt: "2026-04-11T12:00:10.000Z",
+      outputJson: JSON.stringify({ stdout: "out1\nout2\n", stderr: "err1\n" }),
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:05.000Z",
+      endedAt: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:00:05.000Z",
+      updatedAt: "2026-04-11T12:00:10.000Z",
+    });
+
+    store.loops.upsert({
+      id: "loop_2",
+      seq: 2,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "paused",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:00.000Z",
+    });
+
+    const bySeqResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops/1"),
+    );
+    const bySeqBody = (await bySeqResponse.json()) as {
+      data: { id: string; seq: number };
+    };
+    expect(bySeqResponse.status).toBe(200);
+    expect(bySeqBody.data.id).toBe("loop_1");
+    expect(bySeqBody.data.seq).toBe(1);
+
+    const logsWithAgentResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops/1/logs"),
+    );
+    const logsWithAgentBody = (await logsWithAgentResponse.json()) as {
+      data: {
+        seq: number;
+        loopId: string;
+        agent: { stdout: string; stderr: string } | null;
+      };
+    };
+    expect(logsWithAgentBody.data.seq).toBe(1);
+    expect(logsWithAgentBody.data.loopId).toBe("loop_1");
+    expect(logsWithAgentBody.data.agent).toMatchObject({
+      stdout: "out1\nout2",
+      stderr: "err1",
+    });
+
+    const logsWithoutAgentResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops/2/logs"),
+    );
+    const logsWithoutAgentBody = (await logsWithoutAgentResponse.json()) as {
+      data: {
+        seq: number;
+        run: Record<string, unknown> | null;
+        agent: unknown;
+      };
+    };
+    expect(logsWithoutAgentBody.data.seq).toBe(2);
+    expect(logsWithoutAgentBody.data.run).toBeNull();
+    expect(logsWithoutAgentBody.data.agent).toBeNull();
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("returns active run detail by seq with worktree and supports stop by seq", async () => {
+    const stopCalls: Array<{ loopId: string; reason: string }> = [];
+    const { api, store, rootDir } = await createFixture({
+      runtimeControl: {
+        stopLoop: async (input) => {
+          stopCalls.push(input);
+          return {
+            loopId: input.loopId,
+            runId: "run_1",
+            executionId: "agent_exec_1",
+            vendor: "opencode",
+            pid: 777,
+            stopped: true,
+          };
+        },
+      },
+    });
+
+    const existingRun = store.runs.getById("run_1");
+    if (!existingRun) {
+      throw new Error("expected run_1 to exist");
+    }
+    store.runs.upsert({
+      ...existingRun,
+      checkpointJson: JSON.stringify({
+        worktree: {
+          id: "wt_1",
+          path: "/tmp/worktrees/loop-1",
+          branch: "feature/loop-1",
+        },
+      }),
+      updatedAt: "2026-04-11T12:00:30.000Z",
+    });
+
+    const activeRunsResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active"),
+    );
+    const activeRunsBody = (await activeRunsResponse.json()) as {
+      data: {
+        items: Array<{ seq: number; worktree: { path: string } | null }>;
+      };
+    };
+    expect(activeRunsBody.data.items[0]).toMatchObject({
+      seq: 1,
+      worktree: { path: "/tmp/worktrees/loop-1" },
+    });
+
+    const detailResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/1"),
+    );
+    const detailBody = (await detailResponse.json()) as {
+      data: {
+        loopId: string;
+        seq: number;
+        worktree: { branch: string } | null;
+      };
+    };
+    expect(detailBody.data.loopId).toBe("loop_1");
+    expect(detailBody.data.seq).toBe(1);
+    expect(detailBody.data.worktree).toMatchObject({
+      branch: "feature/loop-1",
+    });
+
+    const stopResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/1/stop", {
+        method: "POST",
+      }),
+    );
+    const stopBody = (await stopResponse.json()) as {
+      data: { loopId: string; stopped: boolean };
+    };
+    expect(stopResponse.status).toBe(200);
+    expect(stopBody.data.loopId).toBe("loop_1");
+    expect(stopBody.data.stopped).toBe(true);
+    expect(stopCalls).toEqual([
+      {
+        loopId: "loop_1",
+        reason: "Stopped by user via selector 1",
+      },
     ]);
 
     store.close();

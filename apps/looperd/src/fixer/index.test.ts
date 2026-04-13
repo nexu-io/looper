@@ -357,6 +357,7 @@ describe("FixerLoopRunner", () => {
     const nowIso = fixture.now.toISOString();
     fixture.store.loops.upsert({
       id: "loop_worker_1",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -791,6 +792,7 @@ describe("FixerLoopRunner", () => {
 
     fixture.store.loops.upsert({
       id: "loop_fixer_1",
+      seq: 1,
       projectId: "project_1",
       type: "fixer",
       targetType: "pull_request",

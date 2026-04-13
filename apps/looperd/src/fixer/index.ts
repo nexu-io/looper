@@ -1571,6 +1571,7 @@ export class FixerLoopRunner {
 
     const loop: LoopRecord = {
       id: randomUUID(),
+      seq: this.options.store.loops.allocateSeq(),
       projectId: input.projectId,
       type: "fixer",
       targetType: "pull_request",

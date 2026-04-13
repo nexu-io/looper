@@ -70,6 +70,7 @@ interface PullRequestRef {
 }
 
 interface ActiveRunItem {
+  seq: number;
   runId: string;
   loopId: string;
   projectId: string;
@@ -105,6 +106,41 @@ interface ActiveRunItem {
     lastHeartbeatAt: string | null;
     heartbeatCount: number;
     status: string;
+  } | null;
+  worktree: {
+    id: string | null;
+    path: string;
+    branch: string | null;
+  } | null;
+}
+
+interface LoopLogsEnvelope {
+  seq: number;
+  loopId: string;
+  loopType: string;
+  loopStatus: string;
+  run: {
+    runId: string;
+    status: string;
+    currentStep: string | null;
+    startedAt: string;
+    endedAt: string | null;
+    summary: string | null;
+    errorMessage: string | null;
+  } | null;
+  agent: {
+    executionId: string;
+    vendor: string;
+    status: string;
+    pid: number | null;
+    startedAt: string;
+    endedAt: string | null;
+    heartbeatCount: number;
+    lastHeartbeatAt: string | null;
+    summary: string | null;
+    parseStatus: string | null;
+    stdout: string;
+    stderr: string;
   } | null;
 }
 
@@ -248,6 +284,12 @@ async function dispatch(context: CliContext): Promise<void> {
       return;
     case "ps":
       return runPs(context);
+    case "jump":
+      return runJump(context);
+    case "logs":
+      return runLogs(context);
+    case "stop":
+      return runStop(context);
     default:
       break;
   }
@@ -353,6 +395,34 @@ function createCli(runtime: CliRuntime) {
     .example((name) => `  $ ${name} ps --type reviewer --project project_1`)
     .action(async (options) => {
       await dispatch(createContext(runtime, ["ps"], options));
+    });
+
+  cli
+    .command("jump <id>", "Print shell command for a loop worktree")
+    .option("--print-path", "Print the worktree path only")
+    .option("--shell-integration <shell>", "Print shell integration helper")
+    .example((name) => `  $ eval \"$(${name} jump 12)\"`)
+    .example((name) => `  $ ${name} jump 12 --print-path`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["jump", id], options));
+    });
+
+  cli
+    .command("logs <id>", "Show logs for a loop")
+    .option("--stderr", "Show stderr instead of stdout")
+    .option("--tail <count>", "Show the last N lines")
+    .option("--full", "Show the full output")
+    .example((name) => `  $ ${name} logs 12`)
+    .example((name) => `  $ ${name} logs 12 --stderr --tail 50`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["logs", id], options));
+    });
+
+  cli
+    .command("stop <id>", "Stop an active loop")
+    .example((name) => `  $ ${name} stop 12`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["stop", id], options));
     });
 
   cli
@@ -715,7 +785,7 @@ async function buildLoopCreateBody(context: CliContext) {
 async function runLoopPause(context: CliContext) {
   const loopId = context.args.positionals[2] ?? getFlag(context.args, "id");
   if (!loopId) {
-    throw new Error("Usage: looper loop pause <loop-id>");
+    throw new Error("Usage: looper loop pause <id>");
   }
 
   const data = await context.client.post<Record<string, unknown>>(
@@ -905,9 +975,9 @@ async function runPs(context: CliContext) {
   printTable(
     context.write,
     data.items.map((item) => ({
+      "#": item.seq,
       type: item.type,
       target: item.target.label,
-      run: item.runId,
       step: item.currentStep ?? "-",
       agent: item.agent?.vendor ?? "-",
       pid: item.agent?.pid ?? "-",
@@ -915,6 +985,107 @@ async function runPs(context: CliContext) {
       age: formatRelativeAge(item.startedAt),
     })),
   );
+}
+
+async function runJump(context: CliContext) {
+  const shell = getFlag(context.args, "shell-integration");
+  if (shell) {
+    context.write(buildShellIntegration(shell));
+    return;
+  }
+
+  const selector = requireSelector(context, "Usage: looper jump <id>");
+  const data = await context.client.get<ActiveRunItem>(
+    `/api/v1/runs/active/${encodeURIComponent(selector)}`,
+  );
+
+  if (!data.worktree?.path) {
+    throw new Error(`Loop ${selector} has no active worktree path`);
+  }
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, {
+      seq: data.seq,
+      loopId: data.loopId,
+      projectId: data.projectId,
+      worktree: data.worktree,
+    });
+  }
+
+  if (hasFlag(context.args, "print-path")) {
+    context.write(data.worktree.path);
+    return;
+  }
+
+  context.write(`cd -- ${quoteShellArg(data.worktree.path)}`);
+}
+
+async function runLogs(context: CliContext) {
+  const selector = requireSelector(context, "Usage: looper logs <id>");
+  const data = await context.client.get<LoopLogsEnvelope>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/logs`,
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  const stream = hasFlag(context.args, "stderr")
+    ? (data.agent?.stderr ?? "")
+    : (data.agent?.stdout ?? "");
+  const tailCount = hasFlag(context.args, "full")
+    ? undefined
+    : (readOptionalPositiveIntegerFlag(context.args, "tail") ?? 100);
+
+  context.write(`Loop #${data.seq} · ${data.loopType} · ${data.loopStatus}`);
+  if (data.run) {
+    context.write(
+      `Run ${data.run.runId} · step: ${data.run.currentStep ?? "-"}`,
+    );
+  } else {
+    context.write("Run - · step: -");
+  }
+
+  if (!data.agent) {
+    context.write("No agent output for the current step.");
+    return;
+  }
+
+  context.write(
+    `Agent: ${data.agent.vendor} · pid ${data.agent.pid ?? "-"} · ${data.agent.status}`,
+  );
+  context.write("");
+
+  const content =
+    tailCount === undefined ? stream : tailText(stream, tailCount);
+  if (!content) {
+    context.write("No output captured.");
+    return;
+  }
+
+  for (const line of content.split("\n")) {
+    context.write(line);
+  }
+}
+
+async function runStop(context: CliContext) {
+  const selector = requireSelector(context, "Usage: looper stop <id>");
+  const data = await context.client.post<Record<string, unknown>>(
+    `/api/v1/runs/active/${encodeURIComponent(selector)}/stop`,
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  printSection(context.write, "Loop stopped", [
+    ["loopId", data.loopId as string],
+    ["runId", (data.runId as string | undefined) ?? "-"],
+    ["executionId", (data.executionId as string | undefined) ?? "-"],
+    ["vendor", (data.vendor as string | undefined) ?? "-"],
+    ["pid", (data.pid as number | null | undefined) ?? "-"],
+    ["stopped", Boolean(data.stopped)],
+  ]);
 }
 
 function formatRelativeAge(startedAt: string): string {
@@ -945,6 +1116,54 @@ function formatRelativeAge(startedAt: string): string {
   return remainingHours === 0
     ? `${totalDays}d`
     : `${totalDays}d${remainingHours}h`;
+}
+
+function requireSelector(context: CliContext, usage: string): string {
+  const selector = context.args.positionals[1];
+  if (!selector) {
+    throw new Error(usage);
+  }
+
+  return selector;
+}
+
+function readOptionalPositiveIntegerFlag(
+  args: ParsedArgs,
+  name: string,
+): number | undefined {
+  const value = getFlag(args, name);
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`--${name} must be a positive integer`);
+  }
+
+  return parsed;
+}
+
+function tailText(value: string, count: number): string {
+  const lines = value.split("\n");
+  const trimmed = lines.at(-1) === "" ? lines.slice(0, -1) : lines;
+  return trimmed.slice(-count).join("\n");
+}
+
+function quoteShellArg(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function buildShellIntegration(shell: string): string {
+  switch (shell) {
+    case "bash":
+    case "zsh":
+      return 'lj() { eval "$(looper jump "$@")"; }';
+    case "fish":
+      return "function lj\n  eval (looper jump $argv)\nend";
+    default:
+      throw new Error(`Unsupported shell: ${shell}`);
+  }
 }
 
 function extractConfigArgs(argv: string[]): string[] {

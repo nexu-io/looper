@@ -36,6 +36,16 @@ export interface LooperdApiContext {
   logger: Logger;
   store: Store;
   projects?: ProjectManager;
+  runtimeControl?: {
+    stopLoop(input: { loopId: string; reason: string }): Promise<{
+      stopped: boolean;
+      loopId: string;
+      runId?: string;
+      executionId?: string;
+      vendor?: string;
+      pid?: number | null;
+    }>;
+  };
   getStartedAt(): Date | undefined;
   getRecoverySummary(): Record<string, unknown>;
 }
@@ -138,6 +148,13 @@ export function createLooperdApi(context: LooperdApiContext): LooperdApi {
           case pathname === "/api/v1/runs/active":
             assertMethod(request, ["GET"], pathname);
             data = buildActiveRunsResponse(context, url.searchParams);
+            break;
+          case pathname.startsWith("/api/v1/runs/active/"):
+            data = await buildActiveRunRouteResponse(
+              context,
+              request,
+              pathname,
+            );
             break;
           default:
             throw new ApiError(
@@ -442,31 +459,33 @@ async function buildLoopRouteResponse(
   pathname: string,
 ) {
   const parts = pathname.split("/").filter(Boolean);
-  const loopId = decodeURIComponent(parts[3] ?? "");
+  const selector = decodeURIComponent(parts[3] ?? "");
   const subresource = parts[4];
 
-  if (!loopId) {
+  if (!selector) {
     throw new ApiError("VALIDATION_FAILED", 400, "loopId is required");
   }
 
+  const loop = resolveLoop(context, selector);
+
   if (!subresource) {
     assertMethod(request, ["GET"], pathname);
-    const loop = context.store.loops.getById(loopId);
-    if (!loop) {
-      throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${loopId}`);
-    }
-
     return loop;
+  }
+
+  if (subresource === "logs") {
+    assertMethod(request, ["GET"], pathname);
+    return buildLoopLogsResponse(context, loop);
   }
 
   if (subresource === "start") {
     assertMethod(request, ["POST"], pathname);
-    return mutateLoopStatus(context, loopId, "running");
+    return mutateLoopStatus(context, loop.id, "running");
   }
 
   if (subresource === "pause") {
     assertMethod(request, ["POST"], pathname);
-    return mutateLoopStatus(context, loopId, "paused");
+    return mutateLoopStatus(context, loop.id, "paused");
   }
 
   throw new ApiError("ROUTE_NOT_FOUND", 404, `Unknown route: ${pathname}`);
@@ -504,6 +523,63 @@ function mutateLoopStatus(
   context.store.loops.upsert(updated);
 
   return updated;
+}
+
+async function buildActiveRunRouteResponse(
+  context: LooperdApiContext,
+  request: Request,
+  pathname: string,
+) {
+  const parts = pathname.split("/").filter(Boolean);
+  const selector = decodeURIComponent(parts[4] ?? "");
+  const subresource = parts[5];
+
+  if (!selector) {
+    throw new ApiError("VALIDATION_FAILED", 400, "run selector is required");
+  }
+
+  const loop = resolveLoop(context, selector);
+
+  if (!subresource) {
+    assertMethod(request, ["GET"], pathname);
+    return buildActiveRunDetailResponse(context, loop.id);
+  }
+
+  if (subresource === "stop") {
+    assertMethod(request, ["POST"], pathname);
+    if (!context.runtimeControl) {
+      throw new ApiError(
+        "RUNTIME_CONTROL_UNAVAILABLE",
+        501,
+        "Runtime control is not available in this process",
+      );
+    }
+
+    return context.runtimeControl.stopLoop({
+      loopId: loop.id,
+      reason: `Stopped by user via selector ${selector}`,
+    });
+  }
+
+  throw new ApiError("ROUTE_NOT_FOUND", 404, `Unknown route: ${pathname}`);
+}
+
+function buildActiveRunDetailResponse(
+  context: LooperdApiContext,
+  loopId: string,
+): ActiveRunView {
+  const item = buildActiveRunViews(context).find(
+    (candidate) => candidate.loopId === loopId,
+  );
+  if (!item) {
+    throw new ApiError(
+      "ACTIVE_RUN_NOT_FOUND",
+      404,
+      `Active run not found for loop: ${loopId}`,
+    );
+  }
+
+  return item;
 }
 
 async function buildWorkersCreateResponse(
@@ -708,6 +784,7 @@ interface ActiveRunAgentSummary {
 }
 
 interface ActiveRunView {
+  seq: number;
   runId: string;
   loopId: string;
   projectId: string;
@@ -734,6 +811,11 @@ interface ActiveRunView {
         label: string;
       };
   agent: ActiveRunAgentSummary | null;
+  worktree: {
+    id: string | null;
+    path: string;
+    branch: string | null;
+  } | null;
 }
 
 function buildActiveRunsResponse(
@@ -767,6 +849,7 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
       }
 
       return {
+        seq: loop.seq,
         runId: run.id,
         loopId: run.loopId,
         projectId: loop.projectId,
@@ -776,6 +859,7 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
         startedAt: run.startedAt,
         target,
         agent: activeAgentByRunId.get(run.id) ?? null,
+        worktree: buildWorktreeSummary(loop, run),
       } satisfies ActiveRunView;
     })
     .filter((item): item is ActiveRunView => item !== null)
@@ -1069,82 +1153,168 @@ function createLoopRecord(input: {
   metadataJson?: string | null;
 }) {
   const { context } = input;
-  const issueNumber =
-    input.issueNumber ??
-    (input.targetType === "issue"
-      ? parseIssueNumber(input.targetId)
-      : undefined);
-  const target =
-    input.targetType === "project"
-      ? defineProjectLoopTarget(readRequiredValue(input.targetId, "targetId"))
-      : input.targetType === "issue"
-        ? defineIssueLoopTarget(
-            readRequiredValue(input.repo, "repo"),
-            readRequiredNumber(issueNumber, "issueNumber"),
-          )
-        : definePullRequestLoopTarget(
-            readRequiredValue(input.repo, "repo"),
-            readRequiredNumber(input.prNumber, "prNumber"),
-          );
+  return context.store.withTransaction(() => {
+    const issueNumber =
+      input.issueNumber ??
+      (input.targetType === "issue"
+        ? parseIssueNumber(input.targetId)
+        : undefined);
+    const target =
+      input.targetType === "project"
+        ? defineProjectLoopTarget(readRequiredValue(input.targetId, "targetId"))
+        : input.targetType === "issue"
+          ? defineIssueLoopTarget(
+              readRequiredValue(input.repo, "repo"),
+              readRequiredNumber(issueNumber, "issueNumber"),
+            )
+          : definePullRequestLoopTarget(
+              readRequiredValue(input.repo, "repo"),
+              readRequiredNumber(input.prNumber, "prNumber"),
+            );
 
-  const loop = createLoop({
-    id: randomUUID(),
-    projectId: input.projectId,
-    type: input.type as never,
-    target,
-    status: input.status as never,
-    createdAt: input.now,
-    updatedAt: input.now,
-  });
-
-  const existingLoops = context.store.loops.list().map((candidate) => ({
-    id: candidate.id,
-    projectId: candidate.projectId,
-    type: candidate.type as never,
-    status: candidate.status as never,
-    target: toLoopTarget(candidate),
-  }));
-
-  try {
-    assertUniqueActiveLoop({
-      loops: existingLoops,
-      candidate: loop,
+    const loop = createLoop({
+      id: randomUUID(),
+      projectId: input.projectId,
+      type: input.type as never,
+      target,
+      status: input.status as never,
+      createdAt: input.now,
+      updatedAt: input.now,
     });
-  } catch (error) {
-    throw new ApiError(
-      "LOOP_CONFLICT",
-      409,
-      error instanceof Error ? error.message : "Active loop already exists",
-    );
+
+    const existingLoops = context.store.loops.list().map((candidate) => ({
+      id: candidate.id,
+      projectId: candidate.projectId,
+      type: candidate.type as never,
+      status: candidate.status as never,
+      target: toLoopTarget(candidate),
+    }));
+
+    try {
+      assertUniqueActiveLoop({
+        loops: existingLoops,
+        candidate: loop,
+      });
+    } catch (error) {
+      throw new ApiError(
+        "LOOP_CONFLICT",
+        409,
+        error instanceof Error ? error.message : "Active loop already exists",
+      );
+    }
+
+    const record = {
+      id: loop.id,
+      seq: context.store.loops.allocateSeq(),
+      projectId: loop.projectId,
+      type: loop.type,
+      targetType: target.targetType,
+      targetId:
+        target.targetType === "project"
+          ? `project:${target.projectId}`
+          : target.targetType === "issue"
+            ? `issue:${target.repo}:${target.issueNumber}`
+            : `pr:${target.repo}:${target.prNumber}`,
+      repo:
+        target.targetType === "pull_request" || target.targetType === "issue"
+          ? target.repo
+          : null,
+      prNumber: target.targetType === "pull_request" ? target.prNumber : null,
+      status: loop.status,
+      configJson: null,
+      metadataJson: input.metadataJson ?? null,
+      lastRunAt: null,
+      nextRunAt: loop.status === "running" ? input.now : null,
+      createdAt: input.now,
+      updatedAt: input.now,
+    };
+
+    context.store.loops.upsert(record);
+    return record;
+  });
+}
+
+function resolveLoop(context: LooperdApiContext, selector: string): LoopRecord {
+  const normalized = selector.trim();
+  if (/^\d+$/.test(normalized)) {
+    const loopBySeq = context.store.loops.getBySeq(Number(normalized));
+    if (loopBySeq) {
+      return loopBySeq;
+    }
   }
 
-  const record = {
-    id: loop.id,
-    projectId: loop.projectId,
-    type: loop.type,
-    targetType: target.targetType,
-    targetId:
-      target.targetType === "project"
-        ? `project:${target.projectId}`
-        : target.targetType === "issue"
-          ? `issue:${target.repo}:${target.issueNumber}`
-          : `pr:${target.repo}:${target.prNumber}`,
-    repo:
-      target.targetType === "pull_request" || target.targetType === "issue"
-        ? target.repo
-        : null,
-    prNumber: target.targetType === "pull_request" ? target.prNumber : null,
-    status: loop.status,
-    configJson: null,
-    metadataJson: input.metadataJson ?? null,
-    lastRunAt: null,
-    nextRunAt: loop.status === "running" ? input.now : null,
-    createdAt: input.now,
-    updatedAt: input.now,
-  };
+  const loopById = context.store.loops.getById(normalized);
+  if (!loopById) {
+    throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${selector}`);
+  }
 
-  context.store.loops.upsert(record);
-  return record;
+  return loopById;
+}
+
+function buildLoopLogsResponse(context: LooperdApiContext, loop: LoopRecord) {
+  const latestRun = context.store.runs.listByLoop(loop.id)[0] ?? null;
+  const latestAgent = latestRun
+    ? (context.store.agentExecutions.listByRunId(latestRun.id)[0] ?? null)
+    : null;
+  const output = parseOutputJson(latestAgent?.outputJson);
+
+  return {
+    seq: loop.seq,
+    loopId: loop.id,
+    loopType: loop.type,
+    loopStatus: loop.status,
+    run: latestRun
+      ? {
+          runId: latestRun.id,
+          status: latestRun.status,
+          currentStep: latestRun.currentStep ?? null,
+          startedAt: latestRun.startedAt,
+          endedAt: latestRun.endedAt ?? null,
+          summary: latestRun.summary ?? null,
+          errorMessage: latestRun.errorMessage ?? null,
+        }
+      : null,
+    agent: latestAgent
+      ? {
+          executionId: latestAgent.id,
+          vendor: latestAgent.vendor,
+          status: latestAgent.status,
+          pid: latestAgent.pid ?? null,
+          startedAt: latestAgent.startedAt,
+          endedAt: latestAgent.endedAt ?? null,
+          heartbeatCount: latestAgent.heartbeatCount,
+          lastHeartbeatAt: latestAgent.lastHeartbeatAt ?? null,
+          summary: latestAgent.summary ?? null,
+          parseStatus: latestAgent.parseStatus ?? null,
+          stdout: output.stdout,
+          stderr: output.stderr,
+        }
+      : null,
+  };
+}
+
+function buildWorktreeSummary(
+  loop: LoopRecord,
+  run: RunRecord,
+): ActiveRunView["worktree"] {
+  const checkpoint = asObject(parsePayloadJson(run.checkpointJson ?? "null"));
+  const checkpointWorktree = asObject(checkpoint.worktree);
+  const loopMetadata = asObject(parsePayloadJson(loop.metadataJson ?? "null"));
+  const path =
+    readString(checkpointWorktree.path) ??
+    readString(loopMetadata.worktreePath);
+
+  if (!path) {
+    return null;
+  }
+
+  return {
+    id:
+      readString(checkpointWorktree.id) ?? readString(loopMetadata.worktreeId),
+    path,
+    branch:
+      readString(checkpointWorktree.branch) ?? readString(loopMetadata.branch),
+  };
 }
 
 function toLoopTarget(loop: ReturnType<Store["loops"]["list"]>[number]) {
@@ -1523,6 +1693,23 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function parseOutputJson(outputJson?: string | null): {
+  stdout: string;
+  stderr: string;
+} {
+  const parsed = asObject(parsePayloadJson(outputJson ?? "null"));
+  return {
+    stdout: readString(parsed.stdout) ?? "",
+    stderr: readString(parsed.stderr) ?? "",
+  };
 }
 
 function deriveWorkerTitle(input: {

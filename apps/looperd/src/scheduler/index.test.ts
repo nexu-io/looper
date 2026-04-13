@@ -116,6 +116,7 @@ describe("SchedulerQueue", () => {
       });
       store.loops.upsert({
         id: "loop_1",
+        seq: 1,
         projectId: "project_1",
         type: "worker",
         targetType: "project",

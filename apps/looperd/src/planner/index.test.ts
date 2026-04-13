@@ -508,6 +508,7 @@ describe("PlannerLoopRunner", () => {
     const nowIso = fixture.now.toISOString();
     fixture.store.loops.upsert({
       id: "loop_planner_1",
+      seq: 1,
       projectId: "project_1",
       type: "planner",
       targetType: "issue",
@@ -712,6 +713,7 @@ describe("PlannerLoopRunner", () => {
     const nowIso = fixture.now.toISOString();
     fixture.store.loops.upsert({
       id: "loop_planner_paused",
+      seq: 1,
       projectId: "project_1",
       type: "planner",
       targetType: "issue",
@@ -730,6 +732,7 @@ describe("PlannerLoopRunner", () => {
     });
     fixture.store.loops.upsert({
       id: "loop_planner_completed",
+      seq: 2,
       projectId: "project_1",
       type: "planner",
       targetType: "issue",

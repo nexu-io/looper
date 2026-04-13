@@ -446,6 +446,7 @@ describe("createLooperdRuntime", () => {
     });
     seedStore.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "reviewer",
       targetType: "pull_request",
@@ -594,6 +595,7 @@ describe("createLooperdRuntime", () => {
     });
     seedStore.loops.upsert({
       id: "loop_planner_1",
+      seq: 1,
       projectId: "project_1",
       type: "planner",
       targetType: "issue",
@@ -882,6 +884,7 @@ describe("createLooperdRuntime", () => {
     store.initialize();
     store.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "fixer",
       targetType: "pull_request",
@@ -1024,6 +1027,7 @@ describe("createLooperdRuntime", () => {
     });
     seedStore.loops.upsert({
       id: "loop_worker_1",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -1116,6 +1120,7 @@ describe("createLooperdRuntime", () => {
     });
     seedStore.loops.upsert({
       id: "loop_worker_1",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",

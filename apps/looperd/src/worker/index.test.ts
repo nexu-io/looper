@@ -61,6 +61,7 @@ async function createFixture() {
   });
   store.loops.upsert({
     id: "loop_worker_1",
+    seq: 1,
     projectId: "project_1",
     type: "worker",
     targetType: "project",
@@ -315,6 +316,7 @@ describe("WorkerLoopRunner", () => {
     fixture.store.loops.upsert({
       ...(fixture.store.loops.getById("loop_worker_1") ?? {
         id: "loop_worker_1",
+        seq: 1,
         projectId: "project_1",
         type: "worker",
         targetType: "project",
@@ -382,6 +384,7 @@ describe("WorkerLoopRunner", () => {
     const nowIso = fixture.now.toISOString();
     fixture.store.loops.upsert({
       id: "loop_reviewer_1",
+      seq: 2,
       projectId: "project_1",
       type: "reviewer",
       targetType: "pull_request",
@@ -650,6 +653,7 @@ describe("WorkerLoopRunner", () => {
     const nowIso = fixture.now.toISOString();
     fixture.store.loops.upsert({
       id: "loop_worker_paused_pr",
+      seq: 2,
       projectId: "project_1",
       type: "worker",
       targetType: "pull_request",
@@ -881,6 +885,7 @@ describe("WorkerLoopRunner", () => {
     fixture.store.loops.upsert({
       ...(fixture.store.loops.getById("loop_worker_1") ?? {
         id: "loop_worker_1",
+        seq: 1,
         projectId: "project_1",
         type: "worker",
         targetType: "project",
