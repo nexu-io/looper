@@ -1074,9 +1074,14 @@ async function runStop(context: CliContext) {
   const data = await context.client.post<Record<string, unknown>>(
     `/api/v1/runs/active/${encodeURIComponent(selector)}/stop`,
   );
+  const stopped = Boolean(data.stopped);
 
   if (hasFlag(context.args, "json")) {
-    return printJson(context.write, data);
+    printJson(context.write, data);
+    if (!stopped) {
+      throw new Error(`Loop ${selector} could not be stopped`);
+    }
+    return;
   }
 
   printSection(context.write, "Loop stopped", [
@@ -1085,8 +1090,12 @@ async function runStop(context: CliContext) {
     ["executionId", (data.executionId as string | undefined) ?? "-"],
     ["vendor", (data.vendor as string | undefined) ?? "-"],
     ["pid", (data.pid as number | null | undefined) ?? "-"],
-    ["stopped", Boolean(data.stopped)],
+    ["stopped", stopped],
   ]);
+
+  if (!stopped) {
+    throw new Error(`Loop ${selector} could not be stopped`);
+  }
 }
 
 function formatRelativeAge(startedAt: string): string {

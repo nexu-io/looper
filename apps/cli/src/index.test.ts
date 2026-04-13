@@ -675,4 +675,34 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain("Loop stopped");
     expect(lines.join("\n")).toContain("loop_12");
   });
+
+  test("returns a non-zero exit code when stop reports stopped false", async () => {
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const exitCode = await runCli(["stop", "12"], {
+      stdout: (line) => stdoutLines.push(line),
+      stderr: (line) => stderrLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_stop_failed",
+            data: {
+              loopId: "loop_12",
+              runId: "run_12",
+              executionId: "agent_12",
+              vendor: "opencode",
+              pid: 888,
+              stopped: false,
+            },
+          }),
+        ),
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdoutLines.join("\n")).toContain("Loop stopped");
+    expect(stdoutLines.join("\n")).toContain("stopped     : no");
+    expect(stderrLines.join("\n")).toContain("Loop 12 could not be stopped");
+  });
 });

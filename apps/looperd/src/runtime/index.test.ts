@@ -553,6 +553,132 @@ describe("createLooperdRuntime", () => {
     }
   });
 
+  test("treats ESRCH while stopping the active agent as already terminated", async () => {
+    const fixture = await createFixture();
+    const originalKill = process.kill;
+    process.kill = (() => {
+      const error = new Error("no such process") as NodeJS.ErrnoException;
+      error.code = "ESRCH";
+      throw error;
+    }) as typeof process.kill;
+
+    try {
+      const runtime = createLooperdRuntime({
+        config: fixture.config,
+        logger: fixture.logger,
+      });
+
+      await runtime.start();
+      const store = new SqliteStore({
+        dbPath: fixture.config.storage.dbPath,
+        backupDir: fixture.config.storage.backupDir,
+      });
+      store.initialize({ autoMigrate: true });
+
+      const now = "2026-04-11T12:00:00.000Z";
+      store.projects.upsert({
+        id: "project_1",
+        name: "Looper",
+        repoPath: fixture.rootDir,
+        baseBranch: "main",
+        archived: false,
+        metadataJson: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      store.loops.upsert({
+        id: "loop_1",
+        seq: 1,
+        projectId: "project_1",
+        type: "reviewer",
+        targetType: "pull_request",
+        targetId: "pr:acme/looper:42",
+        repo: "acme/looper",
+        prNumber: 42,
+        status: "running",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: now,
+        nextRunAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+      store.runs.upsert({
+        id: "run_1",
+        loopId: "loop_1",
+        status: "running",
+        currentStep: "review",
+        lastCompletedStep: "snapshot",
+        checkpointJson: null,
+        summary: null,
+        errorMessage: null,
+        startedAt: now,
+        lastHeartbeatAt: now,
+        endedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      store.agentExecutions.upsert({
+        id: "agent_exec_1",
+        projectId: "project_1",
+        loopId: "loop_1",
+        runId: "run_1",
+        vendor: "opencode",
+        status: "running",
+        pid: 12345,
+        commandJson: JSON.stringify(["opencode", "run"]),
+        cwd: fixture.rootDir,
+        summary: null,
+        parseStatus: null,
+        completionSignal: null,
+        heartbeatCount: 0,
+        startedAt: now,
+        lastHeartbeatAt: now,
+        endedAt: null,
+        outputJson: null,
+        errorMessage: null,
+        metadataJson: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      store.close();
+
+      const result = await (
+        runtime as unknown as {
+          stopLoop(input: { loopId: string; reason: string }): Promise<{
+            stopped: boolean;
+          }>;
+        }
+      ).stopLoop({
+        loopId: "loop_1",
+        reason: "test stop",
+      });
+
+      expect(result.stopped).toBe(true);
+
+      const verifyStore = new SqliteStore({
+        dbPath: fixture.config.storage.dbPath,
+        backupDir: fixture.config.storage.backupDir,
+      });
+      verifyStore.initialize({ autoMigrate: true });
+      expect(verifyStore.runs.getById("run_1")).toMatchObject({
+        status: "cancelled",
+        errorMessage: "test stop",
+      });
+      expect(verifyStore.agentExecutions.getById("agent_exec_1")).toMatchObject(
+        {
+          status: "killed",
+          errorMessage: "test stop",
+        },
+      );
+      verifyStore.close();
+
+      await runtime.stop("test");
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
   test("keeps the run active after sending SIGTERM to the agent process", async () => {
     const fixture = await createFixture();
     const originalKill = process.kill;
