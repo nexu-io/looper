@@ -189,7 +189,9 @@ describe("createLooperdApi", () => {
 
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
-    expect(statusBody.data.storage.schemaVersion).toBe("0006_loop_seq_handles");
+    expect(statusBody.data.storage.schemaVersion).toBe(
+      "0007_agent_execution_run_index",
+    );
     expect(statusBody.data.scheduler.queuedItems).toBe(1);
     expect(statusBody.data.scheduler.totalRuns).toBe(1);
     expect(statusBody.data.loops.planner.running).toBe(0);
@@ -1291,6 +1293,32 @@ describe("createLooperdApi", () => {
       createdAt: "2026-04-11T12:00:05.000Z",
       updatedAt: "2026-04-11T12:00:10.000Z",
     });
+    store.agentExecutions.upsert({
+      id: "agent_exec_2",
+      projectId: "project_1",
+      loopId: "loop_1",
+      runId: "run_1",
+      vendor: "opencode",
+      status: "completed",
+      pid: 778,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 2,
+      lastHeartbeatAt: "2026-04-11T12:00:20.000Z",
+      outputJson: JSON.stringify({
+        stdout: "latest stdout\n",
+        stderr: " latest stderr\n",
+      }),
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:15.000Z",
+      endedAt: "2026-04-11T12:00:20.000Z",
+      metadataJson: null,
+      createdAt: "2026-04-11T12:00:15.000Z",
+      updatedAt: "2026-04-11T12:00:20.000Z",
+    });
 
     store.loops.upsert({
       id: "loop_2",
@@ -1333,8 +1361,9 @@ describe("createLooperdApi", () => {
     expect(logsWithAgentBody.data.seq).toBe(1);
     expect(logsWithAgentBody.data.loopId).toBe("loop_1");
     expect(logsWithAgentBody.data.agent).toMatchObject({
-      stdout: "out1\nout2",
-      stderr: "err1",
+      executionId: "agent_exec_2",
+      stdout: "latest stdout",
+      stderr: "latest stderr",
     });
 
     const logsWithoutAgentResponse = await api.handle(

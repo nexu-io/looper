@@ -718,6 +718,14 @@ export class SqliteStore implements Store {
         .get(id) as Record<string, unknown> | null;
       return row ? mapAgentExecution(row) : null;
     },
+    getLatestByRunId: (runId: string): AgentExecutionRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM agent_executions WHERE run_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .get(runId) as Record<string, unknown> | null;
+      return row ? mapAgentExecution(row) : null;
+    },
     list: (): AgentExecutionRecord[] => {
       return this.coordinator.db
         .query("SELECT * FROM agent_executions ORDER BY started_at DESC")

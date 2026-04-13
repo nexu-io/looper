@@ -361,7 +361,9 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0006_loop_seq_handles");
+    expect(health.migration.latestAppliedId).toBe(
+      "0007_agent_execution_run_index",
+    );
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
@@ -530,7 +532,7 @@ describe("SqliteStore", () => {
     store.initialize({ autoMigrate: true });
 
     expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
-      "0006_loop_seq_handles",
+      "0007_agent_execution_run_index",
     );
     expect(store.loops.getById("loop_worker_1")).toMatchObject({
       targetType: "project",
@@ -553,6 +555,15 @@ describe("SqliteStore", () => {
           return false;
         }
       }),
+    ).toBe(true);
+
+    const migratedDb = new Database(fixture.dbPath, { readonly: true });
+    const indexes = migratedDb
+      .query("PRAGMA index_list('agent_executions')")
+      .all() as Array<Record<string, unknown>>;
+    migratedDb.close(false);
+    expect(
+      indexes.some((index) => index.name === "idx_agent_executions_run"),
     ).toBe(true);
 
     store.close();

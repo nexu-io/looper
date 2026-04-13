@@ -93,6 +93,7 @@ export interface Store {
   agentExecutions: {
     upsert(record: AgentExecutionRecord): void;
     getById(id: string): AgentExecutionRecord | null;
+    getLatestByRunId(runId: string): AgentExecutionRecord | null;
     list(): AgentExecutionRecord[];
     listByRunId(runId: string): AgentExecutionRecord[];
     listActive(): AgentExecutionRecord[];

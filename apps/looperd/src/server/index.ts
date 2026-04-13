@@ -1300,7 +1300,7 @@ function resolveLoop(context: LooperdApiContext, selector: string): LoopRecord {
 function buildLoopLogsResponse(context: LooperdApiContext, loop: LoopRecord) {
   const latestRun = context.store.runs.listByLoop(loop.id)[0] ?? null;
   const latestAgent = latestRun
-    ? (context.store.agentExecutions.listByRunId(latestRun.id)[0] ?? null)
+    ? context.store.agentExecutions.getLatestByRunId(latestRun.id)
     : null;
   const output = parseOutputJson(latestAgent?.outputJson);
 
