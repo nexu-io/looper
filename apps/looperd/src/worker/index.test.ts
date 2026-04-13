@@ -33,6 +33,7 @@ async function createFixture() {
   cleanupPaths.push(rootDir);
   const repoPath = join(rootDir, "repo");
   const worktreeRoot = join(rootDir, "worktrees");
+  const now = new Date("2026-04-11T12:00:00.000Z");
   await mkdir(repoPath, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   await writeFile(
@@ -42,10 +43,10 @@ async function createFixture() {
 
   const store = new SqliteStore({
     dbPath: join(rootDir, "state", "looper.sqlite"),
+    now: () => now,
   });
   store.initialize({ autoMigrate: true });
 
-  const now = new Date("2026-04-11T12:00:00.000Z");
   const nowIso = now.toISOString();
 
   store.projects.upsert({
