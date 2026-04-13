@@ -222,7 +222,7 @@ class FakeGitGateway {
   public cleanupCalls = 0;
   public pushError?: string;
 
-  public async detectGitHubRepo(): Promise<string | null> {
+  public async detectGitHubRepo(_repoPath: string): Promise<string | null> {
     return "powerformer/looper";
   }
 

@@ -25,16 +25,35 @@ describe("GhCliGitHubGateway", () => {
     const scriptPath = join(rootDir, "gh");
     await writeFile(
       scriptPath,
-      `#!/bin/sh\nprintf '%s\n' "$*" >> "${logPath}"\nif [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n  printf '[{"number":42,"title":"Review me","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]'
-elif [ "$1" = "issue" ] && [ "$2" = "list" ]; then\n  printf '[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]'
-elif [ "$1" = "issue" ] && [ "$2" = "view" ]; then\n  printf '{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}'
-elif [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n  printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
-elif [ "$1" = "pr" ] && [ "$2" = "diff" ]; then\n  printf 'diff --git a/a.ts b/a.ts\n'
-elif [ "$1" = "api" ] && [ "$2" = "user" ]; then\n  printf 'reviewer\n'
-elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'reviewThreads'; then\n  printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}]}}}}}'
-elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then\n  printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
-elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'resolveReviewThread'; then\n  printf '{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}'
-else\n  exit 0\nfi\n`,
+      `#!/bin/sh\nprintf '%s\n' "$*" >> "${logPath}"\ncase "$*" in
+  "pr list"*)
+    printf '[{"number":42,"title":"Review me","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]'
+    ;;
+  "issue list"*)
+    printf '[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]'
+    ;;
+  "issue view"*)
+    printf '{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}'
+    ;;
+  "pr view"*)
+    printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
+    ;;
+  "pr diff"*)
+    printf 'diff --git a/a.ts b/a.ts\n'
+    ;;
+  "api user"*)
+    printf 'reviewer\n'
+    ;;
+  *"resolveReviewThread"*)
+    printf '{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}'
+    ;;
+  *"reviewThreads"*)
+    printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}]}}}}}'
+    ;;
+  *"threadId=thread-1"*)
+    printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
+    ;;
+esac\n`,
     );
     await chmod(scriptPath, 0o755);
 
@@ -140,11 +159,14 @@ else\n  exit 0\nfi\n`,
     await writeFile(
       scriptPath,
       `#!/bin/sh
-if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then
-  printf '{"data":{"node":null}}'
-else
-  printf '{}'
-fi
+case "$*" in
+  *"threadId=thread-missing"*)
+    printf '{"data":{"node":null}}'
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
 `,
     );
     await chmod(scriptPath, 0o755);
@@ -170,14 +192,18 @@ fi
     await writeFile(
       scriptPath,
       `#!/bin/sh
-if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then
-  printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
-elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'resolveReviewThread'; then
-  printf 'permission denied' >&2
-  exit 1
-else
-  printf '{}'
-fi
+case "$*" in
+  *"resolveReviewThread"*)
+    printf 'permission denied' >&2
+    exit 1
+    ;;
+  *"threadId=thread-1"*)
+    printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
 `,
     );
     await chmod(scriptPath, 0o755);
