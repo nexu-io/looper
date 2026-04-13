@@ -425,7 +425,7 @@ describe("createLooperdRuntime", () => {
     verifyStore.close();
   });
 
-  test("reports stopped false when terminating the active agent fails", async () => {
+  test("keeps stopped false when SIGTERM fails even if queue items are cancelled", async () => {
     const fixture = await createFixture();
     const originalKill = process.kill;
     process.kill = (() => {
@@ -513,6 +513,32 @@ describe("createLooperdRuntime", () => {
         createdAt: now,
         updatedAt: now,
       });
+      store.queue.upsert({
+        id: "queue_1",
+        projectId: "project_1",
+        loopId: "loop_1",
+        type: "reviewer",
+        targetType: "pull_request",
+        targetId: "pr:acme/looper:42",
+        repo: "acme/looper",
+        prNumber: 42,
+        dedupeKey: "reviewer:acme/looper:42",
+        priority: 1,
+        status: "queued",
+        availableAt: now,
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: "pr:acme/looper:42",
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: now,
+        updatedAt: now,
+      });
       store.close();
 
       const result = await (
@@ -545,6 +571,10 @@ describe("createLooperdRuntime", () => {
           errorMessage: null,
         },
       );
+      expect(verifyStore.queue.getById("queue_1")).toMatchObject({
+        status: "cancelled",
+        lastError: "test stop",
+      });
       verifyStore.close();
 
       await runtime.stop("test");
@@ -809,7 +839,7 @@ describe("createLooperdRuntime", () => {
     }
   });
 
-  test("reports stopped when cancelling an active run without an execution pid", async () => {
+  test("does not stop or cancel active run without an interruptible execution pid", async () => {
     const fixture = await createFixture();
 
     const runtime = createLooperdRuntime({
@@ -903,7 +933,7 @@ describe("createLooperdRuntime", () => {
       reason: "test stop",
     });
 
-    expect(result.stopped).toBe(true);
+    expect(result.stopped).toBe(false);
 
     const verifyStore = new SqliteStore({
       dbPath: fixture.config.storage.dbPath,
@@ -911,8 +941,9 @@ describe("createLooperdRuntime", () => {
     });
     verifyStore.initialize({ autoMigrate: true });
     expect(verifyStore.runs.getById("run_1")).toMatchObject({
-      status: "cancelled",
-      errorMessage: "test stop",
+      status: "running",
+      endedAt: null,
+      errorMessage: null,
     });
     expect(verifyStore.agentExecutions.getById("agent_exec_1")).toMatchObject({
       status: "running",

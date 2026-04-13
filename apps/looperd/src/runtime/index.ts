@@ -497,7 +497,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
       });
     }
 
-    if (activeRun && (!activeExecution?.pid || executionTerminated)) {
+    if (activeRun && executionTerminated) {
       this.store.runs.upsert({
         ...activeRun,
         status: "cancelled",
@@ -507,10 +507,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
       });
     }
 
+    const runStopped = Boolean(activeRun && executionTerminated);
     const stopped =
       stopRequested ||
-      cancelledQueueItems > 0 ||
-      Boolean(activeRun && (!activeExecution?.pid || executionTerminated));
+      runStopped ||
+      (!activeRun && cancelledQueueItems > 0);
 
     this.appendEvent({
       id: randomUUID(),
