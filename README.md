@@ -22,6 +22,7 @@ The current product is the daemon + CLI. The web app is not implemented yet.
 From the repo root:
 
 - `bun run dev` — run `apps/looperd`
+- `bun run looper -- <args>` — run the CLI directly from `apps/cli/src/index.ts` without rebuilding
 - `bun run build` — build `apps/looperd`, `apps/cli`, and `apps/web`
 - `bun run typecheck` — TypeScript project references check without emit
 - `bun run lint` — run Biome
@@ -57,6 +58,13 @@ Responsibilities include:
 ### `apps/cli`
 
 The CLI binary is `looper`.
+
+For local development, use one of these options:
+
+- `bun run looper -- ps` — runs the CLI from source without rebuilding
+- add a shell alias such as `alias looper='bun /absolute/path/to/looper/apps/cli/src/index.ts'` if you want to type `looper ps` directly during development
+
+Published installs should continue to use the built `dist` entry declared in `apps/cli/package.json`.
 
 The CLI connects to `looperd` over HTTP and supports commands under:
 

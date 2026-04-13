@@ -6,6 +6,7 @@
   "workspaces": ["apps/*"],
   "scripts": {
     "dev": "bun run --cwd apps/looperd dev",
+    "looper": "bun apps/cli/src/index.ts",
     "build": "bun run --cwd apps/looperd build && bun run --cwd apps/cli build && bun run --cwd apps/web build",
     "typecheck": "bun x tsc -b --noEmit",
     "test": "bun test",
