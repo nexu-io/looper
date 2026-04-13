@@ -1155,7 +1155,7 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
-  test("returns active run detail by seq with worktree and supports stop by seq", async () => {
+  test("returns active run detail by seq or runId with worktree and supports stop by either selector", async () => {
     const stopCalls: Array<{ loopId: string; reason: string }> = [];
     const { api, store, rootDir } = await createFixture({
       runtimeControl: {
@@ -1218,6 +1218,33 @@ describe("createLooperdApi", () => {
       branch: "feature/loop-1",
     });
 
+    const detailByRunIdResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/run_1"),
+    );
+    const detailByRunIdBody = (await detailByRunIdResponse.json()) as {
+      data: {
+        loopId: string;
+        runId: string;
+        seq: number;
+      };
+    };
+    expect(detailByRunIdBody.data.loopId).toBe("loop_1");
+    expect(detailByRunIdBody.data.runId).toBe("run_1");
+    expect(detailByRunIdBody.data.seq).toBe(1);
+
+    const logsByRunIdResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops/run_1/logs"),
+    );
+    const logsByRunIdBody = (await logsByRunIdResponse.json()) as {
+      data: {
+        loopId: string;
+        run: { runId: string } | null;
+      };
+    };
+    expect(logsByRunIdResponse.status).toBe(200);
+    expect(logsByRunIdBody.data.loopId).toBe("loop_1");
+    expect(logsByRunIdBody.data.run).toMatchObject({ runId: "run_1" });
+
     const stopResponse = await api.handle(
       new Request("http://localhost/api/v1/runs/active/1/stop", {
         method: "POST",
@@ -1229,10 +1256,27 @@ describe("createLooperdApi", () => {
     expect(stopResponse.status).toBe(200);
     expect(stopBody.data.loopId).toBe("loop_1");
     expect(stopBody.data.stopped).toBe(true);
+
+    const stopByRunIdResponse = await api.handle(
+      new Request("http://localhost/api/v1/runs/active/run_1/stop", {
+        method: "POST",
+      }),
+    );
+    const stopByRunIdBody = (await stopByRunIdResponse.json()) as {
+      data: { loopId: string; stopped: boolean };
+    };
+    expect(stopByRunIdResponse.status).toBe(200);
+    expect(stopByRunIdBody.data.loopId).toBe("loop_1");
+    expect(stopByRunIdBody.data.stopped).toBe(true);
+
     expect(stopCalls).toEqual([
       {
         loopId: "loop_1",
         reason: "Stopped by user via selector 1",
+      },
+      {
+        loopId: "loop_1",
+        reason: "Stopped by user via selector run_1",
       },
     ]);
 

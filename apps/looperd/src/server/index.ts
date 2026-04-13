@@ -1252,11 +1252,19 @@ function resolveLoop(context: LooperdApiContext, selector: string): LoopRecord {
   }
 
   const loopById = context.store.loops.getById(normalized);
-  if (!loopById) {
-    throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${selector}`);
+  if (loopById) {
+    return loopById;
   }
 
-  return loopById;
+  const run = context.store.runs.getById(normalized);
+  if (run) {
+    const loopByRunId = context.store.loops.getById(run.loopId);
+    if (loopByRunId) {
+      return loopByRunId;
+    }
+  }
+
+  throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${selector}`);
 }
 
 function buildLoopLogsResponse(context: LooperdApiContext, loop: LoopRecord) {
