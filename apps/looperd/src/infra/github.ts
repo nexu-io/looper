@@ -400,15 +400,22 @@ export class GhCliGitHubGateway {
     }
 
     for (const label of input.labels) {
-      await this.runGh(
-        [
-          "api",
-          `repos/${input.repo}/issues/${input.prNumber}/labels/${encodeURIComponent(label)}`,
-          "--method",
-          "DELETE",
-        ],
-        input.cwd,
-      );
+      try {
+        await this.runGh(
+          [
+            "api",
+            `repos/${input.repo}/issues/${input.prNumber}/labels/${encodeURIComponent(label)}`,
+            "--method",
+            "DELETE",
+          ],
+          input.cwd,
+        );
+      } catch (error) {
+        if (isMissingPullRequestLabelDelete(error)) {
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
@@ -870,4 +877,13 @@ function parsePrNumberFromUrl(url: string): number | undefined {
 
   const value = Number(match[1]);
   return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function isMissingPullRequestLabelDelete(error: unknown): boolean {
+  if (!(error instanceof CommandExecutionError)) {
+    return false;
+  }
+
+  const output = `${error.result.stdout}\n${error.result.stderr}`.toLowerCase();
+  return output.includes("404") && output.includes("label");
 }

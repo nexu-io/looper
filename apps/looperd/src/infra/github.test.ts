@@ -238,4 +238,39 @@ esac
       }),
     ).rejects.toThrow("Command exited with code 1");
   });
+
+  test("ignores missing label errors when removing pull request labels", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-gh-"));
+    cleanupPaths.push(rootDir);
+
+    const scriptPath = join(rootDir, "gh");
+    await writeFile(
+      scriptPath,
+      `#!/bin/sh
+case "$*" in
+  "api repos/acme/looper/issues/42/labels/looper%3Aspec-ready --method DELETE")
+    printf 'gh: HTTP 404: label does not exist (https://api.github.com/...)' >&2
+    exit 1
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`,
+    );
+    await chmod(scriptPath, 0o755);
+
+    const gateway = new GhCliGitHubGateway({
+      ghPath: scriptPath,
+      cwd: rootDir,
+    });
+
+    await expect(
+      gateway.removePullRequestLabels({
+        repo: "acme/looper",
+        prNumber: 42,
+        labels: ["looper:spec-ready"],
+      }),
+    ).resolves.toBeUndefined();
+  });
 });
