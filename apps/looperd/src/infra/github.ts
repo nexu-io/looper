@@ -373,15 +373,14 @@ export class GhCliGitHubGateway {
       return;
     }
 
+    await this.ensureLabelsExist(input.repo, input.labels, input.cwd);
     await this.runGh(
       [
-        "pr",
-        "edit",
-        String(input.prNumber),
-        "--repo",
-        input.repo,
-        "--add-label",
-        input.labels.join(","),
+        "api",
+        `repos/${input.repo}/issues/${input.prNumber}/labels`,
+        "--method",
+        "POST",
+        ...input.labels.flatMap((label) => ["-f", `labels[]=${label}`]),
       ],
       input.cwd,
     );
@@ -397,18 +396,17 @@ export class GhCliGitHubGateway {
       return;
     }
 
-    await this.runGh(
-      [
-        "pr",
-        "edit",
-        String(input.prNumber),
-        "--repo",
-        input.repo,
-        "--remove-label",
-        input.labels.join(","),
-      ],
-      input.cwd,
-    );
+    for (const label of input.labels) {
+      await this.runGh(
+        [
+          "api",
+          `repos/${input.repo}/issues/${input.prNumber}/labels/${encodeURIComponent(label)}`,
+          "--method",
+          "DELETE",
+        ],
+        input.cwd,
+      );
+    }
   }
 
   public async addPullRequestReviewers(input: {
@@ -423,13 +421,14 @@ export class GhCliGitHubGateway {
 
     await this.runGh(
       [
-        "pr",
-        "edit",
-        String(input.prNumber),
-        "--repo",
-        input.repo,
-        "--add-reviewer",
-        input.reviewers.join(","),
+        "api",
+        `repos/${input.repo}/pulls/${input.prNumber}/requested_reviewers`,
+        "--method",
+        "POST",
+        ...input.reviewers.flatMap((reviewer) => [
+          "-f",
+          `reviewers[]=${reviewer}`,
+        ]),
       ],
       input.cwd,
     );
@@ -611,6 +610,34 @@ export class GhCliGitHubGateway {
       cwd: cwd ?? this.options.cwd,
     });
   }
+
+  private async ensureLabelsExist(
+    repo: string,
+    labels: string[],
+    cwd?: string,
+  ): Promise<void> {
+    const uniqueLabels = labels.filter(
+      (label, index, values) => values.indexOf(label) === index,
+    );
+
+    for (const label of uniqueLabels) {
+      await this.runGh(
+        [
+          "label",
+          "create",
+          label,
+          "--repo",
+          repo,
+          "--color",
+          resolveLabelColor(label),
+          "--description",
+          resolveLabelDescription(label),
+          "--force",
+        ],
+        cwd,
+      );
+    }
+  }
 }
 
 interface ReviewThreadNode {
@@ -685,6 +712,36 @@ function parseRepo(repo: string): { owner: string; name: string } {
     throw new Error(`Invalid GitHub repo: ${repo}`);
   }
   return { owner, name };
+}
+
+function resolveLabelColor(label: string): string {
+  switch (label.trim().toLowerCase()) {
+    case "looper:plan":
+      return "5319e7";
+    case "looper:spec-reviewing":
+      return "1d76db";
+    case "looper:spec-ready":
+      return "0e8a16";
+    case "looper:needs-human":
+      return "d93f0b";
+    default:
+      return "5319e7";
+  }
+}
+
+function resolveLabelDescription(label: string): string {
+  switch (label.trim().toLowerCase()) {
+    case "looper:plan":
+      return "Picked up automatically by planner";
+    case "looper:spec-reviewing":
+      return "Spec PR is under review";
+    case "looper:spec-ready":
+      return "Spec PR is ready for implementation";
+    case "looper:needs-human":
+      return "Looper requires manual intervention";
+    default:
+      return "Managed by looper";
+  }
 }
 
 function asObject(value: string): Record<string, unknown> {
