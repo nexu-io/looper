@@ -578,6 +578,148 @@ describe("PlannerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("persists publish checkpoint after PR creation before later publish failure", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      issues: [
+        {
+          number: 123,
+          title: "Add planner flow",
+          body: "Implement planning loop",
+          url: "https://example.test/acme/looper/issues/123",
+          assignees: ["octocat"],
+          labels: ["looper:plan"],
+        },
+      ],
+      currentUserLogin: "octocat",
+    });
+    github.addPullRequestLabels = async () => {
+      throw new Error("labeling failed");
+    };
+
+    const runner = new PlannerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git: new FakeGitGateway(fixture.worktreeRoot),
+      github,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("Spec committed")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverIssues();
+    const claimed = fixture.queue.claimNext("planner-1");
+    if (!claimed) {
+      throw new Error("Expected planner queue item");
+    }
+
+    const firstResult = await runner.processClaimedItem(claimed);
+    const plannerLoop = fixture.store.loops.list()[0];
+    if (!plannerLoop) {
+      throw new Error("Expected planner loop");
+    }
+
+    expect(firstResult.status).toBe("failed");
+    expect(github.createPullRequestCalls).toHaveLength(1);
+
+    const failedRun = fixture.store.runs.listByLoop(plannerLoop.id)[0];
+    const failedCheckpoint = failedRun?.checkpointJson
+      ? JSON.parse(failedRun.checkpointJson)
+      : null;
+    expect(failedCheckpoint?.publish?.pullRequest?.number).toBe(77);
+
+    github.addPullRequestLabels = async (input) => {
+      FakeGitHubGateway.prototype.addPullRequestLabels.call(github, input);
+    };
+    fixture.queue.enqueue({
+      id: "queue_planner_retry_1",
+      projectId: "project_1",
+      loopId: plannerLoop.id,
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:123",
+      repo: "acme/looper",
+      dedupeKey: "planner:acme/looper:123:retry",
+      lockKey: "issue:acme/looper:123",
+      payloadJson: JSON.stringify({ issueNumber: 123 }),
+    });
+    const retryClaimed = fixture.queue.claimNext("planner-2");
+    if (!retryClaimed) {
+      throw new Error("Expected retry planner queue item");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaimed);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.createPullRequestCalls).toHaveLength(1);
+
+    fixture.store.close();
+  });
+
+  test("discovery does not requeue paused or completed planner loops", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      id: "loop_planner_paused",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:123",
+      repo: "acme/looper",
+      prNumber: null,
+      status: "paused",
+      configJson: null,
+      metadataJson: JSON.stringify({ specPath: "specs/123-add-planner-flow/spec.md" }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    fixture.store.loops.upsert({
+      id: "loop_planner_completed",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:124",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "completed",
+      configJson: null,
+      metadataJson: JSON.stringify({ specPath: "specs/124-add-planner-flow/spec.md" }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new PlannerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git: new FakeGitGateway(fixture.worktreeRoot),
+      github: new FakeGitHubGateway({
+        issues: [
+          { number: 123, title: "Add planner flow" },
+          { number: 124, title: "Add another planner flow" },
+        ],
+        currentUserLogin: "octocat",
+      }),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("Spec committed")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverIssues();
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(discovery.skipped).toBe(2);
+    expect(fixture.store.loops.getById("loop_planner_paused")?.status).toBe("paused");
+    expect(fixture.store.loops.getById("loop_planner_completed")?.status).toBe(
+      "completed",
+    );
+
+    fixture.store.close();
+  });
+
   test("marks the planner run failed when spec writing fails", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({

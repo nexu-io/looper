@@ -276,6 +276,14 @@ export class PlannerLoopRunner {
           createdLoopIds.push(loop.record.id);
         }
 
+        if (
+          loop.record.status === "paused" ||
+          loop.record.status === "completed"
+        ) {
+          skipped += 1;
+          continue;
+        }
+
         queueItems.push(
           this.options.scheduler.enqueue({
             projectId: project.id,
@@ -704,6 +712,7 @@ export class PlannerLoopRunner {
     checkpoint: PlannerCheckpoint;
     project: ProjectRecord;
     loop: LoopRecord;
+    run: RunRecord;
   }): Promise<PlannerCheckpoint> {
     if (input.checkpoint.skipReason) {
       return input.checkpoint;
@@ -767,6 +776,12 @@ export class PlannerLoopRunner {
           prUrl: pullRequest.url,
           prNumber: pullRequest.number ?? null,
           requestedReviewers: issue.requestedReviewers,
+        });
+
+        this.persistStepStarted(input.run, "publish", {
+          ...input.checkpoint,
+          publish,
+          resumePolicy: "advance_from_checkpoint",
         });
       }
 
@@ -1016,15 +1031,21 @@ export class PlannerLoopRunner {
     };
     const nowIso = this.nowIso();
     if (existing) {
+      const isPausedOrCompleted =
+        existing.status === "paused" || existing.status === "completed";
       const updated = {
         ...existing,
         repo: input.repo,
-        status: existing.status === "running" ? existing.status : "queued",
+        status: isPausedOrCompleted
+          ? existing.status
+          : existing.status === "running"
+            ? existing.status
+            : "queued",
         metadataJson: JSON.stringify({
           ...parseJsonObject(existing.metadataJson),
           ...metadata,
         }),
-        nextRunAt: nowIso,
+        nextRunAt: isPausedOrCompleted ? existing.nextRunAt : nowIso,
         updatedAt: nowIso,
       };
       this.options.store.loops.upsert(updated);

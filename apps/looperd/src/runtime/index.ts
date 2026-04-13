@@ -697,11 +697,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
   }
 
   private async discoverIssues(): Promise<void> {
-    if (
-      !this.store ||
-      !this.plannerRunner ||
-      this.options.enablePlanner !== true
-    ) {
+    if (!this.store || !this.plannerRunner) {
       return;
     }
 

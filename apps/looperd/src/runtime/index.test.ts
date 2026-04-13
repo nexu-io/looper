@@ -573,7 +573,7 @@ describe("createLooperdRuntime", () => {
     await runtime.stop("test");
   });
 
-  test("auto-discovers and processes planner work on startup", async () => {
+  test("auto-discovers planner work whenever planner runner exists", async () => {
     const fixture = await createFixture();
     fixture.config.agent.vendor = "opencode";
     const now = new Date(Date.now() - 1_000).toISOString();
@@ -653,7 +653,7 @@ describe("createLooperdRuntime", () => {
       git: new FakeGitGateway(),
       agentExecutor: new FakeAgentExecutor([]),
       plannerRunner: plannerRunner as never,
-      enablePlanner: true,
+      enablePlanner: false,
       enableReviewer: false,
       enableFixer: false,
     });
