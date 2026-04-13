@@ -109,6 +109,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
         isDraft: this.options.isDraft ?? false,
         reviewDecision: this.options.reviewDecision,
         labels: [...this.currentLabels],
+        headSha: this.options.headSha ?? "abc123",
         author: "octocat",
         reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
@@ -119,6 +120,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
         isDraft: true,
         reviewDecision: undefined,
         labels: [],
+        headSha: "draft123",
         author: "octocat",
         reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
@@ -970,6 +972,57 @@ describe("ReviewerLoopRunner", () => {
     expect(fixture.store.runs.listByLoop(loopId)[0]?.summary).toContain(
       "already-reviewed head",
     );
+
+    fixture.store.close();
+  });
+
+  test("does not enqueue discovery work for PRs already reviewed at the same head", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      headSha: "abc123",
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const nowIso = fixture.now.toISOString();
+
+    fixture.store.loops.upsert({
+      id: "loop_existing",
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "completed",
+      configJson: null,
+      metadataJson: JSON.stringify({ lastPublishedHeadSha: "abc123" }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(discovery.createdLoopIds).toHaveLength(0);
+    expect(discovery.skipped).toBe(3);
+    expect(fixture.queue.listScheduled()).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_existing")?.status).toBe("queued");
 
     fixture.store.close();
   });

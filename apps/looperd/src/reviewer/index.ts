@@ -226,6 +226,29 @@ export class ReviewerLoopRunner {
         createdLoopIds.push(loop.record.id);
       }
 
+      const loopMetadata = parseJsonObject(loop.record.metadataJson);
+      const lastPublishedHeadSha = readString(
+        loopMetadata.lastPublishedHeadSha,
+      );
+      if (
+        !loop.created &&
+        lastPublishedHeadSha &&
+        pullRequest.headSha &&
+        lastPublishedHeadSha === pullRequest.headSha
+      ) {
+        skipped += 1;
+        this.options.logger.info(
+          "reviewer discovery skipped already-reviewed head",
+          {
+            projectId: project.id,
+            repo: input.repo,
+            prNumber: pullRequest.number,
+            headSha: pullRequest.headSha,
+          },
+        );
+        return;
+      }
+
       queueItems.push(
         this.options.scheduler.enqueue({
           projectId: project.id,

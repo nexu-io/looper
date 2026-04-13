@@ -19,6 +19,7 @@ export interface GitHubPullRequestSummary {
   labels: string[];
   headRefName?: string;
   baseRefName?: string;
+  headSha?: string;
   author?: string;
   reviewRequests: string[];
 }
@@ -112,6 +113,7 @@ export class GhCliGitHubGateway {
         "labels",
         "headRefName",
         "baseRefName",
+        "headRefOid",
         "author",
         "reviewRequests",
       ].join(","),
@@ -129,6 +131,7 @@ export class GhCliGitHubGateway {
       labels: extractLabelNames(item.labels),
       headRefName: asOptionalString(item.headRefName),
       baseRefName: asOptionalString(item.baseRefName),
+      headSha: asOptionalString(item.headRefOid),
       author: extractAuthor(item.author),
       reviewRequests: extractReviewRequestLogins(item.reviewRequests),
     }));
