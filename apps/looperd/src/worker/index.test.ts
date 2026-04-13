@@ -307,6 +307,75 @@ function createCapturingLogger() {
 }
 
 describe("WorkerLoopRunner", () => {
+  function configurePullRequestWorkerLoop(
+    fixture: Awaited<ReturnType<typeof createFixture>>,
+    prNumber: number,
+  ) {
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: fixture.now.toISOString(),
+        createdAt: fixture.now.toISOString(),
+        updatedAt: fixture.now.toISOString(),
+      }),
+      targetType: "pull_request",
+      targetId: `pr:acme/looper:${prNumber}`,
+      repo: "acme/looper",
+      prNumber,
+      metadataJson: JSON.stringify({
+        executionMode: "push-existing",
+        prUrl: `https://example.test/acme/looper/pull/${prNumber}`,
+      }),
+      updatedAt: fixture.now.toISOString(),
+    });
+    fixture.store.queue.upsert({
+      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
+        id: "queue_pr_mode",
+        projectId: "project_1",
+        loopId: "loop_worker_1",
+        type: "worker",
+        targetType: "pull_request",
+        targetId: `pr:acme/looper:${prNumber}`,
+        repo: "acme/looper",
+        prNumber,
+        dedupeKey: "worker:loop_worker_1",
+        priority: 0,
+        status: "queued",
+        availableAt: fixture.now.toISOString(),
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: `pr:acme/looper:${prNumber}`,
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: fixture.now.toISOString(),
+        updatedAt: fixture.now.toISOString(),
+      }),
+      type: "worker",
+      targetType: "pull_request",
+      targetId: `pr:acme/looper:${prNumber}`,
+      repo: "acme/looper",
+      prNumber,
+      lockKey: `pr:acme/looper:${prNumber}`,
+      payloadJson: null,
+      updatedAt: fixture.now.toISOString(),
+    });
+  }
+
   test("processNext does not claim queue items for other loop types", async () => {
     const fixture = await createFixture();
     const nowIso = fixture.now.toISOString();
@@ -501,69 +570,7 @@ describe("WorkerLoopRunner", () => {
 
   test("discovers spec-ready PRs and pushes to the existing PR branch", async () => {
     const fixture = await createFixture();
-    fixture.store.loops.upsert({
-      ...(fixture.store.loops.getById("loop_worker_1") ?? {
-        id: "loop_worker_1",
-        projectId: "project_1",
-        type: "worker",
-        targetType: "project",
-        targetId: "project_1",
-        repo: "acme/looper",
-        prNumber: null,
-        status: "queued",
-        configJson: null,
-        metadataJson: null,
-        lastRunAt: null,
-        nextRunAt: fixture.now.toISOString(),
-        createdAt: fixture.now.toISOString(),
-        updatedAt: fixture.now.toISOString(),
-      }),
-      targetType: "pull_request",
-      targetId: "pr:acme/looper:77",
-      repo: "acme/looper",
-      prNumber: 77,
-      metadataJson: JSON.stringify({
-        executionMode: "push-existing",
-        prUrl: "https://example.test/acme/looper/pull/77",
-      }),
-      updatedAt: fixture.now.toISOString(),
-    });
-    fixture.store.queue.upsert({
-      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
-        id: "queue_pr_mode",
-        projectId: "project_1",
-        loopId: "loop_worker_1",
-        type: "worker",
-        targetType: "pull_request",
-        targetId: "pr:acme/looper:77",
-        repo: "acme/looper",
-        prNumber: 77,
-        dedupeKey: "worker:loop_worker_1",
-        priority: 0,
-        status: "queued",
-        availableAt: fixture.now.toISOString(),
-        attempts: 0,
-        maxAttempts: 3,
-        claimedBy: null,
-        claimedAt: null,
-        startedAt: null,
-        finishedAt: null,
-        lockKey: "pr:acme/looper:77",
-        payloadJson: null,
-        lastError: null,
-        lastErrorKind: null,
-        createdAt: fixture.now.toISOString(),
-        updatedAt: fixture.now.toISOString(),
-      }),
-      type: "worker",
-      targetType: "pull_request",
-      targetId: "pr:acme/looper:77",
-      repo: "acme/looper",
-      prNumber: 77,
-      lockKey: "pr:acme/looper:77",
-      payloadJson: null,
-      updatedAt: fixture.now.toISOString(),
-    });
+    configurePullRequestWorkerLoop(fixture, 77);
 
     const git = new FakeGitGateway(fixture.worktreeRoot);
     const github = new FakeGitHubGateway();
@@ -633,6 +640,102 @@ describe("WorkerLoopRunner", () => {
         reviewers: ["octocat"],
       },
     ]);
+
+    fixture.store.close();
+  });
+
+  test("keeps spec-ready label when pull_request mode has no resolved spec path", async () => {
+    const fixture = await createFixture();
+    configurePullRequestWorkerLoop(fixture, 78);
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.viewPullRequest = async (input) => ({
+      number: input.prNumber,
+      title: "Missing spec",
+      body: "No spec here",
+      url: `https://example.test/${input.repo}/pull/${input.prNumber}`,
+      state: "OPEN",
+      isDraft: false,
+      reviewDecision: undefined,
+      labels: ["looper:spec-ready"],
+      headRefName: "feature/missing-spec",
+      baseRefName: "main",
+      headSha: "abc123",
+      baseSha: "base123",
+      author: "octocat",
+      reviewRequests: ["octocat"],
+      comments: [],
+      reviews: [],
+      checks: [{ conclusion: "SUCCESS" }],
+    });
+
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("manual_intervention");
+    expect(github.removedLabels).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
+  test("keeps spec-ready label when pull_request lock acquisition fails", async () => {
+    const fixture = await createFixture();
+    configurePullRequestWorkerLoop(fixture, 79);
+    fixture.queue.acquireBusinessLock({
+      key: "pr:acme/looper:79",
+      owner: "other-worker",
+      reason: "test-lock",
+      expiresAt: new Date(fixture.now.getTime() + 60_000).toISOString(),
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("retryable_transient");
+    expect(github.removedLabels).toHaveLength(0);
 
     fixture.store.close();
   });

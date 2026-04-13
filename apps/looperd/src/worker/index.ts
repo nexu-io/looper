@@ -488,6 +488,12 @@ export class WorkerLoopRunner {
     loop: LoopRecord;
     project: ProjectRecord;
   }): Promise<WorkerCheckpoint> {
+    let pullRequestTarget:
+      | {
+          repo: string;
+          prNumber: number;
+        }
+      | undefined;
     let work =
       input.checkpoint.work ??
       this.resolveWorkerInput(
@@ -504,16 +510,11 @@ export class WorkerLoopRunner {
           "non_retryable",
         );
       }
+      pullRequestTarget = { repo, prNumber };
 
       const detail = await this.options.github.viewPullRequest({
         repo,
         prNumber,
-        cwd: input.project.repoPath,
-      });
-      await this.options.github.removePullRequestLabels({
-        repo,
-        prNumber,
-        labels: [SPEC_READY_LABEL],
         cwd: input.project.repoPath,
       });
       work = {
@@ -555,6 +556,15 @@ export class WorkerLoopRunner {
         `Worker lock is already held for ${lockKey}`,
         "retryable_transient",
       );
+    }
+
+    if (pullRequestTarget) {
+      await this.options.github.removePullRequestLabels({
+        repo: pullRequestTarget.repo,
+        prNumber: pullRequestTarget.prNumber,
+        labels: [SPEC_READY_LABEL],
+        cwd: input.project.repoPath,
+      });
     }
 
     return {
