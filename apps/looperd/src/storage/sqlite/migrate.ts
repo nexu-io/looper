@@ -87,14 +87,26 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
       try {
         if (usesForeignKeyPragma(sql)) {
           const previousForeignKeysSetting = readForeignKeysSetting(this.db);
+          const migrationForeignKeysSetting = readFirstForeignKeysPragma(sql);
 
           try {
-            this.db.exec(sql);
-            this.db
-              .query(
-                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-              )
-              .run(migration.id, this.now().toISOString());
+            if (
+              typeof migrationForeignKeysSetting === "boolean" &&
+              migrationForeignKeysSetting !== previousForeignKeysSetting
+            ) {
+              this.db.exec(
+                `PRAGMA foreign_keys = ${migrationForeignKeysSetting ? "ON" : "OFF"}`,
+              );
+            }
+
+            this.db.transaction(() => {
+              this.db.exec(sql);
+              this.db
+                .query(
+                  "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                )
+                .run(migration.id, this.now().toISOString());
+            })();
           } finally {
             this.db.exec(
               `PRAGMA foreign_keys = ${previousForeignKeysSetting ? "ON" : "OFF"}`,
@@ -165,6 +177,15 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
 
 function usesForeignKeyPragma(sql: string): boolean {
   return /PRAGMA\s+foreign_keys\s*=\s*(ON|OFF)\s*;/i.test(sql);
+}
+
+function readFirstForeignKeysPragma(sql: string): boolean | undefined {
+  const match = sql.match(/PRAGMA\s+foreign_keys\s*=\s*(ON|OFF)\s*;/i);
+  if (!match) {
+    return undefined;
+  }
+
+  return match[1]?.toUpperCase() === "ON";
 }
 
 function readForeignKeysSetting(db: Database): boolean {

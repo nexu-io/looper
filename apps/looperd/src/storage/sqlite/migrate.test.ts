@@ -163,4 +163,49 @@ describe("createMigrationRunner", () => {
 
     db.close(false);
   });
+
+  test("rolls back foreign key pragma migration side effects on failure", async () => {
+    const fixture = await createFixture("looper-migrate-fk-fail-");
+
+    await Bun.write(
+      join(fixture.migrationsDir, "0001_init.sql"),
+      "CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL);",
+    );
+    await Bun.write(
+      join(fixture.migrationsDir, "0002_partial_fail.sql"),
+      [
+        "PRAGMA foreign_keys = OFF;",
+        "CREATE TABLE tmp_widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL);",
+        "INSERT INTO tmp_widgets (id, name) VALUES ('w_1', 'alpha');",
+        "INSERT INTO definitely_missing_table (id) VALUES ('x');",
+        "PRAGMA foreign_keys = ON;",
+      ].join("\n"),
+    );
+
+    const db = new Database(fixture.dbPath, { create: true });
+    const initialForeignKeys = db.query("PRAGMA foreign_keys;").get();
+    const runner = createMigrationRunner(db, {
+      migrationsDir: fixture.migrationsDir,
+      now: () => new Date("2026-04-11T10:20:30.000Z"),
+    });
+
+    expect(() => runner.runPending()).toThrow(
+      "Migration failed (0002_partial_fail.sql)",
+    );
+
+    expect(
+      db
+        .query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .get("tmp_widgets"),
+    ).toBeNull();
+    expect(runner.status().applied.map((migration) => migration.id)).toEqual([
+      "0001_init",
+    ]);
+    expect(runner.listPending()).toEqual(["0002_partial_fail"]);
+    expect(db.query("PRAGMA foreign_keys;").get()).toEqual(initialForeignKeys);
+
+    db.close(false);
+  });
 });

@@ -10,6 +10,7 @@ import type {
   SubmitReviewInput,
 } from "../infra/github";
 import {
+  hasLabel,
   SPEC_READY_LABEL,
   SPEC_REVIEWING_LABEL,
   isSpecReviewClean,
@@ -838,6 +839,9 @@ export class ReviewerLoopRunner {
       cwd: input.project.repoPath,
     });
     const phase = resolvePullRequestPhase({ labels: detail.labels });
+    const checkpointPhase = resolvePullRequestPhase({
+      labels: input.checkpoint.detail?.labels,
+    });
     if (detail.headSha && detail.headSha !== pendingReview.headSha) {
       throw new ReviewerLoopError(
         `PR head changed before publish: expected ${pendingReview.headSha}, got ${detail.headSha}`,
@@ -864,19 +868,26 @@ export class ReviewerLoopRunner {
       );
     }
 
-    if (phase === "spec" && isSpecReviewClean(detail)) {
-      await this.options.github.removePullRequestLabels({
-        repo,
-        prNumber,
-        labels: [SPEC_REVIEWING_LABEL],
-        cwd: input.project.repoPath,
-      });
-      await this.options.github.addPullRequestLabels({
-        repo,
-        prNumber,
-        labels: [SPEC_READY_LABEL],
-        cwd: input.project.repoPath,
-      });
+    const shouldPromoteSpecLabel =
+      (phase === "spec" || checkpointPhase === "spec") &&
+      isSpecReviewClean(detail);
+    if (shouldPromoteSpecLabel) {
+      if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
+        await this.options.github.removePullRequestLabels({
+          repo,
+          prNumber,
+          labels: [SPEC_REVIEWING_LABEL],
+          cwd: input.project.repoPath,
+        });
+      }
+      if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
+        await this.options.github.addPullRequestLabels({
+          repo,
+          prNumber,
+          labels: [SPEC_READY_LABEL],
+          cwd: input.project.repoPath,
+        });
+      }
     }
 
     this.updateLoop(input.loop, {

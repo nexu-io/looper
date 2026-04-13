@@ -192,6 +192,7 @@ interface FixerCheckpoint {
   detail?: {
     state?: string;
     isDraft?: boolean;
+    labels?: string[];
     headSha?: string;
     headRefName?: string;
     baseRefName?: string;
@@ -682,6 +683,7 @@ export class FixerLoopRunner {
       detail: {
         state: detail.state,
         isDraft: detail.isDraft,
+        labels: detail.labels,
         headSha: detail.headSha,
         headRefName: detail.headRefName,
         baseRefName: detail.baseRefName,
@@ -1360,22 +1362,31 @@ export class FixerLoopRunner {
         prNumber,
         cwd: input.project.repoPath,
       });
+      const checkpointHadSpecReviewing = hasLabel(
+        input.checkpoint.detail?.labels,
+        SPEC_REVIEWING_LABEL,
+      );
       if (
-        hasLabel(detail.labels, SPEC_REVIEWING_LABEL) &&
+        (hasLabel(detail.labels, SPEC_REVIEWING_LABEL) ||
+          checkpointHadSpecReviewing) &&
         isSpecReviewClean(detail)
       ) {
-        await this.options.github.removePullRequestLabels({
-          repo,
-          prNumber,
-          labels: [SPEC_REVIEWING_LABEL],
-          cwd: input.project.repoPath,
-        });
-        await this.options.github.addPullRequestLabels({
-          repo,
-          prNumber,
-          labels: [SPEC_READY_LABEL],
-          cwd: input.project.repoPath,
-        });
+        if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
+          await this.options.github.removePullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_REVIEWING_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
+        if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
+          await this.options.github.addPullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_READY_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
       }
       return {
         ...input.checkpoint,
