@@ -1643,7 +1643,17 @@ function requirePullRequestTarget(
       `Pull request not found: ${input.repo}#${input.prNumber}`,
     );
   }
-  if (snapshot.projectId !== input.projectId) {
+  const project = context.store.projects.getById(input.projectId);
+  if (!project) {
+    throw new ApiError(
+      "PROJECT_NOT_FOUND",
+      404,
+      `Project not found: ${input.projectId}`,
+    );
+  }
+
+  const projectMetadata = parseMetadata(project.metadataJson);
+  if (readString(projectMetadata.repo) !== input.repo) {
     throw new ApiError(
       "PULL_REQUEST_PROJECT_MISMATCH",
       409,

@@ -880,6 +880,15 @@ async function resolveProjectForWork(
         `Multiple projects match repo ${hint.repo}; pass --project <projectId>`,
       );
     }
+
+    const projectFromCwd = inferProjectFromCwd(context.cwd, projects);
+    if (
+      projectFromCwd &&
+      (projectFromCwd.repo == null || projectFromCwd.repo === hint.repo)
+    ) {
+      return projectFromCwd;
+    }
+
     if (hint.requireRepoMatch) {
       throw new Error(
         `Project not found for repo ${hint.repo}; pass --project <projectId>`,
