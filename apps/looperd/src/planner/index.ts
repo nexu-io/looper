@@ -327,6 +327,7 @@ export class PlannerLoopRunner {
       resumedRun.startStep !== "discover-issues"
         ? checkpoint.claimedLockKey
         : undefined;
+    let acquiredClaimedLock = false;
 
     if (claimedLockKey) {
       const acquired = this.options.scheduler.acquireBusinessLock({
@@ -343,6 +344,8 @@ export class PlannerLoopRunner {
           "retryable_transient",
         );
       }
+
+      acquiredClaimedLock = true;
     }
 
     this.updateLoop(loop, {
@@ -380,6 +383,7 @@ export class PlannerLoopRunner {
 
         if (step === "discover-issues") {
           claimedLockKey = checkpoint.claimedLockKey;
+          acquiredClaimedLock = Boolean(claimedLockKey);
         }
 
         run = this.persistStepCompleted(run, step, checkpoint);
@@ -456,7 +460,7 @@ export class PlannerLoopRunner {
         failureKind: failure.kind,
       };
     } finally {
-      if (claimedLockKey) {
+      if (acquiredClaimedLock && claimedLockKey) {
         this.options.scheduler.releaseBusinessLock(claimedLockKey);
       }
     }

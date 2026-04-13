@@ -77,6 +77,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
   }> = [];
   public submitFailuresRemaining = 0;
   public addLabelFailuresRemaining = 0;
+  public nextReviewDecisionAfterSubmit: string | undefined;
   private readonly currentLabels: string[];
 
   constructor(
@@ -196,6 +197,11 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     if (this.submitFailuresRemaining > 0) {
       this.submitFailuresRemaining -= 1;
       throw new Error("temporary GitHub failure");
+    }
+
+    if (this.nextReviewDecisionAfterSubmit !== undefined) {
+      this.options.reviewDecision = this.nextReviewDecisionAfterSubmit;
+      this.nextReviewDecisionAfterSubmit = undefined;
     }
   }
 
@@ -510,8 +516,10 @@ describe("ReviewerLoopRunner", () => {
       labels: ["looper:spec-reviewing"],
       reviewRequests: [],
       currentUserLogin: "someone-else",
+      reviewDecision: "CHANGES_REQUESTED",
     });
     github.submitFailuresRemaining = 1;
+    github.nextReviewDecisionAfterSubmit = "APPROVED";
     const agent = new FakeAgentExecutor([
       completedAgentResult("Spec looks ready to implement"),
     ]);

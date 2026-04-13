@@ -858,12 +858,24 @@ export class ReviewerLoopRunner {
         cwd: input.project.repoPath,
       });
 
+      let postSubmitDetail = detail;
+      if (
+        reviewEvent === "APPROVE" &&
+        (phase === "spec" || checkpointPhase === "spec")
+      ) {
+        postSubmitDetail = await this.options.github.viewPullRequest({
+          repo,
+          prNumber,
+          cwd: input.project.repoPath,
+        });
+      }
+
       const shouldPromoteSpecLabel =
         reviewEvent === "APPROVE" &&
         (phase === "spec" || checkpointPhase === "spec") &&
-        isSpecReviewClean(detail);
+        isSpecReviewClean(postSubmitDetail);
       if (shouldPromoteSpecLabel) {
-        if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
+        if (hasLabel(postSubmitDetail.labels, SPEC_REVIEWING_LABEL)) {
           await this.options.github.removePullRequestLabels({
             repo,
             prNumber,
@@ -871,7 +883,7 @@ export class ReviewerLoopRunner {
             cwd: input.project.repoPath,
           });
         }
-        if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
+        if (!hasLabel(postSubmitDetail.labels, SPEC_READY_LABEL)) {
           await this.options.github.addPullRequestLabels({
             repo,
             prNumber,
