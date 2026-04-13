@@ -899,11 +899,9 @@ async function resolveProjectForWork(
       return projectFromCwd;
     }
 
-    if (hint.requireRepoMatch) {
-      throw new Error(
-        `Project not found for repo ${hint.repo}; pass --project <projectId>`,
-      );
-    }
+    throw new Error(
+      `Project not found for repo ${hint.repo}; pass --project <projectId>`,
+    );
   }
 
   const projectFromCwd = inferProjectFromCwd(context.cwd, projects);

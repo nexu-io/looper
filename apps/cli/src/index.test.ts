@@ -162,6 +162,55 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"projectId":"project_inferred"');
   });
 
+  test("fails work create when --repo has no matching project instead of falling back to cwd", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      [
+        "work",
+        "--spec",
+        "spec.md",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/other",
+        "--base-branch",
+        "main",
+      ],
+      {
+        cwd: "/tmp/repos/looper/packages/cli",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_missing_repo_hint",
+                data: {
+                  items: [
+                    {
+                      id: "project_cwd",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(JSON.stringify({ ok: true, requestId: "unexpected" }));
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(workerRequestCount).toBe(0);
+  });
+
   test("creates worker from numeric --pr input", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(["work", "--pr", "42"], {
