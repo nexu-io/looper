@@ -1298,7 +1298,7 @@ function resolveLoop(context: LooperdApiContext, selector: string): LoopRecord {
 }
 
 function buildLoopLogsResponse(context: LooperdApiContext, loop: LoopRecord) {
-  const latestRun = context.store.runs.listByLoop(loop.id)[0] ?? null;
+  const latestRun = context.store.runs.getLatestByLoopId(loop.id);
   const latestAgent = latestRun
     ? context.store.agentExecutions.getLatestByRunId(latestRun.id)
     : null;

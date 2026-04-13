@@ -219,6 +219,14 @@ export class SqliteStore implements Store {
         .get(id) as Record<string, unknown> | null;
       return row ? mapRun(row) : null;
     },
+    getLatestByLoopId: (loopId: string): RunRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM runs WHERE loop_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .get(loopId) as Record<string, unknown> | null;
+      return row ? mapRun(row) : null;
+    },
     list: (): RunRecord[] => {
       const rows = this.coordinator.db
         .query("SELECT * FROM runs ORDER BY started_at DESC")

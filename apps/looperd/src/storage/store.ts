@@ -34,6 +34,7 @@ export interface Store {
   runs: {
     upsert(record: RunRecord): void;
     getById(id: string): RunRecord | null;
+    getLatestByLoopId(loopId: string): RunRecord | null;
     list(): RunRecord[];
     listByStatus(status: RunRecord["status"]): RunRecord[];
     listByLoop(loopId: string): RunRecord[];

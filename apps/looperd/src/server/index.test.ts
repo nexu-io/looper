@@ -1270,6 +1270,22 @@ describe("createLooperdApi", () => {
   test("resolves loop routes by seq and returns logs envelopes", async () => {
     const { api, store, rootDir } = await createFixture();
 
+    store.runs.upsert({
+      id: "run_2",
+      loopId: "loop_1",
+      status: "completed",
+      currentStep: null,
+      lastCompletedStep: "execute",
+      checkpointJson: null,
+      summary: "latest run",
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:15.000Z",
+      lastHeartbeatAt: "2026-04-11T12:00:20.000Z",
+      endedAt: "2026-04-11T12:00:20.000Z",
+      createdAt: "2026-04-11T12:00:15.000Z",
+      updatedAt: "2026-04-11T12:00:20.000Z",
+    });
+
     store.agentExecutions.upsert({
       id: "agent_exec_1",
       projectId: "project_1",
@@ -1297,7 +1313,7 @@ describe("createLooperdApi", () => {
       id: "agent_exec_2",
       projectId: "project_1",
       loopId: "loop_1",
-      runId: "run_1",
+      runId: "run_2",
       vendor: "opencode",
       status: "completed",
       pid: 778,

@@ -318,6 +318,7 @@ describe("SqliteStore", () => {
     expect(store.loops.getById("loop_1")?.repo).toBe("acme/looper");
     expect(store.loops.getById("loop_1")?.projectId).toBe("project_1");
     expect(store.runs.listByLoop("loop_1")).toHaveLength(1);
+    expect(store.runs.getLatestByLoopId("loop_1")?.id).toBe("run_1");
     expect(
       store.pullRequestSnapshots.getLatest("acme/looper", 42)?.headSha,
     ).toBe("abc123");
