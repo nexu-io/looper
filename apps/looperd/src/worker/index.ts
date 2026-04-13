@@ -437,6 +437,11 @@ export class WorkerLoopRunner {
         createdLoopIds.push(loop.record.id);
       }
 
+      if (loop.record.status === "paused") {
+        skipped += 1;
+        continue;
+      }
+
       queueItems.push(
         this.options.scheduler.enqueue({
           projectId: project.id,
