@@ -602,7 +602,9 @@ describe("PlannerLoopRunner", () => {
       scheduler: fixture.queue,
       git: new FakeGitGateway(fixture.worktreeRoot),
       github,
-      agentExecutor: new FakeAgentExecutor([completedAgentResult("Spec committed")]),
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Spec committed"),
+      ]),
       logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
@@ -669,7 +671,9 @@ describe("PlannerLoopRunner", () => {
       prNumber: null,
       status: "paused",
       configJson: null,
-      metadataJson: JSON.stringify({ specPath: "specs/123-add-planner-flow/spec.md" }),
+      metadataJson: JSON.stringify({
+        specPath: "specs/123-add-planner-flow/spec.md",
+      }),
       lastRunAt: nowIso,
       nextRunAt: null,
       createdAt: nowIso,
@@ -685,7 +689,9 @@ describe("PlannerLoopRunner", () => {
       prNumber: 77,
       status: "completed",
       configJson: null,
-      metadataJson: JSON.stringify({ specPath: "specs/124-add-planner-flow/spec.md" }),
+      metadataJson: JSON.stringify({
+        specPath: "specs/124-add-planner-flow/spec.md",
+      }),
       lastRunAt: nowIso,
       nextRunAt: null,
       createdAt: nowIso,
@@ -703,7 +709,9 @@ describe("PlannerLoopRunner", () => {
         ],
         currentUserLogin: "octocat",
       }),
-      agentExecutor: new FakeAgentExecutor([completedAgentResult("Spec committed")]),
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Spec committed"),
+      ]),
       logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
@@ -712,7 +720,9 @@ describe("PlannerLoopRunner", () => {
 
     expect(discovery.queueItems).toHaveLength(0);
     expect(discovery.skipped).toBe(2);
-    expect(fixture.store.loops.getById("loop_planner_paused")?.status).toBe("paused");
+    expect(fixture.store.loops.getById("loop_planner_paused")?.status).toBe(
+      "paused",
+    );
     expect(fixture.store.loops.getById("loop_planner_completed")?.status).toBe(
       "completed",
     );

@@ -411,17 +411,18 @@ export class PlannerLoopRunner {
       };
     } catch (error) {
       const failure = this.classifyFailure(error);
+      const failedCheckpoint = this.getLatestCheckpoint(run, checkpoint);
       this.finalizeRun(run, {
         status: "failed",
         summary: failure.message,
         checkpoint: {
-          ...checkpoint,
+          ...failedCheckpoint,
           resumePolicy:
             failure.kind === "retryable_after_resume"
               ? "advance_from_checkpoint"
               : failure.kind === "manual_intervention"
                 ? "manual_intervention"
-                : (checkpoint.resumePolicy ?? "replay_step"),
+                : (failedCheckpoint.resumePolicy ?? "replay_step"),
         },
         errorMessage: failure.message,
       });
@@ -1003,6 +1004,18 @@ export class PlannerLoopRunner {
     };
     this.options.store.runs.upsert(updated);
     return updated;
+  }
+
+  private getLatestCheckpoint(
+    run: RunRecord,
+    fallback: PlannerCheckpoint,
+  ): PlannerCheckpoint {
+    const persistedRun = this.options.store.runs.getById(run.id);
+
+    return (
+      parseCheckpoint(persistedRun?.checkpointJson ?? run.checkpointJson) ??
+      fallback
+    );
   }
 
   private ensureLoopForIssue(input: {
