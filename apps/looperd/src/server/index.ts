@@ -631,7 +631,7 @@ async function buildWorkersCreateResponse(
       ? buildWorkerPullRequestDedupeKey(projectId, repo, effectivePrNumber)
       : `worker:${loop.id}`,
     lockKey: effectivePrNumber
-      ? buildPullRequestLockKey(repo, effectivePrNumber)
+      ? buildWorkerPullRequestLockKey(projectId, repo, effectivePrNumber)
       : `worker:${loop.id}`,
     payloadJson: JSON.stringify(payload),
   });
@@ -1752,8 +1752,12 @@ function buildWorkerPullRequestDedupeKey(
   return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
-function buildPullRequestLockKey(repo: string, prNumber: number): string {
-  return `pr:${repo}:${prNumber}`;
+function buildWorkerPullRequestLockKey(
+  projectId: string,
+  repo: string,
+  prNumber: number,
+): string {
+  return `worker-pr:${projectId}:${repo}:${prNumber}`;
 }
 
 function deriveProjectIdFromPath(repoPath: string): string {

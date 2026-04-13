@@ -456,7 +456,11 @@ export class WorkerLoopRunner {
             input.repo,
             pullRequest.number,
           ),
-          lockKey: buildPullRequestLockKey(input.repo, pullRequest.number),
+          lockKey: buildWorkerPullRequestLockKey(
+            project.id,
+            input.repo,
+            pullRequest.number,
+          ),
         }),
       );
     }
@@ -549,7 +553,11 @@ export class WorkerLoopRunner {
     const lockKey =
       input.queueItem.lockKey ??
       (work.executionMode === "push-existing" && work.prNumber
-        ? buildPullRequestLockKey(work.repo, work.prNumber)
+        ? buildWorkerPullRequestLockKey(
+            input.project.id,
+            work.repo,
+            work.prNumber,
+          )
         : `worker:${input.loop.id}`);
     const acquired = this.options.scheduler.acquireBusinessLock({
       key: lockKey,
@@ -1423,8 +1431,12 @@ function buildWorkerPullRequestDedupeKey(
   return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
-function buildPullRequestLockKey(repo: string, prNumber: number): string {
-  return `pr:${repo}:${prNumber}`;
+function buildWorkerPullRequestLockKey(
+  projectId: string,
+  repo: string,
+  prNumber: number,
+): string {
+  return `worker-pr:${projectId}:${repo}:${prNumber}`;
 }
 
 function normalizePrState(value: string | undefined): "open" | "other" {
