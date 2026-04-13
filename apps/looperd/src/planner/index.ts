@@ -546,7 +546,7 @@ export class PlannerLoopRunner {
           assignees: detail.assignees,
           labels: detail.labels,
           currentUserLogin,
-          specPath: buildSpecPath(this.now(), detail.title),
+          specPath: buildSpecPath(this.now(), issueNumber, detail.title),
           requestedReviewers: [],
         },
         claimedLockKey: lockKey,
@@ -569,7 +569,7 @@ export class PlannerLoopRunner {
           assignees: detail.assignees,
           labels: detail.labels,
           currentUserLogin,
-          specPath: buildSpecPath(this.now(), detail.title),
+          specPath: buildSpecPath(this.now(), issueNumber, detail.title),
           requestedReviewers: [],
         },
         claimedLockKey: lockKey,
@@ -589,7 +589,7 @@ export class PlannerLoopRunner {
         assignees: detail.assignees,
         labels: detail.labels,
         currentUserLogin,
-        specPath: buildSpecPath(this.now(), detail.title),
+        specPath: buildSpecPath(this.now(), issueNumber, detail.title),
         requestedReviewers: this.resolveRequestedReviewers({
           project: input.project,
           loop: input.loop,
@@ -1047,7 +1047,7 @@ export class PlannerLoopRunner {
       issueUrl: input.issue.url,
       issueNumber: input.issue.number,
       currentUserLogin: input.currentUserLogin,
-      specPath: buildSpecPath(this.now(), input.issue.title),
+      specPath: buildSpecPath(this.now(), input.issueNumber, input.issue.title),
     };
     const nowIso = this.nowIso();
     if (existing) {
@@ -1368,8 +1368,8 @@ function buildPlannerBranch(issueNumber: number, title: string): string {
   return `looper/planner/${issueNumber}-${buildPlannerSlug(title)}`;
 }
 
-function buildSpecPath(now: Date, title: string): string {
-  return `specs/${formatDatePrefix(now)}-${buildPlannerSlug(title)}.md`;
+function buildSpecPath(now: Date, issueNumber: number, title: string): string {
+  return `specs/${formatDatePrefix(now)}-${issueNumber}-${buildPlannerSlug(title)}.md`;
 }
 
 async function buildPlannerPrompt(input: {
