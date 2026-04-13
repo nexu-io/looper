@@ -521,29 +521,39 @@ async function buildWorkersCreateResponse(
   }
 
   const body = await parseJsonBody(request);
-  const projectId = readRequiredString(body, "projectId");
-  const project = context.store.projects.getById(projectId);
-  if (!project) {
-    throw new ApiError(
-      "PROJECT_NOT_FOUND",
-      404,
-      `Project not found: ${projectId}`,
-    );
-  }
-
+  const requestedProjectId = readOptionalString(body, "projectId");
+  const requestedRepo = readOptionalString(body, "repo");
   const prompt = readOptionalString(body, "prompt");
   const specPath = readOptionalString(body, "specPath");
-  if (!prompt && !specPath) {
+  const prNumber = readOptionalPositiveInteger(body, "prNumber");
+  const issueNumber = readOptionalPositiveInteger(body, "issueNumber");
+  const modeCount =
+    Number(Boolean(prNumber)) +
+    Number(Boolean(issueNumber)) +
+    Number(Boolean(prompt || specPath));
+  if (modeCount === 0) {
     throw new ApiError(
       "VALIDATION_FAILED",
       400,
-      "prompt or specPath is required",
+      "prompt or specPath is required unless prNumber or issueNumber is provided",
+    );
+  }
+  if (modeCount > 1) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      "worker accepts exactly one input mode: prompt/specPath, prNumber, or issueNumber",
     );
   }
 
+  const project = resolveWorkerProject(context, {
+    projectId: requestedProjectId,
+    repo: requestedRepo,
+    prNumber,
+  });
+  const projectId = project.id;
   const projectMetadata = parseMetadata(project.metadataJson);
-  const repo =
-    readOptionalString(body, "repo") ?? readString(projectMetadata.repo);
+  const repo = requestedRepo ?? readString(projectMetadata.repo);
   const baseBranch =
     readOptionalString(body, "baseBranch") ?? project.baseBranch ?? null;
   if (!repo) {
@@ -553,48 +563,83 @@ async function buildWorkersCreateResponse(
     throw new ApiError("VALIDATION_FAILED", 400, "baseBranch is required");
   }
 
+  const pullRequestTarget =
+    prNumber == null
+      ? null
+      : requirePullRequestTarget(context, {
+          projectId,
+          repo,
+          prNumber,
+        });
+  const planner =
+    issueNumber == null
+      ? null
+      : findPlannerLoopForIssue(context, {
+          projectId,
+          repo,
+          issueNumber,
+        });
+  const effectivePrNumber =
+    pullRequestTarget?.prNumber ?? planner?.prNumber ?? null;
+  const effectiveSpecPath = specPath ?? planner?.specPath ?? null;
   const title =
     readOptionalString(body, "title") ??
-    deriveWorkerTitle({ prompt, specPath });
+    deriveWorkerTitle({
+      prompt,
+      specPath: effectiveSpecPath,
+      repo,
+      prNumber: effectivePrNumber,
+      issueNumber,
+    });
   const now = new Date().toISOString();
   const payload = {
     title,
     prompt,
-    specPath,
+    specPath: effectiveSpecPath,
     repo,
     baseBranch,
+    ...(effectivePrNumber ? { prNumber: effectivePrNumber } : {}),
   };
   const loop = createLoopRecord({
     context,
     projectId,
     type: "worker",
-    targetType: "project",
-    targetId: projectId,
+    targetType: effectivePrNumber ? "pull_request" : "project",
+    targetId: effectivePrNumber ? `pr:${repo}:${effectivePrNumber}` : projectId,
+    repo,
+    prNumber: effectivePrNumber ?? undefined,
     status: "running",
     now,
     metadataJson: JSON.stringify({ worker: payload }),
   });
 
-  new SchedulerQueue({
+  const scheduler = new SchedulerQueue({
     store: context.store,
     retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
     retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
     now: () => new Date(now),
-  }).enqueue({
+  });
+  scheduler.enqueue({
     projectId,
     loopId: loop.id,
     type: "worker",
-    targetType: "project",
-    targetId: projectId,
+    targetType: effectivePrNumber ? "pull_request" : "project",
+    targetId: effectivePrNumber ? `pr:${repo}:${effectivePrNumber}` : projectId,
     repo,
-    dedupeKey: `worker:${loop.id}`,
-    lockKey: `worker:${loop.id}`,
+    ...(effectivePrNumber ? { prNumber: effectivePrNumber } : {}),
+    dedupeKey: effectivePrNumber
+      ? buildWorkerPullRequestDedupeKey(repo, effectivePrNumber)
+      : `worker:${loop.id}`,
+    lockKey: effectivePrNumber
+      ? buildPullRequestLockKey(repo, effectivePrNumber)
+      : `worker:${loop.id}`,
     payloadJson: JSON.stringify(payload),
   });
 
   return {
     ...loop,
     ...payload,
+    ...(issueNumber ? { issueNumber } : {}),
   };
 }
 
@@ -1519,15 +1564,156 @@ function parseMetadata(metadataJson?: string | null): Record<string, unknown> {
     : {};
 }
 
+function resolveWorkerProject(
+  context: LooperdApiContext,
+  input: {
+    projectId: string | null;
+    repo: string | null;
+    prNumber: number | null;
+  },
+) {
+  if (input.projectId) {
+    const project = context.store.projects.getById(input.projectId);
+    if (!project) {
+      throw new ApiError(
+        "PROJECT_NOT_FOUND",
+        404,
+        `Project not found: ${input.projectId}`,
+      );
+    }
+    return project;
+  }
+
+  if (input.repo && input.prNumber) {
+    const snapshot = context.store.pullRequestSnapshots.getLatest(
+      input.repo,
+      input.prNumber,
+    );
+    if (snapshot) {
+      const project = context.store.projects.getById(snapshot.projectId);
+      if (project) {
+        return project;
+      }
+    }
+  }
+
+  if (input.repo) {
+    const matches = context.store.projects.list().filter((project) => {
+      const metadata = parseMetadata(project.metadataJson);
+      return readString(metadata.repo) === input.repo;
+    });
+    if (matches.length === 1) {
+      const project = matches[0];
+      if (project) {
+        return project;
+      }
+    }
+    if (matches.length > 1) {
+      throw new ApiError(
+        "PROJECT_AMBIGUOUS",
+        409,
+        `Multiple projects match repo ${input.repo}; pass projectId explicitly`,
+      );
+    }
+  }
+
+  throw new ApiError(
+    "VALIDATION_FAILED",
+    400,
+    "projectId is required unless it can be resolved from repo/prNumber",
+  );
+}
+
+function requirePullRequestTarget(
+  context: LooperdApiContext,
+  input: {
+    projectId: string;
+    repo: string;
+    prNumber: number;
+  },
+): { prNumber: number } {
+  const snapshot = context.store.pullRequestSnapshots.getLatest(
+    input.repo,
+    input.prNumber,
+  );
+  if (!snapshot) {
+    throw new ApiError(
+      "PULL_REQUEST_NOT_FOUND",
+      404,
+      `Pull request not found: ${input.repo}#${input.prNumber}`,
+    );
+  }
+  if (snapshot.projectId !== input.projectId) {
+    throw new ApiError(
+      "PULL_REQUEST_PROJECT_MISMATCH",
+      409,
+      `Pull request ${input.repo}#${input.prNumber} does not belong to project ${input.projectId}`,
+    );
+  }
+
+  return { prNumber: snapshot.prNumber };
+}
+
+function findPlannerLoopForIssue(
+  context: LooperdApiContext,
+  input: {
+    projectId: string;
+    repo: string;
+    issueNumber: number;
+  },
+): { prNumber: number; specPath: string | null } {
+  const targetId = `issue:${input.repo}:${input.issueNumber}`;
+  const loop = context.store.loops
+    .list()
+    .find(
+      (candidate) =>
+        candidate.projectId === input.projectId &&
+        candidate.type === "planner" &&
+        candidate.targetType === "issue" &&
+        candidate.targetId === targetId,
+    );
+  if (!loop) {
+    throw new ApiError(
+      "PLANNER_NOT_FOUND",
+      404,
+      `No planner loop found for ${input.repo}#${input.issueNumber}`,
+    );
+  }
+
+  const metadata = parseMetadata(loop.metadataJson);
+  const prNumber = loop.prNumber ?? readNumber(metadata.prNumber);
+  if (!prNumber) {
+    throw new ApiError(
+      "PLANNER_PR_NOT_READY",
+      409,
+      `Planner spec PR is not ready for ${input.repo}#${input.issueNumber}`,
+    );
+  }
+
+  return {
+    prNumber,
+    specPath: readString(metadata.specPath),
+  };
+}
+
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
 }
 
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : null;
+}
+
 function deriveWorkerTitle(input: {
   prompt: string | null;
   specPath: string | null;
+  repo: string | null;
+  prNumber: number | null;
+  issueNumber: number | null;
 }): string {
   if (input.prompt) {
     return input.prompt.slice(0, 80);
@@ -1537,7 +1723,26 @@ function deriveWorkerTitle(input: {
     return `Implement ${input.specPath}`;
   }
 
+  if (input.prNumber && input.repo) {
+    return `Implement ${input.repo}#${input.prNumber}`;
+  }
+
+  if (input.issueNumber && input.repo) {
+    return `Implement ${input.repo}#${input.issueNumber}`;
+  }
+
   return "Worker run";
+}
+
+function buildWorkerPullRequestDedupeKey(
+  repo: string,
+  prNumber: number,
+): string {
+  return `worker:${repo}:${prNumber}`;
+}
+
+function buildPullRequestLockKey(repo: string, prNumber: number): string {
+  return `pr:${repo}:${prNumber}`;
 }
 
 function deriveProjectIdFromPath(repoPath: string): string {
