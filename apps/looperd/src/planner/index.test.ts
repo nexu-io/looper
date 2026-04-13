@@ -338,7 +338,7 @@ describe("PlannerLoopRunner", () => {
     expect(result.queueItems[0]?.dedupeKey).toBe("planner:acme/looper:123");
     expect(fixture.store.loops.list()[0]?.targetType).toBe("issue");
     expect(fixture.store.loops.list()[0]?.metadataJson).toContain(
-      "specs/123-add-planner-flow/spec.md",
+      "specs/2026-04-12-add-planner-flow.md",
     );
 
     fixture.store.close();
@@ -425,12 +425,12 @@ describe("PlannerLoopRunner", () => {
     expect(git.pushCalls).toBe(1);
     expect(agent.starts).toHaveLength(1);
     expect(agent.starts[0]?.prompt).toContain(
-      "Spec path: specs/123-add-planner-flow/spec.md",
+      "Spec path: specs/2026-04-12-add-planner-flow.md",
     );
     expect(agent.starts[0]?.prompt).toContain("AGENTS.md:");
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(github.createPullRequestCalls[0]?.body).toContain(
-      "Spec: specs/123-add-planner-flow/spec.md",
+      "Spec: specs/2026-04-12-add-planner-flow.md",
     );
     expect(github.addLabelCalls).toEqual([
       {
@@ -449,7 +449,9 @@ describe("PlannerLoopRunner", () => {
     expect(fixture.store.loops.getById("loop_planner_missing")).toBeNull();
     const loop = fixture.store.loops.list()[0];
     expect(loop?.prNumber).toBe(77);
-    expect(loop?.metadataJson).toContain("specs/123-add-planner-flow/spec.md");
+    expect(loop?.metadataJson).toContain(
+      "specs/2026-04-12-add-planner-flow.md",
+    );
 
     fixture.store.close();
   });
@@ -468,7 +470,7 @@ describe("PlannerLoopRunner", () => {
       status: "queued",
       configJson: null,
       metadataJson: JSON.stringify({
-        specPath: "specs/123-add-planner-flow/spec.md",
+        specPath: "specs/2026-04-12-add-planner-flow.md",
         prUrl: "https://example.test/acme/looper/pull/77",
       }),
       lastRunAt: null,
@@ -494,7 +496,7 @@ describe("PlannerLoopRunner", () => {
           assignees: ["octocat"],
           labels: ["looper:plan"],
           currentUserLogin: "octocat",
-          specPath: "specs/123-add-planner-flow/spec.md",
+          specPath: "specs/2026-04-12-add-planner-flow.md",
           requestedReviewers: ["review-bot"],
         },
         worktree: {
@@ -502,12 +504,12 @@ describe("PlannerLoopRunner", () => {
           path: fixture.worktreeRoot,
           branch: "looper/planner/123-add-planner-flow",
           baseBranch: "main",
-          specPath: "specs/123-add-planner-flow/spec.md",
+          specPath: "specs/2026-04-12-add-planner-flow.md",
         },
         writeSpec: {
           status: "completed",
           summary: "Spec committed",
-          changedFiles: ["specs/123-add-planner-flow/spec.md"],
+          changedFiles: ["specs/2026-04-12-add-planner-flow.md"],
           commits: ["abc123"],
           stdout: "Spec committed\n",
         },
@@ -516,7 +518,7 @@ describe("PlannerLoopRunner", () => {
           pullRequest: {
             number: 77,
             url: "https://example.test/acme/looper/pull/77",
-            body: "Spec: specs/123-add-planner-flow/spec.md",
+            body: "Spec: specs/2026-04-12-add-planner-flow.md",
           },
           labelsAdded: [],
           reviewersAdded: [],
@@ -672,7 +674,7 @@ describe("PlannerLoopRunner", () => {
       status: "paused",
       configJson: null,
       metadataJson: JSON.stringify({
-        specPath: "specs/123-add-planner-flow/spec.md",
+        specPath: "specs/2026-04-12-add-planner-flow.md",
       }),
       lastRunAt: nowIso,
       nextRunAt: null,
@@ -690,7 +692,7 @@ describe("PlannerLoopRunner", () => {
       status: "completed",
       configJson: null,
       metadataJson: JSON.stringify({
-        specPath: "specs/124-add-planner-flow/spec.md",
+        specPath: "specs/2026-04-12-add-another-planner-flow.md",
       }),
       lastRunAt: nowIso,
       nextRunAt: null,
@@ -770,6 +772,64 @@ describe("PlannerLoopRunner", () => {
     const runs = fixture.store.runs.listByLoop(result.loopId);
     expect(runs[0]?.status).toBe("failed");
     expect(fixture.store.loops.getById(result.loopId)?.status).toBe("queued");
+
+    fixture.store.close();
+  });
+
+  test("truncates planner spec paths and branch slugs to four words", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      issues: [
+        {
+          number: 123,
+          title:
+            "Let agents create their own git commits with looperd as fallback",
+          body: "Implement planning loop",
+          url: "https://example.test/acme/looper/issues/123",
+          assignees: ["octocat"],
+          labels: ["looper:plan"],
+        },
+      ],
+      currentUserLogin: "octocat",
+    });
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Spec committed"),
+    ]);
+    const runner = new PlannerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverIssues();
+    const claimed = fixture.queue.claimNext("planner-1");
+    if (!claimed) {
+      throw new Error("Expected planner queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(agent.starts[0]?.prompt).toContain(
+      "Spec path: specs/2026-04-12-let-agents-create-their.md",
+    );
+
+    const latestRun = fixture.store.runs.listByLoop(result.loopId)[0];
+    const checkpoint = latestRun?.checkpointJson
+      ? JSON.parse(latestRun.checkpointJson)
+      : null;
+
+    expect(checkpoint?.worktree?.branch).toBe(
+      "looper/planner/123-let-agents-create-their",
+    );
+    expect(checkpoint?.issue?.specPath).toBe(
+      "specs/2026-04-12-let-agents-create-their.md",
+    );
 
     fixture.store.close();
   });

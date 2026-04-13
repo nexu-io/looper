@@ -546,7 +546,7 @@ export class PlannerLoopRunner {
           assignees: detail.assignees,
           labels: detail.labels,
           currentUserLogin,
-          specPath: buildSpecPath(issueNumber, detail.title),
+          specPath: buildSpecPath(this.now(), detail.title),
           requestedReviewers: [],
         },
         claimedLockKey: lockKey,
@@ -569,7 +569,7 @@ export class PlannerLoopRunner {
           assignees: detail.assignees,
           labels: detail.labels,
           currentUserLogin,
-          specPath: buildSpecPath(issueNumber, detail.title),
+          specPath: buildSpecPath(this.now(), detail.title),
           requestedReviewers: [],
         },
         claimedLockKey: lockKey,
@@ -589,7 +589,7 @@ export class PlannerLoopRunner {
         assignees: detail.assignees,
         labels: detail.labels,
         currentUserLogin,
-        specPath: buildSpecPath(issueNumber, detail.title),
+        specPath: buildSpecPath(this.now(), detail.title),
         requestedReviewers: this.resolveRequestedReviewers({
           project: input.project,
           loop: input.loop,
@@ -615,7 +615,10 @@ export class PlannerLoopRunner {
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
       configuredRoot ?? join(input.project.repoPath, ".looper-worktrees");
-    const branch = `looper/planner/${issue.issueNumber}-${slugify(issue.title || "issue")}`;
+    const branch = buildPlannerBranch(
+      issue.issueNumber,
+      issue.title || "issue",
+    );
     const worktree = await this.options.git.createWorktree({
       projectId: input.project.id,
       repoPath: input.project.repoPath,
@@ -1044,7 +1047,7 @@ export class PlannerLoopRunner {
       issueUrl: input.issue.url,
       issueNumber: input.issue.number,
       currentUserLogin: input.currentUserLogin,
-      specPath: buildSpecPath(input.issue.number, input.issue.title),
+      specPath: buildSpecPath(this.now(), input.issue.title),
     };
     const nowIso = this.nowIso();
     if (existing) {
@@ -1349,8 +1352,24 @@ function slugify(value: string): string {
   return slug || "issue";
 }
 
-function buildSpecPath(issueNumber: number, title: string): string {
-  return `specs/${issueNumber}-${slugify(title)}/spec.md`;
+function buildPlannerSlug(title: string, maxWords = 4): string {
+  const words = slugify(title)
+    .split("-")
+    .filter((word) => word.length > 0)
+    .slice(0, maxWords);
+  return words.join("-") || "issue";
+}
+
+function formatDatePrefix(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function buildPlannerBranch(issueNumber: number, title: string): string {
+  return `looper/planner/${issueNumber}-${buildPlannerSlug(title)}`;
+}
+
+function buildSpecPath(now: Date, title: string): string {
+  return `specs/${formatDatePrefix(now)}-${buildPlannerSlug(title)}.md`;
 }
 
 async function buildPlannerPrompt(input: {
