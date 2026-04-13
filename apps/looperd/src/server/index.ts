@@ -5,6 +5,7 @@ import type { LooperConfig } from "../config/index";
 import {
   assertUniqueActiveLoop,
   createLoop,
+  createPrLockKey,
   defineIssueLoopTarget,
   defineProjectLoopTarget,
   definePullRequestLoopTarget,
@@ -631,7 +632,7 @@ async function buildWorkersCreateResponse(
       ? buildWorkerPullRequestDedupeKey(projectId, repo, effectivePrNumber)
       : `worker:${loop.id}`,
     lockKey: effectivePrNumber
-      ? buildWorkerPullRequestLockKey(projectId, repo, effectivePrNumber)
+      ? buildWorkerPullRequestLockKey(repo, effectivePrNumber)
       : `worker:${loop.id}`,
     payloadJson: JSON.stringify(payload),
   });
@@ -1752,12 +1753,8 @@ function buildWorkerPullRequestDedupeKey(
   return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
-function buildWorkerPullRequestLockKey(
-  projectId: string,
-  repo: string,
-  prNumber: number,
-): string {
-  return `worker-pr:${projectId}:${repo}:${prNumber}`;
+function buildWorkerPullRequestLockKey(repo: string, prNumber: number): string {
+  return createPrLockKey(repo, prNumber);
 }
 
 function deriveProjectIdFromPath(repoPath: string): string {

@@ -458,7 +458,7 @@ describe("createLooperdApi", () => {
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
       prNumber: 42,
-      lockKey: "worker-pr:project_1:acme/looper:42",
+      lockKey: "pr:acme/looper:42",
       status: "queued",
     });
 
@@ -503,7 +503,7 @@ describe("createLooperdApi", () => {
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
       prNumber: 42,
-      lockKey: "worker-pr:project_2:acme/looper:42",
+      lockKey: "pr:acme/looper:42",
       status: "queued",
     });
 
@@ -560,7 +560,7 @@ describe("createLooperdApi", () => {
       targetType: "pull_request",
       targetId: "pr:acme/looper:77",
       prNumber: 77,
-      lockKey: "worker-pr:project_1:acme/looper:77",
+      lockKey: "pr:acme/looper:77",
       status: "queued",
     });
 

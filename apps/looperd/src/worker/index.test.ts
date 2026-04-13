@@ -359,7 +359,7 @@ describe("WorkerLoopRunner", () => {
         claimedAt: null,
         startedAt: null,
         finishedAt: null,
-        lockKey: `worker-pr:project_1:acme/looper:${prNumber}`,
+        lockKey: `pr:acme/looper:${prNumber}`,
         payloadJson: null,
         lastError: null,
         lastErrorKind: null,
@@ -371,7 +371,7 @@ describe("WorkerLoopRunner", () => {
       targetId: `pr:acme/looper:${prNumber}`,
       repo: "acme/looper",
       prNumber,
-      lockKey: `worker-pr:project_1:acme/looper:${prNumber}`,
+      lockKey: `pr:acme/looper:${prNumber}`,
       payloadJson: null,
       updatedAt: fixture.now.toISOString(),
     });
@@ -778,7 +778,7 @@ describe("WorkerLoopRunner", () => {
     const fixture = await createFixture();
     configurePullRequestWorkerLoop(fixture, 79);
     fixture.queue.acquireBusinessLock({
-      key: "worker-pr:project_1:acme/looper:79",
+      key: "pr:acme/looper:79",
       owner: "other-worker",
       reason: "test-lock",
       expiresAt: new Date(fixture.now.getTime() + 60_000).toISOString(),

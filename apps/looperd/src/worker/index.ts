@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
 import type { OpenPrStrategy } from "../config/index";
+import { createPrLockKey } from "../domain/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
@@ -457,7 +458,6 @@ export class WorkerLoopRunner {
             pullRequest.number,
           ),
           lockKey: buildWorkerPullRequestLockKey(
-            project.id,
             input.repo,
             pullRequest.number,
           ),
@@ -553,11 +553,7 @@ export class WorkerLoopRunner {
     const lockKey =
       input.queueItem.lockKey ??
       (work.executionMode === "push-existing" && work.prNumber
-        ? buildWorkerPullRequestLockKey(
-            input.project.id,
-            work.repo,
-            work.prNumber,
-          )
+        ? buildWorkerPullRequestLockKey(work.repo, work.prNumber)
         : `worker:${input.loop.id}`);
     const acquired = this.options.scheduler.acquireBusinessLock({
       key: lockKey,
@@ -1431,12 +1427,8 @@ function buildWorkerPullRequestDedupeKey(
   return `worker:${projectId}:${repo}:${prNumber}`;
 }
 
-function buildWorkerPullRequestLockKey(
-  projectId: string,
-  repo: string,
-  prNumber: number,
-): string {
-  return `worker-pr:${projectId}:${repo}:${prNumber}`;
+function buildWorkerPullRequestLockKey(repo: string, prNumber: number): string {
+  return createPrLockKey(repo, prNumber);
 }
 
 function normalizePrState(value: string | undefined): "open" | "other" {
