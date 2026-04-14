@@ -237,6 +237,143 @@ describe("GitWorktreeGateway", () => {
     store.close();
   });
 
+  test("recreates an attached branch worktree when detached mode is requested", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
+    cleanupPaths.push(rootDir);
+    const repoPath = join(rootDir, "repo");
+    const worktreeRoot = join(rootDir, "worktrees");
+    await mkdir(repoPath, { recursive: true });
+
+    await runGit(["init", "-b", "main"], repoPath);
+    await runGit(["config", "user.email", "test@example.com"], repoPath);
+    await runGit(["config", "user.name", "Looper Test"], repoPath);
+    await writeFile(join(repoPath, "README.md"), "hello\n");
+    await runGit(["add", "README.md"], repoPath);
+    await runGit(["commit", "-m", "init"], repoPath);
+    await runGit(["checkout", "-b", "feature/fixer"], repoPath);
+    await runGit(["checkout", "main"], repoPath);
+
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+    });
+    store.initialize({ autoMigrate: true });
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const gateway = new GitWorktreeGateway({ gitPath: "git", store });
+    const attached = await gateway.createWorktree({
+      projectId: "project_1",
+      repoPath,
+      worktreeRoot,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      prNumber: 42,
+    });
+
+    expect(
+      (
+        await runGit(["branch", "--show-current"], attached.worktreePath)
+      ).trim(),
+    ).toBe("feature/fixer");
+
+    const detached = await gateway.createWorktree({
+      projectId: "project_1",
+      repoPath,
+      worktreeRoot,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      prNumber: 42,
+      checkoutMode: "detached",
+    });
+
+    expect(detached.worktreePath).toBe(attached.worktreePath);
+    expect(
+      (
+        await runGit(["branch", "--show-current"], detached.worktreePath)
+      ).trim(),
+    ).toBe("");
+
+    store.close();
+  });
+
+  test("ignores stored worktrees that belong to a different repo path", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
+    cleanupPaths.push(rootDir);
+    const repoPath = join(rootDir, "repo");
+    const otherRepoPath = join(rootDir, "other-repo");
+    const worktreeRoot = join(rootDir, "worktrees");
+    const strayWorktreePath = join(rootDir, "stray-worktree");
+    await mkdir(repoPath, { recursive: true });
+    await mkdir(otherRepoPath, { recursive: true });
+    await mkdir(strayWorktreePath, { recursive: true });
+
+    await runGit(["init", "-b", "main"], repoPath);
+    await runGit(["config", "user.email", "test@example.com"], repoPath);
+    await runGit(["config", "user.name", "Looper Test"], repoPath);
+    await writeFile(join(repoPath, "README.md"), "hello\n");
+    await runGit(["add", "README.md"], repoPath);
+    await runGit(["commit", "-m", "init"], repoPath);
+
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+    });
+    store.initialize({ autoMigrate: true });
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.worktrees.upsert({
+      id: "wrong-repo-record",
+      projectId: "project_1",
+      repoPath: otherRepoPath,
+      worktreePath: strayWorktreePath,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      status: "active",
+      headSha: null,
+      metadataJson: JSON.stringify({ recovered: false }),
+      createdAt: now,
+      updatedAt: now,
+      cleanedAt: null,
+    });
+
+    const gateway = new GitWorktreeGateway({ gitPath: "git", store });
+    const worktree = await gateway.createWorktree({
+      projectId: "project_1",
+      repoPath,
+      worktreeRoot,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      prNumber: 42,
+      checkoutMode: "detached",
+    });
+
+    expect(worktree.worktreePath).not.toBe(strayWorktreePath);
+    expect(
+      normalizeForTest(
+        store.worktrees.getByBranch("project_1", "feature/fixer")?.repoPath,
+      ),
+    ).toBe(normalizeForTest(repoPath));
+
+    store.close();
+  });
+
   test("does not treat the primary checkout as a restorable worktree", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
     cleanupPaths.push(rootDir);
@@ -344,3 +481,7 @@ describe("GitWorktreeGateway", () => {
     store.close();
   });
 });
+
+function normalizeForTest(path: string | null | undefined): string | null {
+  return path ? path.replace(/^\/private/, "") : null;
+}

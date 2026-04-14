@@ -23,6 +23,14 @@ export interface CreateWorktreeInput {
   checkoutMode?: "branch" | "detached";
 }
 
+interface RestoreWorktreeInput {
+  projectId: string;
+  repoPath: string;
+  branch: string;
+  worktreeRoot?: string;
+  checkoutMode?: "branch" | "detached";
+}
+
 export interface PrepareWorktreeResult {
   headSha?: string;
   clean: boolean;
@@ -91,18 +99,19 @@ export class GitWorktreeGateway {
       input.worktreeRoot,
       buildWorktreeDirectoryName(input),
     );
+    const checkoutMode = input.checkoutMode ?? "branch";
     const existing = await this.restoreWorktree({
       projectId: input.projectId,
       repoPath: input.repoPath,
       branch: input.branch,
       worktreeRoot: input.worktreeRoot,
+      checkoutMode,
     });
 
     if (existing) {
       return existing;
     }
 
-    const checkoutMode = input.checkoutMode ?? "branch";
     if (checkoutMode === "detached") {
       await this.runGit(
         [
@@ -181,12 +190,9 @@ export class GitWorktreeGateway {
     return parseGitHubRepoFromRemoteUrl(result.stdout.trim());
   }
 
-  public async restoreWorktree(input: {
-    projectId: string;
-    repoPath: string;
-    branch: string;
-    worktreeRoot?: string;
-  }): Promise<WorktreeRecord | null> {
+  public async restoreWorktree(
+    input: RestoreWorktreeInput,
+  ): Promise<WorktreeRecord | null> {
     const stored = this.options.store?.worktrees.getByBranch(
       input.projectId,
       input.branch,
@@ -194,12 +200,18 @@ export class GitWorktreeGateway {
     if (
       stored &&
       stored.status !== "cleaned" &&
+      normalizeComparablePath(stored.repoPath) ===
+        normalizeComparablePath(input.repoPath) &&
       normalizeComparablePath(stored.worktreePath) !==
         normalizeComparablePath(input.repoPath) &&
       (!input.worktreeRoot ||
         isWithinRoot(stored.worktreePath, input.worktreeRoot))
     ) {
-      if (await this.isHealthyWorktree(stored.worktreePath)) {
+      if (
+        (await this.isHealthyWorktree(stored.worktreePath)) &&
+        (input.checkoutMode !== "detached" ||
+          (await this.isDetachedWorktree(stored.worktreePath)))
+      ) {
         const nowIso = this.now().toISOString();
         const restored = {
           ...stored,
@@ -216,6 +228,9 @@ export class GitWorktreeGateway {
 
     const worktrees = await this.listWorktrees(input.repoPath);
     const match = worktrees.find((worktree) => {
+      if (input.checkoutMode === "detached") {
+        return false;
+      }
       if (worktree.branch !== input.branch) {
         return false;
       }
@@ -528,6 +543,14 @@ export class GitWorktreeGateway {
     } catch {
       return false;
     }
+  }
+
+  private async isDetachedWorktree(worktreePath: string): Promise<boolean> {
+    const result = await this.runGit(
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      worktreePath,
+    );
+    return result.stdout.trim() === "HEAD";
   }
 
   private async tryRemoveWorktree(
