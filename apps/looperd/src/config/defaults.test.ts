@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   createDefaultLooperConfig,
