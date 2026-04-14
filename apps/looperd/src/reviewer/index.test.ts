@@ -1029,4 +1029,59 @@ describe("ReviewerLoopRunner", () => {
 
     fixture.store.close();
   });
+
+  test("re-enqueues manual follow-up loops when a PR head changes", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      headSha: "new-head",
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const nowIso = fixture.now.toISOString();
+
+    fixture.store.loops.upsert({
+      id: "loop_manual_followup",
+      seq: 1,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "completed",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        followUpdates: true,
+        manual: true,
+        lastPublishedHeadSha: "abc123",
+      }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(1);
+    expect(fixture.queue.listScheduled()).toHaveLength(1);
+    expect(fixture.store.loops.getById("loop_manual_followup")?.status).toBe(
+      "queued",
+    );
+
+    fixture.store.close();
+  });
 });

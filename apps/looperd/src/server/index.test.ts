@@ -701,6 +701,39 @@ describe("createLooperdApi", () => {
     expect(createLoopBody.data.prNumber).toBe(43);
     expect(createLoopBody.data.status).toBe("running");
 
+    const createReviewerResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "reviewer",
+          targetType: "pull_request",
+          repo: "acme/looper",
+          prNumber: 43,
+          metadata: { followUpdates: true, manual: true },
+        }),
+      }),
+    );
+    const createReviewerBody = (await createReviewerResponse.json()) as {
+      data: { id: string; metadataJson: string | null; status: string };
+    };
+    expect(createReviewerResponse.status).toBe(200);
+    expect(createReviewerBody.data.status).toBe("running");
+    expect(createReviewerBody.data.metadataJson).toContain(
+      '"followUpdates":true',
+    );
+    expect(
+      store.queue.findActiveByDedupe("reviewer:acme/looper:43"),
+    ).toMatchObject({
+      loopId: createReviewerBody.data.id,
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      prNumber: 43,
+      status: "queued",
+    });
+
     const createPlannerResponse = await api.handle(
       new Request("http://localhost/api/v1/planners", {
         method: "POST",

@@ -1158,6 +1158,8 @@ async function buildLoopsCreateResponse(
   const type = readRequiredString(body, "type");
   const targetType = readRequiredString(body, "targetType");
   const status = readOptionalString(body, "status") ?? "running";
+  const metadata = readOptionalObject(body, "metadata");
+  const now = new Date().toISOString();
 
   if (
     (type === "reviewer" || type === "fixer") &&
@@ -1180,10 +1182,40 @@ async function buildLoopsCreateResponse(
     prNumber: readOptionalPositiveInteger(body, "prNumber") ?? undefined,
     issueNumber: readOptionalPositiveInteger(body, "issueNumber") ?? undefined,
     status,
-    now: new Date().toISOString(),
+    now,
+    metadataJson: metadata ? JSON.stringify(metadata) : null,
   });
 
+  enqueueLoopCreate(context, loop, now);
+
   return loop;
+}
+
+function enqueueLoopCreate(
+  context: LooperdApiContext,
+  loop: LoopRecord,
+  now: string,
+): void {
+  const scheduler = new SchedulerQueue({
+    store: context.store,
+    retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
+    retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
+    now: () => new Date(now),
+  });
+
+  if (loop.type === "reviewer" && loop.repo && loop.prNumber) {
+    scheduler.enqueue({
+      projectId: loop.projectId,
+      loopId: loop.id,
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: `pr:${loop.repo}:${loop.prNumber}`,
+      repo: loop.repo,
+      prNumber: loop.prNumber,
+      dedupeKey: `reviewer:${loop.repo}:${loop.prNumber}`,
+      lockKey: createPrLockKey(loop.repo, loop.prNumber),
+    });
+  }
 }
 
 function createLoopRecord(input: {
@@ -1479,6 +1511,26 @@ function readOptionalString(
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function readOptionalObject(
+  body: Record<string, unknown>,
+  fieldName: string,
+): Record<string, unknown> | null {
+  const value = body[fieldName];
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `${fieldName} must be an object`,
+    );
+  }
+
+  return value as Record<string, unknown>;
 }
 
 function readOptionalPositiveInteger(

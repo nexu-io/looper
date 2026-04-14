@@ -209,18 +209,17 @@ export class ReviewerLoopRunner {
     let skipped = 0;
     const seen = new Set<string>();
 
-    const enqueuePullRequest = (pullRequest: GitHubPullRequestSummary) => {
-      const dedupe = `${input.repo}#${pullRequest.number}`;
-      if (seen.has(dedupe)) {
-        return;
-      }
-      seen.add(dedupe);
-
-      const loop = this.ensureLoopForPullRequest({
-        projectId: project.id,
-        repo: input.repo,
-        prNumber: pullRequest.number,
-      });
+    const enqueueLoopRecord = (
+      pullRequest: Pick<GitHubPullRequestSummary, "number" | "headSha">,
+      loopRecord?: LoopRecord,
+    ) => {
+      const loop = loopRecord
+        ? this.refreshLoopForPullRequest(loopRecord)
+        : this.ensureLoopForPullRequest({
+            projectId: project.id,
+            repo: input.repo,
+            prNumber: pullRequest.number,
+          });
 
       if (loop.created) {
         createdLoopIds.push(loop.record.id);
@@ -263,6 +262,16 @@ export class ReviewerLoopRunner {
       );
     };
 
+    const enqueuePullRequest = (pullRequest: GitHubPullRequestSummary) => {
+      const dedupe = `${input.repo}#${pullRequest.number}`;
+      if (seen.has(dedupe)) {
+        return;
+      }
+      seen.add(dedupe);
+
+      enqueueLoopRecord(pullRequest);
+    };
+
     for (const pullRequest of openPullRequests) {
       if (
         pullRequest.isDraft ||
@@ -287,6 +296,26 @@ export class ReviewerLoopRunner {
       }
 
       enqueuePullRequest(pullRequest);
+    }
+
+    for (const loop of this.listFollowUpLoops(project.id, input.repo)) {
+      const dedupe = `${input.repo}#${loop.prNumber}`;
+      if (seen.has(dedupe) || loop.prNumber == null) {
+        continue;
+      }
+      seen.add(dedupe);
+
+      const detail = await this.options.github.viewPullRequest({
+        repo: input.repo,
+        prNumber: loop.prNumber,
+        cwd: project.repoPath,
+      });
+      if (detail.isDraft || normalizePrState(detail.state) !== "open") {
+        skipped += 1;
+        continue;
+      }
+
+      enqueueLoopRecord(detail, loop);
     }
 
     return { queueItems, createdLoopIds, skipped };
@@ -1157,6 +1186,37 @@ export class ReviewerLoopRunner {
       },
     });
     return { record: loop, created: true };
+  }
+
+  private refreshLoopForPullRequest(loop: LoopRecord): {
+    record: LoopRecord;
+    created: boolean;
+  } {
+    const nowIso = this.nowIso();
+    const updated = {
+      ...loop,
+      status: loop.status === "running" ? loop.status : "queued",
+      nextRunAt: nowIso,
+      updatedAt: nowIso,
+    };
+    this.options.store.loops.upsert(updated);
+    return { record: updated, created: false };
+  }
+
+  private listFollowUpLoops(projectId: string, repo: string): LoopRecord[] {
+    return this.options.store.loops.list().filter((loop) => {
+      if (
+        loop.type !== "reviewer" ||
+        loop.projectId !== projectId ||
+        loop.repo !== repo ||
+        loop.prNumber == null
+      ) {
+        return false;
+      }
+
+      const metadata = parseJsonObject(loop.metadataJson);
+      return metadata.followUpdates === true;
+    });
   }
 
   private updateLoop(

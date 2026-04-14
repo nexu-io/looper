@@ -379,6 +379,111 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
+  test("creates manual review task from repo-qualified PR reference", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["review", "acme/looper#42", "--loop"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({ url, body: init?.body as string | null });
+
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_review_1",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_review_1",
+            data: {
+              id: "loop_review_1",
+              projectId: "project_1",
+              repo: "acme/looper",
+              prNumber: 42,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.url).toContain("/api/v1/loops");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"prNumber":42');
+    expect(requests[1]?.body).toContain('"followUpdates":true');
+    expect(requests[1]?.body).toContain('"manual":true');
+  });
+
+  test("creates manual review task from local project PR number", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["review", "42"], {
+      cwd: "/tmp/repos/looper/packages/cli",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({ url, body: init?.body as string | null });
+
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_review_2",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_review_2",
+            data: {
+              id: "loop_review_2",
+              projectId: "project_1",
+              repo: "acme/looper",
+              prNumber: 42,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"prNumber":42');
+    expect(requests[1]?.body).toContain('"followUpdates":false');
+  });
+
   test("creates planner work item from issue number", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(

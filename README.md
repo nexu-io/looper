@@ -72,9 +72,15 @@ The CLI connects to `looperd` over HTTP and supports commands under:
 - `config show`
 - `daemon status|logs`
 - `loop list|start|pause`
+- `review <pr> [--loop]`
 - `work`
 - `pr list|show|status`
 - `run list`
+
+Manual review examples:
+
+- `looper review 123` — create a one-shot reviewer task for PR `123` in the current project
+- `looper review powerformer/looper#123 --loop` — keep re-reviewing that PR as new commits are pushed
 
 ### `apps/web`
 
