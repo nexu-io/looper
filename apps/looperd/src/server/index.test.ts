@@ -917,6 +917,49 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
+  test("rejects reserved legacy-id project ids through the API", async () => {
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-invalid-legacy-id`,
+      ),
+      store,
+      projects: {
+        addProject: async () => {
+          throw new InvalidProjectIdError("legacy-id-Li4vdG1w");
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/looper",
+          id: "legacy-id-Li4vdG1w",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_FAILED");
+    expect(body.error.message).toContain(
+      'Invalid project id "legacy-id-Li4vdG1w"',
+    );
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
   test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
     const { api, store, rootDir } = await createFixture();
     store.loops.upsert({

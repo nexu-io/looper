@@ -37,5 +37,13 @@ describe("config defaults", () => {
     expect(getDefaultProjectWorktreeRoot("/var/tmp/x")).toBe(
       join(homedir(), ".looper", "worktrees", "legacy-id-L3Zhci90bXAveA"),
     );
+    expect(getDefaultProjectWorktreeRoot("legacy-id-Li4vdG1w")).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        "legacy-id-bGVnYWN5LWlkLUxpNHZkRzF3",
+      ),
+    );
   });
 });

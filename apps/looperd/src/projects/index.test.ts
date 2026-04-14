@@ -139,6 +139,15 @@ describe("ProjectManager", () => {
       }),
     ).rejects.toBeInstanceOf(InvalidProjectIdError);
 
+    await expect(
+      manager.addProject({
+        id: "legacy-id-Li4vdG1w",
+        name: "looper",
+        repoPath: join(rootDir, "repo"),
+        baseBranch: "main",
+      }),
+    ).rejects.toBeInstanceOf(InvalidProjectIdError);
+
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });

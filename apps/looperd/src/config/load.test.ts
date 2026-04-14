@@ -3,7 +3,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ConfigValidationError, loadLooperConfig } from "./index";
+import {
+  ConfigValidationError,
+  createDefaultLooperConfig,
+  loadLooperConfig,
+  validateLooperConfig,
+} from "./index";
 
 async function createFixture(): Promise<{
   rootDir: string;
@@ -219,7 +224,86 @@ describe("loadLooperConfig", () => {
         {
           path: "projects[0].id",
           message:
-            "must not contain path separators, dot segments, or be an absolute path",
+            "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-",
+        },
+      ],
+    });
+  });
+
+  test("rejects project ids that use the reserved legacy-id prefix", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    await writeFile(
+      fixture.configPath,
+      JSON.stringify({
+        daemon: {
+          logDir: fixture.logDir,
+          workingDirectory: fixture.writableDir,
+        },
+        storage: { dbPath: fixture.dbPath },
+        notifications: {
+          osascript: { enabled: false, throttleWindowSeconds: 60 },
+        },
+        tools: {
+          bunPath: "/file/bun",
+          gitPath: "/file/git",
+          ghPath: "/file/gh",
+        },
+        projects: [
+          {
+            id: "legacy-id-Li4vdG1w",
+            name: "bad-project",
+            repoPath: fixture.writableDir,
+          },
+        ],
+      }),
+    );
+
+    await expect(
+      loadLooperConfig({
+        argv: ["--config", fixture.configPath],
+        cwd: fixture.rootDir,
+        env: {},
+      }),
+    ).rejects.toMatchObject({
+      issues: [
+        {
+          path: "projects[0].id",
+          message:
+            "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-",
+        },
+      ],
+    });
+  });
+
+  test("rejects configs when the default worktree root cannot be created", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    const blockingRoot = join(fixture.rootDir, "blocked-root");
+    await writeFile(blockingRoot, "not-a-directory");
+
+    const config = createDefaultLooperConfig(fixture.rootDir);
+    config.daemon.logDir = fixture.logDir;
+    config.daemon.workingDirectory = fixture.writableDir;
+    config.storage.dbPath = fixture.dbPath;
+    config.notifications.osascript.enabled = false;
+    config.tools = {
+      bunPath: "/file/bun",
+      gitPath: "/file/git",
+      ghPath: "/file/gh",
+    };
+
+    await expect(
+      validateLooperConfig(config, {
+        defaultWorktreeRoot: join(blockingRoot, "worktrees"),
+      }),
+    ).rejects.toMatchObject({
+      issues: [
+        {
+          path: "defaults.worktreeRoot",
+          message: `${blockingRoot} is not a directory`,
         },
       ],
     });

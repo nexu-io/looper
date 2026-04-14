@@ -1,6 +1,7 @@
-import { constants, access } from "node:fs/promises";
+import { constants, access, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { getDefaultWorktreeRoot } from "./defaults";
 import { getProjectIdValidationMessage, isValidProjectId } from "./project-id";
 import {
   AGENT_VENDORS,
@@ -37,7 +38,14 @@ async function ensureWritablePath(
 
   while (true) {
     try {
-      await access(writableAnchor, constants.F_OK);
+      const anchorStat = await stat(writableAnchor);
+      if (!anchorStat.isDirectory()) {
+        issues.push({
+          path: field,
+          message: `${writableAnchor} is not a directory`,
+        });
+        return;
+      }
       break;
     } catch {
       const parent = dirname(writableAnchor);
@@ -65,6 +73,7 @@ async function ensureWritablePath(
 
 export async function validateLooperConfig(
   config: LooperConfig,
+  options: { defaultWorktreeRoot?: string } = {},
 ): Promise<void> {
   const issues: ValidationIssue[] = [];
 
@@ -337,6 +346,12 @@ export async function validateLooperConfig(
         "directory",
         issues,
         "daemon.workingDirectory",
+      ),
+      ensureWritablePath(
+        options.defaultWorktreeRoot ?? getDefaultWorktreeRoot(),
+        "directory",
+        issues,
+        "defaults.worktreeRoot",
       ),
     ]);
   }

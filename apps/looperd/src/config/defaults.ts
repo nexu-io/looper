@@ -4,10 +4,13 @@ import { join } from "node:path";
 import { toProjectWorktreeDirectoryName } from "./project-id";
 import type { LooperConfig } from "./types";
 
-const LOOPER_HOME = join(homedir(), ".looper");
-const DEFAULT_WORKTREE_ROOT = join(LOOPER_HOME, "worktrees");
+function getLooperHome(): string {
+  return join(homedir(), ".looper");
+}
 
 export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
+  const looperHome = getLooperHome();
+
   return {
     server: {
       host: "127.0.0.1",
@@ -16,8 +19,8 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
     },
     storage: {
       mode: "sqlite",
-      dbPath: join(LOOPER_HOME, "looper.sqlite"),
-      backupDir: join(LOOPER_HOME, "backups"),
+      dbPath: join(looperHome, "looper.sqlite"),
+      backupDir: join(looperHome, "backups"),
     },
     scheduler: {
       pollIntervalSeconds: 30,
@@ -45,7 +48,7 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
     tools: {},
     daemon: {
       mode: "foreground",
-      logDir: join(LOOPER_HOME, "logs"),
+      logDir: join(looperHome, "logs"),
       workingDirectory: cwd,
       environment: {},
     },
@@ -68,13 +71,16 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
 }
 
 export function getDefaultWorktreeRoot(): string {
-  return DEFAULT_WORKTREE_ROOT;
+  return join(getLooperHome(), "worktrees");
 }
 
 export function getDefaultProjectWorktreeRoot(projectId: string): string {
-  return join(DEFAULT_WORKTREE_ROOT, toProjectWorktreeDirectoryName(projectId));
+  return join(
+    getDefaultWorktreeRoot(),
+    toProjectWorktreeDirectoryName(projectId),
+  );
 }
 
 export function getDefaultConfigPath(): string {
-  return join(LOOPER_HOME, "config.json");
+  return join(getLooperHome(), "config.json");
 }
