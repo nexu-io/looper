@@ -656,13 +656,6 @@ async function buildWorkersCreateResponse(
           repo,
           issueNumber,
         });
-  if (issueNumber != null && !planner?.specPath) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `issueNumber requires planner-derived specPath; run planner for ${repo}#${issueNumber} first`,
-    );
-  }
   const effectivePrNumber =
     pullRequestTarget?.prNumber ?? planner?.prNumber ?? null;
   const effectiveSpecPath = specPath ?? planner?.specPath ?? null;
@@ -682,6 +675,7 @@ async function buildWorkersCreateResponse(
     specPath: effectiveSpecPath,
     repo,
     baseBranch,
+    ...(issueNumber ? { issueNumber } : {}),
     ...(effectivePrNumber ? { prNumber: effectivePrNumber } : {}),
   };
   const loop = createLoopRecord({
