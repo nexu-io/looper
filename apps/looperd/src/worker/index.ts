@@ -862,6 +862,7 @@ export class WorkerLoopRunner {
       const existingPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
         branch: worktree.branch,
+        baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
       if (existingPullRequest) {
@@ -897,6 +898,7 @@ export class WorkerLoopRunner {
       const discoveredPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
         branch: worktree.branch,
+        baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
       if (discoveredPullRequest) {
@@ -977,6 +979,7 @@ export class WorkerLoopRunner {
   private async findOpenPullRequestForBranch(input: {
     repo: string;
     branch: string;
+    baseBranch: string;
     cwd: string;
   }): Promise<GitHubPullRequestSummary | null> {
     const pullRequests = await this.options.github.listOpenPullRequests({
@@ -988,7 +991,8 @@ export class WorkerLoopRunner {
       pullRequests.find(
         (pullRequest) =>
           normalizePrState(pullRequest.state) === "open" &&
-          pullRequest.headRefName === input.branch,
+          pullRequest.headRefName === input.branch &&
+          pullRequest.baseRefName === input.baseBranch,
       ) ?? null
     );
   }

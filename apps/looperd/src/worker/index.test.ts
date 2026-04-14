@@ -575,6 +575,64 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("does not reuse an existing PR when the base branch differs", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 303,
+          title: "Wrong-base PR",
+          url: "https://example.test/acme/looper/pull/303",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/loop-worker-1",
+          baseRefName: "develop",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(101);
+    expect(github.createPullRequestCalls).toHaveLength(1);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(101);
+
+    fixture.store.close();
+  });
+
   test("hydrates worker input from issue details and opens a PR without planner", async () => {
     const fixture = await createFixture();
     const nowIso = fixture.now.toISOString();
