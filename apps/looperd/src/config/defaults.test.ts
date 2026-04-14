@@ -60,6 +60,18 @@ describe("config defaults", () => {
     );
   });
 
+  test("sanitizes Windows-invalid canonical project ids when deriving project worktree roots", () => {
+    expect(getDefaultProjectWorktreeRoot("con")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-636f6e"),
+    );
+    expect(getDefaultProjectWorktreeRoot("nul.txt")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-6e756c2e747874"),
+    );
+    expect(getDefaultProjectWorktreeRoot("project.")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-70726f6a6563742e"),
+    );
+  });
+
   test("hashes long canonical project ids when deriving project worktree roots", () => {
     const projectId = "a".repeat(256);
     const hashedProjectId = createHash("sha256")

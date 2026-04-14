@@ -5,6 +5,8 @@ const PROJECT_ID_SEPARATOR_PATTERN = /[\\/]/;
 const LEGACY_PROJECT_ID_PREFIX = "legacy-id-";
 const CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN = /^[a-z0-9._-]+$/;
 const MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH = 255;
+const WINDOWS_RESERVED_PROJECT_DIRECTORY_BASENAME_PATTERN =
+  /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/;
 const INVALID_PROJECT_ID_MESSAGE =
   "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-";
 
@@ -43,11 +45,21 @@ export function assertValidProjectId(projectId: string): void {
   }
 }
 
+function isWindowsInvalidCanonicalProjectDirectoryName(
+  directoryName: string,
+): boolean {
+  return (
+    directoryName.endsWith(".") ||
+    WINDOWS_RESERVED_PROJECT_DIRECTORY_BASENAME_PATTERN.test(directoryName)
+  );
+}
+
 export function toProjectWorktreeDirectoryName(projectId: string): string {
   if (
     isValidProjectId(projectId) &&
     CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN.test(projectId) &&
-    projectId.length <= MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH
+    projectId.length <= MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH &&
+    !isWindowsInvalidCanonicalProjectDirectoryName(projectId)
   ) {
     return projectId;
   }
