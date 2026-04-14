@@ -3,6 +3,7 @@ import { posix, win32 } from "node:path";
 
 const PROJECT_ID_SEPARATOR_PATTERN = /[\\/]/;
 const LEGACY_PROJECT_ID_PREFIX = "legacy-id-";
+const AUTO_DERIVED_LEGACY_PROJECT_ID_PREFIX = "project_";
 const CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN = /^[a-z0-9._-]+$/;
 const MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH = 255;
 const WINDOWS_RESERVED_PROJECT_DIRECTORY_BASENAME_PATTERN =
@@ -25,7 +26,7 @@ export function normalizeDerivedProjectId(projectId: string): string {
     return projectId;
   }
 
-  return `project-${projectId}`;
+  return `${AUTO_DERIVED_LEGACY_PROJECT_ID_PREFIX}${projectId}`;
 }
 
 export class InvalidProjectIdError extends Error {

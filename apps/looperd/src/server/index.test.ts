@@ -978,9 +978,55 @@ describe("createLooperdApi", () => {
     };
 
     expect(response.status).toBe(200);
-    expect(body.data.id).toBe("project-legacy-id-example");
+    expect(body.data.id).toBe("project_legacy-id-example");
     expect(body.data.name).toBe("Looper");
     expect(body.data.repoPath).toBe("/tmp/repos/legacy-id-example");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("keeps derived legacy-id project ids distinct from normalized repo names", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    const legacyResponse = await api.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/legacy-id-foo",
+          name: "Legacy repo",
+        }),
+      }),
+    );
+    const legacyBody = (await legacyResponse.json()) as {
+      data: { id: string; repoPath: string };
+    };
+
+    const normalizedResponse = await api.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/project-legacy-id-foo",
+          name: "Normalized repo",
+        }),
+      }),
+    );
+    const normalizedBody = (await normalizedResponse.json()) as {
+      data: { id: string; repoPath: string };
+    };
+
+    expect(legacyResponse.status).toBe(200);
+    expect(normalizedResponse.status).toBe(200);
+    expect(legacyBody.data.id).toBe("project_legacy-id-foo");
+    expect(normalizedBody.data.id).toBe("project-legacy-id-foo");
+    expect(store.projects.getById("project_legacy-id-foo")?.repoPath).toBe(
+      "/tmp/repos/legacy-id-foo",
+    );
+    expect(store.projects.getById("project-legacy-id-foo")?.repoPath).toBe(
+      "/tmp/repos/project-legacy-id-foo",
+    );
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
