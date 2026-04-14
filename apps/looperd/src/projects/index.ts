@@ -163,13 +163,14 @@ export class ProjectManager {
   ): ProjectRecord {
     const metadata = parseMetadata(existing?.metadataJson);
     const derivedProjectId = deriveProjectIdFromRepoPath(input.repoPath);
+    const normalizedDerivedId =
+      metadata.normalizedDerivedId === true ||
+      (input.idSource === "derived" &&
+        derivedProjectId.startsWith("legacy-id-") &&
+        input.id === normalizeDerivedProjectId(derivedProjectId));
     const nextMetadata = {
       ...metadata,
-      normalizedDerivedId:
-        metadata.normalizedDerivedId === true ||
-        (input.idSource === "derived" &&
-          derivedProjectId.startsWith("legacy-id-") &&
-          input.id === normalizeDerivedProjectId(derivedProjectId)),
+      ...(normalizedDerivedId ? { normalizedDerivedId: true } : {}),
       repo,
       worktreeRoot: input.worktreeRoot ?? metadata.worktreeRoot ?? null,
       source: existing ? (metadata.source ?? "api") : "api",

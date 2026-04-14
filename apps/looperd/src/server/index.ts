@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import {
   InvalidProjectIdError,
-  deriveProjectIdFromRepoPath,
   type LooperConfig,
+  deriveProjectIdFromRepoPath,
 } from "../config/index";
 import {
   assertUniqueActiveLoop,
@@ -14,7 +14,10 @@ import {
   defineProjectLoopTarget,
   definePullRequestLoopTarget,
 } from "../domain/index";
-import { ProjectIdCollisionError, type ProjectManager } from "../projects/index";
+import {
+  ProjectIdCollisionError,
+  type ProjectManager,
+} from "../projects/index";
 import { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
