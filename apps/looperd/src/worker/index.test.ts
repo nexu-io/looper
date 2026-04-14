@@ -609,6 +609,65 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("reuses open pull requests on legacy worker branch names", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 212,
+          title: "Legacy worker PR",
+          url: "https://example.test/acme/looper/pull/212",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/05e7c1d53bba907c",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(212);
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(212);
+
+    fixture.store.close();
+  });
+
   test("does not reuse an existing PR when the base branch differs", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);

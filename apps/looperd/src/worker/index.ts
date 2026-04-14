@@ -870,9 +870,10 @@ export class WorkerLoopRunner {
     }
 
     try {
+      const branchAliases = buildWorkerBranchAliases(work, input.loop.id);
       const existingPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
-        branch: worktree.branch,
+        branches: branchAliases,
         baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
@@ -908,7 +909,7 @@ export class WorkerLoopRunner {
       });
       const discoveredPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
-        branch: worktree.branch,
+        branches: branchAliases,
         baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
@@ -999,7 +1000,7 @@ export class WorkerLoopRunner {
 
   private async findOpenPullRequestForBranch(input: {
     repo: string;
-    branch: string;
+    branches: string[];
     baseBranch: string;
     cwd: string;
   }): Promise<GitHubPullRequestSummary | null> {
@@ -1012,7 +1013,7 @@ export class WorkerLoopRunner {
       pullRequests.find(
         (pullRequest) =>
           normalizePrState(pullRequest.state) === "open" &&
-          pullRequest.headRefName === input.branch &&
+          input.branches.includes(pullRequest.headRefName) &&
           pullRequest.baseRefName === input.baseBranch,
       ) ?? null
     );
@@ -1646,6 +1647,15 @@ function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
   }
 
   return `looper/${loopHash}`;
+}
+
+function buildWorkerBranchAliases(work: WorkerInput, loopId: string): string[] {
+  const branchName = buildWorkerBranchName(work, loopId);
+  const legacyBranchName = branchName.replace(/^looper\//, "looper/worker/");
+
+  return legacyBranchName === branchName
+    ? [branchName]
+    : [branchName, legacyBranchName];
 }
 
 function buildWorkerSlug(title: string): string {
