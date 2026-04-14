@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../bootstrap/logger";
+import { assertValidProjectId } from "../config/index";
 import type { GitHubPullRequestSummary } from "../infra/index";
 import type { Store } from "../storage/store";
 import type {
@@ -66,6 +67,7 @@ export class ProjectManager {
   }
 
   public async addProject(input: AddProjectInput): Promise<AddProjectResult> {
+    assertValidProjectId(input.id);
     const warnings: string[] = [];
     const nowIso = this.now().toISOString();
     const existing = this.options.store.projects.getById(input.id);

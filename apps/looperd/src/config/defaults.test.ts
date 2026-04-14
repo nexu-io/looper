@@ -26,4 +26,16 @@ describe("config defaults", () => {
       join(homedir(), ".looper", "worktrees", "project_1"),
     );
   });
+
+  test("rejects unsafe project ids when deriving project worktree roots", () => {
+    expect(() => getDefaultProjectWorktreeRoot("../tmp")).toThrow(
+      'Invalid project id "../tmp": must not contain path separators, dot segments, or be an absolute path',
+    );
+    expect(() => getDefaultProjectWorktreeRoot("..")).toThrow(
+      'Invalid project id "..": must not contain path separators, dot segments, or be an absolute path',
+    );
+    expect(() => getDefaultProjectWorktreeRoot("/var/tmp/x")).toThrow(
+      'Invalid project id "/var/tmp/x": must not contain path separators, dot segments, or be an absolute path',
+    );
+  });
 });

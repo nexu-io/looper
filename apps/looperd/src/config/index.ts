@@ -4,6 +4,12 @@ export {
   getDefaultProjectWorktreeRoot,
   getDefaultWorktreeRoot,
 } from "./defaults";
+export {
+  assertValidProjectId,
+  getProjectIdValidationMessage,
+  InvalidProjectIdError,
+  isValidProjectId,
+} from "./project-id";
 export { loadLooperConfig } from "./load";
 export { detectToolPaths } from "./tools";
 export {

@@ -12,6 +12,7 @@ import {
   OPEN_PR_STRATEGIES,
   type ValidationIssue,
 } from "./types";
+import { getProjectIdValidationMessage, isValidProjectId } from "./project-id";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -287,6 +288,11 @@ export async function validateLooperConfig(
       issues.push({
         path: `${prefix}.id`,
         message: "must be a non-empty string",
+      });
+    } else if (!isValidProjectId(project.id)) {
+      issues.push({
+        path: `${prefix}.id`,
+        message: getProjectIdValidationMessage(),
       });
     } else if (projectIds.has(project.id)) {
       issues.push({

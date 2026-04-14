@@ -177,4 +177,51 @@ describe("loadLooperConfig", () => {
       }),
     ).rejects.toThrow("Unknown looperd argument: --hostfoo");
   });
+
+  test("rejects project ids that would escape the default worktree root", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    await writeFile(
+      fixture.configPath,
+      JSON.stringify({
+        daemon: {
+          logDir: fixture.logDir,
+          workingDirectory: fixture.writableDir,
+        },
+        storage: { dbPath: fixture.dbPath },
+        notifications: {
+          osascript: { enabled: false, throttleWindowSeconds: 60 },
+        },
+        tools: {
+          bunPath: "/file/bun",
+          gitPath: "/file/git",
+          ghPath: "/file/gh",
+        },
+        projects: [
+          {
+            id: "../../tmp",
+            name: "bad-project",
+            repoPath: fixture.writableDir,
+          },
+        ],
+      }),
+    );
+
+    await expect(
+      loadLooperConfig({
+        argv: ["--config", fixture.configPath],
+        cwd: fixture.rootDir,
+        env: {},
+      }),
+    ).rejects.toMatchObject({
+      issues: [
+        {
+          path: "projects[0].id",
+          message:
+            "must not contain path separators, dot segments, or be an absolute path",
+        },
+      ],
+    });
+  });
 });

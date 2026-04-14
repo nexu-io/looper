@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { InvalidProjectIdError } from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { ProjectManager } from "./index";
 
@@ -101,6 +102,42 @@ describe("ProjectManager", () => {
     expect(
       store.pullRequestSnapshots.getLatest("powerformer/looper", 1)?.title,
     ).toBe("PR 1");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects unsafe project ids", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-projects-"));
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+      backupDir: join(rootDir, "backups"),
+    });
+    store.initialize({ autoMigrate: true });
+
+    const manager = new ProjectManager({
+      store,
+      logger: createLogger(),
+      git: {
+        detectGitHubRepo: async () => null,
+        listWorktrees: async () => [],
+      },
+      github: {
+        listOpenPullRequests: async () => [],
+        capturePullRequestSnapshot: async () => {
+          throw new Error("not implemented");
+        },
+      },
+    });
+
+    await expect(
+      manager.addProject({
+        id: "../tmp",
+        name: "looper",
+        repoPath: join(rootDir, "repo"),
+        baseBranch: "main",
+      }),
+    ).rejects.toBeInstanceOf(InvalidProjectIdError);
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../bootstrap/logger";
-import type { LooperConfig } from "../config/index";
+import { InvalidProjectIdError, type LooperConfig } from "../config/index";
 import {
   assertUniqueActiveLoop,
   createLoop,
@@ -1989,6 +1989,10 @@ function isCodingAgentConfigured(config: LooperConfig): boolean {
 function toApiError(error: unknown): ApiError {
   if (error instanceof ApiError) {
     return error;
+  }
+
+  if (error instanceof InvalidProjectIdError) {
+    return new ApiError("VALIDATION_FAILED", 400, error.message);
   }
 
   return new ApiError(

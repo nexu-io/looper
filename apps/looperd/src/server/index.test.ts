@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "../bootstrap/logger";
-import { createDefaultLooperConfig } from "../config/index";
+import {
+  createDefaultLooperConfig,
+  InvalidProjectIdError,
+} from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -868,6 +871,47 @@ describe("createLooperdApi", () => {
     expect(body.data.id).toBe("looper");
     expect(body.data.repo).toBe("powerformer/looper");
     expect(body.data.discoveredPullRequests).toBe(1);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects unsafe project ids through the API", async () => {
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-invalid-id`,
+      ),
+      store,
+      projects: {
+        addProject: async () => {
+          throw new InvalidProjectIdError("../../tmp");
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/looper",
+          id: "../../tmp",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_FAILED");
+    expect(body.error.message).toContain('Invalid project id "../../tmp"');
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
