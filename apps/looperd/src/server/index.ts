@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../bootstrap/logger";
-import { InvalidProjectIdError, type LooperConfig } from "../config/index";
+import {
+  InvalidProjectIdError,
+  normalizeDerivedProjectId,
+  type LooperConfig,
+} from "../config/index";
 import {
   assertUniqueActiveLoop,
   createLoop,
@@ -1955,7 +1959,7 @@ function deriveProjectIdFromPath(repoPath: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 
-  return normalized || "project";
+  return normalizeDerivedProjectId(normalized || "project");
 }
 
 function serializeEvent(event: EventLogRecord) {

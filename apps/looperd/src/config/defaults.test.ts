@@ -8,11 +8,11 @@ import {
   getDefaultProjectWorktreeRoot,
   getDefaultWorktreeRoot,
 } from "./index";
-import { toProjectWorktreeDirectoryName } from "./project-id";
+import { toRepoWorktreeDirectoryName } from "./project-id";
 
 describe("config defaults", () => {
   const repoPath = join(homedir(), "src", "looper");
-  const repoDirectoryName = toProjectWorktreeDirectoryName(repoPath);
+  const repoDirectoryName = toRepoWorktreeDirectoryName(repoPath);
 
   test("uses ~/.looper for runtime artifacts and worktree roots", () => {
     const config = createDefaultLooperConfig("/tmp/workspace");
@@ -169,6 +169,26 @@ describe("config defaults", () => {
       getDefaultProjectWorktreeRoot(
         "project_1",
         join(homedir(), "src", "repo-b"),
+      ),
+    );
+  });
+
+  test("hashes repository identity when deriving default project worktree roots", () => {
+    const deepRepoPath = join(
+      homedir(),
+      "src",
+      "very".repeat(20),
+      "deep".repeat(20),
+      "repo",
+    );
+
+    expect(getDefaultProjectWorktreeRoot("project_1", deepRepoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        toRepoWorktreeDirectoryName(deepRepoPath),
+        "project_1",
       ),
     );
   });

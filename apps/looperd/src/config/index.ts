@@ -9,6 +9,8 @@ export {
   getProjectIdValidationMessage,
   InvalidProjectIdError,
   isValidProjectId,
+  normalizeDerivedProjectId,
+  toRepoWorktreeDirectoryName,
 } from "./project-id";
 export { loadLooperConfig } from "./load";
 export { detectToolPaths } from "./tools";

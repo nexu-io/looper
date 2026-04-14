@@ -960,6 +960,32 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
+  test("normalizes derived legacy-id project ids through the API", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    const response = await api.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/legacy-id-example",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      data: { id: string; name: string; repoPath: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data.id).toBe("project-legacy-id-example");
+    expect(body.data.name).toBe("Looper");
+    expect(body.data.repoPath).toBe("/tmp/repos/legacy-id-example");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
   test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
     const { api, store, rootDir } = await createFixture();
     store.loops.upsert({

@@ -1,7 +1,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { toProjectWorktreeDirectoryName } from "./project-id";
+import {
+  toProjectWorktreeDirectoryName,
+  toRepoWorktreeDirectoryName,
+} from "./project-id";
 import type { LooperConfig } from "./types";
 
 function getLooperHome(): string {
@@ -80,7 +83,7 @@ export function getDefaultProjectWorktreeRoot(
 ): string {
   return join(
     getDefaultWorktreeRoot(),
-    toProjectWorktreeDirectoryName(repoIdentity),
+    toRepoWorktreeDirectoryName(repoIdentity),
     toProjectWorktreeDirectoryName(projectId),
   );
 }

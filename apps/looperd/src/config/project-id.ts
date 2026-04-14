@@ -16,6 +16,18 @@ function toHashedProjectWorktreeDirectoryName(projectId: string): string {
   return `${LEGACY_PROJECT_ID_PREFIX}${hashedProjectId}`;
 }
 
+export function toRepoWorktreeDirectoryName(repoIdentity: string): string {
+  return `repo-${createHash("sha256").update(repoIdentity).digest("hex")}`;
+}
+
+export function normalizeDerivedProjectId(projectId: string): string {
+  if (!projectId.startsWith(LEGACY_PROJECT_ID_PREFIX)) {
+    return projectId;
+  }
+
+  return `project-${projectId}`;
+}
+
 export class InvalidProjectIdError extends Error {
   constructor(projectId: string) {
     super(`Invalid project id \"${projectId}\": ${INVALID_PROJECT_ID_MESSAGE}`);
