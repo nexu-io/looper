@@ -1013,6 +1013,7 @@ export class WorkerLoopRunner {
       pullRequests.find(
         (pullRequest) =>
           normalizePrState(pullRequest.state) === "open" &&
+          typeof pullRequest.headRefName === "string" &&
           input.branches.includes(pullRequest.headRefName) &&
           pullRequest.baseRefName === input.baseBranch,
       ) ?? null
