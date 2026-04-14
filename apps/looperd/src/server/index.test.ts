@@ -666,7 +666,7 @@ describe("createLooperdApi", () => {
 
     store.loops.upsert({
       id: "loop_planner_issue_999",
-      seq: 100,
+      seq: 200,
       projectId: "project_2",
       type: "planner",
       targetType: "issue",
