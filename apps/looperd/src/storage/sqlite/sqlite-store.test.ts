@@ -878,6 +878,110 @@ describe("SqliteStore", () => {
     store.close();
   });
 
+  test("does not claim queued work whose lock key is already running", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    store.queue.upsert({
+      id: "queue_running_reviewer",
+      projectId: "project_1",
+      loopId: null,
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "reviewer:acme/looper:42",
+      priority: 2,
+      status: "running",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: "executor-1",
+      claimedAt: now,
+      startedAt: now,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.queue.upsert({
+      id: "queue_blocked_worker",
+      projectId: "project_1",
+      loopId: null,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "worker:acme/looper:42",
+      priority: 4,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.queue.upsert({
+      id: "queue_other_pr_worker",
+      projectId: "project_1",
+      loopId: null,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      dedupeKey: "worker:acme/looper:43",
+      priority: 4,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:43",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(store.queue.claimNext(now, "executor-2")?.id).toBe(
+      "queue_other_pr_worker",
+    );
+    expect(store.queue.getById("queue_blocked_worker")?.status).toBe("queued");
+
+    store.close();
+  });
+
   test("lists runs by status in stable newest-first order", async () => {
     const fixture = await createStoreFixture();
     const store = new SqliteStore({ dbPath: fixture.dbPath });

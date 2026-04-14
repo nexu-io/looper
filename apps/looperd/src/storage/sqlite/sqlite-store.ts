@@ -1127,6 +1127,16 @@ const SCHEDULED_QUEUE_BASE_QUERY = `
     AND qi.available_at <= ?1
     AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted')
     AND (
+      qi.lock_key IS NULL
+      OR NOT EXISTS (
+        SELECT 1
+        FROM queue_items lock_blocker
+        WHERE lock_blocker.lock_key = qi.lock_key
+          AND lock_blocker.status = 'running'
+          AND lock_blocker.id != qi.id
+      )
+    )
+    AND (
       qi.type != 'fixer'
       OR qi.repo IS NULL
       OR qi.pr_number IS NULL
