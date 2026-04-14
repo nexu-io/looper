@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +57,28 @@ describe("config defaults", () => {
     );
     expect(getDefaultProjectWorktreeRoot("FOO")).toBe(
       join(homedir(), ".looper", "worktrees", "legacy-id-464f4f"),
+    );
+  });
+
+  test("hashes long canonical project ids when deriving project worktree roots", () => {
+    const projectId = "a".repeat(256);
+    const hashedProjectId = createHash("sha256")
+      .update(projectId)
+      .digest("hex");
+
+    expect(getDefaultProjectWorktreeRoot(projectId)).toBe(
+      join(homedir(), ".looper", "worktrees", `legacy-id-${hashedProjectId}`),
+    );
+  });
+
+  test("hashes long legacy project ids when deriving project worktree roots", () => {
+    const projectId = "A".repeat(123);
+    const hashedProjectId = createHash("sha256")
+      .update(projectId)
+      .digest("hex");
+
+    expect(getDefaultProjectWorktreeRoot(projectId)).toBe(
+      join(homedir(), ".looper", "worktrees", `legacy-id-${hashedProjectId}`),
     );
   });
 });

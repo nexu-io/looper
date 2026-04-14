@@ -1,10 +1,18 @@
+import { createHash } from "node:crypto";
 import { posix, win32 } from "node:path";
 
 const PROJECT_ID_SEPARATOR_PATTERN = /[\\/]/;
 const LEGACY_PROJECT_ID_PREFIX = "legacy-id-";
 const CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN = /^[a-z0-9._-]+$/;
+const MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH = 255;
 const INVALID_PROJECT_ID_MESSAGE =
   "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-";
+
+function toHashedProjectWorktreeDirectoryName(projectId: string): string {
+  const hashedProjectId = createHash("sha256").update(projectId).digest("hex");
+
+  return `${LEGACY_PROJECT_ID_PREFIX}${hashedProjectId}`;
+}
 
 export class InvalidProjectIdError extends Error {
   constructor(projectId: string) {
@@ -38,12 +46,20 @@ export function assertValidProjectId(projectId: string): void {
 export function toProjectWorktreeDirectoryName(projectId: string): string {
   if (
     isValidProjectId(projectId) &&
-    CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN.test(projectId)
+    CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN.test(projectId) &&
+    projectId.length <= MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH
   ) {
     return projectId;
   }
 
   const encodedProjectId = Buffer.from(projectId).toString("hex") || "empty";
 
-  return `${LEGACY_PROJECT_ID_PREFIX}${encodedProjectId}`;
+  if (
+    LEGACY_PROJECT_ID_PREFIX.length + encodedProjectId.length <=
+    MAX_PROJECT_WORKTREE_DIRECTORY_NAME_LENGTH
+  ) {
+    return `${LEGACY_PROJECT_ID_PREFIX}${encodedProjectId}`;
+  }
+
+  return toHashedProjectWorktreeDirectoryName(projectId);
 }
