@@ -10,6 +10,7 @@ import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { ProtectedBranchError } from "../infra/git";
 import type {
+  GitHubIssueDetail,
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
 } from "../infra/github";
@@ -78,6 +79,11 @@ export interface WorkerGitHubGateway {
     prNumber: number;
     cwd?: string;
   }): Promise<GitHubPullRequestDetail>;
+  viewIssue(input: {
+    repo: string;
+    issueNumber: number;
+    cwd?: string;
+  }): Promise<GitHubIssueDetail>;
   createPullRequest(input: {
     repo: string;
     headBranch: string;
@@ -160,6 +166,8 @@ interface WorkerInput {
   repo: string;
   baseBranch: string;
   executionMode: "create-pr" | "push-existing";
+  issueNumber?: number;
+  issueUrl?: string;
   prNumber?: number;
   branch?: string;
   headSha?: string;
@@ -511,6 +519,19 @@ export class WorkerLoopRunner {
         input.loop.metadataJson,
         input.loop,
       );
+    if (
+      work.executionMode === "create-pr" &&
+      work.issueNumber &&
+      !work.prompt &&
+      !work.specPath
+    ) {
+      const issue = await this.options.github.viewIssue({
+        repo: work.repo,
+        issueNumber: work.issueNumber,
+        cwd: input.project.repoPath,
+      });
+      work = hydrateWorkerInputFromIssue(work, issue);
+    }
     if (input.loop.targetType === "pull_request") {
       const repo = input.loop.repo ?? input.queueItem.repo;
       const prNumber = input.loop.prNumber ?? input.queueItem.prNumber;
@@ -602,7 +623,7 @@ export class WorkerLoopRunner {
     const branch =
       work.executionMode === "push-existing"
         ? (work.branch ?? `pr-${work.prNumber}`)
-        : `looper/worker/${slugify(input.loop.id)}`;
+        : buildWorkerBranchName(work, input.loop.id);
     const worktree = await this.options.git.createWorktree({
       projectId: input.project.id,
       repoPath: input.project.repoPath,
@@ -897,7 +918,12 @@ export class WorkerLoopRunner {
       (executionMode === "push-existing"
         ? (readString(parseJsonObject(loop?.metadataJson).baseBranch) ?? "main")
         : null);
-    if (executionMode === "create-pr" && !prompt && !specPath) {
+    if (
+      executionMode === "create-pr" &&
+      !prompt &&
+      !specPath &&
+      !readNumber(source.issueNumber)
+    ) {
       throw new WorkerLoopError(
         "worker.prompt or worker.specPath is required",
         "non_retryable",
@@ -920,6 +946,8 @@ export class WorkerLoopRunner {
       prompt,
       specPath,
       executionMode,
+      issueNumber: readNumber(source.issueNumber),
+      issueUrl: readString(source.issueUrl) ?? undefined,
       prNumber: readNumber(source.prNumber),
       branch: readString(source.branch) ?? undefined,
       headSha: readString(source.headSha) ?? undefined,
@@ -1409,11 +1437,62 @@ function buildPullRequestBody(input: {
     input.executionSummary
       ? `\n## Agent Summary\n${input.executionSummary}`
       : null,
+    input.work.issueNumber
+      ? `\nIssue: ${input.work.repo}#${input.work.issueNumber}`
+      : null,
+    input.work.issueUrl ? `Issue URL: ${input.work.issueUrl}` : null,
     input.work.specPath ? `\nSpec: ${input.work.specPath}` : null,
     input.work.prompt ? `\nPrompt: ${input.work.prompt}` : null,
+    input.work.issueNumber ? `\nCloses #${input.work.issueNumber}` : null,
   ]
     .filter((value): value is string => Boolean(value))
     .join("\n");
+}
+
+function hydrateWorkerInputFromIssue(
+  work: WorkerInput,
+  issue: GitHubIssueDetail,
+): WorkerInput {
+  const fallbackTitle = buildDefaultIssueWorkerTitle(work.repo, issue.number);
+  return {
+    ...work,
+    title:
+      work.title === "Worker run" || work.title === fallbackTitle
+        ? issue.title
+        : work.title,
+    prompt: buildIssuePrompt(work.repo, issue),
+    issueUrl: issue.url,
+  };
+}
+
+function buildIssuePrompt(repo: string, issue: GitHubIssueDetail): string {
+  return [
+    `Implement GitHub issue ${repo}#${issue.number}: ${issue.title}`,
+    issue.body ? `Issue body:\n${issue.body}` : null,
+    issue.url ? `Issue URL: ${issue.url}` : null,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n\n");
+}
+
+function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
+  if (work.issueNumber) {
+    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}`;
+  }
+
+  return `looper/worker/${slugify(loopId)}`;
+}
+
+function buildWorkerSlug(title: string): string {
+  const words = slugify(title).split("-").filter(Boolean).slice(0, 8).join("-");
+  return words || "update";
+}
+
+function buildDefaultIssueWorkerTitle(
+  repo: string,
+  issueNumber: number,
+): string {
+  return `Implement ${repo}#${issueNumber}`;
 }
 
 function buildPullRequestTargetId(repo: string, prNumber: number): string {
