@@ -28,6 +28,7 @@ export interface GitHubPullRequestDetail extends GitHubPullRequestSummary {
   body?: string;
   headSha?: string;
   baseSha?: string;
+  hasConflicts?: boolean;
   comments: unknown[];
   reviews: unknown[];
   checks: unknown[];
@@ -259,6 +260,7 @@ export class GhCliGitHubGateway {
           "comments",
           "reviews",
           "statusCheckRollup",
+          "mergeStateStatus",
         ].join(","),
       ],
       input.cwd,
@@ -281,6 +283,7 @@ export class GhCliGitHubGateway {
       baseSha: asOptionalString(parsed.baseRefOid),
       author: extractAuthor(parsed.author),
       reviewRequests: extractReviewRequestLogins(parsed.reviewRequests),
+      hasConflicts: asOptionalString(parsed.mergeStateStatus) === "DIRTY",
       comments:
         reviewThreads.length > 0
           ? reviewThreads

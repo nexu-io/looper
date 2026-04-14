@@ -48,7 +48,7 @@ describe("GhCliGitHubGateway", () => {
     printf '{}'
     ;;
   "pr view"*)
-    printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
+    printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
     ;;
   "pr diff"*)
     printf 'diff --git a/a.ts b/a.ts\n'
@@ -129,6 +129,7 @@ esac\n`,
       prNumber: 42,
     });
     expect(detail.reviewRequests).toEqual(["reviewer"]);
+    expect(detail.hasConflicts).toBe(true);
     expect(detail.comments).toEqual([
       {
         id: "comment-1",
