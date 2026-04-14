@@ -1000,6 +1000,42 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("fails claimed work instead of leaving it running when setup throws", async () => {
+    const fixture = await createFixture();
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git: new FakeGitGateway(fixture.worktreeRoot),
+      github: new FakeGitHubGateway(),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    Object.assign(runner as object, {
+      getLoop() {
+        throw new Error("setup exploded");
+      },
+    });
+
+    await expect(runner.processClaimedItem(claimed)).rejects.toThrow(
+      "setup exploded",
+    );
+    expect(fixture.store.queue.getById(claimed.id)?.status).toBe("failed");
+
+    fixture.store.close();
+  });
+
   test("discovers spec-ready PRs and pushes to the existing PR branch", async () => {
     const fixture = await createFixture();
     configurePullRequestWorkerLoop(fixture, 77);

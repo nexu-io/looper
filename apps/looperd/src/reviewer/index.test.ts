@@ -921,6 +921,40 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("fails claimed review work instead of leaving it running when setup throws", async () => {
+    const fixture = await createFixture();
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github: new FakeGitHubGateway(),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    Object.assign(runner as object, {
+      getLoop() {
+        throw new Error("setup exploded");
+      },
+    });
+
+    await expect(runner.processClaimedItem(claimed)).rejects.toThrow(
+      "setup exploded",
+    );
+    expect(fixture.store.queue.getById(claimed.id)?.status).toBe("failed");
+
+    fixture.store.close();
+  });
+
   test("skips PRs already reviewed for the same head sha", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({ headSha: "abc123" });

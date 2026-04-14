@@ -266,53 +266,57 @@ export class WorkerLoopRunner {
       throw new Error("Worker queue item requires loopId");
     }
 
-    const loop = this.getLoop(queueItem.loopId);
-    const project = this.getProject(loop.projectId);
-    const resumedRun = this.createRunContext(loop);
-    let run = resumedRun.run;
-    let checkpoint = resumedRun.checkpoint;
-    let claimedLockKey =
-      resumedRun.startStep !== "prepare-work"
-        ? checkpoint.claimedLockKey
-        : undefined;
-
-    if (claimedLockKey) {
-      const acquired = this.options.scheduler.acquireBusinessLock({
-        key: claimedLockKey,
-        owner: queueItem.id,
-        reason: "worker-run-resume",
-        expiresAt: new Date(
-          this.now().getTime() + this.claimTtlMs,
-        ).toISOString(),
-      });
-      if (!acquired) {
-        throw new WorkerLoopError(
-          `Worker lock is already held for ${claimedLockKey}`,
-          "retryable_transient",
-        );
-      }
-    }
-
-    this.updateLoop(loop, {
-      status: "running",
-      lastRunAt: run.startedAt,
-      nextRunAt: null,
-    });
-    this.appendEvent({
-      eventType: "loop.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "loop",
-      entityId: loop.id,
-      payload: {
-        queueItemId: queueItem.id,
-        resumed: resumedRun.resumed,
-        startStep: resumedRun.startStep,
-      },
-    });
-
+    let loop: LoopRecord | undefined;
+    let run: RunRecord | undefined;
+    let checkpoint: WorkerCheckpoint | undefined;
+    let claimedLockKey: string | undefined;
     try {
+      loop = this.getLoop(queueItem.loopId);
+      const project = this.getProject(loop.projectId);
+      const resumedRun = this.createRunContext(loop);
+      run = resumedRun.run;
+      checkpoint = resumedRun.checkpoint;
+      claimedLockKey =
+        resumedRun.startStep !== "prepare-work"
+          ? checkpoint.claimedLockKey
+          : undefined;
+
+      if (claimedLockKey) {
+        const acquired = this.options.scheduler.acquireBusinessLock({
+          key: claimedLockKey,
+          owner: queueItem.id,
+          reason: "worker-run-resume",
+          expiresAt: new Date(
+            this.now().getTime() + this.claimTtlMs,
+          ).toISOString(),
+        });
+        if (!acquired) {
+          throw new WorkerLoopError(
+            `Worker lock is already held for ${claimedLockKey}`,
+            "retryable_transient",
+          );
+        }
+      }
+
+      this.updateLoop(loop, {
+        status: "running",
+        lastRunAt: run.startedAt,
+        nextRunAt: null,
+      });
+      this.appendEvent({
+        eventType: "loop.started",
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        entityType: "loop",
+        entityId: loop.id,
+        payload: {
+          queueItemId: queueItem.id,
+          resumed: resumedRun.resumed,
+          startStep: resumedRun.startStep,
+        },
+      });
+
       for (const step of WORKER_STEP_SEQUENCE.slice(
         WORKER_STEP_SEQUENCE.indexOf(resumedRun.startStep),
       )) {
@@ -359,6 +363,14 @@ export class WorkerLoopRunner {
       };
     } catch (error) {
       const failure = this.classifyFailure(error);
+      if (!loop || !run || !checkpoint) {
+        this.options.scheduler.fail(
+          queueItem.id,
+          failure.kind,
+          failure.message,
+        );
+        throw error;
+      }
       const failedCheckpoint = this.getLatestCheckpoint(run, checkpoint);
       this.finalizeRun(run, {
         status: "failed",

@@ -327,60 +327,65 @@ export class ReviewerLoopRunner {
       );
     }
 
-    const loop = this.getLoop(queueItem.loopId);
-    const project = this.getProject(loop.projectId);
-    const resumedRun = this.createRunContext(loop);
-    let run = resumedRun.run;
-    let checkpoint = resumedRun.checkpoint;
+    let loop: LoopRecord | undefined;
+    let project: ProjectRecord | undefined;
+    let run: RunRecord | undefined;
+    let checkpoint: ReviewerCheckpoint | undefined;
     let claimedLockKey: string | undefined;
 
-    this.updateLoop(loop, {
-      status: "running",
-      lastRunAt: run.startedAt,
-      nextRunAt: null,
-    });
-    this.appendEvent({
-      eventType: "loop.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "loop",
-      entityId: loop.id,
-      payload: {
-        queueItemId: queueItem.id,
-        resumed: resumedRun.resumed,
-        startStep: resumedRun.startStep,
-      },
-    });
-    this.options.logger.info("reviewer loop started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      queueItemId: queueItem.id,
-      currentStep: resumedRun.startStep,
-      resumed: resumedRun.resumed,
-    });
-    this.appendEvent({
-      eventType: "run.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "run",
-      entityId: run.id,
-      payload: {
+    try {
+      loop = this.getLoop(queueItem.loopId);
+      project = this.getProject(loop.projectId);
+      const resumedRun = this.createRunContext(loop);
+      run = resumedRun.run;
+      checkpoint = resumedRun.checkpoint;
+
+      this.updateLoop(loop, {
+        status: "running",
+        lastRunAt: run.startedAt,
+        nextRunAt: null,
+      });
+      this.appendEvent({
+        eventType: "loop.started",
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        entityType: "loop",
+        entityId: loop.id,
+        payload: {
+          queueItemId: queueItem.id,
+          resumed: resumedRun.resumed,
+          startStep: resumedRun.startStep,
+        },
+      });
+      this.options.logger.info("reviewer loop started", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
         queueItemId: queueItem.id,
         currentStep: resumedRun.startStep,
-      },
-    });
-    this.options.logger.info("reviewer run started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      queueItemId: queueItem.id,
-      currentStep: resumedRun.startStep,
-    });
+        resumed: resumedRun.resumed,
+      });
+      this.appendEvent({
+        eventType: "run.started",
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        entityType: "run",
+        entityId: run.id,
+        payload: {
+          queueItemId: queueItem.id,
+          currentStep: resumedRun.startStep,
+        },
+      });
+      this.options.logger.info("reviewer run started", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        queueItemId: queueItem.id,
+        currentStep: resumedRun.startStep,
+      });
 
-    try {
       for (const step of REVIEWER_STEP_SEQUENCE.slice(
         REVIEWER_STEP_SEQUENCE.indexOf(resumedRun.startStep),
       )) {
@@ -485,6 +490,14 @@ export class ReviewerLoopRunner {
       };
     } catch (error) {
       const failure = this.classifyFailure(error);
+      if (!loop || !project || !run || !checkpoint) {
+        this.options.scheduler.fail(
+          queueItem.id,
+          failure.kind,
+          failure.message,
+        );
+        throw error;
+      }
       const failedCheckpoint = this.getLatestCheckpoint(run, checkpoint);
       this.appendEvent({
         eventType: "loop.step.failed",

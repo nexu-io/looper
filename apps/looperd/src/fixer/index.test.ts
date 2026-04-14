@@ -397,7 +397,14 @@ describe("FixerLoopRunner", () => {
     const runner = new FixerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
-      github: new FakeGitHubGateway({ views: [] }),
+      github: new FakeGitHubGateway({
+        views: [
+          {
+            comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+            checks: [],
+          },
+        ],
+      }),
       git: new FakeGitGateway(),
       agentExecutor: new FakeAgentExecutor([]),
       logger: createCapturingLogger().logger,
@@ -1035,6 +1042,52 @@ describe("FixerLoopRunner", () => {
     expect(result.summary).toContain("Auto commit disabled");
     expect(agent.starts).toHaveLength(1);
     expect(git.pushCalls).toBe(0);
+
+    fixture.store.close();
+  });
+
+  test("fails claimed fixer work instead of leaving it running when setup throws", async () => {
+    const fixture = await createFixture();
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github: new FakeGitHubGateway({
+        views: [
+          {
+            comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+            checks: [],
+          },
+        ],
+      }),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("fixer-1");
+    if (!claimed) {
+      throw new Error("Expected claimed fixer queue item");
+    }
+
+    Object.assign(runner as object, {
+      getLoop() {
+        throw new Error("setup exploded");
+      },
+    });
+
+    await expect(runner.processClaimedItem(claimed)).rejects.toThrow(
+      "setup exploded",
+    );
+    expect(fixture.store.queue.getById(claimed.id)?.status).toBe("failed");
 
     fixture.store.close();
   });
