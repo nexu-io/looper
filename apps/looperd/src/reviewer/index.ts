@@ -1225,7 +1225,8 @@ export class ReviewerLoopRunner {
         loop.type !== "reviewer" ||
         loop.projectId !== projectId ||
         loop.repo !== repo ||
-        loop.prNumber == null
+        loop.prNumber == null ||
+        loop.status === "paused"
       ) {
         return false;
       }
