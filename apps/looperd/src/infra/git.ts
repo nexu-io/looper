@@ -209,8 +209,9 @@ export class GitWorktreeGateway {
     ) {
       if (
         (await this.isHealthyWorktree(stored.worktreePath)) &&
-        (input.checkoutMode !== "detached" ||
-          (await this.isDetachedWorktree(stored.worktreePath)))
+        (input.checkoutMode === "detached"
+          ? await this.isDetachedWorktree(stored.worktreePath)
+          : !(await this.isDetachedWorktree(stored.worktreePath)))
       ) {
         const nowIso = this.now().toISOString();
         const restored = {
