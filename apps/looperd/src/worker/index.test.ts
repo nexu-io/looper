@@ -564,7 +564,7 @@ describe("WorkerLoopRunner", () => {
           isDraft: false,
           reviewDecision: undefined,
           labels: [],
-          headRefName: "looper/05e7c1d5",
+          headRefName: "looper/05e7c1d53bba907c",
           baseRefName: "main",
           author: "octocat",
           reviewRequests: [],
@@ -627,7 +627,7 @@ describe("WorkerLoopRunner", () => {
           isDraft: false,
           reviewDecision: undefined,
           labels: [],
-          headRefName: "looper/05e7c1d5",
+          headRefName: "looper/05e7c1d53bba907c",
           baseRefName: "develop",
           author: "octocat",
           reviewRequests: [],
@@ -785,7 +785,7 @@ describe("WorkerLoopRunner", () => {
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(github.createPullRequestCalls[0]?.headBranch).toBe(
-      "looper/123-add-worker-issue-fallback-05e7c1d5",
+      "looper/123-add-worker-issue-fallback-05e7c1d53bba907c",
     );
     expect(github.createPullRequestCalls[0]?.title).toBe(
       "Add worker issue fallback",
@@ -903,9 +903,9 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     const headBranch = github.createPullRequestCalls[0]?.headBranch;
     expect(headBranch).toBeDefined();
-    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(50);
+    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(58);
     expect(headBranch).toMatch(/^looper\/124-/);
-    expect(headBranch).toMatch(/-05e7c1d5$/);
+    expect(headBranch).toMatch(/-05e7c1d53bba907c$/);
 
     fixture.store.close();
   });
