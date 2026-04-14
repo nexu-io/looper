@@ -6,8 +6,10 @@ export {
 } from "./defaults";
 export {
   assertValidProjectId,
+  getConfigProjectIdValidationMessage,
   getProjectIdValidationMessage,
   InvalidProjectIdError,
+  isValidConfiguredProjectId,
   isValidProjectId,
   normalizeDerivedProjectId,
   toRepoWorktreeDirectoryName,

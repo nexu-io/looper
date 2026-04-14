@@ -1029,8 +1029,9 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
-  test("normalizes derived legacy-id project ids through the API", async () => {
+  test("derives legacy-looking project ids without pre-normalizing through the API", async () => {
     const { store, rootDir } = await createFixture();
+    let derivedId: string | undefined;
     const apiWithProjects = createLooperdApi({
       config: createDefaultLooperConfig(rootDir),
       logger: await createLogger(
@@ -1045,6 +1046,7 @@ describe("createLooperdApi", () => {
           repoPath: string;
           baseBranch: string;
         }) => {
+          derivedId = input.id;
           const project = {
             id: input.id,
             name: input.name,
@@ -1084,7 +1086,8 @@ describe("createLooperdApi", () => {
     };
 
     expect(response.status).toBe(200);
-    expect(body.data.id).toBe("project_legacy-id-example");
+    expect(derivedId).toBe("legacy-id-example");
+    expect(body.data.id).toBe("legacy-id-example");
     expect(body.data.name).toBe("Looper");
     expect(body.data.repoPath).toBe("/tmp/repos/legacy-id-example");
 
@@ -1162,9 +1165,9 @@ describe("createLooperdApi", () => {
 
     expect(legacyResponse.status).toBe(200);
     expect(normalizedResponse.status).toBe(200);
-    expect(legacyBody.data.id).toBe("project_legacy-id-foo");
+    expect(legacyBody.data.id).toBe("legacy-id-foo");
     expect(normalizedBody.data.id).toBe("project-legacy-id-foo");
-    expect(store.projects.getById("project_legacy-id-foo")?.repoPath).toBe(
+    expect(store.projects.getById("legacy-id-foo")?.repoPath).toBe(
       "/tmp/repos/legacy-id-foo",
     );
     expect(store.projects.getById("project-legacy-id-foo")?.repoPath).toBe(

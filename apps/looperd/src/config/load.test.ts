@@ -229,13 +229,13 @@ describe("loadLooperConfig", () => {
         {
           path: "projects[0].id",
           message:
-            "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-",
+            "must not contain path separators, dot segments, or be an absolute path",
         },
       ],
     });
   });
 
-  test("rejects project ids that use the reserved legacy-id prefix", async () => {
+  test("allows legacy project ids in config for upgrade compatibility", async () => {
     const fixture = await createFixture();
     cleanupPaths.push(fixture.rootDir);
 
@@ -258,28 +258,20 @@ describe("loadLooperConfig", () => {
         projects: [
           {
             id: "legacy-id-Li4vdG1w",
-            name: "bad-project",
+            name: "legacy-project",
             repoPath: fixture.writableDir,
           },
         ],
       }),
     );
 
-    await expect(
-      loadLooperConfig({
-        argv: ["--config", fixture.configPath],
-        cwd: fixture.rootDir,
-        env: {},
-      }),
-    ).rejects.toMatchObject({
-      issues: [
-        {
-          path: "projects[0].id",
-          message:
-            "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-",
-        },
-      ],
+    const loaded = await loadLooperConfig({
+      argv: ["--config", fixture.configPath],
+      cwd: fixture.rootDir,
+      env: {},
     });
+
+    expect(loaded.config.projects[0]?.id).toBe("legacy-id-Li4vdG1w");
   });
 
   test("rejects configs when the default worktree root cannot be created", async () => {

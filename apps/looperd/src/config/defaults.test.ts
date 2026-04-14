@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   createDefaultLooperConfig,
@@ -191,5 +193,23 @@ describe("config defaults", () => {
         "project_1",
       ),
     );
+  });
+
+  test("canonicalizes equivalent repository paths before hashing worktree roots", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-defaults-"));
+    const repoPath = join(rootDir, "repo");
+    const repoAliasPath = join(rootDir, "repo-alias");
+
+    await mkdir(repoPath, { recursive: true });
+    await symlink(repoPath, repoAliasPath);
+
+    expect(toRepoWorktreeDirectoryName(`${repoPath}/`)).toBe(
+      toRepoWorktreeDirectoryName(repoPath),
+    );
+    expect(toRepoWorktreeDirectoryName(repoAliasPath)).toBe(
+      toRepoWorktreeDirectoryName(repoPath),
+    );
+
+    await rm(rootDir, { recursive: true, force: true });
   });
 });

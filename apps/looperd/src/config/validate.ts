@@ -2,7 +2,10 @@ import { constants, access, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { getDefaultWorktreeRoot } from "./defaults";
-import { getProjectIdValidationMessage, isValidProjectId } from "./project-id";
+import {
+  getConfigProjectIdValidationMessage,
+  isValidConfiguredProjectId,
+} from "./project-id";
 import {
   AGENT_VENDORS,
   AUTH_MODES,
@@ -298,10 +301,10 @@ export async function validateLooperConfig(
         path: `${prefix}.id`,
         message: "must be a non-empty string",
       });
-    } else if (!isValidProjectId(project.id)) {
+    } else if (!isValidConfiguredProjectId(project.id)) {
       issues.push({
         path: `${prefix}.id`,
-        message: getProjectIdValidationMessage(),
+        message: getConfigProjectIdValidationMessage(),
       });
     } else if (projectIds.has(project.id)) {
       issues.push({

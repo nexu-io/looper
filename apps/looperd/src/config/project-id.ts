@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { posix, win32 } from "node:path";
+import { realpathSync } from "node:fs";
+import { normalize, posix, resolve, win32 } from "node:path";
 
 const PROJECT_ID_SEPARATOR_PATTERN = /[\\/]/;
 const LEGACY_PROJECT_ID_PREFIX = "legacy-id-";
@@ -10,6 +11,8 @@ const WINDOWS_RESERVED_PROJECT_DIRECTORY_BASENAME_PATTERN =
   /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/;
 const INVALID_PROJECT_ID_MESSAGE =
   "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-";
+const CONFIG_PROJECT_ID_MESSAGE =
+  "must not contain path separators, dot segments, or be an absolute path";
 
 function toHashedProjectWorktreeDirectoryName(projectId: string): string {
   const hashedProjectId = createHash("sha256").update(projectId).digest("hex");
@@ -18,7 +21,7 @@ function toHashedProjectWorktreeDirectoryName(projectId: string): string {
 }
 
 export function toRepoWorktreeDirectoryName(repoIdentity: string): string {
-  return `repo-${createHash("sha256").update(repoIdentity).digest("hex")}`;
+  return `repo-${createHash("sha256").update(canonicalizeRepoIdentity(repoIdentity)).digest("hex")}`;
 }
 
 export function normalizeDerivedProjectId(projectId: string): string {
@@ -52,9 +55,34 @@ export function getProjectIdValidationMessage(): string {
   return INVALID_PROJECT_ID_MESSAGE;
 }
 
+export function getConfigProjectIdValidationMessage(): string {
+  return CONFIG_PROJECT_ID_MESSAGE;
+}
+
 export function assertValidProjectId(projectId: string): void {
   if (!isValidProjectId(projectId)) {
     throw new InvalidProjectIdError(projectId);
+  }
+}
+
+export function isValidConfiguredProjectId(projectId: string): boolean {
+  return (
+    projectId.length > 0 &&
+    projectId !== "." &&
+    projectId !== ".." &&
+    !PROJECT_ID_SEPARATOR_PATTERN.test(projectId) &&
+    !posix.isAbsolute(projectId) &&
+    !win32.isAbsolute(projectId)
+  );
+}
+
+function canonicalizeRepoIdentity(repoIdentity: string): string {
+  const resolved = normalize(resolve(repoIdentity));
+
+  try {
+    return normalize(realpathSync.native(resolved));
+  } catch {
+    return resolved;
   }
 }
 
