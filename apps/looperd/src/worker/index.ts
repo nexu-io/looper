@@ -1477,7 +1477,7 @@ function buildIssuePrompt(repo: string, issue: GitHubIssueDetail): string {
 
 function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
   if (work.issueNumber) {
-    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}`;
+    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}-${slugify(loopId)}`;
   }
 
   return `looper/worker/${slugify(loopId)}`;

@@ -623,7 +623,7 @@ describe("WorkerLoopRunner", () => {
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(github.createPullRequestCalls[0]?.headBranch).toBe(
-      "looper/worker/123-add-worker-issue-fallback",
+      "looper/worker/123-add-worker-issue-fallback-loop-worker-1",
     );
     expect(github.createPullRequestCalls[0]?.title).toBe(
       "Add worker issue fallback",
