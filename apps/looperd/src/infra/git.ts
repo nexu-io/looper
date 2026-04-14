@@ -209,26 +209,28 @@ export class GitWorktreeGateway {
       (!input.worktreeRoot ||
         isWithinRoot(stored.worktreePath, input.worktreeRoot))
     ) {
-      const storedCheckoutMatches = await this.matchesRestoreCheckoutMode(
-        stored.worktreePath,
-        input,
-      );
-      if (
-        (await this.isHealthyWorktree(stored.worktreePath)) &&
-        storedCheckoutMatches
-      ) {
-        const nowIso = this.now().toISOString();
-        const restored = {
-          ...stored,
-          headSha: await this.getHeadSha(stored.worktreePath),
-          status: "active" as const,
-          updatedAt: nowIso,
-        };
-        this.options.store?.worktrees.upsert(restored);
-        return restored;
-      }
+      const storedHealthy = await this.isHealthyWorktree(stored.worktreePath);
+      if (!storedHealthy) {
+        await this.tryRemoveWorktree(input.repoPath, stored.worktreePath);
+      } else {
+        const storedCheckoutMatches = await this.matchesRestoreCheckoutMode(
+          stored.worktreePath,
+          input,
+        );
+        if (storedCheckoutMatches) {
+          const nowIso = this.now().toISOString();
+          const restored = {
+            ...stored,
+            headSha: await this.getHeadSha(stored.worktreePath),
+            status: "active" as const,
+            updatedAt: nowIso,
+          };
+          this.options.store?.worktrees.upsert(restored);
+          return restored;
+        }
 
-      await this.tryRemoveWorktree(input.repoPath, stored.worktreePath);
+        await this.tryRemoveWorktree(input.repoPath, stored.worktreePath);
+      }
     }
 
     const worktrees = await this.listWorktrees(input.repoPath);

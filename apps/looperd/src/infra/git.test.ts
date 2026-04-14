@@ -502,6 +502,78 @@ describe("GitWorktreeGateway", () => {
     store.close();
   });
 
+  test("recreates worktree when stored row points at a deleted path", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
+    cleanupPaths.push(rootDir);
+    const repoPath = join(rootDir, "repo");
+    const worktreeRoot = join(rootDir, "worktrees");
+    await mkdir(repoPath, { recursive: true });
+
+    await runGit(["init", "-b", "main"], repoPath);
+    await runGit(["config", "user.email", "test@example.com"], repoPath);
+    await runGit(["config", "user.name", "Looper Test"], repoPath);
+    await writeFile(join(repoPath, "README.md"), "hello\n");
+    await runGit(["add", "README.md"], repoPath);
+    await runGit(["commit", "-m", "init"], repoPath);
+
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+    });
+    store.initialize({ autoMigrate: true });
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const missingWorktreePath = join(
+      worktreeRoot,
+      "looper-fix-project_1-pr-42",
+    );
+    store.worktrees.upsert({
+      id: "missing-record",
+      projectId: "project_1",
+      repoPath,
+      worktreePath: missingWorktreePath,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      status: "active",
+      headSha: null,
+      metadataJson: JSON.stringify({ recovered: false }),
+      createdAt: now,
+      updatedAt: now,
+      cleanedAt: null,
+    });
+
+    const gateway = new GitWorktreeGateway({ gitPath: "git", store });
+    const recreated = await gateway.createWorktree({
+      projectId: "project_1",
+      repoPath,
+      worktreeRoot,
+      branch: "feature/fixer",
+      baseBranch: "main",
+      prNumber: 42,
+      checkoutMode: "detached",
+    });
+
+    expect(normalizeForTest(recreated.worktreePath)).toBe(
+      normalizeForTest(missingWorktreePath),
+    );
+    expect(
+      (
+        await runGit(["branch", "--show-current"], recreated.worktreePath)
+      ).trim(),
+    ).toBe("");
+
+    store.close();
+  });
+
   test("ignores stored worktrees that belong to a different repo path", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
     cleanupPaths.push(rootDir);
