@@ -238,6 +238,7 @@ describe("ProjectManager", () => {
       name: "legacy-id-example",
       repoPath: join(rootDir, "legacy-id-example"),
       baseBranch: "main",
+      idSource: "derived",
     });
 
     expect(result.project.id).toBe("project_legacy-id-example");
@@ -289,6 +290,7 @@ describe("ProjectManager", () => {
       name: "new name",
       repoPath: join(rootDir, "legacy-id-example"),
       baseBranch: "develop",
+      idSource: "derived",
     });
 
     expect(result.project.id).toBe("legacy-id-example");
@@ -297,6 +299,58 @@ describe("ProjectManager", () => {
     expect(result.project.baseBranch).toBe("develop");
     expect(store.projects.list()).toHaveLength(1);
     expect(store.projects.getById("project_legacy-id-example")).toBeNull();
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects derived legacy-id collisions with explicit normalized ids", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-projects-"));
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+      backupDir: join(rootDir, "backups"),
+    });
+    store.initialize({ autoMigrate: true });
+
+    store.projects.upsert({
+      id: "project_legacy-id-foo",
+      name: "explicit project",
+      repoPath: join(rootDir, "explicit-project"),
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ source: "api" }),
+      createdAt: "2026-04-10T12:00:00.000Z",
+      updatedAt: "2026-04-10T12:00:00.000Z",
+    });
+
+    const manager = new ProjectManager({
+      store,
+      logger: createLogger(),
+      now: () => new Date("2026-04-11T12:00:00.000Z"),
+      git: {
+        detectGitHubRepo: async () => null,
+        listWorktrees: async () => [],
+      },
+      github: {
+        listOpenPullRequests: async () => [],
+        capturePullRequestSnapshot: async () => {
+          throw new Error("not implemented");
+        },
+      },
+    });
+
+    await expect(
+      manager.addProject({
+        id: "legacy-id-foo",
+        name: "legacy-id-foo",
+        repoPath: join(rootDir, "legacy-id-foo"),
+        baseBranch: "main",
+        idSource: "derived",
+      }),
+    ).rejects.toThrow("Derived project id collides");
+    expect(store.projects.getById("project_legacy-id-foo")?.repoPath).toBe(
+      join(rootDir, "explicit-project"),
+    );
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

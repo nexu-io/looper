@@ -1045,6 +1045,7 @@ describe("createLooperdApi", () => {
           name: string;
           repoPath: string;
           baseBranch: string;
+          idSource?: "explicit" | "derived";
         }) => {
           derivedId = input.id;
           const project = {
@@ -1090,6 +1091,75 @@ describe("createLooperdApi", () => {
     expect(body.data.id).toBe("legacy-id-example");
     expect(body.data.name).toBe("Looper");
     expect(body.data.repoPath).toBe("/tmp/repos/legacy-id-example");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("derives project ids with the same mixed-separator parser used by project normalization", async () => {
+    const { store, rootDir } = await createFixture();
+    let derivedId = "";
+    let idSource: "explicit" | "derived" | undefined;
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-mixed-separators`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+          idSource?: "explicit" | "derived";
+        }) => {
+          derivedId = input.id;
+          idSource = input.idSource;
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos\\legacy-id-example",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      data: { id: string; name: string; repoPath: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(derivedId).toBe("legacy-id-example");
+    expect(idSource).toBe("derived");
+    expect(body.data.id).toBe("legacy-id-example");
+    expect(body.data.repoPath).toBe("/tmp/repos\\legacy-id-example");
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

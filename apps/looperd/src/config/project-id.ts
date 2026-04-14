@@ -32,6 +32,17 @@ export function normalizeDerivedProjectId(projectId: string): string {
   return `${AUTO_DERIVED_LEGACY_PROJECT_ID_PREFIX}${projectId}`;
 }
 
+export function deriveProjectIdFromRepoPath(repoPath: string): string {
+  const segments = repoPath.split(/[\\/]+/).filter(Boolean);
+  const lastSegment = segments.at(-1) ?? "project";
+  const normalized = lastSegment
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || "project";
+}
+
 export class InvalidProjectIdError extends Error {
   constructor(projectId: string) {
     super(`Invalid project id \"${projectId}\": ${INVALID_PROJECT_ID_MESSAGE}`);

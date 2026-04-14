@@ -6,6 +6,7 @@ export {
 } from "./defaults";
 export {
   assertValidProjectId,
+  deriveProjectIdFromRepoPath,
   getConfigProjectIdValidationMessage,
   getProjectIdValidationMessage,
   InvalidProjectIdError,
