@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import {
   InvalidProjectIdError,
-  normalizeDerivedProjectId,
   type LooperConfig,
+  normalizeDerivedProjectId,
 } from "../config/index";
 import {
   assertUniqueActiveLoop,
