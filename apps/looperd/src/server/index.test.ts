@@ -886,7 +886,7 @@ describe("createLooperdApi", () => {
   });
 
   test("supports project add route", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
     const apiWithProjects = createLooperdApi({
       config: createDefaultLooperConfig(rootDir),
       logger: await createLogger(
@@ -1030,9 +1030,46 @@ describe("createLooperdApi", () => {
   });
 
   test("normalizes derived legacy-id project ids through the API", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-derived-id`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => {
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
 
-    const response = await api.handle(
+    const response = await apiWithProjects.handle(
       new Request("http://localhost/api/v1/projects", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1056,9 +1093,46 @@ describe("createLooperdApi", () => {
   });
 
   test("keeps derived legacy-id project ids distinct from normalized repo names", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-distinct-derived-id`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => {
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
 
-    const legacyResponse = await api.handle(
+    const legacyResponse = await apiWithProjects.handle(
       new Request("http://localhost/api/v1/projects", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1072,7 +1146,7 @@ describe("createLooperdApi", () => {
       data: { id: string; repoPath: string };
     };
 
-    const normalizedResponse = await api.handle(
+    const normalizedResponse = await apiWithProjects.handle(
       new Request("http://localhost/api/v1/projects", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1102,7 +1176,7 @@ describe("createLooperdApi", () => {
   });
 
   test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
     store.loops.upsert({
       id: "loop_fixer_no_agent",
       seq: 4,
