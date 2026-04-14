@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
-import type { OpenPrStrategy } from "../config/index";
+import {
+  type OpenPrStrategy,
+  getDefaultProjectWorktreeRoot,
+} from "../config/index";
 import { createPrLockKey } from "../domain/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
@@ -622,7 +625,7 @@ export class WorkerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
-      configuredRoot ?? join(input.project.repoPath, ".looper-worktrees");
+      configuredRoot ?? getDefaultProjectWorktreeRoot(input.project.id);
     const branch =
       work.executionMode === "push-existing"
         ? (work.branch ?? `pr-${work.prNumber}`)
