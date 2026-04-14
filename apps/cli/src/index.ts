@@ -78,15 +78,21 @@ interface PullRequestRef {
   prNumber: number;
 }
 
+interface ProjectSummary {
+  id: string;
+  repoPath: string;
+  repo: string | null;
+}
+
 interface ActiveRunItem {
   seq: number;
-  runId: string;
+  runId: string | null;
   loopId: string;
   projectId: string;
   type: string;
   status: string;
   currentStep: string | null;
-  startedAt: string;
+  startedAt: string | null;
   target:
     | {
         type: "project";
@@ -293,6 +299,8 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       context.showHelp("pr");
       return;
+    case "review":
+      return runReviewCreate(context);
     case "run":
       if (subcommand === "list") {
         return runRunList(context);
@@ -404,6 +412,16 @@ function createCli(runtime: CliRuntime) {
     .example((name) => `  $ ${name} pr show acme/looper#42`)
     .action(async (args, options) => {
       await dispatch(createContext(runtime, ["pr", ...args], options));
+    });
+
+  cli
+    .command("review <pr>", "Create a reviewer task for a pull request")
+    .option("--project <projectId>", "Project id")
+    .option("--loop", "Keep reviewing when new commits are pushed")
+    .example((name) => `  $ ${name} review 123`)
+    .example((name) => `  $ ${name} review acme/looper#42 --loop`)
+    .action(async (pr, options) => {
+      await dispatch(createContext(runtime, ["review", pr], options));
     });
 
   cli
@@ -780,6 +798,42 @@ async function runLoopStart(context: CliContext) {
   ]);
 }
 
+async function runReviewCreate(context: CliContext) {
+  const refText = context.args.positionals[1];
+  if (!refText) {
+    throw new Error("Usage: looper review <pr> [--loop]");
+  }
+
+  const target = await resolveReviewTarget(context, refText);
+  const data = await context.client.post<Record<string, unknown>>(
+    "/api/v1/loops",
+    {
+      projectId: target.projectId,
+      type: "reviewer",
+      targetType: "pull_request",
+      repo: target.repo,
+      prNumber: target.prNumber,
+      status: "running",
+      metadata: {
+        followUpdates: hasFlag(context.args, "loop"),
+        manual: true,
+      },
+    },
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  printSection(context.write, "Reviewer started", [
+    ["id", data.id as string],
+    ["projectId", data.projectId as string],
+    ["pr", `${data.repo}#${data.prNumber}`],
+    ["status", data.status as string],
+    ["loop", String(hasFlag(context.args, "loop"))],
+  ]);
+}
+
 async function buildLoopCreateBody(context: CliContext) {
   const type = requireFlag(context.args, "type");
   const pr = getFlag(context.args, "pr");
@@ -1014,7 +1068,7 @@ async function runPs(context: CliContext) {
   }
 
   if (data.items.length === 0) {
-    context.write("No running loops.");
+    context.write("No running or queued loops.");
     return;
   }
 
@@ -1163,7 +1217,11 @@ async function runStop(context: CliContext) {
   }
 }
 
-function formatRelativeAge(startedAt: string): string {
+function formatRelativeAge(startedAt: string | null): string {
+  if (!startedAt) {
+    return "-";
+  }
+
   const started = Date.parse(startedAt);
   if (Number.isNaN(started)) {
     return "-";
@@ -1288,17 +1346,118 @@ function requireFlag(args: ParsedArgs, name: string): string {
   return value;
 }
 
+async function resolveReviewTarget(
+  context: CliContext,
+  value: string,
+): Promise<{ projectId: string; repo: string; prNumber: number }> {
+  const explicitProjectId = getFlag(context.args, "project");
+  const projects = await listProjects(context);
+  const parsed = parseOptionalRepoPullRequestRef(value);
+
+  if (parsed.repo) {
+    const project = resolveProjectForRepo(
+      projects,
+      parsed.repo,
+      explicitProjectId,
+    );
+    return {
+      projectId: project.id,
+      repo: parsed.repo,
+      prNumber: parsed.prNumber,
+    };
+  }
+
+  const projectId = resolveExplicitOrCurrentProjectId(
+    context,
+    projects,
+    explicitProjectId,
+  );
+  const project = projects.find((candidate) => candidate.id === projectId);
+  if (!project?.repo) {
+    throw new Error(`project ${projectId} is missing a configured repo`);
+  }
+
+  return {
+    projectId,
+    repo: project.repo,
+    prNumber: parsed.prNumber,
+  };
+}
+
+function resolveExplicitOrCurrentProjectId(
+  context: CliContext,
+  projects: ProjectSummary[],
+  explicitProjectId?: string,
+): string {
+  if (explicitProjectId && explicitProjectId !== "true") {
+    const explicitProject = projects.find(
+      (project) => project.id === explicitProjectId,
+    );
+    if (!explicitProject) {
+      throw new Error(`project not found: ${explicitProjectId}`);
+    }
+    return explicitProject.id;
+  }
+
+  return resolveProjectId(context, projects);
+}
+
+async function listProjects(context: CliContext): Promise<ProjectSummary[]> {
+  const data = await context.client.get<{ items: ProjectSummary[] }>(
+    "/api/v1/projects",
+  );
+  return data.items;
+}
+
+function resolveProjectForRepo(
+  projects: ProjectSummary[],
+  repo: string,
+  explicitProjectId?: string,
+): ProjectSummary {
+  if (explicitProjectId && explicitProjectId !== "true") {
+    const explicitProject = projects.find(
+      (project) => project.id === explicitProjectId,
+    );
+    if (!explicitProject) {
+      throw new Error(`project not found: ${explicitProjectId}`);
+    }
+    if (explicitProject.repo !== repo) {
+      throw new Error(
+        `project ${explicitProjectId} is configured for ${explicitProject.repo ?? "no repo"}, not ${repo}`,
+      );
+    }
+    return explicitProject;
+  }
+
+  const matches = projects.filter((project) => project.repo === repo);
+  if (matches.length === 0) {
+    throw new Error(
+      `--project is required (no project configured for repo ${repo})`,
+    );
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `--project is required (multiple projects are configured for repo ${repo})`,
+    );
+  }
+  return matches[0] as ProjectSummary;
+}
+
 async function resolveCommandProjectId(context: CliContext): Promise<string> {
   const explicitProjectId = getFlag(context.args, "project");
   if (explicitProjectId && explicitProjectId !== "true") {
     return explicitProjectId;
   }
 
+  return resolveProjectId(context, await listProjects(context));
+}
+
+function resolveProjectId(
+  context: CliContext,
+  projects: ProjectSummary[],
+): string {
   const cwd = normalizeComparablePath(context.cwd);
-  const data = await context.client.get<{
-    items: Array<{ id: string; repoPath: string }>;
-  }>("/api/v1/projects");
-  const matches = data.items.filter((project) =>
+  const matches = projects.filter((project) =>
     isWithinProjectRepo(cwd, project.repoPath),
   );
 
@@ -1361,6 +1520,26 @@ function parsePullRequestRef(value: string): PullRequestRef {
     repo,
     prNumber: Number(prNumber),
   };
+}
+
+function parseOptionalRepoPullRequestRef(value: string): {
+  repo?: string;
+  prNumber: number;
+} {
+  const trimmed = value.trim();
+  const repoQualified = /^(?<repo>[^#]+)#(?<prNumber>\d+)$/.exec(trimmed);
+  if (repoQualified?.groups?.repo && repoQualified.groups.prNumber) {
+    return {
+      repo: repoQualified.groups.repo,
+      prNumber: Number(repoQualified.groups.prNumber),
+    };
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return { prNumber: Number(trimmed) };
+  }
+
+  throw new Error(`Invalid pull request reference: ${value}`);
 }
 
 function deriveProjectId(repoPath: string): string {

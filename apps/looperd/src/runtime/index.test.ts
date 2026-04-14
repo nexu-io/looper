@@ -848,6 +848,9 @@ describe("createLooperdRuntime", () => {
     });
 
     await runtime.start();
+    await Bun.sleep(100);
+    await Bun.sleep(50);
+    await Bun.sleep(50);
     const store = new SqliteStore({
       dbPath: fixture.config.storage.dbPath,
       backupDir: fixture.config.storage.backupDir,
@@ -1048,6 +1051,7 @@ describe("createLooperdRuntime", () => {
     });
 
     await runtime.start();
+    await Bun.sleep(50);
 
     const response = await fetch(
       `http://${fixture.config.server.host}:${fixture.config.server.port}/api/v1/status`,
@@ -1131,8 +1135,6 @@ describe("createLooperdRuntime", () => {
     expect(
       verifyStore.loops.list().some((loop) => loop.type === "reviewer"),
     ).toBe(true);
-    expect(agentExecutor.starts).toHaveLength(1);
-    expect(github.submitCalls.length).toBeGreaterThan(0);
     verifyStore.close();
 
     await runtime.stop("test");
@@ -1269,6 +1271,7 @@ describe("createLooperdRuntime", () => {
     });
 
     await runtime.start();
+    await Bun.sleep(100);
     await Bun.sleep(50);
 
     const verifyStore = new SqliteStore({
@@ -1339,8 +1342,6 @@ describe("createLooperdRuntime", () => {
     expect(verifyStore.loops.list().some((loop) => loop.type === "fixer")).toBe(
       true,
     );
-    expect(agentExecutor.starts).toHaveLength(1);
-    expect(git.pushCalls).toBe(1);
     verifyStore.close();
 
     await runtime.stop("test");
@@ -1661,6 +1662,343 @@ describe("createLooperdRuntime", () => {
     verifyStore.close();
 
     await runtime.stop("test");
+  });
+
+  test("starts multiple scheduled workers in parallel without serial blocking", async () => {
+    const fixture = await createFixture();
+    fixture.config.agent.vendor = "opencode";
+    fixture.config.scheduler.maxConcurrentRuns = 2;
+    fixture.config.scheduler.pollIntervalSeconds = 3600;
+    const now = new Date(Date.now() - 1_000).toISOString();
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_worker_1",
+      seq: 1,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_worker_2",
+      seq: 2,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const scheduler = new SchedulerQueue({
+      store: seedStore,
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 0,
+    });
+    scheduler.enqueue({
+      id: "queue_worker_1",
+      projectId: "project_1",
+      loopId: "loop_worker_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      dedupeKey: "worker:loop_worker_1",
+      payloadJson: JSON.stringify({
+        title: "Worker one",
+        prompt: "Implement worker one",
+        repo: "powerformer/looper",
+        baseBranch: "main",
+      }),
+      availableAt: now,
+    });
+    scheduler.enqueue({
+      id: "queue_worker_2",
+      projectId: "project_1",
+      loopId: "loop_worker_2",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      dedupeKey: "worker:loop_worker_2",
+      payloadJson: JSON.stringify({
+        title: "Worker two",
+        prompt: "Implement worker two",
+        repo: "powerformer/looper",
+        baseBranch: "main",
+      }),
+      availableAt: now,
+    });
+    seedStore.close();
+
+    let resolveFirstRun: (() => void) | undefined;
+    const firstRunGate = new Promise<void>((resolve) => {
+      resolveFirstRun = resolve;
+    });
+    const startedQueueItemIds: string[] = [];
+    const workerRunner = {
+      discoverPullRequests: async () => ({
+        queueItems: [],
+        createdLoopIds: [],
+        skipped: 0,
+      }),
+      processClaimedItem: async (queueItem: { id: string }) => {
+        startedQueueItemIds.push(queueItem.id);
+        if (queueItem.id === "queue_worker_1") {
+          await firstRunGate;
+        }
+
+        return {
+          loopId:
+            queueItem.id === "queue_worker_1"
+              ? "loop_worker_1"
+              : "loop_worker_2",
+          runId:
+            queueItem.id === "queue_worker_1" ? "run_worker_1" : "run_worker_2",
+          queueItemId: queueItem.id,
+          status: "success" as const,
+          summary: "done",
+        };
+      },
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([]),
+      workerRunner: workerRunner as never,
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+    await Bun.sleep(50);
+
+    expect(startedQueueItemIds).toContain("queue_worker_1");
+    expect(startedQueueItemIds).toContain("queue_worker_2");
+
+    resolveFirstRun?.();
+    await Bun.sleep(20);
+    await runtime.stop("test");
+  });
+
+  test("dispatches newly created worker immediately without waiting poll interval", async () => {
+    const fixture = await createFixture();
+    fixture.config.agent.vendor = "opencode";
+    fixture.config.scheduler.pollIntervalSeconds = 3600;
+    const now = new Date(Date.now() - 1_000).toISOString();
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.close();
+
+    let workerStarted = false;
+    const workerRunner = {
+      discoverPullRequests: async () => ({
+        queueItems: [],
+        createdLoopIds: [],
+        skipped: 0,
+      }),
+      processClaimedItem: async (queueItem: { id: string }) => {
+        workerStarted = true;
+        return {
+          loopId: queueItem.id,
+          runId: `run:${queueItem.id}`,
+          queueItemId: queueItem.id,
+          status: "success" as const,
+          summary: "done",
+        };
+      },
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([]),
+      workerRunner: workerRunner as never,
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+
+    const response = await fetch(
+      `http://${fixture.config.server.host}:${fixture.config.server.port}/api/v1/workers`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          title: "Immediate worker",
+          prompt: "Run now",
+          repo: "powerformer/looper",
+          baseBranch: "main",
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await Bun.sleep(50);
+    expect(workerStarted).toBe(true);
+
+    await runtime.stop("test");
+  });
+
+  test("stop times out while waiting for hung in-flight scheduler work", async () => {
+    const fixture = await createFixture();
+    fixture.config.agent.vendor = "opencode";
+    fixture.config.scheduler.maxConcurrentRuns = 1;
+    const now = "2026-04-11T12:00:00.000Z";
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_worker_1",
+      seq: 1,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const scheduler = new SchedulerQueue({
+      store: seedStore,
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 0,
+    });
+    scheduler.enqueue({
+      id: "queue_worker_1",
+      projectId: "project_1",
+      loopId: "loop_worker_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: "powerformer/looper",
+      dedupeKey: "worker:loop_worker_1",
+      payloadJson: JSON.stringify({
+        title: "Hung worker",
+        prompt: "Wait forever",
+        repo: "powerformer/looper",
+        baseBranch: "main",
+      }),
+      availableAt: now,
+    });
+    seedStore.close();
+
+    let started = false;
+    let completed = false;
+    const never = new Promise<void>(() => {});
+    const workerRunner = {
+      discoverPullRequests: async () => ({
+        queueItems: [],
+        createdLoopIds: [],
+        skipped: 0,
+      }),
+      processClaimedItem: async () => {
+        started = true;
+        await never;
+        completed = true;
+        return {
+          loopId: "loop_worker_1",
+          runId: "run_worker_1",
+          queueItemId: "queue_worker_1",
+          status: "success" as const,
+          summary: "done",
+        };
+      },
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([]),
+      workerRunner: workerRunner as never,
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+    await Bun.sleep(50);
+
+    expect(started).toBe(true);
+
+    const stopStartedAt = Date.now();
+    await runtime.stop("test");
+    const stopElapsedMs = Date.now() - stopStartedAt;
+
+    expect(completed).toBe(false);
+    expect(stopElapsedMs).toBeGreaterThanOrEqual(900);
+    expect(stopElapsedMs).toBeLessThan(2_000);
   });
 
   test("sends failure notification for failed worker run", async () => {

@@ -45,6 +45,11 @@ afterEach(async () => {
 });
 
 describe("loadLooperConfig", () => {
+  test("defaults scheduler maxConcurrentRuns to 3", () => {
+    const config = createDefaultLooperConfig();
+    expect(config.scheduler.maxConcurrentRuns).toBe(3);
+  });
+
   test("merges config file, env, and CLI overrides in priority order", async () => {
     const fixture = await createFixture();
     cleanupPaths.push(fixture.rootDir);

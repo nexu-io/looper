@@ -50,6 +50,7 @@ export interface LooperdApiContext {
       vendor?: string;
       pid?: number | null;
     }>;
+    triggerSchedulerTick(): void;
   };
   getStartedAt(): Date | undefined;
   getRecoverySummary(): Record<string, unknown>;
@@ -690,7 +691,7 @@ async function buildWorkersCreateResponse(
     targetId: effectivePrNumber ? `pr:${repo}:${effectivePrNumber}` : projectId,
     repo,
     prNumber: effectivePrNumber ?? undefined,
-    status: "running",
+    status: "queued",
     now,
     metadataJson: JSON.stringify({ worker: payload }),
   });
@@ -717,6 +718,8 @@ async function buildWorkersCreateResponse(
       : `worker:${loop.id}`,
     payloadJson: JSON.stringify(payload),
   });
+
+  context.runtimeControl?.triggerSchedulerTick();
 
   return {
     ...loop,
@@ -836,13 +839,13 @@ interface ActiveRunAgentSummary {
 
 interface ActiveRunView {
   seq: number;
-  runId: string;
+  runId: string | null;
   loopId: string;
   projectId: string;
   type: string;
   status: string;
   currentStep: string | null;
-  startedAt: string;
+  startedAt: string | null;
   target:
     | {
         type: "project";
@@ -883,12 +886,15 @@ function buildActiveRunsResponse(
 
 function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
   const activeRuns = context.store.runs.listByStatus("running");
+  const queuedLoops = context.store.loops
+    .list()
+    .filter((loop) => loop.status === "queued");
   const activeAgentByRunId = buildActiveAgentByRunId(
     context.store.agentExecutions.listActive(),
   );
 
-  return activeRuns
-    .map((run) => {
+  const runningViews = activeRuns
+    .map<ActiveRunView | null>((run) => {
       const loop = context.store.loops.getById(run.loopId);
       if (!loop) {
         return null;
@@ -913,8 +919,32 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
         worktree: buildWorktreeSummary(loop, run),
       } satisfies ActiveRunView;
     })
-    .filter((item): item is ActiveRunView => item !== null)
-    .sort(compareActiveRunViews);
+    .filter(isActiveRunView);
+
+  const queuedViews = queuedLoops
+    .map<ActiveRunView | null>((loop) => {
+      const target = tryBuildActiveRunTarget(context, loop);
+      if (!target) {
+        return null;
+      }
+
+      return {
+        seq: loop.seq,
+        runId: null,
+        loopId: loop.id,
+        projectId: loop.projectId,
+        type: loop.type,
+        status: loop.status,
+        currentStep: null,
+        startedAt: loop.nextRunAt ?? loop.updatedAt ?? loop.createdAt,
+        target,
+        agent: null,
+        worktree: null,
+      } satisfies ActiveRunView;
+    })
+    .filter(isActiveRunView);
+
+  return [...runningViews, ...queuedViews].sort(compareActiveRunViews);
 }
 
 function buildActiveAgentByRunId(
@@ -958,6 +988,10 @@ function buildActiveAgentByRunId(
       ];
     }),
   );
+}
+
+function isActiveRunView(item: ActiveRunView | null): item is ActiveRunView {
+  return item !== null;
 }
 
 function tryBuildActiveRunTarget(
@@ -1073,18 +1107,27 @@ function compareActiveRunViews(
   left: ActiveRunView,
   right: ActiveRunView,
 ): number {
+  const leftIsRunning = left.status === "running" ? 1 : 0;
+  const rightIsRunning = right.status === "running" ? 1 : 0;
+  if (leftIsRunning !== rightIsRunning) {
+    return rightIsRunning - leftIsRunning;
+  }
+
   const leftHasActiveAgent = left.agent ? 1 : 0;
   const rightHasActiveAgent = right.agent ? 1 : 0;
   if (leftHasActiveAgent !== rightHasActiveAgent) {
     return rightHasActiveAgent - leftHasActiveAgent;
   }
 
-  const startedAtComparison = compareIsoAsc(left.startedAt, right.startedAt);
+  const startedAtComparison = compareIsoAsc(
+    left.startedAt ?? "",
+    right.startedAt ?? "",
+  );
   if (startedAtComparison !== 0) {
     return startedAtComparison;
   }
 
-  return left.runId.localeCompare(right.runId);
+  return (left.runId ?? left.loopId).localeCompare(right.runId ?? right.loopId);
 }
 
 function compareIsoAsc(left: string, right: string): number {
@@ -1162,6 +1205,8 @@ async function buildLoopsCreateResponse(
   const type = readRequiredString(body, "type");
   const targetType = readRequiredString(body, "targetType");
   const status = readOptionalString(body, "status") ?? "running";
+  const metadata = readOptionalObject(body, "metadata");
+  const now = new Date().toISOString();
 
   if (
     (type === "reviewer" || type === "fixer") &&
@@ -1184,10 +1229,45 @@ async function buildLoopsCreateResponse(
     prNumber: readOptionalPositiveInteger(body, "prNumber") ?? undefined,
     issueNumber: readOptionalPositiveInteger(body, "issueNumber") ?? undefined,
     status,
-    now: new Date().toISOString(),
+    now,
+    metadataJson: metadata ? JSON.stringify(metadata) : null,
   });
 
+  enqueueLoopCreate(context, loop, now);
+
   return loop;
+}
+
+function enqueueLoopCreate(
+  context: LooperdApiContext,
+  loop: LoopRecord,
+  now: string,
+): void {
+  const scheduler = new SchedulerQueue({
+    store: context.store,
+    retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
+    retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
+    now: () => new Date(now),
+  });
+
+  if (
+    loop.type === "reviewer" &&
+    loop.status === "running" &&
+    loop.repo &&
+    loop.prNumber
+  ) {
+    scheduler.enqueue({
+      projectId: loop.projectId,
+      loopId: loop.id,
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: `pr:${loop.repo}:${loop.prNumber}`,
+      repo: loop.repo,
+      prNumber: loop.prNumber,
+      dedupeKey: `reviewer:${loop.repo}:${loop.prNumber}`,
+      lockKey: createPrLockKey(loop.repo, loop.prNumber),
+    });
+  }
 }
 
 function createLoopRecord(input: {
@@ -1483,6 +1563,26 @@ function readOptionalString(
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function readOptionalObject(
+  body: Record<string, unknown>,
+  fieldName: string,
+): Record<string, unknown> | null {
+  const value = body[fieldName];
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `${fieldName} must be an object`,
+    );
+  }
+
+  return value as Record<string, unknown>;
 }
 
 function readOptionalPositiveInteger(
