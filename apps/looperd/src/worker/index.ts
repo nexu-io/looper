@@ -38,6 +38,9 @@ const WORKER_STEP_SEQUENCE = [
   "open-pr",
 ] as const;
 
+const WORKER_BRANCH_SLUG_MAX_LENGTH = 48;
+const WORKER_PR_DEDUPE_LOOKUP_LIMIT = 1000;
+
 export type WorkerStep = (typeof WORKER_STEP_SEQUENCE)[number];
 
 export interface WorkerGitGateway {
@@ -979,6 +982,7 @@ export class WorkerLoopRunner {
     const pullRequests = await this.options.github.listOpenPullRequests({
       repo: input.repo,
       cwd: input.cwd,
+      limit: WORKER_PR_DEDUPE_LOOKUP_LIMIT,
     });
     return (
       pullRequests.find(
@@ -1620,7 +1624,10 @@ function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
 
 function buildWorkerSlug(title: string): string {
   const words = slugify(title).split("-").filter(Boolean).slice(0, 8).join("-");
-  return words || "update";
+  return (
+    words.slice(0, WORKER_BRANCH_SLUG_MAX_LENGTH).replace(/-+$/g, "") ||
+    "update"
+  );
 }
 
 function buildDefaultIssueWorkerTitle(

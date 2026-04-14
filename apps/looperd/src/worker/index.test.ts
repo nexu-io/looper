@@ -516,21 +516,27 @@ describe("WorkerLoopRunner", () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);
     const github = new FakeGitHubGateway();
-    github.listOpenPullRequests = async () => [
-      {
-        number: 202,
-        title: "Agent-created PR",
-        url: "https://example.test/acme/looper/pull/202",
-        state: "OPEN",
-        isDraft: false,
-        reviewDecision: undefined,
-        labels: [],
-        headRefName: "looper/worker/loop-worker-1",
-        baseRefName: "main",
-        author: "octocat",
-        reviewRequests: [],
-      },
-    ];
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 202,
+          title: "Agent-created PR",
+          url: "https://example.test/acme/looper/pull/202",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/loop-worker-1",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
     const agent = new FakeAgentExecutor([
       completedAgentResult("Implemented slice and opened PR", ["abc123"]),
     ]);
@@ -560,7 +566,7 @@ describe("WorkerLoopRunner", () => {
     expect(result.pullRequestNumber).toBe(202);
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(0);
-    expect(github.listOpenPullRequestCalls[0]?.limit).toBeUndefined();
+    expect(github.listOpenPullRequestCalls[0]?.limit).toBe(1000);
     expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(202);
     expect(
       fixture.store.loops.getById("loop_worker_1")?.metadataJson,
@@ -693,6 +699,121 @@ describe("WorkerLoopRunner", () => {
       "Add worker issue fallback",
     );
     expect(github.createPullRequestCalls[0]?.body).toContain("Closes #123");
+
+    fixture.store.close();
+  });
+
+  test("truncates long issue-derived branch slugs", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    const longTitle = `Implement ${"supercalifragilisticexpialidocious".repeat(6)}`;
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        seq: 1,
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      metadataJson: JSON.stringify({
+        worker: {
+          title: "Implement acme/looper#124",
+          repo: "acme/looper",
+          baseBranch: "main",
+          issueNumber: 124,
+        },
+      }),
+      updatedAt: nowIso,
+    });
+    fixture.store.queue.upsert({
+      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
+        id: "queue_issue_mode_long",
+        projectId: "project_1",
+        loopId: "loop_worker_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        dedupeKey: "worker:loop_worker_1",
+        priority: 0,
+        status: "queued",
+        availableAt: nowIso,
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: "worker:loop_worker_1",
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      payloadJson: JSON.stringify({
+        title: "Implement acme/looper#124",
+        repo: "acme/looper",
+        baseBranch: "main",
+        issueNumber: 124,
+      }),
+      updatedAt: nowIso,
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.viewIssue = async (input) => ({
+      number: input.issueNumber,
+      title: longTitle,
+      body: "Long title branch test.",
+      url: `https://example.test/${input.repo}/issues/${input.issueNumber}`,
+      state: "OPEN",
+      author: "octocat",
+      assignees: [],
+      labels: [],
+    });
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented issue fallback", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    const headBranch = github.createPullRequestCalls[0]?.headBranch;
+    expect(headBranch).toBeDefined();
+    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(80);
+    expect(headBranch).toMatch(/^looper\/worker\/124-/);
+    expect(headBranch).toContain("-loop-worker-1");
 
     fixture.store.close();
   });
