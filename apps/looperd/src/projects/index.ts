@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
-import { assertValidProjectId } from "../config/index";
+import {
+  assertValidProjectId,
+  normalizeDerivedProjectId,
+} from "../config/index";
 import type { GitHubPullRequestSummary } from "../infra/index";
 import type { Store } from "../storage/store";
 import type {
@@ -67,9 +71,10 @@ export class ProjectManager {
   }
 
   public async addProject(input: AddProjectInput): Promise<AddProjectResult> {
-    const existing = this.options.store.projects.getById(input.id);
+    const projectId = this.normalizeProjectId(input.id, input.repoPath);
+    const existing = this.options.store.projects.getById(projectId);
     if (!existing) {
-      assertValidProjectId(input.id);
+      assertValidProjectId(projectId);
     }
     const warnings: string[] = [];
     const nowIso = this.now().toISOString();
@@ -78,7 +83,12 @@ export class ProjectManager {
       input.repoPath,
       warnings,
     );
-    const project = this.upsertProject(input, detectedRepo, existing, nowIso);
+    const project = this.upsertProject(
+      { ...input, id: projectId },
+      detectedRepo,
+      existing,
+      nowIso,
+    );
 
     const discoveredWorktrees = await this.discoverWorktrees(project, warnings);
     const discoveredPullRequests = await this.discoverPullRequests(
@@ -94,6 +104,18 @@ export class ProjectManager {
       discoveredWorktrees,
       warnings,
     };
+  }
+
+  private normalizeProjectId(projectId: string, repoPath: string): string {
+    if (!projectId.startsWith("legacy-id-")) {
+      return projectId;
+    }
+
+    if (projectId !== deriveProjectId(repoPath)) {
+      return projectId;
+    }
+
+    return normalizeDerivedProjectId(projectId);
   }
 
   private upsertProject(
@@ -242,6 +264,15 @@ export class ProjectManager {
       return 0;
     }
   }
+}
+
+function deriveProjectId(repoPath: string): string {
+  const normalized = basename(repoPath)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || "project";
 }
 
 function parseMetadata(metadataJson?: string | null): Record<string, unknown> {
