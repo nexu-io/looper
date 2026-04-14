@@ -150,7 +150,8 @@ class FakeGitGateway implements WorkerGitGateway {
 }
 
 class FakeGitHubGateway implements WorkerGitHubGateway {
-  public listOpenPullRequestCalls: Array<{ label?: string }> = [];
+  public listOpenPullRequestCalls: Array<{ label?: string; limit?: number }> =
+    [];
   public viewIssueCalls: Array<{
     repo: string;
     issueNumber: number;
@@ -183,7 +184,10 @@ class FakeGitHubGateway implements WorkerGitHubGateway {
   }): Promise<
     Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
   > {
-    this.listOpenPullRequestCalls.push({ label: input.label });
+    this.listOpenPullRequestCalls.push({
+      label: input.label,
+      limit: input.limit,
+    });
     return [];
   }
 
@@ -556,6 +560,7 @@ describe("WorkerLoopRunner", () => {
     expect(result.pullRequestNumber).toBe(202);
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(github.listOpenPullRequestCalls[0]?.limit).toBeUndefined();
     expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(202);
     expect(
       fixture.store.loops.getById("loop_worker_1")?.metadataJson,
@@ -1191,11 +1196,51 @@ describe("WorkerLoopRunner", () => {
     expect(agent.starts[0]?.prompt).not.toContain(
       "use the GitHub CLI (`gh`) to create the pull request yourself",
     );
+    expect(github.listOpenPullRequestCalls).toHaveLength(0);
     expect(git.pushCalls).toBe(0);
     expect(github.createPullRequestCalls).toHaveLength(0);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+
+    fixture.store.close();
+  });
+
+  test("skips GitHub PR lookup when manual PR opening is configured", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "manual",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("skipped");
+    expect(result.summary).toContain("PR opening is manual");
+    expect(github.listOpenPullRequestCalls).toHaveLength(0);
+    expect(github.createPullRequestCalls).toHaveLength(0);
 
     fixture.store.close();
   });

@@ -840,6 +840,21 @@ export class WorkerLoopRunner {
         );
       }
     }
+    if (this.openPrStrategy === "manual") {
+      return {
+        ...input.checkpoint,
+        skipReason: `Worker completed; PR opening is manual for ${input.loop.id}`,
+        resumePolicy: "manual_intervention",
+      };
+    }
+    if (!this.allowAutoPush) {
+      return {
+        ...input.checkpoint,
+        skipReason: `Auto push disabled; manual PR opening required for worker ${input.loop.id}`,
+        resumePolicy: "manual_intervention",
+      };
+    }
+
     try {
       const existingPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
@@ -847,13 +862,11 @@ export class WorkerLoopRunner {
         cwd: input.project.repoPath,
       });
       if (existingPullRequest) {
-        if (this.allowAutoPush) {
-          await this.options.git.push({
-            worktreePath: worktree.path,
-            branch: worktree.branch,
-            protectedBranches: [work.baseBranch],
-          });
-        }
+        await this.options.git.push({
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          protectedBranches: [work.baseBranch],
+        });
         await this.assignReviewersIfNeeded({
           work,
           pullRequest: existingPullRequest,
@@ -871,20 +884,6 @@ export class WorkerLoopRunner {
             url: existingPullRequest.url ?? "",
           },
           resumePolicy: "advance_from_checkpoint",
-        };
-      }
-      if (this.openPrStrategy === "manual") {
-        return {
-          ...input.checkpoint,
-          skipReason: `Worker completed; PR opening is manual for ${input.loop.id}`,
-          resumePolicy: "manual_intervention",
-        };
-      }
-      if (!this.allowAutoPush) {
-        return {
-          ...input.checkpoint,
-          skipReason: `Auto push disabled; manual PR opening required for worker ${input.loop.id}`,
-          resumePolicy: "manual_intervention",
         };
       }
       await this.options.git.push({
@@ -980,7 +979,6 @@ export class WorkerLoopRunner {
     const pullRequests = await this.options.github.listOpenPullRequests({
       repo: input.repo,
       cwd: input.cwd,
-      limit: 100,
     });
     return (
       pullRequests.find(
