@@ -98,6 +98,8 @@ export interface CreateLooperdRuntimeOptions {
   enablePlanner?: boolean;
 }
 
+const STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS = 1_000;
+
 const MIGRATIONS_DIR = resolveMigrationsDir();
 
 function resolveMigrationsDir(): string {
@@ -414,7 +416,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
         this.schedulerTimer = undefined;
       }
       await this.server?.stop();
-      await Promise.allSettled(this.inFlightSchedulerWork.values());
+      await this.waitForInFlightSchedulerWorkOnStop();
     } finally {
       this.store?.close();
       this.server = undefined;
@@ -426,6 +428,41 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.workerRunner = undefined;
       this.store = undefined;
       this.resolveShutdown();
+    }
+  }
+
+  private async waitForInFlightSchedulerWorkOnStop(): Promise<void> {
+    if (this.inFlightSchedulerWork.size === 0) {
+      return;
+    }
+
+    const inFlightWork = [...this.inFlightSchedulerWork.entries()];
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const completed = await Promise.race([
+      Promise.allSettled(
+        inFlightWork.map(([, workPromise]) => workPromise),
+      ).then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeoutHandle = setTimeout(
+          () => resolve(false),
+          STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS,
+        );
+      }),
+    ]);
+
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+
+    if (!completed) {
+      this.options.logger.warn(
+        "looperd stop timed out waiting for in-flight scheduler work",
+        {
+          timeoutMs: STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS,
+          queueItemIds: inFlightWork.map(([queueItemId]) => queueItemId),
+        },
+      );
     }
   }
 
