@@ -71,9 +71,13 @@ export class ProjectManager {
   }
 
   public async addProject(input: AddProjectInput): Promise<AddProjectResult> {
-    const projectId = this.normalizeProjectId(input.id, input.repoPath);
-    const existing = this.options.store.projects.getById(projectId);
-    if (!existing) {
+    const existing = this.options.store.projects.getById(input.id);
+    const projectId = existing
+      ? existing.id
+      : this.normalizeProjectId(input.id, input.repoPath);
+    const normalizedExisting =
+      existing ?? this.options.store.projects.getById(projectId);
+    if (!normalizedExisting) {
       assertValidProjectId(projectId);
     }
     const warnings: string[] = [];
@@ -86,7 +90,7 @@ export class ProjectManager {
     const project = this.upsertProject(
       { ...input, id: projectId },
       detectedRepo,
-      existing,
+      normalizedExisting,
       nowIso,
     );
 

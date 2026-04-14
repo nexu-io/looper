@@ -248,4 +248,57 @@ describe("ProjectManager", () => {
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });
+
+  test("updates existing derived legacy-prefixed ids in place", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-projects-"));
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+      backupDir: join(rootDir, "backups"),
+    });
+    store.initialize({ autoMigrate: true });
+
+    store.projects.upsert({
+      id: "legacy-id-example",
+      name: "old name",
+      repoPath: join(rootDir, "old-repo"),
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ source: "api" }),
+      createdAt: "2026-04-10T12:00:00.000Z",
+      updatedAt: "2026-04-10T12:00:00.000Z",
+    });
+
+    const manager = new ProjectManager({
+      store,
+      logger: createLogger(),
+      now: () => new Date("2026-04-11T12:00:00.000Z"),
+      git: {
+        detectGitHubRepo: async () => null,
+        listWorktrees: async () => [],
+      },
+      github: {
+        listOpenPullRequests: async () => [],
+        capturePullRequestSnapshot: async () => {
+          throw new Error("not implemented");
+        },
+      },
+    });
+
+    const result = await manager.addProject({
+      id: "legacy-id-example",
+      name: "new name",
+      repoPath: join(rootDir, "legacy-id-example"),
+      baseBranch: "develop",
+    });
+
+    expect(result.project.id).toBe("legacy-id-example");
+    expect(result.project.name).toBe("new name");
+    expect(result.project.repoPath).toBe(join(rootDir, "legacy-id-example"));
+    expect(result.project.baseBranch).toBe("develop");
+    expect(store.projects.list()).toHaveLength(1);
+    expect(store.projects.getById("project_legacy-id-example")).toBeNull();
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
 });
