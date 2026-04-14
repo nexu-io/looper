@@ -29,21 +29,33 @@ describe("config defaults", () => {
 
   test("sanitizes legacy project ids when deriving project worktree roots", () => {
     expect(getDefaultProjectWorktreeRoot("../tmp")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-Li4vdG1w"),
+      join(homedir(), ".looper", "worktrees", "legacy-id-2e2e2f746d70"),
     );
     expect(getDefaultProjectWorktreeRoot("..")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-Li4"),
+      join(homedir(), ".looper", "worktrees", "legacy-id-2e2e"),
     );
     expect(getDefaultProjectWorktreeRoot("/var/tmp/x")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-L3Zhci90bXAveA"),
+      join(homedir(), ".looper", "worktrees", "legacy-id-2f7661722f746d702f78"),
     );
     expect(getDefaultProjectWorktreeRoot("legacy-id-Li4vdG1w")).toBe(
       join(
         homedir(),
         ".looper",
         "worktrees",
-        "legacy-id-bGVnYWN5LWlkLUxpNHZkRzF3",
+        "legacy-id-6c65676163792d69642d4c69347664473177",
       ),
+    );
+  });
+
+  test("canonicalizes mixed-case project ids when deriving project worktree roots", () => {
+    expect(getDefaultProjectWorktreeRoot("foo")).toBe(
+      join(homedir(), ".looper", "worktrees", "foo"),
+    );
+    expect(getDefaultProjectWorktreeRoot("Foo")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-466f6f"),
+    );
+    expect(getDefaultProjectWorktreeRoot("FOO")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-464f4f"),
     );
   });
 });

@@ -2,6 +2,7 @@ import { posix, win32 } from "node:path";
 
 const PROJECT_ID_SEPARATOR_PATTERN = /[\\/]/;
 const LEGACY_PROJECT_ID_PREFIX = "legacy-id-";
+const CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN = /^[a-z0-9._-]+$/;
 const INVALID_PROJECT_ID_MESSAGE =
   "must not contain path separators, dot segments, be an absolute path, or start with legacy-id-";
 
@@ -35,12 +36,14 @@ export function assertValidProjectId(projectId: string): void {
 }
 
 export function toProjectWorktreeDirectoryName(projectId: string): string {
-  if (isValidProjectId(projectId)) {
+  if (
+    isValidProjectId(projectId) &&
+    CANONICAL_PROJECT_DIRECTORY_NAME_PATTERN.test(projectId)
+  ) {
     return projectId;
   }
 
-  const encodedProjectId =
-    Buffer.from(projectId).toString("base64url") || "empty";
+  const encodedProjectId = Buffer.from(projectId).toString("hex") || "empty";
 
   return `${LEGACY_PROJECT_ID_PREFIX}${encodedProjectId}`;
 }
