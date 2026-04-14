@@ -67,10 +67,12 @@ export class ProjectManager {
   }
 
   public async addProject(input: AddProjectInput): Promise<AddProjectResult> {
-    assertValidProjectId(input.id);
+    const existing = this.options.store.projects.getById(input.id);
+    if (!existing) {
+      assertValidProjectId(input.id);
+    }
     const warnings: string[] = [];
     const nowIso = this.now().toISOString();
-    const existing = this.options.store.projects.getById(input.id);
     const detectedRepo = await this.detectRepo(
       input.repo ?? null,
       input.repoPath,

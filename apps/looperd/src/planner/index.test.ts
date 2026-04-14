@@ -567,7 +567,7 @@ describe("PlannerLoopRunner", () => {
 
     expect(result.status).toBe("success");
     expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
-      getDefaultProjectWorktreeRoot("project_1"),
+      getDefaultProjectWorktreeRoot("project_1", fixture.repoPath),
     );
 
     fixture.store.close();

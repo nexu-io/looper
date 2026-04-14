@@ -74,9 +74,13 @@ export function getDefaultWorktreeRoot(): string {
   return join(getLooperHome(), "worktrees");
 }
 
-export function getDefaultProjectWorktreeRoot(projectId: string): string {
+export function getDefaultProjectWorktreeRoot(
+  projectId: string,
+  repoIdentity: string,
+): string {
   return join(
     getDefaultWorktreeRoot(),
+    toProjectWorktreeDirectoryName(repoIdentity),
     toProjectWorktreeDirectoryName(projectId),
   );
 }

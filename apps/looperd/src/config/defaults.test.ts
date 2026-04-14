@@ -8,8 +8,12 @@ import {
   getDefaultProjectWorktreeRoot,
   getDefaultWorktreeRoot,
 } from "./index";
+import { toProjectWorktreeDirectoryName } from "./project-id";
 
 describe("config defaults", () => {
+  const repoPath = join(homedir(), "src", "looper");
+  const repoDirectoryName = toProjectWorktreeDirectoryName(repoPath);
+
   test("uses ~/.looper for runtime artifacts and worktree roots", () => {
     const config = createDefaultLooperConfig("/tmp/workspace");
 
@@ -23,52 +27,101 @@ describe("config defaults", () => {
     expect(getDefaultWorktreeRoot()).toBe(
       join(homedir(), ".looper", "worktrees"),
     );
-    expect(getDefaultProjectWorktreeRoot("project_1")).toBe(
-      join(homedir(), ".looper", "worktrees", "project_1"),
+    expect(getDefaultProjectWorktreeRoot("project_1", repoPath)).toBe(
+      join(homedir(), ".looper", "worktrees", repoDirectoryName, "project_1"),
     );
   });
 
   test("sanitizes legacy project ids when deriving project worktree roots", () => {
-    expect(getDefaultProjectWorktreeRoot("../tmp")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-2e2e2f746d70"),
-    );
-    expect(getDefaultProjectWorktreeRoot("..")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-2e2e"),
-    );
-    expect(getDefaultProjectWorktreeRoot("/var/tmp/x")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-2f7661722f746d702f78"),
-    );
-    expect(getDefaultProjectWorktreeRoot("legacy-id-Li4vdG1w")).toBe(
+    expect(getDefaultProjectWorktreeRoot("../tmp", repoPath)).toBe(
       join(
         homedir(),
         ".looper",
         "worktrees",
+        repoDirectoryName,
+        "legacy-id-2e2e2f746d70",
+      ),
+    );
+    expect(getDefaultProjectWorktreeRoot("..", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-2e2e",
+      ),
+    );
+    expect(getDefaultProjectWorktreeRoot("/var/tmp/x", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-2f7661722f746d702f78",
+      ),
+    );
+    expect(getDefaultProjectWorktreeRoot("legacy-id-Li4vdG1w", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
         "legacy-id-6c65676163792d69642d4c69347664473177",
       ),
     );
   });
 
   test("canonicalizes mixed-case project ids when deriving project worktree roots", () => {
-    expect(getDefaultProjectWorktreeRoot("foo")).toBe(
-      join(homedir(), ".looper", "worktrees", "foo"),
+    expect(getDefaultProjectWorktreeRoot("foo", repoPath)).toBe(
+      join(homedir(), ".looper", "worktrees", repoDirectoryName, "foo"),
     );
-    expect(getDefaultProjectWorktreeRoot("Foo")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-466f6f"),
+    expect(getDefaultProjectWorktreeRoot("Foo", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-466f6f",
+      ),
     );
-    expect(getDefaultProjectWorktreeRoot("FOO")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-464f4f"),
+    expect(getDefaultProjectWorktreeRoot("FOO", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-464f4f",
+      ),
     );
   });
 
   test("sanitizes Windows-invalid canonical project ids when deriving project worktree roots", () => {
-    expect(getDefaultProjectWorktreeRoot("con")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-636f6e"),
+    expect(getDefaultProjectWorktreeRoot("con", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-636f6e",
+      ),
     );
-    expect(getDefaultProjectWorktreeRoot("nul.txt")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-6e756c2e747874"),
+    expect(getDefaultProjectWorktreeRoot("nul.txt", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-6e756c2e747874",
+      ),
     );
-    expect(getDefaultProjectWorktreeRoot("project.")).toBe(
-      join(homedir(), ".looper", "worktrees", "legacy-id-70726f6a6563742e"),
+    expect(getDefaultProjectWorktreeRoot("project.", repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        "legacy-id-70726f6a6563742e",
+      ),
     );
   });
 
@@ -78,8 +131,14 @@ describe("config defaults", () => {
       .update(projectId)
       .digest("hex");
 
-    expect(getDefaultProjectWorktreeRoot(projectId)).toBe(
-      join(homedir(), ".looper", "worktrees", `legacy-id-${hashedProjectId}`),
+    expect(getDefaultProjectWorktreeRoot(projectId, repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        `legacy-id-${hashedProjectId}`,
+      ),
     );
   });
 
@@ -89,8 +148,28 @@ describe("config defaults", () => {
       .update(projectId)
       .digest("hex");
 
-    expect(getDefaultProjectWorktreeRoot(projectId)).toBe(
-      join(homedir(), ".looper", "worktrees", `legacy-id-${hashedProjectId}`),
+    expect(getDefaultProjectWorktreeRoot(projectId, repoPath)).toBe(
+      join(
+        homedir(),
+        ".looper",
+        "worktrees",
+        repoDirectoryName,
+        `legacy-id-${hashedProjectId}`,
+      ),
+    );
+  });
+
+  test("scopes default project worktree roots by repository identity", () => {
+    expect(
+      getDefaultProjectWorktreeRoot(
+        "project_1",
+        join(homedir(), "src", "repo-a"),
+      ),
+    ).not.toBe(
+      getDefaultProjectWorktreeRoot(
+        "project_1",
+        join(homedir(), "src", "repo-b"),
+      ),
     );
   });
 });

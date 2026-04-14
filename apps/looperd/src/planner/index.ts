@@ -615,7 +615,8 @@ export class PlannerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
-      configuredRoot ?? getDefaultProjectWorktreeRoot(input.project.id);
+      configuredRoot ??
+      getDefaultProjectWorktreeRoot(input.project.id, input.project.repoPath);
     const branch = buildPlannerBranch(
       issue.issueNumber,
       issue.title || "issue",

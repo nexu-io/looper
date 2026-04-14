@@ -625,7 +625,8 @@ export class WorkerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
-      configuredRoot ?? getDefaultProjectWorktreeRoot(input.project.id);
+      configuredRoot ??
+      getDefaultProjectWorktreeRoot(input.project.id, input.project.repoPath);
     const branch =
       work.executionMode === "push-existing"
         ? (work.branch ?? `pr-${work.prNumber}`)

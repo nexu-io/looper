@@ -791,7 +791,7 @@ export class FixerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const worktreeRoot =
       readString(projectMetadata.worktreeRoot) ??
-      getDefaultProjectWorktreeRoot(input.project.id);
+      getDefaultProjectWorktreeRoot(input.project.id, input.project.repoPath);
     if (shouldRebuildWorktree(input.checkpoint)) {
       const previousWorktree = input.checkpoint.worktree;
       if (previousWorktree?.path && previousWorktree.branch) {
