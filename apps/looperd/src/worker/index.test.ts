@@ -496,12 +496,71 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     expect(result.pullRequestNumber).toBe(101);
     expect(agent.starts).toHaveLength(1);
+    expect(agent.starts[0]?.prompt).toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
     expect(git.createWorktreeCalls).toBe(1);
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+    fixture.store.close();
+  });
+
+  test("records agent-created pull requests without creating a duplicate", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async () => [
+      {
+        number: 202,
+        title: "Agent-created PR",
+        url: "https://example.test/acme/looper/pull/202",
+        state: "OPEN",
+        isDraft: false,
+        reviewDecision: undefined,
+        labels: [],
+        headRefName: "looper/worker/loop-worker-1",
+        baseRefName: "main",
+        author: "octocat",
+        reviewRequests: [],
+      },
+    ];
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(202);
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(202);
+    expect(
+      fixture.store.loops.getById("loop_worker_1")?.metadataJson,
+    ).toContain("https://example.test/acme/looper/pull/202");
+
     fixture.store.close();
   });
 
@@ -1129,6 +1188,9 @@ describe("WorkerLoopRunner", () => {
     const result = await runner.processClaimedItem(claimed);
     expect(result.status).toBe("skipped");
     expect(result.summary).toContain("Auto push disabled");
+    expect(agent.starts[0]?.prompt).not.toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
     expect(git.pushCalls).toBe(0);
     expect(github.createPullRequestCalls).toHaveLength(0);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
