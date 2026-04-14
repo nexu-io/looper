@@ -5,8 +5,8 @@ import { join } from "node:path";
 
 import { createLogger } from "../bootstrap/logger";
 import {
-  createDefaultLooperConfig,
   InvalidProjectIdError,
+  createDefaultLooperConfig,
 } from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";

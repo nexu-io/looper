@@ -1,6 +1,7 @@
 import { constants, access } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { getProjectIdValidationMessage, isValidProjectId } from "./project-id";
 import {
   AGENT_VENDORS,
   AUTH_MODES,
@@ -12,7 +13,6 @@ import {
   OPEN_PR_STRATEGIES,
   type ValidationIssue,
 } from "./types";
-import { getProjectIdValidationMessage, isValidProjectId } from "./project-id";
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
