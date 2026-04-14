@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
@@ -1661,8 +1661,10 @@ function buildWorkerSlug(title: string): string {
 }
 
 function buildWorkerLoopHash(loopId: string): string {
-  const compact = loopId.toLowerCase().replace(/[^a-z0-9]+/g, "");
-  const hash = compact.slice(0, WORKER_BRANCH_HASH_LENGTH);
+  const hash = createHash("sha1")
+    .update(loopId)
+    .digest("hex")
+    .slice(0, WORKER_BRANCH_HASH_LENGTH);
   return hash || "worker";
 }
 
