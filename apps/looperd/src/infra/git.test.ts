@@ -237,6 +237,79 @@ describe("GitWorktreeGateway", () => {
     store.close();
   });
 
+  test("pushes HEAD to the requested remote branch", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
+    cleanupPaths.push(rootDir);
+    const repoPath = join(rootDir, "repo");
+    const worktreeRoot = join(rootDir, "worktrees");
+    const remotePath = join(rootDir, "remote.git");
+    await mkdir(repoPath, { recursive: true });
+    await mkdir(remotePath, { recursive: true });
+
+    await runGit(["init", "-b", "main"], repoPath);
+    await runGit(["init", "--bare"], remotePath);
+    await runGit(["config", "user.email", "test@example.com"], repoPath);
+    await runGit(["config", "user.name", "Looper Test"], repoPath);
+    await runGit(["remote", "add", "origin", remotePath], repoPath);
+    await writeFile(join(repoPath, "README.md"), "hello\n");
+    await runGit(["add", "README.md"], repoPath);
+    await runGit(["commit", "-m", "init"], repoPath);
+    await runGit(["push", "-u", "origin", "main"], repoPath);
+
+    const store = new SqliteStore({
+      dbPath: join(rootDir, "state", "looper.sqlite"),
+    });
+    store.initialize({ autoMigrate: true });
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const gateway = new GitWorktreeGateway({ gitPath: "git", store });
+    const worktree = await gateway.createWorktree({
+      projectId: "project_1",
+      repoPath,
+      worktreeRoot,
+      branch: "looper/05e7c1d53bba907c",
+      baseBranch: "main",
+    });
+
+    await writeFile(
+      join(worktree.worktreePath, "README.md"),
+      "hello updated\n",
+    );
+    await gateway.commit({
+      worktreePath: worktree.worktreePath,
+      message: "worker: update reused PR branch",
+    });
+
+    await gateway.push({
+      worktreePath: worktree.worktreePath,
+      branch: "looper/worker/05e7c1d53bba907c",
+    });
+
+    const remoteHeadSha = (
+      await runGit(
+        ["rev-parse", "refs/heads/looper/worker/05e7c1d53bba907c"],
+        remotePath,
+      )
+    ).trim();
+    const worktreeHeadSha = (
+      await runGit(["rev-parse", "HEAD"], worktree.worktreePath)
+    ).trim();
+
+    expect(remoteHeadSha).toBe(worktreeHeadSha);
+
+    store.close();
+  });
+
   test("recreates an attached branch worktree when detached mode is requested", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "looper-git-"));
     cleanupPaths.push(rootDir);

@@ -394,7 +394,10 @@ export class GitWorktreeGateway {
       }
       return;
     }
-    await this.runGit(["push", "-u", remote, input.branch], input.worktreePath);
+    await this.runGit(
+      ["push", "-u", remote, `HEAD:refs/heads/${input.branch}`],
+      input.worktreePath,
+    );
   }
 
   public async prepareWorktree(input: {
