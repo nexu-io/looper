@@ -500,7 +500,7 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     expect(result.pullRequestNumber).toBe(101);
     expect(agent.starts).toHaveLength(1);
-    expect(agent.starts[0]?.prompt).toContain(
+    expect(agent.starts[0]?.prompt).not.toContain(
       "use the GitHub CLI (`gh`) to create the pull request yourself",
     );
     expect(git.createWorktreeCalls).toBe(1);
@@ -509,6 +509,40 @@ describe("WorkerLoopRunner", () => {
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+    fixture.store.close();
+  });
+
+  test("prompts agent to create PR only when looperd validation is disabled", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(agent.starts[0]?.prompt).toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
+
     fixture.store.close();
   });
 

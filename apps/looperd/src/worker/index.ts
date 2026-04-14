@@ -716,10 +716,7 @@ export class WorkerLoopRunner {
       repoRootPath: worktree.path,
       work,
       plan: input.checkpoint.plan?.items ?? [],
-      allowAgentPrCreation:
-        work.executionMode === "create-pr" &&
-        this.openPrStrategy !== "manual" &&
-        this.allowAutoPush,
+      allowAgentPrCreation: this.canAgentCreatePr(work),
     });
     const executionId = randomUUID();
     const execution = await this.options.agentExecutor.start({
@@ -974,6 +971,16 @@ export class WorkerLoopRunner {
       reviewers: input.work.reviewers ?? [],
       cwd: input.cwd,
     });
+  }
+
+  private canAgentCreatePr(work: WorkerInput): boolean {
+    return (
+      work.executionMode === "create-pr" &&
+      this.openPrStrategy !== "manual" &&
+      this.allowAutoPush &&
+      this.validationCommands.length === 0 &&
+      !this.options.validationRunner
+    );
   }
 
   private async findOpenPullRequestForBranch(input: {
