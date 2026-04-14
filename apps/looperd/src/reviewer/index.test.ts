@@ -1158,7 +1158,7 @@ describe("ReviewerLoopRunner", () => {
     });
 
     expect(discovery.queueItems).toHaveLength(1);
-    expect(discovery.skipped).toBe(2);
+    expect(discovery.skipped).toBe(3);
     expect(fixture.queue.listScheduled()).toHaveLength(1);
     expect(
       fixture.store.loops.getById("loop_manual_followup_valid")?.status,

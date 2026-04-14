@@ -755,7 +755,9 @@ describe("createLooperdApi", () => {
       };
     expect(createPausedReviewerResponse.status).toBe(200);
     expect(createPausedReviewerBody.data.status).toBe("paused");
-    expect(store.queue.findActiveByDedupe("reviewer:acme/looper:44")).toBeNull();
+    expect(
+      store.queue.findActiveByDedupe("reviewer:acme/looper:44"),
+    ).toBeNull();
 
     const createPlannerResponse = await api.handle(
       new Request("http://localhost/api/v1/planners", {
