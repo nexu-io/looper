@@ -649,13 +649,35 @@ describe("createLooperdApi", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          projectId: "project_1",
+          projectId: "project_2",
           repo: "acme/looper",
           issueNumber: 999,
         }),
       }),
     );
-    expect(missingIssueResponse.status).toBe(404);
+    const missingIssueBody = (await missingIssueResponse.json()) as {
+      data: {
+        id: string;
+        status: string;
+        issueNumber: number;
+        prNumber?: number;
+        specPath?: string;
+      };
+    };
+    expect(missingIssueResponse.status).toBe(200);
+    expect(missingIssueBody.data.status).toBe("running");
+    expect(missingIssueBody.data.issueNumber).toBe(999);
+    expect(missingIssueBody.data.prNumber).toBeNull();
+    expect(missingIssueBody.data.specPath).toBeNull();
+    expect(
+      store.queue.findActiveByDedupe(`worker:${missingIssueBody.data.id}`),
+    ).toMatchObject({
+      loopId: missingIssueBody.data.id,
+      type: "worker",
+      targetType: "project",
+      targetId: "project_2",
+      status: "queued",
+    });
 
     const createLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops", {
