@@ -305,11 +305,27 @@ export class ReviewerLoopRunner {
       }
       seen.add(dedupe);
 
-      const detail = await this.options.github.viewPullRequest({
-        repo: input.repo,
-        prNumber: loop.prNumber,
-        cwd: project.repoPath,
-      });
+      let detail: GitHubPullRequestDetail;
+      try {
+        detail = await this.options.github.viewPullRequest({
+          repo: input.repo,
+          prNumber: loop.prNumber,
+          cwd: project.repoPath,
+        });
+      } catch (error) {
+        skipped += 1;
+        this.options.logger.warn(
+          "reviewer discovery skipped follow-up PR fetch failure",
+          {
+            projectId: project.id,
+            repo: input.repo,
+            prNumber: loop.prNumber,
+            loopId: loop.id,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        continue;
+      }
       if (detail.isDraft || normalizePrState(detail.state) !== "open") {
         skipped += 1;
         continue;

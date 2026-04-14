@@ -734,6 +734,29 @@ describe("createLooperdApi", () => {
       status: "queued",
     });
 
+    const createPausedReviewerResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "reviewer",
+          targetType: "pull_request",
+          repo: "acme/looper",
+          prNumber: 44,
+          status: "paused",
+          metadata: { followUpdates: true, manual: true },
+        }),
+      }),
+    );
+    const createPausedReviewerBody =
+      (await createPausedReviewerResponse.json()) as {
+        data: { id: string; status: string };
+      };
+    expect(createPausedReviewerResponse.status).toBe(200);
+    expect(createPausedReviewerBody.data.status).toBe("paused");
+    expect(store.queue.findActiveByDedupe("reviewer:acme/looper:44")).toBeNull();
+
     const createPlannerResponse = await api.handle(
       new Request("http://localhost/api/v1/planners", {
         method: "POST",

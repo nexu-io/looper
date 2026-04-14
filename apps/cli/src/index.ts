@@ -1363,7 +1363,11 @@ async function resolveReviewTarget(
     };
   }
 
-  const projectId = resolveProjectId(context, projects);
+  const projectId = resolveExplicitOrCurrentProjectId(
+    context,
+    projects,
+    explicitProjectId,
+  );
   const project = projects.find((candidate) => candidate.id === projectId);
   if (!project?.repo) {
     throw new Error(`project ${projectId} is missing a configured repo`);
@@ -1374,6 +1378,24 @@ async function resolveReviewTarget(
     repo: project.repo,
     prNumber: parsed.prNumber,
   };
+}
+
+function resolveExplicitOrCurrentProjectId(
+  context: CliContext,
+  projects: ProjectSummary[],
+  explicitProjectId?: string,
+): string {
+  if (explicitProjectId && explicitProjectId !== "true") {
+    const explicitProject = projects.find(
+      (project) => project.id === explicitProjectId,
+    );
+    if (!explicitProject) {
+      throw new Error(`project not found: ${explicitProjectId}`);
+    }
+    return explicitProject.id;
+  }
+
+  return resolveProjectId(context, projects);
 }
 
 async function listProjects(context: CliContext): Promise<ProjectSummary[]> {

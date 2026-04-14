@@ -484,6 +484,62 @@ describe("runCli", () => {
     expect(requests[1]?.body).toContain('"followUpdates":false');
   });
 
+  test("uses explicit project for local PR number review targets", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["review", "42", "--project", "project_2"], {
+      cwd: "/tmp/outside-repo",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({ url, body: init?.body as string | null });
+
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_review_3",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/other",
+                    repo: "acme/other",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_review_3",
+            data: {
+              id: "loop_review_3",
+              projectId: "project_2",
+              repo: "acme/other",
+              prNumber: 42,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.body).toContain('"projectId":"project_2"');
+    expect(requests[1]?.body).toContain('"repo":"acme/other"');
+    expect(requests[1]?.body).toContain('"prNumber":42');
+  });
+
   test("creates planner work item from issue number", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(

@@ -78,6 +78,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
   public submitFailuresRemaining = 0;
   public addLabelFailuresRemaining = 0;
   public nextReviewDecisionAfterSubmit: string | undefined;
+  public failingViewPullRequestNumbers = new Set<number>();
   private readonly currentLabels: string[];
 
   constructor(
@@ -141,12 +142,16 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     return this.options.currentUserLogin ?? "octocat";
   }
 
-  public async viewPullRequest() {
+  public async viewPullRequest(input: { prNumber: number }) {
+    if (this.failingViewPullRequestNumbers.has(input.prNumber)) {
+      throw new Error(`PR not accessible: ${input.prNumber}`);
+    }
+
     return {
-      number: 42,
+      number: input.prNumber,
       title: "Review me",
       body: "PR body",
-      url: "https://example.test/pr/42",
+      url: `https://example.test/pr/${input.prNumber}`,
       state: this.options.state ?? "OPEN",
       isDraft: this.options.isDraft ?? false,
       reviewDecision: this.options.reviewDecision,
@@ -1081,6 +1086,86 @@ describe("ReviewerLoopRunner", () => {
     expect(fixture.store.loops.getById("loop_manual_followup")?.status).toBe(
       "queued",
     );
+
+    fixture.store.close();
+  });
+
+  test("discovery skips invalid follow-up PR fetch failures without aborting", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      headSha: "new-head",
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    github.failingViewPullRequestNumbers.add(77);
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const nowIso = fixture.now.toISOString();
+
+    fixture.store.loops.upsert({
+      id: "loop_manual_followup_valid",
+      seq: 1,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "completed",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        followUpdates: true,
+        manual: true,
+        lastPublishedHeadSha: "abc123",
+      }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    fixture.store.loops.upsert({
+      id: "loop_manual_followup_invalid",
+      seq: 2,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "completed",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        followUpdates: true,
+        manual: true,
+      }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(1);
+    expect(discovery.skipped).toBe(2);
+    expect(fixture.queue.listScheduled()).toHaveLength(1);
+    expect(
+      fixture.store.loops.getById("loop_manual_followup_valid")?.status,
+    ).toBe("queued");
+    expect(
+      fixture.store.loops.getById("loop_manual_followup_invalid")?.status,
+    ).toBe("completed");
 
     fixture.store.close();
   });

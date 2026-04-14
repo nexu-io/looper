@@ -1203,7 +1203,12 @@ function enqueueLoopCreate(
     now: () => new Date(now),
   });
 
-  if (loop.type === "reviewer" && loop.repo && loop.prNumber) {
+  if (
+    loop.type === "reviewer" &&
+    loop.status === "running" &&
+    loop.repo &&
+    loop.prNumber
+  ) {
     scheduler.enqueue({
       projectId: loop.projectId,
       loopId: loop.id,
