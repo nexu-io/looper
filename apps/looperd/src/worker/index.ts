@@ -38,7 +38,9 @@ const WORKER_STEP_SEQUENCE = [
   "open-pr",
 ] as const;
 
-const WORKER_BRANCH_SLUG_MAX_LENGTH = 48;
+const WORKER_BRANCH_SLUG_MAX_LENGTH = 30;
+const WORKER_BRANCH_SLUG_MAX_WORDS = 5;
+const WORKER_BRANCH_HASH_LENGTH = 8;
 const WORKER_PR_DEDUPE_LOOKUP_LIMIT = 1000;
 
 export type WorkerStep = (typeof WORKER_STEP_SEQUENCE)[number];
@@ -1638,19 +1640,30 @@ function buildIssuePrompt(repo: string, issue: GitHubIssueDetail): string {
 }
 
 function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
+  const loopHash = buildWorkerLoopHash(loopId);
   if (work.issueNumber) {
-    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}-${slugify(loopId)}`;
+    return `looper/${work.issueNumber}-${buildWorkerSlug(work.title)}-${loopHash}`;
   }
 
-  return `looper/worker/${slugify(loopId)}`;
+  return `looper/${loopHash}`;
 }
 
 function buildWorkerSlug(title: string): string {
-  const words = slugify(title).split("-").filter(Boolean).slice(0, 8).join("-");
+  const words = slugify(title)
+    .split("-")
+    .filter(Boolean)
+    .slice(0, WORKER_BRANCH_SLUG_MAX_WORDS)
+    .join("-");
   return (
     words.slice(0, WORKER_BRANCH_SLUG_MAX_LENGTH).replace(/-+$/g, "") ||
     "update"
   );
+}
+
+function buildWorkerLoopHash(loopId: string): string {
+  const compact = loopId.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const hash = compact.slice(0, WORKER_BRANCH_HASH_LENGTH);
+  return hash || "worker";
 }
 
 function buildDefaultIssueWorkerTitle(
