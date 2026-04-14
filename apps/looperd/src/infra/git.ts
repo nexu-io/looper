@@ -20,6 +20,7 @@ export interface CreateWorktreeInput {
   baseBranch: string;
   prNumber?: number;
   protectedBranches?: string[];
+  checkoutMode?: "branch" | "detached";
 }
 
 export interface PrepareWorktreeResult {
@@ -101,21 +102,39 @@ export class GitWorktreeGateway {
       return existing;
     }
 
-    const branchExists = await this.branchExists(input.repoPath, input.branch);
-    await this.runGit(
-      branchExists
-        ? ["worktree", "add", "--force", worktreePath, input.branch]
-        : [
-            "worktree",
-            "add",
-            "--force",
-            "-b",
-            input.branch,
-            worktreePath,
-            input.baseBranch,
-          ],
-      input.repoPath,
-    );
+    const checkoutMode = input.checkoutMode ?? "branch";
+    if (checkoutMode === "detached") {
+      await this.runGit(
+        [
+          "worktree",
+          "add",
+          "--force",
+          "--detach",
+          worktreePath,
+          await this.resolveDetachedStartPoint(input),
+        ],
+        input.repoPath,
+      );
+    } else {
+      const branchExists = await this.branchExists(
+        input.repoPath,
+        input.branch,
+      );
+      await this.runGit(
+        branchExists
+          ? ["worktree", "add", "--force", worktreePath, input.branch]
+          : [
+              "worktree",
+              "add",
+              "--force",
+              "-b",
+              input.branch,
+              worktreePath,
+              input.baseBranch,
+            ],
+        input.repoPath,
+      );
+    }
 
     const headSha = await this.getHeadSha(worktreePath);
     const nowIso = this.now().toISOString();
@@ -168,6 +187,33 @@ export class GitWorktreeGateway {
     branch: string;
     worktreeRoot?: string;
   }): Promise<WorktreeRecord | null> {
+    const stored = this.options.store?.worktrees.getByBranch(
+      input.projectId,
+      input.branch,
+    );
+    if (
+      stored &&
+      stored.status !== "cleaned" &&
+      normalizeComparablePath(stored.worktreePath) !==
+        normalizeComparablePath(input.repoPath) &&
+      (!input.worktreeRoot ||
+        isWithinRoot(stored.worktreePath, input.worktreeRoot))
+    ) {
+      if (await this.isHealthyWorktree(stored.worktreePath)) {
+        const nowIso = this.now().toISOString();
+        const restored = {
+          ...stored,
+          headSha: await this.getHeadSha(stored.worktreePath),
+          status: "active" as const,
+          updatedAt: nowIso,
+        };
+        this.options.store?.worktrees.upsert(restored);
+        return restored;
+      }
+
+      await this.tryRemoveWorktree(input.repoPath, stored.worktreePath);
+    }
+
     const worktrees = await this.listWorktrees(input.repoPath);
     const match = worktrees.find((worktree) => {
       if (worktree.branch !== input.branch) {
@@ -417,6 +463,43 @@ export class GitWorktreeGateway {
     } catch {
       return false;
     }
+  }
+
+  private async remoteBranchExists(
+    repoPath: string,
+    remote: string,
+    branch: string,
+  ): Promise<boolean> {
+    try {
+      await this.runGit(
+        ["show-ref", "--verify", `refs/remotes/${remote}/${branch}`],
+        repoPath,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async resolveDetachedStartPoint(
+    input: CreateWorktreeInput,
+  ): Promise<string> {
+    const remote = "origin";
+    try {
+      await this.runGit(["fetch", remote, input.branch], input.repoPath);
+    } catch {
+      // fall back to any local branch/base branch that is available
+    }
+
+    if (await this.remoteBranchExists(input.repoPath, remote, input.branch)) {
+      return `${remote}/${input.branch}`;
+    }
+
+    if (await this.branchExists(input.repoPath, input.branch)) {
+      return input.branch;
+    }
+
+    return input.baseBranch;
   }
 
   private async isAncestor(

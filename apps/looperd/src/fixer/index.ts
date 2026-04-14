@@ -85,6 +85,7 @@ export interface FixerGitGateway {
     baseBranch: string;
     prNumber: number;
     protectedBranches?: string[];
+    checkoutMode?: "branch" | "detached";
   }): Promise<{
     worktreePath: string;
     branch: string;
@@ -816,6 +817,7 @@ export class FixerLoopRunner {
         detail?.baseRefName,
         input.project.baseBranch,
       ]),
+      checkoutMode: "detached",
     });
     const prepared = await this.options.git.prepareWorktree({
       worktreePath: worktree.worktreePath,

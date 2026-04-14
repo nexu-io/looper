@@ -210,6 +210,16 @@ class FakeGitGateway implements FixerGitGateway {
   public cleanupCalls = 0;
   public lastExpectedRemoteHeadSha?: string;
   public pushError?: string;
+  public lastCreateWorktreeInput?: {
+    projectId: string;
+    repoPath: string;
+    worktreeRoot: string;
+    branch: string;
+    baseBranch: string;
+    prNumber: number;
+    protectedBranches?: string[];
+    checkoutMode?: "branch" | "detached";
+  };
 
   constructor(
     private readonly options: {
@@ -236,8 +246,10 @@ class FakeGitGateway implements FixerGitGateway {
     baseBranch: string;
     prNumber: number;
     protectedBranches?: string[];
+    checkoutMode?: "branch" | "detached";
   }) {
     this.createWorktreeCalls += 1;
+    this.lastCreateWorktreeInput = _input;
     return {
       worktreePath: this.options.worktreePath ?? "/tmp/looper-fixer-worktree",
       branch: _input.branch,
@@ -483,6 +495,7 @@ describe("FixerLoopRunner", () => {
     }
     expect(agent.starts).toHaveLength(1);
     expect(git.createWorktreeCalls).toBe(1);
+    expect(git.lastCreateWorktreeInput?.checkoutMode).toBe("detached");
     expect(git.prepareCalls).toBe(1);
     expect(git.pushCalls).toBe(1);
     expect(git.lastExpectedRemoteHeadSha).toBe("abc123");
