@@ -31,3 +31,14 @@ export function assertValidProjectId(projectId: string): void {
     throw new InvalidProjectIdError(projectId);
   }
 }
+
+export function toProjectWorktreeDirectoryName(projectId: string): string {
+  if (isValidProjectId(projectId)) {
+    return projectId;
+  }
+
+  const encodedProjectId =
+    Buffer.from(projectId).toString("base64url") || "empty";
+
+  return `legacy-id-${encodedProjectId}`;
+}

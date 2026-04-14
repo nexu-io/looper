@@ -27,15 +27,15 @@ describe("config defaults", () => {
     );
   });
 
-  test("rejects unsafe project ids when deriving project worktree roots", () => {
-    expect(() => getDefaultProjectWorktreeRoot("../tmp")).toThrow(
-      'Invalid project id "../tmp": must not contain path separators, dot segments, or be an absolute path',
+  test("sanitizes legacy project ids when deriving project worktree roots", () => {
+    expect(getDefaultProjectWorktreeRoot("../tmp")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-Li4vdG1w"),
     );
-    expect(() => getDefaultProjectWorktreeRoot("..")).toThrow(
-      'Invalid project id "..": must not contain path separators, dot segments, or be an absolute path',
+    expect(getDefaultProjectWorktreeRoot("..")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-Li4"),
     );
-    expect(() => getDefaultProjectWorktreeRoot("/var/tmp/x")).toThrow(
-      'Invalid project id "/var/tmp/x": must not contain path separators, dot segments, or be an absolute path',
+    expect(getDefaultProjectWorktreeRoot("/var/tmp/x")).toBe(
+      join(homedir(), ".looper", "worktrees", "legacy-id-L3Zhci90bXAveA"),
     );
   });
 });

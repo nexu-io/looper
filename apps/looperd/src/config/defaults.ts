@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { assertValidProjectId } from "./project-id";
+import { toProjectWorktreeDirectoryName } from "./project-id";
 import type { LooperConfig } from "./types";
 
 const LOOPER_HOME = join(homedir(), ".looper");
@@ -72,8 +72,7 @@ export function getDefaultWorktreeRoot(): string {
 }
 
 export function getDefaultProjectWorktreeRoot(projectId: string): string {
-  assertValidProjectId(projectId);
-  return join(DEFAULT_WORKTREE_ROOT, projectId);
+  return join(DEFAULT_WORKTREE_ROOT, toProjectWorktreeDirectoryName(projectId));
 }
 
 export function getDefaultConfigPath(): string {
