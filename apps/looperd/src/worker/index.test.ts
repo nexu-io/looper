@@ -104,6 +104,7 @@ async function createFixture() {
 class FakeGitGateway implements WorkerGitGateway {
   public createWorktreeCalls = 0;
   public pushCalls = 0;
+  public pushedBranches: string[] = [];
 
   constructor(private readonly worktreeRoot: string) {}
 
@@ -137,8 +138,14 @@ class FakeGitGateway implements WorkerGitGateway {
     };
   }
 
-  public async push(): Promise<void> {
+  public async push(input: {
+    worktreePath: string;
+    branch: string;
+    remote?: string;
+    protectedBranches?: string[];
+  }): Promise<void> {
     this.pushCalls += 1;
+    this.pushedBranches.push(input.branch);
   }
 
   public async prepareWorktree(): Promise<{
@@ -662,6 +669,7 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     expect(result.pullRequestNumber).toBe(212);
     expect(git.pushCalls).toBe(1);
+    expect(git.pushedBranches).toEqual(["looper/worker/05e7c1d53bba907c"]);
     expect(github.createPullRequestCalls).toHaveLength(0);
     expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(212);
 

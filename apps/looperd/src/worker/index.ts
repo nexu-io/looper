@@ -878,9 +878,11 @@ export class WorkerLoopRunner {
         cwd: input.project.repoPath,
       });
       if (existingPullRequest) {
+        const existingPullRequestBranch =
+          existingPullRequest.headRefName ?? worktree.branch;
         await this.options.git.push({
           worktreePath: worktree.path,
-          branch: worktree.branch,
+          branch: existingPullRequestBranch,
           protectedBranches: [work.baseBranch],
         });
         await this.assignReviewersIfNeeded({
