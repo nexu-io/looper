@@ -1510,6 +1510,51 @@ describe("createLooperdApi", () => {
       createdAt: "2026-04-11T12:04:00.000Z",
       updatedAt: "2026-04-11T12:04:00.000Z",
     });
+    store.queue.upsert({
+      id: "queue_worker_queued",
+      projectId: "project_1",
+      loopId: "loop_worker_queued",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      dedupeKey: "worker:loop_worker_queued",
+      priority: 3,
+      status: "queued",
+      availableAt: "2026-04-11T12:04:00.000Z",
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "worker:loop_worker_queued",
+      payloadJson: JSON.stringify({ repo: "acme/looper", baseBranch: "main" }),
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: "2026-04-11T12:04:00.000Z",
+      updatedAt: "2026-04-11T12:04:00.000Z",
+    });
+
+    // stale queued loops without queued scheduler work should not be shown
+    store.loops.upsert({
+      id: "loop_worker_stale_queued",
+      seq: 10,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: "2026-04-11T12:05:00.000Z",
+      createdAt: "2026-04-11T12:05:00.000Z",
+      updatedAt: "2026-04-11T12:05:00.000Z",
+    });
 
     // null-runId active execution is ignored
     store.agentExecutions.upsert({
@@ -1711,6 +1756,7 @@ describe("createLooperdApi", () => {
 
     const queuedWorker = body.data.items.find((item) => item.runId === null);
     expect(queuedWorker).toMatchObject({
+      loopId: "loop_worker_queued",
       type: "worker",
       status: "queued",
       currentStep: null,

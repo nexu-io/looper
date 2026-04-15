@@ -742,6 +742,42 @@ class BasicLooperdRuntime implements LooperdRuntime {
       }
     }
 
+    const queuedLoopIds = new Set(
+      this.store.queue
+        .list()
+        .filter((item) => item.status === "queued" && item.loopId)
+        .map((item) => item.loopId),
+    );
+    for (const loop of this.store.loops.list()) {
+      if (loop.status !== "queued" || queuedLoopIds.has(loop.id)) {
+        continue;
+      }
+
+      const latestRun = this.store.runs.getLatestByLoopId(loop.id);
+      const normalizedStatus = normalizeStaleQueuedLoopStatus(latestRun);
+      this.store.loops.upsert({
+        ...loop,
+        status: normalizedStatus,
+        nextRunAt: null,
+        lastRunAt: latestRun?.endedAt ?? latestRun?.startedAt ?? loop.lastRunAt,
+        updatedAt: nowIso,
+      });
+      this.appendEvent({
+        id: randomUUID(),
+        eventType: "looperd.recovery.loop_queue_normalized",
+        loopId: loop.id,
+        entityType: "loop",
+        entityId: loop.id,
+        payloadJson: JSON.stringify({
+          previousStatus: loop.status,
+          recoveredStatus: normalizedStatus,
+          latestRunStatus: latestRun?.status ?? null,
+        }),
+        createdAt: nowIso,
+      });
+      eventsWritten += 1;
+    }
+
     summary.completedAt = nowIso;
 
     this.appendEvent({
@@ -1189,6 +1225,22 @@ function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
   }
 
   return loop.status === "running" || latestRun.status === "interrupted";
+}
+
+function normalizeStaleQueuedLoopStatus(latestRun: RunRecord | null): string {
+  if (!latestRun) {
+    return "failed";
+  }
+
+  if (latestRun.status === "running") {
+    return "interrupted";
+  }
+
+  if (latestRun.status === "queued") {
+    return "failed";
+  }
+
+  return latestRun.status;
 }
 
 function parseProjectMetadata(

@@ -1140,6 +1140,140 @@ describe("createLooperdRuntime", () => {
     await runtime.stop("test");
   });
 
+  test("normalizes stale queued loops without queued queue items on startup", async () => {
+    const fixture = await createFixture();
+    const now = new Date(Date.now() - 1_000).toISOString();
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_stale",
+      seq: 1,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.runs.upsert({
+      id: "run_stale",
+      loopId: "loop_stale",
+      status: "failed",
+      currentStep: "execute",
+      lastCompletedStep: "snapshot",
+      checkpointJson: null,
+      summary: "failed",
+      errorMessage: "boom",
+      startedAt: now,
+      lastHeartbeatAt: now,
+      endedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_legit",
+      seq: 2,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.queue.upsert({
+      id: "queue_legit",
+      projectId: "project_1",
+      loopId: "loop_legit",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      dedupeKey: "worker:acme/looper:43",
+      priority: 4,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:43",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.close();
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+
+    const verifyStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+    });
+    verifyStore.initialize();
+
+    expect(verifyStore.loops.getById("loop_stale")?.status).toBe("failed");
+    expect(verifyStore.loops.getById("loop_stale")?.nextRunAt).toBeNull();
+    expect(verifyStore.loops.getById("loop_legit")?.status).toBe("queued");
+    expect(
+      verifyStore.events
+        .listByEntity("loop", "loop_stale")
+        .some(
+          (event) =>
+            event.eventType === "looperd.recovery.loop_queue_normalized",
+        ),
+    ).toBe(true);
+    expect(
+      verifyStore.events
+        .listByEntity("loop", "loop_legit")
+        .some(
+          (event) =>
+            event.eventType === "looperd.recovery.loop_queue_normalized",
+        ),
+    ).toBe(false);
+
+    verifyStore.close();
+    await runtime.stop("test");
+  });
+
   test("auto-discovers planner work whenever planner runner exists", async () => {
     const fixture = await createFixture();
     fixture.config.agent.vendor = "opencode";
