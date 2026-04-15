@@ -1,7 +1,11 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { LOOPERD_VERSION } from "./generated/version";
+import {
+  LOOPERD_BUILD_METADATA,
+  LOOPERD_VERSION,
+  type LooperdBuildMetadata,
+} from "./generated/version";
 
 export const LOOPERD_BINARY_BASENAME = "looperd";
 export const LOOPERD_INSTALL_DIR = join(homedir(), ".looper", "bin");
@@ -26,4 +30,14 @@ export function getCurrentLooperdTarget(): string {
   return `${process.platform}-${process.arch}`;
 }
 
-export { LOOPERD_VERSION };
+export interface LooperdBuildInfo {
+  version: string;
+  metadata: LooperdBuildMetadata;
+}
+
+export const LOOPERD_BUILD_INFO: LooperdBuildInfo = {
+  version: LOOPERD_VERSION,
+  metadata: LOOPERD_BUILD_METADATA,
+};
+
+export { LOOPERD_BUILD_METADATA, LOOPERD_VERSION };

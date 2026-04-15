@@ -8,7 +8,7 @@ import {
   InvalidProjectIdError,
   createDefaultLooperConfig,
 } from "../config/index";
-import { LOOPERD_VERSION } from "../metadata";
+import { LOOPERD_BUILD_METADATA, LOOPERD_VERSION } from "../metadata";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -182,6 +182,11 @@ describe("createLooperdApi", () => {
       data: {
         service: {
           version: string;
+          build: {
+            versionSource: string;
+            gitCommitSha: string | null;
+            buildTimestamp: string | null;
+          };
           binary: { installDir: string; supportedTargets: string[] };
         };
         storage: { schemaVersion: string };
@@ -201,6 +206,7 @@ describe("createLooperdApi", () => {
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
     expect(statusBody.data.service.version).toBe(LOOPERD_VERSION);
+    expect(statusBody.data.service.build).toEqual(LOOPERD_BUILD_METADATA);
     expect(statusBody.data.service.binary.installDir).toBe(
       join(homedir(), ".looper", "bin"),
     );

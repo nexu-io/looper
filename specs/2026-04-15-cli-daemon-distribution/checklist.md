@@ -45,7 +45,7 @@
 ## Phase 4 - `looperd` binary 运行与元数据
 
 - [x] 明确 compiled binary 的输出命名规则
-- [ ] 明确 daemon version / build metadata 暴露方式
+- [x] 明确 daemon version / build metadata 暴露方式
 - [x] 明确版本 single source of truth，并让 CLI/daemon 构建都读取它
 - [x] 在状态接口中返回 daemon 版本信息
 - [x] 验证 CLI 可读取并展示 daemon 版本

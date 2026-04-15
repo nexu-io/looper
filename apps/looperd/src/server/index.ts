@@ -23,6 +23,7 @@ import {
   getLooperdArtifactName,
   isLooperdSupportedTarget,
   LOOPERD_BINARY_BASENAME,
+  LOOPERD_BUILD_METADATA,
   LOOPERD_INSTALL_DIR,
   LOOPERD_SUPPORTED_TARGETS,
   LOOPERD_VERSION,
@@ -308,6 +309,7 @@ function buildStatusResponse(context: LooperdApiContext) {
     service: {
       healthy: storage.ok,
       version: LOOPERD_VERSION,
+      build: LOOPERD_BUILD_METADATA,
       daemonMode: context.config.daemon.mode,
       startedAt: context.getStartedAt()?.toISOString(),
       recovery: context.getRecoverySummary(),

@@ -448,6 +448,18 @@ Restart the daemon to use the new version:
 
 其中 `looperd --version` 必须在 daemon bootstrap 之前短路返回，不能走完整配置加载、路径校验、数据库初始化与服务启动流程。
 
+### daemon build metadata
+
+当前约定：
+
+1. `looperd --version` 只输出语义化版本号，保证脚本调用与 CLI fallback 易于解析
+2. `/api/v1/status` 额外暴露 `service.build`，用于返回构建元数据
+3. `service.build` 当前至少包含：
+   - `versionSource`：当前版本号来自哪个 source of truth（现阶段固定为 `apps/cli/package.json`）
+   - `gitCommitSha`：若 release/build 流程注入则返回 commit sha，否则为 `null`
+   - `buildTimestamp`：若 release/build 流程注入则返回构建时间，否则为 `null`
+4. 这些字段由 `apps/looperd/scripts/generate-artifacts.ts` 在构建时生成到 `apps/looperd/src/generated/version.ts`
+
 ### daemon 最新版本
 
 从 GitHub Releases REST API 获取，不依赖 `gh` CLI。
