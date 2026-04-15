@@ -11,7 +11,8 @@
       },
     },
     "apps/cli": {
-      "name": "@looper/cli",
+      "name": "@powerformer/looper",
+      "version": "0.1.0",
       "bin": {
         "looper": "dist/index.js",
       },
@@ -45,11 +46,11 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@1.9.4", "", { "os": "win32", "cpu": "x64" }, "sha512-8Y5wMhVIPaWe6jw2H+KlEm4wP/f7EW3810ZLmDlrEEy5KvBsb9ECEfu/kMWD484ijfQ8+nIi0giMgu9g1UAuuA=="],
 
-    "@looper/cli": ["@looper/cli@workspace:apps/cli"],
-
     "@looper/looperd": ["@looper/looperd@workspace:apps/looperd"],
 
     "@looper/web": ["@looper/web@workspace:apps/web"],
+
+    "@powerformer/looper": ["@powerformer/looper@workspace:apps/cli"],
 
     "@types/node": ["@types/node@25.6.0", "", { "dependencies": { "undici-types": "~7.19.0" } }, "sha512-+qIYRKdNYJwY3vRCZMdJbPLJAtGjQBudzZzdzwQYkEPQd+PJGixUL5QfvCLDaULoLv+RhT3LDkwEfKaAkgSmNQ=="],
 
