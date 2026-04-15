@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../bootstrap/logger";
+import {
+  assertValidProjectId,
+  deriveProjectIdFromRepoPath,
+  normalizeDerivedProjectId,
+} from "../config/index";
 import type { GitHubPullRequestSummary } from "../infra/index";
 import type { Store } from "../storage/store";
 import type {
@@ -38,6 +43,7 @@ export interface AddProjectInput {
   name: string;
   repoPath: string;
   baseBranch: string;
+  idSource?: "explicit" | "derived";
   worktreeRoot?: string | null;
   repo?: string | null;
 }
@@ -58,6 +64,15 @@ export interface ProjectManagerOptions {
   now?: () => Date;
 }
 
+export class ProjectIdCollisionError extends Error {
+  constructor(projectId: string) {
+    super(
+      `Derived project id collides with an existing explicit project: ${projectId}`,
+    );
+    this.name = "ProjectIdCollisionError";
+  }
+}
+
 export class ProjectManager {
   private readonly now: () => Date;
 
@@ -66,15 +81,26 @@ export class ProjectManager {
   }
 
   public async addProject(input: AddProjectInput): Promise<AddProjectResult> {
+    const existing = this.options.store.projects.getById(input.id);
+    const projectId = existing ? existing.id : this.normalizeProjectId(input);
+    const normalizedExisting =
+      existing ?? this.getNormalizedExisting(input, projectId);
+    if (!normalizedExisting) {
+      assertValidProjectId(projectId);
+    }
     const warnings: string[] = [];
     const nowIso = this.now().toISOString();
-    const existing = this.options.store.projects.getById(input.id);
     const detectedRepo = await this.detectRepo(
       input.repo ?? null,
       input.repoPath,
       warnings,
     );
-    const project = this.upsertProject(input, detectedRepo, existing, nowIso);
+    const project = this.upsertProject(
+      { ...input, id: projectId },
+      detectedRepo,
+      normalizedExisting,
+      nowIso,
+    );
 
     const discoveredWorktrees = await this.discoverWorktrees(project, warnings);
     const discoveredPullRequests = await this.discoverPullRequests(
@@ -92,6 +118,43 @@ export class ProjectManager {
     };
   }
 
+  private normalizeProjectId(input: AddProjectInput): string {
+    if (input.idSource !== "derived") {
+      return input.id;
+    }
+
+    if (input.id !== deriveProjectIdFromRepoPath(input.repoPath)) {
+      return input.id;
+    }
+
+    if (!input.id.startsWith("legacy-id-")) {
+      return input.id;
+    }
+
+    return normalizeDerivedProjectId(input.id);
+  }
+
+  private getNormalizedExisting(
+    input: AddProjectInput,
+    projectId: string,
+  ): ProjectRecord | null {
+    if (projectId === input.id) {
+      return null;
+    }
+
+    const existing = this.options.store.projects.getById(projectId);
+    if (!existing) {
+      return null;
+    }
+
+    const metadata = parseMetadata(existing.metadataJson);
+    if (metadata.normalizedDerivedId === true) {
+      return existing;
+    }
+
+    throw new ProjectIdCollisionError(projectId);
+  }
+
   private upsertProject(
     input: AddProjectInput,
     repo: string | null,
@@ -99,8 +162,15 @@ export class ProjectManager {
     nowIso: string,
   ): ProjectRecord {
     const metadata = parseMetadata(existing?.metadataJson);
+    const derivedProjectId = deriveProjectIdFromRepoPath(input.repoPath);
+    const normalizedDerivedId =
+      metadata.normalizedDerivedId === true ||
+      (input.idSource === "derived" &&
+        derivedProjectId.startsWith("legacy-id-") &&
+        input.id === normalizeDerivedProjectId(derivedProjectId));
     const nextMetadata = {
       ...metadata,
+      ...(normalizedDerivedId ? { normalizedDerivedId: true } : {}),
       repo,
       worktreeRoot: input.worktreeRoot ?? metadata.worktreeRoot ?? null,
       source: existing ? (metadata.source ?? "api") : "api",

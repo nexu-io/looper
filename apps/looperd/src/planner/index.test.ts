@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
+import { getDefaultProjectWorktreeRoot } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
@@ -189,6 +190,14 @@ class FakeGitHubGateway implements PlannerGitHubGateway {
 class FakeGitGateway implements PlannerGitGateway {
   public createWorktreeCalls = 0;
   public pushCalls = 0;
+  public lastCreateWorktreeInput?: {
+    projectId: string;
+    repoPath: string;
+    worktreeRoot: string;
+    branch: string;
+    baseBranch: string;
+    protectedBranches?: string[];
+  };
 
   constructor(private readonly worktreeRoot: string) {}
 
@@ -201,6 +210,7 @@ class FakeGitGateway implements PlannerGitGateway {
     protectedBranches?: string[];
   }): Promise<WorktreeRecord> {
     this.createWorktreeCalls += 1;
+    this.lastCreateWorktreeInput = input;
     const worktreePath = join(
       this.worktreeRoot,
       input.branch.replace(/[^a-zA-Z0-9._-]+/g, "-"),
@@ -469,6 +479,9 @@ describe("PlannerLoopRunner", () => {
     expect(result.status).toBe("success");
     expect(result.pullRequestNumber).toBe(77);
     expect(git.createWorktreeCalls).toBe(1);
+    expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
+      fixture.worktreeRoot,
+    );
     expect(git.pushCalls).toBe(1);
     expect(agent.starts).toHaveLength(1);
     expect(agent.starts[0]?.prompt).toContain(
@@ -498,6 +511,63 @@ describe("PlannerLoopRunner", () => {
     expect(loop?.prNumber).toBe(77);
     expect(loop?.metadataJson).toContain(
       "specs/2026-04-12-123-add-planner-flow.md",
+    );
+
+    fixture.store.close();
+  });
+
+  test("uses the config default worktree root when project metadata omits one", async () => {
+    const fixture = await createFixture();
+    const project = fixture.store.projects.getById("project_1");
+    if (!project) {
+      throw new Error("Expected project fixture");
+    }
+    fixture.store.projects.upsert({
+      ...project,
+      metadataJson: JSON.stringify({
+        repo: "acme/looper",
+        reviewers: ["review-bot"],
+      }),
+      updatedAt: fixture.now.toISOString(),
+    });
+
+    const github = new FakeGitHubGateway({
+      issues: [
+        {
+          number: 123,
+          title: "Add planner flow",
+          body: "Implement planning loop",
+          url: "https://example.test/acme/looper/issues/123",
+          assignees: ["octocat"],
+          labels: ["looper:plan"],
+        },
+      ],
+      currentUserLogin: "octocat",
+    });
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const runner = new PlannerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Spec committed"),
+      ]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverIssues();
+    const claimed = fixture.queue.claimNext("planner-1");
+    if (!claimed) {
+      throw new Error("Expected planner queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
+      getDefaultProjectWorktreeRoot("project_1", fixture.repoPath),
     );
 
     fixture.store.close();

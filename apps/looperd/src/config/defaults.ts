@@ -1,10 +1,18 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import {
+  toProjectWorktreeDirectoryName,
+  toRepoWorktreeDirectoryName,
+} from "./project-id";
 import type { LooperConfig } from "./types";
 
+function getLooperHome(): string {
+  return join(homedir(), ".looper");
+}
+
 export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
-  const looperHome = join(homedir(), ".looper");
+  const looperHome = getLooperHome();
 
   return {
     server: {
@@ -65,6 +73,21 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
   };
 }
 
+export function getDefaultWorktreeRoot(): string {
+  return join(getLooperHome(), "worktrees");
+}
+
+export function getDefaultProjectWorktreeRoot(
+  projectId: string,
+  repoIdentity: string,
+): string {
+  return join(
+    getDefaultWorktreeRoot(),
+    toRepoWorktreeDirectoryName(repoIdentity),
+    toProjectWorktreeDirectoryName(projectId),
+  );
+}
+
 export function getDefaultConfigPath(): string {
-  return join(homedir(), ".looper", "config.json");
+  return join(getLooperHome(), "config.json");
 }

@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../bootstrap/logger";
-import type { LooperConfig } from "../config/index";
+import {
+  InvalidProjectIdError,
+  type LooperConfig,
+  deriveProjectIdFromRepoPath,
+} from "../config/index";
 import {
   assertUniqueActiveLoop,
   createLoop,
@@ -10,7 +14,10 @@ import {
   defineProjectLoopTarget,
   definePullRequestLoopTarget,
 } from "../domain/index";
-import type { ProjectManager } from "../projects/index";
+import {
+  ProjectIdCollisionError,
+  type ProjectManager,
+} from "../projects/index";
 import { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
@@ -1157,8 +1164,8 @@ async function buildProjectsRouteResponse(
 
   const body = await parseJsonBody(request);
   const repoPath = readRequiredString(body, "repoPath");
-  const id =
-    readOptionalString(body, "id") ?? deriveProjectIdFromPath(repoPath);
+  const providedId = readOptionalString(body, "id");
+  const id = providedId ?? deriveProjectIdFromRepoPath(repoPath);
   const name = readOptionalString(body, "name") ?? id;
   const baseBranch =
     readOptionalString(body, "baseBranch") ??
@@ -1169,6 +1176,7 @@ async function buildProjectsRouteResponse(
     name,
     repoPath,
     baseBranch,
+    idSource: providedId ? "explicit" : "derived",
     worktreeRoot: readOptionalString(body, "worktreeRoot"),
     repo: readOptionalString(body, "repo"),
   });
@@ -2047,17 +2055,6 @@ function buildWorkerPullRequestLockKey(repo: string, prNumber: number): string {
   return createPrLockKey(repo, prNumber);
 }
 
-function deriveProjectIdFromPath(repoPath: string): string {
-  const segments = repoPath.split(/[\\/]+/).filter(Boolean);
-  const lastSegment = segments.at(-1) ?? "project";
-  const normalized = lastSegment
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return normalized || "project";
-}
-
 function serializeEvent(event: EventLogRecord) {
   return {
     ...event,
@@ -2089,6 +2086,14 @@ function isCodingAgentConfigured(config: LooperConfig): boolean {
 function toApiError(error: unknown): ApiError {
   if (error instanceof ApiError) {
     return error;
+  }
+
+  if (error instanceof InvalidProjectIdError) {
+    return new ApiError("VALIDATION_FAILED", 400, error.message);
+  }
+
+  if (error instanceof ProjectIdCollisionError) {
+    return new ApiError("PROJECT_ID_CONFLICT", 409, error.message);
   }
 
   return new ApiError(

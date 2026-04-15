@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
+import { getDefaultProjectWorktreeRoot } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError } from "../infra/command";
@@ -614,7 +615,8 @@ export class PlannerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
-      configuredRoot ?? join(input.project.repoPath, ".looper-worktrees");
+      configuredRoot ??
+      getDefaultProjectWorktreeRoot(input.project.id, input.project.repoPath);
     const branch = buildPlannerBranch(
       issue.issueNumber,
       issue.title || "issue",

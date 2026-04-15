@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
+import { getDefaultProjectWorktreeRoot } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
@@ -803,7 +804,7 @@ export class FixerLoopRunner {
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const worktreeRoot =
       readString(projectMetadata.worktreeRoot) ??
-      join(input.project.repoPath, ".looper-worktrees");
+      getDefaultProjectWorktreeRoot(input.project.id, input.project.repoPath);
     if (shouldRebuildWorktree(input.checkpoint)) {
       const previousWorktree = input.checkpoint.worktree;
       if (previousWorktree?.path && previousWorktree.branch) {

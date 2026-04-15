@@ -1,4 +1,20 @@
-export { createDefaultLooperConfig, getDefaultConfigPath } from "./defaults";
+export {
+  createDefaultLooperConfig,
+  getDefaultConfigPath,
+  getDefaultProjectWorktreeRoot,
+  getDefaultWorktreeRoot,
+} from "./defaults";
+export {
+  assertValidProjectId,
+  deriveProjectIdFromRepoPath,
+  getConfigProjectIdValidationMessage,
+  getProjectIdValidationMessage,
+  InvalidProjectIdError,
+  isValidConfiguredProjectId,
+  isValidProjectId,
+  normalizeDerivedProjectId,
+  toRepoWorktreeDirectoryName,
+} from "./project-id";
 export { loadLooperConfig } from "./load";
 export { detectToolPaths } from "./tools";
 export {

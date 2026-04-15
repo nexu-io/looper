@@ -7,6 +7,7 @@ import {
   ConfigValidationError,
   createDefaultLooperConfig,
   loadLooperConfig,
+  validateLooperConfig,
 } from "./index";
 
 async function createFixture(): Promise<{
@@ -185,5 +186,123 @@ describe("loadLooperConfig", () => {
         env: {},
       }),
     ).rejects.toThrow("Unknown looperd argument: --hostfoo");
+  });
+
+  test("rejects project ids that would escape the default worktree root", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    await writeFile(
+      fixture.configPath,
+      JSON.stringify({
+        daemon: {
+          logDir: fixture.logDir,
+          workingDirectory: fixture.writableDir,
+        },
+        storage: { dbPath: fixture.dbPath },
+        notifications: {
+          osascript: { enabled: false, throttleWindowSeconds: 60 },
+        },
+        tools: {
+          bunPath: "/file/bun",
+          gitPath: "/file/git",
+          ghPath: "/file/gh",
+        },
+        projects: [
+          {
+            id: "../../tmp",
+            name: "bad-project",
+            repoPath: fixture.writableDir,
+          },
+        ],
+      }),
+    );
+
+    await expect(
+      loadLooperConfig({
+        argv: ["--config", fixture.configPath],
+        cwd: fixture.rootDir,
+        env: {},
+      }),
+    ).rejects.toMatchObject({
+      issues: [
+        {
+          path: "projects[0].id",
+          message:
+            "must not contain path separators, dot segments, or be an absolute path",
+        },
+      ],
+    });
+  });
+
+  test("allows legacy project ids in config for upgrade compatibility", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    await writeFile(
+      fixture.configPath,
+      JSON.stringify({
+        daemon: {
+          logDir: fixture.logDir,
+          workingDirectory: fixture.writableDir,
+        },
+        storage: { dbPath: fixture.dbPath },
+        notifications: {
+          osascript: { enabled: false, throttleWindowSeconds: 60 },
+        },
+        tools: {
+          bunPath: "/file/bun",
+          gitPath: "/file/git",
+          ghPath: "/file/gh",
+        },
+        projects: [
+          {
+            id: "legacy-id-Li4vdG1w",
+            name: "legacy-project",
+            repoPath: fixture.writableDir,
+          },
+        ],
+      }),
+    );
+
+    const loaded = await loadLooperConfig({
+      argv: ["--config", fixture.configPath],
+      cwd: fixture.rootDir,
+      env: {},
+    });
+
+    expect(loaded.config.projects[0]?.id).toBe("legacy-id-Li4vdG1w");
+  });
+
+  test("rejects configs when the default worktree root cannot be created", async () => {
+    const fixture = await createFixture();
+    cleanupPaths.push(fixture.rootDir);
+
+    const blockingRoot = join(fixture.rootDir, "blocked-root");
+    await writeFile(blockingRoot, "not-a-directory");
+
+    const config = createDefaultLooperConfig(fixture.rootDir);
+    config.daemon.logDir = fixture.logDir;
+    config.daemon.workingDirectory = fixture.writableDir;
+    config.storage.dbPath = fixture.dbPath;
+    config.notifications.osascript.enabled = false;
+    config.tools = {
+      bunPath: "/file/bun",
+      gitPath: "/file/git",
+      ghPath: "/file/gh",
+    };
+
+    await expect(
+      validateLooperConfig(config, {
+        defaultWorktreeRoot: join(blockingRoot, "worktrees"),
+      }),
+    ).rejects.toMatchObject({
+      issues: [
+        {
+          path: "defaults.worktreeRoot",
+          message: `${blockingRoot} is not a directory`,
+        },
+      ],
+    });
   });
 });

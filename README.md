@@ -151,6 +151,7 @@ Selected CLI config flags:
 - `looperd` fails fast on invalid config.
 - Runtime paths must be writable.
 - If `notifications.osascript.enabled` is `true`, `osascript` must resolve.
+- Default daemon-managed worktrees now live under `~/.looper/worktrees/<project-id>/`; if you still have legacy repo-local `.looper-worktrees/` entries, prune any stale `.git/worktrees/*/gitdir` references before deleting those old directories.
 - SQLite migrations are loaded from the built output when present, otherwise from source.
 
 ## Development notes

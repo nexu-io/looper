@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "../bootstrap/logger";
-import { createDefaultLooperConfig } from "../config/index";
+import {
+  InvalidProjectIdError,
+  createDefaultLooperConfig,
+} from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -883,7 +886,7 @@ describe("createLooperdApi", () => {
   });
 
   test("supports project add route", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
     const apiWithProjects = createLooperdApi({
       config: createDefaultLooperConfig(rootDir),
       logger: await createLogger(
@@ -942,8 +945,311 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
+  test("rejects unsafe project ids through the API", async () => {
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-invalid-id`,
+      ),
+      store,
+      projects: {
+        addProject: async () => {
+          throw new InvalidProjectIdError("../../tmp");
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/looper",
+          id: "../../tmp",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_FAILED");
+    expect(body.error.message).toContain('Invalid project id "../../tmp"');
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects reserved legacy-id project ids through the API", async () => {
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-invalid-legacy-id`,
+      ),
+      store,
+      projects: {
+        addProject: async () => {
+          throw new InvalidProjectIdError("legacy-id-Li4vdG1w");
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/looper",
+          id: "legacy-id-Li4vdG1w",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_FAILED");
+    expect(body.error.message).toContain(
+      'Invalid project id "legacy-id-Li4vdG1w"',
+    );
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("derives legacy-looking project ids without pre-normalizing through the API", async () => {
+    const { store, rootDir } = await createFixture();
+    let derivedId: string | undefined;
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-derived-id`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+          idSource?: "explicit" | "derived";
+        }) => {
+          derivedId = input.id;
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/legacy-id-example",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      data: { id: string; name: string; repoPath: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(derivedId).toBe("legacy-id-example");
+    expect(body.data.id).toBe("legacy-id-example");
+    expect(body.data.name).toBe("Looper");
+    expect(body.data.repoPath).toBe("/tmp/repos/legacy-id-example");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("derives project ids with the same mixed-separator parser used by project normalization", async () => {
+    const { store, rootDir } = await createFixture();
+    let derivedId = "";
+    let idSource: "explicit" | "derived" | undefined;
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-mixed-separators`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+          idSource?: "explicit" | "derived";
+        }) => {
+          derivedId = input.id;
+          idSource = input.idSource;
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos\\legacy-id-example",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      data: { id: string; name: string; repoPath: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(derivedId).toBe("legacy-id-example");
+    expect(idSource).toBe("derived");
+    expect(body.data.id).toBe("legacy-id-example");
+    expect(body.data.repoPath).toBe("/tmp/repos\\legacy-id-example");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("keeps derived legacy-id project ids distinct from normalized repo names", async () => {
+    const { store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects-distinct-derived-id`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => {
+          const project = {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: null, worktreeRoot: null }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          };
+          store.projects.upsert(project);
+          return {
+            project,
+            repo: null,
+            discoveredPullRequests: 0,
+            discoveredWorktrees: 0,
+            warnings: [],
+          };
+        },
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const legacyResponse = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/legacy-id-foo",
+          name: "Legacy repo",
+        }),
+      }),
+    );
+    const legacyBody = (await legacyResponse.json()) as {
+      data: { id: string; repoPath: string };
+    };
+
+    const normalizedResponse = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/project-legacy-id-foo",
+          name: "Normalized repo",
+        }),
+      }),
+    );
+    const normalizedBody = (await normalizedResponse.json()) as {
+      data: { id: string; repoPath: string };
+    };
+
+    expect(legacyResponse.status).toBe(200);
+    expect(normalizedResponse.status).toBe(200);
+    expect(legacyBody.data.id).toBe("legacy-id-foo");
+    expect(normalizedBody.data.id).toBe("project-legacy-id-foo");
+    expect(store.projects.getById("legacy-id-foo")?.repoPath).toBe(
+      "/tmp/repos/legacy-id-foo",
+    );
+    expect(store.projects.getById("project-legacy-id-foo")?.repoPath).toBe(
+      "/tmp/repos/project-legacy-id-foo",
+    );
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
   test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
-    const { api, store, rootDir } = await createFixture();
+    const { store, rootDir } = await createFixture();
     store.loops.upsert({
       id: "loop_fixer_no_agent",
       seq: 4,

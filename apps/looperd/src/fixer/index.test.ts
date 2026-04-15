@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
+import { getDefaultProjectWorktreeRoot } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { RemoteHeadChangedError } from "../infra/git";
 import { SchedulerQueue } from "../scheduler/index";
@@ -502,6 +503,9 @@ describe("FixerLoopRunner", () => {
     }
     expect(agent.starts).toHaveLength(1);
     expect(git.createWorktreeCalls).toBe(1);
+    expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
+      getDefaultProjectWorktreeRoot("project_1", fixture.repoPath),
+    );
     expect(git.lastCreateWorktreeInput?.checkoutMode).toBe("detached");
     expect(git.prepareCalls).toBe(1);
     expect(git.pushCalls).toBe(1);

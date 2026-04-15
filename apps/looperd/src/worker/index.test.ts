@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
+import { getDefaultProjectWorktreeRoot } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
@@ -105,6 +106,15 @@ class FakeGitGateway implements WorkerGitGateway {
   public createWorktreeCalls = 0;
   public pushCalls = 0;
   public pushedBranches: string[] = [];
+  public lastCreateWorktreeInput?: {
+    projectId: string;
+    repoPath: string;
+    worktreeRoot: string;
+    branch: string;
+    baseBranch: string;
+    prNumber?: number;
+    protectedBranches?: string[];
+  };
 
   constructor(private readonly worktreeRoot: string) {}
 
@@ -114,9 +124,11 @@ class FakeGitGateway implements WorkerGitGateway {
     worktreeRoot: string;
     branch: string;
     baseBranch: string;
+    prNumber?: number;
     protectedBranches?: string[];
   }): Promise<WorktreeRecord> {
     this.createWorktreeCalls += 1;
+    this.lastCreateWorktreeInput = input;
     const worktreePath = join(
       this.worktreeRoot,
       input.branch.replace(/[^a-zA-Z0-9._-]+/g, "-"),
@@ -511,11 +523,62 @@ describe("WorkerLoopRunner", () => {
       "use the GitHub CLI (`gh`) to create the pull request yourself",
     );
     expect(git.createWorktreeCalls).toBe(1);
+    expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
+      fixture.worktreeRoot,
+    );
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+    fixture.store.close();
+  });
+
+  test("uses the config default worktree root when project metadata omits one", async () => {
+    const fixture = await createFixture();
+    const project = fixture.store.projects.getById("project_1");
+    if (!project) {
+      throw new Error("Expected project fixture");
+    }
+    fixture.store.projects.upsert({
+      ...project,
+      metadataJson: null,
+      updatedAt: fixture.now.toISOString(),
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github: new FakeGitHubGateway(),
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Implemented slice and committed changes", [
+          "abc123",
+        ]),
+      ]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(git.lastCreateWorktreeInput?.worktreeRoot).toBe(
+      getDefaultProjectWorktreeRoot("project_1", fixture.repoPath),
+    );
+
     fixture.store.close();
   });
 
