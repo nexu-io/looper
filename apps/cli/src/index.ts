@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { arch as osArch, homedir, platform as osPlatform } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { cac } from "cac";
 
 import {
@@ -51,6 +51,17 @@ interface CliDeps {
     homeDir: string;
     force: boolean;
   }) => Promise<DaemonInstallResult>;
+  writeFileImpl?: (path: string, contents: string) => Promise<void>;
+  mkdirImpl?: (path: string, options: { recursive: boolean }) => Promise<void>;
+  removeFileImpl?: (path: string) => Promise<void>;
+  killImpl?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  spawnDetachedImpl?: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => { pid: number | undefined };
+  sleepImpl?: (ms: number) => Promise<void>;
 }
 
 interface CliContext {
@@ -77,6 +88,17 @@ interface CliContext {
     homeDir: string;
     force: boolean;
   }) => Promise<DaemonInstallResult>;
+  writeFileImpl: (path: string, contents: string) => Promise<void>;
+  mkdirImpl: (path: string, options: { recursive: boolean }) => Promise<void>;
+  removeFileImpl: (path: string) => Promise<void>;
+  killImpl: (pid: number, signal?: NodeJS.Signals | number) => void;
+  spawnDetached: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => { pid: number | undefined };
+  sleep: (ms: number) => Promise<void>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -259,6 +281,23 @@ export async function runCli(
           homeDir,
           force,
         }),
+      writeFileImpl: async (path, contents) =>
+        (deps.writeFileImpl ?? writeFile)(path, contents),
+      mkdirImpl: async (path, options) => {
+        if (deps.mkdirImpl) {
+          await deps.mkdirImpl(path, options);
+          return;
+        }
+        await mkdir(path, options);
+      },
+      removeFileImpl: async (path) =>
+        deps.removeFileImpl ? deps.removeFileImpl(path) : await rm(path),
+      killImpl: deps.killImpl ?? ((pid, signal) => process.kill(pid, signal)),
+      spawnDetached: (options) =>
+        (deps.spawnDetachedImpl ?? spawnDetachedDaemon)(options),
+      sleep:
+        deps.sleepImpl ??
+        ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     };
 
     const cli = createCli(runtime);
@@ -311,6 +350,12 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       if (subcommand === "status") {
         return runDaemonStatus(context);
+      }
+      if (subcommand === "start") {
+        return runDaemonStart(context);
+      }
+      if (subcommand === "restart") {
+        return runDaemonRestart(context);
       }
       if (subcommand === "logs") {
         return runDaemonLogs(context);
@@ -412,6 +457,8 @@ function createCli(runtime: CliRuntime) {
     .option("--lines <count>", "Line count")
     .option("--force", "Overwrite existing installed daemon binary")
     .example((name) => `  $ ${name} daemon install`)
+    .example((name) => `  $ ${name} daemon start`)
+    .example((name) => `  $ ${name} daemon restart`)
     .example((name) => `  $ ${name} daemon status`)
     .example((name) => `  $ ${name} daemon logs --lines 50`)
     .action(async (args, options) => {
@@ -845,26 +892,149 @@ async function runDaemonInstall(context: CliContext) {
 async function readInstalledDaemonVersion(
   context: CliContext,
 ): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  const resolvedBinary = await resolveDaemonBinary(context);
+  if (!resolvedBinary) {
+    return null;
+  }
+
+  try {
+    const result = await context.runCommand({
+      command: resolvedBinary.path,
+      args: ["--version"],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const version = result.stdout.trim();
+    if (!version) {
+      return null;
+    }
+
+    return {
+      version,
+      source: "binary",
+      binaryPath: resolvedBinary.path,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function runDaemonStart(context: CliContext) {
+  const binary = await resolveDaemonBinary(context);
+  if (!binary) {
+    throw new Error(
+      "Cannot find looperd binary. Lookup order: ~/.looper/bin/looperd, then $PATH.",
+    );
+  }
+
+  const pidFilePath = resolveDaemonPidFilePath(context);
+  const existingPid = await readPidFile(context, pidFilePath);
+  if (existingPid && isProcessAlive(context, existingPid)) {
+    context.write(`looperd already appears to be running (pid ${existingPid})`);
+    context.write(
+      "Phase 1 process management is minimal: use `looper daemon restart` or stop the process manually if needed.",
+    );
+    return;
+  }
+  if (existingPid) {
+    await removePidFile(context, pidFilePath);
+    context.write(`Removed stale daemon pid file for pid ${existingPid}`);
+  }
+
+  const child = context.spawnDetached({
+    command: binary.path,
+    args: [],
+    cwd: context.cwd,
+    env: context.env,
+  });
+  const pid = child.pid;
+  if (!pid || pid <= 0) {
+    throw new Error("Failed to start looperd: process did not report a pid");
+  }
+
+  await context.mkdirImpl(dirname(pidFilePath), { recursive: true });
+  await context.writeFileImpl(pidFilePath, `${pid}\n`);
+
+  context.write(`Started looperd (${binary.path}) with pid ${pid}`);
+  context.write(`PID file: ${pidFilePath}`);
+  context.write(
+    "Phase 1 process management is minimal and does not provide full background supervision.",
+  );
+}
+
+async function runDaemonRestart(context: CliContext) {
+  const pidFilePath = resolveDaemonPidFilePath(context);
+  const existingPid = await readPidFile(context, pidFilePath);
+
+  if (!existingPid) {
+    context.write("No daemon pid file found; starting daemon.");
+    return runDaemonStart(context);
+  }
+
+  if (!isProcessAlive(context, existingPid)) {
+    context.write(`Daemon pid ${existingPid} is stale; starting daemon.`);
+    await removePidFile(context, pidFilePath);
+    return runDaemonStart(context);
+  }
+
+  context.killImpl(existingPid, "SIGTERM");
+  await waitForProcessExit(context, existingPid, 2_000, 100);
+  await removePidFile(context, pidFilePath);
+  context.write(`Stopped looperd pid ${existingPid}`);
+
+  await runDaemonStart(context);
+}
+
+function spawnDetachedDaemon(options: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+}): { pid: number | undefined } {
+  const env = Object.fromEntries(
+    Object.entries(options.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  return { pid: child.pid };
+}
+
+function resolveDaemonPidFilePath(context: CliContext): string {
   const home =
     context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
-  const candidates = [join(home, ".looper", "bin", "looperd"), "looperd"];
+  return join(home, ".looper", "looperd.pid");
+}
+
+async function resolveDaemonBinary(
+  context: CliContext,
+): Promise<{ path: string; source: "installed" | "path" } | null> {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const candidates: Array<{ path: string; source: "installed" | "path" }> = [
+    { path: join(home, ".looper", "bin", "looperd"), source: "installed" },
+    { path: "looperd", source: "path" },
+  ];
 
   for (const candidate of candidates) {
     try {
       const result = await context.runCommand({
-        command: candidate,
+        command: candidate.path,
         args: ["--version"],
         timeoutMs: 5_000,
       });
       if (result.exitCode === 0) {
-        const version = result.stdout.trim();
-        if (version.length > 0) {
-          return {
-            version,
-            source: "binary",
-            binaryPath: candidate,
-          };
-        }
+        return candidate;
       }
     } catch {
       // try next candidate
@@ -872,6 +1042,53 @@ async function readInstalledDaemonVersion(
   }
 
   return null;
+}
+
+async function readPidFile(
+  context: CliContext,
+  pidFilePath: string,
+): Promise<number | null> {
+  try {
+    const raw = await context.readFileImpl(pidFilePath, "utf8");
+    const pid = Number.parseInt(raw.trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function removePidFile(context: CliContext, pidFilePath: string) {
+  try {
+    await context.removeFileImpl(pidFilePath);
+  } catch {
+    // best effort for minimal process management
+  }
+}
+
+function isProcessAlive(context: CliContext, pid: number): boolean {
+  try {
+    context.killImpl(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(
+  context: CliContext,
+  pid: number,
+  timeoutMs: number,
+  intervalMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(context, pid)) {
+      return;
+    }
+    await context.sleep(intervalMs);
+  }
+
+  throw new Error(`Timed out waiting for looperd pid ${pid} to exit`);
 }
 
 async function runCommand(options: {

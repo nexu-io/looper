@@ -88,12 +88,12 @@
 
 ## Phase 7 - CLI 的 daemon 管理命令
 
-- [ ] 设计 `looper daemon start`
-- [ ] 明确启动前如何定位已安装的 `looperd`
-- [ ] daemon 查找顺序固定为 `~/.looper/bin/looperd` → `$PATH` → 报错
-- [ ] `looper daemon status` 兼容 binary 安装模式
-- [ ] 设计 `looper daemon restart`
-- [ ] 明确 Phase 1 是否只支持手动运行 daemon，而不承诺完整后台托管
+- [x] 设计 `looper daemon start`
+- [x] 明确启动前如何定位已安装的 `looperd`
+- [x] daemon 查找顺序固定为 `~/.looper/bin/looperd` → `$PATH` → 报错
+- [x] `looper daemon status` 兼容 binary 安装模式
+- [x] 设计 `looper daemon restart`
+- [x] 明确 Phase 1 是否只支持手动运行 daemon，而不承诺完整后台托管
 
 ## Phase 8 - 顶层 `looper upgrade`
 

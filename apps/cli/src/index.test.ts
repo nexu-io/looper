@@ -601,13 +601,12 @@ describe("runCli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(runCommandCalls).toEqual([
-      {
-        command: "/Users/tester/.looper/bin/looperd",
-        args: ["--version"],
-        timeoutMs: 5_000,
-      },
-    ]);
+    expect(runCommandCalls).toHaveLength(2);
+    expect(runCommandCalls[0]).toEqual({
+      command: "/Users/tester/.looper/bin/looperd",
+      args: ["--version"],
+      timeoutMs: 5_000,
+    });
     expect(lines.join("\n")).toContain("daemonVersion");
     expect(lines.join("\n")).toContain("0.1.0");
     expect(lines.join("\n")).toContain("/Users/tester/.looper/bin/looperd");
@@ -722,6 +721,189 @@ describe("runCli", () => {
     expect(firstLines.join("\n")).toContain(
       "looperd is already installed at /Users/tester/.looper/bin/looperd (use --force to overwrite)",
     );
+  });
+
+  test("starts daemon with installed binary and writes pid file", async () => {
+    const lines: string[] = [];
+    const writeCalls: Array<{ path: string; contents: string }> = [];
+    const mkdirCalls: string[] = [];
+    const spawnCalls: Array<{ command: string; args: string[] }> = [];
+
+    const exitCode = await runCli(["daemon", "start"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      readFileImpl: async () => {
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      mkdirImpl: async (path) => {
+        mkdirCalls.push(path);
+      },
+      writeFileImpl: async (path, contents) => {
+        writeCalls.push({ path, contents });
+      },
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push({ command: options.command, args: options.args });
+        return { pid: 4321 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawnCalls).toEqual([
+      { command: "/Users/tester/.looper/bin/looperd", args: [] },
+    ]);
+    expect(mkdirCalls).toEqual(["/Users/tester/.looper"]);
+    expect(writeCalls).toEqual([
+      { path: "/Users/tester/.looper/looperd.pid", contents: "4321\n" },
+    ]);
+    expect(lines.join("\n")).toContain("Started looperd");
+    expect(lines.join("\n")).toContain("minimal");
+  });
+
+  test("starts daemon from PATH binary when local install is unavailable", async () => {
+    const spawnCalls: string[] = [];
+    const exitCode = await runCli(["daemon", "start"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/local/bin:/usr/bin",
+      },
+      readFileImpl: async () => {
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "", stderr: "not found", exitCode: 1 };
+        }
+        if (command === "looperd") {
+          return { stdout: "0.4.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push(options.command);
+        return { pid: 5678 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawnCalls).toEqual(["looperd"]);
+  });
+
+  test("restarts daemon from pid file and starts a new process", async () => {
+    const lines: string[] = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
+    const removedPidFiles: string[] = [];
+    const writeCalls: string[] = [];
+    const spawnCalls: string[] = [];
+    let alive = true;
+
+    const exitCode = await runCli(["daemon", "restart"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      readFileImpl: async (path) => {
+        if (path.endsWith("looperd.pid")) {
+          return "1234\n";
+        }
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.5.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        killCalls.push({ pid, signal });
+        if (signal === "SIGTERM") {
+          alive = false;
+          return;
+        }
+        if (signal === 0 && !alive) {
+          throw new Error("not running");
+        }
+      },
+      sleepImpl: async () => {},
+      removeFileImpl: async (path) => {
+        removedPidFiles.push(path);
+      },
+      mkdirImpl: async () => {},
+      writeFileImpl: async (path) => {
+        writeCalls.push(path);
+      },
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push(options.command);
+        return { pid: 2233 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(killCalls).toContainEqual({ pid: 1234, signal: "SIGTERM" });
+    expect(removedPidFiles).toContain("/Users/tester/.looper/looperd.pid");
+    expect(writeCalls).toContain("/Users/tester/.looper/looperd.pid");
+    expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
+    expect(lines.join("\n")).toContain("Stopped looperd pid 1234");
+  });
+
+  test("handles stale pid file during daemon restart", async () => {
+    const lines: string[] = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
+    let readPidCalls = 0;
+
+    const exitCode = await runCli(["daemon", "restart"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      readFileImpl: async (path) => {
+        if (!path.endsWith("looperd.pid")) {
+          throw new Error("missing");
+        }
+        readPidCalls += 1;
+        if (readPidCalls === 1) {
+          return "9999\n";
+        }
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.6.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        killCalls.push({ pid, signal });
+        if (signal === 0) {
+          throw new Error("not running");
+        }
+      },
+      removeFileImpl: async () => {},
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: () => ({ pid: 7788 }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(killCalls).toEqual([{ pid: 9999, signal: 0 }]);
+    expect(lines.join("\n")).toContain("stale");
   });
 
   test("prints clear error when daemon install fails", async () => {
