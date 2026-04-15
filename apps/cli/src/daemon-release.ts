@@ -16,6 +16,7 @@ export interface GitHubReleaseAsset {
 }
 
 export interface GitHubReleasePayload {
+  tag_name?: string;
   assets: GitHubReleaseAsset[];
 }
 
@@ -74,4 +75,15 @@ export function findLooperdReleaseAssets(options: {
   }
 
   return { binary, checksum };
+}
+
+export function resolveGitHubReleaseVersion(
+  release: Pick<GitHubReleasePayload, "tag_name">,
+): string {
+  const raw = release.tag_name?.trim();
+  if (!raw) {
+    throw new Error("GitHub release payload is missing tag_name");
+  }
+
+  return raw.startsWith("v") ? raw.slice(1) : raw;
 }

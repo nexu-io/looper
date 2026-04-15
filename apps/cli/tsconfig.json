@@ -6,5 +6,5 @@
     "outDir": "dist",
     "types": ["bun-types"]
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "package.json"]
 }

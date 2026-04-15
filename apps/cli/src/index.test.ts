@@ -723,6 +723,316 @@ describe("runCli", () => {
     );
   });
 
+  test("checks CLI and daemon upgrades via top-level upgrade --check", async () => {
+    const lines: string[] = [];
+
+    const exitCode = await runCli(["upgrade", "--check"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async (input) => {
+        const url = String(input);
+
+        if (url.endsWith("/api/v1/status")) {
+          throw new Error("daemon offline");
+        }
+
+        if (
+          url === "https://registry.npmjs.org/%40powerformer%2Flooper/latest"
+        ) {
+          return new Response(JSON.stringify({ version: "0.2.0" }));
+        }
+
+        if (
+          url ===
+          "https://api.github.com/repos/powerformer/looper/releases/latest"
+        ) {
+          return new Response(
+            JSON.stringify({ tag_name: "v0.3.0", assets: [] }),
+          );
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.1.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(lines.join("\n")).toContain("cliCurrent");
+    expect(lines.join("\n")).toContain("0.1.0");
+    expect(lines.join("\n")).toContain("0.2.0");
+    expect(lines.join("\n")).toContain("0.3.0");
+    expect(lines.join("\n")).toContain("installed-binary");
+  });
+
+  test("rejects combining upgrade --check and --daemon", async () => {
+    const errors: string[] = [];
+
+    const exitCode = await runCli(["upgrade", "--check", "--daemon"], {
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toBe("--check and --daemon cannot be combined");
+  });
+
+  test("explains that bare upgrade is not implemented yet", async () => {
+    const errors: string[] = [];
+
+    const exitCode = await runCli(["upgrade"], {
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "Full `looper upgrade` (CLI + daemon) is not implemented yet",
+    );
+  });
+
+  test("upgrades daemon via top-level upgrade --daemon and prints restart hint", async () => {
+    const lines: string[] = [];
+    const installCalls: Array<{
+      platform: NodeJS.Platform;
+      arch: string;
+      homeDir: string;
+      force: boolean;
+      tag?: string;
+    }> = [];
+
+    const exitCode = await runCli(["upgrade", "--daemon"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async (input) => {
+        const url = String(input);
+
+        if (url.endsWith("/api/v1/status")) {
+          throw new Error("daemon offline");
+        }
+
+        if (
+          url ===
+          "https://api.github.com/repos/powerformer/looper/releases/latest"
+        ) {
+          return new Response(
+            JSON.stringify({ tag_name: "v0.2.0", assets: [] }),
+          );
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.1.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      daemonInstallImpl: async (options) => {
+        installCalls.push(options);
+        return {
+          target: "darwin-arm64",
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: "https://example.invalid/looperd-darwin-arm64",
+          skipped: false,
+        };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(installCalls).toHaveLength(1);
+    expect(installCalls[0]?.homeDir).toBe("/Users/tester");
+    expect(installCalls[0]?.force).toBe(true);
+    expect(installCalls[0]?.tag).toBe("v0.2.0");
+    expect(lines.join("\n")).toContain("Upgraded looperd 0.1.0 → 0.2.0");
+    expect(lines.join("\n")).toContain("looper daemon restart");
+  });
+
+  test("skips daemon reinstall when managed daemon is already current", async () => {
+    const lines: string[] = [];
+    let installCalled = false;
+
+    const exitCode = await runCli(["upgrade", "--daemon"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async (input) => {
+        const url = String(input);
+
+        if (url.endsWith("/api/v1/status")) {
+          throw new Error("daemon offline");
+        }
+
+        if (
+          url ===
+          "https://api.github.com/repos/powerformer/looper/releases/latest"
+        ) {
+          return new Response(
+            JSON.stringify({ tag_name: "v0.2.0", assets: [] }),
+          );
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      daemonInstallImpl: async () => {
+        installCalled = true;
+        return {
+          target: "darwin-arm64",
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: null,
+          skipped: false,
+        };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(installCalled).toBe(false);
+    expect(lines.join("\n")).toContain("looperd is already up to date (0.2.0)");
+  });
+
+  test("upgrade --daemon installs managed daemon when only PATH binary exists", async () => {
+    const lines: string[] = [];
+
+    const exitCode = await runCli(["upgrade", "--daemon"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/local/bin:/usr/bin",
+      },
+      fetchImpl: async (input) => {
+        const url = String(input);
+
+        if (url.endsWith("/api/v1/status")) {
+          throw new Error("daemon offline");
+        }
+
+        if (
+          url ===
+          "https://api.github.com/repos/powerformer/looper/releases/latest"
+        ) {
+          return new Response(
+            JSON.stringify({ tag_name: "v0.4.0", assets: [] }),
+          );
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "", stderr: "not found", exitCode: 1 };
+        }
+        if (command === "looperd") {
+          return { stdout: "0.4.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      daemonInstallImpl: async () => ({
+        target: "darwin-arm64",
+        installPath: "/Users/tester/.looper/bin/looperd",
+        downloadedFrom: "https://example.invalid/looperd-darwin-arm64",
+        skipped: false,
+      }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(lines.join("\n")).toContain("previously using looperd");
+    expect(lines.join("\n")).toContain("Installed managed looperd 0.4.0");
+  });
+
+  test("allows retrying upgrade --daemon after a failed download", async () => {
+    const errors: string[] = [];
+    const lines: string[] = [];
+    let attempt = 0;
+
+    const deps = {
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async (input: string | URL | Request) => {
+        const url = String(input);
+
+        if (url.endsWith("/api/v1/status")) {
+          throw new Error("daemon offline");
+        }
+
+        if (
+          url ===
+          "https://api.github.com/repos/powerformer/looper/releases/latest"
+        ) {
+          return new Response(
+            JSON.stringify({ tag_name: "v0.5.0", assets: [] }),
+          );
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      runCommandImpl: async ({ command }: { command: string }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.4.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      daemonInstallImpl: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          throw new Error("temporary network failure");
+        }
+
+        return {
+          target: "darwin-arm64" as const,
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: "https://example.invalid/looperd-darwin-arm64",
+          skipped: false,
+        };
+      },
+    };
+
+    const firstExitCode = await runCli(["upgrade", "--daemon"], {
+      ...deps,
+      stderr: (line) => errors.push(line),
+    });
+    const secondExitCode = await runCli(["upgrade", "--daemon"], {
+      ...deps,
+      stdout: (line) => lines.push(line),
+    });
+
+    expect(firstExitCode).toBe(1);
+    expect(secondExitCode).toBe(0);
+    expect(errors.at(-1)).toContain(
+      "Failed to upgrade looperd: temporary network failure",
+    );
+    expect(lines.join("\n")).toContain("Upgraded looperd 0.4.0 → 0.5.0");
+  });
+
   test("starts daemon with installed binary and writes pid file", async () => {
     const lines: string[] = [];
     const writeCalls: Array<{ path: string; contents: string }> = [];

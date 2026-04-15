@@ -5,6 +5,7 @@ import {
   buildGitHubReleaseApiUrl,
   findLooperdReleaseAssets,
   findReleaseAssetByExactName,
+  resolveGitHubReleaseVersion,
   resolveLooperdReleaseAssetNames,
 } from "./daemon-release";
 
@@ -39,6 +40,11 @@ describe("daemon release helpers", () => {
     ).toBe(
       "https://api.github.com/repos/powerformer/looper/releases/tags/v0.2.0",
     );
+  });
+
+  test("normalizes release tag names into versions", () => {
+    expect(resolveGitHubReleaseVersion({ tag_name: "v0.2.0" })).toBe("0.2.0");
+    expect(resolveGitHubReleaseVersion({ tag_name: "0.3.0" })).toBe("0.3.0");
   });
 
   test("findReleaseAssetByExactName matches exact names only", () => {

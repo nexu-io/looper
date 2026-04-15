@@ -97,19 +97,19 @@
 
 ## Phase 8 - 顶层 `looper upgrade`
 
-- [ ] 设计 `looper upgrade`
-- [ ] 支持 `looper upgrade --check`
-- [ ] 支持 `looper upgrade --daemon`
-- [ ] Phase 1 先实现 `--check`
-- [ ] Phase 1 再实现 `--daemon`
-- [ ] 完整 `looper upgrade`（CLI + daemon）后置
-- [ ] 从 npm registry 获取最新 CLI 版本
-- [ ] 从 GitHub Releases REST API 获取最新 daemon 版本
-- [ ] daemon 未安装时，`looper upgrade` 自动走 install 路径
-- [ ] daemon 下载采用临时文件 + 校验 + 原子替换
-- [ ] CLI 自升级设计单独后置，不在当前 phase 强行落地
-- [ ] 明确 daemon 下载失败时的提示与恢复策略
-- [ ] 升级完成后默认只提示 `looper daemon restart`，不自动重启 daemon
+- [x] 设计 `looper upgrade`
+- [x] 支持 `looper upgrade --check`
+- [x] 支持 `looper upgrade --daemon`
+- [x] Phase 1 先实现 `--check`
+- [x] Phase 1 再实现 `--daemon`
+- [x] 完整 `looper upgrade`（CLI + daemon）后置
+- [x] 从 npm registry 获取最新 CLI 版本
+- [x] 从 GitHub Releases REST API 获取最新 daemon 版本
+- [x] daemon 未安装时，`looper upgrade` 自动走 install 路径
+- [x] daemon 下载采用临时文件 + 校验 + 原子替换
+- [x] CLI 自升级设计单独后置，不在当前 phase 强行落地
+- [x] 明确 daemon 下载失败时的提示与恢复策略
+- [x] 升级完成后默认只提示 `looper daemon restart`，不自动重启 daemon
 
 ## Phase 9 - README / docs 更新
 
@@ -136,9 +136,9 @@
 - [ ] 单测覆盖 migration 内嵌化逻辑
 - [ ] 单测覆盖 daemon install 下载与平台识别逻辑
 - [ ] 单测覆盖 daemon start / restart 的主要分支
-- [ ] 单测覆盖 `looper upgrade --check` 的主要分支
-- [ ] 单测覆盖 `looper upgrade --daemon` 的主要分支
-- [ ] 单测覆盖升级失败后的可重试行为
+- [x] 单测覆盖 `looper upgrade --check` 的主要分支
+- [x] 单测覆盖 `looper upgrade --daemon` 的主要分支
+- [x] 单测覆盖升级失败后的可重试行为
 - [ ] 验证 `npm install -g @powerformer/looper` 后 CLI 正常工作
 - [ ] 验证手动下载或自动下载的 `looperd` binary 可启动
 - [ ] 验证 `looper status` / `looper daemon status` 在新安装模型下工作正常

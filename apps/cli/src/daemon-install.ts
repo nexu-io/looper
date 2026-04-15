@@ -1,4 +1,5 @@
-import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -21,6 +22,8 @@ export interface DaemonInstallFs {
   writeFileImpl: typeof writeFile;
   chmodImpl: typeof chmod;
   statImpl: typeof stat;
+  renameImpl: typeof rename;
+  removeFileImpl: typeof rm;
 }
 
 export async function installLooperdBinary(options: {
@@ -42,6 +45,8 @@ export async function installLooperdBinary(options: {
   const writeFileImpl = options.fs?.writeFileImpl ?? writeFile;
   const chmodImpl = options.fs?.chmodImpl ?? chmod;
   const statImpl = options.fs?.statImpl ?? stat;
+  const renameImpl = options.fs?.renameImpl ?? rename;
+  const removeFileImpl = options.fs?.removeFileImpl ?? rm;
 
   if (!options.force) {
     const exists = await fileExists(statImpl, installPath);
@@ -66,7 +71,7 @@ export async function installLooperdBinary(options: {
     options.fetchImpl,
     releaseUrl,
   );
-  const { binary } = findLooperdReleaseAssets({
+  const { binary, checksum } = findLooperdReleaseAssets({
     release: releasePayload,
     target,
   });
@@ -83,10 +88,41 @@ export async function installLooperdBinary(options: {
     );
   }
 
+  const checksumResponse = await options.fetchImpl(
+    checksum.browser_download_url,
+    {
+      headers: {
+        "user-agent": "looper-cli",
+        accept: "text/plain",
+      },
+    },
+  );
+  if (!checksumResponse.ok) {
+    throw new Error(
+      `Failed to download looperd checksum from ${checksum.browser_download_url} (status ${checksumResponse.status} ${checksumResponse.statusText})`,
+    );
+  }
+
   const binaryBytes = new Uint8Array(await binaryResponse.arrayBuffer());
+  const expectedChecksum = parseChecksum(await checksumResponse.text());
+  const actualChecksum = createHash("sha256").update(binaryBytes).digest("hex");
+  if (actualChecksum !== expectedChecksum) {
+    throw new Error(
+      `Downloaded looperd checksum mismatch: expected ${expectedChecksum}, received ${actualChecksum}`,
+    );
+  }
+
   await mkdirImpl(installDir, { recursive: true });
-  await writeFileImpl(installPath, binaryBytes);
-  await chmodImpl(installPath, 0o755);
+  const tempInstallPath = `${installPath}.new`;
+
+  try {
+    await writeFileImpl(tempInstallPath, binaryBytes);
+    await chmodImpl(tempInstallPath, 0o755);
+    await renameImpl(tempInstallPath, installPath);
+  } catch (error) {
+    await removeTempInstallFile(removeFileImpl, tempInstallPath);
+    throw error;
+  }
 
   return {
     target,
@@ -138,8 +174,30 @@ async function fetchReleaseMetadata(
   }
 
   return {
+    tag_name:
+      typeof payload.tag_name === "string" ? payload.tag_name : undefined,
     assets: payload.assets,
   };
+}
+
+function parseChecksum(value: string): string {
+  const hash = value.trim().split(/\s+/)[0]?.toLowerCase();
+  if (!hash || !/^[a-f0-9]{64}$/.test(hash)) {
+    throw new Error("Downloaded looperd checksum is invalid");
+  }
+
+  return hash;
+}
+
+async function removeTempInstallFile(
+  removeFileImpl: typeof rm,
+  filePath: string,
+): Promise<void> {
+  try {
+    await removeFileImpl(filePath, { force: true });
+  } catch {
+    // best effort cleanup for retryable installs/upgrades
+  }
 }
 
 async function fileExists(

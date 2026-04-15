@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import cliPackageJson from "../package.json";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { arch as osArch, homedir, platform as osPlatform } from "node:os";
@@ -16,7 +17,14 @@ import {
   installLooperdBinary,
   type DaemonInstallResult,
 } from "./daemon-install";
+import {
+  buildGitHubReleaseApiUrl,
+  resolveGitHubReleaseVersion,
+} from "./daemon-release";
 import { printJson, printSection, printTable } from "./format";
+
+const CLI_PACKAGE_NAME = cliPackageJson.name;
+const CURRENT_CLI_VERSION = cliPackageJson.version;
 
 type Writer = (line: string) => void;
 
@@ -50,6 +58,7 @@ interface CliDeps {
     arch: string;
     homeDir: string;
     force: boolean;
+    tag?: string;
   }) => Promise<DaemonInstallResult>;
   writeFileImpl?: (path: string, contents: string) => Promise<void>;
   mkdirImpl?: (path: string, options: { recursive: boolean }) => Promise<void>;
@@ -87,6 +96,7 @@ interface CliContext {
     arch: string;
     homeDir: string;
     force: boolean;
+    tag?: string;
   }) => Promise<DaemonInstallResult>;
   writeFileImpl: (path: string, contents: string) => Promise<void>;
   mkdirImpl: (path: string, options: { recursive: boolean }) => Promise<void>;
@@ -273,13 +283,14 @@ export async function runCli(
           timeoutMs,
         }),
       fetchImpl,
-      installDaemon: async ({ platform, arch, homeDir, force }) =>
+      installDaemon: async ({ platform, arch, homeDir, force, tag }) =>
         (deps.daemonInstallImpl ?? installLooperdBinary)({
           fetchImpl,
           platform,
           arch,
           homeDir,
           force,
+          tag,
         }),
       writeFileImpl: async (path, contents) =>
         (deps.writeFileImpl ?? writeFile)(path, contents),
@@ -362,6 +373,8 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       context.showHelp("daemon");
       return;
+    case "upgrade":
+      return runUpgrade(context);
     case "loop":
       if (subcommand === "list") {
         return runLoopList(context);
@@ -463,6 +476,16 @@ function createCli(runtime: CliRuntime) {
     .example((name) => `  $ ${name} daemon logs --lines 50`)
     .action(async (args, options) => {
       await dispatch(createContext(runtime, ["daemon", ...args], options));
+    });
+
+  cli
+    .command("upgrade", "Check or upgrade Looper installations")
+    .option("--check", "Check available CLI and daemon updates")
+    .option("--daemon", "Install or upgrade the managed daemon binary")
+    .example((name) => `  $ ${name} upgrade --check`)
+    .example((name) => `  $ ${name} upgrade --daemon`)
+    .action(async (options) => {
+      await dispatch(createContext(runtime, ["upgrade"], options));
     });
 
   cli
@@ -887,6 +910,299 @@ async function runDaemonInstall(context: CliContext) {
   } catch (error) {
     throw new Error(`Failed to install looperd: ${formatError(error)}`);
   }
+}
+
+interface DaemonVersionState {
+  version: string;
+  source: "api" | "installed-binary" | "path-binary";
+  binaryPath: string | null;
+}
+
+interface UpgradeCheckSummary {
+  cli: {
+    currentVersion: string;
+    latestVersion: string;
+    updateAvailable: boolean;
+  };
+  daemon: {
+    currentVersion: string | null;
+    latestVersion: string;
+    updateAvailable: boolean;
+    installed: boolean;
+    source: DaemonVersionState["source"] | "not-installed";
+    binaryPath: string | null;
+  };
+}
+
+interface LatestDaemonReleaseInfo {
+  version: string;
+  tag: string;
+}
+
+async function runUpgrade(context: CliContext) {
+  const check = hasFlag(context.args, "check");
+  const daemonOnly = hasFlag(context.args, "daemon");
+
+  if (check && daemonOnly) {
+    throw new Error("--check and --daemon cannot be combined");
+  }
+
+  if (check) {
+    const summary = await collectUpgradeCheckSummary(context);
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, summary);
+    }
+
+    return printUpgradeSummary(context, summary);
+  }
+
+  if (daemonOnly) {
+    return runDaemonUpgrade(context);
+  }
+
+  throw new Error(
+    "Full `looper upgrade` (CLI + daemon) is not implemented yet. Use `looper upgrade --check` or `looper upgrade --daemon`.",
+  );
+}
+
+async function runDaemonUpgrade(context: CliContext) {
+  const current = await detectDaemonVersionState(context);
+  const latestRelease = await fetchLatestDaemonRelease(context);
+  const homeDir =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+
+  const needsInstall = current === null || current.source === "path-binary";
+  const needsUpgrade =
+    needsInstall ||
+    normalizeVersion(current.version) !==
+      normalizeVersion(latestRelease.version);
+
+  if (!needsUpgrade) {
+    const payload = {
+      changed: false,
+      currentVersion: current.version,
+      latestVersion: latestRelease.version,
+      binaryPath: current.binaryPath,
+    };
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, payload);
+    }
+
+    context.write(`looperd is already up to date (${current.version})`);
+    if (current.binaryPath) {
+      context.write(`Managed binary: ${current.binaryPath}`);
+    }
+    return;
+  }
+
+  let result: DaemonInstallResult;
+  try {
+    result = await context.installDaemon({
+      platform: osPlatform(),
+      arch: osArch(),
+      homeDir,
+      force: true,
+      tag: latestRelease.tag,
+    });
+  } catch (error) {
+    throw new Error(`Failed to upgrade looperd: ${formatError(error)}`);
+  }
+
+  const payload = {
+    changed: true,
+    previousVersion: current?.version ?? null,
+    latestVersion: latestRelease.version,
+    installPath: result.installPath,
+    downloadedFrom: result.downloadedFrom,
+    skipped: result.skipped,
+  };
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, payload);
+  }
+
+  if (current === null) {
+    context.write(
+      `Installed looperd ${latestRelease.version} to ${result.installPath}`,
+    );
+  } else if (current.source === "path-binary") {
+    context.write(
+      `Installed managed looperd ${latestRelease.version} to ${result.installPath} (previously using ${current.binaryPath ?? "$PATH"})`,
+    );
+  } else {
+    context.write(
+      `Upgraded looperd ${current.version} → ${latestRelease.version} at ${result.installPath}`,
+    );
+  }
+  if (result.downloadedFrom) {
+    context.write(`Downloaded from ${result.downloadedFrom}`);
+  }
+  context.write("Restart the daemon to use the new version:");
+  context.write("  looper daemon restart");
+}
+
+async function collectUpgradeCheckSummary(
+  context: CliContext,
+): Promise<UpgradeCheckSummary> {
+  const [latestCliVersion, latestDaemonVersion, currentDaemon] =
+    await Promise.all([
+      fetchLatestCliVersion(context),
+      fetchLatestDaemonRelease(context).then((release) => release.version),
+      detectDaemonVersionState(context),
+    ]);
+
+  return {
+    cli: {
+      currentVersion: CURRENT_CLI_VERSION,
+      latestVersion: latestCliVersion,
+      updateAvailable:
+        normalizeVersion(CURRENT_CLI_VERSION) !==
+        normalizeVersion(latestCliVersion),
+    },
+    daemon: {
+      currentVersion: currentDaemon?.version ?? null,
+      latestVersion: latestDaemonVersion,
+      updateAvailable:
+        currentDaemon === null ||
+        normalizeVersion(currentDaemon.version) !==
+          normalizeVersion(latestDaemonVersion),
+      installed: currentDaemon?.source === "installed-binary",
+      source: currentDaemon?.source ?? "not-installed",
+      binaryPath: currentDaemon?.binaryPath ?? null,
+    },
+  };
+}
+
+function printUpgradeSummary(
+  context: CliContext,
+  summary: UpgradeCheckSummary,
+): void {
+  printSection(context.write, "Upgrade check", [
+    ["cliCurrent", summary.cli.currentVersion],
+    ["cliLatest", summary.cli.latestVersion],
+    ["cliUpdateAvailable", summary.cli.updateAvailable],
+    ["daemonCurrent", summary.daemon.currentVersion ?? "not installed"],
+    ["daemonLatest", summary.daemon.latestVersion],
+    ["daemonUpdateAvailable", summary.daemon.updateAvailable],
+    ["daemonSource", summary.daemon.source],
+    ["daemonBinaryPath", summary.daemon.binaryPath ?? "-"],
+  ]);
+}
+
+async function fetchLatestCliVersion(context: CliContext): Promise<string> {
+  const packageName = encodeURIComponent(CLI_PACKAGE_NAME);
+  const response = await context.fetchImpl(
+    `https://registry.npmjs.org/${packageName}/latest`,
+    {
+      headers: {
+        accept: "application/json",
+        "user-agent": "looper-cli",
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch npm metadata for ${CLI_PACKAGE_NAME} (status ${response.status} ${response.statusText})`,
+    );
+  }
+
+  const payload = (await response.json()) as { version?: unknown };
+  if (
+    typeof payload.version !== "string" ||
+    payload.version.trim().length === 0
+  ) {
+    throw new Error(`npm metadata for ${CLI_PACKAGE_NAME} is missing version`);
+  }
+
+  return payload.version;
+}
+
+async function fetchLatestDaemonRelease(
+  context: CliContext,
+): Promise<LatestDaemonReleaseInfo> {
+  const response = await context.fetchImpl(
+    buildGitHubReleaseApiUrl({ owner: "powerformer", repo: "looper" }),
+    {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "looper-cli",
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch latest looperd release metadata (status ${response.status} ${response.statusText})`,
+    );
+  }
+
+  const payload = (await response.json()) as { tag_name?: string };
+
+  return {
+    version: resolveGitHubReleaseVersion(payload),
+    tag: payload.tag_name ?? `v${resolveGitHubReleaseVersion(payload)}`,
+  };
+}
+
+async function detectDaemonVersionState(
+  context: CliContext,
+): Promise<DaemonVersionState | null> {
+  try {
+    const status =
+      await context.client.get<Record<string, unknown>>("/api/v1/status");
+    const runningVersion = (status.service as { version?: unknown } | undefined)
+      ?.version;
+    if (
+      typeof runningVersion === "string" &&
+      runningVersion.trim().length > 0
+    ) {
+      return {
+        version: runningVersion,
+        source: "api",
+        binaryPath: null,
+      };
+    }
+  } catch (error) {
+    if (!(error instanceof CliApiError)) {
+      throw error;
+    }
+  }
+
+  const resolvedBinary = await resolveDaemonBinary(context);
+  if (!resolvedBinary) {
+    return null;
+  }
+
+  try {
+    const result = await context.runCommand({
+      command: resolvedBinary.path,
+      args: ["--version"],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const version = result.stdout.trim();
+    if (!version) {
+      return null;
+    }
+
+    return {
+      version,
+      source:
+        resolvedBinary.source === "installed"
+          ? "installed-binary"
+          : "path-binary",
+      binaryPath: resolvedBinary.path,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeVersion(value: string): string {
+  return value.trim().replace(/^v/, "");
 }
 
 async function readInstalledDaemonVersion(
