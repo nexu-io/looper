@@ -1580,9 +1580,11 @@ export class FixerLoopRunner {
 
     const nowIso = this.nowIso();
     if (existing) {
+      const shouldPreserveRunningState =
+        existing.status === "running" && this.hasActiveRunningRun(existing.id);
       const updated = {
         ...existing,
-        status: existing.status === "running" ? existing.status : "queued",
+        status: shouldPreserveRunningState ? "running" : "queued",
         nextRunAt: nowIso,
         updatedAt: nowIso,
       };
@@ -1609,6 +1611,12 @@ export class FixerLoopRunner {
     };
     this.options.store.loops.upsert(loop);
     return { record: loop, created: true };
+  }
+
+  private hasActiveRunningRun(loopId: string): boolean {
+    return this.options.store.runs
+      .listByLoop(loopId)
+      .some((run) => run.status === "running");
   }
 
   private hasActivePrLock(repo: string, prNumber: number): boolean {

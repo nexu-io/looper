@@ -1096,6 +1096,119 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("reuses stale running fixer loop as queued when no run is active", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      id: "fixer_loop_stale_running",
+      seq: 1,
+      projectId: "project_1",
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github: new FakeGitHubGateway({
+        views: [{ comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] }],
+      }),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(
+      fixture.store.loops.getById("fixer_loop_stale_running")?.status,
+    ).toBe("queued");
+
+    fixture.store.close();
+  });
+
+  test("preserves running fixer loop when a running run exists", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      id: "fixer_loop_active_running",
+      seq: 1,
+      projectId: "project_1",
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    fixture.store.runs.upsert({
+      id: "fixer_run_active",
+      loopId: "fixer_loop_active_running",
+      status: "running",
+      currentStep: "repair",
+      lastCompletedStep: "prepare-worktree",
+      checkpointJson: JSON.stringify({ resumePolicy: "replay_step" }),
+      summary: null,
+      errorMessage: null,
+      startedAt: nowIso,
+      lastHeartbeatAt: nowIso,
+      endedAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github: new FakeGitHubGateway({
+        views: [{ comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] }],
+      }),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(
+      fixture.store.loops.getById("fixer_loop_active_running")?.status,
+    ).toBe("running");
+
+    fixture.store.close();
+  });
+
   test("allows one extra reconcile pass when validation generates changes", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({

@@ -1174,9 +1174,11 @@ export class ReviewerLoopRunner {
 
     const nowIso = this.nowIso();
     if (existing) {
+      const shouldPreserveRunningState =
+        existing.status === "running" && this.hasActiveRunningRun(existing.id);
       const updated = {
         ...existing,
-        status: existing.status === "running" ? existing.status : "queued",
+        status: shouldPreserveRunningState ? "running" : "queued",
         nextRunAt: nowIso,
         updatedAt: nowIso,
       };
@@ -1222,14 +1224,22 @@ export class ReviewerLoopRunner {
     created: boolean;
   } {
     const nowIso = this.nowIso();
+    const shouldPreserveRunningState =
+      loop.status === "running" && this.hasActiveRunningRun(loop.id);
     const updated = {
       ...loop,
-      status: loop.status === "running" ? loop.status : "queued",
+      status: shouldPreserveRunningState ? "running" : "queued",
       nextRunAt: nowIso,
       updatedAt: nowIso,
     };
     this.options.store.loops.upsert(updated);
     return { record: updated, created: false };
+  }
+
+  private hasActiveRunningRun(loopId: string): boolean {
+    return this.options.store.runs
+      .listByLoop(loopId)
+      .some((run) => run.status === "running");
   }
 
   private listFollowUpLoops(projectId: string, repo: string): LoopRecord[] {

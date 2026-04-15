@@ -1017,6 +1017,119 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("reuses stale running loop as queued when no run is active", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const nowIso = fixture.now.toISOString();
+
+    fixture.store.loops.upsert({
+      id: "loop_stale_running",
+      seq: 1,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(fixture.store.loops.getById("loop_stale_running")?.status).toBe(
+      "queued",
+    );
+
+    fixture.store.close();
+  });
+
+  test("preserves running loop when a running run exists", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const nowIso = fixture.now.toISOString();
+
+    fixture.store.loops.upsert({
+      id: "loop_active_running",
+      seq: 1,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    fixture.store.runs.upsert({
+      id: "run_active",
+      loopId: "loop_active_running",
+      status: "running",
+      currentStep: "review",
+      lastCompletedStep: "snapshot",
+      checkpointJson: JSON.stringify({ resumePolicy: "replay_step" }),
+      summary: null,
+      errorMessage: null,
+      startedAt: nowIso,
+      lastHeartbeatAt: nowIso,
+      endedAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(fixture.store.loops.getById("loop_active_running")?.status).toBe(
+      "running",
+    );
+
+    fixture.store.close();
+  });
+
   test("does not enqueue discovery work for PRs already reviewed at the same head", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
