@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { createMigrationRunner } from "./migrate";
+import { SQLITE_MIGRATIONS } from "./migrations.gen";
 
 const cleanupPaths: string[] = [];
 
@@ -32,6 +33,34 @@ async function createFixture(prefix: string) {
 }
 
 describe("createMigrationRunner", () => {
+  test("uses embedded migrations by default when migrationsDir is not provided", () => {
+    const db = new Database(":memory:", { create: true });
+    const migrationIds = SQLITE_MIGRATIONS.map((migration) => migration.id);
+    const runner = createMigrationRunner(db, {
+      now: () => new Date("2026-04-11T10:20:30.000Z"),
+    });
+
+    expect(runner.status().available.map((migration) => migration.id)).toEqual(
+      migrationIds,
+    );
+    expect(runner.status().applied).toEqual([]);
+    expect(runner.status().pending.map((migration) => migration.id)).toEqual(
+      migrationIds,
+    );
+
+    const result = runner.runPending();
+    expect(result.appliedIds).toEqual(migrationIds);
+    expect(result.skippedIds).toEqual([]);
+
+    const status = runner.status();
+    expect(status.applied.map((migration) => migration.id)).toEqual(
+      migrationIds,
+    );
+    expect(status.pending).toEqual([]);
+
+    db.close(false);
+  });
+
   test("lists and runs pending migrations with a backup", async () => {
     const fixture = await createFixture("looper-migrate-");
 

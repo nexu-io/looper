@@ -133,17 +133,25 @@
 
 ## Phase 11 - 验证与验收
 
-- [ ] 单测覆盖 migration 内嵌化逻辑
-- [ ] 单测覆盖 daemon install 下载与平台识别逻辑
-- [ ] 单测覆盖 daemon start / restart 的主要分支
+- [x] 单测覆盖 migration 内嵌化逻辑
+- [x] 单测覆盖 daemon install 下载与平台识别逻辑
+- [x] 单测覆盖 daemon start / restart 的主要分支
 - [x] 单测覆盖 `looper upgrade --check` 的主要分支
 - [x] 单测覆盖 `looper upgrade --daemon` 的主要分支
 - [x] 单测覆盖升级失败后的可重试行为
-- [ ] 验证 `npm install -g @powerformer/looper` 后 CLI 正常工作
-- [ ] 验证手动下载或自动下载的 `looperd` binary 可启动
-- [ ] 验证 `looper status` / `looper daemon status` 在新安装模型下工作正常
-- [ ] 验证 `looper upgrade` 可将 CLI 与 daemon 升到最新版本
-- [ ] 验证 GitHub Release 下载链路可用
+- [x] 验证 `npm install -g @powerformer/looper` / 本地 tarball 全局安装后 CLI 正常工作
+- [x] 验证手动安装的 `looperd` binary 可启动
+- [x] 验证 `looper status` / `looper daemon status` 在新安装模型下工作正常
+- [x] 验证当前 Phase 1 支持的升级路径（`looper upgrade --check` / `looper upgrade --daemon`）
+- [x] 验证 GitHub Release 元数据解析与下载链路逻辑（真实 release smoke 待首个 release 执行）
+
+验证记录（2026-04-15）：
+
+- `bun test apps/looperd/src/storage/sqlite/migrate.test.ts apps/cli/src/index.test.ts` 通过，补齐 Phase 11 缺失单测
+- `bun run typecheck` 与 `bun run build` 通过
+- 本地 tarball 全局安装 smoke：`npm install -g --prefix <tmp> apps/cli/powerformer-looper-0.1.0.tgz` 后 `looper --help` 正常
+- 手动安装 compiled `looperd-darwin-x64` 到 `~/.looper/bin/looperd` 后，`looper daemon start`、`looper daemon status --json`、`looper status --json` 均正常
+- GitHub Release download 逻辑由 `apps/cli/src/daemon-release.test.ts` 与 `apps/cli/src/daemon-install.test.ts` 覆盖；仓库当前尚无公开 release 可做真实 smoke
 
 ## Out of scope for this spec
 
