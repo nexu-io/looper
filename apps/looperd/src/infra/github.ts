@@ -284,10 +284,7 @@ export class GhCliGitHubGateway {
       author: extractAuthor(parsed.author),
       reviewRequests: extractReviewRequestLogins(parsed.reviewRequests),
       hasConflicts: asOptionalString(parsed.mergeStateStatus) === "DIRTY",
-      comments:
-        reviewThreads.length > 0
-          ? reviewThreads
-          : asArrayValue(parsed.comments),
+      comments: reviewThreads,
       reviews: asArrayValue(parsed.reviews),
       checks: asArrayValue(parsed.statusCheckRollup),
     };

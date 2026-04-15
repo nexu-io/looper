@@ -203,6 +203,42 @@ esac
     ).rejects.toBeInstanceOf(ReviewThreadNotFoundError);
   });
 
+  test("does not treat plain pull request comments as review threads", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-gh-"));
+    cleanupPaths.push(rootDir);
+
+    const scriptPath = join(rootDir, "gh");
+    await writeFile(
+      scriptPath,
+      `#!/bin/sh
+case "$*" in
+  "pr view"*)
+    printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}'
+    ;;
+  *"reviewThreads"*)
+    printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`,
+    );
+    await chmod(scriptPath, 0o755);
+
+    const gateway = new GhCliGitHubGateway({
+      ghPath: scriptPath,
+      cwd: rootDir,
+    });
+
+    const detail = await gateway.viewPullRequest({
+      repo: "acme/looper",
+      prNumber: 42,
+    });
+
+    expect(detail.comments).toEqual([]);
+  });
+
   test("surfaces permission errors when resolving review thread", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "looper-gh-"));
     cleanupPaths.push(rootDir);
