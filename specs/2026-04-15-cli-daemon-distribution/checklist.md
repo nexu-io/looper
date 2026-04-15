@@ -2,15 +2,15 @@
 
 ## Phase 0 - 方向先定死
 
-- [ ] 明确主分发策略采用 `npm CLI + compiled daemon`
-- [ ] 明确 `@powerformer/looper` 只承载 `looper` CLI
-- [ ] 明确 `looperd` 不再作为 npm 包内默认安装的 daemon 形态
-- [ ] 明确 `looper` single binary 仅作为可选发布方向，不作为主路径
-- [ ] 明确 Phase 1 不实现 Homebrew / 自更新 / Windows service
-- [ ] 明确顶层升级入口采用 `looper upgrade`
-- [ ] 明确 `looper daemon upgrade` 不作为主 UX
-- [ ] 明确 CLI 与 daemon 共享同一版本号，并从同一 git tag 发布
-- [ ] 明确当前一期只支持 macOS，不支持 Linux
+- [x] 明确主分发策略采用 `npm CLI + compiled daemon`
+- [x] 明确 `@powerformer/looper` 只承载 `looper` CLI
+- [x] 明确 `looperd` 不再作为 npm 包内默认安装的 daemon 形态
+- [x] 明确 `looper` single binary 仅作为可选发布方向，不作为主路径
+- [x] 明确 Phase 1 不实现 Homebrew / 自更新 / Windows service
+- [x] 明确顶层升级入口采用 `looper upgrade`
+- [x] 明确 `looper daemon upgrade` 不作为主 UX
+- [x] 明确 CLI 与 daemon 共享同一版本号，并从同一 git tag 发布
+- [x] 明确当前一期只支持 macOS，不支持 Linux
 
 ## Phase 1 - 收回 npm 包职责边界
 

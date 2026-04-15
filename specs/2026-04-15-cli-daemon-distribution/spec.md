@@ -39,7 +39,7 @@
 
 1. 本次不把 `looperd` 全量迁移到 Node 兼容运行时。
 2. 本次不要求 `looper` CLI 也必须变成 single binary。
-3. 本次不要求一次性实现 auto-update、Homebrew、Windows service 等完整安装生态。
+3. **Phase 1 明确不实现** auto-update、Homebrew、Windows service 等完整安装生态。
 
 ## 2.1 执行分期约定
 
@@ -239,12 +239,16 @@ bun build --compile src/index.ts --outfile looperd
 - `darwin-arm64`
 - `darwin-x64`
 
-当前阶段仅覆盖：
+当前一期仅覆盖：
 
 - `darwin-arm64`
 - `darwin-x64`
 
 Linux 不进入当前实施范围。
+
+换言之：
+
+> **当前一期只支持 macOS，不支持 Linux。**
 
 ## 6.3 不采用“单一 universal binary”假设
 
