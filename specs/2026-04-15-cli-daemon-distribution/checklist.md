@@ -59,7 +59,7 @@
 
 > release workflow 是 compile 可用性的权威验证点；本地 compile 失败不能单独作为否定该分发模型的依据。
 
-- [ ] 增加 tag 驱动的 release workflow
+- [x] 增加 tag 驱动的 release workflow
 - [ ] matrix 构建 macOS 双架构 `looperd` binary
 - [ ] 第一批 workflow 至少覆盖 `darwin-arm64`
 - [ ] 第一批 workflow 至少覆盖 `darwin-x64`

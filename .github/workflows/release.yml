@@ -1,0 +1,204 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: write
+
+env:
+  BUN_VERSION: 1.3.12
+  NODE_VERSION: 20
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    outputs:
+      package-version: ${{ steps.package-version.outputs.value }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Read CLI package version
+        id: package-version
+        run: |
+          package_version=$(bun --eval 'const pkg = await Bun.file("apps/cli/package.json").json(); console.log(pkg.version);')
+          echo "value=${package_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches CLI package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ steps.package-version.outputs.value }}
+        run: |
+          expected_tag="v${PACKAGE_VERSION}"
+          if [ "$TAG_NAME" != "$expected_tag" ]; then
+            echo "Release tag ${TAG_NAME} does not match apps/cli/package.json version ${PACKAGE_VERSION}." >&2
+            exit 1
+          fi
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+  create-draft-release:
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Looper ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+
+  build-looperd:
+    needs:
+      - prepare
+      - create-draft-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Phase 1 intentionally publishes macOS artifacts only.
+          - target: darwin-arm64
+            runner: macos-14
+            artifact-name: looperd-darwin-arm64
+          - target: darwin-x64
+            runner: macos-13
+            artifact-name: looperd-darwin-x64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile looperd for ${{ matrix.target }}
+        env:
+          LOOPER_FORCE_COMPILE: "1"
+          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
+        run: |
+          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          bun run --cwd apps/looperd compile:${{ matrix.target }}
+
+      - name: Verify compiled binary version
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.package-version }}
+        run: |
+          artifact_path="apps/looperd/dist/compiled/${{ matrix.artifact-name }}"
+          actual_version=$("$artifact_path" --version)
+          if [ "$actual_version" != "$EXPECTED_VERSION" ]; then
+            echo "Expected $artifact_path --version to print ${EXPECTED_VERSION}, got ${actual_version}." >&2
+            exit 1
+          fi
+
+      - name: Generate and verify SHA-256 checksum
+        working-directory: apps/looperd/dist/compiled
+        run: |
+          shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
+          shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.target }}
+          path: |
+            apps/looperd/dist/compiled/${{ matrix.artifact-name }}
+            apps/looperd/dist/compiled/${{ matrix.artifact-name }}.sha256
+
+  publish-cli:
+    needs:
+      - prepare
+      - create-draft-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Publish CLI to npm
+        working-directory: apps/cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  publish-release:
+    needs:
+      - prepare
+      - build-looperd
+      - publish-cli
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download compiled artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify predictable asset names
+        run: |
+          test -f release-assets/looperd-darwin-arm64
+          test -f release-assets/looperd-darwin-arm64.sha256
+          test -f release-assets/looperd-darwin-x64
+          test -f release-assets/looperd-darwin-x64.sha256
+
+      - name: Publish GitHub release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Looper ${{ github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            release-assets/looperd-darwin-arm64
+            release-assets/looperd-darwin-arm64.sha256
+            release-assets/looperd-darwin-x64
+            release-assets/looperd-darwin-x64.sha256
