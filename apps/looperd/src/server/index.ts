@@ -893,7 +893,9 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
     context.store.queue
       .list()
       .flatMap((item) =>
-        item.status === "queued" && item.loopId ? [item.loopId] : [],
+        (item.status === "queued" || item.status === "running") && item.loopId
+          ? [item.loopId]
+          : [],
       ),
   );
   const queuedLoops = context.store.loops

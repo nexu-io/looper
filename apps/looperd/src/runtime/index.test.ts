@@ -1303,6 +1303,23 @@ describe("createLooperdRuntime", () => {
       createdAt: now,
       updatedAt: now,
     });
+    seedStore.loops.upsert({
+      id: "loop_claimed",
+      seq: 6,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:47",
+      repo: "acme/looper",
+      prNumber: 47,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
     seedStore.queue.upsert({
       id: "queue_legit",
       projectId: "project_1",
@@ -1329,6 +1346,32 @@ describe("createLooperdRuntime", () => {
       createdAt: now,
       updatedAt: now,
     });
+    seedStore.queue.upsert({
+      id: "queue_claimed",
+      projectId: "project_1",
+      loopId: "loop_claimed",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:47",
+      repo: "acme/looper",
+      prNumber: 47,
+      dedupeKey: "worker:acme/looper:47",
+      priority: 2,
+      status: "running",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: "executor_1",
+      claimedAt: now,
+      startedAt: now,
+      finishedAt: null,
+      lockKey: "worker:acme/looper:47",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
     seedStore.close();
 
     const runtime = createLooperdRuntime({
@@ -1346,8 +1389,12 @@ describe("createLooperdRuntime", () => {
     });
     verifyStore.initialize();
 
-    expect(verifyStore.loops.getById("loop_stale_failed")?.status).toBe("failed");
-    expect(verifyStore.loops.getById("loop_stale_failed")?.nextRunAt).toBeNull();
+    expect(verifyStore.loops.getById("loop_stale_failed")?.status).toBe(
+      "failed",
+    );
+    expect(
+      verifyStore.loops.getById("loop_stale_failed")?.nextRunAt,
+    ).toBeNull();
     expect(verifyStore.loops.getById("loop_stale_success")?.status).toBe(
       "completed",
     );
@@ -1358,6 +1405,7 @@ describe("createLooperdRuntime", () => {
       "failed",
     );
     expect(verifyStore.loops.getById("loop_legit")?.status).toBe("queued");
+    expect(verifyStore.loops.getById("loop_claimed")?.status).toBe("queued");
     expect(
       verifyStore.events
         .listByEntity("loop", "loop_stale_success")
@@ -1369,6 +1417,14 @@ describe("createLooperdRuntime", () => {
     expect(
       verifyStore.events
         .listByEntity("loop", "loop_legit")
+        .some(
+          (event) =>
+            event.eventType === "looperd.recovery.loop_queue_normalized",
+        ),
+    ).toBe(false);
+    expect(
+      verifyStore.events
+        .listByEntity("loop", "loop_claimed")
         .some(
           (event) =>
             event.eventType === "looperd.recovery.loop_queue_normalized",

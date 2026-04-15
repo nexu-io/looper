@@ -745,7 +745,11 @@ class BasicLooperdRuntime implements LooperdRuntime {
     const queuedLoopIds = new Set(
       this.store.queue
         .list()
-        .filter((item) => item.status === "queued" && item.loopId)
+        .filter(
+          (item) =>
+            (item.status === "queued" || item.status === "running") &&
+            item.loopId,
+        )
         .map((item) => item.loopId),
     );
     for (const loop of this.store.loops.list()) {
@@ -1238,13 +1242,8 @@ function normalizeStaleQueuedLoopStatus(
     case "success":
       return "completed";
     case "interrupted":
-      return "interrupted";
     case "running":
       return "interrupted";
-    case "failed":
-    case "cancelled":
-    case "parse_failed":
-    case "queued":
     default:
       return "failed";
   }
