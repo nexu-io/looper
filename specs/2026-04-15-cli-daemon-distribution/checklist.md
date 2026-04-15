@@ -61,7 +61,7 @@
 
 - [x] 增加 tag 驱动的 release workflow
 - [x] matrix 构建 macOS 双架构 `looperd` binary
-- [ ] 第一批 workflow 至少覆盖 `darwin-arm64`
+- [x] 第一批 workflow 至少覆盖 `darwin-arm64`
 - [ ] 第一批 workflow 至少覆盖 `darwin-x64`
 - [ ] macOS targets 使用 macOS runners 构建
 - [ ] 明确当前 workflow 不发布 Linux artifacts
