@@ -64,7 +64,7 @@
 - [x] 第一批 workflow 至少覆盖 `darwin-arm64`
 - [x] 第一批 workflow 至少覆盖 `darwin-x64`
 - [x] macOS targets 使用 macOS runners 构建
-- [ ] 明确当前 workflow 不发布 Linux artifacts
+- [x] 明确当前 workflow 不发布 Linux artifacts
 - [ ] 上传 GitHub Release artifacts
 - [ ] 生成 SHA-256 校验信息
 - [ ] Phase 1 先只依赖稳定 artifact 命名 + GitHub Releases API

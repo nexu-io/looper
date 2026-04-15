@@ -190,6 +190,13 @@ jobs:
           test -f release-assets/looperd-darwin-x64
           test -f release-assets/looperd-darwin-x64.sha256
 
+      - name: Verify Linux artifacts are not published in Phase 1
+        run: |
+          if find release-assets -maxdepth 1 \( -name '*linux*' -o -name '*.AppImage' \) | grep -q .; then
+            echo "Phase 1 release workflow must not publish Linux artifacts." >&2
+            exit 1
+          fi
+
       - name: Publish GitHub release with assets
         uses: softprops/action-gh-release@v2
         with:
