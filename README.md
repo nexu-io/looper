@@ -10,6 +10,13 @@ The current product is the daemon + CLI. The web app is not implemented yet.
 
 ## Requirements
 
+For the recommended install path:
+
+- macOS (`darwin-arm64` or `darwin-x64`)
+- Node.js/npm for installing `looper`
+
+For source development:
+
 - [Bun](https://bun.sh/) `1.3.12`
 - `git`
 - `gh`
@@ -19,38 +26,78 @@ The current product is the daemon + CLI. The web app is not implemented yet.
 
 ## Installation
 
-Install the CLI and daemon globally with npm:
+Looper now uses a split distribution model:
+
+- `looper` CLI is installed with npm
+- `looperd` daemon is installed separately as a managed macOS binary
+
+Linux daemon artifacts are not supported in this phase.
+
+### Install the CLI
 
 ```bash
 npm install -g @powerformer/looper
 ```
 
-The published package installs both:
+### Install the daemon
 
-- `looper` — CLI
-- `looperd` — daemon
-
-`looperd` runs on Bun, so keep Bun installed on the machine even if you install the package with npm.
-
-Then start the daemon:
+Recommended path:
 
 ```bash
-looperd
+looper daemon install
 ```
+
+This command:
+
+- detects the current macOS architecture
+- downloads the matching GitHub Release artifact
+- installs it to `~/.looper/bin/looperd`
+
+Current release binaries are unsigned. If macOS Gatekeeper blocks the first launch, you may need to allow the binary manually in System Settings.
+
+Manual fallback:
+
+- download the matching `looperd` release artifact yourself
+- place it at `~/.looper/bin/looperd` or somewhere on your `PATH`
+
+Daemon lookup order is fixed to `~/.looper/bin/looperd`, then `$PATH`.
+
+### Start the daemon
+
+```bash
+looper daemon start
+```
+
+Phase 1 process management is intentionally minimal. `looper daemon start` writes a pid file and launches the daemon, but it does not provide full background supervision.
+
+### Verify the install
 
 In another shell, verify the install and daemon connection:
 
 ```bash
 looper status
-```
-
-You can also inspect daemon health directly:
-
-```bash
 looper daemon status
 ```
 
-To develop from source, clone the repo and install workspace dependencies from the root:
+### Upgrade
+
+Unified upgrade entrypoint:
+
+```bash
+looper upgrade --check
+looper upgrade --daemon
+```
+
+Current phase behavior:
+
+- `looper upgrade --check` shows current/latest CLI and daemon versions
+- `looper upgrade --daemon` installs or upgrades the managed daemon binary
+- full `looper upgrade` for CLI + daemon together is not implemented yet
+- after a daemon upgrade, restart manually with `looper daemon restart`
+
+### From source
+
+If you want to develop from source, clone the repo and install workspace dependencies from the root:
 
 ```bash
 git clone https://github.com/powerformer/looper.git
@@ -58,7 +105,7 @@ cd looper
 bun install
 ```
 
-Then start the daemon:
+Then start the daemon from source:
 
 ```bash
 bun run dev
@@ -69,6 +116,18 @@ In another shell, run the CLI from source:
 ```bash
 bun run looper -- status
 ```
+
+### Compatibility and version policy
+
+- CLI and daemon are published from the same git tag and should normally share the same version.
+- Short-lived version skew is allowed when the HTTP API remains compatible; the current expectation is that newer CLI builds should keep working with same-major daemons.
+- Management endpoints stay under `/api/v1/*` in the current phase, and minor releases should not introduce breaking protocol changes.
+- If the daemon is running, the CLI reads its current version from `/api/v1/status`; otherwise it falls back to `looperd --version`.
+- `looper upgrade --check` reads the latest CLI version from npm registry metadata and the latest daemon version from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed binary version; if no binary is found, daemon current version is reported as not installed.
+- The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade --daemon` to update the managed binary.
+- Full major-version upgrade confirmation is not implemented in this phase because full `looper upgrade` is not implemented yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*`, and major-version upgrade confirmation can be added there.
+- If a breaking management API change is ever needed, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
+
 
 ## Workspace commands
 
@@ -117,15 +176,22 @@ For local development, use one of these options:
 - `bun run looper -- ps` — runs the CLI from source without rebuilding
 - add a shell alias such as `alias looper='bun /absolute/path/to/looper/apps/cli/src/index.ts'` if you want to type `looper ps` directly during development
 
-Published installs should continue to use the built `dist` entry declared in `apps/cli/package.json`.
+Published installs should use the built `dist` entry declared in `apps/cli/package.json` and install the daemon separately via `looper daemon install`.
 
 The CLI connects to `looperd` over HTTP and supports commands under:
 
+- `project list|add`
+- `ps`
+- `jump`
+- `logs`
+- `stop`
 - `status`
+- `plan`
 - `config show`
-- `daemon status|logs`
+- `daemon install|start|restart|status|logs`
 - `loop list|start|pause`
 - `review <pr> [--loop]`
+- `upgrade`
 - `work`
 - `pr list|show|status`
 - `run list`
@@ -165,7 +231,7 @@ Important defaults verified in code:
 - agent vendor: `opencode`
 - base branch: `main`
 
-Selected environment overrides:
+Selected looperd environment overrides:
 
 - `LOOPER_CONFIG`
 - `LOOPER_HOST`
@@ -183,7 +249,10 @@ Selected environment overrides:
 - `LOOPER_ALLOW_AUTO_COMMIT`
 - `LOOPER_ALLOW_AUTO_PUSH`
 - `LOOPER_ALLOW_AUTO_APPROVE`
-- `LOOPER_TOKEN`
+
+CLI-only environment override:
+
+- `LOOPER_TOKEN` — auth token sent by the CLI when talking to a token-protected daemon
 
 Selected CLI config flags:
 
@@ -206,8 +275,9 @@ Selected CLI config flags:
 - `looperd` fails fast on invalid config.
 - Runtime paths must be writable.
 - If `notifications.osascript.enabled` is `true`, `osascript` must resolve.
+- Managed daemon installs live at `~/.looper/bin/looperd`.
 - Default daemon-managed worktrees now live under `~/.looper/worktrees/<project-id>/`; if you still have legacy repo-local `.looper-worktrees/` entries, prune any stale `.git/worktrees/*/gitdir` references before deleting those old directories.
-- SQLite migrations are loaded from the built output when present, otherwise from source.
+- SQLite migrations are embedded in the daemon binary/build output for normal runtime execution; directory-based migration loading is only used in explicit test/injection paths.
 
 ## Development notes
 

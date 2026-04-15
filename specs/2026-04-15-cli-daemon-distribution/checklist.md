@@ -113,23 +113,23 @@
 
 ## Phase 9 - README / docs 更新
 
-- [ ] README 安装说明改成双通道模型
-- [ ] README 写清楚 CLI 通过 npm 安装
-- [ ] README 写清楚 daemon 通过 `looper daemon install` 或手动下载安装
-- [ ] README 写清楚 daemon 启动与验证流程
-- [ ] README 写清楚 `looper upgrade` 是统一升级入口
-- [ ] README 写清楚升级后需手动 `looper daemon restart`
-- [ ] `docs/configuration.md` 检查是否需要补充 binary 安装路径说明
-- [ ] 在相关文档中移除“daemon 需从源码启动”的过时描述
+- [x] README 安装说明改成双通道模型
+- [x] README 写清楚 CLI 通过 npm 安装
+- [x] README 写清楚 daemon 通过 `looper daemon install` 或手动下载安装
+- [x] README 写清楚 daemon 启动与验证流程
+- [x] README 写清楚 `looper upgrade` 是统一升级入口
+- [x] README 写清楚升级后需手动 `looper daemon restart`
+- [x] `docs/configuration.md` 检查是否需要补充 binary 安装路径说明
+- [x] 在相关文档中移除“daemon 需从源码启动”的过时描述
 
 ## Phase 10 - 兼容性与版本策略
 
-- [ ] 明确 CLI / daemon 的 API 兼容原则
-- [ ] 明确 `/api/v1` 在当前阶段不做破坏性变更
-- [ ] 明确 CLI 与 daemon 轻度版本错位时的支持策略
-- [ ] 明确 daemon 过旧时 CLI 是否给出升级提示
-- [ ] 明确 current/latest 版本信息的数据来源与降级策略
-- [ ] 明确 major version 升级是否需要 `--force` 或确认
+- [x] 明确 CLI / daemon 的 API 兼容原则
+- [x] 明确 `/api/v1` 在当前阶段不做破坏性变更
+- [x] 明确 CLI 与 daemon 轻度版本错位时的支持策略
+- [x] 明确 daemon 过旧时 CLI 是否给出升级提示
+- [x] 明确 current/latest 版本信息的数据来源与降级策略
+- [x] 明确 major version 升级是否需要 `--force` 或确认
 
 ## Phase 11 - 验证与验收
 

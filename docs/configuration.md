@@ -2,6 +2,16 @@
 
 This document explains how `looper` and `looperd` configuration works, where the config file lives, which values can be overridden by environment variables and CLI flags, and what a complete config file looks like.
 
+## Install layout notes
+
+For the packaged macOS install flow:
+
+- `looper` is installed via npm
+- `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
+- `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
+
+The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
+
 ## How config loading works
 
 `looperd` loads configuration in this order:
@@ -193,6 +203,8 @@ If these are omitted, `looperd` tries to detect them with `Bun.which()`. Startup
 - `logDir`: daemon log directory
 - `workingDirectory`: working directory used by the daemon
 - `environment`: extra environment variables for the daemon process
+
+Current packaged install and CLI management flows document `foreground` as the active Phase 1 path. `launchd` remains part of the configuration surface, but full launchd-oriented lifecycle management is not the primary documented install flow here.
 
 Defaults:
 
