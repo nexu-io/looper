@@ -620,6 +620,16 @@ CLI 与 daemon 在共享版本号前提下，仍应允许**短暂轻度版本错
 - 可以在 CI 中稳定生成 `looperd` binary
 - compile 产物至少能够成功执行 `--version`；完整 daemon 运行依赖 Phase 3 完成
 
+补充约定：
+
+> **compile 是 release artifact 能力，不是本地开发主流程依赖。**
+
+也就是说：
+
+1. `bun run dev` / `bun run build` / `bun run test` 不应依赖 `--compile`
+2. 本地已知存在 Bun `--compile` 环境问题时，可以在 compile 脚本中 fail-fast，避免静默产出不可用 binary
+3. 是否可发布，以 release workflow 在受控 macOS runner 上的 smoke test 为准，而不是要求每台开发机本地 compile 都成功
+
 ## 10.3 Phase 3：migration 内嵌化
 
 目标：让 `looperd` compile 产物真正自包含。
@@ -744,6 +754,20 @@ release workflow 除了“能跑完”，还应验证：
 4. Release 页面上的 artifact 名称符合 CLI 预期
 5. CLI 能根据最新 release 正确定位下载目标
 6. macOS target 使用 macOS runners，而不是假设从 Linux cross-compile 到 macOS
+
+补充说明：
+
+> **在 Phase 1/2，compiled daemon 的最终可用性判断应以后述 smoke validation 为准。**
+
+因此可以接受：
+
+1. 某些本地开发环境对 `bun --compile` 存在已知问题
+2. compile 脚本对这些环境直接报错并提示使用受控 runner 或显式 override
+
+但不能接受：
+
+1. 本地产出一个看似成功、实际执行会挂死的 binary
+2. release workflow 未验证 `looperd --version` 就发布 artifact
 
 ## 10.5 Phase 5：CLI 安装助手与升级命令
 

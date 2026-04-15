@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "../bootstrap/logger";
@@ -8,6 +8,7 @@ import {
   InvalidProjectIdError,
   createDefaultLooperConfig,
 } from "../config/index";
+import { LOOPERD_VERSION } from "../metadata";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -179,6 +180,10 @@ describe("createLooperdApi", () => {
     const statusBody = (await statusResponse.json()) as {
       ok: boolean;
       data: {
+        service: {
+          version: string;
+          binary: { installDir: string; supportedTargets: string[] };
+        };
         storage: { schemaVersion: string };
         scheduler: { queuedItems: number; totalRuns: number };
         loops: { planner: { running: number } };
@@ -195,6 +200,14 @@ describe("createLooperdApi", () => {
 
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
+    expect(statusBody.data.service.version).toBe(LOOPERD_VERSION);
+    expect(statusBody.data.service.binary.installDir).toBe(
+      join(homedir(), ".looper", "bin"),
+    );
+    expect(statusBody.data.service.binary.supportedTargets).toEqual([
+      "darwin-arm64",
+      "darwin-x64",
+    ]);
     expect(statusBody.data.storage.schemaVersion).toBe(
       "0007_agent_execution_run_index",
     );

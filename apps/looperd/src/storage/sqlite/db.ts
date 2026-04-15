@@ -28,6 +28,7 @@ export class SqliteDbCoordinator {
     this.db = new Database(options.dbPath, { create: true });
     this.applyPragmas();
     this.runner = createMigrationRunner(this.db, {
+      migrations: options.migrations,
       migrationsDir: options.migrationsDir,
       now: options.now,
       backupDir: options.backupDir,

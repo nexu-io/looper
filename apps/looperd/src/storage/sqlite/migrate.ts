@@ -1,16 +1,19 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import type { Database } from "bun:sqlite";
 
 import type { MigrationRunResult, MigrationStatus } from "../types";
+import {
+  SQLITE_MIGRATIONS,
+  type EmbeddedSqliteMigration,
+} from "./migrations.gen";
 import { buildBackupPath } from "./paths";
 
 const MIGRATION_FILE_RE = /^(\d{4}_[a-zA-Z0-9_\-]+)\.sql$/;
 
 export interface SqliteMigrationRunnerOptions {
+  migrations?: EmbeddedSqliteMigration[];
   migrationsDir?: string;
   backupDir?: string;
   dbPath?: string;
@@ -32,14 +35,18 @@ export function createMigrationRunner(
 }
 
 class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
-  private readonly migrationsDir: string;
+  private readonly migrations: EmbeddedSqliteMigration[];
   private readonly now: () => Date;
 
   constructor(
     private readonly db: Database,
     private readonly options: SqliteMigrationRunnerOptions,
   ) {
-    this.migrationsDir = options.migrationsDir ?? resolveDefaultMigrationsDir();
+    this.migrations =
+      options.migrations ??
+      (options.migrationsDir
+        ? readMigrationsFromDir(options.migrationsDir)
+        : SQLITE_MIGRATIONS);
     this.now = options.now ?? (() => new Date());
   }
 
@@ -62,11 +69,12 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
     options: { requireBackup?: boolean } = {},
   ): MigrationRunResult {
     this.ensureSchemaMigrationsTable();
-    const status = this.status();
-    if (status.pending.length === 0) {
+    const applied = this.readAppliedMigrations();
+    const pending = this.readPendingMigrations(applied.map((item) => item.id));
+    if (pending.length === 0) {
       return {
         appliedIds: [],
-        skippedIds: status.applied.map((item) => item.id),
+        skippedIds: applied.map((item) => item.id),
       };
     }
 
@@ -75,14 +83,11 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
       backupPath = this.backup();
     }
 
-    const skippedIds = status.applied.map((item) => item.id);
+    const skippedIds = applied.map((item) => item.id);
     const appliedIds: string[] = [];
 
-    for (const migration of status.pending) {
-      const sql = readFileSync(
-        join(this.migrationsDir, migration.fileName),
-        "utf8",
-      );
+    for (const migration of pending) {
+      const { sql } = migration;
 
       try {
         if (usesForeignKeyPragma(sql)) {
@@ -156,14 +161,19 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
   }
 
   private readAvailableMigrations() {
-    const migrationFiles = readdirSync(this.migrationsDir)
-      .filter((file) => MIGRATION_FILE_RE.test(file))
-      .sort();
-
-    return migrationFiles.map((fileName) => ({
-      id: basename(fileName, ".sql"),
-      fileName,
+    return this.migrations.map((migration) => ({
+      id: migration.id,
+      fileName: migration.fileName,
     }));
+  }
+
+  private readPendingMigrations(
+    appliedIds: string[],
+  ): EmbeddedSqliteMigration[] {
+    const appliedIdSet = new Set(appliedIds);
+    return this.migrations.filter(
+      (migration) => !appliedIdSet.has(migration.id),
+    );
   }
 
   private readAppliedMigrations() {
@@ -197,20 +207,15 @@ function readForeignKeysSetting(db: Database): boolean {
   return value === 1 || value === "1";
 }
 
-function resolveDefaultMigrationsDir(): string {
-  const bundledDir = fileURLToPath(
-    new URL("./storage/sqlite/migrations", import.meta.url),
-  );
-  if (existsSync(bundledDir)) {
-    return bundledDir;
-  }
-
-  const colocatedDir = fileURLToPath(new URL("./migrations", import.meta.url));
-  if (existsSync(colocatedDir)) {
-    return colocatedDir;
-  }
-
-  return fileURLToPath(
-    new URL("../../../src/storage/sqlite/migrations", import.meta.url),
-  );
+function readMigrationsFromDir(
+  migrationsDir: string,
+): EmbeddedSqliteMigration[] {
+  return readdirSync(migrationsDir)
+    .filter((file) => MIGRATION_FILE_RE.test(file))
+    .sort()
+    .map((fileName) => ({
+      id: basename(fileName, ".sql"),
+      fileName,
+      sql: readFileSync(join(migrationsDir, fileName), "utf8"),
+    }));
 }

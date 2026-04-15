@@ -12,11 +12,13 @@ import type {
   RunRecord,
   WorktreeRecord,
 } from "../types";
+import type { EmbeddedSqliteMigration } from "./migrations.gen";
 import { SqliteDbCoordinator } from "./db";
 
 export interface SqliteStoreOptions {
   dbPath: string;
   backupDir?: string;
+  migrations?: EmbeddedSqliteMigration[];
   migrationsDir?: string;
   now?: () => Date;
 }

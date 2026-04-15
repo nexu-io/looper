@@ -1,8 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
+import { join } from "node:path";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import { FixerLoopRunner } from "../fixer/index";
@@ -103,23 +100,6 @@ export interface CreateLooperdRuntimeOptions {
 
 const STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS = 1_000;
 
-const MIGRATIONS_DIR = resolveMigrationsDir();
-
-function resolveMigrationsDir(): string {
-  const currentDir = dirname(fileURLToPath(import.meta.url));
-  const packagedDistPath = join(currentDir, "storage/sqlite/migrations");
-  if (existsSync(packagedDistPath)) {
-    return packagedDistPath;
-  }
-
-  const distPath = join(currentDir, "../storage/sqlite/migrations");
-  if (existsSync(distPath)) {
-    return distPath;
-  }
-
-  return join(currentDir, "../../src/storage/sqlite/migrations");
-}
-
 class BasicLooperdRuntime implements LooperdRuntime {
   public startedAt?: Date;
 
@@ -153,7 +133,6 @@ class BasicLooperdRuntime implements LooperdRuntime {
     const store = new SqliteStore({
       dbPath: this.options.config.storage.dbPath,
       backupDir: this.options.config.storage.backupDir,
-      migrationsDir: MIGRATIONS_DIR,
     });
 
     try {

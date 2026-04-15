@@ -33,6 +33,13 @@ interface CliDeps {
     cwd: string;
     env: Record<string, string | undefined>;
   }) => Promise<number>;
+  runCommandImpl?: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+    timeoutMs?: number;
+  }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 }
 
 interface CliContext {
@@ -47,6 +54,11 @@ interface CliContext {
   cwd: string;
   isStdoutTty: boolean;
   launchShell: (cwd: string) => Promise<number>;
+  runCommand: (options: {
+    command: string;
+    args: string[];
+    timeoutMs?: number;
+  }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -210,6 +222,14 @@ export async function runCli(
         (deps.launchShellImpl ?? launchInteractiveShell)({
           cwd: shellCwd,
           env,
+        }),
+      runCommand: async ({ command, args, timeoutMs }) =>
+        (deps.runCommandImpl ?? runCommand)({
+          command,
+          args,
+          cwd,
+          env,
+          timeoutMs,
         }),
     };
 
@@ -693,24 +713,45 @@ async function runProjectAdd(context: CliContext) {
 }
 
 async function runDaemonStatus(context: CliContext) {
-  let health: unknown = null;
+  let status: Record<string, unknown> | null = null;
+  let health: Record<string, unknown> | null = null;
   let reachable = false;
 
   try {
-    health =
-      await context.client.get<Record<string, unknown>>("/api/v1/healthz");
+    status =
+      await context.client.get<Record<string, unknown>>("/api/v1/status");
     reachable = true;
   } catch (error) {
     if (!(error instanceof CliApiError)) {
       throw error;
     }
+
+    try {
+      health =
+        await context.client.get<Record<string, unknown>>("/api/v1/healthz");
+      reachable = true;
+    } catch (healthError) {
+      if (!(healthError instanceof CliApiError)) {
+        throw healthError;
+      }
+    }
   }
+
+  const runningVersion = (status?.service as { version?: string } | undefined)
+    ?.version;
+  const daemonVersion = runningVersion
+    ? { version: runningVersion, source: "api" as const, binaryPath: null }
+    : await readInstalledDaemonVersion(context);
 
   const data = {
     mode: context.config.config.daemon.mode,
     configPath: context.config.metadata.configPath,
     logDir: context.config.config.daemon.logDir,
     apiReachable: reachable,
+    daemonVersion: daemonVersion?.version ?? null,
+    daemonVersionSource: daemonVersion?.source ?? null,
+    daemonBinaryPath: daemonVersion?.binaryPath ?? null,
+    status,
     health,
   };
 
@@ -723,11 +764,86 @@ async function runDaemonStatus(context: CliContext) {
     ["configPath", data.configPath],
     ["logDir", data.logDir],
     ["apiReachable", data.apiReachable],
+    ["daemonVersion", data.daemonVersion ?? "not installed"],
+    ["daemonVersionSource", data.daemonVersionSource ?? "unavailable"],
+    ["daemonBinaryPath", data.daemonBinaryPath ?? "-"],
   ]);
   if (reachable) {
     context.write("");
-    printJson(context.write, health);
+    printJson(context.write, status ?? health);
   }
+}
+
+async function readInstalledDaemonVersion(
+  context: CliContext,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const candidates = [join(home, ".looper", "bin", "looperd"), "looperd"];
+
+  for (const candidate of candidates) {
+    try {
+      const result = await context.runCommand({
+        command: candidate,
+        args: ["--version"],
+        timeoutMs: 5_000,
+      });
+      if (result.exitCode === 0) {
+        const version = result.stdout.trim();
+        if (version.length > 0) {
+          return {
+            version,
+            source: "binary",
+            binaryPath: candidate,
+          };
+        }
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
+}
+
+async function runCommand(options: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+  timeoutMs?: number;
+}): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const env = Object.fromEntries(
+    Object.entries(options.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    signal: options.timeoutMs
+      ? AbortSignal.timeout(options.timeoutMs)
+      : undefined,
+  });
+
+  const stdoutChunks: Uint8Array[] = [];
+  const stderrChunks: Uint8Array[] = [];
+
+  child.stdout.on("data", (chunk: Uint8Array) => stdoutChunks.push(chunk));
+  child.stderr.on("data", (chunk: Uint8Array) => stderrChunks.push(chunk));
+
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code ?? 1));
+  });
+
+  return {
+    stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+    stderr: Buffer.concat(stderrChunks).toString("utf8"),
+    exitCode,
+  };
 }
 
 async function runDaemonLogs(context: CliContext) {

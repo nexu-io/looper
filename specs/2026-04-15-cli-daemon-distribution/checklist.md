@@ -22,37 +22,42 @@
 
 ## Phase 2 - 为 `looperd` 建立 compile 构建链路
 
-- [ ] 在 `apps/looperd/package.json` 增加 `compile` 脚本
-- [ ] 增加按平台 target 的 compile 脚本
-- [ ] 第一批支持 `darwin-arm64`
-- [ ] 第一批支持 `darwin-x64`
-- [ ] 明确 Linux 不进入当前范围
+> 当前约定：compile 仍是 release 架构的一部分，但不进入本地 dev/build/test 主流程；
+> 本地已知坏环境可以 fail-fast，release workflow 再在 macOS runners 上做最终 smoke validation。
+
+- [x] 在 `apps/looperd/package.json` 增加 `compile` 脚本
+- [x] 增加按平台 target 的 compile 脚本
+- [x] 第一批支持 `darwin-arm64`
+- [x] 第一批支持 `darwin-x64`
+- [x] 明确 Linux 不进入当前范围
 - [ ] 验证 compile 产物至少可执行 `--version`（完整运行依赖 Phase 3）
 - [ ] 验证 compiled binary 体积是否在可接受范围，并记录预期大小
 
 ## Phase 3 - SQLite migrations 内嵌化
 
-- [ ] 设计 migration 内嵌表示结构
-- [ ] 将现有 `.sql` 文件转换为内嵌资源或生成模块
-- [ ] 改造 `migrate.ts`，从内存资源读取 migration 列表
-- [ ] 删除对运行时 migrations 目录扫描的主路径依赖
-- [ ] 保留测试场景下可注入 migrations 的能力（如需要）
+- [x] 设计 migration 内嵌表示结构
+- [x] 将现有 `.sql` 文件转换为内嵌资源或生成模块
+- [x] 改造 `migrate.ts`，从内存资源读取 migration 列表
+- [x] 删除对运行时 migrations 目录扫描的主路径依赖
+- [x] 保留测试场景下可注入 migrations 的能力（如需要）
 - [ ] 验证源码运行 / build 运行 / compile 运行三种模式行为一致
 
 ## Phase 4 - `looperd` binary 运行与元数据
 
-- [ ] 明确 compiled binary 的输出命名规则
+- [x] 明确 compiled binary 的输出命名规则
 - [ ] 明确 daemon version / build metadata 暴露方式
-- [ ] 明确版本 single source of truth，并让 CLI/daemon 构建都读取它
-- [ ] 在状态接口中返回 daemon 版本信息
-- [ ] 验证 CLI 可读取并展示 daemon 版本
-- [ ] 明确 binary 安装目录约定（建议 `~/.looper/bin/`）
-- [ ] 支持 `looperd --version`
-- [ ] `looperd --version` 必须在 bootstrap 前短路
-- [ ] 支持 CLI 获取当前 daemon 版本（运行中 / 未运行两种路径）
-- [ ] 替换 `apps/looperd/src/server/index.ts` 中硬编码的 daemon 版本字符串
+- [x] 明确版本 single source of truth，并让 CLI/daemon 构建都读取它
+- [x] 在状态接口中返回 daemon 版本信息
+- [x] 验证 CLI 可读取并展示 daemon 版本
+- [x] 明确 binary 安装目录约定（建议 `~/.looper/bin/`）
+- [x] 支持 `looperd --version`
+- [x] `looperd --version` 必须在 bootstrap 前短路
+- [x] 支持 CLI 获取当前 daemon 版本（运行中 / 未运行两种路径）
+- [x] 替换 `apps/looperd/src/server/index.ts` 中硬编码的 daemon 版本字符串
 
 ## Phase 5 - Release Workflow
+
+> release workflow 是 compile 可用性的权威验证点；本地 compile 失败不能单独作为否定该分发模型的依据。
 
 - [ ] 增加 tag 驱动的 release workflow
 - [ ] matrix 构建 macOS 双架构 `looperd` binary

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { CliApiError } from "./client";
 import { runCli } from "./index";
 
 function createConfig() {
@@ -570,6 +571,76 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(requests[0]?.url).toContain("/api/v1/planners");
     expect(requests[0]?.body).toContain('"issueNumber":123');
+  });
+
+  test("reads daemon version from installed binary when api is unreachable", async () => {
+    const lines: string[] = [];
+    const runCommandCalls: Array<{
+      command: string;
+      args: string[];
+      timeoutMs?: number;
+    }> = [];
+    const exitCode = await runCli(["daemon", "status"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async () => {
+        throw new CliApiError("daemon offline", "UNAVAILABLE", 503);
+      },
+      runCommandImpl: async ({ command, args, timeoutMs }) => {
+        runCommandCalls.push({ command, args, timeoutMs });
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.1.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runCommandCalls).toEqual([
+      {
+        command: "/Users/tester/.looper/bin/looperd",
+        args: ["--version"],
+        timeoutMs: 5_000,
+      },
+    ]);
+    expect(lines.join("\n")).toContain("daemonVersion");
+    expect(lines.join("\n")).toContain("0.1.0");
+    expect(lines.join("\n")).toContain("/Users/tester/.looper/bin/looperd");
+  });
+
+  test("falls back to PATH daemon binary when installed binary version check times out", async () => {
+    const lines: string[] = [];
+    const exitCode = await runCli(["daemon", "status"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      fetchImpl: async () => {
+        throw new CliApiError("daemon offline", "UNAVAILABLE", 503);
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          throw new Error("timed out");
+        }
+
+        if (command === "looperd") {
+          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+        }
+
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(lines.join("\n")).toContain("0.2.0");
+    expect(lines.join("\n")).toContain("looperd");
   });
 
   test("detects planner project from cwd when --project is omitted", async () => {

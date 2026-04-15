@@ -18,6 +18,15 @@ import {
   ProjectIdCollisionError,
   type ProjectManager,
 } from "../projects/index";
+import {
+  getCurrentLooperdTarget,
+  getLooperdArtifactName,
+  isLooperdSupportedTarget,
+  LOOPERD_BINARY_BASENAME,
+  LOOPERD_INSTALL_DIR,
+  LOOPERD_SUPPORTED_TARGETS,
+  LOOPERD_VERSION,
+} from "../metadata";
 import { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
@@ -293,14 +302,24 @@ function buildStatusResponse(context: LooperdApiContext) {
   const runs = context.store.runs.list();
   const queueItems = context.store.queue.list();
   const storage = context.store.schema.healthcheck();
+  const currentTarget = getCurrentLooperdTarget();
 
   return {
     service: {
       healthy: storage.ok,
-      version: "0.1.0",
+      version: LOOPERD_VERSION,
       daemonMode: context.config.daemon.mode,
       startedAt: context.getStartedAt()?.toISOString(),
       recovery: context.getRecoverySummary(),
+      binary: {
+        name: LOOPERD_BINARY_BASENAME,
+        installDir: LOOPERD_INSTALL_DIR,
+        currentTarget,
+        artifactName: isLooperdSupportedTarget(currentTarget)
+          ? getLooperdArtifactName(currentTarget)
+          : null,
+        supportedTargets: [...LOOPERD_SUPPORTED_TARGETS],
+      },
     },
     storage: {
       mode: storage.mode,
