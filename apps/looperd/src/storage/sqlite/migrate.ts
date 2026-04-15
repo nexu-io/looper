@@ -198,6 +198,13 @@ function readForeignKeysSetting(db: Database): boolean {
 }
 
 function resolveDefaultMigrationsDir(): string {
+  const bundledDir = fileURLToPath(
+    new URL("./storage/sqlite/migrations", import.meta.url),
+  );
+  if (existsSync(bundledDir)) {
+    return bundledDir;
+  }
+
   const colocatedDir = fileURLToPath(new URL("./migrations", import.meta.url));
   if (existsSync(colocatedDir)) {
     return colocatedDir;

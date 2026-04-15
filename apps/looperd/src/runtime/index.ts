@@ -107,6 +107,11 @@ const MIGRATIONS_DIR = resolveMigrationsDir();
 
 function resolveMigrationsDir(): string {
   const currentDir = dirname(fileURLToPath(import.meta.url));
+  const packagedDistPath = join(currentDir, "storage/sqlite/migrations");
+  if (existsSync(packagedDistPath)) {
+    return packagedDistPath;
+  }
+
   const distPath = join(currentDir, "../storage/sqlite/migrations");
   if (existsSync(distPath)) {
     return distPath;

@@ -4,18 +4,24 @@
   "private": false,
   "type": "module",
   "bin": {
-    "looper": "dist/index.js"
+    "looper": "dist/index.js",
+    "looperd": "dist/looperd.js"
   },
-  "files": ["dist/index.js"],
+  "files": [
+    "dist/index.js",
+    "dist/looperd.js",
+    "dist/storage/sqlite/migrations/**"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20",
+    "bun": ">=1.3.12"
   },
   "scripts": {
     "dev": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "build": "bun run scripts/build.ts",
     "prepublishOnly": "bun run build",
     "typecheck": "bun x tsc -p tsconfig.json --noEmit",
     "test": "bun test src"

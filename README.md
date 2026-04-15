@@ -17,6 +17,59 @@ The current product is the daemon + CLI. The web app is not implemented yet.
 
 `looperd` auto-detects tool paths with `Bun.which()`, but startup validation fails if required tools cannot be resolved.
 
+## Installation
+
+Install the CLI and daemon globally with npm:
+
+```bash
+npm install -g @powerformer/looper
+```
+
+The published package installs both:
+
+- `looper` — CLI
+- `looperd` — daemon
+
+`looperd` runs on Bun, so keep Bun installed on the machine even if you install the package with npm.
+
+Then start the daemon:
+
+```bash
+looperd
+```
+
+In another shell, verify the install and daemon connection:
+
+```bash
+looper status
+```
+
+You can also inspect daemon health directly:
+
+```bash
+looper daemon status
+```
+
+To develop from source, clone the repo and install workspace dependencies from the root:
+
+```bash
+git clone https://github.com/powerformer/looper.git
+cd looper
+bun install
+```
+
+Then start the daemon:
+
+```bash
+bun run dev
+```
+
+In another shell, run the CLI from source:
+
+```bash
+bun run looper -- status
+```
+
 ## Workspace commands
 
 From the repo root:
@@ -87,6 +140,8 @@ Manual review examples:
 Currently a stub that only logs a placeholder message.
 
 ## Configuration
+
+For a full configuration guide with examples, field reference, env overrides, and CLI flags, see [docs/configuration.md](docs/configuration.md).
 
 Default config path:
 

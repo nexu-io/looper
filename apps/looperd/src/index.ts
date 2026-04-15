@@ -1,3 +1,5 @@
+#!/usr/bin/env bun
+
 import { bootstrapLooperd } from "./bootstrap/index";
 import { ConfigValidationError } from "./config/index";
 
