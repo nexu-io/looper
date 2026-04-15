@@ -18,7 +18,82 @@ function createConfig() {
   };
 }
 
+async function captureHelpOutput(args: string[]) {
+  const result = Bun.spawnSync({
+    cmd: [
+      process.execPath,
+      "-e",
+      [
+        `import { runCli } from ${JSON.stringify(new URL("./index.ts", import.meta.url).href)};`,
+        `const exitCode = await runCli(${JSON.stringify(args)}, {`,
+        `  loadConfigImpl: async () => (${JSON.stringify(createConfig())}),`,
+        "});",
+        "process.exit(exitCode);",
+      ].join("\n"),
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  return {
+    exitCode: result.exitCode,
+    output: result.stdout.toString(),
+    error: result.stderr.toString(),
+  };
+}
+
 describe("runCli", () => {
+  test("shows subcommands in help output for every command group", async () => {
+    const commandGroups = [
+      {
+        args: ["project", "--help"],
+        subcommands: ["list  List projects", "add   Add a project"],
+      },
+      {
+        args: ["config", "--help"],
+        subcommands: ["show  Show active config"],
+      },
+      {
+        args: ["daemon", "--help"],
+        subcommands: ["status  Show daemon status", "logs    Show daemon logs"],
+      },
+      {
+        args: ["loop", "--help"],
+        subcommands: [
+          "list   List loops",
+          "start  Start a loop",
+          "pause  Pause a loop",
+        ],
+      },
+      {
+        args: ["pr", "--help"],
+        subcommands: [
+          "list    List pull requests",
+          "show    Show a pull request",
+          "status  Show pull request status",
+        ],
+      },
+      {
+        args: ["run", "--help"],
+        subcommands: ["list  List runs"],
+      },
+    ];
+
+    for (const commandGroup of commandGroups) {
+      const { exitCode, output, error } = await captureHelpOutput(
+        commandGroup.args,
+      );
+
+      expect(exitCode).toBe(0);
+      expect(error).toBe("");
+      expect(output).toContain("Subcommands:");
+
+      for (const subcommand of commandGroup.subcommands) {
+        expect(output).toContain(subcommand);
+      }
+    }
+  });
+
   test("renders status as json", async () => {
     const lines: string[] = [];
     const exitCode = await runCli(["status", "--json"], {

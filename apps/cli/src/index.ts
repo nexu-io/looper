@@ -78,6 +78,39 @@ interface PullRequestRef {
   prNumber: number;
 }
 
+interface HelpSection {
+  title?: string;
+  body: string;
+}
+
+interface CommandGroupSubcommand {
+  name: string;
+  description: string;
+}
+
+const COMMAND_GROUP_SUBCOMMANDS: Record<string, CommandGroupSubcommand[]> = {
+  project: [
+    { name: "list", description: "List projects" },
+    { name: "add", description: "Add a project" },
+  ],
+  config: [{ name: "show", description: "Show active config" }],
+  daemon: [
+    { name: "status", description: "Show daemon status" },
+    { name: "logs", description: "Show daemon logs" },
+  ],
+  loop: [
+    { name: "list", description: "List loops" },
+    { name: "start", description: "Start a loop" },
+    { name: "pause", description: "Pause a loop" },
+  ],
+  pr: [
+    { name: "list", description: "List pull requests" },
+    { name: "show", description: "Show a pull request" },
+    { name: "status", description: "Show pull request status" },
+  ],
+  run: [{ name: "list", description: "List runs" }],
+};
+
 interface ProjectSummary {
   id: string;
   repoPath: string;
@@ -473,9 +506,50 @@ function createCli(runtime: CliRuntime) {
       await dispatch(createContext(runtime, ["run", ...args], options));
     });
 
-  cli.help();
+  cli.help((sections) => {
+    return addCommandGroupSubcommandSection(sections, cli.matchedCommand?.name);
+  });
 
   return cli;
+}
+
+function addCommandGroupSubcommandSection(
+  sections: HelpSection[],
+  commandName?: string,
+): HelpSection[] {
+  if (!commandName) {
+    return sections;
+  }
+
+  const subcommands = COMMAND_GROUP_SUBCOMMANDS[commandName];
+  if (!subcommands?.length) {
+    return sections;
+  }
+
+  const longestSubcommandName = Math.max(
+    ...subcommands.map((subcommand) => subcommand.name.length),
+  );
+  const subcommandsSection: HelpSection = {
+    title: "Subcommands",
+    body: subcommands
+      .map(
+        (subcommand) =>
+          `  ${subcommand.name.padEnd(longestSubcommandName)}  ${subcommand.description}`,
+      )
+      .join("\n"),
+  };
+  const usageSectionIndex = sections.findIndex(
+    (section) => section.title === "Usage",
+  );
+  const nextSections = [...sections];
+
+  if (usageSectionIndex === -1) {
+    nextSections.push(subcommandsSection);
+    return nextSections;
+  }
+
+  nextSections.splice(usageSectionIndex + 1, 0, subcommandsSection);
+  return nextSections;
 }
 
 function addGlobalOptions(cli: ReturnType<typeof cac>) {
