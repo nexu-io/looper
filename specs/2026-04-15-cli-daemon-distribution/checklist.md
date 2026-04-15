@@ -78,13 +78,13 @@
 
 ## Phase 6 - CLI 的 daemon 安装助手
 
-- [ ] 设计 `looper daemon install` 命令
-- [ ] 自动识别当前平台和架构
-- [ ] 自动拼出正确的 release artifact 下载地址
-- [ ] 下载 binary 到本地安装目录
-- [ ] 设置可执行权限
-- [ ] 已安装时提供幂等行为或覆盖策略
-- [ ] 安装失败时输出清晰错误信息
+- [x] 设计 `looper daemon install` 命令
+- [x] 自动识别当前平台和架构
+- [x] 自动拼出正确的 release artifact 下载地址
+- [x] 下载 binary 到本地安装目录
+- [x] 设置可执行权限
+- [x] 已安装时提供幂等行为或覆盖策略
+- [x] 安装失败时输出清晰错误信息
 
 ## Phase 7 - CLI 的 daemon 管理命令
 

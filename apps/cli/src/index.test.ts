@@ -643,6 +643,106 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain("looperd");
   });
 
+  test("installs daemon binary via daemon install command", async () => {
+    const lines: string[] = [];
+    const installCalls: Array<{
+      platform: NodeJS.Platform;
+      arch: string;
+      homeDir: string;
+      force: boolean;
+    }> = [];
+
+    const exitCode = await runCli(["daemon", "install"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      daemonInstallImpl: async (options) => {
+        installCalls.push(options);
+        return {
+          target: "darwin-arm64",
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: "https://example.invalid/looperd-darwin-arm64",
+          skipped: false,
+        };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(installCalls).toHaveLength(1);
+    expect(installCalls[0]?.homeDir).toBe("/Users/tester");
+    expect(installCalls[0]?.force).toBe(false);
+    expect(lines.join("\n")).toContain(
+      "Installed looperd (darwin-arm64) to /Users/tester/.looper/bin/looperd",
+    );
+  });
+
+  test("supports idempotent daemon install and force overwrite", async () => {
+    const firstLines: string[] = [];
+    const installCalls: boolean[] = [];
+
+    const firstExitCode = await runCli(["daemon", "install"], {
+      stdout: (line) => firstLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      daemonInstallImpl: async (options) => {
+        installCalls.push(options.force);
+        return {
+          target: "darwin-x64",
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: null,
+          skipped: true,
+        };
+      },
+    });
+
+    const secondExitCode = await runCli(["daemon", "install", "--force"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      daemonInstallImpl: async (options) => {
+        installCalls.push(options.force);
+        return {
+          target: "darwin-x64",
+          installPath: "/Users/tester/.looper/bin/looperd",
+          downloadedFrom: "https://example.invalid/looperd-darwin-x64",
+          skipped: false,
+        };
+      },
+    });
+
+    expect(firstExitCode).toBe(0);
+    expect(secondExitCode).toBe(0);
+    expect(installCalls).toEqual([false, true]);
+    expect(firstLines.join("\n")).toContain(
+      "looperd is already installed at /Users/tester/.looper/bin/looperd (use --force to overwrite)",
+    );
+  });
+
+  test("prints clear error when daemon install fails", async () => {
+    const errors: string[] = [];
+
+    const exitCode = await runCli(["daemon", "install"], {
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      daemonInstallImpl: async () => {
+        throw new Error(
+          "Unsupported platform/arch for looperd install: linux-x64",
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toBe(
+      "Failed to install looperd: Unsupported platform/arch for looperd install: linux-x64",
+    );
+  });
+
   test("detects planner project from cwd when --project is omitted", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(["plan", "--issue", "123"], {

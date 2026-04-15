@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { arch as osArch, homedir, platform as osPlatform } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { cac } from "cac";
 
@@ -12,6 +12,10 @@ import {
   type FetchLike,
   createApiClient,
 } from "./client";
+import {
+  installLooperdBinary,
+  type DaemonInstallResult,
+} from "./daemon-install";
 import { printJson, printSection, printTable } from "./format";
 
 type Writer = (line: string) => void;
@@ -40,6 +44,13 @@ interface CliDeps {
     env: Record<string, string | undefined>;
     timeoutMs?: number;
   }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  daemonInstallImpl?: (options: {
+    fetchImpl: FetchLike;
+    platform: NodeJS.Platform;
+    arch: string;
+    homeDir: string;
+    force: boolean;
+  }) => Promise<DaemonInstallResult>;
 }
 
 interface CliContext {
@@ -59,6 +70,13 @@ interface CliContext {
     args: string[];
     timeoutMs?: number;
   }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  fetchImpl: FetchLike;
+  installDaemon: (options: {
+    platform: NodeJS.Platform;
+    arch: string;
+    homeDir: string;
+    force: boolean;
+  }) => Promise<DaemonInstallResult>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -201,12 +219,13 @@ export async function runCli(
       env,
       cwd,
     });
+    const fetchImpl = deps.fetchImpl ?? fetch;
     const client = createApiClient({
       baseUrl:
         config.config.server.baseUrl ??
         `http://${config.config.server.host}:${config.config.server.port}`,
       token: env.LOOPER_TOKEN ?? config.config.server.localToken,
-      fetchImpl: deps.fetchImpl,
+      fetchImpl,
     });
     const runtime: CliRuntime = {
       write,
@@ -230,6 +249,15 @@ export async function runCli(
           cwd,
           env,
           timeoutMs,
+        }),
+      fetchImpl,
+      installDaemon: async ({ platform, arch, homeDir, force }) =>
+        (deps.daemonInstallImpl ?? installLooperdBinary)({
+          fetchImpl,
+          platform,
+          arch,
+          homeDir,
+          force,
         }),
     };
 
@@ -278,6 +306,9 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       return runConfigShow(context);
     case "daemon":
+      if (subcommand === "install") {
+        return runDaemonInstall(context);
+      }
       if (subcommand === "status") {
         return runDaemonStatus(context);
       }
@@ -379,6 +410,8 @@ function createCli(runtime: CliRuntime) {
     .command("daemon [...args]", "Daemon commands")
     .usage("daemon <subcommand> [options]")
     .option("--lines <count>", "Line count")
+    .option("--force", "Overwrite existing installed daemon binary")
+    .example((name) => `  $ ${name} daemon install`)
     .example((name) => `  $ ${name} daemon status`)
     .example((name) => `  $ ${name} daemon logs --lines 50`)
     .action(async (args, options) => {
@@ -771,6 +804,41 @@ async function runDaemonStatus(context: CliContext) {
   if (reachable) {
     context.write("");
     printJson(context.write, status ?? health);
+  }
+}
+
+async function runDaemonInstall(context: CliContext) {
+  const homeDir =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const force = hasFlag(context.args, "force");
+
+  try {
+    const result = await context.installDaemon({
+      platform: osPlatform(),
+      arch: osArch(),
+      homeDir,
+      force,
+    });
+
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, result);
+    }
+
+    if (result.skipped) {
+      context.write(
+        `looperd is already installed at ${result.installPath} (use --force to overwrite)`,
+      );
+      return;
+    }
+
+    context.write(
+      `Installed looperd (${result.target}) to ${result.installPath}`,
+    );
+    if (result.downloadedFrom) {
+      context.write(`Downloaded from ${result.downloadedFrom}`);
+    }
+  } catch (error) {
+    throw new Error(`Failed to install looperd: ${formatError(error)}`);
   }
 }
 
