@@ -1,5 +1,6 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
@@ -216,7 +217,7 @@ export async function runCli(
     runtime.showHelp = (commandName) => {
       outputCommandHelp(cli, commandName);
     };
-    cli.parse(["bun", "looper", ...argv], { run: false });
+    cli.parse(["node", "looper", ...argv], { run: false });
 
     if (!cli.matchedCommand) {
       if (argv.includes("--help") || argv.includes("-h")) {
@@ -1130,14 +1131,23 @@ async function launchInteractiveShell(options: {
   env: Record<string, string | undefined>;
 }): Promise<number> {
   const shell = options.env.SHELL || "/bin/zsh";
-  const subprocess = Bun.spawn([shell, "-i"], {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit",
+  return await new Promise<number>((resolve, reject) => {
+    const subprocess = spawn(shell, ["-i"], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: "inherit",
+    });
+
+    subprocess.once("error", reject);
+    subprocess.once("exit", (code, signal) => {
+      if (signal) {
+        reject(new Error(`Interactive shell exited from signal ${signal}`));
+        return;
+      }
+
+      resolve(code ?? 0);
+    });
   });
-  return await subprocess.exited;
 }
 
 async function runLogs(context: CliContext) {
