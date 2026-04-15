@@ -1304,6 +1304,23 @@ describe("createLooperdRuntime", () => {
       updatedAt: now,
     });
     seedStore.loops.upsert({
+      id: "loop_never_run",
+      seq: 7,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:48",
+      repo: "acme/looper",
+      prNumber: 48,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
       id: "loop_claimed",
       seq: 6,
       projectId: "project_1",
@@ -1405,6 +1422,7 @@ describe("createLooperdRuntime", () => {
       "failed",
     );
     expect(verifyStore.loops.getById("loop_legit")?.status).toBe("queued");
+    expect(verifyStore.loops.getById("loop_never_run")?.status).toBe("queued");
     expect(verifyStore.loops.getById("loop_claimed")?.status).toBe("queued");
     expect(
       verifyStore.events
@@ -1417,6 +1435,14 @@ describe("createLooperdRuntime", () => {
     expect(
       verifyStore.events
         .listByEntity("loop", "loop_legit")
+        .some(
+          (event) =>
+            event.eventType === "looperd.recovery.loop_queue_normalized",
+        ),
+    ).toBe(false);
+    expect(
+      verifyStore.events
+        .listByEntity("loop", "loop_never_run")
         .some(
           (event) =>
             event.eventType === "looperd.recovery.loop_queue_normalized",

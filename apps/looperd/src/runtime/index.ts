@@ -758,12 +758,15 @@ class BasicLooperdRuntime implements LooperdRuntime {
       }
 
       const latestRun = this.store.runs.getLatestByLoopId(loop.id);
+      if (!latestRun) {
+        continue;
+      }
       const normalizedStatus = normalizeStaleQueuedLoopStatus(latestRun);
       this.store.loops.upsert({
         ...loop,
         status: normalizedStatus,
         nextRunAt: null,
-        lastRunAt: latestRun?.endedAt ?? latestRun?.startedAt ?? loop.lastRunAt,
+        lastRunAt: latestRun.endedAt ?? latestRun.startedAt ?? loop.lastRunAt,
         updatedAt: nowIso,
       });
       this.appendEvent({
@@ -775,7 +778,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
         payloadJson: JSON.stringify({
           previousStatus: loop.status,
           recoveredStatus: normalizedStatus,
-          latestRunStatus: latestRun?.status ?? null,
+          latestRunStatus: latestRun.status,
         }),
         createdAt: nowIso,
       });
@@ -1232,12 +1235,8 @@ function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
 }
 
 function normalizeStaleQueuedLoopStatus(
-  latestRun: RunRecord | null,
+  latestRun: RunRecord,
 ): LoopRecord["status"] {
-  if (!latestRun) {
-    return "failed";
-  }
-
   switch (latestRun.status) {
     case "success":
       return "completed";
