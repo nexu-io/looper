@@ -732,6 +732,14 @@ Phase 1 可以直接依赖：
 1. 稳定的 artifact 命名规则
 2. GitHub Releases REST API
 
+当前 release workflow 已显式验证：
+
+1. Release assets 名称固定为 `looperd-darwin-{arm64,x64}` 与对应 `.sha256`
+2. Phase 1 不发布 Linux artifacts
+3. tag / checksum / `--version` 均在 workflow 内校验
+
+因此在进入 `looper daemon install` / `looper upgrade` 实现前，现有发布元数据已经足以支撑 CLI 定位下载目标，当前不补 manifest。
+
 只有当后续发现单纯依赖 release asset 命名不足以支撑安装/升级逻辑时，再补 manifest。
 
 ## 10.4.5 推荐的 workflow 分层

@@ -68,7 +68,7 @@
 - [x] 上传 GitHub Release artifacts
 - [x] 生成 SHA-256 校验信息
 - [x] Phase 1 先只依赖稳定 artifact 命名 + GitHub Releases API
-- [ ] 如后续确有需要，再补 manifest
+- [x] 如后续确有需要，再补 manifest
 - [ ] 在同一 release 流程中发布 npm CLI
 - [ ] 验证 release 产物命名与下载地址可预测
 - [ ] 验证 tag 与 npm package version 一致
