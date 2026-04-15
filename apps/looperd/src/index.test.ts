@@ -21,6 +21,32 @@ describe("runLooperdCli", () => {
     expect(bootstrapCalled).toBe(false);
   });
 
+  test("uses shared Bun argv resolution for source entrypoint", () => {
+    expect(
+      resolveLooperdCliArgv(
+        ["/opt/homebrew/bin/bun", "ignored", "--version"],
+        [
+          "bun",
+          "bunfs:///Users/mrc/Projects/looper/apps/looperd/src/index.ts",
+          "--version",
+        ],
+      ),
+    ).toEqual(["--version"]);
+  });
+
+  test("uses shared Bun argv resolution for compiled entrypoint", () => {
+    expect(
+      resolveLooperdCliArgv(
+        ["/opt/homebrew/bin/bun", "ignored", "--version"],
+        [
+          "bun",
+          "bunfs:///Users/mrc/Projects/looper/apps/looperd/src/compiled.ts",
+          "--version",
+        ],
+      ),
+    ).toEqual(["--version"]);
+  });
+
   test("prefers Bun.argv for compiled executables", () => {
     expect(
       resolveLooperdCliArgv(

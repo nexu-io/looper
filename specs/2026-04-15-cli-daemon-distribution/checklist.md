@@ -40,7 +40,7 @@
 - [x] 改造 `migrate.ts`，从内存资源读取 migration 列表
 - [x] 删除对运行时 migrations 目录扫描的主路径依赖
 - [x] 保留测试场景下可注入 migrations 的能力（如需要）
-- [ ] 验证源码运行 / build 运行 / compile 运行三种模式行为一致
+- [x] 验证源码运行 / build 运行 / compile 运行三种模式行为一致
 
 ## Phase 4 - `looperd` binary 运行与元数据
 
