@@ -63,7 +63,7 @@
 - [x] matrix 构建 macOS 双架构 `looperd` binary
 - [x] 第一批 workflow 至少覆盖 `darwin-arm64`
 - [x] 第一批 workflow 至少覆盖 `darwin-x64`
-- [ ] macOS targets 使用 macOS runners 构建
+- [x] macOS targets 使用 macOS runners 构建
 - [ ] 明确当前 workflow 不发布 Linux artifacts
 - [ ] 上传 GitHub Release artifacts
 - [ ] 生成 SHA-256 校验信息
