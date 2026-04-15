@@ -893,6 +893,16 @@ looper daemon status
 
 `bun build --compile` 产物会包含 Bun runtime，因此 daemon binary 体积会明显大于普通 JS 文件分发。
 
+当前实测（本仓库 `apps/looperd/scripts/compile.ts` 默认产物）：
+
+- `looperd-darwin-arm64`：约 **58.9 MiB**
+- `looperd-darwin-x64`：约 **64.1 MiB**
+
+因此当前 phase 可接受的预期范围可先定为：
+
+- **darwin-arm64 / darwin-x64 单个 artifact 预期约 59–64 MiB**
+- **只要单个 release binary 未明显超过 70 MiB，就仍视为可接受**
+
 这会影响：
 
 - GitHub Release 上传/下载时间

@@ -31,7 +31,7 @@
 - [x] 第一批支持 `darwin-x64`
 - [x] 明确 Linux 不进入当前范围
 - [x] 验证 compile 产物至少可执行 `--version`（完整运行依赖 Phase 3）
-- [ ] 验证 compiled binary 体积是否在可接受范围，并记录预期大小
+- [x] 验证 compiled binary 体积是否在可接受范围，并记录预期大小（当前实测：darwin-arm64 ≈ 58.9 MiB，darwin-x64 ≈ 64.1 MiB；Phase 1 先以单产物 < 70 MiB 为可接受范围）
 
 ## Phase 3 - SQLite migrations 内嵌化
 
