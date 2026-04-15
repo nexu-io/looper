@@ -30,7 +30,7 @@
 - [x] 第一批支持 `darwin-arm64`
 - [x] 第一批支持 `darwin-x64`
 - [x] 明确 Linux 不进入当前范围
-- [ ] 验证 compile 产物至少可执行 `--version`（完整运行依赖 Phase 3）
+- [x] 验证 compile 产物至少可执行 `--version`（完整运行依赖 Phase 3）
 - [ ] 验证 compiled binary 体积是否在可接受范围，并记录预期大小
 
 ## Phase 3 - SQLite migrations 内嵌化
