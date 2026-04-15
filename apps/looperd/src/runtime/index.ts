@@ -1232,15 +1232,20 @@ function normalizeStaleQueuedLoopStatus(latestRun: RunRecord | null): string {
     return "failed";
   }
 
-  if (latestRun.status === "running") {
-    return "interrupted";
+  switch (latestRun.status) {
+    case "success":
+      return "completed";
+    case "interrupted":
+      return "interrupted";
+    case "running":
+      return "interrupted";
+    case "failed":
+    case "cancelled":
+    case "parse_failed":
+    case "queued":
+    default:
+      return "failed";
   }
-
-  if (latestRun.status === "queued") {
-    return "failed";
-  }
-
-  return latestRun.status;
 }
 
 function parseProjectMetadata(

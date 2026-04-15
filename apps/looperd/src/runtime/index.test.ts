@@ -1140,7 +1140,7 @@ describe("createLooperdRuntime", () => {
     await runtime.stop("test");
   });
 
-  test("normalizes stale queued loops without queued queue items on startup", async () => {
+  test("normalizes stale queued loops to valid loop statuses on startup", async () => {
     const fixture = await createFixture();
     const now = new Date(Date.now() - 1_000).toISOString();
     const seedStore = new SqliteStore({
@@ -1159,7 +1159,7 @@ describe("createLooperdRuntime", () => {
       updatedAt: now,
     });
     seedStore.loops.upsert({
-      id: "loop_stale",
+      id: "loop_stale_failed",
       seq: 1,
       projectId: "project_1",
       type: "worker",
@@ -1176,8 +1176,8 @@ describe("createLooperdRuntime", () => {
       updatedAt: now,
     });
     seedStore.runs.upsert({
-      id: "run_stale",
-      loopId: "loop_stale",
+      id: "run_stale_failed",
+      loopId: "loop_stale_failed",
       status: "failed",
       currentStep: "execute",
       lastCompletedStep: "snapshot",
@@ -1191,7 +1191,7 @@ describe("createLooperdRuntime", () => {
       updatedAt: now,
     });
     seedStore.loops.upsert({
-      id: "loop_legit",
+      id: "loop_stale_success",
       seq: 2,
       projectId: "project_1",
       type: "worker",
@@ -1207,16 +1207,112 @@ describe("createLooperdRuntime", () => {
       createdAt: now,
       updatedAt: now,
     });
+    seedStore.runs.upsert({
+      id: "run_stale_success",
+      loopId: "loop_stale_success",
+      status: "success",
+      currentStep: "validate",
+      lastCompletedStep: "validate",
+      checkpointJson: null,
+      summary: "success",
+      errorMessage: null,
+      startedAt: now,
+      lastHeartbeatAt: now,
+      endedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_stale_cancelled",
+      seq: 3,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:44",
+      repo: "acme/looper",
+      prNumber: 44,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.runs.upsert({
+      id: "run_stale_cancelled",
+      loopId: "loop_stale_cancelled",
+      status: "cancelled",
+      currentStep: "execute",
+      lastCompletedStep: "snapshot",
+      checkpointJson: null,
+      summary: "cancelled",
+      errorMessage: "stopped",
+      startedAt: now,
+      lastHeartbeatAt: now,
+      endedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_stale_parse_failed",
+      seq: 4,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:45",
+      repo: "acme/looper",
+      prNumber: 45,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.runs.upsert({
+      id: "run_stale_parse_failed",
+      loopId: "loop_stale_parse_failed",
+      status: "parse_failed",
+      currentStep: "execute",
+      lastCompletedStep: "snapshot",
+      checkpointJson: null,
+      summary: "parse failed",
+      errorMessage: "unable to parse",
+      startedAt: now,
+      lastHeartbeatAt: now,
+      endedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_legit",
+      seq: 5,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:46",
+      repo: "acme/looper",
+      prNumber: 46,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
     seedStore.queue.upsert({
       id: "queue_legit",
       projectId: "project_1",
       loopId: "loop_legit",
       type: "worker",
       targetType: "pull_request",
-      targetId: "pr:acme/looper:43",
+      targetId: "pr:acme/looper:46",
       repo: "acme/looper",
-      prNumber: 43,
-      dedupeKey: "worker:acme/looper:43",
+      prNumber: 46,
+      dedupeKey: "worker:acme/looper:46",
       priority: 4,
       status: "queued",
       availableAt: now,
@@ -1226,7 +1322,7 @@ describe("createLooperdRuntime", () => {
       claimedAt: null,
       startedAt: null,
       finishedAt: null,
-      lockKey: "pr:acme/looper:43",
+      lockKey: "pr:acme/looper:46",
       payloadJson: null,
       lastError: null,
       lastErrorKind: null,
@@ -1250,12 +1346,21 @@ describe("createLooperdRuntime", () => {
     });
     verifyStore.initialize();
 
-    expect(verifyStore.loops.getById("loop_stale")?.status).toBe("failed");
-    expect(verifyStore.loops.getById("loop_stale")?.nextRunAt).toBeNull();
+    expect(verifyStore.loops.getById("loop_stale_failed")?.status).toBe("failed");
+    expect(verifyStore.loops.getById("loop_stale_failed")?.nextRunAt).toBeNull();
+    expect(verifyStore.loops.getById("loop_stale_success")?.status).toBe(
+      "completed",
+    );
+    expect(verifyStore.loops.getById("loop_stale_cancelled")?.status).toBe(
+      "failed",
+    );
+    expect(verifyStore.loops.getById("loop_stale_parse_failed")?.status).toBe(
+      "failed",
+    );
     expect(verifyStore.loops.getById("loop_legit")?.status).toBe("queued");
     expect(
       verifyStore.events
-        .listByEntity("loop", "loop_stale")
+        .listByEntity("loop", "loop_stale_success")
         .some(
           (event) =>
             event.eventType === "looperd.recovery.loop_queue_normalized",
