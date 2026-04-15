@@ -69,12 +69,12 @@
 - [x] 生成 SHA-256 校验信息
 - [x] Phase 1 先只依赖稳定 artifact 命名 + GitHub Releases API
 - [x] 如后续确有需要，再补 manifest
-- [ ] 在同一 release 流程中发布 npm CLI
-- [ ] 验证 release 产物命名与下载地址可预测
-- [ ] 验证 tag 与 npm package version 一致
-- [ ] 验证 compiled `looperd` artifact 可执行 `--version`
-- [ ] 验证 checksum 与 artifact 内容一致
-- [ ] 验证 CLI 可根据 release 元数据定位正确下载目标
+- [x] 在同一 release 流程中发布 npm CLI
+- [x] 验证 release 产物命名与下载地址可预测
+- [x] 验证 tag 与 npm package version 一致
+- [x] 验证 compiled `looperd` artifact 可执行 `--version`
+- [x] 验证 checksum 与 artifact 内容一致
+- [x] 验证 CLI 可根据 release 元数据定位正确下载目标
 
 ## Phase 6 - CLI 的 daemon 安装助手
 
