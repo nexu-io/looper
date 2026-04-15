@@ -4,14 +4,9 @@
   "private": false,
   "type": "module",
   "bin": {
-    "looper": "dist/index.js",
-    "looperd": "dist/looperd.js"
+    "looper": "dist/index.js"
   },
-  "files": [
-    "dist/index.js",
-    "dist/looperd.js",
-    "dist/storage/sqlite/migrations/**"
-  ],
+  "files": ["dist/index.js"],
   "publishConfig": {
     "access": "public"
   },

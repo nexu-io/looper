@@ -14,11 +14,11 @@
 
 ## Phase 1 - 收回 npm 包职责边界
 
-- [ ] 从 `apps/cli/package.json` 的 `bin` 中移除 `looperd`
-- [ ] 从 `apps/cli/package.json` 的 `files` 中移除 `dist/looperd.js` 与 daemon 相关产物
-- [ ] 将 `apps/cli` 的构建脚本恢复为只构建 `looper`
-- [ ] 从 `apps/cli/scripts/build.ts` 中移除 looperd build 与 migrations copy 逻辑
-- [ ] 确认 `npm pack --dry-run` 产物只包含 CLI 所需文件
+- [x] 从 `apps/cli/package.json` 的 `bin` 中移除 `looperd`
+- [x] 从 `apps/cli/package.json` 的 `files` 中移除 `dist/looperd.js` 与 daemon 相关产物
+- [x] 将 `apps/cli` 的构建脚本恢复为只构建 `looper`
+- [x] 从 `apps/cli/scripts/build.ts` 中移除 looperd build 与 migrations copy 逻辑
+- [x] 确认 `npm pack --dry-run` 产物只包含 CLI 所需文件
 
 ## Phase 2 - 为 `looperd` 建立 compile 构建链路
 
