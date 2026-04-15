@@ -1227,7 +1227,9 @@ function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
   return loop.status === "running" || latestRun.status === "interrupted";
 }
 
-function normalizeStaleQueuedLoopStatus(latestRun: RunRecord | null): string {
+function normalizeStaleQueuedLoopStatus(
+  latestRun: RunRecord | null,
+): LoopRecord["status"] {
   if (!latestRun) {
     return "failed";
   }

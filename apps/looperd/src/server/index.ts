@@ -889,11 +889,12 @@ function buildActiveRunsResponse(
 
 function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
   const activeRuns = context.store.runs.listByStatus("running");
-  const queuedLoopIds = new Set(
+  const queuedLoopIds = new Set<string>(
     context.store.queue
       .list()
-      .filter((item) => item.status === "queued")
-      .map((item) => item.loopId),
+      .flatMap((item) =>
+        item.status === "queued" && item.loopId ? [item.loopId] : [],
+      ),
   );
   const queuedLoops = context.store.loops
     .list()
