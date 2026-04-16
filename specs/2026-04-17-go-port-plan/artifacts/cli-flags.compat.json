@@ -1,0 +1,281 @@
+{
+  "artifactVersion": 1,
+  "generatedFrom": [
+    "apps/cli/src/index.ts",
+    "apps/cli/src/index.test.ts",
+    "specs/2026-04-17-go-port-plan/artifacts/cli-commands.md",
+    "specs/2026-04-17-go-port-plan/artifacts/config-surface.md"
+  ],
+  "notes": [
+    "This artifact freezes the current looper CLI flag surface as part of the Go-port compatibility boundary.",
+    "Flag names, value shapes, forwarding behavior, and command-level meanings should remain compatible unless an intentional contract change is documented.",
+    "Only flags listed in configForwarding.globalFlags are forwarded by looper into daemon-start/config-loading flows via extractConfigArgs()."
+  ],
+  "configForwarding": {
+    "globalFlags": [
+      "config",
+      "host",
+      "port",
+      "db-path",
+      "log-dir",
+      "daemon-mode",
+      "bun-path",
+      "git-path",
+      "gh-path",
+      "osascript-path"
+    ],
+    "rules": [
+      {
+        "behavior": "pass-through",
+        "description": "looper forwards only the listed global flags into CLI config loading and daemon launch argument construction"
+      },
+      {
+        "behavior": "drop-unlisted-flags",
+        "description": "other CLI flags, including --json and command-local flags, are not forwarded by extractConfigArgs()"
+      }
+    ]
+  },
+  "globalFlags": [
+    {
+      "name": "json",
+      "syntax": "--json",
+      "valueKind": "boolean",
+      "semantics": "Emit JSON output for commands that support JSON rendering.",
+      "forwarded": false
+    },
+    {
+      "name": "config",
+      "syntax": "--config <path>",
+      "valueKind": "string",
+      "semantics": "Select the config file path used by looper and forwarded daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "host",
+      "syntax": "--host <host>",
+      "valueKind": "string",
+      "semantics": "Override the daemon host used for API client connection and forwarded daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "port",
+      "syntax": "--port <port>",
+      "valueKind": "string",
+      "semantics": "Override the daemon port used for API client connection and forwarded daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "db-path",
+      "syntax": "--db-path <path>",
+      "valueKind": "string",
+      "semantics": "Forward an explicit SQLite database path into daemon startup/config loading.",
+      "forwarded": true
+    },
+    {
+      "name": "log-dir",
+      "syntax": "--log-dir <path>",
+      "valueKind": "string",
+      "semantics": "Override the daemon log directory in CLI config loading and daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "daemon-mode",
+      "syntax": "--daemon-mode <mode>",
+      "valueKind": "string",
+      "semantics": "Override daemon.mode for CLI config loading and daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "bun-path",
+      "syntax": "--bun-path <path>",
+      "valueKind": "string",
+      "semantics": "Forward an explicit Bun binary path into daemon startup/config loading.",
+      "forwarded": true
+    },
+    {
+      "name": "git-path",
+      "syntax": "--git-path <path>",
+      "valueKind": "string",
+      "semantics": "Forward an explicit git binary path into daemon startup/config loading.",
+      "forwarded": true
+    },
+    {
+      "name": "gh-path",
+      "syntax": "--gh-path <path>",
+      "valueKind": "string",
+      "semantics": "Forward an explicit gh binary path into daemon startup/config loading.",
+      "forwarded": true
+    },
+    {
+      "name": "osascript-path",
+      "syntax": "--osascript-path <path>",
+      "valueKind": "string",
+      "semantics": "Forward an explicit osascript binary path into daemon startup/config loading.",
+      "forwarded": true
+    }
+  ],
+  "commands": {
+    "status": {
+      "flags": ["json"]
+    },
+    "project list": {
+      "flags": ["json"]
+    },
+    "project add": {
+      "flags": [
+        "repo-path",
+        "id",
+        "name",
+        "base-branch",
+        "worktree-root",
+        "repo",
+        "json"
+      ],
+      "flagSemantics": {
+        "repo-path": "Repository path operand accepted either positionally or via flag.",
+        "id": "Explicit project id override for project creation.",
+        "name": "Explicit project display name for project creation.",
+        "base-branch": "Override the project base branch for project creation.",
+        "worktree-root": "Override the project worktree root for project creation.",
+        "repo": "Set the repository slug metadata for project creation.",
+        "json": "Emit the created project as JSON."
+      }
+    },
+    "config show": {
+      "flags": ["json"]
+    },
+    "daemon install": {
+      "flags": ["force", "json"],
+      "flagSemantics": {
+        "force": "Overwrite an existing installed managed daemon binary.",
+        "json": "Emit install results as JSON."
+      }
+    },
+    "daemon status": {
+      "flags": ["json"]
+    },
+    "daemon start": {
+      "flags": ["json"],
+      "inheritsGlobalForwardedFlags": true
+    },
+    "daemon restart": {
+      "flags": ["json"],
+      "inheritsGlobalForwardedFlags": true
+    },
+    "daemon logs": {
+      "flags": ["lines", "json"],
+      "flagSemantics": {
+        "lines": "Request the last N log lines.",
+        "json": "Emit daemon log output metadata as JSON."
+      }
+    },
+    "upgrade": {
+      "flags": ["check", "daemon"],
+      "flagSemantics": {
+        "check": "Check for available CLI and daemon updates without installing.",
+        "daemon": "Install or upgrade the managed daemon binary."
+      }
+    },
+    "loop list": {
+      "flags": ["json"]
+    },
+    "loop start": {
+      "flags": ["id", "type", "pr", "json"],
+      "flagSemantics": {
+        "id": "Loop identifier used by commands that target an existing loop.",
+        "type": "Loop type selector for starting a loop.",
+        "pr": "Pull request reference in owner/repo#number form when starting a reviewer loop.",
+        "json": "Emit loop data as JSON."
+      }
+    },
+    "loop pause": {
+      "flags": ["id", "json"],
+      "flagSemantics": {
+        "id": "Loop identifier to pause.",
+        "json": "Emit loop data as JSON."
+      }
+    },
+    "work": {
+      "flags": [
+        "project",
+        "title",
+        "prompt",
+        "issue",
+        "spec",
+        "repo",
+        "base-branch",
+        "json"
+      ],
+      "flagSemantics": {
+        "project": "Project id that owns the created worker run.",
+        "title": "Human-readable task title.",
+        "prompt": "Implementation prompt text.",
+        "issue": "Issue number used to seed the work request.",
+        "spec": "Path to a spec file used to seed the work request.",
+        "repo": "Repository slug associated with the work request.",
+        "base-branch": "Base branch override for the work request.",
+        "json": "Emit work creation results as JSON."
+      }
+    },
+    "plan": {
+      "flags": ["project", "issue", "json"],
+      "flagSemantics": {
+        "project": "Project id that owns the created planner run.",
+        "issue": "Issue number used to seed the planner run.",
+        "json": "Emit planner creation results as JSON."
+      }
+    },
+    "pr list": {
+      "flags": ["json"]
+    },
+    "pr show": {
+      "flags": ["json"]
+    },
+    "pr status": {
+      "flags": ["json"]
+    },
+    "review": {
+      "flags": ["project", "loop", "json"],
+      "flagSemantics": {
+        "project": "Project id used to resolve context for the review request.",
+        "loop": "Keep reviewing when new commits are pushed.",
+        "json": "Emit review creation results as JSON."
+      }
+    },
+    "run list": {
+      "flags": ["loop", "json"],
+      "flagSemantics": {
+        "loop": "Filter runs by loop id.",
+        "json": "Emit run data as JSON."
+      }
+    },
+    "ps": {
+      "flags": ["type", "project", "json"],
+      "flagSemantics": {
+        "type": "Filter running loops by loop type.",
+        "project": "Filter running loops by project id.",
+        "json": "Emit running-loop data as JSON."
+      }
+    },
+    "jump": {
+      "flags": ["print-path", "shell-integration", "json"],
+      "flagSemantics": {
+        "print-path": "Print only the resolved worktree path.",
+        "shell-integration": "Print a shell helper function for the named shell.",
+        "json": "Emit jump resolution data as JSON."
+      }
+    },
+    "logs": {
+      "flags": ["stderr", "tail", "full", "json"],
+      "flagSemantics": {
+        "stderr": "Show stderr instead of stdout.",
+        "tail": "Show the last N lines of output.",
+        "full": "Show the full output without truncation.",
+        "json": "Emit log payload metadata as JSON."
+      }
+    },
+    "stop": {
+      "flags": ["json"]
+    }
+  }
+}
