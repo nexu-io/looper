@@ -1099,6 +1099,8 @@ describe("runCli", () => {
     const writeCalls: Array<{ path: string; contents: string }> = [];
     const mkdirCalls: string[] = [];
     const spawnCalls: Array<{ command: string; args: string[] }> = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
 
     const exitCode = await runCli(["daemon", "start"], {
       stdout: (line) => lines.push(line),
@@ -1111,10 +1113,20 @@ describe("runCli", () => {
         throw new Error("missing");
       },
       runCommandImpl: async ({ command }) => {
+        if (command === "ps") {
+          return {
+            stdout: "/Users/tester/.looper/bin/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
         if (command === "/Users/tester/.looper/bin/looperd") {
           return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
         }
         return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        killCalls.push({ pid, signal });
       },
       mkdirImpl: async (path) => {
         mkdirCalls.push(path);
@@ -1132,6 +1144,7 @@ describe("runCli", () => {
     expect(spawnCalls).toEqual([
       { command: "/Users/tester/.looper/bin/looperd", args: [] },
     ]);
+    expect(killCalls).toEqual([{ pid: 4321, signal: 0 }]);
     expect(mkdirCalls).toEqual(["/Users/tester/.looper"]);
     expect(writeCalls).toEqual([
       { path: "/Users/tester/.looper/looperd.pid", contents: "4321\n" },
@@ -1142,6 +1155,8 @@ describe("runCli", () => {
 
   test("passes config override flags through when starting daemon", async () => {
     const spawnCalls: Array<{ command: string; args: string[] }> = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
 
     const exitCode = await runCli(
       [
@@ -1165,10 +1180,21 @@ describe("runCli", () => {
           throw new Error("missing");
         },
         runCommandImpl: async ({ command }) => {
+          if (command === "ps") {
+            return {
+              stdout:
+                "/Users/tester/.looper/bin/looperd --config /tmp/looper.json\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           if (command === "/Users/tester/.looper/bin/looperd") {
             return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
           }
           return { stdout: "", stderr: "not found", exitCode: 1 };
+        },
+        killImpl: (pid, signal) => {
+          killCalls.push({ pid, signal });
         },
         mkdirImpl: async () => {},
         writeFileImpl: async () => {},
@@ -1193,6 +1219,61 @@ describe("runCli", () => {
         ],
       },
     ]);
+    expect(killCalls).toEqual([{ pid: 4321, signal: 0 }]);
+  });
+
+  test("fails daemon start when spawned process exits during startup", async () => {
+    const errors: string[] = [];
+    const writeCalls: Array<{ path: string; contents: string }> = [];
+    const removeCalls: string[] = [];
+    let alive = false;
+
+    const exitCode = await runCli(["daemon", "start"], {
+      stderr: (line) => errors.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      readFileImpl: async () => {
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
+        }
+        if (command === "ps") {
+          return { stdout: "", stderr: "", exitCode: 1 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (_pid, signal) => {
+        if (signal === 0 && !alive) {
+          throw new Error("not running");
+        }
+      },
+      sleepImpl: async () => {
+        alive = false;
+      },
+      mkdirImpl: async () => {},
+      writeFileImpl: async (path, contents) => {
+        writeCalls.push({ path, contents });
+      },
+      removeFileImpl: async (path) => {
+        removeCalls.push(path);
+      },
+      spawnDetachedImpl: () => {
+        alive = false;
+        return { pid: 4321 };
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(writeCalls).toEqual([]);
+    expect(removeCalls).toContain("/Users/tester/.looper/looperd.pid");
+    expect(errors.at(-1)).toContain(
+      "Failed to start looperd: process 4321 exited during startup",
+    );
   });
 
   test("returns early on daemon start when pid file points to running process", async () => {
@@ -1246,6 +1327,7 @@ describe("runCli", () => {
       [];
     const removedPidFiles: string[] = [];
     const spawnCalls: string[] = [];
+    let launched = false;
 
     const exitCode = await runCli(["daemon", "start"], {
       stdout: (line) => lines.push(line),
@@ -1254,8 +1336,15 @@ describe("runCli", () => {
         HOME: "/Users/tester",
       },
       readFileImpl: async () => "1234\n",
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
         if (command === "ps") {
+          if (args[1] === "7777") {
+            return {
+              stdout: "/Users/tester/.looper/bin/looperd\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return {
             stdout: "/Applications/Calculator.app/Contents/MacOS/Calculator\n",
             stderr: "",
@@ -1269,6 +1358,9 @@ describe("runCli", () => {
       },
       killImpl: (pid, signal) => {
         killCalls.push({ pid, signal });
+        if (pid === 7777 && signal === 0 && !launched) {
+          throw new Error("not running");
+        }
       },
       removeFileImpl: async (path) => {
         removedPidFiles.push(path);
@@ -1277,12 +1369,16 @@ describe("runCli", () => {
       writeFileImpl: async () => {},
       spawnDetachedImpl: (options) => {
         spawnCalls.push(options.command);
+        launched = true;
         return { pid: 7777 };
       },
     });
 
     expect(exitCode).toBe(0);
-    expect(killCalls).toEqual([{ pid: 1234, signal: 0 }]);
+    expect(killCalls).toEqual([
+      { pid: 1234, signal: 0 },
+      { pid: 7777, signal: 0 },
+    ]);
     expect(removedPidFiles).toContain("/Users/tester/.looper/looperd.pid");
     expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
     expect(lines.join("\n")).toContain("does not appear to be looperd");
@@ -1290,6 +1386,7 @@ describe("runCli", () => {
 
   test("starts daemon from PATH binary when local install is unavailable", async () => {
     const spawnCalls: string[] = [];
+    let launched = false;
     const exitCode = await runCli(["daemon", "start"], {
       stdout: () => {},
       loadConfigImpl: async () => createConfig() as never,
@@ -1300,7 +1397,10 @@ describe("runCli", () => {
       readFileImpl: async () => {
         throw new Error("missing");
       },
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps" && args[1] === "5678") {
+          return { stdout: "looperd\n", stderr: "", exitCode: 0 };
+        }
         if (command === "/Users/tester/.looper/bin/looperd") {
           return { stdout: "", stderr: "not found", exitCode: 1 };
         }
@@ -1309,10 +1409,16 @@ describe("runCli", () => {
         }
         return { stdout: "", stderr: "not found", exitCode: 1 };
       },
+      killImpl: (pid, signal) => {
+        if (pid === 5678 && signal === 0 && !launched) {
+          throw new Error("not running");
+        }
+      },
       mkdirImpl: async () => {},
       writeFileImpl: async () => {},
       spawnDetachedImpl: (options) => {
         spawnCalls.push(options.command);
+        launched = true;
         return { pid: 5678 };
       },
     });
@@ -1348,13 +1454,20 @@ describe("runCli", () => {
           alive = false;
           return;
         }
-        if (signal === 0 && !alive) {
+        if (signal === 0 && !alive && pid !== 2233) {
           throw new Error("not running");
         }
       },
       runCommandImpl: async ({ command, args }) => {
-        if (command === "ps") {
+        if (command === "ps" && args[1] === "1234") {
           expect(args).toEqual(["-p", "1234", "-o", "command="]);
+          return {
+            stdout: "/Users/tester/.looper/bin/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command === "ps" && args[1] === "2233") {
           return {
             stdout: "/Users/tester/.looper/bin/looperd\n",
             stderr: "",
@@ -1395,6 +1508,7 @@ describe("runCli", () => {
     const removedPidFiles: string[] = [];
     const spawnCalls: string[] = [];
     let readPidCalls = 0;
+    let launched = false;
 
     const exitCode = await runCli(["daemon", "restart"], {
       stdout: (line) => lines.push(line),
@@ -1410,8 +1524,15 @@ describe("runCli", () => {
 
         throw new Error("missing");
       },
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
         if (command === "ps") {
+          if (args[1] === "2233") {
+            return {
+              stdout: "/Users/tester/.looper/bin/looperd\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return {
             stdout: "/Applications/Calculator.app/Contents/MacOS/Calculator\n",
             stderr: "",
@@ -1425,6 +1546,9 @@ describe("runCli", () => {
       },
       killImpl: (pid, signal) => {
         killCalls.push({ pid, signal });
+        if (pid === 2233 && signal === 0 && !launched) {
+          throw new Error("not running");
+        }
       },
       removeFileImpl: async (path) => {
         removedPidFiles.push(path);
@@ -1433,12 +1557,16 @@ describe("runCli", () => {
       writeFileImpl: async () => {},
       spawnDetachedImpl: (options) => {
         spawnCalls.push(options.command);
+        launched = true;
         return { pid: 2233 };
       },
     });
 
     expect(exitCode).toBe(0);
-    expect(killCalls).toEqual([{ pid: 1234, signal: 0 }]);
+    expect(killCalls).toEqual([
+      { pid: 1234, signal: 0 },
+      { pid: 2233, signal: 0 },
+    ]);
     expect(removedPidFiles).toContain("/Users/tester/.looper/looperd.pid");
     expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
     expect(lines.join("\n")).toContain("does not appear to be looperd");
@@ -1449,6 +1577,7 @@ describe("runCli", () => {
       [];
     const spawnCalls: string[] = [];
     let alive = true;
+    let launched = false;
 
     const exitCode = await runCli(["daemon", "restart"], {
       stdout: () => {},
@@ -1463,7 +1592,14 @@ describe("runCli", () => {
 
         throw new Error("missing");
       },
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps" && args[1] === "2233") {
+          return {
+            stdout: "/Users/tester/.looper/bin/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
         if (command === "ps") {
           return {
             stdout: "node /Users/tester/.local/bin/looperd --serve\n",
@@ -1482,7 +1618,10 @@ describe("runCli", () => {
           alive = false;
           return;
         }
-        if (signal === 0 && !alive) {
+        if (signal === 0 && !alive && pid !== 2233) {
+          throw new Error("not running");
+        }
+        if (pid === 2233 && signal === 0 && !launched) {
           throw new Error("not running");
         }
       },
@@ -1492,6 +1631,7 @@ describe("runCli", () => {
       writeFileImpl: async () => {},
       spawnDetachedImpl: (options) => {
         spawnCalls.push(options.command);
+        launched = true;
         return { pid: 2233 };
       },
     });
@@ -1506,6 +1646,7 @@ describe("runCli", () => {
     const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
       [];
     let readPidCalls = 0;
+    let launched = false;
 
     const exitCode = await runCli(["daemon", "restart"], {
       stdout: (line) => lines.push(line),
@@ -1523,7 +1664,14 @@ describe("runCli", () => {
         }
         throw new Error("missing");
       },
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps" && args[1] === "7788") {
+          return {
+            stdout: "/Users/tester/.looper/bin/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
         if (command === "/Users/tester/.looper/bin/looperd") {
           return { stdout: "0.6.0\n", stderr: "", exitCode: 0 };
         }
@@ -1532,17 +1680,26 @@ describe("runCli", () => {
       killImpl: (pid, signal) => {
         killCalls.push({ pid, signal });
         if (signal === 0) {
+          if (pid === 7788 && launched) {
+            return;
+          }
           throw new Error("not running");
         }
       },
       removeFileImpl: async () => {},
       mkdirImpl: async () => {},
       writeFileImpl: async () => {},
-      spawnDetachedImpl: () => ({ pid: 7788 }),
+      spawnDetachedImpl: () => {
+        launched = true;
+        return { pid: 7788 };
+      },
     });
 
     expect(exitCode).toBe(0);
-    expect(killCalls).toEqual([{ pid: 9999, signal: 0 }]);
+    expect(killCalls).toEqual([
+      { pid: 9999, signal: 0 },
+      { pid: 7788, signal: 0 },
+    ]);
     expect(lines.join("\n")).toContain("stale");
   });
 
@@ -1550,6 +1707,7 @@ describe("runCli", () => {
     const lines: string[] = [];
     const spawnCalls: string[] = [];
     const writeCalls: string[] = [];
+    let launched = false;
 
     const exitCode = await runCli(["daemon", "restart"], {
       stdout: (line) => lines.push(line),
@@ -1560,11 +1718,23 @@ describe("runCli", () => {
       readFileImpl: async () => {
         throw new Error("missing");
       },
-      runCommandImpl: async ({ command }) => {
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps" && args[1] === "3344") {
+          return {
+            stdout: "/Users/tester/.looper/bin/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
         if (command === "/Users/tester/.looper/bin/looperd") {
           return { stdout: "0.7.0\n", stderr: "", exitCode: 0 };
         }
         return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        if (pid === 3344 && signal === 0 && !launched) {
+          throw new Error("not running");
+        }
       },
       mkdirImpl: async () => {},
       writeFileImpl: async (path) => {
@@ -1572,6 +1742,7 @@ describe("runCli", () => {
       },
       spawnDetachedImpl: (options) => {
         spawnCalls.push(options.command);
+        launched = true;
         return { pid: 3344 };
       },
     });

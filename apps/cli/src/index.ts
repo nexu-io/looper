@@ -1308,6 +1308,17 @@ async function runDaemonStart(context: CliContext) {
     throw new Error("Failed to start looperd: process did not report a pid");
   }
 
+  await context.sleep(100);
+  if (
+    !isProcessAlive(context, pid) ||
+    !(await isLooperdProcess(context, pid))
+  ) {
+    await removePidFile(context, pidFilePath);
+    throw new Error(
+      `Failed to start looperd: process ${pid} exited during startup`,
+    );
+  }
+
   await context.mkdirImpl(dirname(pidFilePath), { recursive: true });
   await context.writeFileImpl(pidFilePath, `${pid}\n`);
 
