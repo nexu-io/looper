@@ -668,7 +668,7 @@ describe("runCli", () => {
       runCommandImpl: async ({ command, args, timeoutMs }) => {
         runCommandCalls.push({ command, args, timeoutMs });
         if (command === "/Users/tester/.looper/bin/looperd") {
-          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+          return { stdout: "0.2.1\n", stderr: "", exitCode: 0 };
         }
 
         return { stdout: "", stderr: "not found", exitCode: 1 };
@@ -683,7 +683,7 @@ describe("runCli", () => {
       timeoutMs: 5_000,
     });
     expect(lines.join("\n")).toContain("daemonVersion");
-    expect(lines.join("\n")).toContain("0.2.0");
+    expect(lines.join("\n")).toContain("0.2.1");
     expect(lines.join("\n")).toContain("/Users/tester/.looper/bin/looperd");
   });
 
@@ -705,7 +705,7 @@ describe("runCli", () => {
         }
 
         if (command === "looperd") {
-          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+          return { stdout: "0.2.1\n", stderr: "", exitCode: 0 };
         }
 
         return { stdout: "", stderr: "not found", exitCode: 1 };
@@ -713,7 +713,7 @@ describe("runCli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(lines.join("\n")).toContain("0.2.0");
+    expect(lines.join("\n")).toContain("0.2.1");
     expect(lines.join("\n")).toContain("looperd");
   });
 
@@ -818,7 +818,7 @@ describe("runCli", () => {
         if (
           url === "https://registry.npmjs.org/%40powerformer%2Flooper/latest"
         ) {
-          return new Response(JSON.stringify({ version: "0.2.0" }));
+          return new Response(JSON.stringify({ version: "0.2.1" }));
         }
 
         if (
@@ -834,7 +834,7 @@ describe("runCli", () => {
       },
       runCommandImpl: async ({ command }) => {
         if (command === "/Users/tester/.looper/bin/looperd") {
-          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+          return { stdout: "0.2.1\n", stderr: "", exitCode: 0 };
         }
 
         return { stdout: "", stderr: "not found", exitCode: 1 };
@@ -843,8 +843,8 @@ describe("runCli", () => {
 
     expect(exitCode).toBe(0);
     expect(lines.join("\n")).toContain("cliCurrent");
-    expect(lines.join("\n")).toContain("0.2.0");
-    expect(lines.join("\n")).toContain("0.2.0");
+    expect(lines.join("\n")).toContain("0.2.1");
+    expect(lines.join("\n")).toContain("0.2.1");
     expect(lines.join("\n")).toContain("0.3.0");
     expect(lines.join("\n")).toContain("installed-binary");
   });
@@ -912,7 +912,7 @@ describe("runCli", () => {
       },
       runCommandImpl: async ({ command }) => {
         if (command === "/Users/tester/.looper/bin/looperd") {
-          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+          return { stdout: "0.2.1\n", stderr: "", exitCode: 0 };
         }
 
         return { stdout: "", stderr: "not found", exitCode: 1 };
@@ -933,7 +933,7 @@ describe("runCli", () => {
     expect(installCalls[0]?.homeDir).toBe("/Users/tester");
     expect(installCalls[0]?.force).toBe(true);
     expect(installCalls[0]?.tag).toBe("v0.3.0");
-    expect(lines.join("\n")).toContain("Upgraded looperd 0.2.0 → 0.3.0");
+    expect(lines.join("\n")).toContain("Upgraded looperd 0.2.1 → 0.3.0");
     expect(lines.join("\n")).toContain("looper daemon restart");
   });
 
@@ -960,7 +960,7 @@ describe("runCli", () => {
           "https://api.github.com/repos/powerformer/looper/releases/latest"
         ) {
           return new Response(
-            JSON.stringify({ tag_name: "v0.2.0", assets: [] }),
+            JSON.stringify({ tag_name: "v0.2.1", assets: [] }),
           );
         }
 
@@ -968,7 +968,7 @@ describe("runCli", () => {
       },
       runCommandImpl: async ({ command }) => {
         if (command === "/Users/tester/.looper/bin/looperd") {
-          return { stdout: "0.2.0\n", stderr: "", exitCode: 0 };
+          return { stdout: "0.2.1\n", stderr: "", exitCode: 0 };
         }
 
         return { stdout: "", stderr: "not found", exitCode: 1 };
@@ -986,7 +986,7 @@ describe("runCli", () => {
 
     expect(exitCode).toBe(0);
     expect(installCalled).toBe(false);
-    expect(lines.join("\n")).toContain("looperd is already up to date (0.2.0)");
+    expect(lines.join("\n")).toContain("looperd is already up to date (0.2.1)");
   });
 
   test("upgrade --daemon installs managed daemon when API version is current but no managed binary exists", async () => {

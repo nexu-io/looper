@@ -12,7 +12,7 @@
     },
     "apps/cli": {
       "name": "@powerformer/looper",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "bin": {
         "looper": "dist/index.js",
       },
