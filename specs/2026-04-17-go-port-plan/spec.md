@@ -47,7 +47,7 @@ Secondary goals:
 
 1. Improve package boundaries while porting.
 2. Make storage, process execution, and API contracts more explicit.
-3. Keep a migration path that allows incremental validation instead of one big rewrite cutover.
+3. Optimize for a fast, clean cutover instead of a long dual-runtime migration.
 
 Non-goals:
 
@@ -60,21 +60,29 @@ Non-goals:
 
 ## 3. Porting strategy
 
-## 3.1 Recommended strategy
+### 3.1 Recommended strategy
 
-Use a **strangler migration** with explicit parity checkpoints, not a blind rewrite.
+Use a **big-bang migration** with a short contract-freeze period and a single implementation track.
 
 That means:
 
 1. Freeze the current product behavior as the source of truth.
-2. Define stable HTTP, config, and storage contracts.
-3. Implement a new Go daemon and Go CLI alongside the current TypeScript apps.
-4. Move subsystem-by-subsystem, validating parity after each phase.
-5. Retire Bun/TypeScript only after the Go path is production-complete.
+2. Define stable HTTP, config, and storage contracts up front.
+3. Build the new Go daemon and Go CLI as the replacement implementation, not as a long-lived parallel stack.
+4. Validate parity aggressively during development, but cut over in one coordinated switch.
+5. Remove Bun/TypeScript from the main path as soon as the Go implementation is ready.
 
-## 3.2 Why this is preferred over a hard cutover rewrite
+### 3.2 Why big-bang is preferred here
 
-The project contains several high-risk areas:
+This project has not gone to production yet, so the main optimization target is delivery speed and codebase cleanliness, not migration safety for live users.
+
+That changes the tradeoff:
+
+- a long strangler plan would force the team to maintain dual implementations, mixed-runtime compatibility rules, and extra migration scaffolding
+- the extra scaffolding would slow the port and leave temporary architecture in the codebase
+- a focused rewrite can keep the target architecture cleaner and reach a Go-first repository sooner
+
+The high-risk areas still need deliberate validation:
 
 - SQLite persistence and migrations
 - process management and long-running agent execution
@@ -82,13 +90,13 @@ The project contains several high-risk areas:
 - daemon/CLI compatibility
 - installer and release behavior
 
-A big-bang rewrite would combine architecture migration, behavior migration, and release migration into one failure domain. The better path is to separate those concerns and prove parity in layers.
+But those risks should be handled with contract fixtures, integration tests, and end-to-end validation during the rewrite, not by extending the life of the TypeScript implementation.
 
 ---
 
 ## 4. Current system map to port
 
-## 4.1 Apps
+### 4.1 Apps
 
 - `apps/looperd`
   - CLI entrypoint for daemon binary
@@ -97,15 +105,17 @@ A big-bang rewrite would combine architecture migration, behavior migration, and
   - HTTP API server under `/api/v1/*`
   - SQLite-backed persistence
   - scheduler / loops / runs / worker flows
-  - infra adapters for git, gh, shell, notifications, and agent vendors
+  - reviewer / fixer / planner / worker orchestration state machines
+  - infra adapters for git, gh, shell, notifications, spec PR handling, and agent vendors
 - `apps/cli`
   - local CLI entrypoint
   - daemon install / upgrade / start / restart / status
   - API client and human-readable formatting
 - `apps/web`
   - no meaningful migration work yet
+  - should remain out of scope for the port and can stay as a placeholder until there is real product work for it
 
-## 4.2 Major daemon subsystems
+### 4.2 Major daemon subsystems
 
 From the current repo structure, the Go port must cover at least these domains:
 
@@ -129,32 +139,44 @@ From the current repo structure, the Go port must cover at least these domains:
    - SQLite connection handling
    - migrations
    - repositories / queries
+   - persistent scheduler queue state
+   - event log storage and retrieval
    - backups or retention behavior where applicable
 5. **Runtime orchestration**
    - projects
    - loops
    - runs
+   - reviewer lifecycle
+   - fixer lifecycle
+   - planner lifecycle
+   - worker lifecycle
    - agent execution lifecycle
    - scheduler and recovery behavior
+   - event emission and persisted run history
+   - domain rules for loop targets, locking, and uniqueness constraints
 6. **Infra adapters**
    - git
    - GitHub CLI / API interactions
    - worktree management
    - shell command execution
    - notifications (`osascript` today)
+   - spec PR state/label handling
+   - agent prompt/completion marker handling
 7. **CLI surface**
    - all existing user commands
    - daemon management commands
    - release/install helpers
    - text and JSON output modes
 
-## 4.3 Bun-specific behavior to replace
+### 4.3 Bun-specific behavior to replace
 
 The main Bun-native concerns are:
 
 - `Bun.serve()`
 - `bun:sqlite`
 - `Bun.which()`
+- `Bun.$` shell execution
+- Bun subprocess APIs used for agent/process execution
 - Bun test/build/release flows
 - Bun-specific CLI/runtime assumptions
 - Bun compile reliability for shipping `looperd`
@@ -165,7 +187,7 @@ The Go port should replace these with standard Go libraries or well-contained de
 
 ## 5. Target Go architecture
 
-## 5.1 Recommended repository layout
+### 5.1 Recommended repository layout
 
 Recommended target shape:
 
@@ -178,12 +200,18 @@ internal/
   bootstrap/
   config/
   api/
+  domain/
   runtime/
   storage/
   scheduler/
   projects/
   runs/
   loops/
+  reviewer/
+  fixer/
+  planner/
+  worker/
+  eventlog/
   agent/
   infra/
     git/
@@ -191,6 +219,7 @@ internal/
     worktree/
     shell/
     notify/
+    specpr/
 pkg/
   api/
   version/
@@ -210,30 +239,34 @@ Rules:
 4. Keep migrations as embedded files via Go `embed`.
 5. Use `pkg/api` for shared request/response and error-code types consumed by both CLI and daemon.
 
-## 5.2 Architecture boundaries
+### 5.2 Architecture boundaries
 
 Recommended layering:
 
 1. **Domain / application layer**
-   - loop state transitions
-   - run lifecycle
-   - project registration
-   - orchestration rules
+    - loop state transitions
+    - run lifecycle
+    - project registration
+    - orchestration rules
+    - reviewer/fixer/planner/worker state transitions
+    - lock-key, target, and uniqueness invariants
 2. **Ports / interfaces**
-   - storage
-   - git/github
-   - notifications
-   - agent execution
-   - clock/process abstractions where tests need control
+    - storage
+    - git/github
+    - notifications
+    - agent execution
+    - event logging
+    - clock/process abstractions where tests need control
 3. **Adapters**
-   - SQLite repos
-   - HTTP handlers
-   - CLI commands
-   - OS process execution
+    - SQLite repos
+    - HTTP handlers
+    - CLI commands
+    - OS process execution
+    - PR label/spec-path helpers and installer/release helpers
 
 This is an opportunity to make the current implicit boundaries explicit rather than carrying file-for-file TypeScript structure into Go.
 
-## 5.3 Recommended libraries
+### 5.3 Recommended libraries
 
 Prefer conservative choices:
 
@@ -258,7 +291,7 @@ Additional guidance:
 
 ## 6. Key design decisions to settle before implementation
 
-## 6.1 API compatibility
+### 6.1 API compatibility
 
 Decide whether the Go daemon will keep the exact `/api/v1/*` contracts.
 
@@ -268,9 +301,9 @@ Recommendation:
 
 That allows:
 
-- old CLI ↔ new daemon smoke tests
-- new CLI ↔ old daemon smoke tests where possible
-- less migration risk
+- the Go daemon and Go CLI to converge on one stable contract
+- fixture-based validation against the TypeScript reference behavior
+- less churn while the rewrite is in flight
 
 This compatibility boundary must include:
 
@@ -287,7 +320,7 @@ Phase 0 should freeze this contract in a machine-verifiable form, preferably one
 2. golden request/response fixtures
 3. JSON schema plus endpoint fixtures
 
-## 6.2 Config compatibility
+### 6.2 Config compatibility
 
 Recommendation:
 
@@ -304,7 +337,7 @@ This avoids forcing users to rewrite local setup during the port.
 
 The compatibility boundary should also explicitly include CLI flag names and semantics, not just daemon config inputs.
 
-## 6.3 Storage compatibility
+### 6.3 Storage compatibility
 
 This is the biggest architectural fork in the road.
 
@@ -319,8 +352,8 @@ Recommendation:
 
 Reason:
 
-- much lower cutover risk
-- easier smoke validation against real local state
+- faster cutover with less temporary migration code
+- easier validation against real local state
 - no separate data migration project in phase 1
 
 Additional decision to settle:
@@ -329,7 +362,13 @@ Additional decision to settle:
 
 This decision should be made explicitly before repository work begins.
 
-## 6.4 External tool strategy
+The storage compatibility boundary should explicitly include:
+
+- scheduler queue persistence and restart recovery semantics
+- event-log schema and retention behavior where applicable
+- migration compatibility with real databases created by the TypeScript implementation
+
+### 6.4 External tool strategy
 
 Current behavior depends on tools like `git`, `gh`, and `osascript`.
 
@@ -342,13 +381,13 @@ Recommendation:
 
 This keeps behavior stable and avoids a second rewrite hidden inside the port.
 
-## 6.5 Process model
+### 6.5 Process model
 
 Recommendation:
 
 > Keep the local foreground daemon + detached start helper model first. Do not redesign supervision during the language port.
 
-## 6.6 Agent execution model
+### 6.6 Agent execution model
 
 The agent execution subsystem deserves its own migration decision because it is the heaviest Bun-runtime dependency in the project.
 
@@ -365,7 +404,7 @@ The Go design must preserve:
 5. SIGTERM → SIGKILL escalation behavior
 6. final parse/completion marker handling
 
-## 6.7 Scheduler model
+### 6.7 Scheduler model
 
 Recommendation:
 
@@ -373,7 +412,9 @@ Recommendation:
 
 In Go, that likely means a `time.Ticker` plus a trigger channel, not a goroutine-per-item architecture.
 
-## 6.8 Build and version metadata
+That model must also preserve persisted queue semantics so restart/recovery behavior matches the current daemon closely enough for parity.
+
+### 6.8 Build and version metadata
 
 Recommendation:
 
@@ -386,7 +427,7 @@ The Go binaries should preserve the current user-facing metadata behavior:
 - daemon version in status responses
 - build SHA / build timestamp where currently exposed
 
-## 6.9 Logging and observability
+### 6.9 Logging and observability
 
 Recommendation:
 
@@ -394,11 +435,13 @@ Recommendation:
 
 If exact log format compatibility is not required, the spec should still define what compatibility is required operationally.
 
-## 6.10 Rollback posture
+This should also cover event-log observability expectations, not just daemon log files.
+
+### 6.10 Rollback posture
 
 Recommendation:
 
-> The TypeScript implementation remains the production path until Phase 10 cutover; any earlier phase must be safe to abandon without user-facing migration debt.
+> The TypeScript implementation is the reference path only until the Go rewrite is complete; once the Go implementation is feature-complete and validated, cut over directly and archive the TypeScript path.
 
 ---
 
@@ -498,6 +541,8 @@ Deliverables:
 4. scheduler and recovery loop
 5. run/loop/project orchestration core
 6. graceful shutdown coordination
+7. reviewer/fixer/planner/worker orchestration state machines
+8. event emission and persisted queue/recovery behavior
 
 Acceptance criteria:
 
@@ -515,14 +560,15 @@ Deliverables:
 3. GitHub adapter
 4. worktree adapter
 5. notification adapter
-6. agent execution adapter
-7. daemon-process detection compatibility for mixed TS/Go environments
+6. spec PR adapter behavior
+7. agent execution adapter
 
 Acceptance criteria:
 
 - Integration tests cover the critical happy paths and failure modes.
 - Tool resolution and error reporting match current user expectations.
 - Agent execution parity is validated for streaming output, heartbeat tracking, inactivity timeout, and kill escalation.
+- Git/GitHub/spec-PR flows are validated against the current contract-sensitive behaviors.
 
 ## Phase 6 - Port HTTP API
 
@@ -550,7 +596,6 @@ Deliverables:
 4. config display
 5. JSON/text formatting
 6. install and upgrade helpers
-7. dual-daemon detection behavior during migration
 
 Acceptance criteria:
 
@@ -558,21 +603,23 @@ Acceptance criteria:
 - JSON mode remains stable enough for scripted use.
 - The Go CLI remains testable with injected dependencies or an equivalent isolation pattern.
 
-## Phase 8 - Dual-run validation
+## Phase 8 - Big-bang validation
 
 Deliverables:
 
-1. smoke tests for TS CLI ↔ Go daemon
-2. smoke tests for Go CLI ↔ TS daemon where feasible
-3. fixture-based parity tests for config and API responses
-4. real local workflow validation on sample repos
-5. mixed-install daemon detection tests
+1. fixture-based parity tests for config and API responses
+2. CLI golden tests and help-output checks
+3. real local workflow validation on sample repos
+4. install/upgrade validation for the Go binaries
+5. final SQLite migration validation against TypeScript-created databases
+6. final agent execution validation for streaming, heartbeat, timeout, and kill-escalation behavior
 
 Acceptance criteria:
 
 - The Go implementation is feature-complete for current supported workflows.
 - Remaining gaps are explicitly listed and accepted.
-- Dual-run validation uses separate DB paths/ports or strictly sequential execution; both daemons are never assumed to run against the same runtime state concurrently.
+- The Go binaries can replace the TypeScript binaries without requiring a mixed-runtime operating mode.
+- SQLite, process execution, Git/GitHub integration, daemon/CLI compatibility, and install/release behavior have all been re-validated at the end of the rewrite, not only in earlier phases.
 
 ## Phase 9 - Packaging and release migration
 
@@ -621,19 +668,19 @@ Recommended order:
 9. review/work automation paths
 10. install/upgrade/release pipeline
 
-This ordering should be treated as the preferred vertical-slice execution order for Phases 4-7, even if the phase descriptions remain grouped by layer.
+This ordering should be treated as the preferred execution order within the phase plan. When the suggested order and the phase grouping appear to conflict, follow the subsystem order for implementation sequencing and use the phases as milestone buckets.
 
 Why this order:
 
 - it establishes deterministic foundations first
-- it gives early end-to-end vertical slices
+- it keeps the rewrite on a clean dependency order
 - it postpones the most failure-prone orchestration logic until storage and contracts are stable
 
 ---
 
 ## 9. Testing strategy for the port
 
-## 9.1 Parity tests
+### 9.1 Parity tests
 
 Add tests that compare Go behavior against frozen expectations from the current implementation for:
 
@@ -642,8 +689,10 @@ Add tests that compare Go behavior against frozen expectations from the current 
 - API response envelopes
 - CLI JSON output
 - migration results
+- scheduler queue persistence and recovery
+- event-log records for key orchestration flows
 
-## 9.2 Integration tests
+### 9.2 Integration tests
 
 Required integration coverage:
 
@@ -655,8 +704,10 @@ Required integration coverage:
 6. git/worktree shell integration
 7. graceful shutdown with in-flight work
 8. agent execution streaming and timeout behavior
+9. reviewer/fixer/planner/worker orchestration happy paths
+10. persisted queue recovery and event-log emission
 
-## 9.3 End-to-end smoke tests
+### 9.3 End-to-end smoke tests
 
 At minimum keep automated smoke paths for:
 
@@ -666,8 +717,9 @@ At minimum keep automated smoke paths for:
 4. `looper daemon status`
 5. project registration
 6. at least one run-producing workflow
+7. one end-to-end workflow each for reviewer, fixer, planner, and worker if those workflows remain supported at cutover
 
-## 9.4 Golden fixtures
+### 9.4 Golden fixtures
 
 Use golden files for:
 
@@ -681,7 +733,7 @@ This is especially useful because the current CLI has many commands and formatti
 
 ## 10. Risks and mitigations
 
-## 10.1 Hidden behavior drift
+### 10.1 Hidden behavior drift
 
 Risk:
 
@@ -692,7 +744,7 @@ Mitigation:
 - create contract tests before rewriting each subsystem
 - preserve API/config/storage compatibility first
 
-## 10.2 SQLite driver differences
+### 10.2 SQLite driver differences
 
 Risk:
 
@@ -704,7 +756,7 @@ Mitigation:
 - use real-database integration tests rather than mocks only
 - explicitly test backup and `VACUUM INTO` related behavior if retained
 
-## 10.3 Process execution differences
+### 10.3 Process execution differences
 
 Risk:
 
@@ -716,7 +768,7 @@ Mitigation:
 - add OS-level integration tests for the supported platforms
 - test mixed stdout/stderr streaming and process-group termination behavior explicitly
 
-## 10.4 Over-redesign during port
+### 10.4 Over-redesign during port
 
 Risk:
 
@@ -727,7 +779,7 @@ Mitigation:
 - treat parity as the default
 - require explicit approval for intentional behavior changes
 
-## 10.5 Release disruption
+### 10.5 Release disruption
 
 Risk:
 
@@ -735,10 +787,10 @@ Risk:
 
 Mitigation:
 
-- keep TypeScript release path alive until Go artifacts are proven
-- run parallel release dry-runs before cutover
+- keep TypeScript release behavior available as a reference until Go artifacts are proven
+- run release dry-runs for the Go artifacts before cutover
 
-## 10.6 Contract drift during a long migration
+### 10.6 Contract drift during a long migration
 
 Risk:
 
@@ -750,16 +802,26 @@ Mitigation:
 - require new TS behavior changes to update the frozen fixtures/specs intentionally
 - avoid implicit contract expansion during the port
 
-## 10.7 Dual-runtime validation confusion
+### 10.7 Big-bang cutover misses hidden behavior
 
 Risk:
 
-- test runs may accidentally share the same port, PID files, or SQLite DB and produce misleading migration failures
+- the team may miss a low-visibility workflow because there is no prolonged mixed-runtime migration period
 
 Mitigation:
 
-- use explicit isolated runtime paths during dual-run validation
-- never assume concurrent mixed-daemon operation on a shared state directory
+- freeze contracts before implementation starts
+- use fixture-based parity tests plus end-to-end sample-repo validation
+- require a written cutover checklist before replacing the TypeScript binaries
+
+Minimum cutover checklist:
+
+1. all phase acceptance criteria are either satisfied or explicitly waived
+2. Go release artifacts build successfully on target platforms
+3. install/upgrade flows are validated end to end
+4. config, API, CLI golden, SQLite migration, and agent execution parity suites are green
+5. end-to-end sample-repo workflows are green for all supported automation paths
+6. cutover docs specify the exact fate of the TypeScript apps, including `apps/web`
 
 ---
 
@@ -774,6 +836,7 @@ The project can be considered fully ported when all of the following are true:
 5. SQLite persistence, migrations, and runtime recovery are validated in Go.
 6. Release artifacts and install/upgrade flows are documented and working.
 7. The old TypeScript implementation is no longer required for supported usage.
+8. The reviewer, fixer, planner, and worker automation paths are either ported and validated or explicitly removed from scope with documentation.
 
 ---
 

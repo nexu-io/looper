@@ -12,7 +12,10 @@
 - [ ] Inventory the SQLite schema, migrations, and repository responsibilities
 - [ ] Capture a schema DDL snapshot and migration-sequence notes
 - [ ] Inventory all runtime tables, including notifications and worktrees
+- [ ] Inventory scheduler queue and event-log tables plus their recovery/retention semantics
 - [ ] Inventory external tool dependencies (`git`, `gh`, `osascript`, shell)
+- [ ] Inventory reviewer, fixer, planner, and worker state-machine behaviors
+- [ ] Inventory spec-PR label/path conventions and agent completion-marker behavior
 - [ ] Define parity expectations for daemon startup, shutdown, recovery, and run lifecycle
 - [ ] Capture daemon lifecycle notes for start, stop, recovery, and graceful shutdown
 
@@ -46,7 +49,7 @@
 
 ## Phase 3 - Port storage
 
-- [ ] Choose the Go SQLite driver
+- [ ] Implement the Phase 1 SQLite driver decision
 - [ ] Reuse the current schema unless a blocker is found
 - [ ] Decide and document the initial single-connection SQLite model
 - [ ] Port embedded migrations
@@ -54,6 +57,8 @@
 - [ ] Port DB open/close and transaction helpers
 - [ ] Preserve backup / migration safety behavior
 - [ ] Port repositories needed for projects, loops, runs, and runtime metadata
+- [ ] Port scheduler queue persistence and recovery state
+- [ ] Port event-log storage and retrieval behavior
 - [ ] Add real SQLite integration tests
 - [ ] Validate the Go migration runner against databases created by the TS runner across all existing schema versions
 - [ ] Test backup and `VACUUM INTO` behavior if retained
@@ -67,6 +72,10 @@
 - [ ] Port scheduler/recovery startup behavior
 - [ ] Implement scheduler immediate-trigger behavior alongside polling
 - [ ] Port core loop/run/project orchestration
+- [ ] Port reviewer orchestration state machine
+- [ ] Port fixer orchestration state machine
+- [ ] Port planner orchestration state machine
+- [ ] Port worker orchestration state machine
 - [ ] Port graceful shutdown coordination for in-flight work
 - [ ] Define an explicit shutdown timeout budget
 
@@ -77,10 +86,11 @@
 - [ ] Port GitHub integration behavior
 - [ ] Port worktree management
 - [ ] Port notifications behavior
+- [ ] Port spec-PR label/path behavior
 - [ ] Do a dedicated agent execution design spike
 - [ ] Port agent execution lifecycle and heartbeat handling
+- [ ] Port agent completion-marker behavior
 - [ ] Preserve concurrent stdout/stderr capture, bounded buffers, inactivity timeout, and kill escalation
-- [ ] Port daemon-process detection behavior for mixed TS/Go environments
 
 ## Phase 6 - Port the HTTP API
 
@@ -90,7 +100,7 @@
 - [ ] Port loop endpoints
 - [ ] Port run endpoints
 - [ ] Port review/work endpoints
-- [ ] Preserve `/api/v1/*` compatibility during migration
+- [ ] Match the frozen `/api/v1/*` contract in the Go daemon
 - [ ] Preserve error-envelope and error-code compatibility
 
 ## Phase 7 - Port the CLI
@@ -103,7 +113,6 @@
 - [ ] Port daemon start/restart/status/logs flows
 - [ ] Port upgrade flows
 - [ ] Preserve CLI testability with injected dependencies or equivalent isolation
-- [ ] Preserve dual-daemon detection behavior during migration
 
 ## Phase 8 - Validate parity
 
@@ -111,16 +120,17 @@
 - [ ] Add API response parity fixtures
 - [ ] Add API error-code and error-envelope fixtures
 - [ ] Add CLI golden tests
-- [ ] Smoke test TS CLI against the Go daemon
-- [ ] Smoke test Go CLI against the TS daemon where feasible
-- [ ] Test mixed-install daemon detection
-- [ ] Use isolated DB paths/ports or strictly sequential runs during dual-run validation
+- [ ] Re-validate SQLite migrations against TypeScript-created databases at the end of the rewrite
+- [ ] Re-validate agent execution streaming, heartbeat, timeout, and kill escalation at the end of the rewrite
+- [ ] Re-validate Git/GitHub/spec-PR integration behavior at the end of the rewrite
 - [ ] Run end-to-end local workflow validation on sample repos
+- [ ] Run end-to-end validation for reviewer, fixer, planner, and worker flows that remain in scope
+- [ ] Validate Go install/upgrade flows end to end
 
-## Preferred vertical slices during Phases 4-7
+## Preferred execution order during Phases 4-7
 
-- [ ] Deliver status/config endpoint + CLI status/config command slices early
-- [ ] Deliver project-management slice before deeper loop/run automation
+- [ ] Port status/config foundations before deeper runtime automation
+- [ ] Port project management before deeper loop/run automation
 - [ ] Delay process execution and agent orchestration until storage/contracts are stable
 
 ## Phase 9 - Move packaging and release to Go
@@ -135,8 +145,9 @@
 
 ## Phase 10 - Cut over
 
+- [ ] Complete a written cutover go/no-go checklist before replacing TypeScript binaries
 - [ ] Make Go binaries the default supported implementation
 - [ ] Switch CI and release pipelines to Go-first
 - [ ] Remove Bun from the required production runtime path
+- [ ] Decide and document the fate of `apps/web`
 - [ ] Retire or archive the TypeScript implementation after parity is proven
-- [ ] Keep the TS implementation as the production fallback until cutover is complete
