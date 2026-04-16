@@ -7,4 +7,8 @@ export interface LooperdBuildMetadata {
 }
 
 export const LOOPERD_VERSION = "0.1.0";
-export const LOOPERD_BUILD_METADATA: LooperdBuildMetadata = {"versionSource":"apps/cli/package.json","gitCommitSha":null,"buildTimestamp":null};
+export const LOOPERD_BUILD_METADATA: LooperdBuildMetadata = {
+  versionSource: "apps/cli/package.json",
+  gitCommitSha: null,
+  buildTimestamp: null,
+};

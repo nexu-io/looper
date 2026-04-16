@@ -1436,8 +1436,10 @@ async function isLooperdProcess(
     return false;
   }
 
-  const executable = command.trim().split(/\s+/)[0] ?? "";
-  return basename(executable) === "looperd";
+  return command
+    .trim()
+    .split(/\s+/)
+    .some((token) => basename(token.replace(/^['"]|['"]$/g, "")) === "looperd");
 }
 
 async function readProcessCommand(

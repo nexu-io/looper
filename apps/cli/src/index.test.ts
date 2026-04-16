@@ -1333,6 +1333,63 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain("does not appear to be looperd");
   });
 
+  test("restarts daemon when looperd runs via interpreter shim", async () => {
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
+    const spawnCalls: string[] = [];
+    let alive = true;
+
+    const exitCode = await runCli(["daemon", "restart"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      readFileImpl: async (path) => {
+        if (path.endsWith("looperd.pid")) {
+          return "1234\n";
+        }
+
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command }) => {
+        if (command === "ps") {
+          return {
+            stdout: "node /Users/tester/.local/bin/looperd --serve\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.5.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        killCalls.push({ pid, signal });
+        if (signal === "SIGTERM") {
+          alive = false;
+          return;
+        }
+        if (signal === 0 && !alive) {
+          throw new Error("not running");
+        }
+      },
+      sleepImpl: async () => {},
+      removeFileImpl: async () => {},
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push(options.command);
+        return { pid: 2233 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(killCalls).toContainEqual({ pid: 1234, signal: "SIGTERM" });
+    expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
+  });
+
   test("handles stale pid file during daemon restart", async () => {
     const lines: string[] = [];
     const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
