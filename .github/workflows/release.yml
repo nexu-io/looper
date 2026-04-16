@@ -141,6 +141,7 @@ jobs:
   publish-cli:
     needs:
       - prepare
+      - build-looperd
       - create-draft-release
     runs-on: ubuntu-latest
 

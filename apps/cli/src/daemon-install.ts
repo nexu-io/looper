@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { FetchLike } from "./client";
 import {
   type GitHubReleasePayload,
   type LooperdTarget,
   buildGitHubReleaseApiUrl,
   findLooperdReleaseAssets,
 } from "./daemon-release";
-import type { FetchLike } from "./client";
 
 export interface DaemonInstallResult {
   target: LooperdTarget;

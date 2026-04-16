@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import cliPackageJson from "../package.json";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { arch as osArch, homedir, platform as osPlatform } from "node:os";
+import { homedir, arch as osArch, platform as osPlatform } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { cac } from "cac";
+import cliPackageJson from "../package.json";
 
 import {
   type ApiClient,
@@ -14,8 +14,8 @@ import {
   createApiClient,
 } from "./client";
 import {
-  installLooperdBinary,
   type DaemonInstallResult,
+  installLooperdBinary,
 } from "./daemon-install";
 import {
   buildGitHubReleaseApiUrl,
@@ -844,7 +844,8 @@ async function runDaemonStatus(context: CliContext) {
     ?.version;
   const daemonVersion = runningVersion
     ? { version: runningVersion, source: "api" as const, binaryPath: null }
-    : await readInstalledDaemonVersion(context);
+    : ((await readManagedDaemonVersion(context)) ??
+      (await readPathDaemonVersion(context)));
 
   const data = {
     mode: context.config.config.daemon.mode,
@@ -966,31 +967,39 @@ async function runUpgrade(context: CliContext) {
 }
 
 async function runDaemonUpgrade(context: CliContext) {
-  const current = await detectDaemonVersionState(context);
-  const latestRelease = await fetchLatestDaemonRelease(context);
+  const [current, managedDaemon, pathDaemon, latestRelease] = await Promise.all(
+    [
+      detectDaemonVersionState(context),
+      readManagedDaemonVersion(context),
+      readPathDaemonVersion(context),
+      fetchLatestDaemonRelease(context),
+    ],
+  );
   const homeDir =
     context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
 
-  const needsInstall = current === null || current.source === "path-binary";
+  const currentVersion = managedDaemon?.version ?? current?.version ?? null;
+  const needsInstall = managedDaemon === null;
   const needsUpgrade =
     needsInstall ||
-    normalizeVersion(current.version) !==
+    currentVersion === null ||
+    normalizeVersion(currentVersion) !==
       normalizeVersion(latestRelease.version);
 
   if (!needsUpgrade) {
     const payload = {
       changed: false,
-      currentVersion: current.version,
+      currentVersion,
       latestVersion: latestRelease.version,
-      binaryPath: current.binaryPath,
+      binaryPath: managedDaemon?.binaryPath ?? current?.binaryPath ?? null,
     };
     if (hasFlag(context.args, "json")) {
       return printJson(context.write, payload);
     }
 
-    context.write(`looperd is already up to date (${current.version})`);
-    if (current.binaryPath) {
-      context.write(`Managed binary: ${current.binaryPath}`);
+    context.write(`looperd is already up to date (${currentVersion})`);
+    if (managedDaemon?.binaryPath) {
+      context.write(`Managed binary: ${managedDaemon.binaryPath}`);
     }
     return;
   }
@@ -1020,17 +1029,17 @@ async function runDaemonUpgrade(context: CliContext) {
     return printJson(context.write, payload);
   }
 
-  if (current === null) {
+  if (managedDaemon === null && pathDaemon !== null) {
+    context.write(
+      `Installed managed looperd ${latestRelease.version} to ${result.installPath} (previously using ${pathDaemon.binaryPath})`,
+    );
+  } else if (managedDaemon === null) {
     context.write(
       `Installed looperd ${latestRelease.version} to ${result.installPath}`,
     );
-  } else if (current.source === "path-binary") {
-    context.write(
-      `Installed managed looperd ${latestRelease.version} to ${result.installPath} (previously using ${current.binaryPath ?? "$PATH"})`,
-    );
   } else {
     context.write(
-      `Upgraded looperd ${current.version} → ${latestRelease.version} at ${result.installPath}`,
+      `Upgraded looperd ${managedDaemon.version} → ${latestRelease.version} at ${result.installPath}`,
     );
   }
   if (result.downloadedFrom) {
@@ -1205,17 +1214,45 @@ function normalizeVersion(value: string): string {
   return value.trim().replace(/^v/, "");
 }
 
-async function readInstalledDaemonVersion(
+async function readManagedDaemonVersion(
   context: CliContext,
 ): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
-  const resolvedBinary = await resolveDaemonBinary(context);
-  if (!resolvedBinary) {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const binaryPath = join(home, ".looper", "bin", "looperd");
+
+  return readDaemonVersion(context, binaryPath);
+}
+
+async function readPathDaemonVersion(
+  context: CliContext,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  return readDaemonVersion(context, "looperd");
+}
+
+async function readDaemonVersion(
+  context: CliContext,
+  command: string,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  const result = await runVersionCommand(context, command);
+  if (result === null) {
     return null;
   }
 
+  return {
+    version: result,
+    source: "binary",
+    binaryPath: command,
+  };
+}
+
+async function runVersionCommand(
+  context: CliContext,
+  command: string,
+): Promise<string | null> {
   try {
     const result = await context.runCommand({
-      command: resolvedBinary.path,
+      command,
       args: ["--version"],
       timeoutMs: 5_000,
     });
@@ -1224,15 +1261,7 @@ async function readInstalledDaemonVersion(
     }
 
     const version = result.stdout.trim();
-    if (!version) {
-      return null;
-    }
-
-    return {
-      version,
-      source: "binary",
-      binaryPath: resolvedBinary.path,
-    };
+    return version.length > 0 ? version : null;
   } catch {
     return null;
   }
@@ -1292,6 +1321,14 @@ async function runDaemonRestart(context: CliContext) {
 
   if (!isProcessAlive(context, existingPid)) {
     context.write(`Daemon pid ${existingPid} is stale; starting daemon.`);
+    await removePidFile(context, pidFilePath);
+    return runDaemonStart(context);
+  }
+
+  if (!(await isLooperdProcess(context, existingPid))) {
+    context.write(
+      `Daemon pid ${existingPid} does not appear to be looperd; treating pid file as stale.`,
+    );
     await removePidFile(context, pidFilePath);
     return runDaemonStart(context);
   }
@@ -1387,6 +1424,40 @@ function isProcessAlive(context: CliContext, pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function isLooperdProcess(
+  context: CliContext,
+  pid: number,
+): Promise<boolean> {
+  const command = await readProcessCommand(context, pid);
+  if (!command) {
+    return false;
+  }
+
+  const executable = command.trim().split(/\s+/)[0] ?? "";
+  return basename(executable) === "looperd";
+}
+
+async function readProcessCommand(
+  context: CliContext,
+  pid: number,
+): Promise<string | null> {
+  try {
+    const result = await context.runCommand({
+      command: "ps",
+      args: ["-p", String(pid), "-o", "command="],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const command = result.stdout.trim();
+    return command.length > 0 ? command : null;
+  } catch {
+    return null;
   }
 }
 

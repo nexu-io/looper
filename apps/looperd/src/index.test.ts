@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { LOOPERD_VERSION } from "./metadata";
 import { resolveLooperdCliArgv, runLooperdCli } from "./index";
+import { LOOPERD_VERSION } from "./metadata";
 
 describe("runLooperdCli", () => {
   test("short-circuits --version before bootstrap", async () => {

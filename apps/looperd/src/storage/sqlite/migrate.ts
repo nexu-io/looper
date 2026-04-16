@@ -5,8 +5,8 @@ import type { Database } from "bun:sqlite";
 
 import type { MigrationRunResult, MigrationStatus } from "../types";
 import {
-  SQLITE_MIGRATIONS,
   type EmbeddedSqliteMigration,
+  SQLITE_MIGRATIONS,
 } from "./migrations.gen";
 import { buildBackupPath } from "./paths";
 

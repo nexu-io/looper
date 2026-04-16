@@ -15,19 +15,19 @@ import {
   definePullRequestLoopTarget,
 } from "../domain/index";
 import {
-  ProjectIdCollisionError,
-  type ProjectManager,
-} from "../projects/index";
-import {
-  getCurrentLooperdTarget,
-  getLooperdArtifactName,
-  isLooperdSupportedTarget,
   LOOPERD_BINARY_BASENAME,
   LOOPERD_BUILD_METADATA,
   LOOPERD_INSTALL_DIR,
   LOOPERD_SUPPORTED_TARGETS,
   LOOPERD_VERSION,
+  getCurrentLooperdTarget,
+  getLooperdArtifactName,
+  isLooperdSupportedTarget,
 } from "../metadata";
+import {
+  ProjectIdCollisionError,
+  type ProjectManager,
+} from "../projects/index";
 import { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {

@@ -12,8 +12,8 @@ import type {
   RunRecord,
   WorktreeRecord,
 } from "../types";
-import type { EmbeddedSqliteMigration } from "./migrations.gen";
 import { SqliteDbCoordinator } from "./db";
+import type { EmbeddedSqliteMigration } from "./migrations.gen";
 
 export interface SqliteStoreOptions {
   dbPath: string;

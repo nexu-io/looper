@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 
 import type { FetchLike } from "./client";
 import {
+  type DaemonInstallFs,
   installLooperdBinary,
   resolveLooperdTarget,
-  type DaemonInstallFs,
 } from "./daemon-install";
 
 describe("daemon install helpers", () => {
