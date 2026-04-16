@@ -88,9 +88,6 @@ jobs:
           - target: darwin-arm64
             runner: macos-14
             artifact-name: looperd-darwin-arm64
-          - target: darwin-x64
-            runner: macos-13
-            artifact-name: looperd-darwin-x64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -188,8 +185,6 @@ jobs:
         run: |
           test -f release-assets/looperd-darwin-arm64
           test -f release-assets/looperd-darwin-arm64.sha256
-          test -f release-assets/looperd-darwin-x64
-          test -f release-assets/looperd-darwin-x64.sha256
 
       - name: Verify Linux artifacts are not published in Phase 1
         run: |
@@ -208,5 +203,3 @@ jobs:
           files: |
             release-assets/looperd-darwin-arm64
             release-assets/looperd-darwin-arm64.sha256
-            release-assets/looperd-darwin-x64
-            release-assets/looperd-darwin-x64.sha256
