@@ -9,6 +9,7 @@ import {
   createDefaultLooperConfig,
 } from "../config/index";
 import { LOOPERD_BUILD_METADATA, LOOPERD_VERSION } from "../metadata";
+import { ProjectIdCollisionError } from "../projects/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -19,6 +20,11 @@ const DAEMON_HTTP_CONTRACT_ARTIFACT_PATH = new URL(
 
 const DAEMON_HTTP_RESPONSE_ARTIFACT_PATH = new URL(
   "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.responses.compat.json",
+  import.meta.url,
+);
+
+const DAEMON_HTTP_ERROR_ARTIFACT_PATH = new URL(
+  "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.errors.compat.json",
   import.meta.url,
 );
 
@@ -64,6 +70,35 @@ interface DaemonHttpResponseArtifact {
   }>;
 }
 
+interface DaemonHttpErrorArtifact {
+  sharedBehavior: {
+    responseHeaders: Record<string, string>;
+    requestIdHeader: { name: string };
+  };
+  cases: Array<{
+    id: string;
+    fixture:
+      | "default"
+      | "projects-id-conflict"
+      | "projects-internal-error"
+      | "projects-invalid-id"
+      | "auth-misconfigured"
+      | "auth-required"
+      | "runtime-control-disabled"
+      | "inactive-run"
+      | "ambiguous-project-repo"
+      | "pull-request-mismatch";
+    method: string;
+    path: string;
+    request?: {
+      headers?: Record<string, string>;
+      body?: Record<string, unknown>;
+    };
+    expectedStatus: number;
+    body: unknown;
+  }>;
+}
+
 async function loadDaemonHttpContractArtifact() {
   return (await Bun.file(
     DAEMON_HTTP_CONTRACT_ARTIFACT_PATH,
@@ -74,6 +109,12 @@ async function loadDaemonHttpResponseArtifact() {
   return (await Bun.file(
     DAEMON_HTTP_RESPONSE_ARTIFACT_PATH,
   ).json()) as DaemonHttpResponseArtifact;
+}
+
+async function loadDaemonHttpErrorArtifact() {
+  return (await Bun.file(
+    DAEMON_HTTP_ERROR_ARTIFACT_PATH,
+  ).json()) as DaemonHttpErrorArtifact;
 }
 
 function normalizeResponseFixture(
@@ -2348,6 +2389,181 @@ describe("createLooperdApi", () => {
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP error fixtures", async () => {
+    const errorArtifact = await loadDaemonHttpErrorArtifact();
+
+    for (const errorCase of errorArtifact.cases) {
+      const fixture = await createFixture();
+
+      try {
+        let api = fixture.api;
+
+        switch (errorCase.fixture) {
+          case "auth-misconfigured": {
+            fixture.config.server.authMode = "local-token";
+            fixture.config.server.localToken = "";
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "auth-required": {
+            fixture.config.server.authMode = "local-token";
+            fixture.config.server.localToken = "secret-token";
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "runtime-control-disabled": {
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "inactive-run": {
+            const run = fixture.store.runs.getLatestByLoopId("loop_1");
+            if (!run) {
+              throw new Error("expected seeded run_1 for inactive-run fixture");
+            }
+
+            fixture.store.runs.upsert({
+              ...run,
+              status: "success",
+              endedAt: SEEDED_NOW,
+              updatedAt: SEEDED_NOW,
+            });
+            break;
+          }
+          case "ambiguous-project-repo": {
+            fixture.store.projects.upsert({
+              id: "project_2",
+              name: "Looper Mirror",
+              repoPath: "/tmp/looper-mirror",
+              baseBranch: "main",
+              archived: false,
+              metadataJson: JSON.stringify({ repo: "acme/looper" }),
+              createdAt: SEEDED_NOW,
+              updatedAt: SEEDED_NOW,
+            });
+            break;
+          }
+          case "pull-request-mismatch": {
+            fixture.store.projects.upsert({
+              id: "project_2",
+              name: "Other Repo",
+              repoPath: "/tmp/other-repo",
+              baseBranch: "main",
+              archived: false,
+              metadataJson: JSON.stringify({ repo: "acme/other" }),
+              createdAt: SEEDED_NOW,
+              updatedAt: SEEDED_NOW,
+            });
+            break;
+          }
+          case "projects-id-conflict": {
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              projects: {
+                addProject: async (input: {
+                  id: string;
+                  name: string;
+                  repoPath: string;
+                  baseBranch: string;
+                }) => {
+                  throw new ProjectIdCollisionError(input.id);
+                },
+              } as never,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "projects-internal-error": {
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              projects: {
+                addProject: async () => {
+                  throw new Error("boom");
+                },
+              } as never,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "projects-invalid-id": {
+            api = createLooperdApi({
+              config: fixture.config,
+              logger: fixture.logger,
+              store: fixture.store,
+              projects: {
+                addProject: async () => {
+                  throw new InvalidProjectIdError("../../tmp");
+                },
+              } as never,
+              getStartedAt: () => new Date(SEEDED_NOW),
+              getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+            });
+            break;
+          }
+          case "default":
+            if (errorCase.id === "agent-not-configured") {
+              fixture.config.agent.vendor = undefined;
+              api = createLooperdApi({
+                config: fixture.config,
+                logger: fixture.logger,
+                store: fixture.store,
+                getStartedAt: () => new Date(SEEDED_NOW),
+                getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+              });
+            }
+            break;
+        }
+
+        const headers = new Headers(errorCase.request?.headers ?? {});
+        const response = await api.handle(
+          new Request(`http://localhost${errorCase.path}`, {
+            method: errorCase.method,
+            headers,
+            body: errorCase.request?.body
+              ? JSON.stringify(errorCase.request.body)
+              : undefined,
+          }),
+        );
+        const body = await response.json();
+
+        expect(response.status, errorCase.id).toBe(errorCase.expectedStatus);
+        expect(response.headers.get("content-type"), errorCase.id).toBe(
+          errorArtifact.sharedBehavior.responseHeaders["content-type"] ?? null,
+        );
+        expect(
+          normalizeResponseFixture(body, { rootDir: fixture.rootDir }),
+          errorCase.id,
+        ).toEqual(errorCase.body);
+      } finally {
+        fixture.store.close();
+        await rm(fixture.rootDir, { recursive: true, force: true });
+      }
+    }
   });
 
   test("matches the machine-verifiable daemon HTTP response fixtures", async () => {

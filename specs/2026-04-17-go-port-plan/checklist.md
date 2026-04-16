@@ -8,7 +8,7 @@
 - [x] Freeze CLI flag names and semantics as part of the compatibility boundary
 - [x] Freeze API paths, methods, status codes, headers, and auth behavior in machine-verifiable artifacts
 - [x] Freeze request/response JSON shapes with fixtures, schema, or OpenAPI
-- [ ] Freeze API error codes and error-envelope behavior
+- [x] Freeze API error codes and error-envelope behavior
 - [ ] Inventory the SQLite schema, migrations, and repository responsibilities
 - [ ] Capture a schema DDL snapshot and migration-sequence notes
 - [ ] Inventory all runtime tables, including notifications and worktrees
@@ -118,7 +118,7 @@
 
 - [ ] Add config parity fixtures
 - [ ] Add API response parity fixtures
-- [ ] Add API error-code and error-envelope fixtures
+- [x] Add API error-code and error-envelope fixtures
 - [ ] Add CLI golden tests
 - [ ] Re-validate SQLite migrations against TypeScript-created databases at the end of the rewrite
 - [ ] Re-validate agent execution streaming, heartbeat, timeout, and kill escalation at the end of the rewrite

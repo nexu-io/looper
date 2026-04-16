@@ -1,0 +1,476 @@
+{
+  "artifactVersion": 1,
+  "generatedFrom": [
+    "apps/looperd/src/server/index.ts",
+    "apps/looperd/src/server/index.test.ts",
+    "specs/2026-04-17-go-port-plan/spec.md",
+    "specs/2026-04-17-go-port-plan/checklist.md"
+  ],
+  "notes": [
+    "This artifact freezes the current /api/v1 error envelope and error-code compatibility boundary for the Go port.",
+    "Each case is machine-verifiable against the Bun daemon test harness and captures the exact status plus JSON body shape.",
+    "When requestId is omitted from the request, the daemon generates one; the fixture normalizes generated UUID values as <uuid>.",
+    "error.details is omitted from these envelopes because the current daemon does not include details for these failures."
+  ],
+  "placeholders": {
+    "<uuid>": "Runtime-generated UUID for requestId when x-request-id is not supplied."
+  },
+  "sharedBehavior": {
+    "responseHeaders": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "requestIdHeader": {
+      "name": "x-request-id"
+    },
+    "envelope": {
+      "ok": false,
+      "requestId": "always present on error responses",
+      "error": {
+        "requiredFields": ["code", "message"],
+        "details": "omitted when undefined"
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "auth-misconfigured",
+      "fixture": "auth-misconfigured",
+      "method": "GET",
+      "path": "/api/v1/status",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 500,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "AUTH_MISCONFIGURED",
+          "message": "Local token auth is enabled but no token is configured"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "unauthorized",
+      "fixture": "auth-required",
+      "method": "GET",
+      "path": "/api/v1/status",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 401,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "Authorization token is required"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "route-not-found",
+      "fixture": "default",
+      "method": "GET",
+      "path": "/api/v1/does-not-exist",
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "ROUTE_NOT_FOUND",
+          "message": "Unknown route: /api/v1/does-not-exist"
+        },
+        "requestId": "<uuid>"
+      }
+    },
+    {
+      "id": "method-not-allowed",
+      "fixture": "default",
+      "method": "DELETE",
+      "path": "/api/v1/status",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 405,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "METHOD_NOT_ALLOWED",
+          "message": "Unsupported method for /api/v1/status"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "validation-failed",
+      "fixture": "default",
+      "method": "GET",
+      "path": "/api/v1/events?limit=0",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 400,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "VALIDATION_FAILED",
+          "message": "limit must be a positive integer"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "loop-not-found",
+      "fixture": "default",
+      "method": "GET",
+      "path": "/api/v1/loops/missing-loop",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "LOOP_NOT_FOUND",
+          "message": "Loop not found: missing-loop"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "agent-not-configured",
+      "fixture": "default",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "projectId": "project_1",
+          "title": "Wire runtime",
+          "prompt": "Wire runtime",
+          "repo": "acme/looper",
+          "baseBranch": "main"
+        }
+      },
+      "expectedStatus": 400,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "AGENT_NOT_CONFIGURED",
+          "message": "Cannot create worker loop without config.agent.vendor"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "runtime-control-unavailable",
+      "fixture": "runtime-control-disabled",
+      "method": "POST",
+      "path": "/api/v1/runs/active/1/stop",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 501,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "RUNTIME_CONTROL_UNAVAILABLE",
+          "message": "Runtime control is not available in this process"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "active-run-not-found",
+      "fixture": "inactive-run",
+      "method": "GET",
+      "path": "/api/v1/runs/active/1",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "ACTIVE_RUN_NOT_FOUND",
+          "message": "Active run not found for loop: loop_1"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "projects-unavailable",
+      "fixture": "default",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "name": "Looper"
+        }
+      },
+      "expectedStatus": 500,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PROJECTS_UNAVAILABLE",
+          "message": "Project management is not available in this runtime"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "project-not-found",
+      "fixture": "default",
+      "method": "POST",
+      "path": "/api/v1/loops",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "projectId": "missing-project",
+          "type": "worker",
+          "targetType": "project",
+          "targetId": "missing-project"
+        }
+      },
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PROJECT_NOT_FOUND",
+          "message": "Project not found: missing-project"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "loop-conflict",
+      "fixture": "default",
+      "method": "POST",
+      "path": "/api/v1/loops",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "projectId": "project_1",
+          "type": "reviewer",
+          "targetType": "pull_request",
+          "repo": "acme/looper",
+          "prNumber": 42
+        }
+      },
+      "expectedStatus": 409,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "LOOP_CONFLICT",
+          "message": "active loop already exists for project_1:reviewer:pull_request:acme/looper:42"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "project-ambiguous",
+      "fixture": "ambiguous-project-repo",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "repo": "acme/looper",
+          "prompt": "Wire runtime",
+          "baseBranch": "main"
+        }
+      },
+      "expectedStatus": 409,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PROJECT_AMBIGUOUS",
+          "message": "Multiple projects match repo acme/looper; pass projectId explicitly"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "pull-request-not-found",
+      "fixture": "default",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "projectId": "project_1",
+          "repo": "acme/looper",
+          "prNumber": 999,
+          "baseBranch": "main"
+        }
+      },
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PULL_REQUEST_NOT_FOUND",
+          "message": "Pull request not found: acme/looper#999"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "pull-request-project-mismatch",
+      "fixture": "pull-request-mismatch",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "projectId": "project_2",
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "baseBranch": "main"
+        }
+      },
+      "expectedStatus": 409,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PULL_REQUEST_PROJECT_MISMATCH",
+          "message": "Pull request acme/looper#42 does not belong to project project_2"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "pr-not-found",
+      "fixture": "default",
+      "method": "GET",
+      "path": "/api/v1/pull-requests/acme%2Flooper/999",
+      "request": {
+        "headers": {
+          "x-request-id": "error-request-id"
+        }
+      },
+      "expectedStatus": 404,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PR_NOT_FOUND",
+          "message": "Pull request not found: acme/looper#999"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "invalid-project-id",
+      "fixture": "projects-invalid-id",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "id": "../../tmp",
+          "name": "Looper"
+        }
+      },
+      "expectedStatus": 400,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "VALIDATION_FAILED",
+          "message": "Invalid project id \"../../tmp\": must not contain path separators, dot segments, be an absolute path, or start with legacy-id-"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "project-id-conflict",
+      "fixture": "projects-id-conflict",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "error-request-id"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "id": "looper",
+          "name": "Looper"
+        }
+      },
+      "expectedStatus": 409,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "PROJECT_ID_CONFLICT",
+          "message": "Derived project id collides with an existing explicit project: looper"
+        },
+        "requestId": "error-request-id"
+      }
+    },
+    {
+      "id": "internal-error",
+      "fixture": "projects-internal-error",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "id": "looper",
+          "name": "Looper"
+        }
+      },
+      "expectedStatus": 500,
+      "body": {
+        "ok": false,
+        "error": {
+          "code": "INTERNAL_ERROR",
+          "message": "boom"
+        },
+        "requestId": "<uuid>"
+      }
+    }
+  ]
+}
