@@ -2,7 +2,7 @@
 
 ## Phase 0 - Freeze the current contracts
 
-- [ ] Inventory all `looper` commands and subcommands
+- [x] Inventory all `looper` commands and subcommands
 - [ ] Inventory all daemon HTTP endpoints under `/api/v1/*`
 - [ ] Inventory config fields, env overrides, and CLI flag overrides
 - [ ] Freeze CLI flag names and semantics as part of the compatibility boundary
