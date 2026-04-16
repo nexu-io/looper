@@ -149,7 +149,7 @@
 
 - `bun test apps/looperd/src/storage/sqlite/migrate.test.ts apps/cli/src/index.test.ts` 通过，补齐 Phase 11 缺失单测
 - `bun run typecheck` 与 `bun run build` 通过
-- 本地 tarball 全局安装 smoke：`npm install -g --prefix <tmp> apps/cli/powerformer-looper-0.1.0.tgz` 后 `looper --help` 正常
+- 本地 tarball 全局安装 smoke：`npm install -g --prefix <tmp> apps/cli/powerformer-looper-0.2.0.tgz` 后 `looper --help` 正常
 - 手动安装 compiled `looperd-darwin-x64` 到 `~/.looper/bin/looperd` 后，`looper daemon start`、`looper daemon status --json`、`looper status --json` 均正常
 - GitHub Release download 逻辑由 `apps/cli/src/daemon-release.test.ts` 与 `apps/cli/src/daemon-install.test.ts` 覆盖；仓库当前尚无公开 release 可做真实 smoke
 
