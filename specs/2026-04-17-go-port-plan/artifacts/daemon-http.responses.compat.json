@@ -1,0 +1,709 @@
+{
+  "artifactVersion": 1,
+  "generatedFrom": [
+    "apps/looperd/src/server/index.ts",
+    "apps/looperd/src/server/index.test.ts",
+    "specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json"
+  ],
+  "notes": [
+    "This artifact freezes the current /api/v1 success-envelope JSON shapes using the seeded fixture in apps/looperd/src/server/index.test.ts.",
+    "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary."
+  ],
+  "placeholders": {
+    "<tmp-root>": "Temporary fixture root directory used by the test harness.",
+    "<home>": "Current user home directory.",
+    "<uuid>": "Runtime-generated UUID.",
+    "<generated-timestamp>": "Runtime-generated ISO-8601 timestamp.",
+    "<current-target>": "Current looperd build target for the running platform.",
+    "<artifact-name>": "Compiled looperd artifact name for the current target."
+  },
+  "routes": [
+    {
+      "id": "healthz.get",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "healthy": true,
+          "startedAt": "2026-04-11T12:00:00.000Z",
+          "storage": {
+            "ok": true,
+            "mode": "sqlite",
+            "dbPath": "<tmp-root>/state/looper.sqlite",
+            "lastUpdatedAt": "<generated-timestamp>",
+            "migration": {
+              "latestAvailableId": "0007_agent_execution_run_index",
+              "latestAppliedId": "0007_agent_execution_run_index",
+              "pendingCount": 0
+            }
+          }
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "status.get",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "service": {
+            "healthy": true,
+            "version": "0.2.1",
+            "build": {
+              "versionSource": "apps/cli/package.json",
+              "gitCommitSha": null,
+              "buildTimestamp": null
+            },
+            "daemonMode": "foreground",
+            "startedAt": "2026-04-11T12:00:00.000Z",
+            "recovery": {
+              "expiredLocksReleased": 1
+            },
+            "binary": {
+              "name": "looperd",
+              "installDir": "<home>/.looper/bin",
+              "currentTarget": "<current-target>",
+              "artifactName": "<artifact-name>",
+              "supportedTargets": ["darwin-arm64", "darwin-x64"]
+            }
+          },
+          "storage": {
+            "mode": "sqlite",
+            "dbPath": "<tmp-root>/state/looper.sqlite",
+            "schemaVersion": "0007_agent_execution_run_index",
+            "pendingMigrations": [],
+            "healthy": true
+          },
+          "scheduler": {
+            "healthy": true,
+            "queuedItems": 1,
+            "runningItems": 0,
+            "completedItems": 0,
+            "failedItems": 0,
+            "totalRuns": 1,
+            "activeRuns": 1
+          },
+          "loops": {
+            "planner": {
+              "running": 0,
+              "paused": 0,
+              "failed": 0
+            },
+            "reviewer": {
+              "running": 1,
+              "paused": 0,
+              "failed": 0
+            },
+            "worker": {
+              "running": 0,
+              "paused": 0,
+              "failed": 0
+            },
+            "fixer": {
+              "running": 0,
+              "paused": 0,
+              "failed": 0
+            }
+          },
+          "safety": {
+            "allowAutoCommit": true,
+            "allowAutoPush": true,
+            "allowAutoApprove": false,
+            "allowRiskyFixes": false,
+            "openPrStrategy": "manual"
+          },
+          "notifications": {
+            "inAppEnabled": true,
+            "osascriptEnabled": true
+          },
+          "tools": {
+            "bun": true,
+            "git": true,
+            "gh": true,
+            "osascript": true
+          }
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "config.get",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "server": {
+            "host": "127.0.0.1",
+            "port": 4310,
+            "authMode": "none",
+            "localTokenConfigured": false
+          },
+          "storage": {
+            "mode": "sqlite",
+            "dbPath": "<tmp-root>/state/looper.sqlite",
+            "backupDir": "<tmp-root>/backups"
+          },
+          "scheduler": {
+            "pollIntervalSeconds": 30,
+            "maxConcurrentRuns": 3,
+            "retryMaxAttempts": 5,
+            "retryBaseDelayMs": 5000
+          },
+          "agent": {
+            "env": {},
+            "params": {},
+            "vendor": "opencode"
+          },
+          "logging": {
+            "level": "info",
+            "maxSizeMB": 10,
+            "maxFiles": 5
+          },
+          "notifications": {
+            "inApp": true,
+            "osascript": {
+              "enabled": true,
+              "soundForLevels": ["action_required", "failure"],
+              "throttleWindowSeconds": 60
+            }
+          },
+          "tools": {
+            "bunPath": "/usr/bin/bun",
+            "gitPath": "/usr/bin/git",
+            "ghPath": "/usr/bin/gh",
+            "osascriptPath": "/usr/bin/osascript"
+          },
+          "daemon": {
+            "mode": "foreground",
+            "logDir": "<tmp-root>/logs",
+            "workingDirectory": "<tmp-root>",
+            "environment": {}
+          },
+          "package": {
+            "distribution": "npm",
+            "autoMigrateOnStartup": true,
+            "requireBackupBeforeMigrate": false
+          },
+          "defaults": {
+            "baseBranch": "main",
+            "allowAutoCommit": true,
+            "allowAutoPush": true,
+            "allowAutoApprove": false,
+            "allowAutoMerge": false,
+            "allowRiskyFixes": false,
+            "openPrStrategy": "manual"
+          },
+          "projects": []
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "events.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "id": "event_1",
+              "eventType": "loop.created",
+              "projectId": "project_1",
+              "loopId": "loop_1",
+              "runId": null,
+              "entityType": "loop",
+              "entityId": "loop_1",
+              "correlationId": null,
+              "causationId": null,
+              "actorType": "system",
+              "actorId": "looperd",
+              "actorDisplayName": "looperd",
+              "payloadJson": "{\"status\":\"running\"}",
+              "createdAt": "2026-04-11T12:00:00.000Z",
+              "payload": {
+                "status": "running"
+              }
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "events.entity",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "entityType": "loop",
+          "entityId": "loop_1",
+          "items": [
+            {
+              "id": "event_1",
+              "eventType": "loop.created",
+              "projectId": "project_1",
+              "loopId": "loop_1",
+              "runId": null,
+              "entityType": "loop",
+              "entityId": "loop_1",
+              "correlationId": null,
+              "causationId": null,
+              "actorType": "system",
+              "actorId": "looperd",
+              "actorDisplayName": "looperd",
+              "payloadJson": "{\"status\":\"running\"}",
+              "createdAt": "2026-04-11T12:00:00.000Z",
+              "payload": {
+                "status": "running"
+              }
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "pullRequests.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "repo": "acme/looper",
+              "prNumber": 42,
+              "projectId": "project_1",
+              "headSha": "abc123",
+              "baseSha": "base123",
+              "title": "Runtime foundation",
+              "body": "Adds recovery and API",
+              "author": "octocat",
+              "diffRef": null,
+              "checksSummary": "green",
+              "unresolvedThreadCount": 1,
+              "reviewState": "changes_requested",
+              "capturedAt": "2026-04-11T12:00:00.000Z",
+              "reviewer": "running",
+              "fixer": null
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "pullRequests.detail",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "projectId": "project_1",
+          "headSha": "abc123",
+          "baseSha": "base123",
+          "title": "Runtime foundation",
+          "body": "Adds recovery and API",
+          "author": "octocat",
+          "diffRef": null,
+          "checksSummary": "green",
+          "unresolvedThreadCount": 1,
+          "reviewState": "changes_requested",
+          "capturedAt": "2026-04-11T12:00:00.000Z",
+          "reviewer": "running",
+          "fixer": null
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "pullRequests.status",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "reviewState": "changes_requested",
+          "checksSummary": "green",
+          "unresolvedThreadCount": 1,
+          "capturedAt": "2026-04-11T12:00:00.000Z",
+          "reviewer": "running",
+          "fixer": null,
+          "loopStatus": {
+            "loops": ["running"],
+            "latestRunStatus": "running",
+            "runningRunCount": 1
+          }
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loops.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "id": "loop_1",
+              "seq": 1,
+              "projectId": "project_1",
+              "type": "reviewer",
+              "targetType": "pull_request",
+              "targetId": "pr:acme/looper:42",
+              "repo": "acme/looper",
+              "prNumber": 42,
+              "status": "running",
+              "configJson": null,
+              "metadataJson": null,
+              "lastRunAt": "2026-04-11T12:00:00.000Z",
+              "nextRunAt": "2026-04-11T12:00:00.000Z",
+              "createdAt": "2026-04-11T12:00:00.000Z",
+              "updatedAt": "2026-04-11T12:00:00.000Z"
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loops.create",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "<uuid>",
+          "seq": 2,
+          "projectId": "project_1",
+          "type": "worker",
+          "targetType": "project",
+          "targetId": "project:project_1",
+          "repo": null,
+          "prNumber": null,
+          "status": "running",
+          "configJson": null,
+          "metadataJson": null,
+          "lastRunAt": null,
+          "nextRunAt": "<generated-timestamp>",
+          "createdAt": "<generated-timestamp>",
+          "updatedAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.detail",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "loop_1",
+          "seq": 1,
+          "projectId": "project_1",
+          "type": "reviewer",
+          "targetType": "pull_request",
+          "targetId": "pr:acme/looper:42",
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "status": "running",
+          "configJson": null,
+          "metadataJson": null,
+          "lastRunAt": "2026-04-11T12:00:00.000Z",
+          "nextRunAt": "2026-04-11T12:00:00.000Z",
+          "createdAt": "2026-04-11T12:00:00.000Z",
+          "updatedAt": "2026-04-11T12:00:00.000Z"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.logs",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "seq": 1,
+          "loopId": "loop_1",
+          "loopType": "reviewer",
+          "loopStatus": "running",
+          "run": {
+            "runId": "run_1",
+            "status": "running",
+            "currentStep": "review",
+            "startedAt": "2026-04-11T12:00:00.000Z",
+            "endedAt": null,
+            "summary": null,
+            "errorMessage": null
+          },
+          "agent": null
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.start",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "loop_1",
+          "seq": 1,
+          "projectId": "project_1",
+          "type": "reviewer",
+          "targetType": "pull_request",
+          "targetId": "pr:acme/looper:42",
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "status": "running",
+          "configJson": null,
+          "metadataJson": null,
+          "lastRunAt": "2026-04-11T12:00:00.000Z",
+          "nextRunAt": "<generated-timestamp>",
+          "createdAt": "2026-04-11T12:00:00.000Z",
+          "updatedAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.pause",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "loop_1",
+          "seq": 1,
+          "projectId": "project_1",
+          "type": "reviewer",
+          "targetType": "pull_request",
+          "targetId": "pr:acme/looper:42",
+          "repo": "acme/looper",
+          "prNumber": 42,
+          "status": "paused",
+          "configJson": null,
+          "metadataJson": null,
+          "lastRunAt": "2026-04-11T12:00:00.000Z",
+          "nextRunAt": "<generated-timestamp>",
+          "createdAt": "2026-04-11T12:00:00.000Z",
+          "updatedAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "workers.create",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "<uuid>",
+          "seq": 3,
+          "projectId": "project_1",
+          "type": "worker",
+          "targetType": "project",
+          "targetId": "project:project_1",
+          "repo": "acme/looper",
+          "prNumber": null,
+          "status": "queued",
+          "configJson": null,
+          "metadataJson": "{\"worker\":{\"title\":\"Wire runtime\",\"prompt\":\"Wire runtime\",\"specPath\":null,\"repo\":\"acme/looper\",\"baseBranch\":\"main\"}}",
+          "lastRunAt": null,
+          "nextRunAt": null,
+          "createdAt": "<generated-timestamp>",
+          "updatedAt": "<generated-timestamp>",
+          "title": "Wire runtime",
+          "prompt": "Wire runtime",
+          "specPath": null,
+          "baseBranch": "main"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "planners.create",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "<uuid>",
+          "seq": 4,
+          "projectId": "project_1",
+          "type": "planner",
+          "targetType": "issue",
+          "targetId": "issue:acme/looper:77",
+          "repo": "acme/looper",
+          "prNumber": null,
+          "status": "running",
+          "configJson": null,
+          "metadataJson": "{\"issueNumber\":77}",
+          "lastRunAt": null,
+          "nextRunAt": "<generated-timestamp>",
+          "createdAt": "<generated-timestamp>",
+          "updatedAt": "<generated-timestamp>",
+          "issueNumber": 77
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "projects.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "id": "project_1",
+              "name": "Looper",
+              "repoPath": "/tmp/looper",
+              "baseBranch": "main",
+              "archived": false,
+              "repo": "acme/looper",
+              "worktreeRoot": null,
+              "createdAt": "2026-04-11T12:00:00.000Z",
+              "updatedAt": "2026-04-11T12:00:00.000Z"
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "projects.create",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "looper",
+          "name": "Looper",
+          "repoPath": "/tmp/repos/looper",
+          "baseBranch": "main",
+          "archived": false,
+          "repo": "powerformer/looper",
+          "worktreeRoot": null,
+          "createdAt": "2026-04-11T12:00:00.000Z",
+          "updatedAt": "2026-04-11T12:00:00.000Z",
+          "discoveredPullRequests": 1,
+          "discoveredWorktrees": 2,
+          "warnings": []
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "runs.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "id": "run_1",
+              "loopId": "loop_1",
+              "status": "running",
+              "currentStep": "review",
+              "lastCompletedStep": "snapshot",
+              "checkpointJson": null,
+              "summary": null,
+              "errorMessage": null,
+              "startedAt": "2026-04-11T12:00:00.000Z",
+              "lastHeartbeatAt": "2026-04-11T12:00:00.000Z",
+              "endedAt": null,
+              "createdAt": "2026-04-11T12:00:00.000Z",
+              "updatedAt": "2026-04-11T12:00:00.000Z"
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "runs.active.list",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "seq": 1,
+              "runId": "run_1",
+              "loopId": "loop_1",
+              "projectId": "project_1",
+              "type": "reviewer",
+              "status": "running",
+              "currentStep": "review",
+              "startedAt": "2026-04-11T12:00:00.000Z",
+              "target": {
+                "type": "pull_request",
+                "repo": "acme/looper",
+                "prNumber": 42,
+                "label": "acme/looper#42"
+              },
+              "agent": null,
+              "worktree": null
+            },
+            {
+              "seq": 3,
+              "runId": null,
+              "loopId": "<uuid>",
+              "projectId": "project_1",
+              "type": "worker",
+              "status": "queued",
+              "currentStep": null,
+              "startedAt": "<generated-timestamp>",
+              "target": {
+                "type": "project",
+                "projectId": "project_1",
+                "label": "Looper"
+              },
+              "agent": null,
+              "worktree": null
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "runs.active.detail",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "seq": 1,
+          "runId": "run_1",
+          "loopId": "loop_1",
+          "projectId": "project_1",
+          "type": "reviewer",
+          "status": "running",
+          "currentStep": "review",
+          "startedAt": "2026-04-11T12:00:00.000Z",
+          "target": {
+            "type": "pull_request",
+            "repo": "acme/looper",
+            "prNumber": 42,
+            "label": "acme/looper#42"
+          },
+          "agent": null,
+          "worktree": null
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "runs.active.stop",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "stopped": true,
+          "loopId": "loop_1"
+        },
+        "requestId": "fixture-request-id"
+      }
+    }
+  ]
+}

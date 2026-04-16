@@ -1,0 +1,270 @@
+{
+  "artifactVersion": 1,
+  "generatedFrom": [
+    "apps/looperd/src/server/index.ts",
+    "apps/looperd/src/server/index.test.ts",
+    "specs/2026-04-17-go-port-plan/artifacts/daemon-http-endpoints.md"
+  ],
+  "notes": [
+    "This artifact freezes the current /api/v1 HTTP compatibility boundary for the Go port.",
+    "It covers route paths, methods, success statuses, shared response headers, request-id propagation, and local-token auth behavior.",
+    "Request and response JSON field shapes are intentionally left to a separate artifact task."
+  ],
+  "basePath": "/api/v1",
+  "sharedBehavior": {
+    "responseHeaders": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "requestIdHeader": {
+      "name": "x-request-id",
+      "behavior": "If provided on the request, the JSON response envelope echoes the same requestId value; otherwise the daemon generates one."
+    },
+    "auth": {
+      "modeField": "config.server.authMode",
+      "noneMode": {
+        "value": "none",
+        "behavior": "Requests are accepted without Authorization."
+      },
+      "localTokenMode": {
+        "value": "local-token",
+        "authorizationHeader": "Authorization: Bearer <token>",
+        "missingConfiguredToken": {
+          "status": 500,
+          "behavior": "If auth mode is local-token but config.server.localToken is empty, all requests fail before route dispatch."
+        },
+        "missingOrWrongBearerToken": {
+          "status": 401,
+          "behavior": "If the Authorization header is missing or does not exactly match the configured bearer token, the request is rejected before route dispatch."
+        },
+        "matchingBearerToken": {
+          "status": 200,
+          "behavior": "If the bearer token matches, normal route dispatch continues."
+        }
+      }
+    },
+    "genericStatuses": {
+      "routeNotFound": 404,
+      "methodNotAllowed": 405
+    }
+  },
+  "routes": [
+    {
+      "id": "healthz.get",
+      "method": "GET",
+      "path": "/api/v1/healthz",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "status.get",
+      "method": "GET",
+      "path": "/api/v1/status",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "config.get",
+      "method": "GET",
+      "path": "/api/v1/config",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "events.list",
+      "method": "GET",
+      "path": "/api/v1/events?limit=1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400]
+    },
+    {
+      "id": "events.entity",
+      "method": "GET",
+      "path": "/api/v1/events/loop/loop_1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400]
+    },
+    {
+      "id": "pullRequests.list",
+      "method": "GET",
+      "path": "/api/v1/pull-requests",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "pullRequests.detail",
+      "method": "GET",
+      "path": "/api/v1/pull-requests/acme%2Flooper/42",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "pullRequests.status",
+      "method": "GET",
+      "path": "/api/v1/pull-requests/acme%2Flooper/42/status",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "loops.list",
+      "method": "GET",
+      "path": "/api/v1/loops",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "loops.create",
+      "method": "POST",
+      "path": "/api/v1/loops",
+      "fixture": "default",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "type": "worker",
+          "targetType": "project",
+          "targetId": "project_1"
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 409]
+    },
+    {
+      "id": "loop.detail",
+      "method": "GET",
+      "path": "/api/v1/loops/loop_1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "loop.logs",
+      "method": "GET",
+      "path": "/api/v1/loops/1/logs",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "loop.start",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/start",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "loop.pause",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/pause",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [404]
+    },
+    {
+      "id": "workers.create",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "fixture": "default",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "title": "Wire runtime",
+          "prompt": "Wire runtime",
+          "repo": "acme/looper",
+          "baseBranch": "main"
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 409]
+    },
+    {
+      "id": "planners.create",
+      "method": "POST",
+      "path": "/api/v1/planners",
+      "fixture": "default",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "issueNumber": 77
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "projects.list",
+      "method": "GET",
+      "path": "/api/v1/projects",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "projects.create",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "fixture": "projects-enabled",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "id": "looper",
+          "name": "Looper"
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 409, 500]
+    },
+    {
+      "id": "runs.list",
+      "method": "GET",
+      "path": "/api/v1/runs?loopId=loop_1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": []
+    },
+    {
+      "id": "runs.active.list",
+      "method": "GET",
+      "path": "/api/v1/runs/active",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400]
+    },
+    {
+      "id": "runs.active.detail",
+      "method": "GET",
+      "path": "/api/v1/runs/active/1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404]
+    },
+    {
+      "id": "runs.active.stop",
+      "method": "POST",
+      "path": "/api/v1/runs/active/1/stop",
+      "fixture": "runtime-control",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 501]
+    }
+  ]
+}

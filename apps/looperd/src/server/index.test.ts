@@ -12,6 +12,117 @@ import { LOOPERD_BUILD_METADATA, LOOPERD_VERSION } from "../metadata";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
+const DAEMON_HTTP_CONTRACT_ARTIFACT_PATH = new URL(
+  "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json",
+  import.meta.url,
+);
+
+const DAEMON_HTTP_RESPONSE_ARTIFACT_PATH = new URL(
+  "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.responses.compat.json",
+  import.meta.url,
+);
+
+const SEEDED_NOW = "2026-04-11T12:00:00.000Z";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+interface DaemonHttpContractArtifact {
+  sharedBehavior: {
+    responseHeaders: Record<string, string>;
+    requestIdHeader: { name: string };
+    auth: {
+      localTokenMode: {
+        missingConfiguredToken: { status: number };
+        missingOrWrongBearerToken: { status: number };
+        matchingBearerToken: { status: number };
+      };
+    };
+    genericStatuses: {
+      routeNotFound: number;
+      methodNotAllowed: number;
+    };
+  };
+  routes: Array<{
+    id: string;
+    method: string;
+    path: string;
+    fixture: "default" | "projects-enabled" | "runtime-control";
+    request?: {
+      headers?: Record<string, string>;
+      body?: Record<string, unknown>;
+    };
+    expectedStatus: number;
+  }>;
+}
+
+interface DaemonHttpResponseArtifact {
+  routes: Array<{
+    id: string;
+    status: number;
+    body: unknown;
+  }>;
+}
+
+async function loadDaemonHttpContractArtifact() {
+  return (await Bun.file(
+    DAEMON_HTTP_CONTRACT_ARTIFACT_PATH,
+  ).json()) as DaemonHttpContractArtifact;
+}
+
+async function loadDaemonHttpResponseArtifact() {
+  return (await Bun.file(
+    DAEMON_HTTP_RESPONSE_ARTIFACT_PATH,
+  ).json()) as DaemonHttpResponseArtifact;
+}
+
+function normalizeResponseFixture(
+  value: unknown,
+  options: { rootDir: string },
+  path = "",
+): unknown {
+  if (typeof value === "string") {
+    const normalized = value
+      .replaceAll(options.rootDir, "<tmp-root>")
+      .replaceAll(homedir(), "<home>");
+
+    if (path.endsWith(".currentTarget")) {
+      return "<current-target>";
+    }
+
+    if (path.endsWith(".artifactName") && normalized.length > 0) {
+      return "<artifact-name>";
+    }
+
+    if (UUID_PATTERN.test(normalized)) {
+      return "<uuid>";
+    }
+
+    if (ISO_TIMESTAMP_PATTERN.test(normalized) && normalized !== SEEDED_NOW) {
+      return "<generated-timestamp>";
+    }
+
+    return normalized;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      normalizeResponseFixture(item, options, `${path}[${index}]`),
+    );
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        normalizeResponseFixture(item, options, path ? `${path}.${key}` : key),
+      ]),
+    );
+  }
+
+  return value;
+}
+
 async function createFixture(options?: {
   runtimeControl?: {
     stopLoop(input: { loopId: string; reason: string }): Promise<unknown>;
@@ -26,6 +137,10 @@ async function createFixture(options?: {
   config.daemon.workingDirectory = rootDir;
   config.server.authMode = "none";
   config.agent.vendor = "opencode";
+  config.tools.bunPath = "/usr/bin/bun";
+  config.tools.gitPath = "/usr/bin/git";
+  config.tools.ghPath = "/usr/bin/gh";
+  config.tools.osascriptPath = "/usr/bin/osascript";
 
   const logger = await createLogger(config.logging, config.daemon.logDir);
   const store = new SqliteStore({
@@ -167,7 +282,7 @@ async function createFixture(options?: {
       | undefined,
   });
 
-  return { api, store, rootDir };
+  return { api, store, rootDir, config, logger };
 }
 
 describe("createLooperdApi", () => {
@@ -2037,6 +2152,290 @@ describe("createLooperdApi", () => {
         reason: "Stopped by user via selector 1",
       },
     ]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP contract routes and headers", async () => {
+    const contract = await loadDaemonHttpContractArtifact();
+    const requestId = "contract-request-id";
+    const runtimeStopCalls: Array<{ loopId: string; reason: string }> = [];
+    const { api, config, logger, store, rootDir } = await createFixture({
+      runtimeControl: {
+        async stopLoop(input) {
+          runtimeStopCalls.push(input);
+          return {
+            stopped: true,
+            loopId: input.loopId,
+          };
+        },
+        triggerSchedulerTick() {},
+      },
+    });
+
+    const projectsApi = createLooperdApi({
+      config,
+      logger,
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => ({
+          project: {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          },
+          repo: "powerformer/looper",
+          discoveredPullRequests: 1,
+          discoveredWorktrees: 2,
+          warnings: [],
+        }),
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+      runtimeControl: {
+        async stopLoop(input) {
+          runtimeStopCalls.push(input);
+          return {
+            stopped: true,
+            loopId: input.loopId,
+          };
+        },
+        triggerSchedulerTick() {},
+      },
+    });
+
+    for (const route of contract.routes) {
+      const targetApi =
+        route.fixture === "projects-enabled" ? projectsApi : api;
+      const headers = new Headers(route.request?.headers ?? {});
+      headers.set(contract.sharedBehavior.requestIdHeader.name, requestId);
+
+      const response = await targetApi.handle(
+        new Request(`http://localhost${route.path}`, {
+          method: route.method,
+          headers,
+          body: route.request?.body
+            ? JSON.stringify(route.request.body)
+            : undefined,
+        }),
+      );
+      const body = (await response.json()) as { requestId: string };
+
+      expect(response.status, route.id).toBe(route.expectedStatus);
+      expect(response.headers.get("content-type"), route.id).toBe(
+        contract.sharedBehavior.responseHeaders["content-type"] ?? null,
+      );
+      expect(body.requestId, route.id).toBe(requestId);
+    }
+
+    expect(runtimeStopCalls).toEqual([
+      {
+        loopId: "loop_1",
+        reason: "Stopped by user via selector 1",
+      },
+    ]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP contract auth behavior", async () => {
+    const contract = await loadDaemonHttpContractArtifact();
+    const { config, logger, store, rootDir } = await createFixture();
+
+    config.server.authMode = "local-token";
+
+    const misconfiguredApi = createLooperdApi({
+      config,
+      logger,
+      store,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+    const misconfiguredResponse = await misconfiguredApi.handle(
+      new Request("http://localhost/api/v1/status"),
+    );
+    expect(misconfiguredResponse.status).toBe(
+      contract.sharedBehavior.auth.localTokenMode.missingConfiguredToken.status,
+    );
+
+    config.server.localToken = "secret-token";
+    const authedApi = createLooperdApi({
+      config,
+      logger,
+      store,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const missingTokenResponse = await authedApi.handle(
+      new Request("http://localhost/api/v1/status"),
+    );
+    expect(missingTokenResponse.status).toBe(
+      contract.sharedBehavior.auth.localTokenMode.missingOrWrongBearerToken
+        .status,
+    );
+
+    const wrongTokenResponse = await authedApi.handle(
+      new Request("http://localhost/api/v1/status", {
+        headers: { authorization: "Bearer wrong-token" },
+      }),
+    );
+    expect(wrongTokenResponse.status).toBe(
+      contract.sharedBehavior.auth.localTokenMode.missingOrWrongBearerToken
+        .status,
+    );
+
+    const okResponse = await authedApi.handle(
+      new Request("http://localhost/api/v1/status", {
+        headers: {
+          authorization: "Bearer secret-token",
+          "x-request-id": "auth-ok-request-id",
+        },
+      }),
+    );
+    const okBody = (await okResponse.json()) as { requestId: string };
+    expect(okResponse.status).toBe(
+      contract.sharedBehavior.auth.localTokenMode.matchingBearerToken.status,
+    );
+    expect(okResponse.headers.get("content-type")).toBe(
+      contract.sharedBehavior.responseHeaders["content-type"] ?? null,
+    );
+    expect(okBody.requestId).toBe("auth-ok-request-id");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP contract generic 404 and 405 behavior", async () => {
+    const contract = await loadDaemonHttpContractArtifact();
+    const { api, store, rootDir } = await createFixture();
+
+    const seenPaths = new Set<string>();
+    for (const route of contract.routes) {
+      if (seenPaths.has(route.path)) {
+        continue;
+      }
+      seenPaths.add(route.path);
+
+      const response = await api.handle(
+        new Request(`http://localhost${route.path}`, {
+          method: "DELETE",
+        }),
+      );
+      expect(response.status, route.path).toBe(
+        contract.sharedBehavior.genericStatuses.methodNotAllowed,
+      );
+    }
+
+    const missingRouteResponse = await api.handle(
+      new Request("http://localhost/api/v1/does-not-exist"),
+    );
+    expect(missingRouteResponse.status).toBe(
+      contract.sharedBehavior.genericStatuses.routeNotFound,
+    );
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP response fixtures", async () => {
+    const contract = await loadDaemonHttpContractArtifact();
+    const responseArtifact = await loadDaemonHttpResponseArtifact();
+    const fixturesByRouteId = new Map(
+      responseArtifact.routes.map((route) => [route.id, route]),
+    );
+    const { api, config, logger, store, rootDir } = await createFixture({
+      runtimeControl: {
+        async stopLoop(input) {
+          return {
+            stopped: true,
+            loopId: input.loopId,
+          };
+        },
+        triggerSchedulerTick() {},
+      },
+    });
+
+    const projectsApi = createLooperdApi({
+      config,
+      logger,
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => ({
+          project: {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+            createdAt: SEEDED_NOW,
+            updatedAt: SEEDED_NOW,
+          },
+          repo: "powerformer/looper",
+          discoveredPullRequests: 1,
+          discoveredWorktrees: 2,
+          warnings: [],
+        }),
+      } as never,
+      getStartedAt: () => new Date(SEEDED_NOW),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+      runtimeControl: {
+        async stopLoop(input) {
+          return {
+            stopped: true,
+            loopId: input.loopId,
+          };
+        },
+        triggerSchedulerTick() {},
+      },
+    });
+
+    for (const route of contract.routes) {
+      const expected = fixturesByRouteId.get(route.id);
+      expect(expected, route.id).toBeDefined();
+      if (!expected) {
+        continue;
+      }
+
+      const targetApi =
+        route.fixture === "projects-enabled" ? projectsApi : api;
+      const headers = new Headers(route.request?.headers ?? {});
+      headers.set("x-request-id", "fixture-request-id");
+
+      const response = await targetApi.handle(
+        new Request(`http://localhost${route.path}`, {
+          method: route.method,
+          headers,
+          body: route.request?.body
+            ? JSON.stringify(route.request.body)
+            : undefined,
+        }),
+      );
+      const body = await response.json();
+
+      expect(response.status, route.id).toBe(expected.status);
+      expect(normalizeResponseFixture(body, { rootDir }), route.id).toEqual(
+        expected.body,
+      );
+    }
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

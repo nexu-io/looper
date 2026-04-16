@@ -6,8 +6,8 @@
 - [x] Inventory all daemon HTTP endpoints under `/api/v1/*`
 - [x] Inventory config fields, env overrides, and CLI flag overrides
 - [x] Freeze CLI flag names and semantics as part of the compatibility boundary
-- [ ] Freeze API paths, methods, status codes, headers, and auth behavior in machine-verifiable artifacts
-- [ ] Freeze request/response JSON shapes with fixtures, schema, or OpenAPI
+- [x] Freeze API paths, methods, status codes, headers, and auth behavior in machine-verifiable artifacts
+- [x] Freeze request/response JSON shapes with fixtures, schema, or OpenAPI
 - [ ] Freeze API error codes and error-envelope behavior
 - [ ] Inventory the SQLite schema, migrations, and repository responsibilities
 - [ ] Capture a schema DDL snapshot and migration-sequence notes
