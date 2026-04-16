@@ -1278,20 +1278,28 @@ async function runDaemonStart(context: CliContext) {
   const pidFilePath = resolveDaemonPidFilePath(context);
   const existingPid = await readPidFile(context, pidFilePath);
   if (existingPid && isProcessAlive(context, existingPid)) {
-    context.write(`looperd already appears to be running (pid ${existingPid})`);
+    if (await isLooperdProcess(context, existingPid)) {
+      context.write(
+        `looperd already appears to be running (pid ${existingPid})`,
+      );
+      context.write(
+        "Phase 1 process management is minimal: use `looper daemon restart` or stop the process manually if needed.",
+      );
+      return;
+    }
+
+    await removePidFile(context, pidFilePath);
     context.write(
-      "Phase 1 process management is minimal: use `looper daemon restart` or stop the process manually if needed.",
+      `Daemon pid ${existingPid} does not appear to be looperd; treating pid file as stale.`,
     );
-    return;
-  }
-  if (existingPid) {
+  } else if (existingPid) {
     await removePidFile(context, pidFilePath);
     context.write(`Removed stale daemon pid file for pid ${existingPid}`);
   }
 
   const child = context.spawnDetached({
     command: binary.path,
-    args: [],
+    args: buildDaemonLaunchArgs(context.args),
     cwd: context.cwd,
     env: context.env,
   });
@@ -2413,6 +2421,28 @@ function readConfigArg(argv: string[], name: string): string | undefined {
   }
 
   return undefined;
+}
+
+function buildDaemonLaunchArgs(args: ParsedArgs): string[] {
+  const launchArgs: string[] = [];
+
+  for (const flagName of CONFIG_FLAGS) {
+    const values = args.flags.get(flagName);
+    if (!values) {
+      continue;
+    }
+
+    for (const value of values) {
+      if (value === "true") {
+        launchArgs.push(`--${flagName}`);
+        continue;
+      }
+
+      launchArgs.push(`--${flagName}`, value);
+    }
+  }
+
+  return launchArgs;
 }
 
 async function readJsonFile(path: string): Promise<Record<string, unknown>> {
