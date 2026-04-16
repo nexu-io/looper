@@ -4,7 +4,7 @@
 
 - [x] Inventory all `looper` commands and subcommands
 - [x] Inventory all daemon HTTP endpoints under `/api/v1/*`
-- [ ] Inventory config fields, env overrides, and CLI flag overrides
+- [x] Inventory config fields, env overrides, and CLI flag overrides
 - [ ] Freeze CLI flag names and semantics as part of the compatibility boundary
 - [ ] Freeze API paths, methods, status codes, headers, and auth behavior in machine-verifiable artifacts
 - [ ] Freeze request/response JSON shapes with fixtures, schema, or OpenAPI
