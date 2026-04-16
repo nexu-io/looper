@@ -1422,7 +1422,12 @@ async function readPidFile(
 ): Promise<number | null> {
   try {
     const raw = await context.readFileImpl(pidFilePath, "utf8");
-    const pid = Number.parseInt(raw.trim(), 10);
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      return null;
+    }
+
+    const pid = Number.parseInt(trimmed, 10);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
@@ -1455,10 +1460,31 @@ async function isLooperdProcess(
     return false;
   }
 
-  return command
+  const tokens = command
     .trim()
     .split(/\s+/)
-    .some((token) => basename(token.replace(/^['"]|['"]$/g, "")) === "looperd");
+    .map((token) => token.replace(/^['"]|['"]$/g, ""))
+    .filter((token) => token.length > 0);
+
+  const executable = tokens[0];
+  if (!executable) {
+    return false;
+  }
+
+  if (basename(executable) === "looperd") {
+    return true;
+  }
+
+  if (!isLooperdInterpreter(basename(executable))) {
+    return false;
+  }
+
+  const scriptToken = tokens[1];
+  return scriptToken ? basename(scriptToken) === "looperd" : false;
+}
+
+function isLooperdInterpreter(executableName: string): boolean {
+  return executableName === "node" || executableName === "bun";
 }
 
 async function readProcessCommand(

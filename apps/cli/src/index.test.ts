@@ -1321,6 +1321,56 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain("looper daemon restart");
   });
 
+  test("ignores malformed pid file contents during daemon start", async () => {
+    const spawnCalls: string[] = [];
+    let launched = false;
+
+    const exitCode = await runCli(["daemon", "start"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      readFileImpl: async () => "1234abc\n",
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps") {
+          if (args[1] === "4321") {
+            return {
+              stdout: "/Users/tester/.looper/bin/looperd\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
+          throw new Error(`unexpected ps call ${args.join(" ")}`);
+        }
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        if (pid === 4321 && signal === 0) {
+          if (!launched) {
+            throw new Error("not running");
+          }
+          return;
+        }
+        throw new Error("unexpected kill call");
+      },
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push(options.command);
+        launched = true;
+        return { pid: 4321 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
+  });
+
   test("treats reused pid as stale during daemon start when it is not looperd", async () => {
     const lines: string[] = [];
     const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
@@ -1639,6 +1689,78 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(killCalls).toContainEqual({ pid: 1234, signal: "SIGTERM" });
     expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
+  });
+
+  test("does not treat arbitrary looperd-named arguments as daemon ownership", async () => {
+    const lines: string[] = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
+    const removedPidFiles: string[] = [];
+    const spawnCalls: string[] = [];
+    let readPidCalls = 0;
+    let launched = false;
+
+    const exitCode = await runCli(["daemon", "restart"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      env: {
+        HOME: "/Users/tester",
+      },
+      readFileImpl: async () => {
+        readPidCalls += 1;
+        if (readPidCalls === 1) {
+          return "1234\n";
+        }
+
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps") {
+          if (args[1] === "2233") {
+            return {
+              stdout: "/Users/tester/.looper/bin/looperd\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
+
+          return {
+            stdout: "tail -f /tmp/looperd\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.5.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: (pid, signal) => {
+        killCalls.push({ pid, signal });
+        if (pid === 2233 && signal === 0 && !launched) {
+          throw new Error("not running");
+        }
+      },
+      removeFileImpl: async (path) => {
+        removedPidFiles.push(path);
+      },
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: (options) => {
+        spawnCalls.push(options.command);
+        launched = true;
+        return { pid: 2233 };
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(killCalls).toEqual([
+      { pid: 1234, signal: 0 },
+      { pid: 2233, signal: 0 },
+    ]);
+    expect(removedPidFiles).toContain("/Users/tester/.looper/looperd.pid");
+    expect(spawnCalls).toEqual(["/Users/tester/.looper/bin/looperd"]);
+    expect(lines.join("\n")).toContain("does not appear to be looperd");
   });
 
   test("handles stale pid file during daemon restart", async () => {
