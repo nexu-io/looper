@@ -17,7 +17,7 @@
 - [x] Inventory reviewer, fixer, planner, and worker state-machine behaviors
 - [x] Inventory spec-PR label/path conventions and agent completion-marker behavior
 - [x] Define parity expectations for daemon startup, shutdown, recovery, and run lifecycle
-- [ ] Capture daemon lifecycle notes for start, stop, recovery, and graceful shutdown
+- [x] Capture daemon lifecycle notes for start, stop, recovery, and graceful shutdown
 
 ## Phase 1 - Establish Go project scaffolding
 
