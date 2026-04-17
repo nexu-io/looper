@@ -168,6 +168,74 @@ From the current repo structure, the Go port must cover at least these domains:
    - release/install helpers
    - text and JSON output modes
 
+### 4.2.1 Reviewer, fixer, planner, and worker state-machine inventory
+
+The four automation loops share the same top-level domain model in `apps/looperd/src/domain/index.ts`:
+
+- loop types: `planner`, `reviewer`, `worker`, `fixer`
+- loop statuses: `idle -> queued -> running -> paused|completed|failed|interrupted`
+- run statuses: `queued`, `running`, `success`, `failed`, `cancelled`, `interrupted`, `parse_failed`
+- resume policies persisted in checkpoints: `replay_step`, `advance_from_checkpoint`, `manual_intervention`
+- audit events emitted around execution: `loop.started`, `loop.step.started`, `loop.step.completed`, `loop.step.failed`, `run.started`, `run.completed`, `run.failed`
+
+Scheduler/runtime coordination lives in `apps/looperd/src/scheduler/index.ts` and `apps/looperd/src/runtime/index.ts`:
+
+- scheduler queue priority order is `planner` -> `reviewer` -> `fixer` -> `worker`
+- queue dedupe is keyed per discovered target/work unit before enqueue
+- retryable failures are re-queued with exponential backoff; terminal failures remain failed
+- runtime ticks run discovery first, then claim queue items and dispatch by loop type
+- each runner updates loop status to `running` on start, persists per-step checkpoints, and sets the loop to `queued`, `paused`, `completed`, or `failed` when the run ends
+
+#### Planner (`apps/looperd/src/planner/index.ts`)
+
+- discovery source: assigned open issues labeled `looper:plan`
+- target type: `issue`
+- discovery skips ambiguous repo-to-project mappings, missing current GH login, and loops already `paused` or `completed`
+- step sequence: `discover-issues` -> `prepare-worktree` -> `write-spec` -> `publish` -> `notify`
+- `discover-issues` claims an issue-scoped business lock and snapshots issue metadata into the checkpoint
+- `write-spec` is the agent-heavy step; later steps reuse the persisted checkpoint rather than rebuilding context
+- `publish` pushes the spec branch, opens the PR, adds `looper:spec-reviewing`, and requests reviewers
+- failures marked `retryable_after_resume` resume from the next step using the checkpoint; `manual_intervention` pauses the loop
+
+#### Reviewer (`apps/looperd/src/reviewer/index.ts`)
+
+- discovery source: open PRs where the current user is requested for review, plus open PRs labeled `looper:spec-reviewing`, plus existing follow-up loops
+- target type: `pull_request`
+- discovery skips drafts, non-open PRs, and PR heads already matching `lastPublishedHeadSha`
+- step sequence: `discover` -> `filter` -> `claim` -> `snapshot` -> `review` -> `publish`
+- `claim` acquires the PR-scoped business lock; `snapshot` and later steps reuse persisted review context
+- a successful publish records the reviewed head SHA so unchanged heads are skipped on later discovery passes
+- retryable failures requeue the loop; `manual_intervention` pauses it; successful or skipped runs mark the loop `completed`
+
+#### Fixer (`apps/looperd/src/fixer/index.ts`)
+
+- discovery source: open PRs whose review state yields actionable fix items from `collectFixItems(detail)`
+- target type: `pull_request`
+- discovery skips drafts, non-open PRs, PRs already under an active PR lock, and PRs with no actionable fix items
+- step sequence: `discover-pr` -> `claim-pr` -> `collect-fixes` -> `prepare-worktree` -> `repair` -> `validate` -> `push` -> `reconcile-commits` -> `resolve-comments` -> `recheck`
+- `claim-pr` acquires the PR-scoped business lock; the rest of the run advances from the persisted checkpoint
+- the loop is explicitly resume-oriented: push/open review follow-up failures can come back as `advance_from_checkpoint` instead of replaying the full repair flow
+- `manual_intervention` pauses the loop; terminal states also clean up fixer worktrees
+
+#### Worker (`apps/looperd/src/worker/index.ts`)
+
+- discovery source: open PRs labeled `looper:spec-ready`
+- target type today includes both `project` and `pull_request`, but the spec-PR flow inventories the PR-targeted path here
+- discovery skips drafts, non-open PRs, and already-paused PR-targeted worker loops
+- step sequence: `prepare-work` -> `prepare-worktree` -> `plan` -> `execute` -> `validate` -> `open-pr`
+- `prepare-work` branches early by execution mode: create a new PR for project-targeted work, or continue on an existing PR for `pull_request` targets
+- PR-targeted worker runs fetch PR details, require a spec path, remove the `looper:spec-ready` label, and acquire a PR-scoped business lock before execution continues
+- `execute` is the agent-heavy step; `validate` runs configured commands; `open-pr` either pushes the existing PR branch or creates a new PR depending on execution mode
+- validation failures and missing spec-path cases pause the loop via `manual_intervention`; retryable push/agent failures resume from checkpoint
+
+The most useful behavior locks for parity are the tests in:
+
+- `apps/looperd/src/domain/index.test.ts`
+- `apps/looperd/src/planner/index.test.ts`
+- `apps/looperd/src/reviewer/index.test.ts`
+- `apps/looperd/src/fixer/index.test.ts`
+- `apps/looperd/src/worker/index.test.ts`
+
 ### 4.3 Bun-specific behavior to replace
 
 The main Bun-native concerns are:

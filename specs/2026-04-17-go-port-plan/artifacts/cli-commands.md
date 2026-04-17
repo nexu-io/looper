@@ -24,6 +24,39 @@ Source of truth inspected from:
 
 ## Implemented commands
 
+### Command tree
+
+- `looper status`
+- `looper project`
+  - `list`
+  - `add`
+- `looper config`
+  - `show`
+- `looper daemon`
+  - `install`
+  - `status`
+  - `start`
+  - `restart`
+  - `logs`
+- `looper upgrade`
+- `looper loop`
+  - `list`
+  - `start`
+  - `pause`
+- `looper work`
+- `looper plan`
+- `looper pr`
+  - `list`
+  - `show`
+  - `status`
+- `looper review <pr>`
+- `looper run`
+  - `list`
+- `looper ps`
+- `looper jump [id]`
+- `looper logs <id>`
+- `looper stop <id>`
+
 - `looper status`
   - flags: `--json`
 - `looper project list`
