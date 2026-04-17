@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -349,6 +350,73 @@ func TestMigrationRunnerRollsBackForeignKeyPragmaMigrationSideEffectsOnFailure(t
 	}
 }
 
+func TestMigrationRunnerAppliesPendingMigrationsOnTypeScriptCreatedDatabasesAcrossVersions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	latestFixtureID := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID
+	latestDB := openSQLiteDBAtPath(t, writeTypeScriptCreatedDBFixture(t, latestFixtureID))
+	latestSchema := readSQLiteSchemaSnapshot(t, latestDB)
+
+	const typeScriptAppliedAt = "2026-04-17T12:00:00.000Z"
+	const goAppliedAt = "2026-04-17T13:00:00.000Z"
+
+	for version := 1; version <= len(EmbeddedMigrations); version++ {
+		version := version
+		fixtureID := EmbeddedMigrations[version-1].ID
+
+		t.Run(fixtureID, func(t *testing.T) {
+			t.Parallel()
+
+			db := openSQLiteDBAtPath(t, writeTypeScriptCreatedDBFixture(t, fixtureID))
+			runner := NewMigrationRunner(db, MigrationRunnerOptions{
+				Migrations: EmbeddedMigrations,
+				Now: func() time.Time {
+					return time.Date(2026, time.April, 17, 13, 0, 0, 0, time.UTC)
+				},
+			})
+
+			status, err := runner.Status(ctx)
+			if err != nil {
+				t.Fatalf("runner.Status() before run error = %v", err)
+			}
+
+			wantAppliedIDs := migrationIDsForPrefix(version)
+			wantPendingIDs := migrationIDsForSuffix(version)
+			assertDescriptors(t, status.Available, migrationIDsForPrefix(len(EmbeddedMigrations)))
+			assertAppliedMigrations(t, status.Applied, wantAppliedIDs, typeScriptAppliedAt)
+			assertDescriptors(t, status.Pending, wantPendingIDs)
+
+			result, err := runner.RunPending(ctx)
+			if err != nil {
+				t.Fatalf("runner.RunPending() error = %v", err)
+			}
+
+			if !reflect.DeepEqual(result.AppliedIDs, wantPendingIDs) {
+				t.Fatalf("runner.RunPending().AppliedIDs = %v, want %v", result.AppliedIDs, wantPendingIDs)
+			}
+			if !reflect.DeepEqual(result.SkippedIDs, wantAppliedIDs) {
+				t.Fatalf("runner.RunPending().SkippedIDs = %v, want %v", result.SkippedIDs, wantAppliedIDs)
+			}
+
+			status, err = runner.Status(ctx)
+			if err != nil {
+				t.Fatalf("runner.Status() after run error = %v", err)
+			}
+
+			assertAppliedMigrationsWithSplitTimestamps(t, status.Applied, migrationIDsForPrefix(len(EmbeddedMigrations)), version, typeScriptAppliedAt, goAppliedAt)
+			if len(status.Pending) != 0 {
+				t.Fatalf("runner.Status().Pending after run = %v, want empty", status.Pending)
+			}
+
+			gotSchema := readSQLiteSchemaSnapshot(t, db)
+			if !reflect.DeepEqual(gotSchema, latestSchema) {
+				t.Fatalf("sqlite schema after migrating %q fixture = %v, want %v", fixtureID, gotSchema, latestSchema)
+			}
+		})
+	}
+}
+
 func openTestSQLiteDB(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -364,6 +432,122 @@ func openTestSQLiteDB(t *testing.T) *sql.DB {
 	})
 
 	return db
+}
+
+func openSQLiteDBAtPath(t *testing.T, dbPath string) *sql.DB {
+	t.Helper()
+
+	db, err := OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(%q) error = %v", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	return db
+}
+
+type sqliteSchemaEntry struct {
+	Type    string
+	Name    string
+	Table   string
+	SQLText string
+}
+
+func readSQLiteSchemaSnapshot(t *testing.T, db *sql.DB) []sqliteSchemaEntry {
+	t.Helper()
+
+	rows, err := db.Query(`
+		SELECT type, name, tbl_name, COALESCE(sql, '')
+		FROM sqlite_master
+		WHERE type IN ('table', 'index', 'trigger', 'view')
+		  AND name NOT LIKE 'sqlite_%'
+		ORDER BY type ASC, name ASC
+	`)
+	if err != nil {
+		t.Fatalf("db.Query(sqlite_master) error = %v", err)
+	}
+	defer rows.Close()
+
+	entries := make([]sqliteSchemaEntry, 0)
+	for rows.Next() {
+		var entry sqliteSchemaEntry
+		if err := rows.Scan(&entry.Type, &entry.Name, &entry.Table, &entry.SQLText); err != nil {
+			t.Fatalf("rows.Scan(sqlite_master) error = %v", err)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err(sqlite_master) error = %v", err)
+	}
+
+	return entries
+}
+
+func writeTypeScriptCreatedDBFixture(t *testing.T, fixtureID string) string {
+	t.Helper()
+
+	encodedFixture, err := os.ReadFile(filepath.Join("testdata", "ts-created-migration-versions", fixtureID+".sqlite.base64"))
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", fixtureID, err)
+	}
+
+	decodedFixture, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encodedFixture)))
+	if err != nil {
+		t.Fatalf("DecodeString(%q) error = %v", fixtureID, err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), fixtureID+".sqlite")
+	if err := os.WriteFile(dbPath, decodedFixture, 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", dbPath, err)
+	}
+
+	return dbPath
+}
+
+func migrationIDsForPrefix(count int) []string {
+	ids := make([]string, count)
+	for i := 0; i < count; i++ {
+		ids[i] = EmbeddedMigrations[i].ID
+	}
+
+	return ids
+}
+
+func migrationIDsForSuffix(offset int) []string {
+	ids := make([]string, len(EmbeddedMigrations)-offset)
+	for i := offset; i < len(EmbeddedMigrations); i++ {
+		ids[i-offset] = EmbeddedMigrations[i].ID
+	}
+
+	return ids
+}
+
+func assertAppliedMigrationsWithSplitTimestamps(t *testing.T, got []AppliedMigration, wantIDs []string, typeScriptCount int, typeScriptAppliedAt string, goAppliedAt string) {
+	t.Helper()
+
+	if len(got) != len(wantIDs) {
+		t.Fatalf("applied migration count = %d, want %d", len(got), len(wantIDs))
+	}
+
+	for i, migration := range got {
+		if migration.ID != wantIDs[i] {
+			t.Fatalf("applied[%d].ID = %q, want %q", i, migration.ID, wantIDs[i])
+		}
+
+		wantAppliedAt := goAppliedAt
+		if i < typeScriptCount {
+			wantAppliedAt = typeScriptAppliedAt
+		}
+
+		if migration.AppliedAt != wantAppliedAt {
+			t.Fatalf("applied[%d].AppliedAt = %q, want %q", i, migration.AppliedAt, wantAppliedAt)
+		}
+	}
 }
 
 func readForeignKeysPragmaForTest(t *testing.T, db *sql.DB) bool {
