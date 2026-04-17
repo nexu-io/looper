@@ -238,21 +238,15 @@ func openTestSQLiteDB(t *testing.T) *sql.DB {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
-	db, err := sql.Open(DriverName, dbPath)
+	db, err := OpenSQLiteDB(context.Background(), dbPath)
 	if err != nil {
-		t.Fatalf("sql.Open() error = %v", err)
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
 			t.Fatalf("db.Close() error = %v", err)
 		}
 	})
-
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
-		t.Fatalf("db.Exec(PRAGMA foreign_keys = ON) error = %v", err)
-	}
 
 	return db
 }
