@@ -3,9 +3,11 @@
 Source of truth inspected from:
 
 - `apps/looperd/src/storage/store.ts`
+- `apps/looperd/src/storage/types.ts`
 - `apps/looperd/src/storage/sqlite/sqlite-store.ts`
 - `apps/looperd/src/storage/sqlite/db.ts`
 - `apps/looperd/src/storage/sqlite/migrate.ts`
+- `apps/looperd/src/storage/sqlite/migrations.gen.ts`
 - `apps/looperd/src/storage/sqlite/migrations/*.sql`
 - `apps/looperd/src/runtime/index.ts`
 - `apps/looperd/src/server/index.ts`
@@ -13,9 +15,11 @@ Source of truth inspected from:
 ## Storage module map
 
 - `apps/looperd/src/storage/store.ts:17-125` defines the storage contract consumed by the daemon: projects, loops, runs, pull-request snapshots, events, locks, queue, agent executions, notifications, worktrees, and schema helpers.
+- `apps/looperd/src/storage/types.ts:54-243` defines the record shapes that each repository persists, including queue status/failure enums and storage health/migration status payloads.
 - `apps/looperd/src/storage/sqlite/sqlite-store.ts:26-900` is the concrete SQLite implementation of that contract.
 - `apps/looperd/src/storage/sqlite/db.ts:22-99` owns database creation, connection lifetime, pragmas, migration wiring, healthcheck, and backup delegation.
 - `apps/looperd/src/storage/sqlite/migrate.ts:30-221` owns migration discovery, lexical ordering, pending/applied status, `schema_migrations`, transactional execution, and optional backup via `VACUUM INTO`.
+- `apps/looperd/src/storage/sqlite/migrations.gen.ts` is the generated embedded migration bundle used by default at runtime.
 - `apps/looperd/src/runtime/index.ts:133-146` shows runtime startup creating `SqliteStore` and running `initialize({ autoMigrate, requireBackup })` before scheduler/server assembly.
 - `apps/looperd/src/server/index.ts:301-333` shows the daemon status surface exposing `schemaVersion` and pending migration IDs from `store.schema`.
 
