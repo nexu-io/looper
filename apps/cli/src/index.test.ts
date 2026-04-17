@@ -3,6 +3,29 @@ import { describe, expect, test } from "bun:test";
 import { CliApiError } from "./client";
 import { runCli } from "./index";
 
+const CLI_FLAG_CONTRACT_ARTIFACT_PATH = new URL(
+  "../../../specs/2026-04-17-go-port-plan/artifacts/cli-flags.compat.json",
+  import.meta.url,
+);
+
+interface CliFlagContractArtifact {
+  configForwarding: {
+    globalFlags: string[];
+  };
+  globalFlags: Array<{
+    name: string;
+    syntax: string;
+    forwarded: boolean;
+  }>;
+  commands: Record<
+    string,
+    {
+      flags: string[];
+      inheritsGlobalForwardedFlags?: boolean;
+    }
+  >;
+}
+
 function createConfig() {
   return {
     config: {
@@ -41,6 +64,12 @@ async function captureHelpOutput(args: string[]) {
     output: result.stdout.toString(),
     error: result.stderr.toString(),
   };
+}
+
+async function loadCliFlagContractArtifact() {
+  return (await Bun.file(
+    CLI_FLAG_CONTRACT_ARTIFACT_PATH,
+  ).json()) as CliFlagContractArtifact;
 }
 
 describe("runCli", () => {
@@ -91,6 +120,164 @@ describe("runCli", () => {
 
       for (const subcommand of commandGroup.subcommands) {
         expect(output).toContain(subcommand);
+      }
+    }
+  });
+
+  test("keeps the CLI flag compatibility artifact in sync with help and forwarding behavior", async () => {
+    const artifact = await loadCliFlagContractArtifact();
+    const { exitCode, output, error } = await captureHelpOutput(["--help"]);
+
+    expect(exitCode).toBe(0);
+    expect(error).toBe("");
+
+    const forwardedFlagNames = artifact.globalFlags
+      .filter((flag) => flag.forwarded)
+      .map((flag) => flag.name)
+      .sort();
+    expect(forwardedFlagNames).toEqual(
+      [...artifact.configForwarding.globalFlags].sort(),
+    );
+
+    for (const flag of artifact.globalFlags) {
+      expect(output).toContain(flag.syntax);
+    }
+
+    const forwardedArgs = [
+      "daemon",
+      "start",
+      "--json",
+      "--config",
+      "/tmp/looper.json",
+      "--host",
+      "127.0.0.2",
+      "--port",
+      "9999",
+      "--db-path=/tmp/looper.sqlite",
+      "--log-dir",
+      "/tmp/looper-logs",
+      "--daemon-mode",
+      "minimal",
+      "--bun-path",
+      "/opt/bun",
+      "--git-path",
+      "/opt/git",
+      "--gh-path",
+      "/opt/gh",
+      "--osascript-path",
+      "/opt/osascript",
+      "--force",
+    ];
+    let capturedConfigArgv: string[] = [];
+
+    const forwardingExitCode = await runCli(forwardedArgs, {
+      stdout: () => {},
+      loadConfigImpl: async ({ argv }) => {
+        capturedConfigArgv = [...argv];
+        return createConfig() as never;
+      },
+      env: {
+        HOME: "/Users/tester",
+        PATH: "/usr/bin:/bin",
+      },
+      readFileImpl: async () => {
+        throw new Error("missing");
+      },
+      runCommandImpl: async ({ command, args }) => {
+        if (command === "ps") {
+          return {
+            stdout: `${args.at(1) === "4321" ? "/Users/tester/.looper/bin/looperd" : ""}\n`,
+            stderr: "",
+            exitCode: args.at(1) === "4321" ? 0 : 1,
+          };
+        }
+        if (command === "/Users/tester/.looper/bin/looperd") {
+          return { stdout: "0.3.0\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "not found", exitCode: 1 };
+      },
+      killImpl: () => {},
+      mkdirImpl: async () => {},
+      writeFileImpl: async () => {},
+      spawnDetachedImpl: () => ({ pid: 4321 }),
+    });
+
+    expect(forwardingExitCode).toBe(0);
+    expect(capturedConfigArgv).toEqual([
+      "--config",
+      "/tmp/looper.json",
+      "--host",
+      "127.0.0.2",
+      "--port",
+      "9999",
+      "--db-path=/tmp/looper.sqlite",
+      "--log-dir",
+      "/tmp/looper-logs",
+      "--daemon-mode",
+      "minimal",
+      "--bun-path",
+      "/opt/bun",
+      "--git-path",
+      "/opt/git",
+      "--gh-path",
+      "/opt/gh",
+      "--osascript-path",
+      "/opt/osascript",
+    ]);
+
+    const commandHelpChecks: Record<string, string[]> = {
+      status: ["status", "--help"],
+      "project list": ["project", "--help"],
+      "project add": ["project", "--help"],
+      "config show": ["config", "--help"],
+      "daemon install": ["daemon", "--help"],
+      "daemon status": ["daemon", "--help"],
+      "daemon start": ["daemon", "--help"],
+      "daemon restart": ["daemon", "--help"],
+      "daemon logs": ["daemon", "--help"],
+      upgrade: ["upgrade", "--help"],
+      "loop list": ["loop", "--help"],
+      "loop start": ["loop", "--help"],
+      "loop pause": ["loop", "--help"],
+      work: ["work", "--help"],
+      plan: ["plan", "--help"],
+      "pr list": ["pr", "--help"],
+      "pr show": ["pr", "--help"],
+      "pr status": ["pr", "--help"],
+      review: ["review", "--help"],
+      "run list": ["run", "--help"],
+      ps: ["ps", "--help"],
+      jump: ["jump", "--help"],
+      logs: ["logs", "--help"],
+      stop: ["stop", "--help"],
+    };
+
+    for (const [commandName, definition] of Object.entries(artifact.commands)) {
+      const helpArgs = commandHelpChecks[commandName];
+      expect(helpArgs).toBeDefined();
+      if (!helpArgs) {
+        continue;
+      }
+      const commandHelp = await captureHelpOutput(helpArgs);
+
+      expect(commandHelp.exitCode).toBe(0);
+      expect(commandHelp.error).toBe("");
+
+      for (const flagName of definition.flags) {
+        const flag = artifact.globalFlags.find(
+          (entry) => entry.name === flagName,
+        );
+        const syntax = flag?.syntax ?? `--${flagName}`;
+        expect(commandHelp.output).toContain(syntax);
+      }
+
+      if (definition.inheritsGlobalForwardedFlags) {
+        for (const flagName of artifact.configForwarding.globalFlags) {
+          const globalFlag = artifact.globalFlags.find(
+            (entry) => entry.name === flagName,
+          );
+          expect(globalFlag).toBeDefined();
+        }
       }
     }
   });
