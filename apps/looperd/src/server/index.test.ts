@@ -33,6 +33,8 @@ const DAEMON_HTTP_ERROR_ARTIFACT_PATH = new URL(
   import.meta.url,
 );
 
+const LOOPERD_API_SOURCE_PATH = new URL("./index.ts", import.meta.url);
+
 const SEEDED_NOW = "2026-04-11T12:00:00.000Z";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -92,6 +94,10 @@ interface DaemonHttpErrorArtifact {
     responseHeaders: Record<string, string>;
     requestIdHeader: { name: string };
   };
+  errorCodes: Array<{
+    code: string;
+    status: number;
+  }>;
   cases: Array<{
     id: string;
     fixture:
@@ -138,6 +144,27 @@ async function loadDaemonHttpErrorArtifact() {
   return (await Bun.file(
     DAEMON_HTTP_ERROR_ARTIFACT_PATH,
   ).json()) as DaemonHttpErrorArtifact;
+}
+
+async function loadLooperdApiSourceErrorCodes() {
+  const source = await Bun.file(LOOPERD_API_SOURCE_PATH).text();
+  const matches = source.matchAll(/new ApiError\(\s*"([A-Z_]+)",\s*(\d+)/g);
+  const errorCodes = new Map<string, { code: string; status: number }>();
+
+  for (const [, code, status] of matches) {
+    if (!code || !status) {
+      continue;
+    }
+
+    errorCodes.set(`${code}:${status}`, {
+      code,
+      status: Number(status),
+    });
+  }
+
+  return [...errorCodes.values()].sort((left, right) =>
+    left.code.localeCompare(right.code),
+  );
 }
 
 function normalizeResponseFixture(
@@ -2587,6 +2614,33 @@ describe("createLooperdApi", () => {
         await rm(fixture.rootDir, { recursive: true, force: true });
       }
     }
+  });
+
+  test("freezes the complete daemon API error-code set and statuses", async () => {
+    const errorArtifact = await loadDaemonHttpErrorArtifact();
+    const expectedErrorCodes = [...errorArtifact.errorCodes].sort(
+      (left, right) => left.code.localeCompare(right.code),
+    );
+    const codesFromCases = [
+      ...new Map(
+        errorArtifact.cases.map((errorCase) => {
+          const body = errorCase.body as {
+            error: { code: string };
+          };
+
+          return [
+            `${body.error.code}:${errorCase.expectedStatus}`,
+            {
+              code: body.error.code,
+              status: errorCase.expectedStatus,
+            },
+          ];
+        }),
+      ).values(),
+    ].sort((left, right) => left.code.localeCompare(right.code));
+
+    expect(expectedErrorCodes).toEqual(codesFromCases);
+    expect(await loadLooperdApiSourceErrorCodes()).toEqual(expectedErrorCodes);
   });
 
   test("matches the machine-verifiable daemon HTTP response fixtures", async () => {

@@ -1,5 +1,5 @@
 {
-  "artifactVersion": 1,
+  "artifactVersion": 2,
   "generatedFrom": [
     "apps/looperd/src/server/index.ts",
     "apps/looperd/src/server/index.test.ts",
@@ -10,7 +10,8 @@
     "This artifact freezes the current /api/v1 error envelope and error-code compatibility boundary for the Go port.",
     "Each case is machine-verifiable against the Bun daemon test harness and captures the exact status plus JSON body shape.",
     "When requestId is omitted from the request, the daemon generates one; the fixture normalizes generated UUID values as <uuid>.",
-    "error.details is omitted from these envelopes because the current daemon does not include details for these failures."
+    "error.details is omitted from these envelopes because the current daemon does not include details for these failures.",
+    "errorCodes freezes the complete set of daemon error codes and their HTTP statuses; exact message variants remain frozen by the per-case fixtures."
   ],
   "placeholders": {
     "<uuid>": "Runtime-generated UUID for requestId when x-request-id is not supplied."
@@ -31,6 +32,80 @@
       }
     }
   },
+  "errorCodes": [
+    {
+      "code": "ACTIVE_RUN_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "AGENT_NOT_CONFIGURED",
+      "status": 400
+    },
+    {
+      "code": "AUTH_MISCONFIGURED",
+      "status": 500
+    },
+    {
+      "code": "INTERNAL_ERROR",
+      "status": 500
+    },
+    {
+      "code": "LOOP_CONFLICT",
+      "status": 409
+    },
+    {
+      "code": "LOOP_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "METHOD_NOT_ALLOWED",
+      "status": 405
+    },
+    {
+      "code": "PROJECTS_UNAVAILABLE",
+      "status": 500
+    },
+    {
+      "code": "PROJECT_AMBIGUOUS",
+      "status": 409
+    },
+    {
+      "code": "PROJECT_ID_CONFLICT",
+      "status": 409
+    },
+    {
+      "code": "PROJECT_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "PR_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "PULL_REQUEST_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "PULL_REQUEST_PROJECT_MISMATCH",
+      "status": 409
+    },
+    {
+      "code": "ROUTE_NOT_FOUND",
+      "status": 404
+    },
+    {
+      "code": "RUNTIME_CONTROL_UNAVAILABLE",
+      "status": 501
+    },
+    {
+      "code": "UNAUTHORIZED",
+      "status": 401
+    },
+    {
+      "code": "VALIDATION_FAILED",
+      "status": 400
+    }
+  ],
   "cases": [
     {
       "id": "auth-misconfigured",
