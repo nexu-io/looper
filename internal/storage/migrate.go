@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -30,16 +32,23 @@ type MigrationStatus struct {
 type MigrationRunResult struct {
 	AppliedIDs []string
 	SkippedIDs []string
+	BackupPath string
+}
+
+type RunPendingOptions struct {
+	RequireBackup bool
 }
 
 type MigrationRunnerOptions struct {
 	Migrations []EmbeddedMigration
+	BackupDir  string
 	Now        func() time.Time
 }
 
 type MigrationRunner struct {
 	db         *sql.DB
 	migrations []EmbeddedMigration
+	backupDir  string
 	now        func() time.Time
 }
 
@@ -57,6 +66,7 @@ func NewMigrationRunner(db *sql.DB, options MigrationRunnerOptions) *MigrationRu
 	return &MigrationRunner{
 		db:         db,
 		migrations: migrations,
+		backupDir:  options.BackupDir,
 		now:        now,
 	}
 }
@@ -112,7 +122,7 @@ func (r *MigrationRunner) Status(ctx context.Context) (MigrationStatus, error) {
 	}, nil
 }
 
-func (r *MigrationRunner) RunPending(ctx context.Context) (MigrationRunResult, error) {
+func (r *MigrationRunner) RunPending(ctx context.Context, options ...RunPendingOptions) (MigrationRunResult, error) {
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
 		return MigrationRunResult{}, fmt.Errorf("open sqlite connection: %w", err)
@@ -135,12 +145,32 @@ func (r *MigrationRunner) RunPending(ctx context.Context) (MigrationRunResult, e
 		skipped[i] = migration.ID
 	}
 
-	result := MigrationRunResult{AppliedIDs: make([]string, 0), SkippedIDs: skipped}
+	pending := make([]EmbeddedMigration, 0, len(r.migrations))
 	for _, migration := range r.migrations {
 		if _, ok := appliedIDs[migration.ID]; ok {
 			continue
 		}
+		pending = append(pending, migration)
+	}
+	if len(pending) == 0 {
+		return MigrationRunResult{AppliedIDs: []string{}, SkippedIDs: skipped}, nil
+	}
 
+	requireBackup := false
+	if len(options) > 0 {
+		requireBackup = options[0].RequireBackup
+	}
+
+	result := MigrationRunResult{AppliedIDs: make([]string, 0), SkippedIDs: skipped}
+	if requireBackup {
+		backupPath, err := r.backupOnConn(ctx, conn)
+		if err != nil {
+			return MigrationRunResult{}, err
+		}
+		result.BackupPath = backupPath
+	}
+
+	for _, migration := range pending {
 		if err := runMigration(ctx, conn, migration, r.now); err != nil {
 			return MigrationRunResult{}, err
 		}
@@ -149,6 +179,16 @@ func (r *MigrationRunner) RunPending(ctx context.Context) (MigrationRunResult, e
 	}
 
 	return result, nil
+}
+
+func (r *MigrationRunner) Backup(ctx context.Context) (string, error) {
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return "", fmt.Errorf("open sqlite connection: %w", err)
+	}
+	defer conn.Close()
+
+	return r.backupOnConn(ctx, conn)
 }
 
 func describeMigrations(migrations []EmbeddedMigration) []MigrationDescriptor {
@@ -172,6 +212,29 @@ func ensureSchemaMigrationsTable(ctx context.Context, conn *sql.Conn) error {
 	}
 
 	return nil
+}
+
+func (r *MigrationRunner) backupOnConn(ctx context.Context, conn *sql.Conn) (string, error) {
+	if r.backupDir == "" {
+		return "", fmt.Errorf("backup directory is not configured")
+	}
+
+	if err := os.MkdirAll(r.backupDir, 0o755); err != nil {
+		return "", fmt.Errorf("create backup directory: %w", err)
+	}
+
+	backupPath := buildBackupPath(r.backupDir, r.now().UTC())
+	safePath := strings.ReplaceAll(backupPath, "'", "''")
+	if _, err := conn.ExecContext(ctx, `VACUUM INTO '`+safePath+`'`); err != nil {
+		return "", fmt.Errorf("create sqlite backup: %w", err)
+	}
+
+	return backupPath, nil
+}
+
+func buildBackupPath(backupDir string, now time.Time) string {
+	stamp := strings.ReplaceAll(now.UTC().Format(javaScriptISOStringLayout), ":", "-")
+	return filepath.Join(backupDir, "looper-"+stamp+".sqlite")
 }
 
 func readAppliedMigrations(ctx context.Context, conn *sql.Conn) ([]AppliedMigration, error) {

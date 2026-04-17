@@ -14,6 +14,7 @@ const sqliteBusyTimeoutMilliseconds = 5000
 
 type SQLiteCoordinatorOptions struct {
 	Migrations []EmbeddedMigration
+	BackupDir  string
 	Now        func() time.Time
 }
 
@@ -36,6 +37,7 @@ func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoo
 		db: db,
 		runner: NewMigrationRunner(db, MigrationRunnerOptions{
 			Migrations: options.Migrations,
+			BackupDir:  options.BackupDir,
 			Now:        options.Now,
 		}),
 	}
@@ -75,6 +77,14 @@ func (c *SQLiteCoordinator) DB() *sql.DB {
 
 func (c *SQLiteCoordinator) MigrationRunner() *MigrationRunner {
 	return c.runner
+}
+
+func (c *SQLiteCoordinator) Backup(ctx context.Context) (string, error) {
+	if c == nil || c.runner == nil {
+		return "", fmt.Errorf("sqlite coordinator is not initialized")
+	}
+
+	return c.runner.Backup(ctx)
 }
 
 func (c *SQLiteCoordinator) Close() error {

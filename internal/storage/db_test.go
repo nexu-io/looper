@@ -43,8 +43,10 @@ func TestOpenSQLiteCoordinatorCreatesParentDirAndAppliesPragmas(t *testing.T) {
 func TestOpenSQLiteCoordinatorBuildsMigrationRunner(t *testing.T) {
 	t.Parallel()
 
-	coordinator, err := OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "looper.sqlite"), SQLiteCoordinatorOptions{
+	rootDir := t.TempDir()
+	coordinator, err := OpenSQLiteCoordinator(context.Background(), filepath.Join(rootDir, "looper.sqlite"), SQLiteCoordinatorOptions{
 		Migrations: []EmbeddedMigration{{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"}},
+		BackupDir:  filepath.Join(rootDir, "backups"),
 		Now:        func() time.Time { return time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
@@ -63,6 +65,14 @@ func TestOpenSQLiteCoordinatorBuildsMigrationRunner(t *testing.T) {
 
 	if len(result.AppliedIDs) != 1 || result.AppliedIDs[0] != "0001_init" {
 		t.Fatalf("MigrationRunner().RunPending().AppliedIDs = %v, want [0001_init]", result.AppliedIDs)
+	}
+
+	backupPath, err := coordinator.Backup(context.Background())
+	if err != nil {
+		t.Fatalf("coordinator.Backup() error = %v", err)
+	}
+	if backupPath == "" {
+		t.Fatal("coordinator.Backup() path = empty, want non-empty")
 	}
 }
 

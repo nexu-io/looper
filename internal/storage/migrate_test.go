@@ -111,6 +111,121 @@ func TestMigrationRunnerPreservesSchemaMigrationsOrderingAndStatus(t *testing.T)
 	}
 }
 
+func TestMigrationRunnerCreatesBackupBeforeApplyingPendingMigrations(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	dbPath := filepath.Join(rootDir, "looper.sqlite")
+	backupDir := filepath.Join(rootDir, "backups")
+	db, err := OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL);"},
+			{ID: "0002_seed", FileName: "0002_seed.sql", SQL: "INSERT INTO widgets (id, name) VALUES ('w_1', 'alpha');"},
+		},
+		BackupDir: backupDir,
+		Now:       func() time.Time { return time.Date(2026, time.April, 11, 10, 20, 30, 0, time.UTC) },
+	})
+
+	result, err := runner.RunPending(context.Background(), RunPendingOptions{RequireBackup: true})
+	if err != nil {
+		t.Fatalf("runner.RunPending() error = %v", err)
+	}
+
+	wantBackupPath := filepath.Join(backupDir, "looper-2026-04-11T10-20-30.000Z.sqlite")
+	if result.BackupPath != wantBackupPath {
+		t.Fatalf("runner.RunPending().BackupPath = %q, want %q", result.BackupPath, wantBackupPath)
+	}
+
+	backupInfo, err := os.Stat(result.BackupPath)
+	if err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", result.BackupPath, err)
+	}
+	if backupInfo.Size() <= 0 {
+		t.Fatalf("backup size = %d, want > 0", backupInfo.Size())
+	}
+
+	backupDB, err := OpenSQLiteDB(context.Background(), result.BackupPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(backup) error = %v", err)
+	}
+	defer backupDB.Close()
+
+	var backupAppliedCount int
+	if err := backupDB.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&backupAppliedCount); err != nil {
+		t.Fatalf("backupDB.QueryRow(schema_migrations).Scan() error = %v", err)
+	}
+	if backupAppliedCount != 0 {
+		t.Fatalf("backup schema_migrations count = %d, want 0", backupAppliedCount)
+	}
+
+	var widgetTableCount int
+	if err := backupDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, "widgets").Scan(&widgetTableCount); err != nil {
+		t.Fatalf("backupDB.QueryRow(widget table).Scan() error = %v", err)
+	}
+	if widgetTableCount != 0 {
+		t.Fatalf("backup widgets table count = %d, want 0", widgetTableCount)
+	}
+
+	var widgetName string
+	if err := db.QueryRow(`SELECT name FROM widgets WHERE id = ?`, "w_1").Scan(&widgetName); err != nil {
+		t.Fatalf("db.QueryRow(widgets).Scan() error = %v", err)
+	}
+	if widgetName != "alpha" {
+		t.Fatalf("widgets name = %q, want %q", widgetName, "alpha")
+	}
+}
+
+func TestMigrationRunnerSkipsBackupWhenNoPendingMigrationsRemain(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	backupDir := filepath.Join(rootDir, "backups")
+	db := openTestSQLiteDB(t)
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"}},
+		BackupDir:  backupDir,
+		Now:        func() time.Time { return time.Date(2026, time.April, 11, 10, 20, 30, 0, time.UTC) },
+	})
+
+	if _, err := runner.RunPending(context.Background(), RunPendingOptions{RequireBackup: true}); err != nil {
+		t.Fatalf("first runner.RunPending() error = %v", err)
+	}
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(%q) error = %v", backupDir, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("backup entry count after first run = %d, want 1", len(entries))
+	}
+
+	result, err := runner.RunPending(context.Background(), RunPendingOptions{RequireBackup: true})
+	if err != nil {
+		t.Fatalf("second runner.RunPending() error = %v", err)
+	}
+	if result.BackupPath != "" {
+		t.Fatalf("second runner.RunPending().BackupPath = %q, want empty", result.BackupPath)
+	}
+
+	entries, err = os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(%q) after second run error = %v", backupDir, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("backup entry count after second run = %d, want 1", len(entries))
+	}
+}
+
 func TestMigrationRunnerDoesNotRecordFailedMigration(t *testing.T) {
 	t.Parallel()
 
