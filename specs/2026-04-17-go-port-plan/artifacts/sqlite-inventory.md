@@ -42,6 +42,30 @@ The current schema is the result of applying migrations `0001` through `0007` in
 | `queue_items` | Durable scheduler queue and retry/recovery state. | `id` primary key, optional project/loop FKs, `type`, target selectors, `dedupe_key`, priority, claim/retry/failure fields. | `0003_scheduler_queue.sql:1-43`, `0004_worker_project_target.sql:78-197` |
 | `counters` | Monotonic named counters, currently loop sequence allocation. | `name` primary key, integer `value`; seeded with `loop_seq`. | `0006_loop_seq_handles.sql:68-75` |
 
+## Runtime-table inventory for parity work
+
+These are the tables that actively carry daemon runtime state today, including the notifications/worktree surfaces that need explicit parity in the Go port.
+
+| Table | Runtime responsibility | Key persisted state | Repository surface |
+| --- | --- | --- | --- |
+| `projects` | Anchors runtime state to a registered repository. | Repo path, display name, base branch, archive bit, timestamps. | `projects.upsert/list/get` |
+| `loops` | Persists loop definitions and current orchestration status. | Loop type/target, repo + PR selectors, status, scheduling timestamps, monotonic `seq`. | `loops.upsert/list/get/nextSeq` |
+| `runs` | Tracks each active or historical loop execution. | Status, step, trigger, branch metadata, started/finished/heartbeat timestamps, error fields. | `runs.upsert/list/get/getLatestByLoopId` |
+| `locks` | Coordinates daemon-owned runtime exclusivity. | Lock owner/reason plus expiry for stale-lock recovery. | `locks.acquire/release/listExpired` |
+| `event_logs` | Append-only runtime audit trail. | Event type, entity linkage, actor metadata, opaque payload JSON, created timestamp. | `events.append/list/listByEntity` |
+| `pull_request_snapshots` | Caches external GitHub state consumed by runtime decisions. | PR identifiers, SHA/review/check state, payload JSON, capture timestamp. | `pullRequestSnapshots.upsert/listLatest/getLatestByRepoAndNumber` |
+| `agent_executions` | Persists coding-agent process lifecycle. | Vendor, status, process id, command/cwd JSON, heartbeat/output/error fields, timing data. | `agentExecutions.upsert/listActive/listByRunId/getLatestByRunId/getById` |
+| `notifications` | Persists notification delivery history and dedupe state. | Channel, level, title/body payload JSON, status, dedupe key, sent/error timestamps. | `notifications.upsert/listByRunId/findRecentByDedupeKey` |
+| `worktrees` | Persists git worktree allocation/cleanup lifecycle. | Project linkage, repo/worktree paths, branch/base branch, status, head SHA, cleanup timestamp. | `worktrees.upsert/listByProjectId/getById/getByBranch` |
+| `queue_items` | Durable scheduler queue for deferred/retryable runtime work. | Work type/target selectors, dedupe key, status, attempts, claim metadata, retry/error fields. | `queue.enqueue/claim*/complete/markRetry/fail/requeueRunningByLoop/cancelByLoop` |
+| `counters` | Stores runtime sequence allocator state. | Named integer counters; currently `loop_seq`. | `loops.nextSeq` |
+
+Notes:
+
+- `notifications` and `worktrees` are not optional adjunct tables; both are first-class repositories on the `Store` contract and appear in the post-migration DDL snapshot.
+- `queue_items`, `agent_executions`, `notifications`, `worktrees`, `runs`, and `locks` together capture the daemon's recoverable in-flight runtime state; `event_logs` and `pull_request_snapshots` provide supporting audit/cache state that the runtime also persists.
+- `schema_migrations` remains migration bookkeeping rather than business/runtime state, but it is still part of the persisted compatibility boundary because startup migration behavior depends on it.
+
 ## Migration inventory
 
 Migration source files live in `apps/looperd/src/storage/sqlite/migrations/` and are embedded through `migrations.gen.ts` for normal runtime use.
