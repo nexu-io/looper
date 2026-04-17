@@ -10,6 +10,111 @@ import (
 	"testing"
 )
 
+func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "missing.json")
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Metadata.ConfigPath != configPath {
+		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, configPath)
+	}
+
+	if loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = true, want false")
+	}
+
+	if loaded.Config.Server.Host != "127.0.0.1" {
+		t.Fatalf("LoadFile().Config.Server.Host = %q, want default %q", loaded.Config.Server.Host, "127.0.0.1")
+	}
+
+	if loaded.Config.Daemon.WorkingDirectory != cwd {
+		t.Fatalf("LoadFile().Config.Daemon.WorkingDirectory = %q, want %q", loaded.Config.Daemon.WorkingDirectory, cwd)
+	}
+
+	if loaded.Partial.Server != nil {
+		t.Fatalf("LoadFile().Partial.Server = %#v, want nil", loaded.Partial.Server)
+	}
+}
+
+func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
+	cwd := t.TempDir()
+	relativePath := filepath.Join("configs", "looper.json")
+	configPath := filepath.Join(cwd, relativePath)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
+	contents := `{
+		"server": {"port": 6123},
+		"projects": [{"id": "demo", "name": "Demo", "repoPath": "/repos/demo"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Metadata.ConfigPath != configPath {
+		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, configPath)
+	}
+
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+
+	if loaded.Config.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6123)
+	}
+
+	if len(loaded.Config.Projects) != 1 || loaded.Config.Projects[0].ID != "demo" {
+		t.Fatalf("LoadFile().Config.Projects = %#v, want single demo project", loaded.Config.Projects)
+	}
+
+	if loaded.Partial.Server == nil || loaded.Partial.Server.Port == nil || *loaded.Partial.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Partial.Server.Port = %#v, want 6123", loaded.Partial.Server)
+	}
+}
+
+func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte("{"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "failed to read config file at "+configPath) {
+		t.Fatalf("LoadFile() error = %q, want path context", err)
+	}
+}
+
+func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir()})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	defaultConfigPath, err := DefaultConfigPath()
+	if err != nil {
+		t.Fatalf("DefaultConfigPath() error = %v", err)
+	}
+
+	if loaded.Metadata.ConfigPath != defaultConfigPath {
+		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+	}
+}
+
 func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
