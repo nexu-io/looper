@@ -3,7 +3,9 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,6 +120,320 @@ func TestRuntimeStartIsIdempotent(t *testing.T) {
 	}
 	if _, ok := rt.StartedAt(); !ok {
 		t.Fatal("StartedAt() ok = false, want true")
+	}
+}
+
+func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{
+		BackupDir: backupDir,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seedCoordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() seed error = %v", err)
+	}
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "main"
+	projectID := "project_1"
+	loopID := "loop_1"
+	queueID := "queue_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:         projectID,
+		Name:       "Looper",
+		RepoPath:   filepath.Join(workingDir, "repo"),
+		BaseBranch: &baseBranch,
+		Archived:   false,
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         loopID,
+		Seq:        1,
+		ProjectID:  projectID,
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:42"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(42),
+		Status:     "running",
+		LastRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_1",
+		LoopID:            loopID,
+		Status:            "running",
+		CurrentStep:       stringPtr("review"),
+		LastCompletedStep: stringPtr("snapshot"),
+		StartedAt:         nowISO,
+		LastHeartbeatAt:   stringPtr(nowISO),
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          queueID,
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "reviewer",
+		TargetType:  "pull_request",
+		TargetID:    "pr:acme/looper:42",
+		Repo:        stringPtr("acme/looper"),
+		PRNumber:    int64Ptr(42),
+		DedupeKey:   "reviewer:acme/looper:42",
+		Priority:    2,
+		Status:      "running",
+		AvailableAt: nowISO,
+		Attempts:    0,
+		MaxAttempts: 3,
+		ClaimedBy:   stringPtr("executor_1"),
+		ClaimedAt:   stringPtr(nowISO),
+		StartedAt:   stringPtr(nowISO),
+		LockKey:     stringPtr("pr:acme/looper:42"),
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() seed error = %v", err)
+	}
+	reason := "claim"
+	if _, err := seedRepos.Locks.Acquire(context.Background(), storage.LockRecord{
+		Key:       "pr:acme/looper:42",
+		Owner:     "reviewer-loop",
+		Reason:    &reason,
+		ExpiresAt: "2020-01-01T00:00:00.000Z",
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Locks.Acquire() seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	tickStarted := make(chan struct{})
+	var tickOnce sync.Once
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+		RunSchedulerTick: func(ctx context.Context, services Services) error {
+			loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+			if err != nil {
+				return err
+			}
+			if loop == nil || loop.Status != "queued" {
+				t.Fatalf("scheduler tick saw loop %#v, want queued recovery state", loop)
+			}
+			tickOnce.Do(func() { close(tickStarted) })
+			return nil
+		},
+	})
+
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	select {
+	case <-tickStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler tick did not run immediately after startup")
+	}
+
+	services := rt.Services()
+	run, err := services.Repositories.Runs.GetByID(context.Background(), "run_1")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run == nil || run.Status != "interrupted" {
+		t.Fatalf("Runs.GetByID(run_1) = %#v, want interrupted", run)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil || *loop.NextRunAt != nowISO {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, want queued with next_run_at", loop)
+	}
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.ClaimedBy != nil || queue.StartedAt != nil {
+		t.Fatalf("Queue.GetByID(queue_1) = %#v, want requeued and unclaimed", queue)
+	}
+	lock, err := services.Repositories.Locks.Get(context.Background(), "pr:acme/looper:42")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("Locks.Get() = %#v, want released lock", lock)
+	}
+
+	recovery := rt.RecoverySummary()
+	if recovery.ExpiredLocksReleased != 1 || recovery.InterruptedRunsMarked != 1 || recovery.LoopsRequeued != 1 || recovery.EventsWritten != 4 {
+		t.Fatalf("RecoverySummary() = %#v, want one recovered lock/run/loop and 4 events", recovery)
+	}
+
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop) error = %v", err)
+	}
+	if !containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("loop events = %#v, want looperd.recovery.loop_requeued", events)
+	}
+
+	allEvents, err := services.Repositories.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if !containsEventType(allEvents, "looperd.started") {
+		t.Fatalf("all events = %#v, want looperd.started", allEvents)
+	}
+}
+
+func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "main"
+	projectID := "project_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:         projectID,
+		Name:       "Looper",
+		RepoPath:   filepath.Join(workingDir, "repo"),
+		BaseBranch: &baseBranch,
+		Archived:   false,
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	seedLoopWithRun(t, seedRepos, projectID, "loop_success", 1, "queued", "success", nowISO)
+	seedLoopWithRun(t, seedRepos, projectID, "loop_failed", 2, "queued", "failed", nowISO)
+	seedLoopWithRun(t, seedRepos, projectID, "loop_legit", 3, "queued", "success", nowISO)
+	if err := seedRepos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_legit",
+		ProjectID:   &projectID,
+		LoopID:      stringPtr("loop_legit"),
+		Type:        "worker",
+		TargetType:  "pull_request",
+		TargetID:    "pr:acme/looper:99",
+		DedupeKey:   "worker:acme/looper:99",
+		Priority:    1,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		Attempts:    0,
+		MaxAttempts: 3,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_legit) seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	assertLoopStatus(t, services.Repositories, "loop_success", "completed")
+	assertLoopStatus(t, services.Repositories, "loop_failed", "failed")
+	assertLoopStatus(t, services.Repositories, "loop_legit", "queued")
+
+	successEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_success")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_success) error = %v", err)
+	}
+	if !containsEventType(successEvents, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("loop_success events = %#v, want normalization event", successEvents)
+	}
+	legitEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_legit")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_legit) error = %v", err)
+	}
+	if containsEventType(legitEvents, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("loop_legit events = %#v, want no normalization event", legitEvents)
+	}
+}
+
+func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Scheduler.PollIntervalSeconds = 1
+	var tickCount int32
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error {
+			atomic.AddInt32(&tickCount, 1)
+			return nil
+		},
+	})
+
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	waitForCondition(t, 2500*time.Millisecond, func() bool {
+		return atomic.LoadInt32(&tickCount) >= 2
+	})
+	if got := atomic.LoadInt32(&tickCount); got < 2 {
+		t.Fatalf("scheduler tick count = %d, want immediate tick plus polling tick", got)
 	}
 }
 
@@ -295,4 +611,84 @@ func (l *testLogger) append(message string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.entries = append(l.entries, message)
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
+}
+
+func containsEventType(events []storage.EventLogRecord, want string) bool {
+	for _, event := range events {
+		if event.EventType == want {
+			return true
+		}
+	}
+	return false
+}
+
+func openMigratedCoordinator(t *testing.T, dbPath, backupDir string) *storage.SQLiteCoordinator {
+	t.Helper()
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{
+		BackupDir: backupDir,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	return coordinator
+}
+
+func seedLoopWithRun(t *testing.T, repos *storage.Repositories, projectID, loopID string, seq int64, loopStatus, runStatus, nowISO string) {
+	t.Helper()
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         loopID,
+		Seq:        seq,
+		ProjectID:  projectID,
+		Type:       "worker",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:99"),
+		Status:     loopStatus,
+		NextRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:        loopID + "_run",
+		LoopID:    loopID,
+		Status:    runStatus,
+		StartedAt: nowISO,
+		EndedAt:   stringPtr(nowISO),
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(%s) error = %v", loopID, err)
+	}
+}
+
+func assertLoopStatus(t *testing.T, repos *storage.Repositories, loopID, want string) {
+	t.Helper()
+	loop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID(%s) error = %v", loopID, err)
+	}
+	if loop == nil || loop.Status != want {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want status %q", loopID, loop, want)
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("condition not satisfied before timeout")
 }

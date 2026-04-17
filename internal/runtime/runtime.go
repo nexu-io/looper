@@ -3,6 +3,8 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -18,12 +20,31 @@ type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoord
 
 type SyncConfiguredProjectsFunc func(context.Context, *storage.Repositories, config.Config, time.Time) error
 
+type RunSchedulerTickFunc func(context.Context, Services) error
+
+type RecoverySummary struct {
+	StartedAt             string                     `json:"startedAt,omitempty"`
+	CompletedAt           string                     `json:"completedAt,omitempty"`
+	OrphanAgentCleanup    RecoveryOrphanAgentCleanup `json:"orphanAgentCleanup"`
+	ExpiredLocksReleased  int64                      `json:"expiredLocksReleased"`
+	InterruptedRunsMarked int64                      `json:"interruptedRunsMarked"`
+	LoopsRequeued         int64                      `json:"loopsRequeued"`
+	EventsWritten         int64                      `json:"eventsWritten"`
+}
+
+type RecoveryOrphanAgentCleanup struct {
+	Attempted    bool   `json:"attempted"`
+	CleanedCount int64  `json:"cleanedCount"`
+	Warning      string `json:"warning,omitempty"`
+}
+
 type Options struct {
 	Config                 config.Config
 	Logger                 bootstrap.Logger
 	Now                    func() time.Time
 	OpenSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects SyncConfiguredProjectsFunc
+	RunSchedulerTick       RunSchedulerTickFunc
 }
 
 type Services struct {
@@ -38,15 +59,19 @@ type Runtime struct {
 
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
+	runSchedulerTick       RunSchedulerTickFunc
 
-	mu           sync.RWMutex
-	startedAt    *time.Time
-	stopped      bool
-	services     Services
-	startErr     error
-	startOnce    sync.Once
-	shutdownOnce sync.Once
-	shutdownCh   chan struct{}
+	mu            sync.RWMutex
+	startedAt     *time.Time
+	recovery      RecoverySummary
+	stopped       bool
+	services      Services
+	startErr      error
+	startOnce     sync.Once
+	shutdownOnce  sync.Once
+	shutdownCh    chan struct{}
+	schedulerStop chan struct{}
+	schedulerDone chan struct{}
 }
 
 func New(options Options) *Runtime {
@@ -65,12 +90,21 @@ func New(options Options) *Runtime {
 		syncConfiguredProjects = defaultSyncConfiguredProjects
 	}
 
+	runSchedulerTick := options.RunSchedulerTick
+	if runSchedulerTick == nil {
+		runSchedulerTick = func(context.Context, Services) error {
+			return nil
+		}
+	}
+
 	return &Runtime{
 		config:                 options.Config,
 		logger:                 options.Logger,
 		now:                    now,
 		openSQLiteCoordinator:  openSQLiteCoordinator,
 		syncConfiguredProjects: syncConfiguredProjects,
+		runSchedulerTick:       runSchedulerTick,
+		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 	}
 }
@@ -101,11 +135,20 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		r.stopSchedulerLoop()
+
 		r.mu.Lock()
 		r.stopped = true
 		coordinator := r.services.Coordinator
+		repositories := r.services.Repositories
 		r.services = Services{}
 		r.mu.Unlock()
+
+		if repositories != nil {
+			if err := r.appendStoppedEvent(context.Background(), repositories, reason); err != nil && r.logger != nil {
+				r.logger.Warn("looperd runtime stop event failed", map[string]any{"error": err.Error()})
+			}
+		}
 
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
@@ -148,6 +191,13 @@ func (r *Runtime) Config() config.Config {
 	defer r.mu.RUnlock()
 
 	return r.config
+}
+
+func (r *Runtime) RecoverySummary() RecoverySummary {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.recovery
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -193,30 +243,324 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 
+	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, startedAt)
+	if err != nil {
+		return err
+	}
+
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
 		return fmt.Errorf("runtime already stopped")
 	}
 	r.startedAt = &startedAt
+	r.recovery = recoverySummary
 	r.services = Services{
 		Coordinator:  coordinator,
 		Repositories: repositories,
 	}
 	r.mu.Unlock()
 
+	r.startSchedulerLoop()
+	if err := r.appendStartedEvent(context.Background(), startedAt); err != nil {
+		return err
+	}
+
 	started = true
 
 	if r.logger != nil {
 		r.logger.Info("looperd runtime assembled", map[string]any{
-			"dbPath":         r.config.Storage.DBPath,
-			"projectCount":   len(r.config.Projects),
-			"autoMigrate":    r.config.Package.AutoMigrateOnStartup,
-			"backupRequired": r.config.Package.RequireBackupBeforeMigrate,
+			"dbPath":          r.config.Storage.DBPath,
+			"projectCount":    len(r.config.Projects),
+			"autoMigrate":     r.config.Package.AutoMigrateOnStartup,
+			"backupRequired":  r.config.Package.RequireBackupBeforeMigrate,
+			"recoverySummary": recoverySummary,
 		})
 	}
 
 	return nil
+}
+
+func (r *Runtime) startSchedulerLoop() {
+	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+
+	r.mu.Lock()
+	r.schedulerStop = stopCh
+	r.schedulerDone = doneCh
+	r.mu.Unlock()
+
+	go func() {
+		defer close(doneCh)
+
+		r.executeSchedulerTick(context.Background())
+		if pollInterval <= 0 {
+			<-stopCh
+			return
+		}
+
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				r.executeSchedulerTick(context.Background())
+			}
+		}
+	}()
+}
+
+func (r *Runtime) stopSchedulerLoop() {
+	r.mu.Lock()
+	stopCh := r.schedulerStop
+	doneCh := r.schedulerDone
+	r.schedulerStop = nil
+	r.schedulerDone = nil
+	r.mu.Unlock()
+
+	if stopCh == nil || doneCh == nil {
+		return
+	}
+
+	close(stopCh)
+	<-doneCh
+}
+
+func (r *Runtime) executeSchedulerTick(ctx context.Context) {
+	services := r.Services()
+	if services.Repositories == nil {
+		return
+	}
+
+	if err := r.runSchedulerTick(ctx, services); err != nil && r.logger != nil {
+		r.logger.Warn("looperd scheduler tick failed", map[string]any{"error": err.Error()})
+	}
+}
+
+func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage.Repositories, now time.Time) (RecoverySummary, error) {
+	nowISO := formatJavaScriptISOString(now)
+	eventsWritten := int64(0)
+	summary := createEmptyRecoverySummary()
+	summary.StartedAt = nowISO
+	summary.OrphanAgentCleanup.Warning = "agent execution recovery has not been ported yet"
+
+	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	for _, lock := range expiredLocks {
+		if err := repositories.Locks.Release(ctx, lock.Key); err != nil {
+			return RecoverySummary{}, err
+		}
+		summary.ExpiredLocksReleased += 1
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.lock_released",
+			EntityType: stringPtr("lock"),
+			EntityID:   stringPtr(lock.Key),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"owner":       lock.Owner,
+				"expiredAt":   lock.ExpiresAt,
+				"recoveredAt": nowISO,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return RecoverySummary{}, err
+		}
+		eventsWritten += 1
+	}
+
+	loops, err := repositories.Loops.List(ctx)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	for _, loop := range loops {
+		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return RecoverySummary{}, err
+		}
+		if latestRun == nil {
+			continue
+		}
+
+		if latestRun.Status == "running" {
+			interrupted := *latestRun
+			interrupted.Status = "interrupted"
+			if interrupted.ErrorMessage == nil {
+				interrupted.ErrorMessage = stringPtr("Interrupted during looperd recovery")
+			}
+			interrupted.EndedAt = stringPtr(nowISO)
+			interrupted.UpdatedAt = nowISO
+			if err := repositories.Runs.Upsert(ctx, interrupted); err != nil {
+				return RecoverySummary{}, err
+			}
+			*latestRun = interrupted
+			summary.InterruptedRunsMarked += 1
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "looperd.recovery.run_interrupted",
+				LoopID:     stringPtr(loop.ID),
+				RunID:      stringPtr(latestRun.ID),
+				EntityType: stringPtr("run"),
+				EntityID:   stringPtr(latestRun.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"previousStatus":  "running",
+					"recoveredStatus": "interrupted",
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+		}
+
+		if shouldRequeueLoop(loop, *latestRun) {
+			requeuedLoop := loop
+			requeuedLoop.Status = "queued"
+			requeuedLoop.NextRunAt = stringPtr(nowISO)
+			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			requeuedLoop.UpdatedAt = nowISO
+			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+				return RecoverySummary{}, err
+			}
+			recoveredQueueItems, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			summary.LoopsRequeued += 1
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "looperd.recovery.loop_requeued",
+				LoopID:     stringPtr(loop.ID),
+				EntityType: stringPtr("loop"),
+				EntityID:   stringPtr(loop.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"previousStatus":      loop.Status,
+					"nextRunAt":           nowISO,
+					"recoveredQueueItems": recoveredQueueItems,
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+		}
+	}
+
+	queueItems, err := repositories.Queue.List(ctx)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	queuedLoopIDs := make(map[string]struct{})
+	for _, item := range queueItems {
+		if item.LoopID == nil {
+			continue
+		}
+		if item.Status == "queued" || item.Status == "running" {
+			queuedLoopIDs[*item.LoopID] = struct{}{}
+		}
+	}
+
+	for _, loop := range loops {
+		if loop.Status != "queued" {
+			continue
+		}
+		if _, exists := queuedLoopIDs[loop.ID]; exists {
+			continue
+		}
+
+		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return RecoverySummary{}, err
+		}
+		if latestRun == nil {
+			continue
+		}
+
+		normalizedLoop := loop
+		normalizedLoop.Status = normalizeStaleQueuedLoopStatus(*latestRun)
+		normalizedLoop.NextRunAt = nil
+		normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+		normalizedLoop.UpdatedAt = nowISO
+		if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+			return RecoverySummary{}, err
+		}
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.loop_queue_normalized",
+			LoopID:     stringPtr(loop.ID),
+			EntityType: stringPtr("loop"),
+			EntityID:   stringPtr(loop.ID),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"previousStatus":  loop.Status,
+				"recoveredStatus": normalizedLoop.Status,
+				"latestRunStatus": latestRun.Status,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return RecoverySummary{}, err
+		}
+		eventsWritten += 1
+	}
+
+	summary.CompletedAt = nowISO
+	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  "looperd.recovery.completed",
+		EntityType: stringPtr("notification"),
+		EntityID:   stringPtr("looperd-recovery"),
+		PayloadJSON: mustMarshalJSON(map[string]any{
+			"expiredLocksReleased":  summary.ExpiredLocksReleased,
+			"interruptedRunsMarked": summary.InterruptedRunsMarked,
+			"loopsRequeued":         summary.LoopsRequeued,
+			"orphanAgentCleanup":    summary.OrphanAgentCleanup,
+		}),
+		CreatedAt: nowISO,
+	}); err != nil {
+		return RecoverySummary{}, err
+	}
+	eventsWritten += 1
+	summary.EventsWritten = eventsWritten
+
+	return summary, nil
+}
+
+func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) error {
+	services := r.Services()
+	if services.Repositories == nil {
+		return nil
+	}
+
+	return appendSystemEvent(ctx, services.Repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  "looperd.started",
+		EntityType: stringPtr("notification"),
+		EntityID:   stringPtr("looperd"),
+		PayloadJSON: mustMarshalJSON(map[string]any{
+			"daemonMode": r.config.Daemon.Mode,
+			"host":       r.config.Server.Host,
+			"port":       r.config.Server.Port,
+			"recovery":   r.RecoverySummary(),
+		}),
+		CreatedAt: formatJavaScriptISOString(startedAt),
+	})
+}
+
+func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.Repositories, reason string) error {
+	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  "looperd.stopped",
+		EntityType: stringPtr("notification"),
+		EntityID:   stringPtr("looperd"),
+		PayloadJSON: mustMarshalJSON(map[string]any{
+			"reason": reason,
+		}),
+		CreatedAt: formatJavaScriptISOString(r.now()),
+	})
 }
 
 func defaultSyncConfiguredProjects(ctx context.Context, repositories *storage.Repositories, cfg config.Config, now time.Time) error {
@@ -389,4 +733,79 @@ func marshalOrderedJSONObject(entries []orderedJSONEntry) (string, error) {
 
 	buffer.WriteByte('}')
 	return buffer.String(), nil
+}
+
+func appendSystemEvent(ctx context.Context, repositories *storage.Repositories, record storage.EventLogRecord) error {
+	if repositories == nil || repositories.Events == nil {
+		return fmt.Errorf("events repository is not configured")
+	}
+
+	record.ActorType = stringPtr("system")
+	record.ActorID = stringPtr("looperd")
+	record.ActorDisplayName = stringPtr("looperd")
+	return repositories.Events.Append(ctx, record)
+}
+
+func createEmptyRecoverySummary() RecoverySummary {
+	return RecoverySummary{
+		OrphanAgentCleanup: RecoveryOrphanAgentCleanup{
+			Attempted:    false,
+			CleanedCount: 0,
+		},
+		ExpiredLocksReleased:  0,
+		InterruptedRunsMarked: 0,
+		LoopsRequeued:         0,
+		EventsWritten:         0,
+	}
+}
+
+func shouldRequeueLoop(loop storage.LoopRecord, latestRun storage.RunRecord) bool {
+	if loop.Status == "paused" {
+		return false
+	}
+	if loop.Status == "completed" || loop.Status == "failed" {
+		return false
+	}
+
+	return loop.Status == "running" || latestRun.Status == "interrupted"
+}
+
+func normalizeStaleQueuedLoopStatus(latestRun storage.RunRecord) string {
+	switch latestRun.Status {
+	case "success":
+		return "completed"
+	case "interrupted", "running":
+		return "interrupted"
+	default:
+		return "failed"
+	}
+}
+
+func mustMarshalJSON(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func coalesceString(values ...*string) *string {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func newRuntimeEventID() string {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Sprintf("runtime_%d", time.Now().UTC().UnixNano())
+	}
+	return "runtime_" + hex.EncodeToString(raw)
 }
