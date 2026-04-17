@@ -434,6 +434,11 @@ Recommendation:
 
 > Reuse the current SQLite schema first, unless the existing schema is fundamentally broken.
 
+Decision recorded in `artifacts/sqlite-schema-reuse-decision.md`:
+
+- no blocker has been found in the current schema or migration lineage
+- the Go port should treat the TypeScript migration history through `0007_agent_execution_run_index` as the storage compatibility boundary
+
 Reason:
 
 - faster cutover with less temporary migration code
