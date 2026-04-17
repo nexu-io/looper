@@ -10,6 +10,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/version"
 )
 
@@ -42,9 +43,7 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 	bootstrapImpl := deps.bootstrapImpl
 	if bootstrapImpl == nil {
 		bootstrapImpl = func(ctx context.Context, options bootstrap.Options) (bootstrap.Result, error) {
-			options.StartRuntime = func(context.Context, bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
-				return nil, fmt.Errorf("runtime assembly has not been ported yet")
-			}
+			options.StartRuntime = looperdruntime.Start
 			return bootstrap.Bootstrap(ctx, options)
 		}
 	}
@@ -89,6 +88,6 @@ Usage:
 	looperd help
 
 Status:
-	Bootstrap flow and signal handling are ported. Runtime assembly and daemon command parity remain in progress.
+	Bootstrap flow, signal handling, and runtime assembly are ported. Daemon command parity remains in progress.
 `)
 }
