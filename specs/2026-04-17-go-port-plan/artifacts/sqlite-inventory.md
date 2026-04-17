@@ -106,4 +106,4 @@ The `Store` contract in `apps/looperd/src/storage/store.ts:17-125` is implemente
 - The current daemon assumes a single SQLite database file plus startup auto-migration, not an external migration step (`runtime/index.ts:133-146`, `db.ts:42-44`).
 - Migration compatibility includes both the schema shape and the `schema_migrations` bookkeeping contract (`migrate.ts:57-66`, `154-185`).
 - Queue durability, event history, notifications, worktrees, and agent execution state are already part of the persisted runtime contract; they are not optional side tables.
-- A separate follow-up artifact should capture the exact post-migration DDL snapshot and migration-sequence notes in machine-reviewable form.
+- Exact post-migration DDL and migration-order notes now live in `sqlite-schema.snapshot.sql` and `sqlite-migration-sequence.md` for machine-reviewable parity checks.
