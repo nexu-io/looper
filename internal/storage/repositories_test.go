@@ -350,6 +350,312 @@ func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	}
 }
 
+func TestQueueRoundTripBasics(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_q", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_q", Seq: 1, ProjectID: "project_q", Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	repo := "acme/looper"
+	prNumber := int64(7)
+	payload := `{"kind":"review"}`
+	projectID := "project_q"
+	loopID := "loop_q"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID:          "qi_1",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "reviewer",
+		TargetType:  "pull_request",
+		TargetID:    "pr:7",
+		Repo:        &repo,
+		PRNumber:    &prNumber,
+		DedupeKey:   "reviewer:acme/looper:7",
+		Priority:    10,
+		Status:      "queued",
+		AvailableAt: now,
+		Attempts:    0,
+		MaxAttempts: 3,
+		PayloadJSON: &payload,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	gotByID, err := repos.Queue.GetByID(ctx, "qi_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if gotByID == nil || gotByID.Type != "reviewer" || gotByID.TargetID != "pr:7" {
+		t.Fatalf("Queue.GetByID() = %#v, want reviewer/pr:7", gotByID)
+	}
+
+	activeByDedupe, err := repos.Queue.FindActiveByDedupe(ctx, "reviewer:acme/looper:7")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	}
+	if activeByDedupe == nil || activeByDedupe.ID != "qi_1" {
+		t.Fatalf("Queue.FindActiveByDedupe() = %#v, want qi_1", activeByDedupe)
+	}
+
+	scheduled, err := repos.Queue.ListScheduled(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("Queue.ListScheduled() error = %v", err)
+	}
+	if len(scheduled) != 1 || scheduled[0].ID != "qi_1" {
+		t.Fatalf("Queue.ListScheduled() = %#v, want [qi_1]", scheduled)
+	}
+
+	all, err := repos.Queue.List(ctx)
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(all) != 1 || all[0].ID != "qi_1" {
+		t.Fatalf("Queue.List() = %#v, want [qi_1]", all)
+	}
+}
+
+func TestQueueClaimOrderingAndBlockers(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_sched", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_active", Seq: 1, ProjectID: "project_sched", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_active) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_paused", Seq: 2, ProjectID: "project_sched", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_paused) error = %v", err)
+	}
+
+	repo := "acme/looper"
+	pr := int64(42)
+	loopActive := "loop_active"
+	loopPaused := "loop_paused"
+	queueItems := []QueueItemRecord{
+		{ID: "lock_running", LoopID: &loopActive, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:lock-running", DedupeKey: "d_lock_running", Priority: 1, Status: "running", AvailableAt: "2026-04-11T11:50:00.000Z", Attempts: 1, MaxAttempts: 3, LockKey: strPtr("repo:acme/looper"), CreatedAt: "2026-04-11T11:40:00.000Z", UpdatedAt: now},
+		{ID: "lock_blocked", LoopID: &loopActive, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:lock-blocked", DedupeKey: "d_lock_blocked", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, LockKey: strPtr("repo:acme/looper"), CreatedAt: "2026-04-11T11:41:00.000Z", UpdatedAt: now},
+		{ID: "reviewer_blocker", LoopID: &loopActive, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &pr, DedupeKey: "d_reviewer", Priority: 2, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: "2026-04-11T11:42:00.000Z", UpdatedAt: now},
+		{ID: "fixer_blocked", LoopID: &loopActive, Type: "fixer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &pr, DedupeKey: "d_fixer_blocked", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: "2026-04-11T11:43:00.000Z", UpdatedAt: now},
+		{ID: "paused_excluded", LoopID: &loopPaused, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:paused", DedupeKey: "d_paused", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: "2026-04-11T11:44:00.000Z", UpdatedAt: now},
+		{ID: "eligible_1", LoopID: &loopActive, Type: "planner", TargetType: "project", TargetID: "project_sched", DedupeKey: "d_eligible_1", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: "2026-04-11T11:45:00.000Z", UpdatedAt: now},
+		{ID: "eligible_2", LoopID: &loopActive, Type: "planner", TargetType: "project", TargetID: "project_sched", DedupeKey: "d_eligible_2", Priority: 3, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: "2026-04-11T11:46:00.000Z", UpdatedAt: now},
+	}
+
+	for _, item := range queueItems {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	scheduled, err := repos.Queue.ListScheduled(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("Queue.ListScheduled() error = %v", err)
+	}
+	if len(scheduled) != 3 {
+		t.Fatalf("len(Queue.ListScheduled()) = %d, want 3", len(scheduled))
+	}
+	if scheduled[0].ID != "eligible_1" || scheduled[1].ID != "reviewer_blocker" || scheduled[2].ID != "eligible_2" {
+		t.Fatalf("Queue.ListScheduled() order = %#v, want eligible_1/reviewer_blocker/eligible_2", []string{scheduled[0].ID, scheduled[1].ID, scheduled[2].ID})
+	}
+
+	claimed, err := repos.Queue.ClaimNext(ctx, now, "worker-a")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNext() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "eligible_1" || claimed.Status != "running" {
+		t.Fatalf("Queue.ClaimNext() = %#v, want eligible_1 running", claimed)
+	}
+
+	claimedType, err := repos.Queue.ClaimNextOfType(ctx, now, "worker-b", "planner")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextOfType() error = %v", err)
+	}
+	if claimedType == nil || claimedType.ID != "eligible_2" {
+		t.Fatalf("Queue.ClaimNextOfType() = %#v, want eligible_2", claimedType)
+	}
+}
+
+func TestQueueRetryFailCompleteTransitions(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_tr", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_tr", Seq: 1, ProjectID: "project_tr", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	loopID := "loop_tr"
+	claimedBy := "worker-a"
+	claimedAt := "2026-04-11T12:00:10.000Z"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID:          "qi_retry",
+		LoopID:      &loopID,
+		Type:        "planner",
+		TargetType:  "project",
+		TargetID:    "project_tr",
+		DedupeKey:   "d_retry",
+		Priority:    1,
+		Status:      "running",
+		AvailableAt: now,
+		Attempts:    1,
+		MaxAttempts: 3,
+		ClaimedBy:   &claimedBy,
+		ClaimedAt:   &claimedAt,
+		StartedAt:   &claimedAt,
+		CreatedAt:   now,
+		UpdatedAt:   claimedAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_retry) error = %v", err)
+	}
+
+	retryAt := "2026-04-11T12:05:00.000Z"
+	errMsg := "temporary error"
+	if err := repos.Queue.MarkRetry(ctx, QueueMarkRetryInput{ID: "qi_retry", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetry() error = %v", err)
+	}
+	gotRetry, err := repos.Queue.GetByID(ctx, "qi_retry")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry) error = %v", err)
+	}
+	if gotRetry == nil || gotRetry.Status != "queued" || gotRetry.Attempts != 2 || gotRetry.ClaimedBy != nil || gotRetry.ClaimedAt != nil {
+		t.Fatalf("Queue.GetByID(qi_retry) after markRetry = %#v, want queued attempts=2 unclaimed", gotRetry)
+	}
+
+	finished := "2026-04-11T12:06:00.000Z"
+	if err := repos.Queue.Complete(ctx, "qi_retry", finished); err != nil {
+		t.Fatalf("Queue.Complete() error = %v", err)
+	}
+	gotCompleted, err := repos.Queue.GetByID(ctx, "qi_retry")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry) completed error = %v", err)
+	}
+	if gotCompleted == nil || gotCompleted.Status != "completed" || gotCompleted.FinishedAt == nil || *gotCompleted.FinishedAt != finished {
+		t.Fatalf("Queue.GetByID(qi_retry) after complete = %#v, want completed with finished_at", gotCompleted)
+	}
+
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID:          "qi_fail",
+		LoopID:      &loopID,
+		Type:        "planner",
+		TargetType:  "project",
+		TargetID:    "project_tr",
+		DedupeKey:   "d_fail",
+		Priority:    1,
+		Status:      "running",
+		AvailableAt: now,
+		Attempts:    3,
+		MaxAttempts: 3,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_fail) error = %v", err)
+	}
+
+	failReason := "needs human"
+	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_fail", FinishedAt: finished, ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: finished}); err != nil {
+		t.Fatalf("Queue.Fail() error = %v", err)
+	}
+	gotFailed, err := repos.Queue.GetByID(ctx, "qi_fail")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_fail) error = %v", err)
+	}
+	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason {
+		t.Fatalf("Queue.GetByID(qi_fail) after fail = %#v, want manual_intervention", gotFailed)
+	}
+}
+
+func TestQueueRecoveryHelpersRequeueAndCancelByLoop(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_rec", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_rec", Seq: 1, ProjectID: "project_rec", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	loopID := "loop_rec"
+	runningAt := "2026-04-11T12:01:00.000Z"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_run_1", LoopID: &loopID, Type: "planner", TargetType: "project", TargetID: "project_rec", DedupeKey: "d_run_1", Priority: 1, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, ClaimedBy: strPtr("worker-a"), ClaimedAt: &runningAt, StartedAt: &runningAt, CreatedAt: now, UpdatedAt: runningAt}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_run_1) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_run_2", LoopID: &loopID, Type: "planner", TargetType: "project", TargetID: "project_rec", DedupeKey: "d_run_2", Priority: 2, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, ClaimedBy: strPtr("worker-b"), ClaimedAt: &runningAt, StartedAt: &runningAt, CreatedAt: now, UpdatedAt: runningAt}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_run_2) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_queued", LoopID: &loopID, Type: "planner", TargetType: "project", TargetID: "project_rec", DedupeKey: "d_queued", Priority: 2, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_queued) error = %v", err)
+	}
+
+	requeuedAt := "2026-04-11T12:10:00.000Z"
+	requeuedCount, err := repos.Queue.RequeueRunningByLoop(ctx, "loop_rec", requeuedAt)
+	if err != nil {
+		t.Fatalf("Queue.RequeueRunningByLoop() error = %v", err)
+	}
+	if requeuedCount != 2 {
+		t.Fatalf("Queue.RequeueRunningByLoop() = %d, want 2", requeuedCount)
+	}
+
+	for _, id := range []string{"qi_run_1", "qi_run_2"} {
+		got, getErr := repos.Queue.GetByID(ctx, id)
+		if getErr != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, getErr)
+		}
+		if got == nil || got.Status != "queued" || got.ClaimedBy != nil || got.StartedAt != nil || got.AvailableAt != requeuedAt {
+			t.Fatalf("Queue.GetByID(%s) after requeue = %#v, want queued/cleared/requeued time", id, got)
+		}
+	}
+
+	reason := "loop paused"
+	cancelledCount, err := repos.Queue.CancelByLoop(ctx, "loop_rec", requeuedAt, &reason)
+	if err != nil {
+		t.Fatalf("Queue.CancelByLoop() error = %v", err)
+	}
+	if cancelledCount != 3 {
+		t.Fatalf("Queue.CancelByLoop() = %d, want 3", cancelledCount)
+	}
+
+	for _, id := range []string{"qi_run_1", "qi_run_2", "qi_queued"} {
+		got, getErr := repos.Queue.GetByID(ctx, id)
+		if getErr != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, getErr)
+		}
+		if got == nil || got.Status != "cancelled" || got.LastError == nil || *got.LastError != reason {
+			t.Fatalf("Queue.GetByID(%s) after cancel = %#v, want cancelled with reason", id, got)
+		}
+	}
+}
+
+func strPtr(value string) *string {
+	return &value
+}
+
 func openMigratedCoordinatorForRepositories(t *testing.T) *SQLiteCoordinator {
 	t.Helper()
 

@@ -20,6 +20,7 @@ type Repositories struct {
 	Runs                 *RunsRepository
 	PullRequestSnapshots *PullRequestSnapshotsRepository
 	Locks                *LocksRepository
+	Queue                *QueueRepository
 	Worktrees            *WorktreesRepository
 }
 
@@ -30,6 +31,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Runs:                 &RunsRepository{q: q},
 		PullRequestSnapshots: &PullRequestSnapshotsRepository{q: q},
 		Locks:                &LocksRepository{q: q, now: time.Now},
+		Queue:                &QueueRepository{q: q},
 		Worktrees:            &WorktreesRepository{q: q},
 	}
 }
@@ -105,6 +107,50 @@ type LockRecord struct {
 	ExpiresAt string
 	CreatedAt string
 	UpdatedAt string
+}
+
+type QueueItemRecord struct {
+	ID            string
+	ProjectID     *string
+	LoopID        *string
+	Type          string
+	TargetType    string
+	TargetID      string
+	Repo          *string
+	PRNumber      *int64
+	DedupeKey     string
+	Priority      int64
+	Status        string
+	AvailableAt   string
+	Attempts      int64
+	MaxAttempts   int64
+	ClaimedBy     *string
+	ClaimedAt     *string
+	StartedAt     *string
+	FinishedAt    *string
+	LockKey       *string
+	PayloadJSON   *string
+	LastError     *string
+	LastErrorKind *string
+	CreatedAt     string
+	UpdatedAt     string
+}
+
+type QueueMarkRetryInput struct {
+	ID           string
+	AvailableAt  string
+	Attempts     int64
+	ErrorMessage *string
+	ErrorKind    string
+	UpdatedAt    string
+}
+
+type QueueFailInput struct {
+	ID           string
+	FinishedAt   string
+	ErrorMessage *string
+	ErrorKind    string
+	UpdatedAt    string
 }
 
 type WorktreeRecord struct {
@@ -470,6 +516,269 @@ func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]Loc
 
 type WorktreesRepository struct{ q sqliteQuerier }
 
+type QueueRepository struct{ q sqliteQuerier }
+
+func (r *QueueRepository) Upsert(ctx context.Context, record QueueItemRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO queue_items (
+			id, project_id, loop_id, type, target_type, target_id, repo,
+			pr_number, dedupe_key, priority, status, available_at, attempts,
+			max_attempts, claimed_by, claimed_at, started_at, finished_at,
+			lock_key, payload_json, last_error, last_error_kind, created_at,
+			updated_at
+		)
+		VALUES (
+			?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			?
+		)
+		ON CONFLICT(id) DO UPDATE SET
+			project_id=excluded.project_id,
+			loop_id=excluded.loop_id,
+			type=excluded.type,
+			target_type=excluded.target_type,
+			target_id=excluded.target_id,
+			repo=excluded.repo,
+			pr_number=excluded.pr_number,
+			dedupe_key=excluded.dedupe_key,
+			priority=excluded.priority,
+			status=excluded.status,
+			available_at=excluded.available_at,
+			attempts=excluded.attempts,
+			max_attempts=excluded.max_attempts,
+			claimed_by=excluded.claimed_by,
+			claimed_at=excluded.claimed_at,
+			started_at=excluded.started_at,
+			finished_at=excluded.finished_at,
+			lock_key=excluded.lock_key,
+			payload_json=excluded.payload_json,
+			last_error=excluded.last_error,
+			last_error_kind=excluded.last_error_kind,
+			updated_at=excluded.updated_at
+	`, record.ID, record.ProjectID, record.LoopID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.DedupeKey, record.Priority, record.Status, record.AvailableAt, record.Attempts, record.MaxAttempts, record.ClaimedBy, record.ClaimedAt, record.StartedAt, record.FinishedAt, record.LockKey, record.PayloadJSON, record.LastError, record.LastErrorKind, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("upsert queue item: %w", err)
+	}
+
+	return nil
+}
+
+func (r *QueueRepository) GetByID(ctx context.Context, id string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM queue_items WHERE id = ?`, id)
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get queue item by id: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list queue items: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
+func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE dedupe_key = ? AND status IN ('queued', 'running')
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, dedupeKey)
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find active queue item by dedupe: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *QueueRepository) ListScheduled(ctx context.Context, nowISO string, limit int64) ([]QueueItemRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.q.QueryContext(ctx, scheduledQueueQuery+` LIMIT ?`, nowISO, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list scheduled queue items: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
+func (r *QueueRepository) ClaimNext(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		WITH candidate AS (
+			`+scheduledQueueQuery+`
+			LIMIT 1
+		)
+		UPDATE queue_items
+		SET status = 'running',
+			claimed_by = ?,
+			claimed_at = ?,
+			started_at = COALESCE(started_at, ?),
+			updated_at = ?
+		WHERE id = (SELECT id FROM candidate)
+			AND status = 'queued'
+		RETURNING *
+	`, nowISO, claimedBy, nowISO, nowISO, nowISO)
+
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("claim next queue item: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		WITH candidate AS (
+			`+scheduledQueueBaseQuery+`
+			AND qi.type = ?
+			`+scheduledQueueOrderBy+`
+			LIMIT 1
+		)
+		UPDATE queue_items
+		SET status = 'running',
+			claimed_by = ?,
+			claimed_at = ?,
+			started_at = COALESCE(started_at, ?),
+			updated_at = ?
+		WHERE id = (SELECT id FROM candidate)
+			AND status = 'queued'
+		RETURNING *
+	`, nowISO, queueType, claimedBy, nowISO, nowISO, nowISO)
+
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("claim next queue item of type: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'completed', finished_at = ?, updated_at = ?
+		WHERE id = ?
+	`, finishedAt, finishedAt, id)
+	if err != nil {
+		return fmt.Errorf("complete queue item: %w", err)
+	}
+
+	return nil
+}
+
+func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = ?,
+			last_error = ?,
+			last_error_kind = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			finished_at = NULL,
+			updated_at = ?
+		WHERE id = ?
+	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	if err != nil {
+		return fmt.Errorf("mark queue item for retry: %w", err)
+	}
+
+	return nil
+}
+
+func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error {
+	terminalStatus := "failed"
+	if input.ErrorKind == "manual_intervention" {
+		terminalStatus = "manual_intervention"
+	}
+
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = ?,
+			finished_at = ?,
+			last_error = ?,
+			last_error_kind = ?,
+			updated_at = ?
+		WHERE id = ?
+	`, terminalStatus, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	if err != nil {
+		return fmt.Errorf("fail queue item: %w", err)
+	}
+
+	return nil
+}
+
+func (r *QueueRepository) RequeueRunningByLoop(ctx context.Context, loopID, queuedAt string) (int64, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			finished_at = NULL,
+			updated_at = ?
+		WHERE loop_id = ? AND status = 'running'
+	`, queuedAt, queuedAt, loopID)
+	if err != nil {
+		return 0, fmt.Errorf("requeue running queue items by loop: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeue queue items rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
+func (r *QueueRepository) CancelByLoop(ctx context.Context, loopID, finishedAt string, reason *string) (int64, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'cancelled',
+			finished_at = ?,
+			last_error = COALESCE(?, last_error),
+			updated_at = ?
+		WHERE loop_id = ? AND status IN ('queued', 'running')
+	`, finishedAt, reason, finishedAt, loopID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel queue items by loop: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cancel queue items rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
 func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at)
@@ -554,6 +863,45 @@ func nullableInt64(value sql.NullInt64) *int64 {
 	intValue := value.Int64
 	return &intValue
 }
+
+const scheduledQueueBaseQuery = `
+	SELECT qi.*
+	FROM queue_items qi
+	LEFT JOIN loops l ON l.id = qi.loop_id
+	WHERE qi.status = 'queued'
+		AND qi.available_at <= ?
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted')
+		AND (
+			qi.lock_key IS NULL
+			OR NOT EXISTS (
+				SELECT 1
+				FROM queue_items lock_blocker
+				WHERE lock_blocker.lock_key = qi.lock_key
+					AND lock_blocker.status = 'running'
+					AND lock_blocker.id != qi.id
+			)
+		)
+		AND (
+			qi.type != 'fixer'
+			OR qi.repo IS NULL
+			OR qi.pr_number IS NULL
+			OR NOT EXISTS (
+				SELECT 1
+				FROM queue_items blocker
+				WHERE blocker.type = 'reviewer'
+					AND blocker.repo = qi.repo
+					AND blocker.pr_number = qi.pr_number
+					AND blocker.status IN ('queued', 'running')
+					AND blocker.id != qi.id
+			)
+		)
+`
+
+const scheduledQueueOrderBy = `
+	ORDER BY qi.priority ASC, qi.available_at ASC, qi.created_at ASC
+`
+
+const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 
 func scanProjects(rows *sql.Rows) ([]ProjectRecord, error) {
 	records := make([]ProjectRecord, 0)
@@ -774,6 +1122,86 @@ func scanWorktrees(rows *sql.Rows) ([]WorktreeRecord, error) {
 	}
 
 	return records, nil
+}
+
+func scanQueueItems(rows *sql.Rows) ([]QueueItemRecord, error) {
+	records := make([]QueueItemRecord, 0)
+	for rows.Next() {
+		record, err := scanQueueItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate queue item rows: %w", err)
+	}
+
+	return records, nil
+}
+
+func scanQueueItem(row interface{ Scan(...any) error }) (QueueItemRecord, error) {
+	var (
+		record        QueueItemRecord
+		projectID     sql.NullString
+		loopID        sql.NullString
+		repo          sql.NullString
+		prNumber      sql.NullInt64
+		claimedBy     sql.NullString
+		claimedAt     sql.NullString
+		startedAt     sql.NullString
+		finishedAt    sql.NullString
+		lockKey       sql.NullString
+		payloadJSON   sql.NullString
+		lastError     sql.NullString
+		lastErrorKind sql.NullString
+	)
+
+	err := row.Scan(
+		&record.ID,
+		&projectID,
+		&loopID,
+		&record.Type,
+		&record.TargetType,
+		&record.TargetID,
+		&repo,
+		&prNumber,
+		&record.DedupeKey,
+		&record.Priority,
+		&record.Status,
+		&record.AvailableAt,
+		&record.Attempts,
+		&record.MaxAttempts,
+		&claimedBy,
+		&claimedAt,
+		&startedAt,
+		&finishedAt,
+		&lockKey,
+		&payloadJSON,
+		&lastError,
+		&lastErrorKind,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return QueueItemRecord{}, err
+	}
+
+	record.ProjectID = nullableString(projectID)
+	record.LoopID = nullableString(loopID)
+	record.Repo = nullableString(repo)
+	record.PRNumber = nullableInt64(prNumber)
+	record.ClaimedBy = nullableString(claimedBy)
+	record.ClaimedAt = nullableString(claimedAt)
+	record.StartedAt = nullableString(startedAt)
+	record.FinishedAt = nullableString(finishedAt)
+	record.LockKey = nullableString(lockKey)
+	record.PayloadJSON = nullableString(payloadJSON)
+	record.LastError = nullableString(lastError)
+	record.LastErrorKind = nullableString(lastErrorKind)
+
+	return record, nil
 }
 
 func scanWorktree(row interface{ Scan(...any) error }) (WorktreeRecord, error) {
