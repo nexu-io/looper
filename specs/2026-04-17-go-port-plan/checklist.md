@@ -11,7 +11,7 @@
 - [x] Freeze API error codes and error-envelope behavior
 - [x] Inventory the SQLite schema, migrations, and repository responsibilities
 - [x] Capture a schema DDL snapshot and migration-sequence notes
-- [ ] Inventory all runtime tables, including notifications and worktrees
+- [x] Inventory all runtime tables, including notifications and worktrees
 - [ ] Inventory scheduler queue and event-log tables plus their recovery/retention semantics
 - [ ] Inventory external tool dependencies (`git`, `gh`, `osascript`, shell)
 - [ ] Inventory reviewer, fixer, planner, and worker state-machine behaviors
