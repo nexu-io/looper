@@ -1,6 +1,12 @@
 package config
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
 
 type ValidationIssue struct {
 	Path    string
@@ -9,6 +15,10 @@ type ValidationIssue struct {
 
 type ConfigValidationError struct {
 	Issues []ValidationIssue
+}
+
+type ValidateOptions struct {
+	DefaultWorktreeRoot string
 }
 
 func (err *ConfigValidationError) Error() string {
@@ -25,6 +35,10 @@ func (err *ConfigValidationError) Error() string {
 }
 
 func Validate(config Config) error {
+	return ValidateWithOptions(config, ValidateOptions{})
+}
+
+func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
 
 	if config.Server.Host == "" {
@@ -142,7 +156,94 @@ func Validate(config Config) error {
 		return &ConfigValidationError{Issues: issues}
 	}
 
+	defaultWorktreeRoot := options.DefaultWorktreeRoot
+	if defaultWorktreeRoot == "" {
+		resolvedDefaultWorktreeRoot, err := DefaultWorktreeRoot()
+		if err != nil {
+			return fmt.Errorf("determine default worktree root: %w", err)
+		}
+
+		defaultWorktreeRoot = resolvedDefaultWorktreeRoot
+	}
+
+	ensureWritablePath(config.Storage.DBPath, writablePathFileParent, &issues, "storage.dbPath")
+	ensureWritablePath(config.Daemon.LogDir, writablePathDirectory, &issues, "daemon.logDir")
+	ensureWritablePath(config.Daemon.WorkingDirectory, writablePathDirectory, &issues, "daemon.workingDirectory")
+	ensureWritablePath(defaultWorktreeRoot, writablePathDirectory, &issues, "defaults.worktreeRoot")
+
+	if len(issues) > 0 {
+		return &ConfigValidationError{Issues: issues}
+	}
+
 	return nil
+}
+
+type writablePathKind string
+
+const (
+	writablePathDirectory  writablePathKind = "directory"
+	writablePathFileParent writablePathKind = "file-parent"
+	writePermissionMode                     = 0x2
+)
+
+func ensureWritablePath(path string, kind writablePathKind, issues *[]ValidationIssue, field string) {
+	target := path
+	if kind == writablePathFileParent {
+		target = filepath.Dir(path)
+	}
+
+	writableAnchor := target
+	for {
+		info, err := os.Stat(writableAnchor)
+		if err == nil {
+			if !info.IsDir() {
+				*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s is not a directory", writableAnchor)})
+			}
+			break
+		}
+
+		if errors.Is(err, syscall.ENOTDIR) {
+			parent := filepath.Dir(writableAnchor)
+			if parent == writableAnchor {
+				*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s cannot be created because no existing parent was found", target)})
+				return
+			}
+
+			writableAnchor = parent
+			continue
+		}
+
+		if !os.IsNotExist(err) {
+			*issues = append(*issues, ValidationIssue{Path: field, Message: err.Error()})
+			return
+		}
+
+		parent := filepath.Dir(writableAnchor)
+		if parent == writableAnchor {
+			*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s cannot be created because no existing parent was found", target)})
+			return
+		}
+
+		writableAnchor = parent
+	}
+
+	if hasIssueForField(*issues, field) {
+		return
+	}
+
+	if err := syscall.Access(writableAnchor, writePermissionMode); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s is not writable", writableAnchor)})
+	}
+}
+
+func hasIssueForField(issues []ValidationIssue, field string) bool {
+	for _, issue := range issues {
+		if issue.Path == field {
+			return true
+		}
+	}
+
+	return false
 }
 
 func getConfigProjectIDValidationMessage() string {

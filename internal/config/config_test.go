@@ -369,6 +369,71 @@ func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
 	assertValidationIssue(t, validationErr, "projects[1].repoPath", "must be a non-empty path")
 }
 
+func TestValidateRejectsRuntimePathsWhenNoWritableDirectoryCanBeFound(t *testing.T) {
+	rootDir := t.TempDir()
+	config, err := DefaultConfig(rootDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	blockingRoot := filepath.Join(rootDir, "blocked-root")
+	if err := os.WriteFile(blockingRoot, []byte("not-a-directory"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	config.Storage.DBPath = filepath.Join(blockingRoot, "looper.sqlite")
+	config.Daemon.LogDir = filepath.Join(blockingRoot, "logs")
+	config.Daemon.WorkingDirectory = filepath.Join(blockingRoot, "workspace")
+	config.Projects = []ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo"}}
+
+	err = ValidateWithOptions(config, ValidateOptions{
+		DefaultWorktreeRoot: filepath.Join(blockingRoot, "worktrees"),
+	})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "storage.dbPath", blockingRoot+" is not a directory")
+	assertValidationIssue(t, validationErr, "daemon.logDir", blockingRoot+" is not a directory")
+	assertValidationIssue(t, validationErr, "daemon.workingDirectory", blockingRoot+" is not a directory")
+	assertValidationIssue(t, validationErr, "defaults.worktreeRoot", blockingRoot+" is not a directory")
+}
+
+func TestValidateAcceptsWritableRuntimePaths(t *testing.T) {
+	rootDir := t.TempDir()
+	config, err := DefaultConfig(rootDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	logDir := filepath.Join(rootDir, "logs")
+	workingDir := filepath.Join(rootDir, "workspace")
+	worktreeRoot := filepath.Join(rootDir, "worktrees")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(logDir) error = %v", err)
+	}
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(workingDir) error = %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(worktreeRoot) error = %v", err)
+	}
+
+	config.Storage.DBPath = filepath.Join(rootDir, "state", "looper.sqlite")
+	config.Daemon.LogDir = logDir
+	config.Daemon.WorkingDirectory = workingDir
+	config.Projects = []ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo"}}
+
+	if err := ValidateWithOptions(config, ValidateOptions{DefaultWorktreeRoot: worktreeRoot}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want nil", err)
+	}
+}
+
 func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
