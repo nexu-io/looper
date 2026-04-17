@@ -15,7 +15,7 @@
 - [x] Inventory scheduler queue and event-log tables plus their recovery/retention semantics
 - [x] Inventory external tool dependencies (`git`, `gh`, `osascript`, shell)
 - [x] Inventory reviewer, fixer, planner, and worker state-machine behaviors
-- [ ] Inventory spec-PR label/path conventions and agent completion-marker behavior
+- [x] Inventory spec-PR label/path conventions and agent completion-marker behavior
 - [ ] Define parity expectations for daemon startup, shutdown, recovery, and run lifecycle
 - [ ] Capture daemon lifecycle notes for start, stop, recovery, and graceful shutdown
 
