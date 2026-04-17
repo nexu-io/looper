@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -283,6 +284,89 @@ func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T)
 	if err.Error() != "Unknown looperd argument: --hostfoo" {
 		t.Fatalf("LoadFile() error = %q, want %q", err, "Unknown looperd argument: --hostfoo")
 	}
+}
+
+func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+
+	contents := `{
+		"server": {"port": 0, "authMode": "local-token"},
+		"storage": {"mode": "memory"},
+		"scheduler": {"pollIntervalSeconds": 2},
+		"logging": {"level": "verbose", "maxFiles": 0},
+		"daemon": {"mode": "invalid"},
+		"defaults": {"openPrStrategy": "unsupported"},
+		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
+		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "server.port", "must be an integer between 1 and 65535")
+	assertValidationIssue(t, validationErr, "server.localToken", "is required when authMode is local-token")
+	assertValidationIssue(t, validationErr, "storage.mode", "must be sqlite")
+	assertValidationIssue(t, validationErr, "scheduler.pollIntervalSeconds", "must be an integer >= 10")
+	assertValidationIssue(t, validationErr, "logging.level", "must be one of: debug, info, warn, error")
+	assertValidationIssue(t, validationErr, "logging.maxFiles", "must be a positive integer")
+	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
+	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
+	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
+	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
+}
+
+func TestValidateAllowsLegacyProjectIDsForUpgradeCompatibility(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	config.Projects = []ProjectRefConfig{{
+		ID:       "legacy-id-Li4vdG1w",
+		Name:     "legacy-project",
+		RepoPath: "/repos/legacy-project",
+	}}
+
+	if err := Validate(config); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	config.Projects = []ProjectRefConfig{
+		{ID: "demo", Name: "Demo", RepoPath: "/repos/demo"},
+		{ID: "demo", Name: "", RepoPath: ""},
+	}
+
+	err = Validate(config)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "projects[1].id", "duplicate project id: demo")
+	assertValidationIssue(t, validationErr, "projects[1].name", "must be a non-empty string")
+	assertValidationIssue(t, validationErr, "projects[1].repoPath", "must be a non-empty path")
 }
 
 func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
@@ -744,6 +828,18 @@ func mapEnvLookup(values map[string]string) EnvLookupFunc {
 		value, ok := values[key]
 		return value, ok
 	}
+}
+
+func assertValidationIssue(t *testing.T, err *ConfigValidationError, path string, message string) {
+	t.Helper()
+
+	for _, issue := range err.Issues {
+		if issue.Path == path && issue.Message == message {
+			return
+		}
+	}
+
+	t.Fatalf("ConfigValidationError missing issue {%q, %q}: %#v", path, message, err.Issues)
 }
 
 func emptyEnvLookup(string) (string, bool) {

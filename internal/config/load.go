@@ -94,6 +94,10 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
+	if err := Validate(config); err != nil {
+		return LoadedFileConfig{}, err
+	}
+
 	return LoadedFileConfig{
 		Config:   config,
 		Partial:  partialConfig,
