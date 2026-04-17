@@ -536,6 +536,29 @@ Rejected alternative:
 
 `urfave/cli/v3` remains viable, but it is a worse fit for this parity-first port because its context-driven handler style and coarser help templating add friction around custom grouped help output, exact flag-forwarding behavior, and dependency-injected tests.
 
+### 6.12 CLI dependency-injection and testing pattern
+
+Decision:
+
+> Use an instance-based Cobra app built from a single injected `Deps` struct, and execute it through an importable `App.Run(ctx, argv) int` entrypoint.
+
+Required constraints:
+
+1. `cmd/looper/main.go` remains a thin adapter and is the only place that should call `os.Exit`.
+2. The Go CLI must construct a fresh root command tree for every invocation rather than using Cobra package globals or `init()` registration.
+3. Command handlers should receive a per-invocation context containing parsed arguments, writers, loaded config, and injected dependencies.
+4. Side-effecting operations (config loading, API client creation, file I/O, process execution, shell launch, environment access, time/sleep hooks, daemon install/upgrade helpers, and version/build metadata access) must be routed through the injected dependency surface instead of direct package calls from handler code.
+5. Keep the dependency surface as one explicit struct first; introduce named interfaces only where multiple real implementations or complex fakes justify them.
+
+Testing consequences:
+
+1. The primary test seam is `App.Run(context.Background(), argv)` with fake dependencies and buffer-backed stdout/stderr.
+2. Help and usage tests should run in-process by capturing Cobra output rather than spawning subprocesses.
+3. CLI golden tests should verify help output, JSON output, and selected human-readable formatting against the frozen contract artifacts.
+4. End-to-end binary tests remain valuable, but they are secondary validation on top of the injected-dependency test suite.
+
+See `specs/2026-04-17-go-port-plan/artifacts/cli-di-testing-pattern.md` for the concrete pattern and rejected alternatives.
+
 ---
 
 ## 7. Proposed implementation phases
