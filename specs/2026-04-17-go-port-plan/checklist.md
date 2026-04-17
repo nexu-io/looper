@@ -31,7 +31,7 @@
 - [ ] Add Go build/test/lint commands to CI without removing current TS/Bun CI
 - [x] Decide the CLI framework
 - [x] Decide the CLI dependency-injection/testing pattern
-- [ ] Decide the SQLite driver and document why
+- [x] Decide the SQLite driver and document why
 
 ## Phase 2 - Port shared foundations
 

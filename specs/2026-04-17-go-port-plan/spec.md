@@ -357,6 +357,14 @@ Additional guidance:
 2. If `log/slog` is used, log rotation still needs a separate solution.
 3. The CLI framework choice must preserve testability comparable to the current injected-dependency model.
 
+SQLite driver decision:
+
+> Use `github.com/mattn/go-sqlite3` for the Phase 1 SQLite port.
+>
+> The immediate goal is behavior parity with the current Bun-backed daemon, not maximum portability. `mattn/go-sqlite3` is the lower-risk choice for that phase because it is the most established Go SQLite driver, integrates directly with `database/sql`, and maps cleanly onto the SQLite behaviors Looper already depends on: WAL mode, per-connection foreign-key pragmas, transactional migrations, `busy_timeout`, and backup-oriented flows. The port already targets macOS first, so accepting CGO in Phase 1 is an acceptable trade-off in exchange for using the native SQLite engine rather than a translated pure-Go port while we validate schema, migration, and recovery parity against databases produced by the TypeScript implementation.
+>
+> `modernc.org/sqlite` remains a viable later option if distribution simplicity becomes a higher priority than immediate parity, but choosing it now would introduce an extra compatibility variable during the riskiest storage phase of the rewrite.
+
 CLI framework decision:
 
 > Use `github.com/spf13/cobra` for the Go `looper` CLI.
