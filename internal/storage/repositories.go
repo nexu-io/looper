@@ -19,6 +19,7 @@ type Repositories struct {
 	Loops                *LoopsRepository
 	Runs                 *RunsRepository
 	PullRequestSnapshots *PullRequestSnapshotsRepository
+	Events               *EventsRepository
 	Locks                *LocksRepository
 	Queue                *QueueRepository
 	Worktrees            *WorktreesRepository
@@ -30,6 +31,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Loops:                &LoopsRepository{q: q},
 		Runs:                 &RunsRepository{q: q},
 		PullRequestSnapshots: &PullRequestSnapshotsRepository{q: q},
+		Events:               &EventsRepository{q: q},
 		Locks:                &LocksRepository{q: q, now: time.Now},
 		Queue:                &QueueRepository{q: q},
 		Worktrees:            &WorktreesRepository{q: q},
@@ -100,6 +102,23 @@ type PullRequestSnapshotRecord struct {
 	CreatedAt             string
 }
 
+type EventLogRecord struct {
+	ID               string
+	EventType        string
+	ProjectID        *string
+	LoopID           *string
+	RunID            *string
+	EntityType       *string
+	EntityID         *string
+	CorrelationID    *string
+	CausationID      *string
+	ActorType        *string
+	ActorID          *string
+	ActorDisplayName *string
+	PayloadJSON      string
+	CreatedAt        string
+}
+
 type LockRecord struct {
 	Key       string
 	Owner     string
@@ -166,6 +185,48 @@ type WorktreeRecord struct {
 	CreatedAt    string
 	UpdatedAt    string
 	CleanedAt    *string
+}
+
+type EventsRepository struct{ q sqliteQuerier }
+
+func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO event_logs (
+			id, event_type, project_id, loop_id, run_id, entity_type, entity_id,
+			correlation_id, causation_id, actor_type, actor_id, actor_display_name,
+			payload_json, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.EventType, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.CorrelationID, record.CausationID, record.ActorType, record.ActorID, record.ActorDisplayName, record.PayloadJSON, record.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("append event log: %w", err)
+	}
+
+	return nil
+}
+
+func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by entity: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
 }
 
 type ProjectsRepository struct{ q sqliteQuerier }
@@ -1071,6 +1132,72 @@ func scanPullRequestSnapshot(row interface{ Scan(...any) error }) (PullRequestSn
 	record.UnresolvedThreadCount = nullableInt64(unresolvedThreadCount)
 	record.ReviewState = nullableString(reviewState)
 	record.PayloadJSON = nullableString(payloadJSON)
+
+	return record, nil
+}
+
+func scanEventLogs(rows *sql.Rows) ([]EventLogRecord, error) {
+	records := make([]EventLogRecord, 0)
+	for rows.Next() {
+		record, err := scanEventLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate event log rows: %w", err)
+	}
+
+	return records, nil
+}
+
+func scanEventLog(row interface{ Scan(...any) error }) (EventLogRecord, error) {
+	var (
+		record           EventLogRecord
+		projectID        sql.NullString
+		loopID           sql.NullString
+		runID            sql.NullString
+		entityType       sql.NullString
+		entityID         sql.NullString
+		correlationID    sql.NullString
+		causationID      sql.NullString
+		actorType        sql.NullString
+		actorID          sql.NullString
+		actorDisplayName sql.NullString
+	)
+
+	err := row.Scan(
+		&record.ID,
+		&record.EventType,
+		&projectID,
+		&loopID,
+		&runID,
+		&entityType,
+		&entityID,
+		&correlationID,
+		&causationID,
+		&actorType,
+		&actorID,
+		&actorDisplayName,
+		&record.PayloadJSON,
+		&record.CreatedAt,
+	)
+	if err != nil {
+		return EventLogRecord{}, err
+	}
+
+	record.ProjectID = nullableString(projectID)
+	record.LoopID = nullableString(loopID)
+	record.RunID = nullableString(runID)
+	record.EntityType = nullableString(entityType)
+	record.EntityID = nullableString(entityID)
+	record.CorrelationID = nullableString(correlationID)
+	record.CausationID = nullableString(causationID)
+	record.ActorType = nullableString(actorType)
+	record.ActorID = nullableString(actorID)
+	record.ActorDisplayName = nullableString(actorDisplayName)
 
 	return record, nil
 }

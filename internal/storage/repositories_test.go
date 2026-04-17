@@ -80,6 +80,36 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
 	}
 
+	entityType := "loop"
+	entityID := "loop_1"
+	correlationID := "corr_1"
+	causationID := "cause_1"
+	actorType := "agent"
+	actorID := "reviewer_1"
+	actorDisplayName := "Reviewer"
+	payloadJSON := `{"status":"idle"}`
+	projectID := "project_1"
+	runID := "run_1"
+	loopID := "loop_1"
+	if err := repos.Events.Append(ctx, EventLogRecord{
+		ID:               "event_1",
+		EventType:        "loop.created",
+		ProjectID:        &projectID,
+		LoopID:           &loopID,
+		RunID:            &runID,
+		EntityType:       &entityType,
+		EntityID:         &entityID,
+		CorrelationID:    &correlationID,
+		CausationID:      &causationID,
+		ActorType:        &actorType,
+		ActorID:          &actorID,
+		ActorDisplayName: &actorDisplayName,
+		PayloadJSON:      payloadJSON,
+		CreatedAt:        now,
+	}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
+	}
+
 	lockReason := "reviewer"
 	acquired, err := repos.Locks.Acquire(ctx, LockRecord{
 		Key:       "pr:acme/looper:42",
@@ -135,6 +165,14 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 	if snapshot == nil || snapshot.HeadSHA != headSHA {
 		t.Fatalf("PullRequestSnapshots.GetLatest() = %#v, want headSha %q", snapshot, headSHA)
+	}
+
+	events, err := repos.Events.ListByEntity(ctx, "loop", "loop_1")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].ActorID == nil || *events[0].ActorID != "reviewer_1" {
+		t.Fatalf("Events.ListByEntity() = %#v, want actorId reviewer_1", events)
 	}
 
 	lock, err := repos.Locks.Get(ctx, "pr:acme/looper:42")
@@ -222,6 +260,12 @@ func TestRepositoriesRollbackTransactionalWrites(t *testing.T) {
 		if upsertErr := txRepos.Loops.Upsert(ctx, LoopRecord{ID: "loop_rollback", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); upsertErr != nil {
 			return upsertErr
 		}
+		entityType := "loop"
+		entityID := "loop_rollback"
+		projectID := "project_1"
+		if appendErr := txRepos.Events.Append(ctx, EventLogRecord{ID: "event_loop_rollback", EventType: "loop.created", ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: now}); appendErr != nil {
+			return appendErr
+		}
 
 		return wantErr
 	})
@@ -235,6 +279,14 @@ func TestRepositoriesRollbackTransactionalWrites(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("Loops.GetByID(loop_rollback) = %#v, want nil", got)
+	}
+
+	events, err := repos.Events.ListByEntity(ctx, "loop", "loop_rollback")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("Events.ListByEntity(loop_rollback) = %#v, want none", events)
 	}
 }
 
@@ -305,6 +357,56 @@ func TestLocksAcquireRequiresExpiryBeforeReplacement(t *testing.T) {
 	}
 	if lock == nil || lock.Owner != "worker-b" {
 		t.Fatalf("Locks.Get() = %#v, want owner worker-b", lock)
+	}
+}
+
+func TestEventsListOrdersAndDefaults(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	entityType := "run"
+	entityID := "run_1"
+	for _, event := range []EventLogRecord{
+		{ID: "event_1", EventType: "worker.started", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"step":1}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "event_2", EventType: "worker.progress", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"step":2}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "event_3", EventType: "worker.completed", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"step":3}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	listed, err := repos.Events.List(ctx, 2)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("len(Events.List()) = %d, want 2", len(listed))
+	}
+	if listed[0].ID != "event_3" || listed[1].ID != "event_2" {
+		t.Fatalf("Events.List() order = %#v, want [event_3 event_2]", listed)
+	}
+
+	allByDefault, err := repos.Events.List(ctx, 0)
+	if err != nil {
+		t.Fatalf("Events.List(default) error = %v", err)
+	}
+	if len(allByDefault) != 3 {
+		t.Fatalf("len(Events.List(default)) = %d, want 3", len(allByDefault))
+	}
+
+	byEntity, err := repos.Events.ListByEntity(ctx, "run", "run_1")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(byEntity) != 3 {
+		t.Fatalf("len(Events.ListByEntity()) = %d, want 3", len(byEntity))
+	}
+	if byEntity[0].ID != "event_1" || byEntity[1].ID != "event_2" || byEntity[2].ID != "event_3" {
+		t.Fatalf("Events.ListByEntity() order = %#v, want [event_1 event_2 event_3]", byEntity)
 	}
 }
 
