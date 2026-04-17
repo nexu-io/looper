@@ -125,6 +125,13 @@ The `Store` contract in `apps/looperd/src/storage/store.ts:17-125` is implemente
 - Recovery semantics: startup recovery writes new audit events such as `looperd.recovery.lock_released`, `looperd.recovery.run_interrupted`, `looperd.recovery.loop_requeued`, `looperd.recovery.loop_queue_normalized`, and `looperd.recovery.completed` through `appendEvent()` (`runtime/index.ts:650-791`, `866-878`). Recovery consumes queue/run state directly; it does not replay, compact, or derive state from prior `event_logs` rows.
 - Retention semantics: no retention policy or cleanup path exists for `event_logs`. Parent deletions preserve history by nulling `project_id`, `loop_id`, and `run_id` (`ON DELETE SET NULL`) instead of deleting the event row (`0001_init.sql:91-93`). In practice the table is an indefinite audit log unless an external/manual cleanup step is introduced.
 
+### Recovery / retention evidence matrix
+
+| Surface | Recovery behavior that must be preserved | Retention behavior that must be preserved | Primary evidence |
+| --- | --- | --- | --- |
+| `queue_items` | Startup recovery requeues `running` rows for resumable loops, clears claim/start/finish metadata, and leaves the row immediately runnable; loops still marked `queued` without an active queue row are normalized in loop state rather than recreating queue rows. Retryable failures stay in the same row and move back to `queued` with exponential backoff; terminal failures stay as terminal rows. | Completed, failed, cancelled, and manual-intervention rows are retained in-place. No TTL, pruning job, or archive table exists; only project/loop deletion cascades remove rows. | `runtime/index.ts:676-773`, `sqlite-store.ts:568-672`, `scheduler/index.ts:118-155`, `runtime/index.test.ts:967-1086`, `sqlite-store.test.ts:759-878`, `scheduler/index.test.ts:22-156` |
+| `event_logs` | Recovery appends audit rows describing recovery actions, but recovery decisions are based on current queue/run/lock state rather than replaying prior events. | The table is append-only with no delete/update API and no built-in cleanup policy. Parent deletion preserves history by nulling foreign keys instead of deleting the event row. | `runtime/index.ts:650-791`, `sqlite-store.ts:318-355`, `sqlite-store.test.ts:331-347,741-754`, `0001_init.sql:76-97` |
+
 ## Compatibility notes for the Go port
 
 - The current daemon assumes a single SQLite database file plus startup auto-migration, not an external migration step (`runtime/index.ts:133-146`, `db.ts:42-44`).
