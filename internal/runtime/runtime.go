@@ -1,18 +1,19 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/loops"
+	"github.com/powerformer/looper/internal/projects"
+	"github.com/powerformer/looper/internal/runs"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -50,6 +51,9 @@ type Options struct {
 type Services struct {
 	Coordinator  *storage.SQLiteCoordinator
 	Repositories *storage.Repositories
+	Projects     *projects.Service
+	Loops        *loops.Service
+	Runs         *runs.Service
 }
 
 type Runtime struct {
@@ -239,6 +243,9 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 
 	repositories := storage.NewRepositories(coordinator.DB())
+	projectService := &projects.Service{DB: coordinator.DB(), Repos: repositories, Logger: r.logger, Now: r.now}
+	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
+	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, repositories, r.config, startedAt); err != nil {
 		return err
@@ -259,6 +266,9 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.services = Services{
 		Coordinator:  coordinator,
 		Repositories: repositories,
+		Projects:     projectService,
+		Loops:        loopService,
+		Runs:         runService,
 	}
 	r.mu.Unlock()
 
@@ -600,175 +610,13 @@ func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.
 }
 
 func defaultSyncConfiguredProjects(ctx context.Context, repositories *storage.Repositories, cfg config.Config, now time.Time) error {
-	if repositories == nil || repositories.Projects == nil {
-		return fmt.Errorf("projects repository is not configured")
-	}
-
-	nowISO := formatJavaScriptISOString(now)
-
-	for _, project := range cfg.Projects {
-		existing, err := repositories.Projects.GetByID(ctx, project.ID)
-		if err != nil {
-			return err
-		}
-
-		metadataJSONValue, err := buildProjectMetadataJSON(existing, project)
-		if err != nil {
-			return fmt.Errorf("build project metadata for %s: %w", project.ID, err)
-		}
-
-		baseBranch := cfg.Defaults.BaseBranch
-		if project.BaseBranch != nil {
-			baseBranch = *project.BaseBranch
-		}
-
-		createdAt := nowISO
-		if existing != nil {
-			createdAt = existing.CreatedAt
-		}
-
-		record := storage.ProjectRecord{
-			ID:           project.ID,
-			Name:         project.Name,
-			RepoPath:     project.RepoPath,
-			BaseBranch:   &baseBranch,
-			Archived:     false,
-			MetadataJSON: &metadataJSONValue,
-			CreatedAt:    createdAt,
-			UpdatedAt:    nowISO,
-		}
-		if err := repositories.Projects.Upsert(ctx, record); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.ProjectRefConfig) (string, error) {
-	extras := make([]orderedJSONEntry, 0)
-	repoRaw := []byte("null")
-
-	if existing != nil {
-		existingMetadata, err := parseProjectMetadata(existing.MetadataJSON)
-		if err != nil {
-			return "", err
-		}
-		for _, entry := range existingMetadata {
-			switch entry.Key {
-			case "repo":
-				if existing.RepoPath == project.RepoPath {
-					var existingRepo string
-					if err := json.Unmarshal(entry.Raw, &existingRepo); err == nil && existingRepo != "" {
-						repoRaw, err = json.Marshal(existingRepo)
-						if err != nil {
-							return "", err
-						}
-					}
-				}
-			case "worktreeRoot", "source":
-				continue
-			default:
-				extras = append(extras, entry)
-			}
-		}
-	}
-
-	worktreeRootRaw := []byte("null")
-	if project.WorktreeRoot != nil {
-		encodedWorktreeRoot, err := json.Marshal(*project.WorktreeRoot)
-		if err != nil {
-			return "", err
-		}
-		worktreeRootRaw = encodedWorktreeRoot
-	}
-
-	entries := append(extras,
-		orderedJSONEntry{Key: "repo", Raw: repoRaw},
-		orderedJSONEntry{Key: "worktreeRoot", Raw: worktreeRootRaw},
-		orderedJSONEntry{Key: "source", Raw: json.RawMessage(`"config"`)},
-	)
-
-	return marshalOrderedJSONObject(entries)
-}
-
-type orderedJSONEntry struct {
-	Key string
-	Raw json.RawMessage
-}
-
-func parseProjectMetadata(raw *string) ([]orderedJSONEntry, error) {
-	if raw == nil || *raw == "" {
-		return []orderedJSONEntry{}, nil
-	}
-
-	decoder := json.NewDecoder(strings.NewReader(*raw))
-	startToken, err := decoder.Token()
-	if err != nil {
-		return nil, err
-	}
-	startDelimiter, ok := startToken.(json.Delim)
-	if !ok || startDelimiter != '{' {
-		return nil, fmt.Errorf("project metadata must be a JSON object")
-	}
-
-	entries := make([]orderedJSONEntry, 0)
-	for decoder.More() {
-		keyToken, err := decoder.Token()
-		if err != nil {
-			return nil, err
-		}
-
-		key, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("project metadata key must be a string")
-		}
-
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return nil, err
-		}
-
-		entries = append(entries, orderedJSONEntry{Key: key, Raw: value})
-	}
-
-	endToken, err := decoder.Token()
-	if err != nil {
-		return nil, err
-	}
-	endDelimiter, ok := endToken.(json.Delim)
-	if !ok || endDelimiter != '}' {
-		return nil, fmt.Errorf("project metadata must end with a JSON object delimiter")
-	}
-
-	return entries, nil
+	service := &projects.Service{Repos: repositories, Now: func() time.Time { return now }}
+	return service.SyncConfigured(ctx, cfg, now)
 }
 
 func formatJavaScriptISOString(value time.Time) string {
 	value = value.UTC()
 	return fmt.Sprintf("%s.%03dZ", value.Format("2006-01-02T15:04:05"), value.Nanosecond()/int(time.Millisecond))
-}
-
-func marshalOrderedJSONObject(entries []orderedJSONEntry) (string, error) {
-	buffer := &bytes.Buffer{}
-	buffer.WriteByte('{')
-
-	for index, entry := range entries {
-		if index > 0 {
-			buffer.WriteByte(',')
-		}
-
-		keyJSON, err := json.Marshal(entry.Key)
-		if err != nil {
-			return "", err
-		}
-		buffer.Write(keyJSON)
-		buffer.WriteByte(':')
-		buffer.Write(entry.Raw)
-	}
-
-	buffer.WriteByte('}')
-	return buffer.String(), nil
 }
 
 func appendSystemEvent(ctx context.Context, repositories *storage.Repositories, record storage.EventLogRecord) error {

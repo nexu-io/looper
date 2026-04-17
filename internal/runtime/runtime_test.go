@@ -59,6 +59,9 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	if services.Repositories == nil || services.Repositories.Projects == nil {
 		t.Fatal("Services().Repositories.Projects = nil, want initialized repository set")
 	}
+	if services.Projects == nil || services.Loops == nil || services.Runs == nil {
+		t.Fatal("Services() orchestration services = nil, want initialized services")
+	}
 
 	project, err := services.Repositories.Projects.GetByID(context.Background(), "project_1")
 	if err != nil {
@@ -664,19 +667,38 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.T) {
 	t.Parallel()
 
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
 	existingMetadata := `{"extra":"value","repo":"powerformer/looper","worktreeRoot":"/tmp/old","source":"config"}`
 	repoPath := "/tmp/repo"
 	project := config.ProjectRefConfig{ID: "project_1", Name: "Looper", RepoPath: repoPath}
-	existing := &storage.ProjectRecord{RepoPath: repoPath, MetadataJSON: &existingMetadata}
+	createdAt := "2026-04-16T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: project.ID, Name: project.Name, RepoPath: repoPath, MetadataJSON: &existingMetadata, CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
 
-	got, err := buildProjectMetadataJSON(existing, project)
+	cfg, err := config.DefaultConfig(workingDir)
 	if err != nil {
-		t.Fatalf("buildProjectMetadataJSON() error = %v", err)
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{project}
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	if err := defaultSyncConfiguredProjects(ctx, repos, cfg, now); err != nil {
+		t.Fatalf("defaultSyncConfiguredProjects() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, want metadata", stored)
 	}
 
 	const want = `{"extra":"value","repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
-	if got != want {
-		t.Fatalf("buildProjectMetadataJSON() = %q, want %q", got, want)
+	if *stored.MetadataJSON != want {
+		t.Fatalf("project.MetadataJSON = %q, want %q", *stored.MetadataJSON, want)
 	}
 }
 
