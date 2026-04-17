@@ -340,7 +340,7 @@ This is an opportunity to make the current implicit boundaries explicit rather t
 
 Prefer conservative choices:
 
-- CLI: `cobra` or `urfave/cli/v3`
+- CLI: `github.com/spf13/cobra`
 - HTTP router: standard library `net/http` plus a small router like `chi`, or pure stdlib if the surface stays small
 - Config: stdlib + `encoding/json`; optionally `kong`/`viper` only if needed, but avoid over-abstracting precedence rules
 - SQLite: `modernc.org/sqlite` for pure Go portability or `mattn/go-sqlite3` if CGO is acceptable
@@ -356,6 +356,12 @@ Additional guidance:
 1. Because Looper currently targets macOS first and uses SQLite features such as backup-oriented flows, `mattn/go-sqlite3` is an acceptable default choice if it produces more reliable behavior than `modernc.org/sqlite`.
 2. If `log/slog` is used, log rotation still needs a separate solution.
 3. The CLI framework choice must preserve testability comparable to the current injected-dependency model.
+
+CLI framework decision:
+
+> Use `github.com/spf13/cobra` for the Go `looper` CLI.
+>
+> The frozen command tree under `specs/2026-04-17-go-port-plan/artifacts/cli-commands.md` maps directly to Cobra's nested `Command` model, and the frozen global/config-forwarded flag contract maps cleanly to root persistent flags plus per-command local flags. Cobra also gives enough control over command help to reproduce Looper's existing group-level `Subcommands:` sections without keeping a fully custom parser/dispatcher, while still allowing an injected-dependency `App` or `CLI` struct to build a fresh root command per test. We are explicitly not using Cobra's package-global patterns; command construction should stay instance-based so the next testing/DI task can preserve the current `runCli(argv, deps)` isolation model.
 
 ---
 
@@ -512,6 +518,23 @@ This should also cover event-log observability expectations, not just daemon log
 Recommendation:
 
 > The TypeScript implementation is the reference path only until the Go rewrite is complete; once the Go implementation is feature-complete and validated, cut over directly and archive the TypeScript path.
+
+### 6.11 CLI framework
+
+Decision:
+
+> Use `github.com/spf13/cobra` for the Go CLI.
+
+Why:
+
+1. Cobra's command/subcommand tree matches the frozen `looper` surface (`project`, `daemon`, `loop`, `pr`, `run`, and one-off commands such as `review`, `jump`, `logs`, and `stop`) with minimal translation logic.
+2. Root persistent flags provide a clean home for the frozen global flags and the `extractConfigArgs()` forwarding boundary, while still allowing command-local flags to stay local.
+3. Cobra's help hooks (`SetHelpFunc`, templates, per-command usage control) are flexible enough to preserve the current help-output shape, including explicit group-level `Subcommands:` sections covered by the existing CLI tests.
+4. Testability remains compatible with the current injected-dependency design if the implementation constructs a fresh root command from an `App`/`CLI` struct per invocation rather than closing over package globals.
+
+Rejected alternative:
+
+`urfave/cli/v3` remains viable, but it is a worse fit for this parity-first port because its context-driven handler style and coarser help templating add friction around custom grouped help output, exact flag-forwarding behavior, and dependency-injected tests.
 
 ---
 

@@ -29,7 +29,7 @@
 - [ ] Add shared version package
 - [ ] Add `pkg/api` for shared API types and error codes
 - [ ] Add Go build/test/lint commands to CI without removing current TS/Bun CI
-- [ ] Decide the CLI framework
+- [x] Decide the CLI framework
 - [ ] Decide the CLI dependency-injection/testing pattern
 - [ ] Decide the SQLite driver and document why
 
