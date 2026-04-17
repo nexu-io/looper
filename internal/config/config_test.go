@@ -115,6 +115,176 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	}
 }
 
+func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	logDir := filepath.Join(cwd, "logs")
+	dbPath := filepath.Join(cwd, "looper.sqlite")
+
+	contents := fmt.Sprintf(`{
+		"server": {"host": "0.0.0.0", "port": 5555},
+		"daemon": {"logDir": %q, "workingDirectory": %q},
+		"storage": {"dbPath": %q},
+		"notifications": {"osascript": {"enabled": true, "throttleWindowSeconds": 60}},
+		"tools": {"bunPath": "/file/bun", "gitPath": "/file/git", "ghPath": "/file/gh"},
+		"defaults": {"allowAutoCommit": false}
+	}`, logDir, cwd, dbPath)
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD: cwd,
+		Args: []string{
+			"--config", configPath,
+			"--port", "7000",
+			"--git-path", "/cli/git",
+			"--allow-auto-commit", "false",
+			"--allow-auto-push", "false",
+		},
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_HOST":                 "127.0.0.2",
+			"LOOPER_DB_PATH":              filepath.Join(cwd, "env.sqlite"),
+			"LOOPER_LOG_DIR":              filepath.Join(cwd, "env-logs"),
+			"LOOPER_OSASCRIPT_ENABLED":    "false",
+			"LOOPER_IN_APP_NOTIFICATIONS": "false",
+			"LOOPER_BUN_PATH":             "/env/bun",
+			"LOOPER_GH_PATH":              "/env/gh",
+			"LOOPER_ALLOW_AUTO_COMMIT":    "true",
+			"LOOPER_ALLOW_AUTO_APPROVE":   "true",
+			"LOOPER_WORKING_DIRECTORY":    filepath.Join(cwd, "env-workspace"),
+			"LOOPER_OSASCRIPT_PATH":       "/env/osascript",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Config.Server.Host != "127.0.0.2" {
+		t.Fatalf("LoadFile().Config.Server.Host = %q, want %q", loaded.Config.Server.Host, "127.0.0.2")
+	}
+
+	if loaded.Config.Server.Port != 7000 {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7000)
+	}
+
+	if loaded.Config.Storage.DBPath != filepath.Join(cwd, "env.sqlite") {
+		t.Fatalf("LoadFile().Config.Storage.DBPath = %q, want %q", loaded.Config.Storage.DBPath, filepath.Join(cwd, "env.sqlite"))
+	}
+
+	if loaded.Config.Daemon.LogDir != filepath.Join(cwd, "env-logs") {
+		t.Fatalf("LoadFile().Config.Daemon.LogDir = %q, want %q", loaded.Config.Daemon.LogDir, filepath.Join(cwd, "env-logs"))
+	}
+
+	if loaded.Config.Daemon.WorkingDirectory != filepath.Join(cwd, "env-workspace") {
+		t.Fatalf("LoadFile().Config.Daemon.WorkingDirectory = %q, want %q", loaded.Config.Daemon.WorkingDirectory, filepath.Join(cwd, "env-workspace"))
+	}
+
+	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/env/bun" {
+		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/env/bun")
+	}
+
+	if loaded.Config.Tools.GitPath == nil || *loaded.Config.Tools.GitPath != "/cli/git" {
+		t.Fatalf("LoadFile().Config.Tools.GitPath = %v, want %q", loaded.Config.Tools.GitPath, "/cli/git")
+	}
+
+	if loaded.Config.Tools.GHPath == nil || *loaded.Config.Tools.GHPath != "/env/gh" {
+		t.Fatalf("LoadFile().Config.Tools.GHPath = %v, want %q", loaded.Config.Tools.GHPath, "/env/gh")
+	}
+
+	if loaded.Config.Tools.OsascriptPath == nil || *loaded.Config.Tools.OsascriptPath != "/env/osascript" {
+		t.Fatalf("LoadFile().Config.Tools.OsascriptPath = %v, want %q", loaded.Config.Tools.OsascriptPath, "/env/osascript")
+	}
+
+	if loaded.Config.Defaults.AllowAutoCommit {
+		t.Fatal("LoadFile().Config.Defaults.AllowAutoCommit = true, want false")
+	}
+
+	if loaded.Config.Defaults.AllowAutoPush {
+		t.Fatal("LoadFile().Config.Defaults.AllowAutoPush = true, want false")
+	}
+
+	if !loaded.Config.Defaults.AllowAutoApprove {
+		t.Fatal("LoadFile().Config.Defaults.AllowAutoApprove = false, want true")
+	}
+
+	if loaded.Config.Notifications.InApp {
+		t.Fatal("LoadFile().Config.Notifications.InApp = true, want false")
+	}
+
+	if loaded.Config.Notifications.Osascript.Enabled {
+		t.Fatal("LoadFile().Config.Notifications.Osascript.Enabled = true, want false")
+	}
+
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+}
+
+func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
+	cwd := t.TempDir()
+	cliConfigPath := filepath.Join(cwd, "cli.json")
+	envConfigPath := filepath.Join(cwd, "env.json")
+	optionConfigPath := filepath.Join(cwd, "option.json")
+
+	for path, port := range map[string]int{cliConfigPath: 6100, envConfigPath: 6200, optionConfigPath: 6300} {
+		contents := fmt.Sprintf(`{"server": {"port": %d}}`, port)
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+	}
+
+	t.Run("cli beats env and options", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:        cwd,
+			ConfigPath: optionConfigPath,
+			Args:       []string{"--config", cliConfigPath},
+			LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != cliConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, cliConfigPath)
+		}
+
+		if loaded.Config.Server.Port != 6100 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6100)
+		}
+	})
+
+	t.Run("env beats options when cli absent", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:        cwd,
+			ConfigPath: optionConfigPath,
+			LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != envConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, envConfigPath)
+		}
+
+		if loaded.Config.Server.Port != 6200 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6200)
+		}
+	})
+}
+
+func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T) {
+	_, err := LoadFile(LoadFileOptions{Args: []string{"--hostfoo", "127.0.0.99"}, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if err.Error() != "Unknown looperd argument: --hostfoo" {
+		t.Fatalf("LoadFile() error = %q, want %q", err, "Unknown looperd argument: --hostfoo")
+	}
+}
+
 func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -567,4 +737,15 @@ func TestRepoWorktreeDirectoryNameCanonicalizesSymlinks(t *testing.T) {
 func sha256Hex(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", sum)
+}
+
+func mapEnvLookup(values map[string]string) EnvLookupFunc {
+	return func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
+	}
+}
+
+func emptyEnvLookup(string) (string, bool) {
+	return "", false
 }

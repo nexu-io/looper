@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
+
+type EnvLookupFunc func(string) (string, bool)
 
 type LoadFileMetadata struct {
 	ConfigPath        string
@@ -22,6 +26,14 @@ type LoadFileOptions struct {
 	CWD               string
 	ConfigPath        string
 	DefaultConfigPath string
+	Args              []string
+	LookupEnv         EnvLookupFunc
+}
+
+type parsedCLIArgs struct {
+	configPath    string
+	hasConfigPath bool
+	overrides     PartialConfig
 }
 
 func ResolveConfigPath(path string, cwd string) string {
@@ -42,8 +54,22 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		}
 	}
 
+	lookupEnv := options.LookupEnv
+	if lookupEnv == nil {
+		lookupEnv = os.LookupEnv
+	}
+
+	parsedCLI, err := parseCLIArgs(options.Args)
+	if err != nil {
+		return LoadedFileConfig{}, err
+	}
+
 	configPath := options.ConfigPath
-	if configPath == "" {
+	if parsedCLI.hasConfigPath {
+		configPath = parsedCLI.configPath
+	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok {
+		configPath = envConfigPath
+	} else if configPath == "" {
 		configPath = options.DefaultConfigPath
 	}
 	if configPath == "" {
@@ -61,7 +87,9 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
-	config, err := Normalize(cwd, partialConfig)
+	envOverrides := buildEnvOverrides(lookupEnv)
+
+	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
 	if err != nil {
 		return LoadedFileConfig{}, err
 	}
@@ -89,4 +117,297 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 	}
 
 	return partialConfig, true, nil
+}
+
+func parseCLIArgs(args []string) (parsedCLIArgs, error) {
+	parsed := parsedCLIArgs{}
+
+	takeValue := func(index int, flag string) (string, int, error) {
+		current := args[index]
+		if current == "" {
+			return "", index, fmt.Errorf("missing value for %s", flag)
+		}
+
+		if _, value, ok := strings.Cut(current, "="); ok {
+			return value, index, nil
+		}
+
+		nextIndex := index + 1
+		if nextIndex >= len(args) || strings.HasPrefix(args[nextIndex], "--") {
+			return "", index, fmt.Errorf("missing value for %s", flag)
+		}
+
+		return args[nextIndex], nextIndex, nil
+	}
+
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !strings.HasPrefix(arg, "--") {
+			continue
+		}
+
+		switch {
+		case matchesFlag(arg, "--config"):
+			value, nextIndex, err := takeValue(index, "--config")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsed.configPath = value
+			parsed.hasConfigPath = true
+			index = nextIndex
+		case matchesFlag(arg, "--host"):
+			value, nextIndex, err := takeValue(index, "--host")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureServerConfig(&parsed.overrides).Host = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--port"):
+			value, nextIndex, err := takeValue(index, "--port")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			if parsedValue := parseInteger(value); parsedValue != nil {
+				ensureServerConfig(&parsed.overrides).Port = parsedValue
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--db-path"):
+			value, nextIndex, err := takeValue(index, "--db-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureStorageConfig(&parsed.overrides).DBPath = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--log-dir"):
+			value, nextIndex, err := takeValue(index, "--log-dir")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureDaemonConfig(&parsed.overrides).LogDir = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--daemon-mode"):
+			value, nextIndex, err := takeValue(index, "--daemon-mode")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			daemonMode := DaemonMode(value)
+			ensureDaemonConfig(&parsed.overrides).Mode = &daemonMode
+			index = nextIndex
+		case matchesFlag(arg, "--bun-path"):
+			value, nextIndex, err := takeValue(index, "--bun-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureToolPathsConfig(&parsed.overrides).BunPath = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--git-path"):
+			value, nextIndex, err := takeValue(index, "--git-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureToolPathsConfig(&parsed.overrides).GitPath = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--gh-path"):
+			value, nextIndex, err := takeValue(index, "--gh-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureToolPathsConfig(&parsed.overrides).GHPath = stringPtr(value)
+			index = nextIndex
+		case matchesFlag(arg, "--allow-auto-commit"):
+			value, nextIndex, err := takeValue(index, "--allow-auto-commit")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			if parsedValue := parseBoolean(value); parsedValue != nil {
+				ensureDefaultsConfig(&parsed.overrides).AllowAutoCommit = parsedValue
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--allow-auto-push"):
+			value, nextIndex, err := takeValue(index, "--allow-auto-push")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			if parsedValue := parseBoolean(value); parsedValue != nil {
+				ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--allow-auto-approve"):
+			value, nextIndex, err := takeValue(index, "--allow-auto-approve")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			if parsedValue := parseBoolean(value); parsedValue != nil {
+				ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--osascript-path"):
+			value, nextIndex, err := takeValue(index, "--osascript-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureToolPathsConfig(&parsed.overrides).OsascriptPath = stringPtr(value)
+			index = nextIndex
+		default:
+			return parsedCLIArgs{}, fmt.Errorf("Unknown looperd argument: %s", arg)
+		}
+	}
+
+	return parsed, nil
+}
+
+func matchesFlag(arg string, flag string) bool {
+	return arg == flag || strings.HasPrefix(arg, flag+"=")
+}
+
+func parseInteger(value string) *int {
+	if value == "" {
+		return nil
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return nil
+	}
+
+	return &parsed
+}
+
+func parseBoolean(value string) *bool {
+	if value == "" {
+		return nil
+	}
+
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		parsed := true
+		return &parsed
+	case "0", "false", "no", "off":
+		parsed := false
+		return &parsed
+	default:
+		return nil
+	}
+}
+
+func buildEnvOverrides(lookupEnv EnvLookupFunc) PartialConfig {
+	var overrides PartialConfig
+
+	if value, ok := lookupEnv("LOOPER_HOST"); ok {
+		ensureServerConfig(&overrides).Host = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_PORT"); ok {
+		if parsed := parseInteger(value); parsed != nil {
+			ensureServerConfig(&overrides).Port = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_DB_PATH"); ok {
+		ensureStorageConfig(&overrides).DBPath = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_LOG_DIR"); ok {
+		ensureDaemonConfig(&overrides).LogDir = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_DAEMON_MODE"); ok {
+		daemonMode := DaemonMode(value)
+		ensureDaemonConfig(&overrides).Mode = &daemonMode
+	}
+	if value, ok := lookupEnv("LOOPER_WORKING_DIRECTORY"); ok {
+		ensureDaemonConfig(&overrides).WorkingDirectory = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_IN_APP_NOTIFICATIONS"); ok {
+		if parsed := parseBoolean(value); parsed != nil {
+			ensureNotificationConfig(&overrides).InApp = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_OSASCRIPT_ENABLED"); ok {
+		if parsed := parseBoolean(value); parsed != nil {
+			ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_COMMIT"); ok {
+		if parsed := parseBoolean(value); parsed != nil {
+			ensureDefaultsConfig(&overrides).AllowAutoCommit = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_PUSH"); ok {
+		if parsed := parseBoolean(value); parsed != nil {
+			ensureDefaultsConfig(&overrides).AllowAutoPush = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_APPROVE"); ok {
+		if parsed := parseBoolean(value); parsed != nil {
+			ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
+		}
+	}
+	if value, ok := lookupEnv("LOOPER_BUN_PATH"); ok {
+		ensureToolPathsConfig(&overrides).BunPath = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
+		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_GH_PATH"); ok {
+		ensureToolPathsConfig(&overrides).GHPath = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_OSASCRIPT_PATH"); ok {
+		ensureToolPathsConfig(&overrides).OsascriptPath = stringPtr(value)
+	}
+
+	return overrides
+}
+
+func ensureServerConfig(partial *PartialConfig) *PartialServerConfig {
+	if partial.Server == nil {
+		partial.Server = &PartialServerConfig{}
+	}
+
+	return partial.Server
+}
+
+func ensureStorageConfig(partial *PartialConfig) *PartialStorageConfig {
+	if partial.Storage == nil {
+		partial.Storage = &PartialStorageConfig{}
+	}
+
+	return partial.Storage
+}
+
+func ensureNotificationConfig(partial *PartialConfig) *PartialNotificationConfig {
+	if partial.Notifications == nil {
+		partial.Notifications = &PartialNotificationConfig{}
+	}
+
+	return partial.Notifications
+}
+
+func ensureOsascriptNotificationConfig(partial *PartialConfig) *PartialOsascriptNotificationConfig {
+	notifications := ensureNotificationConfig(partial)
+	if notifications.Osascript == nil {
+		notifications.Osascript = &PartialOsascriptNotificationConfig{}
+	}
+
+	return notifications.Osascript
+}
+
+func ensureToolPathsConfig(partial *PartialConfig) *PartialToolPathsConfig {
+	if partial.Tools == nil {
+		partial.Tools = &PartialToolPathsConfig{}
+	}
+
+	return partial.Tools
+}
+
+func ensureDaemonConfig(partial *PartialConfig) *PartialDaemonConfig {
+	if partial.Daemon == nil {
+		partial.Daemon = &PartialDaemonConfig{}
+	}
+
+	return partial.Daemon
+}
+
+func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
+	if partial.Defaults == nil {
+		partial.Defaults = &PartialDefaultsConfig{}
+	}
+
+	return partial.Defaults
 }
