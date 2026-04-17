@@ -80,6 +80,23 @@ The `Store` contract in `apps/looperd/src/storage/store.ts:17-125` is implemente
 | `worktrees` | Upsert/list/get worktree records by id/branch/project. | `sqlite-store.ts:839-894` |
 | `schema` | Expose migration status, healthcheck, and backup hooks from the coordinator. | `sqlite-store.ts:896-900` |
 
+## Scheduler queue and event-log recovery / retention semantics
+
+### `queue_items`
+
+- Schema contract: `queue_items` is the durable scheduler queue introduced in `0003_scheduler_queue.sql` and later widened in `0004_worker_project_target.sql`; it stores work identity (`type`, `target_type`, `target_id`, `repo`, `pr_number`, `dedupe_key`), scheduling fields (`priority`, `available_at`), and recovery fields (`status`, `attempts`, `max_attempts`, claim timestamps, error fields). The status enum is fixed to `queued`, `running`, `completed`, `failed`, `cancelled`, and `manual_intervention`. `project_id` and `loop_id` are optional foreign keys with `ON DELETE CASCADE`.
+- Scheduling/claim semantics: runnable work is selected from rows whose status is `queued` and `available_at <= now`, ordered by priority/age, then atomically updated to `running` by `queue.claimNext()` / `queue.claimNextOfType()` (`sqlite-store.ts:492-566`). Dedupe only suppresses concurrent active work: `findActiveByDedupe()` checks `queued` + `running` rows, not terminal rows (`sqlite-store.ts:481-490`).
+- Retry/failure semantics: `queue.markRetry()` returns an item to `queued`, bumps `attempts`, clears claim fields, and preserves the last error metadata for later inspection (`sqlite-store.ts:577-607`). `queue.fail()` leaves the row in place with terminal status `failed` or `manual_intervention` depending on `last_error_kind` (`sqlite-store.ts:608-637`). `queue.complete()` marks rows `completed` without deleting them (`sqlite-store.ts:568-576`).
+- Recovery semantics: on daemon startup, `runRecoveryPipeline()` marks interrupted runs, then calls `queue.requeueRunningByLoop()` for loops that should resume; this rewrites any `running` row for that loop back to `queued`, clears claim/start/finish metadata, and makes it immediately runnable (`runtime/index.ts:676-729`, `sqlite-store.ts:639-654`). If a loop is still marked `queued` but no active queue row remains, runtime normalizes the loop status instead of reconstructing queue rows (`runtime/index.ts:732-773`). Explicit loop cleanup uses `queue.cancelByLoop()` to turn active queued/running rows into `cancelled` terminal rows with an optional reason (`sqlite-store.ts:655-672`).
+- Retention semantics: no TTL, pruning job, archive table, or delete-on-completion behavior exists for `queue_items`. Rows are updated in place and retained after completion/failure/cancellation/manual intervention. The only automatic deletion path is foreign-key cascade when the owning project or loop is removed (`0003_scheduler_queue.sql:26-27`).
+
+### `event_logs`
+
+- Schema contract: `event_logs` is the append-only runtime history table from `0001_init.sql`; it stores `event_type`, optional `project_id` / `loop_id` / `run_id`, entity and actor metadata, opaque `payload_json`, and `created_at`, with indexes for entity timeline and event-type timeline queries (`0001_init.sql:76-97`).
+- Write/read semantics: the repository only exposes `events.append()`, `events.list(limit)`, and `events.listByEntity(entityType, entityId)`; there is no update or delete API (`sqlite-store.ts:318-355`). Reads return newest-first globally and oldest-first for a single entity timeline.
+- Recovery semantics: startup recovery writes new audit events such as `looperd.recovery.lock_released`, `looperd.recovery.run_interrupted`, `looperd.recovery.loop_requeued`, `looperd.recovery.loop_queue_normalized`, and `looperd.recovery.completed` through `appendEvent()` (`runtime/index.ts:650-791`, `866-878`). Recovery consumes queue/run state directly; it does not replay, compact, or derive state from prior `event_logs` rows.
+- Retention semantics: no retention policy or cleanup path exists for `event_logs`. Parent deletions preserve history by nulling `project_id`, `loop_id`, and `run_id` (`ON DELETE SET NULL`) instead of deleting the event row (`0001_init.sql:91-93`). In practice the table is an indefinite audit log unless an external/manual cleanup step is introduced.
+
 ## Compatibility notes for the Go port
 
 - The current daemon assumes a single SQLite database file plus startup auto-migration, not an external migration step (`runtime/index.ts:133-146`, `db.ts:42-44`).

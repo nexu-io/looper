@@ -192,6 +192,53 @@ Machine-verifiable freeze artifact: `specs/2026-04-17-go-port-plan/artifacts/cli
 
 Sources: `apps/cli/src/index.ts:258-269`, `apps/cli/src/index.ts:679-690`, `apps/cli/src/index.ts:2221-2249`, `apps/cli/src/index.ts:2537-2557`
 
+## External tool dependency inventory
+
+This inventory freezes the current non-HTTP external command dependencies that the Go port must either preserve or replace intentionally.
+
+### `git`
+
+- Config surface: `tools.gitPath`, `LOOPER_GIT_PATH`, `--git-path`
+- Resolution behavior: explicit config/env/CLI path wins; otherwise auto-detected with `Bun.which("git")`
+- Validation behavior: startup fails when `tools.gitPath` cannot be resolved
+- Current responsibilities:
+  - worktree and branch management via `GitWorktreeGateway`
+  - project add/inspection flows that require repo/worktree mutation
+  - fixer and worker runtimes that need local repo operations
+- Primary sources: `apps/looperd/src/config/tools.ts`, `apps/looperd/src/config/validate.ts`, `apps/looperd/src/infra/git.ts`, `apps/looperd/src/runtime/index.ts`
+
+### `gh`
+
+- Config surface: `tools.ghPath`, `LOOPER_GH_PATH`, `--gh-path`
+- Resolution behavior: explicit config/env/CLI path wins; otherwise auto-detected with `Bun.which("gh")`
+- Validation behavior: startup fails when `tools.ghPath` cannot be resolved
+- Current responsibilities:
+  - GitHub PR and issue reads
+  - review submission, comments, reactions, and related PR automation
+  - project/runtime flows that need GitHub metadata alongside git state
+- Primary sources: `apps/looperd/src/config/tools.ts`, `apps/looperd/src/config/validate.ts`, `apps/looperd/src/infra/github.ts`, `apps/looperd/src/runtime/index.ts`
+
+### `osascript`
+
+- Config surface: `tools.osascriptPath`, `LOOPER_OSASCRIPT_PATH`, `--osascript-path`
+- Resolution behavior: explicit config/env/CLI path wins; otherwise auto-detected with `Bun.which("osascript")`
+- Validation behavior: required only when `notifications.osascript.enabled` is `true`; startup fails otherwise
+- Current responsibilities:
+  - macOS notification delivery, including throttling and sound-level behavior controlled in config
+- Primary sources: `apps/looperd/src/config/defaults.ts`, `apps/looperd/src/config/tools.ts`, `apps/looperd/src/config/validate.ts`, `apps/looperd/src/runtime/index.ts`
+
+### Shell
+
+- No dedicated `tools.shellPath` config exists today
+- Current CLI shell behavior depends on the caller environment:
+  - `looper jump --shell-integration <bash|zsh|fish>` prints shell-specific helper functions
+  - interactive `looper jump <id>` shells out to `process.env.SHELL`, falling back to `/bin/zsh`
+- Current daemon/process execution behavior is Bun-based rather than shell-path-configured:
+  - infra commands execute binaries directly through `Bun.spawn()` with explicit `command` + `args`
+  - Bun shell helpers also appear in build/dev scripts (`Bun.$`), but not as a daemon config field
+- Porting implication: preserve user-visible shell integration behavior and interactive-shell fallback semantics even though shell itself is not currently part of `tools.*`
+- Primary sources: `apps/cli/src/index.ts:2000-2059`, `apps/cli/src/index.ts:2209-2218`, `apps/looperd/src/infra/command.ts`, `apps/looperd/scripts/compile.ts`
+
 ## Compatibility-boundary notes for follow-up tasks
 
 - The config surface is broader than the env/CLI override surface; many fields are config-file-only today.
