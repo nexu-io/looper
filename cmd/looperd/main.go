@@ -50,10 +50,11 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 	}
 
 	_, err := bootstrapImpl(context.Background(), bootstrap.Options{
-		Args:   args,
-		Env:    deps.env,
-		Stdout: stdout,
-		Stderr: stderr,
+		Args:            args,
+		Env:             deps.env,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		WaitForShutdown: true,
 	})
 	if err == nil {
 		return 0
@@ -88,6 +89,6 @@ Usage:
 	looperd help
 
 Status:
-	Bootstrap flow is ported. Signal handling, runtime assembly, and daemon command parity remain in progress.
+	Bootstrap flow and signal handling are ported. Runtime assembly and daemon command parity remain in progress.
 `)
 }

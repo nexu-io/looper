@@ -60,6 +60,9 @@ func TestRunBootstrapsLooperdByDefault(t *testing.T) {
 			if len(options.Args) != 0 {
 				t.Fatalf("bootstrap args = %#v, want empty slice", options.Args)
 			}
+			if !options.WaitForShutdown {
+				t.Fatal("bootstrap WaitForShutdown = false, want true")
+			}
 			return bootstrap.Result{}, nil
 		},
 	})

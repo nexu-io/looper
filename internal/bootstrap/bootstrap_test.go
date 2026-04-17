@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/powerformer/looper/internal/config"
 )
@@ -151,8 +153,184 @@ func TestBootstrapPropagatesLoadConfigError(t *testing.T) {
 	}
 }
 
+func TestBootstrapWaitForShutdownRegistersSignalsAndStopsRuntime(t *testing.T) {
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	logDir := filepath.Join(rootDir, "runtime", "logs")
+	dbPath := filepath.Join(rootDir, "data", "looper.sqlite")
+
+	loadedConfig := config.LoadedFileConfig{
+		Config: config.Config{
+			Storage: config.StorageConfig{DBPath: dbPath},
+			Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+			Daemon:  config.DaemonConfig{LogDir: logDir, WorkingDirectory: workingDir},
+		},
+	}
+
+	logger := &recordingLogger{}
+	runtime := &stubShutdownRuntime{shutdown: make(chan struct{})}
+	notifier := &stubSignalNotifier{}
+
+	done := make(chan Result, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		result, err := Bootstrap(context.Background(), Options{
+			LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+				return loadedConfig, nil
+			},
+			CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) {
+				return logger, nil
+			},
+			StartRuntime: func(context.Context, RuntimeDependencies) (Runtime, error) {
+				return runtime, nil
+			},
+			WaitForShutdown: true,
+			SignalNotifier:  notifier,
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		done <- result
+	}()
+
+	registered := notifier.waitForRegistration(t)
+	if !reflect.DeepEqual(registered, []os.Signal{os.Interrupt, syscall.SIGTERM}) {
+		t.Fatalf("registered signals = %#v, want %#v", registered, []os.Signal{os.Interrupt, syscall.SIGTERM})
+	}
+
+	select {
+	case <-done:
+		t.Fatalf("Bootstrap() returned before runtime shutdown")
+	case err := <-errCh:
+		t.Fatalf("Bootstrap() error = %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	notifier.emit(syscall.SIGTERM)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("Bootstrap() error = %v", err)
+	case result := <-done:
+		if result.Runtime != runtime {
+			t.Fatalf("result.Runtime = %#v, want %#v", result.Runtime, runtime)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Bootstrap() did not return after shutdown signal")
+	}
+
+	if !reflect.DeepEqual(runtime.stopReasons, []string{"SIGTERM"}) {
+		t.Fatalf("runtime.Stop() reasons = %#v, want %#v", runtime.stopReasons, []string{"SIGTERM"})
+	}
+	if notifier.stopCalls != 1 {
+		t.Fatalf("SignalNotifier.Stop() calls = %d, want 1", notifier.stopCalls)
+	}
+
+	if len(logger.infoEntries) != 2 {
+		t.Fatalf("len(logger.infoEntries) = %d, want 2", len(logger.infoEntries))
+	}
+	if got := logger.infoEntries[1].message; got != "received shutdown signal" {
+		t.Fatalf("logger.Info() message = %q, want %q", got, "received shutdown signal")
+	}
+	if got := logger.infoEntries[1].context["signal"]; got != "SIGTERM" {
+		t.Fatalf("logger.Info() context[signal] = %#v, want %#v", got, "SIGTERM")
+	}
+}
+
+func TestBootstrapWaitForShutdownRequiresShutdownRuntime(t *testing.T) {
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	logDir := filepath.Join(rootDir, "runtime", "logs")
+	dbPath := filepath.Join(rootDir, "data", "looper.sqlite")
+
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{
+				Config: config.Config{
+					Storage: config.StorageConfig{DBPath: dbPath},
+					Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+					Daemon:  config.DaemonConfig{LogDir: logDir, WorkingDirectory: workingDir},
+				},
+			}, nil
+		},
+		CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) {
+			return &recordingLogger{}, nil
+		},
+		StartRuntime: func(context.Context, RuntimeDependencies) (Runtime, error) {
+			return struct{}{}, nil
+		},
+		WaitForShutdown: true,
+	})
+	if err == nil {
+		t.Fatal("Bootstrap() error = nil, want error")
+	}
+	if got, want := err.Error(), "runtime does not support shutdown coordination"; !contains(got, want) {
+		t.Fatalf("Bootstrap() error = %q, want substring %q", got, want)
+	}
+}
+
 type recordingLogger struct {
 	infoEntries []logCall
+}
+
+type stubShutdownRuntime struct {
+	stopReasons []string
+	shutdown    chan struct{}
+}
+
+func (r *stubShutdownRuntime) Stop(reason string) {
+	r.stopReasons = append(r.stopReasons, reason)
+	select {
+	case <-r.shutdown:
+	default:
+		close(r.shutdown)
+	}
+}
+
+func (r *stubShutdownRuntime) WaitForShutdown() {
+	<-r.shutdown
+}
+
+type stubSignalNotifier struct {
+	ch         chan<- os.Signal
+	signals    []os.Signal
+	registered chan struct{}
+	stopCalls  int
+}
+
+func (n *stubSignalNotifier) Notify(ch chan<- os.Signal, sig ...os.Signal) {
+	n.ch = ch
+	n.signals = append([]os.Signal(nil), sig...)
+	if n.registered == nil {
+		n.registered = make(chan struct{})
+	}
+	close(n.registered)
+}
+
+func (n *stubSignalNotifier) Stop(chan<- os.Signal) {
+	n.stopCalls++
+}
+
+func (n *stubSignalNotifier) waitForRegistration(t *testing.T) []os.Signal {
+	t.Helper()
+
+	if n.registered == nil {
+		n.registered = make(chan struct{})
+	}
+
+	select {
+	case <-n.registered:
+		return append([]os.Signal(nil), n.signals...)
+	case <-time.After(time.Second):
+		t.Fatal("SignalNotifier.Notify() was not called")
+		return nil
+	}
+}
+
+func (n *stubSignalNotifier) emit(sig os.Signal) {
+	n.ch <- sig
 }
 
 type logCall struct {

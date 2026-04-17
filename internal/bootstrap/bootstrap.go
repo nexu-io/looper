@@ -5,12 +5,19 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/powerformer/looper/internal/config"
 )
 
-type Runtime interface{}
+type Runtime any
+
+type ShutdownRuntime interface {
+	Stop(reason string)
+	WaitForShutdown()
+}
 
 type RuntimeDependencies struct {
 	Config   config.Config
@@ -24,15 +31,22 @@ type CreateLoggerFunc func(config.LoggingConfig, string, LoggerOptions) (Logger,
 
 type StartRuntimeFunc func(context.Context, RuntimeDependencies) (Runtime, error)
 
+type SignalNotifier interface {
+	Notify(chan<- os.Signal, ...os.Signal)
+	Stop(chan<- os.Signal)
+}
+
 type Options struct {
-	Args         []string
-	Env          map[string]string
-	CWD          string
-	Stdout       io.Writer
-	Stderr       io.Writer
-	LoadConfig   LoadConfigFunc
-	CreateLogger CreateLoggerFunc
-	StartRuntime StartRuntimeFunc
+	Args            []string
+	Env             map[string]string
+	CWD             string
+	Stdout          io.Writer
+	Stderr          io.Writer
+	LoadConfig      LoadConfigFunc
+	CreateLogger    CreateLoggerFunc
+	StartRuntime    StartRuntimeFunc
+	WaitForShutdown bool
+	SignalNotifier  SignalNotifier
 }
 
 type Result struct {
@@ -100,7 +114,75 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 	}
 
 	result.Runtime = runtime
+
+	if options.WaitForShutdown {
+		shutdownRuntime, ok := runtime.(ShutdownRuntime)
+		if !ok {
+			return Result{}, fmt.Errorf("runtime does not support shutdown coordination")
+		}
+
+		waitForShutdownWithSignals(shutdownRuntime, logger, signalNotifierOrDefault(options.SignalNotifier))
+	}
+
 	return result, nil
+}
+
+type osSignalNotifier struct{}
+
+func (osSignalNotifier) Notify(ch chan<- os.Signal, sig ...os.Signal) {
+	signal.Notify(ch, sig...)
+}
+
+func (osSignalNotifier) Stop(ch chan<- os.Signal) {
+	signal.Stop(ch)
+}
+
+func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
+	if notifier != nil {
+		return notifier
+	}
+
+	return osSignalNotifier{}
+}
+
+func waitForShutdownWithSignals(runtime ShutdownRuntime, logger Logger, notifier SignalNotifier) {
+	signals := make(chan os.Signal, 1)
+	notifier.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer notifier.Stop(signals)
+
+	listenerStopped := make(chan struct{})
+	listenerDone := make(chan struct{})
+
+	go func() {
+		defer close(listenerDone)
+
+		select {
+		case sig := <-signals:
+			if sig == nil {
+				return
+			}
+
+			reason := signalReason(sig)
+			logger.Info("received shutdown signal", map[string]any{"signal": reason})
+			runtime.Stop(reason)
+		case <-listenerStopped:
+		}
+	}()
+
+	runtime.WaitForShutdown()
+	close(listenerStopped)
+	<-listenerDone
+}
+
+func signalReason(sig os.Signal) string {
+	switch sig {
+	case os.Interrupt:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	default:
+		return sig.String()
+	}
 }
 
 func ensureRuntimePaths(cfg config.Config) error {
