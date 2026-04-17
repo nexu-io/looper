@@ -31,6 +31,10 @@ func TestEmbeddedMigrationsMirrorTypeScriptSourceFiles(t *testing.T) {
 		}
 
 		wantCount++
+		if wantCount-1 >= len(EmbeddedMigrations) {
+			t.Fatalf("len(EmbeddedMigrations) = %d, want at least %d entries to mirror %q", len(EmbeddedMigrations), wantCount, entry.Name())
+		}
+
 		migration := EmbeddedMigrations[wantCount-1]
 		if migration.FileName != entry.Name() {
 			t.Fatalf("EmbeddedMigrations[%d].FileName = %q, want %q", wantCount-1, migration.FileName, entry.Name())
