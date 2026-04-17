@@ -1,0 +1,146 @@
+package bootstrap
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/powerformer/looper/internal/config"
+)
+
+func TestCreateLoggerWritesStructuredJSONAndRoutesStreams(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "logs")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	fixedTime := time.Date(2026, time.April, 17, 12, 34, 56, 789000000, time.FixedZone("PDT", -7*60*60))
+
+	logger, err := CreateLogger(config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5}, logDir, LoggerOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+		Now:    func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatalf("CreateLogger() error = %v", err)
+	}
+
+	logger.Debug("skipped", map[string]any{"debug": true})
+	logger.Info("started", map[string]any{"component": "bootstrap"})
+	logger.Warn("careful", nil)
+	logger.Error("failed", map[string]any{"attempt": float64(2)})
+
+	rawLog, err := os.ReadFile(LogFilePath(logDir))
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(rawLog)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("log lines = %d, want 3", len(lines))
+	}
+
+	entries := decodeEntries(t, lines)
+
+	assertEntry(t, entries[0], fixedTime, config.LogLevelInfo, "started", map[string]any{"component": "bootstrap"})
+	assertEntry(t, entries[1], fixedTime, config.LogLevelWarn, "careful", nil)
+	assertEntry(t, entries[2], fixedTime, config.LogLevelError, "failed", map[string]any{"attempt": float64(2)})
+
+	stdoutLines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(stdoutLines) != 1 {
+		t.Fatalf("stdout lines = %d, want 1", len(stdoutLines))
+	}
+	assertEntry(t, decodeEntries(t, stdoutLines)[0], fixedTime, config.LogLevelInfo, "started", map[string]any{"component": "bootstrap"})
+
+	stderrLines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(stderrLines) != 2 {
+		t.Fatalf("stderr lines = %d, want 2", len(stderrLines))
+	}
+	decodedStderr := decodeEntries(t, stderrLines)
+	assertEntry(t, decodedStderr[0], fixedTime, config.LogLevelWarn, "careful", nil)
+	assertEntry(t, decodedStderr[1], fixedTime, config.LogLevelError, "failed", map[string]any{"attempt": float64(2)})
+}
+
+func TestCreateLoggerCreatesLogDirectory(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "nested", "logs")
+
+	logger, err := CreateLogger(config.LoggingConfig{Level: config.LogLevelDebug, MaxSizeMB: 10, MaxFiles: 5}, logDir, LoggerOptions{})
+	if err != nil {
+		t.Fatalf("CreateLogger() error = %v", err)
+	}
+
+	logger.Info("created", nil)
+
+	if _, err := os.Stat(LogFilePath(logDir)); err != nil {
+		t.Fatalf("os.Stat() error = %v", err)
+	}
+	if _, err := os.Stat(logDir); err != nil {
+		t.Fatalf("os.Stat(logDir) error = %v", err)
+	}
+}
+
+func TestFormatLocalTimestampMatchesExpectedShape(t *testing.T) {
+	value := time.Date(2026, time.April, 17, 12, 34, 56, 789000000, time.FixedZone("IST", 5*60*60+30*60))
+
+	got := FormatLocalTimestamp(value)
+	const want = "2026-04-17T12:34:56.789+05:30"
+	if got != want {
+		t.Fatalf("FormatLocalTimestamp() = %q, want %q", got, want)
+	}
+}
+
+func decodeEntries(t *testing.T, lines []string) []map[string]any {
+	t.Helper()
+
+	entries := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("json.Unmarshal(%q) error = %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+func assertEntry(t *testing.T, entry map[string]any, wantTime time.Time, wantLevel config.LogLevel, wantMessage string, wantContext map[string]any) {
+	t.Helper()
+
+	if got := entry["ts"]; got != FormatLocalTimestamp(wantTime) {
+		t.Fatalf("entry[ts] = %#v, want %q", got, FormatLocalTimestamp(wantTime))
+	}
+
+	if got := entry["level"]; got != string(wantLevel) {
+		t.Fatalf("entry[level] = %#v, want %q", got, wantLevel)
+	}
+
+	if got := entry["message"]; got != wantMessage {
+		t.Fatalf("entry[message] = %#v, want %q", got, wantMessage)
+	}
+
+	contextValue, hasContext := entry["context"]
+	if wantContext == nil {
+		if hasContext {
+			t.Fatalf("entry[context] = %#v, want omitted", contextValue)
+		}
+		return
+	}
+
+	gotContext, ok := contextValue.(map[string]any)
+	if !ok {
+		t.Fatalf("entry[context] = %#v, want object", contextValue)
+	}
+
+	if len(gotContext) != len(wantContext) {
+		t.Fatalf("len(entry[context]) = %d, want %d", len(gotContext), len(wantContext))
+	}
+
+	for key, wantValue := range wantContext {
+		if gotValue := gotContext[key]; gotValue != wantValue {
+			t.Fatalf("entry[context][%q] = %#v, want %#v", key, gotValue, wantValue)
+		}
+	}
+}
