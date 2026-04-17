@@ -69,4 +69,8 @@ jobs:
         run: go test ./...
 
       - name: Build
-        run: go build ./...
+        env:
+          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
+        run: |
+          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -ldflags "$(go run ./tools/go-build-flags)" ./...
