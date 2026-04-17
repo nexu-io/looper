@@ -81,6 +81,115 @@ func TestCreateLoggerCreatesLogDirectory(t *testing.T) {
 	}
 }
 
+func TestCreateLoggerRotatesBySizeAndRetainsMaxFiles(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "logs")
+	logger, err := CreateLogger(config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 1, MaxFiles: 2}, logDir, LoggerOptions{})
+	if err != nil {
+		t.Fatalf("CreateLogger() error = %v", err)
+	}
+
+	message1 := strings.Repeat("a", 700_000)
+	message2 := strings.Repeat("b", 700_000)
+	message3 := strings.Repeat("c", 700_000)
+
+	logger.Info(message1, nil)
+	logger.Info(message2, nil)
+	logger.Info(message3, nil)
+
+	activeLog, err := os.ReadFile(LogFilePath(logDir))
+	if err != nil {
+		t.Fatalf("os.ReadFile(active) error = %v", err)
+	}
+	if !strings.Contains(string(activeLog), message3) {
+		t.Fatalf("active log does not contain newest message")
+	}
+	if strings.Contains(string(activeLog), message2) || strings.Contains(string(activeLog), message1) {
+		t.Fatalf("active log retained rotated messages")
+	}
+
+	rotatedPath := LogFilePath(logDir) + ".1"
+	rotatedLog, err := os.ReadFile(rotatedPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(rotated) error = %v", err)
+	}
+	if !strings.Contains(string(rotatedLog), message2) {
+		t.Fatalf("rotated log does not contain previous message")
+	}
+	if strings.Contains(string(rotatedLog), message1) {
+		t.Fatalf("rotated log retained expired message")
+	}
+
+	if _, err := os.Stat(LogFilePath(logDir) + ".2"); !os.IsNotExist(err) {
+		t.Fatalf("expected no second archive, got err = %v", err)
+	}
+}
+
+func TestCreateLoggerRotationWithSingleRetainedFileDropsArchives(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "logs")
+	logger, err := CreateLogger(config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 1, MaxFiles: 1}, logDir, LoggerOptions{})
+	if err != nil {
+		t.Fatalf("CreateLogger() error = %v", err)
+	}
+
+	message1 := strings.Repeat("x", 700_000)
+	message2 := strings.Repeat("y", 700_000)
+
+	logger.Info(message1, nil)
+	logger.Info(message2, nil)
+
+	activeLog, err := os.ReadFile(LogFilePath(logDir))
+	if err != nil {
+		t.Fatalf("os.ReadFile(active) error = %v", err)
+	}
+	if !strings.Contains(string(activeLog), message2) {
+		t.Fatalf("active log does not contain newest message")
+	}
+	if strings.Contains(string(activeLog), message1) {
+		t.Fatalf("active log retained expired message")
+	}
+
+	if _, err := os.Stat(LogFilePath(logDir) + ".1"); !os.IsNotExist(err) {
+		t.Fatalf("expected no archive files, got err = %v", err)
+	}
+}
+
+func TestCreateLoggerRotatesArchiveChainAndCleansStaleFiles(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	staleArchivePath := LogFilePath(logDir) + ".3"
+	if err := os.WriteFile(staleArchivePath, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(stale archive) error = %v", err)
+	}
+
+	logger, err := CreateLogger(config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 1, MaxFiles: 3}, logDir, LoggerOptions{})
+	if err != nil {
+		t.Fatalf("CreateLogger() error = %v", err)
+	}
+
+	message1 := strings.Repeat("m", 700_000)
+	message2 := strings.Repeat("n", 700_000)
+	message3 := strings.Repeat("o", 700_000)
+	message4 := strings.Repeat("p", 700_000)
+
+	logger.Info(message1, nil)
+	logger.Info(message2, nil)
+	logger.Info(message3, nil)
+	logger.Info(message4, nil)
+
+	assertFileContains(t, LogFilePath(logDir), message4)
+	assertFileContains(t, LogFilePath(logDir)+".1", message3)
+	assertFileContains(t, LogFilePath(logDir)+".2", message2)
+
+	if _, err := os.Stat(staleArchivePath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale archive to be removed, got err = %v", err)
+	}
+	if _, err := os.Stat(LogFilePath(logDir) + ".4"); !os.IsNotExist(err) {
+		t.Fatalf("expected no archive beyond retention, got err = %v", err)
+	}
+}
+
 func TestFormatLocalTimestampMatchesExpectedShape(t *testing.T) {
 	value := time.Date(2026, time.April, 17, 12, 34, 56, 789000000, time.FixedZone("IST", 5*60*60+30*60))
 
@@ -142,5 +251,17 @@ func assertEntry(t *testing.T, entry map[string]any, wantTime time.Time, wantLev
 		if gotValue := gotContext[key]; gotValue != wantValue {
 			t.Fatalf("entry[context][%q] = %#v, want %#v", key, gotValue, wantValue)
 		}
+	}
+}
+
+func assertFileContains(t *testing.T, path string, want string) {
+	t.Helper()
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+	}
+	if !strings.Contains(string(content), want) {
+		t.Fatalf("%s does not contain expected content", path)
 	}
 }

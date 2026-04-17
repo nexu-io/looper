@@ -177,7 +177,9 @@ Default storage paths:
 
 - `level`: one of `debug`, `info`, `warn`, `error`
 - `maxSizeMB`: positive integer log rotation size
-- `maxFiles`: positive integer retained file count
+- `maxFiles`: positive integer retained file count, including the active `looperd.log`
+
+When `looperd.log` would exceed `maxSizeMB`, `looperd` rotates it to `looperd.log.1`, shifts older archives to `.2`, `.3`, and so on, and keeps at most `maxFiles` total log files.
 
 ### `notifications`
 
