@@ -227,6 +227,111 @@ func TestMigrationRunnerSkipsBackupWhenNoPendingMigrationsRemain(t *testing.T) {
 	}
 }
 
+func TestMigrationRunnerBackupCopiesExistingDatabaseState(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	dbPath := filepath.Join(rootDir, "looper.sqlite")
+	backupDir := filepath.Join(rootDir, "backups")
+	db, err := OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	if _, err := db.Exec(`CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
+		t.Fatalf("db.Exec(CREATE TABLE widgets) error = %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO widgets (id, name) VALUES (?, ?)`, "w_1", "alpha"); err != nil {
+		t.Fatalf("db.Exec(INSERT widgets) error = %v", err)
+	}
+
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		BackupDir: backupDir,
+		Now:       func() time.Time { return time.Date(2026, time.April, 11, 10, 20, 30, 0, time.UTC) },
+	})
+
+	backupPath, err := runner.Backup(context.Background())
+	if err != nil {
+		t.Fatalf("runner.Backup() error = %v", err)
+	}
+
+	wantBackupPath := filepath.Join(backupDir, "looper-2026-04-11T10-20-30.000Z.sqlite")
+	if backupPath != wantBackupPath {
+		t.Fatalf("runner.Backup() path = %q, want %q", backupPath, wantBackupPath)
+	}
+
+	backupDB, err := OpenSQLiteDB(context.Background(), backupPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(backup) error = %v", err)
+	}
+	defer backupDB.Close()
+
+	var widgetName string
+	if err := backupDB.QueryRow(`SELECT name FROM widgets WHERE id = ?`, "w_1").Scan(&widgetName); err != nil {
+		t.Fatalf("backupDB.QueryRow(widgets).Scan() error = %v", err)
+	}
+	if widgetName != "alpha" {
+		t.Fatalf("backup widgets name = %q, want %q", widgetName, "alpha")
+	}
+}
+
+func TestMigrationRunnerBackupEscapesSingleQuotesInBackupPath(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	dbPath := filepath.Join(rootDir, "looper.sqlite")
+	backupDir := filepath.Join(rootDir, "backups'quoted")
+	db, err := OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	if _, err := db.Exec(`CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
+		t.Fatalf("db.Exec(CREATE TABLE widgets) error = %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO widgets (id, name) VALUES (?, ?)`, "w_1", "alpha"); err != nil {
+		t.Fatalf("db.Exec(INSERT widgets) error = %v", err)
+	}
+
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		BackupDir: backupDir,
+		Now:       func() time.Time { return time.Date(2026, time.April, 11, 10, 20, 30, 0, time.UTC) },
+	})
+
+	backupPath, err := runner.Backup(context.Background())
+	if err != nil {
+		t.Fatalf("runner.Backup() error = %v", err)
+	}
+
+	if !strings.Contains(backupPath, "backups'quoted") {
+		t.Fatalf("runner.Backup() path = %q, want path containing %q", backupPath, "backups'quoted")
+	}
+
+	backupDB, err := OpenSQLiteDB(context.Background(), backupPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(backup) error = %v", err)
+	}
+	defer backupDB.Close()
+
+	var widgetName string
+	if err := backupDB.QueryRow(`SELECT name FROM widgets WHERE id = ?`, "w_1").Scan(&widgetName); err != nil {
+		t.Fatalf("backupDB.QueryRow(widgets).Scan() error = %v", err)
+	}
+	if widgetName != "alpha" {
+		t.Fatalf("backup widgets name = %q, want %q", widgetName, "alpha")
+	}
+}
+
 func TestMigrationRunnerDoesNotRecordFailedMigration(t *testing.T) {
 	t.Parallel()
 
