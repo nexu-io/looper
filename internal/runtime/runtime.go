@@ -72,6 +72,7 @@ type Runtime struct {
 	shutdownCh    chan struct{}
 	schedulerStop chan struct{}
 	schedulerDone chan struct{}
+	schedulerWake chan struct{}
 }
 
 func New(options Options) *Runtime {
@@ -261,10 +262,10 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 
-	r.startSchedulerLoop()
 	if err := r.appendStartedEvent(context.Background(), startedAt); err != nil {
 		return err
 	}
+	r.startSchedulerLoop()
 
 	started = true
 
@@ -285,10 +286,12 @@ func (r *Runtime) startSchedulerLoop() {
 	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
+	wakeCh := make(chan struct{}, 1)
 
 	r.mu.Lock()
 	r.schedulerStop = stopCh
 	r.schedulerDone = doneCh
+	r.schedulerWake = wakeCh
 	r.mu.Unlock()
 
 	go func() {
@@ -296,8 +299,14 @@ func (r *Runtime) startSchedulerLoop() {
 
 		r.executeSchedulerTick(context.Background())
 		if pollInterval <= 0 {
-			<-stopCh
-			return
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-wakeCh:
+					r.executeSchedulerTick(context.Background())
+				}
+			}
 		}
 
 		ticker := time.NewTicker(pollInterval)
@@ -307,6 +316,8 @@ func (r *Runtime) startSchedulerLoop() {
 			select {
 			case <-stopCh:
 				return
+			case <-wakeCh:
+				r.executeSchedulerTick(context.Background())
 			case <-ticker.C:
 				r.executeSchedulerTick(context.Background())
 			}
@@ -320,6 +331,7 @@ func (r *Runtime) stopSchedulerLoop() {
 	doneCh := r.schedulerDone
 	r.schedulerStop = nil
 	r.schedulerDone = nil
+	r.schedulerWake = nil
 	r.mu.Unlock()
 
 	if stopCh == nil || doneCh == nil {
@@ -328,6 +340,25 @@ func (r *Runtime) stopSchedulerLoop() {
 
 	close(stopCh)
 	<-doneCh
+}
+
+func (r *Runtime) TriggerSchedulerTick() {
+	r.mu.RLock()
+	if r.stopped {
+		r.mu.RUnlock()
+		return
+	}
+	wakeCh := r.schedulerWake
+	r.mu.RUnlock()
+
+	if wakeCh == nil {
+		return
+	}
+
+	select {
+	case wakeCh <- struct{}{}:
+	default:
+	}
 }
 
 func (r *Runtime) executeSchedulerTick(ctx context.Context) {
@@ -378,6 +409,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	if err != nil {
 		return RecoverySummary{}, err
 	}
+	requeuedLoopIDs := make(map[string]struct{})
 	for _, loop := range loops {
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -427,6 +459,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 				return RecoverySummary{}, err
 			}
+			requeuedLoopIDs[loop.ID] = struct{}{}
 			recoveredQueueItems, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO)
 			if err != nil {
 				return RecoverySummary{}, err
@@ -467,6 +500,9 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 
 	for _, loop := range loops {
 		if loop.Status != "queued" {
+			continue
+		}
+		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
 			continue
 		}
 		if _, exists := queuedLoopIDs[loop.ID]; exists {

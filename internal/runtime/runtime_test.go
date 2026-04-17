@@ -348,6 +348,7 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	seedLoopWithRun(t, seedRepos, projectID, "loop_success", 1, "queued", "success", nowISO)
 	seedLoopWithRun(t, seedRepos, projectID, "loop_failed", 2, "queued", "failed", nowISO)
 	seedLoopWithRun(t, seedRepos, projectID, "loop_legit", 3, "queued", "success", nowISO)
+	seedLoopWithRun(t, seedRepos, projectID, "loop_requeued", 4, "queued", "interrupted", nowISO)
 	if err := seedRepos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
 		ID:          "queue_legit",
 		ProjectID:   &projectID,
@@ -386,6 +387,7 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	assertLoopStatus(t, services.Repositories, "loop_success", "completed")
 	assertLoopStatus(t, services.Repositories, "loop_failed", "failed")
 	assertLoopStatus(t, services.Repositories, "loop_legit", "queued")
+	assertLoopStatus(t, services.Repositories, "loop_requeued", "queued")
 
 	successEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_success")
 	if err != nil {
@@ -400,6 +402,16 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	}
 	if containsEventType(legitEvents, "looperd.recovery.loop_queue_normalized") {
 		t.Fatalf("loop_legit events = %#v, want no normalization event", legitEvents)
+	}
+	requeuedEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_requeued")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_requeued) error = %v", err)
+	}
+	if !containsEventType(requeuedEvents, "looperd.recovery.loop_requeued") {
+		t.Fatalf("loop_requeued events = %#v, want requeue event", requeuedEvents)
+	}
+	if containsEventType(requeuedEvents, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("loop_requeued events = %#v, want no normalization event", requeuedEvents)
 	}
 }
 
@@ -434,6 +446,106 @@ func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
 	})
 	if got := atomic.LoadInt32(&tickCount); got < 2 {
 		t.Fatalf("scheduler tick count = %d, want immediate tick plus polling tick", got)
+	}
+}
+
+func TestRuntimeTriggerSchedulerTickRunsImmediatelyWithoutWaitingForPolling(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Scheduler.PollIntervalSeconds = 3600
+	var tickCount int32
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error {
+			atomic.AddInt32(&tickCount, 1)
+			return nil
+		},
+	})
+
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&tickCount) >= 1
+	})
+
+	rt.TriggerSchedulerTick()
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&tickCount) >= 2
+	})
+	if got := atomic.LoadInt32(&tickCount); got < 2 {
+		t.Fatalf("scheduler tick count = %d, want immediate startup tick plus triggered tick", got)
+	}
+}
+
+func TestRuntimeTriggerSchedulerTickCoalescesWhileTickIsRunning(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Scheduler.PollIntervalSeconds = 3600
+	startCh := make(chan struct{}, 4)
+	releaseCh := make(chan struct{})
+	var tickCount int32
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error {
+			atomic.AddInt32(&tickCount, 1)
+			startCh <- struct{}{}
+			<-releaseCh
+			return nil
+		},
+	})
+
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseCh) })
+		rt.Stop("test cleanup")
+	})
+
+	select {
+	case <-startCh:
+	case <-time.After(time.Second):
+		t.Fatal("initial scheduler tick did not start")
+	}
+
+	rt.TriggerSchedulerTick()
+	rt.TriggerSchedulerTick()
+	releaseOnce.Do(func() { close(releaseCh) })
+
+	select {
+	case <-startCh:
+	case <-time.After(time.Second):
+		t.Fatal("triggered scheduler tick did not start after in-flight tick completed")
+	}
+
+	select {
+	case <-startCh:
+		t.Fatal("unexpected extra scheduler tick after coalesced trigger")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if got := atomic.LoadInt32(&tickCount); got != 2 {
+		t.Fatalf("scheduler tick count = %d, want coalesced triggered rerun", got)
 	}
 }
 
