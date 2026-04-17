@@ -1,0 +1,73 @@
+package config
+
+import "os/exec"
+
+type LookPathFunc func(string) (string, error)
+
+type ToolDetectionResult struct {
+	Paths     ToolPathsConfig
+	Detection map[string]ToolDetectionStatus
+}
+
+func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDetectionResult {
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+
+	paths := ToolPathsConfig{
+		BunPath:       cloneStringPtr(configured.BunPath),
+		GitPath:       cloneStringPtr(configured.GitPath),
+		GHPath:        cloneStringPtr(configured.GHPath),
+		OsascriptPath: cloneStringPtr(configured.OsascriptPath),
+	}
+
+	detection := map[string]ToolDetectionStatus{
+		"bunPath":       toolDetectionStatusFor(paths.BunPath),
+		"gitPath":       toolDetectionStatusFor(paths.GitPath),
+		"ghPath":        toolDetectionStatusFor(paths.GHPath),
+		"osascriptPath": toolDetectionStatusFor(paths.OsascriptPath),
+	}
+
+	candidates := []struct {
+		key        string
+		executable string
+		target     **string
+	}{
+		{key: "bunPath", executable: "bun", target: &paths.BunPath},
+		{key: "gitPath", executable: "git", target: &paths.GitPath},
+		{key: "ghPath", executable: "gh", target: &paths.GHPath},
+		{key: "osascriptPath", executable: "osascript", target: &paths.OsascriptPath},
+	}
+
+	for _, candidate := range candidates {
+		if *candidate.target != nil {
+			continue
+		}
+
+		resolvedPath, err := lookPath(candidate.executable)
+		if err != nil || resolvedPath == "" {
+			continue
+		}
+
+		*candidate.target = stringPtr(resolvedPath)
+		detection[candidate.key] = ToolDetectionStatusDetected
+	}
+
+	return ToolDetectionResult{Paths: paths, Detection: detection}
+}
+
+func toolDetectionStatusFor(path *string) ToolDetectionStatus {
+	if path == nil || *path == "" {
+		return ToolDetectionStatusMissing
+	}
+
+	return ToolDetectionStatusConfigured
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+
+	return stringPtr(*value)
+}

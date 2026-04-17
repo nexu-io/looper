@@ -15,7 +15,11 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "missing.json")
 
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookPath:   fakeLookPath(map[string]string{"bun": "/detected/bun", "git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -38,6 +42,14 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 
 	if loaded.Partial.Server != nil {
 		t.Fatalf("LoadFile().Partial.Server = %#v, want nil", loaded.Partial.Server)
+	}
+
+	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/detected/bun" {
+		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/detected/bun")
+	}
+
+	if got := loaded.Metadata.ToolDetection["bunPath"]; got != ToolDetectionStatusDetected {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
 	}
 }
 
@@ -101,7 +113,10 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 }
 
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
-	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir()})
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:      t.TempDir(),
+		LookPath: fakeLookPath(map[string]string{"bun": "/detected/bun", "git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -113,6 +128,103 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 
 	if loaded.Metadata.ConfigPath != defaultConfigPath {
 		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+	}
+}
+
+func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+
+	contents := `{
+		"tools": {"gitPath": "/file/git"}
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_GH_PATH": "/env/gh",
+		}),
+		LookPath: fakeLookPath(map[string]string{
+			"bun":       "/detected/bun",
+			"osascript": "/detected/osascript",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/detected/bun" {
+		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/detected/bun")
+	}
+
+	if loaded.Config.Tools.GitPath == nil || *loaded.Config.Tools.GitPath != "/file/git" {
+		t.Fatalf("LoadFile().Config.Tools.GitPath = %v, want %q", loaded.Config.Tools.GitPath, "/file/git")
+	}
+
+	if loaded.Config.Tools.GHPath == nil || *loaded.Config.Tools.GHPath != "/env/gh" {
+		t.Fatalf("LoadFile().Config.Tools.GHPath = %v, want %q", loaded.Config.Tools.GHPath, "/env/gh")
+	}
+
+	if loaded.Config.Tools.OsascriptPath == nil || *loaded.Config.Tools.OsascriptPath != "/detected/osascript" {
+		t.Fatalf("LoadFile().Config.Tools.OsascriptPath = %v, want %q", loaded.Config.Tools.OsascriptPath, "/detected/osascript")
+	}
+
+	if got := loaded.Metadata.ToolDetection["bunPath"]; got != ToolDetectionStatusDetected {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
+	}
+
+	if got := loaded.Metadata.ToolDetection["gitPath"]; got != ToolDetectionStatusConfigured {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[gitPath] = %q, want %q", got, ToolDetectionStatusConfigured)
+	}
+
+	if got := loaded.Metadata.ToolDetection["ghPath"]; got != ToolDetectionStatusConfigured {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[ghPath] = %q, want %q", got, ToolDetectionStatusConfigured)
+	}
+
+	if got := loaded.Metadata.ToolDetection["osascriptPath"]; got != ToolDetectionStatusDetected {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[osascriptPath] = %q, want %q", got, ToolDetectionStatusDetected)
+	}
+}
+
+func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
+	configuredGitPath := "/configured/git"
+
+	result := DetectToolPaths(ToolPathsConfig{
+		GitPath: &configuredGitPath,
+	}, fakeLookPath(map[string]string{
+		"bun": "/detected/bun",
+	}))
+
+	if result.Paths.BunPath == nil || *result.Paths.BunPath != "/detected/bun" {
+		t.Fatalf("DetectToolPaths().Paths.BunPath = %v, want %q", result.Paths.BunPath, "/detected/bun")
+	}
+
+	if result.Paths.GitPath == nil || *result.Paths.GitPath != configuredGitPath {
+		t.Fatalf("DetectToolPaths().Paths.GitPath = %v, want %q", result.Paths.GitPath, configuredGitPath)
+	}
+
+	if result.Paths.GHPath != nil {
+		t.Fatalf("DetectToolPaths().Paths.GHPath = %v, want nil", result.Paths.GHPath)
+	}
+
+	if got := result.Detection["bunPath"]; got != ToolDetectionStatusDetected {
+		t.Fatalf("DetectToolPaths().Detection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
+	}
+
+	if got := result.Detection["gitPath"]; got != ToolDetectionStatusConfigured {
+		t.Fatalf("DetectToolPaths().Detection[gitPath] = %q, want %q", got, ToolDetectionStatusConfigured)
+	}
+
+	if got := result.Detection["ghPath"]; got != ToolDetectionStatusMissing {
+		t.Fatalf("DetectToolPaths().Detection[ghPath] = %q, want %q", got, ToolDetectionStatusMissing)
+	}
+
+	if got := result.Detection["osascriptPath"]; got != ToolDetectionStatusMissing {
+		t.Fatalf("DetectToolPaths().Detection[osascriptPath] = %q, want %q", got, ToolDetectionStatusMissing)
 	}
 }
 
@@ -892,6 +1004,17 @@ func mapEnvLookup(values map[string]string) EnvLookupFunc {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
+	}
+}
+
+func fakeLookPath(values map[string]string) LookPathFunc {
+	return func(name string) (string, error) {
+		value, ok := values[name]
+		if !ok {
+			return "", errors.New("not found")
+		}
+
+		return value, nil
 	}
 }
 

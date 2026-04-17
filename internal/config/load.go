@@ -14,6 +14,7 @@ type EnvLookupFunc func(string) (string, bool)
 type LoadFileMetadata struct {
 	ConfigPath        string
 	ConfigFilePresent bool
+	ToolDetection     map[string]ToolDetectionStatus
 }
 
 type LoadedFileConfig struct {
@@ -28,6 +29,7 @@ type LoadFileOptions struct {
 	DefaultConfigPath string
 	Args              []string
 	LookupEnv         EnvLookupFunc
+	LookPath          LookPathFunc
 }
 
 type parsedCLIArgs struct {
@@ -94,14 +96,21 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
+	toolDetection := DetectToolPaths(config.Tools, options.LookPath)
+	config.Tools = toolDetection.Paths
+
 	if err := Validate(config); err != nil {
 		return LoadedFileConfig{}, err
 	}
 
 	return LoadedFileConfig{
-		Config:   config,
-		Partial:  partialConfig,
-		Metadata: LoadFileMetadata{ConfigPath: resolvedConfigPath, ConfigFilePresent: present},
+		Config:  config,
+		Partial: partialConfig,
+		Metadata: LoadFileMetadata{
+			ConfigPath:        resolvedConfigPath,
+			ConfigFilePresent: present,
+			ToolDetection:     toolDetection.Detection,
+		},
 	}, nil
 }
 

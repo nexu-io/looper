@@ -99,6 +99,14 @@ type ToolPathsConfig struct {
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 }
 
+type ToolDetectionStatus string
+
+const (
+	ToolDetectionStatusConfigured ToolDetectionStatus = "configured"
+	ToolDetectionStatusDetected   ToolDetectionStatus = "detected"
+	ToolDetectionStatusMissing    ToolDetectionStatus = "missing"
+)
+
 type DaemonConfig struct {
 	Mode             DaemonMode        `json:"mode"`
 	PlistPath        *string           `json:"plistPath,omitempty"`
