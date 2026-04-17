@@ -299,6 +299,8 @@ Recommendation:
 
 > Use a single `go.mod` at the repo root unless a later constraint proves multi-module is necessary.
 
+Status: confirmed for the current port scaffold. The repository now uses the root `go.mod`, and no nested `go.mod` or `go.work` files are present.
+
 Rules:
 
 1. Keep most implementation in `internal/`.

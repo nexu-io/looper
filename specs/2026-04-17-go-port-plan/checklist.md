@@ -22,7 +22,7 @@
 ## Phase 1 - Establish Go project scaffolding
 
 - [ ] Add `go.mod`
-- [ ] Use a single root Go module unless a blocker is found
+- [x] Use a single root Go module unless a blocker is found
 - [ ] Add `cmd/looper`
 - [ ] Add `cmd/looperd`
 - [ ] Add initial `internal/` package layout
