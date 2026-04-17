@@ -8,6 +8,8 @@ Source of truth inspected from:
 
 - All `/api/v1/*` requests are dispatched from `createLooperdApi()` in `apps/looperd/src/server/index.ts:94-210`.
 - Machine-verifiable compatibility artifact: `specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json`.
+- Machine-verifiable JSON request-body fixtures: `specs/2026-04-17-go-port-plan/artifacts/daemon-http.requests.compat.json`.
+- Machine-verifiable JSON success-response fixtures: `specs/2026-04-17-go-port-plan/artifacts/daemon-http.responses.compat.json`.
 - Every `/api/v1/*` request passes through `authorizeRequest()` before route dispatch (`apps/looperd/src/server/index.ts:101`, `apps/looperd/src/server/index.ts:266-285`).
 - Auth behavior:
   - when `config.server.authMode !== "local-token"`, requests are accepted without auth

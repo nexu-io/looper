@@ -23,6 +23,11 @@ const DAEMON_HTTP_RESPONSE_ARTIFACT_PATH = new URL(
   import.meta.url,
 );
 
+const DAEMON_HTTP_REQUEST_ARTIFACT_PATH = new URL(
+  "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.requests.compat.json",
+  import.meta.url,
+);
+
 const DAEMON_HTTP_ERROR_ARTIFACT_PATH = new URL(
   "../../../../specs/2026-04-17-go-port-plan/artifacts/daemon-http.errors.compat.json",
   import.meta.url,
@@ -70,6 +75,18 @@ interface DaemonHttpResponseArtifact {
   }>;
 }
 
+interface DaemonHttpRequestArtifact {
+  routes: Array<{
+    id: string;
+    method: string;
+    path: string;
+    request: {
+      headers?: Record<string, string>;
+      body?: Record<string, unknown>;
+    };
+  }>;
+}
+
 interface DaemonHttpErrorArtifact {
   sharedBehavior: {
     responseHeaders: Record<string, string>;
@@ -109,6 +126,12 @@ async function loadDaemonHttpResponseArtifact() {
   return (await Bun.file(
     DAEMON_HTTP_RESPONSE_ARTIFACT_PATH,
   ).json()) as DaemonHttpResponseArtifact;
+}
+
+async function loadDaemonHttpRequestArtifact() {
+  return (await Bun.file(
+    DAEMON_HTTP_REQUEST_ARTIFACT_PATH,
+  ).json()) as DaemonHttpRequestArtifact;
 }
 
 async function loadDaemonHttpErrorArtifact() {
@@ -2655,5 +2678,37 @@ describe("createLooperdApi", () => {
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("matches the machine-verifiable daemon HTTP request body fixtures", async () => {
+    const contract = await loadDaemonHttpContractArtifact();
+    const requestArtifact = await loadDaemonHttpRequestArtifact();
+    const contractRoutesWithJsonBodies = contract.routes.filter(
+      (route) => route.request?.body,
+    );
+
+    expect(requestArtifact.routes.map((route) => route.id)).toEqual(
+      contractRoutesWithJsonBodies.map((route) => route.id),
+    );
+
+    for (const route of requestArtifact.routes) {
+      const contractRoute = contract.routes.find(
+        (candidate) => candidate.id === route.id,
+      );
+
+      expect(contractRoute, route.id).toBeDefined();
+      if (!contractRoute) {
+        continue;
+      }
+
+      expect(contractRoute.request, route.id).toBeDefined();
+      if (!contractRoute.request) {
+        continue;
+      }
+
+      expect(route.method, route.id).toBe(contractRoute.method);
+      expect(route.path, route.id).toBe(contractRoute.path);
+      expect(route.request, route.id).toEqual(contractRoute.request);
+    }
   });
 });

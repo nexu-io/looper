@@ -1,0 +1,76 @@
+{
+  "artifactVersion": 1,
+  "generatedFrom": [
+    "apps/looperd/src/server/index.ts",
+    "apps/looperd/src/server/index.test.ts",
+    "specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json"
+  ],
+  "notes": [
+    "This artifact freezes the current /api/v1 JSON request body shapes for routes that accept application/json.",
+    "The fixtures use representative valid payloads; field presence, names, and JSON types are part of the compatibility boundary."
+  ],
+  "routes": [
+    {
+      "id": "loops.create",
+      "method": "POST",
+      "path": "/api/v1/loops",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "type": "worker",
+          "targetType": "project",
+          "targetId": "project_1"
+        }
+      }
+    },
+    {
+      "id": "workers.create",
+      "method": "POST",
+      "path": "/api/v1/workers",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "title": "Wire runtime",
+          "prompt": "Wire runtime",
+          "repo": "acme/looper",
+          "baseBranch": "main"
+        }
+      }
+    },
+    {
+      "id": "planners.create",
+      "method": "POST",
+      "path": "/api/v1/planners",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "projectId": "project_1",
+          "issueNumber": 77
+        }
+      }
+    },
+    {
+      "id": "projects.create",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "repoPath": "/tmp/repos/looper",
+          "id": "looper",
+          "name": "Looper"
+        }
+      }
+    }
+  ]
+}

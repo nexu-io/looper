@@ -8,7 +8,8 @@
   "notes": [
     "This artifact freezes the current /api/v1 HTTP compatibility boundary for the Go port.",
     "It covers route paths, methods, success statuses, shared response headers, request-id propagation, and local-token auth behavior.",
-    "Request and response JSON field shapes are intentionally left to a separate artifact task."
+    "JSON request body shapes are frozen in daemon-http.requests.compat.json.",
+    "JSON success-envelope response shapes are frozen in daemon-http.responses.compat.json."
   ],
   "basePath": "/api/v1",
   "sharedBehavior": {
