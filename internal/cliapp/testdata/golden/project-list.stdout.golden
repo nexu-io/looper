@@ -1,0 +1,4 @@
+id         name    repoPath   baseBranch  repo         updatedAt               
+---------  ------  ---------  ----------  -----------  ------------------------
+project_1  Looper  /tmp/repo  main        acme/looper  2026-04-20T10:00:00.000Z
+project_2  CLI     /tmp/cli   develop     -            2026-04-20T11:30:00.000Z

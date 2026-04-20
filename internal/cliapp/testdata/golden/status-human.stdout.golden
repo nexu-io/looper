@@ -1,0 +1,33 @@
+Service
+  healthy    : yes
+  version    : 1.2.3
+  daemonMode : full
+  startedAt  : 2026-04-20T10:00:00.000Z
+
+Storage
+  dbPath            : /tmp/looper.sqlite
+  schemaVersion     : 12
+  healthy           : yes
+  pendingMigrations : none
+
+Scheduler
+  healthy      : yes
+  queuedItems  : 2
+  runningItems : 1
+
+type      running  paused  failed
+--------  -------  ------  ------
+planner   0        1       0     
+reviewer  1        0       0     
+worker    2        0       1     
+fixer     0        0       0     
+
+Tools
+  bun       : yes
+  git       : yes
+  gh        : no
+  osascript : yes
+
+Notifications
+  inAppEnabled     : yes
+  osascriptEnabled : no

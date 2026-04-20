@@ -1,0 +1,9 @@
+Upgrade check
+  cliCurrent            : 0.2.1
+  cliLatest             : 0.2.1
+  cliUpdateAvailable    : no
+  daemonCurrent         : 0.2.1
+  daemonLatest          : 0.3.0
+  daemonUpdateAvailable : yes
+  daemonSource          : installed-binary
+  daemonBinaryPath      : __HOME__/.looper/bin/looperd

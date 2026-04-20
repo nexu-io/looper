@@ -1,0 +1,32 @@
+Usage:
+  looper [flags]
+
+Subcommands:
+  status   Show service status
+  project  Project commands
+  config   Config commands
+  daemon   Daemon commands
+  upgrade  Check or upgrade Looper installations
+  loop     Loop commands
+  work     Create a worker run
+  plan     Create a planner run
+  pr       Pull request commands
+  review   Create a reviewer task for a pull request
+  ps       Show running loops
+  jump     Print shell command for a loop worktree
+  logs     Show logs for a loop
+  stop     Stop an active loop
+  run      Run commands
+
+Flags:
+  --bun-path <path>           Bun binary path
+  --config <path>             Config path
+  --daemon-mode <mode>        Daemon mode
+  --db-path <path>            Database path
+  --gh-path <path>            GitHub CLI path
+  --git-path <path>           Git binary path
+  --host <host>               Server host
+  --json                      Emit JSON output
+  --log-dir <path>            Daemon log directory
+  --osascript-path <path>     osascript binary path
+  --port <port>               Server port
