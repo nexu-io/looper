@@ -660,6 +660,367 @@ func TestHandlerLoopStartRejectsFixerWithoutAgentConfigured(t *testing.T) {
 	assertEqual(t, errorMap["message"], "Cannot start fixer loop without config.agent.vendor")
 }
 
+func TestHandlerWorkerAndPlannerRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
+	routes := loadResponseArtifact(t)
+	requestArtifact := loadRequestArtifact(t)
+
+	fixture := newTestFixture(t)
+	seedLoopRouteData(t, fixture.runtime)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+
+	bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(marshalArtifactRequestBody(t, requestArtifact, "loops.create"))))
+	bootstrapReq.Header.Set("content-type", "application/json")
+	bootstrapRecorder := httptest.NewRecorder()
+	h.ServeHTTP(bootstrapRecorder, bootstrapReq)
+	if bootstrapRecorder.Code != http.StatusOK {
+		t.Fatalf("bootstrap loops.create status = %d, want 200", bootstrapRecorder.Code)
+	}
+
+	workerReq := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(marshalArtifactRequestBody(t, requestArtifact, "workers.create"))))
+	workerReq.Header.Set("x-request-id", "fixture-request-id")
+	workerReq.Header.Set("content-type", "application/json")
+	workerRecorder := httptest.NewRecorder()
+	h.ServeHTTP(workerRecorder, workerReq)
+	if workerRecorder.Code != http.StatusOK {
+		t.Fatalf("workers.create status = %d, want 200", workerRecorder.Code)
+	}
+	workerActual := normalizeResponseValue(parseJSONValue(t, workerRecorder.Body.Bytes()), fixture.rootDir)
+	workerWant := findResponseArtifactRoute(t, routes, "workers.create")
+	if !responseFixtureMatches(workerActual, workerWant.Body) {
+		actualJSON, _ := json.MarshalIndent(workerActual, "", "  ")
+		wantJSON, _ := json.MarshalIndent(workerWant.Body, "", "  ")
+		t.Fatalf("workers.create normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
+	}
+
+	plannerReq := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(marshalArtifactRequestBody(t, requestArtifact, "planners.create"))))
+	plannerReq.Header.Set("x-request-id", "fixture-request-id")
+	plannerReq.Header.Set("content-type", "application/json")
+	plannerRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plannerRecorder, plannerReq)
+	if plannerRecorder.Code != http.StatusOK {
+		t.Fatalf("planners.create status = %d, want 200", plannerRecorder.Code)
+	}
+	plannerActual := normalizeResponseValue(parseJSONValue(t, plannerRecorder.Body.Bytes()), fixture.rootDir)
+	plannerWant := findResponseArtifactRoute(t, routes, "planners.create")
+	if !responseFixtureMatches(plannerActual, plannerWant.Body) {
+		actualJSON, _ := json.MarshalIndent(plannerActual, "", "  ")
+		wantJSON, _ := json.MarshalIndent(plannerWant.Body, "", "  ")
+		t.Fatalf("planners.create normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
+	}
+}
+
+func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedLoopRouteData(t, fixture.runtime)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+	var artifact struct {
+		Cases []errorArtifactCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_1",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: fixture.now.UTC().Format(javaScriptISOString),
+		CreatedAt:  fixture.now.UTC().Format(javaScriptISOString),
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(prs_1) error = %v", err)
+	}
+
+	tests := []struct {
+		caseID string
+		cfg    config.Config
+		body   string
+		setup  func(*testing.T)
+	}{
+		{
+			caseID: "agent-not-configured",
+			cfg: func() config.Config {
+				cfg := fixture.config
+				cfg.Agent.Vendor = nil
+				return cfg
+			}(),
+			body: `{"projectId":"project_1","title":"Wire runtime","prompt":"Wire runtime","repo":"acme/looper","baseBranch":"main"}`,
+		},
+		{
+			caseID: "project-ambiguous",
+			cfg:    fixture.config,
+			body:   `{"repo":"acme/looper","prompt":"Wire runtime","baseBranch":"main"}`,
+			setup: func(t *testing.T) {
+				t.Helper()
+				nowISO := fixture.now.UTC().Format(javaScriptISOString)
+				metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+				baseBranch := "main"
+				if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+					ID:           "project_2",
+					Name:         "Looper 2",
+					RepoPath:     "/tmp/repos/looper-2",
+					BaseBranch:   &baseBranch,
+					Archived:     false,
+					MetadataJSON: &metadata,
+					CreatedAt:    nowISO,
+					UpdatedAt:    nowISO,
+				}); err != nil {
+					t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+				}
+			},
+		},
+		{
+			caseID: "pull-request-not-found",
+			cfg:    fixture.config,
+			body:   `{"projectId":"project_1","repo":"acme/looper","prNumber":999,"baseBranch":"main"}`,
+		},
+		{
+			caseID: "pull-request-project-mismatch",
+			cfg:    fixture.config,
+			body:   `{"projectId":"project_2","repo":"acme/looper","prNumber":42,"baseBranch":"main"}`,
+			setup: func(t *testing.T) {
+				t.Helper()
+				nowISO := fixture.now.UTC().Format(javaScriptISOString)
+				metadata := `{"repo":"other/repo","worktreeRoot":null,"source":"api"}`
+				baseBranch := "main"
+				if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+					ID:           "project_2",
+					Name:         "Mismatch",
+					RepoPath:     "/tmp/repos/mismatch",
+					BaseBranch:   &baseBranch,
+					Archived:     false,
+					MetadataJSON: &metadata,
+					CreatedAt:    nowISO,
+					UpdatedAt:    nowISO,
+				}); err != nil {
+					t.Fatalf("Projects.Upsert(project_2 mismatch) error = %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.caseID, func(t *testing.T) {
+			if tt.setup != nil {
+				tt.setup(t)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(tt.body)))
+			req.Header.Set("x-request-id", "error-request-id")
+			req.Header.Set("content-type", "application/json")
+			recorder := httptest.NewRecorder()
+			NewHandler(Context{Config: tt.cfg, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+			want := findArtifactCase(t, artifact.Cases, tt.caseID)
+			if recorder.Code != want.ExpectedStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errorMap := body["error"].(map[string]any)
+			assertEqual(t, errorMap["code"], want.Body.Error.Code)
+			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+		})
+	}
+}
+
+func TestHandlerWorkersCreateStoresUnwrappedQueuePayloadJSON(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","title":"Wire runtime","prompt":"Wire runtime","repo":"acme/looper","baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	responseBody := parseJSONMap(t, recorder.Body.Bytes())
+	loopID := responseBody["data"].(map[string]any)["id"].(string)
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var queueItem *storage.QueueItemRecord
+	for i := range queueItems {
+		if queueItems[i].LoopID != nil && *queueItems[i].LoopID == loopID {
+			queueItem = &queueItems[i]
+			break
+		}
+	}
+	if queueItem == nil || queueItem.PayloadJSON == nil {
+		t.Fatalf("worker queue payload missing for loop %s", loopID)
+	}
+	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
+	if _, ok := payload["worker"]; ok {
+		t.Fatalf("queue payload should be unwrapped: %#v", payload)
+	}
+	assertEqual(t, payload["title"], "Wire runtime")
+	assertEqual(t, payload["prompt"], "Wire runtime")
+	assertEqual(t, payload["specPath"], nil)
+	assertEqual(t, payload["repo"], "acme/looper")
+	assertEqual(t, payload["baseBranch"], "main")
+}
+
+func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_conflict_1",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: nowISO,
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(prs_conflict_1) error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_existing_worker",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "worker",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:42"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(42),
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_existing_planner",
+		Seq:        2,
+		ProjectID:  "project_1",
+		Type:       "planner",
+		TargetType: "issue",
+		TargetID:   stringPtr("issue:acme/looper:77"),
+		Repo:       stringPtr("acme/looper"),
+		Status:     "running",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_planner) error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+
+	workerReq := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","prNumber":42,"baseBranch":"main"}`)))
+	workerReq.Header.Set("x-request-id", "error-request-id")
+	workerReq.Header.Set("content-type", "application/json")
+	workerRecorder := httptest.NewRecorder()
+	h.ServeHTTP(workerRecorder, workerReq)
+	if workerRecorder.Code != http.StatusConflict {
+		t.Fatalf("worker status = %d, want 409", workerRecorder.Code)
+	}
+	workerBody := parseJSONMap(t, workerRecorder.Body.Bytes())
+	workerError := workerBody["error"].(map[string]any)
+	assertEqual(t, workerError["code"], "LOOP_CONFLICT")
+
+	plannerReq := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77}`)))
+	plannerReq.Header.Set("x-request-id", "error-request-id")
+	plannerReq.Header.Set("content-type", "application/json")
+	plannerRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plannerRecorder, plannerReq)
+	if plannerRecorder.Code != http.StatusConflict {
+		t.Fatalf("planner status = %d, want 409", plannerRecorder.Code)
+	}
+	plannerBody := parseJSONMap(t, plannerRecorder.Body.Bytes())
+	plannerError := plannerBody["error"].(map[string]any)
+	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
+}
+
+func TestHandlerWorkersCreateAllowsConcurrentProjectWorkers(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_existing_worker",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "worker",
+		TargetType: "project",
+		TargetID:   stringPtr("project:project_1"),
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","prompt":"Second worker","repo":"acme/looper","baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+}
+
+func TestHandlerWorkersCreateTriggersSchedulerTickHook(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		TriggerSchedulerTick: func() {
+			triggered++
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","prompt":"Wire runtime","repo":"acme/looper","baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerPlannersCreateChecksProjectBeforeIssueValidation(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"missing-project","issueNumber":0}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
+	assertEqual(t, errorMap["message"], "Project not found: missing-project")
+}
+
 func TestHandlerRunRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 
@@ -711,6 +1072,25 @@ func TestHandlerRunRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 				t.Fatalf("normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
 			}
 		})
+	}
+}
+
+func seedWorkerPlannerArtifactsData(t *testing.T, rt *looperdruntime.Runtime, now time.Time) {
+	t.Helper()
+	nowISO := now.UTC().Format(javaScriptISOString)
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := rt.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "project_1",
+		Name:         "Looper",
+		RepoPath:     "/tmp/repos/looper",
+		BaseBranch:   &baseBranch,
+		Archived:     false,
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1 metadata) error = %v", err)
 	}
 }
 

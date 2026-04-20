@@ -96,6 +96,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	handler := looperdapi.NewHandler(looperdapi.Context{
 		Config:  deps.Config,
 		Runtime: rt,
+		TriggerSchedulerTick: func() {
+			rt.TriggerSchedulerTick()
+		},
 	})
 	server := looperdapi.NewServer(deps.Config, handler)
 	if err := server.Start(); err != nil {
