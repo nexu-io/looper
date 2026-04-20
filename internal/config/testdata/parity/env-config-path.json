@@ -1,0 +1,183 @@
+{
+  "description": "selects the config file from LOOPER_CONFIG and preserves nested config-only values on the compatibility surface",
+  "input": {
+    "env": {
+      "LOOPER_CONFIG": "configs/env-selected.json"
+    },
+    "files": {
+      "configs/env-selected.json": {
+        "server": {
+          "host": "10.0.0.5",
+          "port": 4315,
+          "authMode": "local-token",
+          "localToken": "secret-token"
+        },
+        "storage": {
+          "dbPath": "__TMP__/launchd.sqlite",
+          "backupDir": "__TMP__/launchd-backups"
+        },
+        "scheduler": {
+          "pollIntervalSeconds": 45,
+          "maxConcurrentRuns": 4,
+          "retryMaxAttempts": 7,
+          "retryBaseDelayMs": 1500
+        },
+        "agent": {
+          "vendor": "codex",
+          "model": "gpt-5",
+          "params": {
+            "reasoning": {
+              "effort": "high"
+            }
+          },
+          "env": {
+            "OPENAI_API_KEY": "test"
+          }
+        },
+        "logging": {
+          "level": "debug",
+          "maxSizeMB": 20,
+          "maxFiles": 8
+        },
+        "notifications": {
+          "inApp": true,
+          "osascript": {
+            "enabled": true,
+            "soundForLevels": ["failure"],
+            "throttleWindowSeconds": 120
+          }
+        },
+        "tools": {
+          "bunPath": "/cfg/bun",
+          "gitPath": "/cfg/git",
+          "ghPath": "/cfg/gh",
+          "osascriptPath": "/cfg/osascript"
+        },
+        "daemon": {
+          "mode": "launchd",
+          "logDir": "__TMP__/launchd-logs",
+          "workingDirectory": "__TMP__/launchd-workdir",
+          "environment": {
+            "LAUNCHD": "1"
+          }
+        },
+        "package": {
+          "distribution": "npm",
+          "autoMigrateOnStartup": false,
+          "requireBackupBeforeMigrate": true
+        },
+        "defaults": {
+          "baseBranch": "release",
+          "allowAutoCommit": false,
+          "allowAutoPush": false,
+          "allowAutoApprove": true,
+          "allowAutoMerge": true,
+          "allowRiskyFixes": true,
+          "openPrStrategy": "first_commit"
+        },
+        "projects": [
+          {
+            "id": "alpha",
+            "name": "Alpha",
+            "repoPath": "__TMP__/alpha-repo",
+            "baseBranch": "develop",
+            "worktreeRoot": "__TMP__/alpha-worktrees"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "config": {
+      "server": {
+        "host": "10.0.0.5",
+        "port": 4315,
+        "authMode": "local-token",
+        "localToken": "secret-token"
+      },
+      "storage": {
+        "mode": "sqlite",
+        "dbPath": "__TMP__/launchd.sqlite",
+        "backupDir": "__TMP__/launchd-backups"
+      },
+      "scheduler": {
+        "pollIntervalSeconds": 45,
+        "maxConcurrentRuns": 4,
+        "retryMaxAttempts": 7,
+        "retryBaseDelayMs": 1500
+      },
+      "agent": {
+        "vendor": "codex",
+        "model": "gpt-5",
+        "params": {
+          "reasoning": {
+            "effort": "high"
+          }
+        },
+        "env": {
+          "OPENAI_API_KEY": "test"
+        }
+      },
+      "logging": {
+        "level": "debug",
+        "maxSizeMB": 20,
+        "maxFiles": 8
+      },
+      "notifications": {
+        "inApp": true,
+        "osascript": {
+          "enabled": true,
+          "soundForLevels": ["failure"],
+          "throttleWindowSeconds": 120
+        }
+      },
+      "tools": {
+        "bunPath": "/cfg/bun",
+        "gitPath": "/cfg/git",
+        "ghPath": "/cfg/gh",
+        "osascriptPath": "/cfg/osascript"
+      },
+      "daemon": {
+        "mode": "launchd",
+        "logDir": "__TMP__/launchd-logs",
+        "workingDirectory": "__TMP__/launchd-workdir",
+        "environment": {
+          "LAUNCHD": "1"
+        }
+      },
+      "package": {
+        "distribution": "npm",
+        "autoMigrateOnStartup": false,
+        "requireBackupBeforeMigrate": true
+      },
+      "defaults": {
+        "baseBranch": "release",
+        "allowAutoCommit": false,
+        "allowAutoPush": false,
+        "allowAutoApprove": true,
+        "allowAutoMerge": true,
+        "allowRiskyFixes": true,
+        "openPrStrategy": "first_commit"
+      },
+      "projects": [
+        {
+          "id": "alpha",
+          "name": "Alpha",
+          "repoPath": "__TMP__/alpha-repo",
+          "baseBranch": "develop",
+          "worktreeRoot": "__TMP__/alpha-worktrees"
+        }
+      ]
+    },
+    "metadata": {
+      "configPath": "__TMP__/configs/env-selected.json",
+      "configFilePresent": true,
+      "toolDetection": {
+        "bunPath": "configured",
+        "gitPath": "configured",
+        "ghPath": "configured",
+        "osascriptPath": "configured"
+      }
+    }
+  }
+}

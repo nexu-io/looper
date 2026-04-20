@@ -1,0 +1,47 @@
+{
+  "agent": {
+    "env": {
+      "FILE_ENV": "file"
+    },
+    "params": {
+      "tier": "file"
+    },
+    "vendor": "opencode"
+  },
+  "daemon": {
+    "environment": {
+      "FROM_FILE": "1"
+    },
+    "logDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturescli-file-env-priority2864654040/001/file-logs",
+    "workingDirectory": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturescli-file-env-priority2864654040/001/workspace"
+  },
+  "defaults": {
+    "allowAutoCommit": false,
+    "baseBranch": "develop"
+  },
+  "notifications": {
+    "osascript": {
+      "enabled": true,
+      "throttleWindowSeconds": 60
+    }
+  },
+  "projects": [
+    {
+      "id": "demo",
+      "name": "Demo",
+      "repoPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturescli-file-env-priority2864654040/001/repo"
+    }
+  ],
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5555
+  },
+  "storage": {
+    "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturescli-file-env-priority2864654040/001/file.sqlite"
+  },
+  "tools": {
+    "bunPath": "/file/bun",
+    "ghPath": "/file/gh",
+    "gitPath": "/file/git"
+  }
+}

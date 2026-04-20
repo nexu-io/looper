@@ -1,0 +1,47 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5555
+  },
+  "daemon": {
+    "logDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-bW0Urg/file-logs",
+    "workingDirectory": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-bW0Urg/workspace",
+    "environment": {
+      "FROM_FILE": "1"
+    }
+  },
+  "storage": {
+    "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-bW0Urg/file.sqlite"
+  },
+  "notifications": {
+    "osascript": {
+      "enabled": true,
+      "throttleWindowSeconds": 60
+    }
+  },
+  "tools": {
+    "bunPath": "/file/bun",
+    "gitPath": "/file/git",
+    "ghPath": "/file/gh"
+  },
+  "defaults": {
+    "allowAutoCommit": false,
+    "baseBranch": "develop"
+  },
+  "agent": {
+    "vendor": "opencode",
+    "params": {
+      "tier": "file"
+    },
+    "env": {
+      "FILE_ENV": "file"
+    }
+  },
+  "projects": [
+    {
+      "id": "demo",
+      "name": "Demo",
+      "repoPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-bW0Urg/repo"
+    }
+  ]
+}

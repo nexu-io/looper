@@ -1,0 +1,82 @@
+{
+  "agent": {
+    "env": {
+      "OPENAI_API_KEY": "test"
+    },
+    "model": "gpt-5",
+    "params": {
+      "reasoning": {
+        "effort": "high"
+      }
+    },
+    "vendor": "codex"
+  },
+  "daemon": {
+    "environment": {
+      "LAUNCHD": "1"
+    },
+    "logDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/launchd-logs",
+    "mode": "launchd",
+    "workingDirectory": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/launchd-workdir"
+  },
+  "defaults": {
+    "allowAutoApprove": true,
+    "allowAutoCommit": false,
+    "allowAutoMerge": true,
+    "allowAutoPush": false,
+    "allowRiskyFixes": true,
+    "baseBranch": "release",
+    "openPrStrategy": "first_commit"
+  },
+  "logging": {
+    "level": "debug",
+    "maxFiles": 8,
+    "maxSizeMB": 20
+  },
+  "notifications": {
+    "inApp": true,
+    "osascript": {
+      "enabled": true,
+      "soundForLevels": [
+        "failure"
+      ],
+      "throttleWindowSeconds": 120
+    }
+  },
+  "package": {
+    "autoMigrateOnStartup": false,
+    "distribution": "npm",
+    "requireBackupBeforeMigrate": true
+  },
+  "projects": [
+    {
+      "baseBranch": "develop",
+      "id": "alpha",
+      "name": "Alpha",
+      "repoPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/alpha-repo",
+      "worktreeRoot": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/alpha-worktrees"
+    }
+  ],
+  "scheduler": {
+    "maxConcurrentRuns": 4,
+    "pollIntervalSeconds": 45,
+    "retryBaseDelayMs": 1500,
+    "retryMaxAttempts": 7
+  },
+  "server": {
+    "authMode": "local-token",
+    "host": "10.0.0.5",
+    "localToken": "secret-token",
+    "port": 4315
+  },
+  "storage": {
+    "backupDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/launchd-backups",
+    "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/launchd.sqlite"
+  },
+  "tools": {
+    "bunPath": "/cfg/bun",
+    "ghPath": "/cfg/gh",
+    "gitPath": "/cfg/git",
+    "osascriptPath": "/cfg/osascript"
+  }
+}

@@ -1,0 +1,166 @@
+{
+  "description": "merges config file, env, and CLI overrides into the frozen compatibility surface",
+  "input": {
+    "argv": [
+      "--config",
+      "configs/priority.json",
+      "--port",
+      "7000",
+      "--git-path",
+      "/cli/git",
+      "--allow-auto-commit",
+      "false",
+      "--allow-auto-push",
+      "false",
+      "--osascript-path",
+      "/cli/osascript"
+    ],
+    "env": {
+      "LOOPER_HOST": "127.0.0.2",
+      "LOOPER_DB_PATH": "__TMP__/env.sqlite",
+      "LOOPER_LOG_DIR": "__TMP__/env-logs",
+      "LOOPER_OSASCRIPT_ENABLED": "false",
+      "LOOPER_IN_APP_NOTIFICATIONS": "false",
+      "LOOPER_BUN_PATH": "/env/bun",
+      "LOOPER_GH_PATH": "/env/gh",
+      "LOOPER_ALLOW_AUTO_COMMIT": "true",
+      "LOOPER_ALLOW_AUTO_APPROVE": "true"
+    },
+    "files": {
+      "configs/priority.json": {
+        "server": {
+          "host": "0.0.0.0",
+          "port": 5555
+        },
+        "daemon": {
+          "logDir": "__TMP__/file-logs",
+          "workingDirectory": "__TMP__/workspace",
+          "environment": {
+            "FROM_FILE": "1"
+          }
+        },
+        "storage": {
+          "dbPath": "__TMP__/file.sqlite"
+        },
+        "notifications": {
+          "osascript": {
+            "enabled": true,
+            "throttleWindowSeconds": 60
+          }
+        },
+        "tools": {
+          "bunPath": "/file/bun",
+          "gitPath": "/file/git",
+          "ghPath": "/file/gh"
+        },
+        "defaults": {
+          "allowAutoCommit": false,
+          "baseBranch": "develop"
+        },
+        "agent": {
+          "vendor": "opencode",
+          "params": {
+            "tier": "file"
+          },
+          "env": {
+            "FILE_ENV": "file"
+          }
+        },
+        "projects": [
+          {
+            "id": "demo",
+            "name": "Demo",
+            "repoPath": "__TMP__/repo"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "config": {
+      "server": {
+        "host": "127.0.0.2",
+        "port": 7000,
+        "authMode": "none"
+      },
+      "storage": {
+        "mode": "sqlite",
+        "dbPath": "__TMP__/env.sqlite",
+        "backupDir": "__HOME__/.looper/backups"
+      },
+      "scheduler": {
+        "pollIntervalSeconds": 30,
+        "maxConcurrentRuns": 3,
+        "retryMaxAttempts": 5,
+        "retryBaseDelayMs": 5000
+      },
+      "agent": {
+        "vendor": "opencode",
+        "params": {
+          "tier": "file"
+        },
+        "env": {
+          "FILE_ENV": "file"
+        }
+      },
+      "logging": {
+        "level": "info",
+        "maxSizeMB": 10,
+        "maxFiles": 5
+      },
+      "notifications": {
+        "inApp": false,
+        "osascript": {
+          "enabled": false,
+          "soundForLevels": ["action_required", "failure"],
+          "throttleWindowSeconds": 60
+        }
+      },
+      "tools": {
+        "bunPath": "/env/bun",
+        "gitPath": "/cli/git",
+        "ghPath": "/env/gh",
+        "osascriptPath": "/cli/osascript"
+      },
+      "daemon": {
+        "mode": "foreground",
+        "logDir": "__TMP__/env-logs",
+        "workingDirectory": "__TMP__/workspace",
+        "environment": {
+          "FROM_FILE": "1"
+        }
+      },
+      "package": {
+        "distribution": "npm",
+        "autoMigrateOnStartup": true,
+        "requireBackupBeforeMigrate": false
+      },
+      "defaults": {
+        "baseBranch": "develop",
+        "allowAutoCommit": false,
+        "allowAutoPush": false,
+        "allowAutoApprove": true,
+        "allowAutoMerge": false,
+        "allowRiskyFixes": false,
+        "openPrStrategy": "manual"
+      },
+      "projects": [
+        {
+          "id": "demo",
+          "name": "Demo",
+          "repoPath": "__TMP__/repo"
+        }
+      ]
+    },
+    "metadata": {
+      "configPath": "__TMP__/configs/priority.json",
+      "configFilePresent": true,
+      "toolDetection": {
+        "bunPath": "configured",
+        "gitPath": "configured",
+        "ghPath": "configured",
+        "osascriptPath": "configured"
+      }
+    }
+  }
+}

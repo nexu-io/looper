@@ -1,0 +1,82 @@
+{
+  "server": {
+    "host": "10.0.0.5",
+    "port": 4315,
+    "authMode": "local-token",
+    "localToken": "secret-token"
+  },
+  "storage": {
+    "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/launchd.sqlite",
+    "backupDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/launchd-backups"
+  },
+  "scheduler": {
+    "pollIntervalSeconds": 45,
+    "maxConcurrentRuns": 4,
+    "retryMaxAttempts": 7,
+    "retryBaseDelayMs": 1500
+  },
+  "agent": {
+    "vendor": "codex",
+    "model": "gpt-5",
+    "params": {
+      "reasoning": {
+        "effort": "high"
+      }
+    },
+    "env": {
+      "OPENAI_API_KEY": "test"
+    }
+  },
+  "logging": {
+    "level": "debug",
+    "maxSizeMB": 20,
+    "maxFiles": 8
+  },
+  "notifications": {
+    "inApp": true,
+    "osascript": {
+      "enabled": true,
+      "soundForLevels": [
+        "failure"
+      ],
+      "throttleWindowSeconds": 120
+    }
+  },
+  "tools": {
+    "bunPath": "/cfg/bun",
+    "gitPath": "/cfg/git",
+    "ghPath": "/cfg/gh",
+    "osascriptPath": "/cfg/osascript"
+  },
+  "daemon": {
+    "mode": "launchd",
+    "logDir": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/launchd-logs",
+    "workingDirectory": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/launchd-workdir",
+    "environment": {
+      "LAUNCHD": "1"
+    }
+  },
+  "package": {
+    "distribution": "npm",
+    "autoMigrateOnStartup": false,
+    "requireBackupBeforeMigrate": true
+  },
+  "defaults": {
+    "baseBranch": "release",
+    "allowAutoCommit": false,
+    "allowAutoPush": false,
+    "allowAutoApprove": true,
+    "allowAutoMerge": true,
+    "allowRiskyFixes": true,
+    "openPrStrategy": "first_commit"
+  },
+  "projects": [
+    {
+      "id": "alpha",
+      "name": "Alpha",
+      "repoPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/alpha-repo",
+      "baseBranch": "develop",
+      "worktreeRoot": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/looper-config-parity-CjGBHL/alpha-worktrees"
+    }
+  ]
+}

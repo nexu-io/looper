@@ -1,0 +1,95 @@
+{
+  "description": "uses the provided default config path when no config file exists and env supplies the compatibility-boundary overrides",
+  "input": {
+    "defaultConfigPath": "__TMP__/configs/missing.json",
+    "env": {
+      "LOOPER_HOST": "127.0.0.9",
+      "LOOPER_WORKING_DIRECTORY": "__TMP__/runtime",
+      "LOOPER_DB_PATH": "__TMP__/runtime.sqlite",
+      "LOOPER_LOG_DIR": "__TMP__/runtime-logs",
+      "LOOPER_IN_APP_NOTIFICATIONS": "false",
+      "LOOPER_OSASCRIPT_ENABLED": "false",
+      "LOOPER_ALLOW_AUTO_COMMIT": "false",
+      "LOOPER_ALLOW_AUTO_PUSH": "false",
+      "LOOPER_ALLOW_AUTO_APPROVE": "true",
+      "LOOPER_BUN_PATH": "/envonly/bun",
+      "LOOPER_GIT_PATH": "/envonly/git",
+      "LOOPER_GH_PATH": "/envonly/gh",
+      "LOOPER_OSASCRIPT_PATH": "/envonly/osascript"
+    }
+  },
+  "expected": {
+    "config": {
+      "server": {
+        "host": "127.0.0.9",
+        "port": 4310,
+        "authMode": "none"
+      },
+      "storage": {
+        "mode": "sqlite",
+        "dbPath": "__TMP__/runtime.sqlite",
+        "backupDir": "__HOME__/.looper/backups"
+      },
+      "scheduler": {
+        "pollIntervalSeconds": 30,
+        "maxConcurrentRuns": 3,
+        "retryMaxAttempts": 5,
+        "retryBaseDelayMs": 5000
+      },
+      "agent": {
+        "params": {},
+        "env": {}
+      },
+      "logging": {
+        "level": "info",
+        "maxSizeMB": 10,
+        "maxFiles": 5
+      },
+      "notifications": {
+        "inApp": false,
+        "osascript": {
+          "enabled": false,
+          "soundForLevels": ["action_required", "failure"],
+          "throttleWindowSeconds": 60
+        }
+      },
+      "tools": {
+        "bunPath": "/envonly/bun",
+        "gitPath": "/envonly/git",
+        "ghPath": "/envonly/gh",
+        "osascriptPath": "/envonly/osascript"
+      },
+      "daemon": {
+        "mode": "foreground",
+        "logDir": "__TMP__/runtime-logs",
+        "workingDirectory": "__TMP__/runtime",
+        "environment": {}
+      },
+      "package": {
+        "distribution": "npm",
+        "autoMigrateOnStartup": true,
+        "requireBackupBeforeMigrate": false
+      },
+      "defaults": {
+        "baseBranch": "main",
+        "allowAutoCommit": false,
+        "allowAutoPush": false,
+        "allowAutoApprove": true,
+        "allowAutoMerge": false,
+        "allowRiskyFixes": false,
+        "openPrStrategy": "manual"
+      },
+      "projects": []
+    },
+    "metadata": {
+      "configPath": "__TMP__/configs/missing.json",
+      "configFilePresent": false,
+      "toolDetection": {
+        "bunPath": "configured",
+        "gitPath": "configured",
+        "ghPath": "configured",
+        "osascriptPath": "configured"
+      }
+    }
+  }
+}
