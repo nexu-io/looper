@@ -122,7 +122,7 @@
 - [ ] Add CLI golden tests
 - [ ] Re-validate SQLite migrations against TypeScript-created databases at the end of the rewrite
 - [ ] Re-validate agent execution streaming, heartbeat, timeout, and kill escalation at the end of the rewrite
-- [ ] Re-validate Git/GitHub/spec-PR integration behavior at the end of the rewrite
+- [x] Re-validate Git/GitHub/spec-PR integration behavior at the end of the rewrite
 - [ ] Run end-to-end local workflow validation on sample repos
 - [ ] Run end-to-end validation for reviewer, fixer, planner, and worker flows that remain in scope
 - [ ] Validate Go install/upgrade flows end to end
