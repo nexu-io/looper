@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/powerformer/looper/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -307,27 +306,6 @@ func (r *commandRuntime) postJSON(ctx context.Context, path string, body any) (j
 	}
 
 	return payload, nil
-}
-
-func (r *commandRuntime) apiClient() (*DaemonAPIClient, error) {
-	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
-	if err != nil {
-		return nil, err
-	}
-
-	baseURL := ""
-	if loaded.Config.Server.BaseURL != nil && strings.TrimSpace(*loaded.Config.Server.BaseURL) != "" {
-		baseURL = strings.TrimSpace(*loaded.Config.Server.BaseURL)
-	} else {
-		baseURL = fmt.Sprintf("http://%s:%d", loaded.Config.Server.Host, loaded.Config.Server.Port)
-	}
-
-	token := ""
-	if loaded.Config.Server.AuthMode == config.AuthModeLocalToken && loaded.Config.Server.LocalToken != nil {
-		token = strings.TrimSpace(*loaded.Config.Server.LocalToken)
-	}
-
-	return NewDaemonAPIClient(DaemonAPIClientOptions{BaseURL: baseURL, Token: token}), nil
 }
 
 func (r *commandRuntime) lookupPullRequestProjectID(ctx context.Context, repo string, prNumber int64) (string, error) {

@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,12 +13,21 @@ import (
 )
 
 type Deps struct {
-	Stdout     io.Writer
-	Stderr     io.Writer
-	HTTPClient *http.Client
-	HomeDir    string
-	Platform   string
-	Arch       string
+	Stdout        io.Writer
+	Stderr        io.Writer
+	HTTPClient    *http.Client
+	HomeDir       string
+	Platform      string
+	Arch          string
+	RunCommand    runCommandFunc
+	SpawnDetached spawnDetachedFunc
+	KillProcess   killProcessFunc
+	ReadFile      readFileFunc
+	WriteFile     writeFileFunc
+	RemoveFile    removeFileFunc
+	MkdirAll      mkdirAllFunc
+	Sleep         sleepFunc
+	Getwd         getwdFunc
 }
 
 type App struct {
@@ -118,7 +128,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "daemon",
 				short:           "Daemon commands",
-				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "logs", description: "Show daemon logs"}},
+				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "start", description: "Start the daemon"}, {name: "restart", description: "Restart the daemon"}, {name: "logs", description: "Show daemon logs"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
@@ -133,10 +143,10 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),
-					newCommand(commandSpec{use: "status", short: "Show daemon status"}),
-					newCommand(commandSpec{use: "start", short: "Start the daemon"}),
-					newCommand(commandSpec{use: "restart", short: "Restart the daemon"}),
-					newCommand(commandSpec{use: "logs", short: "Show daemon logs"}),
+					newCommand(commandSpec{use: "status", short: "Show daemon status", runE: runtime.daemonStatus}),
+					newCommand(commandSpec{use: "start", short: "Start the daemon", runE: runtime.daemonStart}),
+					newCommand(commandSpec{use: "restart", short: "Restart the daemon", runE: runtime.daemonRestart}),
+					newCommand(commandSpec{use: "logs", short: "Show daemon logs", runE: runtime.daemonLogs}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -467,8 +477,11 @@ func (e notPortedError) Error() string {
 }
 
 func exitCodeForError(err error) int {
-	_ = err
-	return 2
+	var notPorted notPortedError
+	if errors.As(err, &notPorted) {
+		return 2
+	}
+	return 1
 }
 
 func (a *App) stdout() io.Writer {

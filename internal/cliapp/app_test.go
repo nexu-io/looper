@@ -34,7 +34,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list  List projects", "add   Add a project"}},
 		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
-		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "logs     Show daemon logs"}},
+		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},
@@ -98,16 +98,30 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 func TestNestedCommandParsingReachesLeafCommands(t *testing.T) {
 	t.Parallel()
 
-	exitCode, stdout, stderr := runApp(t, "daemon", "logs", "--lines", "50", "--json")
-	if exitCode != 2 {
-		t.Fatalf("Run([daemon logs --lines 50 --json]) exit code = %d, want 2", exitCode)
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	homeDir := t.TempDir()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			if strings.HasSuffix(path, filepath.Join("logs", "looperd.log")) {
+				return []byte("one\ntwo\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "logs", "--lines", "1", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon logs --lines 1 --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if stdout != "" {
-		t.Fatalf("Run([daemon logs --lines 50 --json]) stdout = %q, want empty string", stdout)
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([daemon logs --lines 1 --json]) stderr = %q, want empty string", stderr.String())
 	}
-	if got, want := stderr, "looper: command support has not been ported yet: daemon logs\n"; got != want {
-		t.Fatalf("Run([daemon logs --lines 50 --json]) stderr = %q, want %q", got, want)
-	}
+	assertJSONContains(t, stdout.String(), "lines", []any{"two"})
 }
 
 func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
