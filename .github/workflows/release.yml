@@ -143,34 +143,41 @@ jobs:
           # Phase 1 intentionally publishes macOS artifacts only.
           - target: darwin-arm64
             runner: macos-14
+            goos: darwin
+            goarch: arm64
             artifact-name: looperd-darwin-arm64
+          - target: darwin-x64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+            artifact-name: looperd-darwin-x64
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          go-version-file: go.mod
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Compile looperd for ${{ matrix.target }}
+      - name: Build looperd for ${{ matrix.target }}
         env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           LOOPER_FORCE_COMPILE: "1"
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
         run: |
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          bun run --cwd apps/looperd compile:${{ matrix.target }}
+          mkdir -p dist/release
+          go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looperd
 
-      - name: Verify compiled binary version
+      - name: Verify built binary version
         env:
           EXPECTED_VERSION: ${{ needs.prepare.outputs.package-version }}
         run: |
-          artifact_path="apps/looperd/dist/compiled/${{ matrix.artifact-name }}"
+          artifact_path="dist/release/${{ matrix.artifact-name }}"
           actual_version=$("$artifact_path" --version)
           if [ "$actual_version" != "$EXPECTED_VERSION" ]; then
             echo "Expected $artifact_path --version to print ${EXPECTED_VERSION}, got ${actual_version}." >&2
@@ -178,7 +185,7 @@ jobs:
           fi
 
       - name: Generate and verify SHA-256 checksum
-        working-directory: apps/looperd/dist/compiled
+        working-directory: dist/release
         run: |
           shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
           shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
@@ -188,8 +195,8 @@ jobs:
         with:
           name: release-assets-${{ matrix.target }}
           path: |
-            apps/looperd/dist/compiled/${{ matrix.artifact-name }}
-            apps/looperd/dist/compiled/${{ matrix.artifact-name }}.sha256
+            dist/release/${{ matrix.artifact-name }}
+            dist/release/${{ matrix.artifact-name }}.sha256
 
   publish-cli:
     needs:
