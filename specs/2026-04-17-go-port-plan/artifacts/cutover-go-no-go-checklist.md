@@ -51,14 +51,14 @@ This checklist defines the explicit decision gates that must be reviewed before 
 
 ## Gate 3 — Operational cutover prerequisites
 
-- [ ] The Go binaries are the default supported implementation in user-facing docs and operator guidance.
+- [x] The Go binaries are the default supported implementation in user-facing docs and operator guidance.
   - Blocking task: `Make Go binaries the default supported implementation`
 - [ ] Default CI is Go-first, with any remaining TypeScript verification clearly demoted to compatibility coverage instead of the primary path.
   - Blocking task: `Switch CI and release pipelines to Go-first`
   - Current status: `.github/workflows/ci.yml` still runs separate `verify-ts` and `verify-go` jobs, and `.github/workflows/release.yml` still depends on Bun/npm in `prepare` and `publish-cli`.
 - [ ] Bun is no longer required on the production runtime path for supported installs and upgrades.
   - Blocking task: `Remove Bun from the required production runtime path`
-  - Current status: `docs/configuration.md:13` still says npm is the supported CLI install path for this phase, and the release workflow still publishes the CLI through npm.
+  - Current status: supported docs now point to the Go release binaries, but `.github/workflows/release.yml` still publishes the CLI through npm and production runtime assumptions still need cleanup.
 - [ ] The fate of `apps/web` is explicitly documented so the cutover does not leave an ambiguous supported surface.
   - Blocking task: `Decide and document the fate of apps/web`
   - Current status: `apps/web/src/index.ts` is still only a placeholder.
@@ -69,7 +69,7 @@ This checklist defines the explicit decision gates that must be reviewed before 
 
 The cutover owner should not announce the Go binaries as the default until all of the following are prepared in the same change window:
 
-- [ ] A release note or migration note tells existing users whether anything changes for install, upgrade, PATH layout, or operational commands.
+- [x] A release note or migration note tells existing users whether anything changes for install, upgrade, PATH layout, or operational commands.
 - [ ] A rollback plan exists that restores the previous default binaries/artifacts if post-release validation fails.
 - [ ] The first post-cutover validation run includes at minimum: CI green, release dry-run/validation green, managed install green, daemon start/status green, one sample workflow green.
 - [ ] Ownership is explicit for cutover execution, rollback approval, and post-release monitoring.

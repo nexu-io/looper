@@ -1,22 +1,28 @@
 # looper
 
-Looper is a Bun workspace with three apps:
+Looper ships as Go binaries for the supported CLI + daemon workflows.
 
-- `apps/looperd` — the main daemon and HTTP API server
-- `apps/cli` — the `looper` command-line client
+This repository currently contains:
+
+- `cmd/looperd` — the supported `looperd` daemon binary
+- `cmd/looper` — the supported `looper` CLI binary
+- `apps/looperd` — legacy TypeScript daemon sources retained during cutover
+- `apps/cli` — legacy TypeScript CLI sources retained during cutover
 - `apps/web` — a placeholder web app
 
 The current product is the daemon + CLI. The web app is not implemented yet.
 
 ## Requirements
 
-For the recommended install path:
+For the default supported install path:
 
 - macOS (`darwin-arm64` or `darwin-x64`)
-- Node.js/npm for installing `looper`
+- `git`
+- `gh`
 
 For source development:
 
+- Go `1.22`
 - [Bun](https://bun.sh/) `1.3.12`
 - `git`
 - `gh`
@@ -26,16 +32,24 @@ For source development:
 
 ## Installation
 
-Looper now uses a split distribution model:
+Looper now uses Go binaries as the default supported implementation:
 
-- `looper` CLI is installed with npm
-- `looperd` daemon is installed separately as a managed macOS binary
+- install the `looper` CLI from GitHub Releases
+- install `looperd` separately as a managed macOS binary with `looper daemon install`
 
-GitHub Releases also publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`, but the npm CLI + managed daemon flow below remains the supported install path for this phase.
+GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`.
 
 Linux daemon artifacts are not supported in this phase.
 
 ### Install the CLI
+
+Recommended path:
+
+1. Download the matching `looper` release artifact for your macOS architecture from GitHub Releases.
+2. Rename it to `looper` if needed.
+3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
+
+Compatibility fallback during the remaining cutover work:
 
 ```bash
 npm install -g @powerformer/looper
@@ -100,21 +114,40 @@ Current phase behavior:
 
 ### From source
 
-If you want to develop from source, clone the repo and install workspace dependencies from the root:
+If you want to develop the supported Go binaries from source, clone the repo:
 
 ```bash
 git clone https://github.com/powerformer/looper.git
 cd looper
+```
+
+Then build or run the Go binaries:
+
+```bash
+go build ./cmd/looper
+go build ./cmd/looperd
+go run ./cmd/looperd
+```
+
+In another shell, run the CLI from source:
+
+```bash
+go run ./cmd/looper -- status
+```
+
+If you need to work on the legacy TypeScript implementation during the transition, install workspace dependencies from the repo root:
+
+```bash
 bun install
 ```
 
-Then start the daemon from source:
+Then start the legacy daemon from source:
 
 ```bash
 bun run dev
 ```
 
-In another shell, run the CLI from source:
+In another shell, run the legacy CLI from source:
 
 ```bash
 bun run looper -- status

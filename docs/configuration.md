@@ -4,13 +4,13 @@ This document explains how `looper` and `looperd` configuration works, where the
 
 ## Install layout notes
 
-For the packaged macOS install flow:
+For the default supported macOS install flow:
 
-- `looper` is installed via npm
+- `looper` is installed from a GitHub Release Go binary
 - `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
 - `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
 
-GitHub Release assets also ship a standalone `looper` binary, but npm remains the supported CLI install path for this phase.
+The previous npm-based CLI install path remains available only as a compatibility fallback during the remaining cutover work.
 
 The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
@@ -218,7 +218,7 @@ Defaults:
 
 ### `package`
 
-- `distribution`: currently `npm`; this describes how the CLI was installed and is the only supported value in this phase
+- `distribution`: install-channel metadata retained for compatibility with the legacy npm-based CLI path; current default supported installs use the Go release binaries instead
 - `autoMigrateOnStartup`: run DB migrations on startup
 - `requireBackupBeforeMigrate`: require a backup before migrations
 

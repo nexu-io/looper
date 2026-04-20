@@ -147,13 +147,12 @@ func isHelpArg(arg string) bool {
 }
 
 func writeUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, `looperd (Go port)
+	_, _ = fmt.Fprint(w, `looperd
 
 Usage:
 	looperd [flags]
 	looperd help
 
-Status:
-	Bootstrap flow, signal handling, and runtime assembly are ported. Daemon command parity remains in progress.
+Daemon and HTTP API server for Looper.
 `)
 }
