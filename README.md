@@ -22,7 +22,7 @@ For source development:
 - `gh`
 - `osascript` if macOS notifications stay enabled
 
-`looperd` auto-detects tool paths with `Bun.which()`, but startup validation fails if required tools cannot be resolved.
+`looperd` auto-detects tool paths from `PATH`, but startup validation fails if required tools cannot be resolved.
 
 ## Installation
 
@@ -30,6 +30,8 @@ Looper now uses a split distribution model:
 
 - `looper` CLI is installed with npm
 - `looperd` daemon is installed separately as a managed macOS binary
+
+GitHub Releases also publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`, but the npm CLI + managed daemon flow below remains the supported install path for this phase.
 
 Linux daemon artifacts are not supported in this phase.
 
@@ -94,6 +96,7 @@ Current phase behavior:
 - `looper upgrade --daemon` installs or upgrades the managed daemon binary
 - full `looper upgrade` for CLI + daemon together is not implemented yet
 - after a daemon upgrade, restart manually with `looper daemon restart`
+- if you installed `looper` from a GitHub Release binary instead of npm, replace that CLI binary manually for now; `looper upgrade --check` still compares the CLI against npm registry metadata
 
 ### From source
 
@@ -125,8 +128,7 @@ bun run looper -- status
 - If the daemon is running, the CLI reads its current version from `/api/v1/status`; otherwise it falls back to `looperd --version`.
 - `looper upgrade --check` reads the latest CLI version from npm registry metadata and the latest daemon version from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed binary version; if no binary is found, daemon current version is reported as not installed.
 - The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade --daemon` to update the managed binary.
-- Full major-version upgrade confirmation is not implemented in this phase because full `looper upgrade` is not implemented yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*`, and major-version upgrade confirmation can be added there.
-- If a breaking management API change is ever needed, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
+- Full major-version upgrade confirmation is not implemented in this phase because full `looper upgrade` is not implemented yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
 
 
 ## Workspace commands

@@ -10,6 +10,8 @@ For the packaged macOS install flow:
 - `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
 - `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
 
+GitHub Release assets also ship a standalone `looper` binary, but npm remains the supported CLI install path for this phase.
+
 The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
 ## How config loading works
@@ -197,7 +199,7 @@ If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resol
 - `ghPath`
 - `osascriptPath`
 
-If these are omitted, `looperd` tries to detect them with `Bun.which()`. Startup validation fails when required tools cannot be resolved.
+If these are omitted, `looperd` tries to detect them from `PATH`. Startup validation fails when required tools cannot be resolved.
 
 ### `daemon`
 
@@ -216,7 +218,7 @@ Defaults:
 
 ### `package`
 
-- `distribution`: currently `npm`
+- `distribution`: currently `npm`; this describes how the CLI was installed and is the only supported value in this phase
 - `autoMigrateOnStartup`: run DB migrations on startup
 - `requireBackupBeforeMigrate`: require a backup before migrations
 
