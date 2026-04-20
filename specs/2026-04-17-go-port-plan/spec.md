@@ -770,10 +770,15 @@ Acceptance criteria:
 
 Deliverables:
 
-1. default CI switched to Go paths
-2. TypeScript apps moved to maintenance or removed
-3. Bun runtime removed from required production path
-4. docs rewritten around Go implementation
+1. written cutover go/no-go checklist with explicit decision gates and rollback requirements
+2. default CI switched to Go paths
+3. TypeScript apps moved to maintenance or removed
+4. Bun runtime removed from required production path
+5. docs rewritten around Go implementation
+
+Decision artifact:
+
+- `specs/2026-04-17-go-port-plan/artifacts/cutover-go-no-go-checklist.md`
 
 Acceptance criteria:
 
