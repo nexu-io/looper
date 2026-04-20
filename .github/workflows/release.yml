@@ -76,6 +76,62 @@ jobs:
           draft: true
           generate_release_notes: true
 
+  build-looper:
+    needs:
+      - prepare
+      - create-draft-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+            artifact-name: looper-darwin-arm64
+          - target: darwin-x64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+            artifact-name: looper-darwin-x64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build looper for ${{ matrix.target }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
+        run: |
+          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist/release
+          go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looper
+
+      - name: Verify built binary exists
+        run: test -f "dist/release/${{ matrix.artifact-name }}"
+
+      - name: Generate and verify SHA-256 checksum
+        working-directory: dist/release
+        run: |
+          shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
+          shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: looper-release-assets-${{ matrix.target }}
+          path: |
+            dist/release/${{ matrix.artifact-name }}
+            dist/release/${{ matrix.artifact-name }}.sha256
+
   build-looperd:
     needs:
       - prepare
