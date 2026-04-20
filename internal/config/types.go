@@ -108,11 +108,12 @@ const (
 )
 
 type DaemonConfig struct {
-	Mode             DaemonMode        `json:"mode"`
-	PlistPath        *string           `json:"plistPath,omitempty"`
-	LogDir           string            `json:"logDir"`
-	WorkingDirectory string            `json:"workingDirectory"`
-	Environment      map[string]string `json:"environment"`
+	Mode              DaemonMode        `json:"mode"`
+	PlistPath         *string           `json:"plistPath,omitempty"`
+	LogDir            string            `json:"logDir"`
+	ShutdownTimeoutMS int               `json:"shutdownTimeoutMs"`
+	WorkingDirectory  string            `json:"workingDirectory"`
+	Environment       map[string]string `json:"environment"`
 }
 
 type PackageConfig struct {
@@ -206,11 +207,12 @@ type PartialToolPathsConfig struct {
 }
 
 type PartialDaemonConfig struct {
-	Mode             *DaemonMode       `json:"mode,omitempty"`
-	PlistPath        *string           `json:"plistPath,omitempty"`
-	LogDir           *string           `json:"logDir,omitempty"`
-	WorkingDirectory *string           `json:"workingDirectory,omitempty"`
-	Environment      map[string]string `json:"environment,omitempty"`
+	Mode              *DaemonMode       `json:"mode,omitempty"`
+	PlistPath         *string           `json:"plistPath,omitempty"`
+	LogDir            *string           `json:"logDir,omitempty"`
+	ShutdownTimeoutMS *int              `json:"shutdownTimeoutMs,omitempty"`
+	WorkingDirectory  *string           `json:"workingDirectory,omitempty"`
+	Environment       map[string]string `json:"environment,omitempty"`
 }
 
 type PartialPackageConfig struct {

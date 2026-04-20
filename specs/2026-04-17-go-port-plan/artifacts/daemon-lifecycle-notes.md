@@ -88,7 +88,7 @@ Current daemon-stop paths are:
 3. appends `looperd.stopped` with the shutdown reason
 4. clears the scheduler polling timer so no new interval ticks are scheduled
 5. stops the Bun HTTP server with `server.stop(true)`
-6. waits for in-flight scheduler work, but only up to `STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS` (`1000` ms today)
+6. waits for in-flight scheduler work, but only up to `daemon.shutdownTimeoutMs` (`1000` ms by default)
 7. closes SQLite and clears runtime references even if the wait timed out
 8. resolves `waitForShutdown()`
 
@@ -100,7 +100,7 @@ If the in-flight wait times out, shutdown still completes; the daemon only logs 
 
 - the API server is stopped before waiting on in-flight scheduler work
 - no new polling ticks are scheduled after shutdown begins
-- already claimed scheduler work is given up to `1000` ms to finish
+- already claimed scheduler work is given up to `daemon.shutdownTimeoutMs` (`1000` ms by default) to finish
 - the daemon does **not** walk all active runs and force them into terminal states during shutdown
 - any still-running loop/run state is intentionally left for the next startup recovery pass unless that work was separately stopped earlier
 

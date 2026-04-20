@@ -89,10 +89,11 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Tools: ToolPathsConfig{},
 		Daemon: DaemonConfig{
-			Mode:             DaemonModeForeground,
-			LogDir:           logDir,
-			WorkingDirectory: cwd,
-			Environment:      map[string]string{},
+			Mode:              DaemonModeForeground,
+			LogDir:            logDir,
+			ShutdownTimeoutMS: 1000,
+			WorkingDirectory:  cwd,
+			Environment:       map[string]string{},
 		},
 		Package: PackageConfig{
 			Distribution:               "npm",

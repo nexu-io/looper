@@ -115,6 +115,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.logDir", Message: "must be a non-empty path"})
 	}
 
+	if config.Daemon.ShutdownTimeoutMS < 1 {
+		issues = append(issues, ValidationIssue{Path: "daemon.shutdownTimeoutMs", Message: "must be a positive integer"})
+	}
+
 	if config.Daemon.WorkingDirectory == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}

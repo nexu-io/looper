@@ -407,7 +407,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 		"storage": {"mode": "memory"},
 		"scheduler": {"pollIntervalSeconds": 2},
 		"logging": {"level": "verbose", "maxFiles": 0},
-		"daemon": {"mode": "invalid"},
+		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
 		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
 		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
@@ -433,6 +433,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "logging.level", "must be one of: debug, info, warn, error")
 	assertValidationIssue(t, validationErr, "logging.maxFiles", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
+	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
@@ -605,6 +606,10 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Daemon.LogDir = %q, want %q", config.Daemon.LogDir, filepath.Join(homeDir, ".looper", "logs"))
 	}
 
+	if config.Daemon.ShutdownTimeoutMS != 1000 {
+		t.Fatalf("DefaultConfig().Daemon.ShutdownTimeoutMS = %d, want %d", config.Daemon.ShutdownTimeoutMS, 1000)
+	}
+
 	if config.Daemon.WorkingDirectory != "/tmp/looper-cwd" {
 		t.Fatalf("DefaultConfig().Daemon.WorkingDirectory = %q, want %q", config.Daemon.WorkingDirectory, "/tmp/looper-cwd")
 	}
@@ -683,10 +688,11 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 			BunPath: &bunPath,
 		},
 		Daemon: &PartialDaemonConfig{
-			Mode:             &daemonMode,
-			LogDir:           &logDir,
-			WorkingDirectory: stringPtr("/workspace"),
-			Environment:      map[string]string{"EXAMPLE_FLAG": "1"},
+			Mode:              &daemonMode,
+			LogDir:            &logDir,
+			ShutdownTimeoutMS: intPtr(2500),
+			WorkingDirectory:  stringPtr("/workspace"),
+			Environment:       map[string]string{"EXAMPLE_FLAG": "1"},
 		},
 		Defaults: &PartialDefaultsConfig{
 			BaseBranch:       &baseBranch,
@@ -785,6 +791,10 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 	if config.Daemon.LogDir != logDir {
 		t.Fatalf("Normalize().Daemon.LogDir = %q, want %q", config.Daemon.LogDir, logDir)
+	}
+
+	if config.Daemon.ShutdownTimeoutMS != 2500 {
+		t.Fatalf("Normalize().Daemon.ShutdownTimeoutMS = %d, want %d", config.Daemon.ShutdownTimeoutMS, 2500)
 	}
 
 	if config.Daemon.WorkingDirectory != "/workspace" {
@@ -1032,4 +1042,8 @@ func assertValidationIssue(t *testing.T, err *ConfigValidationError, path string
 
 func emptyEnvLookup(string) (string, bool) {
 	return "", false
+}
+
+func intPtr(value int) *int {
+	return &value
 }

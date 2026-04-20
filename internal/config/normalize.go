@@ -201,6 +201,10 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 		config.LogDir = *partial.LogDir
 	}
 
+	if partial.ShutdownTimeoutMS != nil {
+		config.ShutdownTimeoutMS = *partial.ShutdownTimeoutMS
+	}
+
 	if partial.WorkingDirectory != nil {
 		config.WorkingDirectory = *partial.WorkingDirectory
 	}

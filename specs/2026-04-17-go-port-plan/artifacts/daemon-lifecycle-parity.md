@@ -101,7 +101,7 @@ Recovery is a startup-only pipeline in the current daemon and must run before se
   - append `looperd.stopped` with the supplied reason
   - stop the scheduler timer so no new polling ticks are scheduled
   - stop the HTTP server
-  - wait for in-flight scheduler work, but only up to `STOP_IN_FLIGHT_SCHEDULER_WORK_TIMEOUT_MS` (currently `1000` ms)
+  - wait for in-flight scheduler work, but only up to `daemon.shutdownTimeoutMs` (default `1000` ms)
   - close SQLite even if waiting times out
   - resolve `waitForShutdown()`
 - If waiting for in-flight scheduler work times out, shutdown still completes and only logs a warning.

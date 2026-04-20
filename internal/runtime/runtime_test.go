@@ -643,17 +643,12 @@ func TestRuntimeStopTimesOutWaitingForHungInFlightSchedulerWork(t *testing.T) {
 	}
 
 	cfg.Storage.DBPath = workingDir + "/runtime.sqlite"
+	cfg.Daemon.ShutdownTimeoutMS = 25
 	logger := &testLogger{}
 	rt := New(Options{Config: cfg, Logger: logger})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-
-	previousTimeout := stopInFlightSchedulerWorkTimeout
-	stopInFlightSchedulerWorkTimeout = 25 * time.Millisecond
-	t.Cleanup(func() {
-		stopInFlightSchedulerWorkTimeout = previousTimeout
-	})
 
 	_ = rt.trackInFlightWork("queue_hung")
 	started := time.Now()

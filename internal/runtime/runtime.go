@@ -24,8 +24,6 @@ type SyncConfiguredProjectsFunc func(context.Context, *storage.Repositories, con
 
 type RunSchedulerTickFunc func(context.Context, Services) error
 
-var stopInFlightSchedulerWorkTimeout = 1 * time.Second
-
 type RecoverySummary struct {
 	StartedAt             string                     `json:"startedAt,omitempty"`
 	CompletedAt           string                     `json:"completedAt,omitempty"`
@@ -46,6 +44,7 @@ type Options struct {
 	Config                 config.Config
 	Logger                 bootstrap.Logger
 	Now                    func() time.Time
+	ShutdownTimeout        time.Duration
 	OpenSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects SyncConfiguredProjectsFunc
 	RunSchedulerTick       RunSchedulerTickFunc
@@ -67,6 +66,7 @@ type Runtime struct {
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
 	runSchedulerTick       RunSchedulerTickFunc
+	shutdownTimeout        time.Duration
 
 	mu            sync.RWMutex
 	startedAt     *time.Time
@@ -106,6 +106,14 @@ func New(options Options) *Runtime {
 		}
 	}
 
+	shutdownTimeout := options.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = time.Duration(options.Config.Daemon.ShutdownTimeoutMS) * time.Millisecond
+	}
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = time.Second
+	}
+
 	return &Runtime{
 		config:                 options.Config,
 		logger:                 options.Logger,
@@ -113,6 +121,7 @@ func New(options Options) *Runtime {
 		openSQLiteCoordinator:  openSQLiteCoordinator,
 		syncConfiguredProjects: syncConfiguredProjects,
 		runSchedulerTick:       runSchedulerTick,
+		shutdownTimeout:        shutdownTimeout,
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 		inFlightWork:           make(map[string]chan struct{}),
@@ -407,7 +416,7 @@ func (r *Runtime) waitForInFlightSchedulerWorkOnStop() {
 	}
 	r.mu.RUnlock()
 
-	timer := time.NewTimer(stopInFlightSchedulerWorkTimeout)
+	timer := time.NewTimer(r.shutdownTimeout)
 	defer timer.Stop()
 
 	for _, doneCh := range work {
@@ -416,7 +425,7 @@ func (r *Runtime) waitForInFlightSchedulerWorkOnStop() {
 		case <-timer.C:
 			if r.logger != nil {
 				r.logger.Warn("looperd stop timed out waiting for in-flight scheduler work", map[string]any{
-					"timeoutMs":    stopInFlightSchedulerWorkTimeout.Milliseconds(),
+					"timeoutMs":    r.shutdownTimeout.Milliseconds(),
 					"queueItemIds": ids,
 				})
 			}
