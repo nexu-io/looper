@@ -24,7 +24,7 @@ func New(deps Deps) *App {
 }
 
 func (a *App) Run(ctx context.Context, argv []string) int {
-	root := a.newRootCommand()
+	root := a.newRootCommand(argv)
 	root.SetArgs(argv)
 
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -40,6 +40,7 @@ type commandSpec struct {
 	use             string
 	short           string
 	args            cobra.PositionalArgs
+	runE            func(cmd *cobra.Command, args []string) error
 	persistentFlags []flagSpec
 	localFlags      []flagSpec
 	exampleLines    []string
@@ -67,17 +68,16 @@ const (
 	flagKindString
 )
 
-func (a *App) newRootCommand() *cobra.Command {
+func (a *App) newRootCommand(argv []string) *cobra.Command {
+	runtime := newCommandRuntime(a, argv)
+
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
 		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
-			newCommand(commandSpec{
-				use:   "status",
-				short: "Show service status",
-			}),
+			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
@@ -96,8 +96,8 @@ func (a *App) newRootCommand() *cobra.Command {
 					"$ looper project add /path/to/repo",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "list", short: "List projects"}),
-					newCommand(commandSpec{use: "add", short: "Add a project"}),
+					newCommand(commandSpec{use: "list", short: "List projects", runE: runtime.projectList}),
+					newCommand(commandSpec{use: "add", short: "Add a project", args: cobra.MaximumNArgs(1), runE: runtime.projectAdd}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -107,7 +107,7 @@ func (a *App) newRootCommand() *cobra.Command {
 				helpWhenNoArgs:  true,
 				exampleLines:    []string{"$ looper config show --json"},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "show", short: "Show active config"}),
+					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -161,14 +161,15 @@ func (a *App) newRootCommand() *cobra.Command {
 					"$ looper loop start --type reviewer --pr acme/looper#42",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "list", short: "List loops"}),
-					newCommand(commandSpec{use: "start", short: "Start a loop"}),
-					newCommand(commandSpec{use: "pause", short: "Pause a loop"}),
+					newCommand(commandSpec{use: "list", short: "List loops", runE: runtime.loopList}),
+					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart}),
+					newCommand(commandSpec{use: "pause", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause}),
 				},
 			}),
 			newCommand(commandSpec{
 				use:   "work",
 				short: "Create a worker run",
+				runE:  runtime.workCreate,
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					stringFlag("title", "title", "Task title"),
@@ -186,6 +187,7 @@ func (a *App) newRootCommand() *cobra.Command {
 			newCommand(commandSpec{
 				use:   "plan",
 				short: "Create a planner run",
+				runE:  runtime.planCreate,
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					stringFlag("issue", "number", "Issue number"),
@@ -202,15 +204,16 @@ func (a *App) newRootCommand() *cobra.Command {
 					"$ looper pr show acme/looper#42",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "list", short: "List pull requests"}),
-					newCommand(commandSpec{use: "show", short: "Show a pull request"}),
-					newCommand(commandSpec{use: "status", short: "Show pull request status"}),
+					newCommand(commandSpec{use: "list", short: "List pull requests", runE: runtime.pullRequestList}),
+					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow}),
+					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus}),
 				},
 			}),
 			newCommand(commandSpec{
 				use:   "review <pr>",
 				short: "Create a reviewer task for a pull request",
 				args:  cobra.ExactArgs(1),
+				runE:  runtime.reviewCreate,
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
@@ -223,6 +226,7 @@ func (a *App) newRootCommand() *cobra.Command {
 			newCommand(commandSpec{
 				use:   "ps",
 				short: "Show running loops",
+				runE:  runtime.activeRuns,
 				localFlags: []flagSpec{
 					stringFlag("type", "type", "Filter by loop type"),
 					stringFlag("project", "projectId", "Filter by project id"),
@@ -250,6 +254,7 @@ func (a *App) newRootCommand() *cobra.Command {
 				use:   "logs <id>",
 				short: "Show logs for a loop",
 				args:  cobra.ExactArgs(1),
+				runE:  runtime.loopLogs,
 				localFlags: []flagSpec{
 					boolFlag("stderr", "Show stderr instead of stdout"),
 					stringFlag("tail", "count", "Show the last N lines"),
@@ -260,26 +265,19 @@ func (a *App) newRootCommand() *cobra.Command {
 					"$ looper logs 12 --stderr --tail 50",
 				},
 			}),
-			newCommand(commandSpec{
-				use:          "stop <id>",
-				short:        "Stop an active loop",
-				args:         cobra.ExactArgs(1),
-				exampleLines: []string{"$ looper stop 12"},
-			}),
+			newCommand(commandSpec{use: "stop <id>", short: "Stop an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12"}}),
 			newCommand(commandSpec{
 				use:             "run",
 				short:           "Run commands",
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List runs"}},
 				helpWhenNoArgs:  true,
-				persistentFlags: []flagSpec{
-					stringFlag("loop", "loopId", "Filter by loop id"),
-				},
+				persistentFlags: []flagSpec{stringFlag("loop", "loopId", "Filter by loop id")},
 				exampleLines: []string{
 					"$ looper run list",
 					"$ looper run list --loop loop_1",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "list", short: "List runs"}),
+					newCommand(commandSpec{use: "list", short: "List runs", runE: runtime.runList}),
 				},
 			}),
 		},
@@ -306,6 +304,9 @@ func newCommand(spec commandSpec) *cobra.Command {
 		cmd.RunE = helpCommand
 	} else {
 		cmd.RunE = notPortedCommand
+	}
+	if spec.runE != nil {
+		cmd.RunE = spec.runE
 	}
 
 	if len(spec.exampleLines) > 0 {

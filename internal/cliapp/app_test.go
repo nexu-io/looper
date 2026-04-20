@@ -3,8 +3,15 @@ package cliapp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	pkgapi "github.com/powerformer/looper/pkg/api"
 )
 
 func runApp(t *testing.T, args ...string) (int, string, string) {
@@ -156,5 +163,168 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("ExtractConfigArgs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true, "version": "1.2.3"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "status", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status --json]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "healthy", true)
+	assertJSONContains(t, stdout, "version", "1.2.3")
+}
+
+func TestConfigShowJSONSendsLocalToken(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("Authorization"), "Bearer secret-token"; got != want {
+			t.Fatalf("Authorization header = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_config", map[string]any{"server": map[string]any{"authMode": "local-token"}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "secret-token")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --json]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config show --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "server", map[string]any{"authMode": "local-token"})
+}
+
+func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("request method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got, want := body["repoPath"], "/tmp/repo"; got != want {
+			t.Fatalf("body.repoPath = %#v, want %#v", got, want)
+		}
+		if got, want := body["id"], "project_1"; got != want {
+			t.Fatalf("body.id = %#v, want %#v", got, want)
+		}
+		if got, want := body["repo"], "acme/looper"; got != want {
+			t.Fatalf("body.repo = %#v, want %#v", got, want)
+		}
+
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "project_1", "repoPath": "/tmp/repo"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "project", "add", "/tmp/repo", "--id", "project_1", "--repo", "acme/looper", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project add ... --json]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project add ... --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "id", "project_1")
+}
+
+func TestStatusWithoutJSONRemainsNotPorted(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "status")
+	if exitCode != 2 {
+		t.Fatalf("Run([status]) exit code = %d, want 2", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("Run([status]) stdout = %q, want empty string", stdout)
+	}
+	if got, want := stderr, "looper: command support has not been ported yet: status\n"; got != want {
+		t.Fatalf("Run([status]) stderr = %q, want %q", got, want)
+	}
+}
+
+func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	config := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  baseURL,
+			"authMode": "none",
+		},
+	}
+	if localToken != "" {
+		config["server"] = map[string]any{
+			"baseUrl":    baseURL,
+			"authMode":   "local-token",
+			"localToken": localToken,
+		}
+	}
+
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return configPath
+}
+
+func writeEnvelope(t *testing.T, w http.ResponseWriter, payload any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+}
+
+func assertJSONContains(t *testing.T, raw string, key string, want any) {
+	t.Helper()
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		t.Fatalf("unmarshal stdout JSON: %v\nraw=%q", err, raw)
+	}
+
+	got, ok := decoded[key]
+	if !ok {
+		t.Fatalf("stdout JSON missing key %q: %#v", key, decoded)
+	}
+
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal got value: %v", err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal want value: %v", err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("stdout JSON %q = %s, want %s", key, gotJSON, wantJSON)
 	}
 }
