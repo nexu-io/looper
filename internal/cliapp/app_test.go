@@ -34,7 +34,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list  List projects", "add   Add a project"}},
 		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
-		{args: []string{"daemon", "--help"}, subcommands: []string{"status  Show daemon status", "logs    Show daemon logs"}},
+		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "logs     Show daemon logs"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},

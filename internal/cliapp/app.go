@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -11,8 +12,12 @@ import (
 )
 
 type Deps struct {
-	Stdout io.Writer
-	Stderr io.Writer
+	Stdout     io.Writer
+	Stderr     io.Writer
+	HTTPClient *http.Client
+	HomeDir    string
+	Platform   string
+	Arch       string
 }
 
 type App struct {
@@ -113,7 +118,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "daemon",
 				short:           "Daemon commands",
-				helpSubcommands: []helpSubcommand{{name: "status", description: "Show daemon status"}, {name: "logs", description: "Show daemon logs"}},
+				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "logs", description: "Show daemon logs"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
@@ -127,7 +132,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper daemon logs --lines 50",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary"}),
+					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),
 					newCommand(commandSpec{use: "status", short: "Show daemon status"}),
 					newCommand(commandSpec{use: "start", short: "Start the daemon"}),
 					newCommand(commandSpec{use: "restart", short: "Restart the daemon"}),
