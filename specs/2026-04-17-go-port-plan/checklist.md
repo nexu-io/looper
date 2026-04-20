@@ -87,7 +87,7 @@
 - [ ] Port worktree management
 - [ ] Port notifications behavior
 - [ ] Port spec-PR label/path behavior
-- [ ] Do a dedicated agent execution design spike
+- [x] Do a dedicated agent execution design spike
 - [ ] Port agent execution lifecycle and heartbeat handling
 - [ ] Port agent completion-marker behavior
 - [ ] Preserve concurrent stdout/stderr capture, bounded buffers, inactivity timeout, and kill escalation
