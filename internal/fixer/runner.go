@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/bootstrap"
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
@@ -779,7 +780,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
 	if worktreeRoot == "" {
-		worktreeRoot = defaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
+		resolvedRoot, err := config.DefaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
+		worktreeRoot = resolvedRoot
 	}
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
 		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
@@ -1844,14 +1849,6 @@ func reconcileBaseHeadSHA(reconcile *checkpointReconcileCommits) string {
 		return ""
 	}
 	return reconcile.BaseHeadSHA
-}
-
-func defaultProjectWorktreeRoot(projectID, repoPath string) string {
-	trimmed := strings.TrimRight(repoPath, "/")
-	if trimmed == "" {
-		return ".looper/worktrees/" + projectID
-	}
-	return trimmed + "/.looper/worktrees/" + projectID
 }
 
 func compactStrings(values []string) []string {

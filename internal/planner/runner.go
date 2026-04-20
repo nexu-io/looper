@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/bootstrap"
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -127,6 +128,7 @@ type CreateWorktreeInput struct {
 }
 
 type CreateWorktreeResult struct {
+	ID           string
 	WorktreePath string
 	Branch       string
 	BaseBranch   string
@@ -261,6 +263,7 @@ type checkpointIssue struct {
 }
 
 type checkpointWorktree struct {
+	ID         string `json:"id,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Branch     string `json:"branch,omitempty"`
 	BaseBranch string `json:"baseBranch,omitempty"`
@@ -653,7 +656,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot := stringFromAnyDefault(projectMetadata["worktreeRoot"])
 	if worktreeRoot == "" {
-		worktreeRoot = defaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
+		worktreeRoot, err = config.DefaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
 	}
 	baseBranch := firstNonEmpty(derefString(input.Project.BaseBranch), "main")
 	branch := buildPlannerBranch(issue.IssueNumber, issue.Title)
@@ -661,7 +667,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 	if err != nil {
 		return checkpoint, err
 	}
-	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: created.Branch, BaseBranch: firstNonEmpty(created.BaseBranch, baseBranch), SpecPath: issue.SpecPath}
+	checkpoint.Worktree = &checkpointWorktree{ID: created.ID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: firstNonEmpty(created.BaseBranch, baseBranch), SpecPath: issue.SpecPath}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1310,14 +1316,6 @@ func buildPlannerSlug(title string) string {
 func projectRepo(project storage.ProjectRecord) string {
 	meta := parseJSONObject(project.MetadataJSON)
 	return stringFromAnyDefault(meta["repo"])
-}
-
-func defaultProjectWorktreeRoot(projectID, repoPath string) string {
-	trimmed := strings.TrimRight(repoPath, "/")
-	if trimmed == "" {
-		return ".looper/worktrees/" + projectID
-	}
-	return trimmed + "/.looper/worktrees/" + projectID
 }
 
 func int64FromAny(value any) int64 {

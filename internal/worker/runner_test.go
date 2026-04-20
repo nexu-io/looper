@@ -78,6 +78,13 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if run == nil || run.Status != "success" || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepOpenPR) {
 		t.Fatalf("run = %#v, want success through open-pr", run)
 	}
+	worktrees, err := fixture.repos.Worktrees.ListByProject(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Worktrees.ListByProject() error = %v", err)
+	}
+	if len(worktrees) != 0 {
+		t.Fatalf("Worktrees.ListByProject() = %#v, want no direct runner upsert with fake gateway", worktrees)
+	}
 }
 
 func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {

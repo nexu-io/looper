@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -237,6 +238,48 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	}
 	if run == nil || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepPush) {
 		t.Fatalf("run = %#v, want lastCompletedStep=push", run)
+	}
+}
+
+func TestProcessClaimedItemUsesDefaultProjectWorktreeRootWhenProjectMetadataOmitsIt(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil {
+		t.Fatal("project missing")
+	}
+	project.MetadataJSON = nil
+	project.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "ok"}}}, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: false, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	wantRoot, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+	if err != nil {
+		t.Fatalf("DefaultProjectWorktreeRoot() error = %v", err)
+	}
+	if len(git.createCalls) == 0 || git.createCalls[0].WorktreeRoot != wantRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %#v, want %q", git.createCalls, wantRoot)
 	}
 }
 

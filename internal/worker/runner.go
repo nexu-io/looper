@@ -660,17 +660,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		}
 	}
 	worktreeID := created.WorktreeID
-	if worktreeID == "" {
-		worktreeID = eventlog.NewEventID("worktree")
-	}
 	baseBranch := created.BaseBranch
 	if baseBranch == "" {
 		baseBranch = work.BaseBranch
-	}
-	headSHA := optionalString(created.HeadSHA)
-	record := storage.WorktreeRecord{ID: worktreeID, ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreePath: created.WorktreePath, Branch: created.Branch, BaseBranch: &baseBranch, Status: "active", HeadSHA: headSHA, CreatedAt: r.nowISO(), UpdatedAt: r.nowISO()}
-	if err := r.repos.Worktrees.Upsert(ctx, record); err != nil {
-		return checkpoint, err
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"worktreeId": worktreeID, "worktreePath": created.WorktreePath, "branch": created.Branch, "baseBranch": baseBranch})
 	if err == nil {
