@@ -37,6 +37,20 @@ func TestEnvelopeJSONShape(t *testing.T) {
 			t.Fatalf("json.Marshal() = %s, want %s", payload, want)
 		}
 	})
+
+	t.Run("error includes details when present", func(t *testing.T) {
+		envelope := Failure("request-3", ErrorCodeInternalError, "boom", map[string]any{"retryable": true})
+
+		payload, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+
+		want := `{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"boom","details":{"retryable":true}},"requestId":"request-3"}`
+		if string(payload) != want {
+			t.Fatalf("json.Marshal() = %s, want %s", payload, want)
+		}
+	})
 }
 
 func TestAllErrorCodesMatchFrozenArtifact(t *testing.T) {

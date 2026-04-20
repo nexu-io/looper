@@ -1861,16 +1861,21 @@ func assertErrorArtifactMatch(t *testing.T, body map[string]any, want errorArtif
 	t.Helper()
 
 	assertEqual(t, body["ok"], false)
-	errorMap := body["error"].(map[string]any)
-	assertEqual(t, errorMap["code"], want.Body.Error.Code)
-	assertEqual(t, errorMap["message"], want.Body.Error.Message)
 
 	requestID, ok := body["requestId"].(string)
 	if !ok || strings.TrimSpace(requestID) == "" {
 		t.Fatalf("requestId = %#v, want non-empty string", body["requestId"])
 	}
-	if want.Body.RequestID != "" && want.Body.RequestID != "<uuid>" {
-		assertEqual(t, requestID, want.Body.RequestID)
+
+	wantBytes, err := json.Marshal(want.Body)
+	if err != nil {
+		t.Fatalf("json.Marshal(want.Body) error = %v", err)
+	}
+	wantBody := parseJSONValue(t, wantBytes)
+	if !responseFixtureMatches(body, wantBody) {
+		actualJSON, _ := json.MarshalIndent(body, "", "  ")
+		wantJSON, _ := json.MarshalIndent(wantBody, "", "  ")
+		t.Fatalf("error artifact mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
 	}
 }
 
