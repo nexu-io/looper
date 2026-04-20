@@ -14,6 +14,8 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	gitinfra "github.com/powerformer/looper/internal/infra/git"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/loops"
 	"github.com/powerformer/looper/internal/projects"
 	"github.com/powerformer/looper/internal/runs"
@@ -221,6 +223,13 @@ func (r *Runtime) WaitForShutdown() {
 	<-r.shutdownCh
 }
 
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
 func (r *Runtime) Services() Services {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -291,7 +300,42 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 
 	repositories := storage.NewRepositories(coordinator.DB())
-	projectService := &projects.Service{DB: coordinator.DB(), Repos: repositories, Logger: r.logger, Now: r.now}
+	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now})
+	projectService := &projects.Service{
+		DB:     coordinator.DB(),
+		Repos:  repositories,
+		Logger: r.logger,
+		Now:    r.now,
+		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
+			return gitGateway.DetectGitHubRepo(ctx, repoPath)
+		},
+		ListWorktrees: func(ctx context.Context, repoPath string) ([]projects.WorktreeListEntry, error) {
+			worktrees, err := gitGateway.ListWorktrees(ctx, repoPath)
+			if err != nil {
+				return nil, err
+			}
+			items := make([]projects.WorktreeListEntry, 0, len(worktrees))
+			for _, worktree := range worktrees {
+				items = append(items, projects.WorktreeListEntry{Path: worktree.Path, Branch: worktree.Branch, HeadSHA: worktree.HeadSHA, Bare: worktree.Bare})
+			}
+			return items, nil
+		},
+		ListOpenPullRequests: func(ctx context.Context, input projects.ListOpenPullRequestsInput) ([]projects.PullRequestSummary, error) {
+			pullRequests, err := githubGateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
+			if err != nil {
+				return nil, err
+			}
+			items := make([]projects.PullRequestSummary, 0, len(pullRequests))
+			for _, pullRequest := range pullRequests {
+				items = append(items, projects.PullRequestSummary{Number: pullRequest.Number, State: pullRequest.State, IsDraft: pullRequest.IsDraft})
+			}
+			return items, nil
+		},
+		CapturePullRequestSnapshot: func(ctx context.Context, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+		},
+	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
 	startedAt := r.now().UTC()

@@ -37,6 +37,107 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:         coordinator.DB(),
+		Repos:      repos,
+		Now:        func() time.Time { return now },
+		DetectRepo: func(context.Context, string) (string, error) { return "powerformer/looper", nil },
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
+		},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}, {Number: 2, State: "OPEN", IsDraft: true}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			capturedAt := now.UTC().Format(time.RFC3339Nano)
+			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: "powerformer/looper", PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
+		},
+	}
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Repo == nil || *result.Repo != "powerformer/looper" {
+		t.Fatalf("AddProject().Repo = %v, want powerformer/looper", result.Repo)
+	}
+	if result.DiscoveredWorktrees != 2 {
+		t.Fatalf("AddProject().DiscoveredWorktrees = %d, want 2", result.DiscoveredWorktrees)
+	}
+	if result.DiscoveredPullRequests != 1 {
+		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 1", result.DiscoveredPullRequests)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("AddProject().Warnings = %#v, want none", result.Warnings)
+	}
+
+	worktrees, err := repos.Worktrees.ListByProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Worktrees.ListByProject() error = %v", err)
+	}
+	if len(worktrees) != 2 {
+		t.Fatalf("len(worktrees) = %d, want 2", len(worktrees))
+	}
+	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, "powerformer/looper", 1)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.GetLatest() error = %v", err)
+	}
+	if snapshot == nil || snapshot.Title == nil || *snapshot.Title != "PR 1" {
+		t.Fatalf("snapshot = %#v, want PR 1 snapshot", snapshot)
+	}
+}
+
+func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return nil, errors.New("git worktree failed")
+		},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return nil, errors.New("gh pr list failed")
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			return storage.PullRequestSnapshotRecord{}, nil
+		},
+	}
+	repo := "powerformer/looper"
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.DiscoveredWorktrees != 0 {
+		t.Fatalf("AddProject().DiscoveredWorktrees = %d, want 0", result.DiscoveredWorktrees)
+	}
+	if result.DiscoveredPullRequests != 0 {
+		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 0", result.DiscoveredPullRequests)
+	}
+	if len(result.Warnings) != 2 {
+		t.Fatalf("len(AddProject().Warnings) = %d, want 2", len(result.Warnings))
+	}
+	if result.Warnings[0] != "Could not discover worktrees: git worktree failed" {
+		t.Fatalf("Warnings[0] = %q, want worktree warning", result.Warnings[0])
+	}
+	if result.Warnings[1] != "Could not discover pull requests: gh pr list failed" {
+		t.Fatalf("Warnings[1] = %q, want pull request warning", result.Warnings[1])
+	}
+}
+
 func TestServiceAddProjectReturnsConflictForExplicitExistingID(t *testing.T) {
 	t.Parallel()
 

@@ -469,12 +469,23 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 
 func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	reqBody := []byte(`{"repoPath":"C:\\\\tmp/repos/Looper Repo"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader(reqBody))
 	req.Header.Set("x-request-id", "fixture-request-id")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project:                storage.ProjectRecord{ID: "looper-repo", Name: "looper-repo", RepoPath: `C:\\tmp/repos/Looper Repo`, BaseBranch: stringPtr(fixture.config.Defaults.BaseBranch), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				DiscoveredPullRequests: 0,
+				DiscoveredWorktrees:    0,
+				Warnings:               nil,
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
@@ -498,6 +509,42 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
+func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reqBody := []byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader(reqBody))
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			repo := "acme/looper"
+			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project:                storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Repo:                   &repo,
+				DiscoveredPullRequests: 2,
+				DiscoveredWorktrees:    3,
+				Warnings:               []string{"warn 1", "warn 2"},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	assertEqual(t, data["repo"], "acme/looper")
+	assertEqual(t, data["discoveredPullRequests"], float64(2))
+	assertEqual(t, data["discoveredWorktrees"], float64(3))
+	warnings, ok := data["warnings"].([]any)
+	if !ok || !reflect.DeepEqual(warnings, []any{"warn 1", "warn 2"}) {
+		t.Fatalf("warnings = %#v, want [warn 1 warn 2]", data["warnings"])
 	}
 }
 

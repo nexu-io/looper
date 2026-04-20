@@ -3,7 +3,9 @@ package projects
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -24,12 +26,48 @@ var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
 type DetectRepoFunc func(context.Context, string) (string, error)
 
+type ListWorktreesFunc func(context.Context, string) ([]WorktreeListEntry, error)
+
+type ListOpenPullRequestsFunc func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
+
+type CapturePullRequestSnapshotFunc func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
+
+type WorktreeListEntry struct {
+	Path    string
+	Branch  string
+	HeadSHA string
+	Bare    bool
+}
+
+type ListOpenPullRequestsInput struct {
+	Repo  string
+	CWD   string
+	Limit int
+}
+
+type PullRequestSummary struct {
+	Number  int64
+	State   string
+	IsDraft bool
+}
+
+type CapturePullRequestSnapshotInput struct {
+	ProjectID  string
+	Repo       string
+	PRNumber   int64
+	CWD        string
+	CapturedAt string
+}
+
 type Service struct {
-	DB         *sql.DB
-	Repos      *storage.Repositories
-	Logger     bootstrap.Logger
-	Now        func() time.Time
-	DetectRepo DetectRepoFunc
+	DB                         *sql.DB
+	Repos                      *storage.Repositories
+	Logger                     bootstrap.Logger
+	Now                        func() time.Time
+	DetectRepo                 DetectRepoFunc
+	ListWorktrees              ListWorktreesFunc
+	ListOpenPullRequests       ListOpenPullRequestsFunc
+	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
 }
 
 type AddInput struct {
@@ -157,7 +195,22 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, err
 	}
 
-	return AddResult{Project: record, Repo: repo, Warnings: warnings}, nil
+	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
+	if err != nil {
+		return AddResult{}, err
+	}
+	discoveredPullRequests, err := s.discoverPullRequests(ctx, record, repo, &warnings)
+	if err != nil {
+		return AddResult{}, err
+	}
+
+	return AddResult{
+		Project:                record,
+		Repo:                   repo,
+		DiscoveredPullRequests: discoveredPullRequests,
+		DiscoveredWorktrees:    discoveredWorktrees,
+		Warnings:               warnings,
+	}, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*storage.ProjectRecord, error) {
@@ -419,4 +472,148 @@ func currentISO(now func() time.Time) string {
 
 func stringPointer(value string) *string {
 	return &value
+}
+
+func (s *Service) discoverWorktrees(ctx context.Context, project storage.ProjectRecord, nowISO string, warnings *[]string) (int, error) {
+	if s.ListWorktrees == nil || s.Repos == nil || s.Repos.Worktrees == nil {
+		return 0, nil
+	}
+
+	worktrees, err := s.ListWorktrees(ctx, project.RepoPath)
+	if err != nil {
+		message := err.Error()
+		if s.Logger != nil {
+			s.Logger.Warn("failed to discover worktrees for project", map[string]any{"projectId": project.ID, "repoPath": project.RepoPath, "message": message})
+		}
+		*warnings = append(*warnings, fmt.Sprintf("Could not discover worktrees: %s", message))
+		return 0, nil
+	}
+
+	discovered := 0
+	for _, worktree := range worktrees {
+		if worktree.Bare || strings.TrimSpace(worktree.Branch) == "" {
+			continue
+		}
+
+		existing, err := s.Repos.Worktrees.GetByBranch(ctx, project.ID, worktree.Branch)
+		if err != nil {
+			return 0, err
+		}
+
+		baseBranch := stringPointer(worktree.Branch)
+		if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+			baseBranch = project.BaseBranch
+		}
+		if existing != nil && existing.BaseBranch != nil && strings.TrimSpace(*existing.BaseBranch) != "" {
+			baseBranch = existing.BaseBranch
+		}
+
+		headSHA := existingHeadSHA(existing)
+		if strings.TrimSpace(worktree.HeadSHA) != "" {
+			headSHA = stringPointer(worktree.HeadSHA)
+		}
+
+		metadataJSON := `{"discovered":true}`
+		record := storage.WorktreeRecord{
+			ID:           worktreeID(existing, s.Now),
+			ProjectID:    project.ID,
+			RepoPath:     project.RepoPath,
+			WorktreePath: worktree.Path,
+			Branch:       worktree.Branch,
+			BaseBranch:   baseBranch,
+			Status:       "active",
+			HeadSHA:      headSHA,
+			MetadataJSON: &metadataJSON,
+			CreatedAt:    worktreeCreatedAt(existing, nowISO),
+			UpdatedAt:    nowISO,
+			CleanedAt:    nil,
+		}
+		if err := s.Repos.Worktrees.Upsert(ctx, record); err != nil {
+			return 0, err
+		}
+		discovered++
+	}
+
+	return discovered, nil
+}
+
+func (s *Service) discoverPullRequests(ctx context.Context, project storage.ProjectRecord, repo *string, warnings *[]string) (int, error) {
+	if repo == nil || strings.TrimSpace(*repo) == "" || s.ListOpenPullRequests == nil || s.CapturePullRequestSnapshot == nil || s.Repos == nil || s.Repos.PullRequestSnapshots == nil {
+		return 0, nil
+	}
+
+	pullRequests, err := s.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: *repo, CWD: project.RepoPath})
+	if err != nil {
+		message := err.Error()
+		if s.Logger != nil {
+			s.Logger.Warn("failed to discover pull requests for project", map[string]any{"projectId": project.ID, "repo": *repo, "message": message})
+		}
+		*warnings = append(*warnings, fmt.Sprintf("Could not discover pull requests: %s", message))
+		return 0, nil
+	}
+
+	discovered := 0
+	for _, pullRequest := range pullRequests {
+		if pullRequest.IsDraft || normalizePRState(pullRequest.State) != "open" {
+			continue
+		}
+
+		snapshot, err := s.CapturePullRequestSnapshot(ctx, CapturePullRequestSnapshotInput{
+			ProjectID:  project.ID,
+			Repo:       *repo,
+			PRNumber:   pullRequest.Number,
+			CWD:        project.RepoPath,
+			CapturedAt: currentISO(s.Now),
+		})
+		if err != nil {
+			return 0, err
+		}
+		if err := s.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+			return 0, err
+		}
+		discovered++
+	}
+
+	return discovered, nil
+}
+
+func normalizePRState(state string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(state))
+	if trimmed == "" {
+		return "open"
+	}
+	return trimmed
+}
+
+func worktreeID(existing *storage.WorktreeRecord, now func() time.Time) string {
+	if existing != nil && strings.TrimSpace(existing.ID) != "" {
+		return existing.ID
+	}
+
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Sprintf("worktree_%d", currentTime(now).UnixNano())
+	}
+	return "worktree_" + hex.EncodeToString(raw)
+}
+
+func currentTime(now func() time.Time) time.Time {
+	if now == nil {
+		return time.Now()
+	}
+	return now()
+}
+
+func existingHeadSHA(existing *storage.WorktreeRecord) *string {
+	if existing == nil {
+		return nil
+	}
+	return existing.HeadSHA
+}
+
+func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
+	if existing != nil && strings.TrimSpace(existing.CreatedAt) != "" {
+		return existing.CreatedAt
+	}
+	return nowISO
 }
