@@ -517,6 +517,149 @@ func TestHandlerProjectsCreateRouteMapsProjectIDConflict(t *testing.T) {
 	assertEqual(t, typed.message, "Derived project id collides with an existing explicit project: looper")
 }
 
+func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
+	routes := loadResponseArtifact(t)
+	requestArtifact := loadRequestArtifact(t)
+
+	tests := []struct {
+		routeID string
+		method  string
+		path    string
+		body    string
+		prepare func(*testing.T, *Handler)
+	}{{routeID: "loops.list", method: http.MethodGet, path: "/api/v1/loops"}, {routeID: "loop.detail", method: http.MethodGet, path: "/api/v1/loops/loop_1"}, {routeID: "loop.logs", method: http.MethodGet, path: "/api/v1/loops/loop_1/logs"}, {routeID: "loop.start", method: http.MethodPost, path: "/api/v1/loops/loop_1/start"}, {routeID: "loop.pause", method: http.MethodPost, path: "/api/v1/loops/loop_1/pause", prepare: func(t *testing.T, h *Handler) {
+		t.Helper()
+		startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/start", nil)
+		startRecorder := httptest.NewRecorder()
+		h.ServeHTTP(startRecorder, startReq)
+		if startRecorder.Code != http.StatusOK {
+			t.Fatalf("pre-start status = %d, want 200", startRecorder.Code)
+		}
+	}}, {routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")}}
+
+	for _, tt := range tests {
+		t.Run(tt.routeID, func(t *testing.T) {
+			fixture := newTestFixture(t)
+			seedLoopRouteData(t, fixture.runtime)
+			h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+			if tt.prepare != nil {
+				tt.prepare(t, h)
+			}
+
+			var body io.Reader
+			if tt.body != "" {
+				body = bytes.NewReader([]byte(tt.body))
+			}
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			req.Header.Set("x-request-id", "fixture-request-id")
+			if tt.body != "" {
+				req.Header.Set("content-type", "application/json")
+			}
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", recorder.Code)
+			}
+
+			actual := normalizeResponseValue(parseJSONValue(t, recorder.Body.Bytes()), fixture.rootDir)
+			want := findResponseArtifactRoute(t, routes, tt.routeID)
+			if !responseFixtureMatches(actual, want.Body) {
+				actualJSON, _ := json.MarshalIndent(actual, "", "  ")
+				wantJSON, _ := json.MarshalIndent(want.Body, "", "  ")
+				t.Fatalf("normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
+			}
+		})
+	}
+}
+
+func TestHandlerLoopRouteErrorsMatchArtifactCases(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedLoopRouteData(t, fixture.runtime)
+
+	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+	var artifact struct {
+		Cases []errorArtifactCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	tests := []struct {
+		caseID string
+		method string
+		path   string
+		body   string
+	}{{caseID: "loop-not-found", method: http.MethodGet, path: "/api/v1/loops/missing-loop"}, {caseID: "project-not-found", method: http.MethodPost, path: "/api/v1/loops", body: `{"projectId":"missing-project","type":"worker","targetType":"project","targetId":"missing-project"}`}, {caseID: "loop-conflict", method: http.MethodPost, path: "/api/v1/loops", body: `{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`}}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	for _, tt := range tests {
+		t.Run(tt.caseID, func(t *testing.T) {
+			var body io.Reader
+			if tt.body != "" {
+				body = bytes.NewReader([]byte(tt.body))
+			}
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			req.Header.Set("x-request-id", "error-request-id")
+			if tt.body != "" {
+				req.Header.Set("content-type", "application/json")
+			}
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+
+			want := findArtifactCase(t, artifact.Cases, tt.caseID)
+			if recorder.Code != want.ExpectedStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
+			}
+			responseBody := parseJSONMap(t, recorder.Body.Bytes())
+			errorMap := responseBody["error"].(map[string]any)
+			assertEqual(t, errorMap["code"], want.Body.Error.Code)
+			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+		})
+	}
+}
+
+func TestHandlerLoopStartRejectsFixerWithoutAgentConfigured(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedLoopRouteData(t, fixture.runtime)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_no_agent",
+		Seq:        4,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:99"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(99),
+		Status:     "paused",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	configWithoutAgent := fixture.config
+	configWithoutAgent.Agent.Vendor = nil
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_fixer_no_agent/start", nil)
+	req.Header.Set("x-request-id", "error-request-id")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "AGENT_NOT_CONFIGURED")
+	assertEqual(t, errorMap["message"], "Cannot start fixer loop without config.agent.vendor")
+}
+
 func TestServerServesStatusEndpoint(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedStatusData(t, fixture.runtime)
@@ -640,6 +783,8 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 		Repo:       stringPtr("acme/looper"),
 		PRNumber:   int64Ptr(42),
 		Status:     "running",
+		LastRunAt:  stringPtr(nowISO),
+		NextRunAt:  stringPtr(nowISO),
 		CreatedAt:  nowISO,
 		UpdatedAt:  nowISO,
 	}); err != nil {
@@ -647,12 +792,15 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 	}
 
 	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID:        "run_1",
-		LoopID:    loopID,
-		Status:    "running",
-		StartedAt: nowISO,
-		CreatedAt: nowISO,
-		UpdatedAt: nowISO,
+		ID:                "run_1",
+		LoopID:            loopID,
+		Status:            "running",
+		CurrentStep:       stringPtr("review"),
+		LastCompletedStep: stringPtr("snapshot"),
+		StartedAt:         nowISO,
+		LastHeartbeatAt:   stringPtr(nowISO),
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -677,6 +825,11 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
+}
+
+func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
+	t.Helper()
+	seedStatusData(t, rt)
 }
 
 func parseJSONMap(t *testing.T, body []byte) map[string]any {
@@ -718,6 +871,44 @@ func loadResponseArtifact(t *testing.T) []responseArtifactRoute {
 	}
 
 	return artifact.Routes
+}
+
+func loadRequestArtifact(t *testing.T) []requestArtifactRoute {
+	t.Helper()
+
+	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.requests.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+
+	var artifact struct {
+		Routes []requestArtifactRoute `json:"routes"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	return artifact.Routes
+}
+
+func marshalArtifactRequestBody(t *testing.T, routes []requestArtifactRoute, routeID string) string {
+	t.Helper()
+	for _, route := range routes {
+		if route.ID != routeID {
+			continue
+		}
+		if route.Request.Body == nil {
+			return ""
+		}
+		encoded, err := json.Marshal(route.Request.Body)
+		if err != nil {
+			t.Fatalf("json.Marshal(%s) error = %v", routeID, err)
+		}
+		return string(encoded)
+	}
+	t.Fatalf("request artifact route %q not found", routeID)
+	return ""
 }
 
 func findResponseArtifactRoute(t *testing.T, routes []responseArtifactRoute, routeID string) responseArtifactRoute {
@@ -781,6 +972,9 @@ func responseFixtureMatches(actual, expected any) bool {
 		return true
 	case string:
 		switch want {
+		case "<uuid>":
+			got, ok := actual.(string)
+			return ok && strings.Count(got, "-") == 4 && strings.TrimSpace(got) != ""
 		case "<generated-timestamp>", "<current-target>":
 			got, ok := actual.(string)
 			return ok && strings.TrimSpace(got) != ""
@@ -916,4 +1110,11 @@ type errorArtifactCase struct {
 type responseArtifactRoute struct {
 	ID   string `json:"id"`
 	Body any    `json:"body"`
+}
+
+type requestArtifactRoute struct {
+	ID      string `json:"id"`
+	Request struct {
+		Body any `json:"body"`
+	} `json:"request"`
 }
