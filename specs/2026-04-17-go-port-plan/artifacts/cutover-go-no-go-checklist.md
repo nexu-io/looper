@@ -53,9 +53,9 @@ This checklist defines the explicit decision gates that must be reviewed before 
 
 - [x] The Go binaries are the default supported implementation in user-facing docs and operator guidance.
   - Blocking task: `Make Go binaries the default supported implementation`
-- [ ] Default CI is Go-first, with any remaining TypeScript verification clearly demoted to compatibility coverage instead of the primary path.
+- [x] Default CI is Go-first, with any remaining TypeScript verification clearly demoted to compatibility coverage instead of the primary path.
   - Blocking task: `Switch CI and release pipelines to Go-first`
-  - Current status: `.github/workflows/ci.yml` still runs separate `verify-ts` and `verify-go` jobs, and `.github/workflows/release.yml` still depends on Bun/npm in `prepare` and `publish-cli`.
+  - Evidence: `.github/workflows/ci.yml`, `.github/workflows/release.yml`
 - [ ] Bun is no longer required on the production runtime path for supported installs and upgrades.
   - Blocking task: `Remove Bun from the required production runtime path`
   - Current status: supported docs now point to the Go release binaries, but `.github/workflows/release.yml` still publishes the CLI through npm and production runtime assumptions still need cleanup.

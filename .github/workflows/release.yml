@@ -16,55 +16,61 @@ env:
   NODE_VERSION: 20
 
 jobs:
-  prepare:
+  prepare-go-release:
     runs-on: ubuntu-latest
 
     outputs:
-      package-version: ${{ steps.package-version.outputs.value }}
+      release-version: ${{ steps.release-version.outputs.value }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          go-version-file: go.mod
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Read CLI package version
-        id: package-version
+      - name: Check formatting
         run: |
-          package_version=$(bun --eval 'const pkg = await Bun.file("apps/cli/package.json").json(); console.log(pkg.version);')
-          echo "value=${package_version}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify tag matches CLI package version
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-          PACKAGE_VERSION: ${{ steps.package-version.outputs.value }}
-        run: |
-          expected_tag="v${PACKAGE_VERSION}"
-          if [ "$TAG_NAME" != "$expected_tag" ]; then
-            echo "Release tag ${TAG_NAME} does not match apps/cli/package.json version ${PACKAGE_VERSION}." >&2
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'These files need gofmt:\n%s\n' "$unformatted"
             exit 1
           fi
 
       - name: Lint
-        run: bun run lint
-
-      - name: Typecheck
-        run: bun run typecheck
+        run: go vet ./...
 
       - name: Test
-        run: bun run test
+        run: go test ./...
 
       - name: Build
-        run: bun run build
+        env:
+          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
+        run: |
+          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+
+      - name: Read Go release version
+        id: release-version
+        run: |
+          release_version="$(go run ./cmd/looper --version)"
+          echo "value=${release_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches Go release version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.value }}
+        run: |
+          expected_tag="v${RELEASE_VERSION}"
+          if [ "$TAG_NAME" != "$expected_tag" ]; then
+            echo "Release tag ${TAG_NAME} does not match Go release version ${RELEASE_VERSION}." >&2
+            exit 1
+          fi
 
   create-draft-release:
-    needs: prepare
+    needs: prepare-go-release
     runs-on: ubuntu-latest
 
     steps:
@@ -78,7 +84,7 @@ jobs:
 
   build-looper:
     needs:
-      - prepare
+      - prepare-go-release
       - create-draft-release
     strategy:
       fail-fast: false
@@ -134,7 +140,7 @@ jobs:
 
   build-looperd:
     needs:
-      - prepare
+      - prepare-go-release
       - create-draft-release
     strategy:
       fail-fast: false
@@ -166,7 +172,6 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          LOOPER_FORCE_COMPILE: "1"
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
         run: |
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -175,7 +180,7 @@ jobs:
 
       - name: Verify built binary version
         env:
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.package-version }}
+          EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
         run: |
           artifact_path="dist/release/${{ matrix.artifact-name }}"
           actual_version=$("$artifact_path" --version)
@@ -198,9 +203,10 @@ jobs:
             dist/release/${{ matrix.artifact-name }}
             dist/release/${{ matrix.artifact-name }}.sha256
 
-  publish-cli:
+  publish-cli-compat:
+    continue-on-error: true
     needs:
-      - prepare
+      - prepare-go-release
       - build-looperd
       - create-draft-release
     runs-on: ubuntu-latest
@@ -223,7 +229,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Publish CLI to npm
+      - name: Publish legacy CLI compatibility package to npm
         working-directory: apps/cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -231,10 +237,9 @@ jobs:
 
   publish-release:
     needs:
-      - prepare
+      - prepare-go-release
       - build-looper
       - build-looperd
-      - publish-cli
     runs-on: ubuntu-latest
 
     steps:
