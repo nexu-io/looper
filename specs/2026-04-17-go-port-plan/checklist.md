@@ -131,7 +131,7 @@
 
 - [x] Port status/config foundations before deeper runtime automation
 - [ ] Port project management before deeper loop/run automation
-- [ ] Delay process execution and agent orchestration until storage/contracts are stable
+- [x] Delay process execution and agent orchestration until storage/contracts are stable
 
 ## Phase 9 - Move packaging and release to Go
 
