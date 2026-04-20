@@ -1,0 +1,524 @@
+package cliapp
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+type Deps struct {
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+type App struct {
+	deps Deps
+}
+
+func New(deps Deps) *App {
+	return &App{deps: deps}
+}
+
+func (a *App) Run(ctx context.Context, argv []string) int {
+	root := a.newRootCommand()
+	root.SetArgs(argv)
+
+	if err := root.ExecuteContext(ctx); err != nil {
+		_, _ = fmt.Fprintf(a.stderr(), "looper: %v\n", err)
+		return exitCodeForError(err)
+	}
+
+	return 0
+
+}
+
+type commandSpec struct {
+	use             string
+	short           string
+	args            cobra.PositionalArgs
+	persistentFlags []flagSpec
+	localFlags      []flagSpec
+	exampleLines    []string
+	helpSubcommands []helpSubcommand
+	helpWhenNoArgs  bool
+	subcommands     []*cobra.Command
+}
+
+type helpSubcommand struct {
+	name        string
+	description string
+}
+
+type flagSpec struct {
+	name        string
+	valueName   string
+	description string
+	kind        flagKind
+}
+
+type flagKind int
+
+const (
+	flagKindBool flagKind = iota
+	flagKindString
+)
+
+func (a *App) newRootCommand() *cobra.Command {
+	root := newCommand(commandSpec{
+		use:             "looper",
+		short:           "Looper command-line interface",
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpWhenNoArgs:  true,
+		subcommands: []*cobra.Command{
+			newCommand(commandSpec{
+				use:   "status",
+				short: "Show service status",
+			}),
+			newCommand(commandSpec{
+				use:             "project",
+				short:           "Project commands",
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List projects"}, {name: "add", description: "Add a project"}},
+				helpWhenNoArgs:  true,
+				persistentFlags: []flagSpec{
+					stringFlag("repo-path", "path", "Repository path"),
+					stringFlag("id", "id", "Project id"),
+					stringFlag("name", "name", "Project name"),
+					stringFlag("base-branch", "branch", "Base branch"),
+					stringFlag("worktree-root", "path", "Worktree root"),
+					stringFlag("repo", "repo", "Repository slug"),
+				},
+				exampleLines: []string{
+					"$ looper project list",
+					"$ looper project add /path/to/repo",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "list", short: "List projects"}),
+					newCommand(commandSpec{use: "add", short: "Add a project"}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "config",
+				short:           "Config commands",
+				helpSubcommands: []helpSubcommand{{name: "show", description: "Show active config"}},
+				helpWhenNoArgs:  true,
+				exampleLines:    []string{"$ looper config show --json"},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "show", short: "Show active config"}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "daemon",
+				short:           "Daemon commands",
+				helpSubcommands: []helpSubcommand{{name: "status", description: "Show daemon status"}, {name: "logs", description: "Show daemon logs"}},
+				helpWhenNoArgs:  true,
+				persistentFlags: []flagSpec{
+					stringFlag("lines", "count", "Line count"),
+					boolFlag("force", "Overwrite existing installed daemon binary"),
+				},
+				exampleLines: []string{
+					"$ looper daemon install",
+					"$ looper daemon start",
+					"$ looper daemon restart",
+					"$ looper daemon status",
+					"$ looper daemon logs --lines 50",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary"}),
+					newCommand(commandSpec{use: "status", short: "Show daemon status"}),
+					newCommand(commandSpec{use: "start", short: "Start the daemon"}),
+					newCommand(commandSpec{use: "restart", short: "Restart the daemon"}),
+					newCommand(commandSpec{use: "logs", short: "Show daemon logs"}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "upgrade",
+				short: "Check or upgrade Looper installations",
+				localFlags: []flagSpec{
+					boolFlag("check", "Check available CLI and daemon updates"),
+					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
+				},
+				exampleLines: []string{
+					"$ looper upgrade --check",
+					"$ looper upgrade --daemon",
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "loop",
+				short:           "Loop commands",
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
+				helpWhenNoArgs:  true,
+				persistentFlags: []flagSpec{
+					stringFlag("id", "id", "Loop id"),
+					stringFlag("type", "type", "Loop type"),
+					stringFlag("pr", "repo#number", "Pull request reference"),
+				},
+				exampleLines: []string{
+					"$ looper loop list",
+					"$ looper loop start --type reviewer --pr acme/looper#42",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "list", short: "List loops"}),
+					newCommand(commandSpec{use: "start", short: "Start a loop"}),
+					newCommand(commandSpec{use: "pause", short: "Pause a loop"}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "work",
+				short: "Create a worker run",
+				localFlags: []flagSpec{
+					stringFlag("project", "projectId", "Project id"),
+					stringFlag("title", "title", "Task title"),
+					stringFlag("prompt", "text", "Implementation prompt"),
+					stringFlag("issue", "number", "Issue number"),
+					stringFlag("spec", "path", "Spec path"),
+					stringFlag("repo", "repo", "Repository slug"),
+					stringFlag("base-branch", "branch", "Base branch"),
+				},
+				exampleLines: []string{
+					"$ looper work --project project_1 --title \"Ship CLI\" --spec specs/ship-cli.md",
+					"$ looper work --project project_1 --issue 123",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "plan",
+				short: "Create a planner run",
+				localFlags: []flagSpec{
+					stringFlag("project", "projectId", "Project id"),
+					stringFlag("issue", "number", "Issue number"),
+				},
+				exampleLines: []string{"$ looper plan --project project_1 --issue 123"},
+			}),
+			newCommand(commandSpec{
+				use:             "pr",
+				short:           "Pull request commands",
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List pull requests"}, {name: "show", description: "Show a pull request"}, {name: "status", description: "Show pull request status"}},
+				helpWhenNoArgs:  true,
+				exampleLines: []string{
+					"$ looper pr list",
+					"$ looper pr show acme/looper#42",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "list", short: "List pull requests"}),
+					newCommand(commandSpec{use: "show", short: "Show a pull request"}),
+					newCommand(commandSpec{use: "status", short: "Show pull request status"}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "review <pr>",
+				short: "Create a reviewer task for a pull request",
+				args:  cobra.ExactArgs(1),
+				localFlags: []flagSpec{
+					stringFlag("project", "projectId", "Project id"),
+					boolFlag("loop", "Keep reviewing when new commits are pushed"),
+				},
+				exampleLines: []string{
+					"$ looper review 123",
+					"$ looper review acme/looper#42 --loop",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "ps",
+				short: "Show running loops",
+				localFlags: []flagSpec{
+					stringFlag("type", "type", "Filter by loop type"),
+					stringFlag("project", "projectId", "Filter by project id"),
+				},
+				exampleLines: []string{
+					"$ looper ps",
+					"$ looper ps --type reviewer --project project_1",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "jump [id]",
+				short: "Print shell command for a loop worktree",
+				args:  cobra.MaximumNArgs(1),
+				localFlags: []flagSpec{
+					boolFlag("print-path", "Print the worktree path only"),
+					stringFlag("shell-integration", "shell", "Print shell integration helper"),
+				},
+				exampleLines: []string{
+					"$ eval \"$(looper jump 12)\"",
+					"$ looper jump 12 --print-path",
+					"$ looper jump --shell-integration bash",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "logs <id>",
+				short: "Show logs for a loop",
+				args:  cobra.ExactArgs(1),
+				localFlags: []flagSpec{
+					boolFlag("stderr", "Show stderr instead of stdout"),
+					stringFlag("tail", "count", "Show the last N lines"),
+					boolFlag("full", "Show the full output"),
+				},
+				exampleLines: []string{
+					"$ looper logs 12",
+					"$ looper logs 12 --stderr --tail 50",
+				},
+			}),
+			newCommand(commandSpec{
+				use:          "stop <id>",
+				short:        "Stop an active loop",
+				args:         cobra.ExactArgs(1),
+				exampleLines: []string{"$ looper stop 12"},
+			}),
+			newCommand(commandSpec{
+				use:             "run",
+				short:           "Run commands",
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List runs"}},
+				helpWhenNoArgs:  true,
+				persistentFlags: []flagSpec{
+					stringFlag("loop", "loopId", "Filter by loop id"),
+				},
+				exampleLines: []string{
+					"$ looper run list",
+					"$ looper run list --loop loop_1",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "list", short: "List runs"}),
+				},
+			}),
+		},
+	})
+
+	addFlags(root.PersistentFlags(), globalFlags())
+	root.SetOut(a.stdout())
+	root.SetErr(a.stderr())
+	root.SilenceErrors = true
+	root.SilenceUsage = true
+	root.CompletionOptions.DisableDefaultCmd = true
+
+	return root
+}
+
+func newCommand(spec commandSpec) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   spec.use,
+		Short: spec.short,
+		Args:  spec.args,
+	}
+
+	if spec.helpWhenNoArgs {
+		cmd.RunE = helpCommand
+	} else {
+		cmd.RunE = notPortedCommand
+	}
+
+	if len(spec.exampleLines) > 0 {
+		cmd.Example = strings.Join(spec.exampleLines, "\n")
+	}
+
+	cmd.SetHelpFunc(func(command *cobra.Command, _ []string) {
+		renderHelp(command.OutOrStdout(), command, spec.helpSubcommands)
+	})
+
+	addFlags(cmd.PersistentFlags(), spec.persistentFlags)
+	addFlags(cmd.Flags(), spec.localFlags)
+	cmd.AddCommand(spec.subcommands...)
+	return cmd
+}
+
+func addFlags(flagSet *pflag.FlagSet, flags []flagSpec) {
+	for _, flag := range flags {
+		switch flag.kind {
+		case flagKindBool:
+			flagSet.Bool(flag.name, false, flag.description)
+		case flagKindString:
+			flagSet.String(flag.name, "", flag.description)
+		}
+
+		defined := flagSet.Lookup(flag.name)
+		if defined != nil && flag.valueName != "" {
+			defined.Annotations = map[string][]string{"looperValueName": {flag.valueName}}
+		}
+	}
+}
+
+func boolFlag(name, description string) flagSpec {
+	return flagSpec{name: name, description: description, kind: flagKindBool}
+}
+
+func stringFlag(name, valueName, description string) flagSpec {
+	return flagSpec{name: name, valueName: valueName, description: description, kind: flagKindString}
+}
+
+func renderHelp(w io.Writer, cmd *cobra.Command, listedSubcommands []helpSubcommand) {
+	var output strings.Builder
+
+	_, _ = fmt.Fprintf(&output, "Usage:\n  %s\n", cmd.UseLine())
+
+	subcommands := listedSubcommands
+	if len(subcommands) == 0 {
+		subcommands = actualSubcommands(cmd)
+	}
+	if len(subcommands) > 0 {
+		longestName := 0
+		for _, subcommand := range subcommands {
+			if len(subcommand.name) > longestName {
+				longestName = len(subcommand.name)
+			}
+		}
+
+		_, _ = fmt.Fprintf(&output, "\nSubcommands:\n")
+		for _, subcommand := range subcommands {
+			_, _ = fmt.Fprintf(&output, "  %-*s  %s\n", longestName, subcommand.name, subcommand.description)
+		}
+	}
+
+	localFlags := collectFlags(cmd.LocalFlags())
+	if len(localFlags) > 0 {
+		_, _ = fmt.Fprintf(&output, "\nFlags:\n")
+		for _, line := range localFlags {
+			_, _ = fmt.Fprintf(&output, "%s\n", line)
+		}
+	}
+
+	inheritedFlags := collectFlags(cmd.InheritedFlags())
+	if len(inheritedFlags) > 0 {
+		_, _ = fmt.Fprintf(&output, "\nGlobal Flags:\n")
+		for _, line := range inheritedFlags {
+			_, _ = fmt.Fprintf(&output, "%s\n", line)
+		}
+	}
+
+	if example := strings.TrimSpace(cmd.Example); example != "" {
+		_, _ = fmt.Fprintf(&output, "\nExamples:\n%s\n", example)
+	}
+
+	_, _ = io.WriteString(w, output.String())
+}
+
+func actualSubcommands(cmd *cobra.Command) []helpSubcommand {
+	subcommands := make([]helpSubcommand, 0)
+	for _, child := range cmd.Commands() {
+		if !child.IsAvailableCommand() || child.Hidden || child.Name() == "help" {
+			continue
+		}
+		subcommands = append(subcommands, helpSubcommand{name: child.Name(), description: child.Short})
+	}
+	return subcommands
+}
+
+func collectFlags(flagSet *pflag.FlagSet) []string {
+	flags := make([]string, 0)
+	flagSet.VisitAll(func(flag *pflag.Flag) {
+		if flag.Name == "help" || flag.Hidden {
+			return
+		}
+
+		syntax := "--" + flag.Name
+		if flag.Value.Type() != "bool" {
+			valueName := "value"
+			if values := flag.Annotations["looperValueName"]; len(values) > 0 && values[0] != "" {
+				valueName = values[0]
+			}
+			syntax += " <" + valueName + ">"
+		}
+
+		flags = append(flags, fmt.Sprintf("  %-27s %s", syntax, flag.Usage))
+	})
+	return flags
+}
+
+func globalFlags() []flagSpec {
+	return []flagSpec{
+		boolFlag("json", "Emit JSON output"),
+		stringFlag("config", "path", "Config path"),
+		stringFlag("host", "host", "Server host"),
+		stringFlag("port", "port", "Server port"),
+		stringFlag("db-path", "path", "Database path"),
+		stringFlag("log-dir", "path", "Daemon log directory"),
+		stringFlag("daemon-mode", "mode", "Daemon mode"),
+		stringFlag("bun-path", "path", "Bun binary path"),
+		stringFlag("git-path", "path", "Git binary path"),
+		stringFlag("gh-path", "path", "GitHub CLI path"),
+		stringFlag("osascript-path", "path", "osascript binary path"),
+	}
+}
+
+func helpCommand(cmd *cobra.Command, _ []string) error {
+	return cmd.Help()
+}
+
+func notPortedCommand(cmd *cobra.Command, _ []string) error {
+	path := strings.TrimSpace(strings.TrimPrefix(cmd.CommandPath(), "looper"))
+	if path == "" {
+		path = cmd.Name()
+	}
+	return notPortedError{Path: strings.TrimSpace(path)}
+}
+
+type notPortedError struct {
+	Path string
+}
+
+func (e notPortedError) Error() string {
+	return fmt.Sprintf("command support has not been ported yet: %s", e.Path)
+}
+
+func exitCodeForError(err error) int {
+	_ = err
+	return 2
+}
+
+func (a *App) stdout() io.Writer {
+	if a.deps.Stdout != nil {
+		return a.deps.Stdout
+	}
+	return io.Discard
+}
+
+func (a *App) stderr() io.Writer {
+	if a.deps.Stderr != nil {
+		return a.deps.Stderr
+	}
+	return io.Discard
+}
+
+var configFlagNames = map[string]struct{}{
+	"config":         {},
+	"host":           {},
+	"port":           {},
+	"db-path":        {},
+	"log-dir":        {},
+	"daemon-mode":    {},
+	"bun-path":       {},
+	"git-path":       {},
+	"gh-path":        {},
+	"osascript-path": {},
+}
+
+func ExtractConfigArgs(argv []string) []string {
+	extracted := make([]string, 0)
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if !strings.HasPrefix(arg, "--") {
+			continue
+		}
+
+		trimmed := strings.TrimPrefix(arg, "--")
+		name := trimmed
+		if equals := strings.Index(trimmed, "="); equals >= 0 {
+			name = trimmed[:equals]
+		}
+
+		if _, ok := configFlagNames[name]; !ok {
+			continue
+		}
+
+		extracted = append(extracted, arg)
+		if !strings.Contains(trimmed, "=") && index+1 < len(argv) {
+			next := argv[index+1]
+			if !strings.HasPrefix(next, "--") {
+				extracted = append(extracted, next)
+				index++
+			}
+		}
+	}
+
+	return extracted
+}
