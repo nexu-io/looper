@@ -23,25 +23,27 @@ func newCommandRuntime(app *App, argv []string) *commandRuntime {
 }
 
 func (r *commandRuntime) status(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/status")
-	})
+	}, writeHumanStatus)
 }
 
 func (r *commandRuntime) configShow(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/config")
+	}, func(w io.Writer, payload json.RawMessage) error {
+		return writeJSON(w, payload)
 	})
 }
 
 func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/projects")
-	})
+	}, writeHumanProjectList)
 }
 
 func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		repoPath := strings.TrimSpace(getStringFlag(cmd, "repo-path"))
 		if repoPath == "" && len(args) > 0 {
 			repoPath = strings.TrimSpace(args[0])
@@ -56,17 +58,17 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		setString(body, "repo", getStringFlag(cmd, "repo"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
-	})
+	}, writeHumanProjectAdd)
 }
 
 func (r *commandRuntime) loopList(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/loops")
-	})
+	}, writeHumanLoopList)
 }
 
 func (r *commandRuntime) loopStart(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		loopType := strings.TrimSpace(getStringFlag(cmd, "type"))
 		if loopType == "" {
 			return nil, fmt.Errorf("loop start requires --type <type>")
@@ -97,11 +99,11 @@ func (r *commandRuntime) loopStart(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
-	})
+	}, writeHumanLoopStarted)
 }
 
 func (r *commandRuntime) loopPause(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		loopID := strings.TrimSpace(getStringFlag(cmd, "id"))
 		if loopID == "" && len(args) > 0 {
 			loopID = strings.TrimSpace(args[0])
@@ -111,37 +113,37 @@ func (r *commandRuntime) loopPause(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(loopID)+"/pause", nil)
-	})
+	}, writeHumanLoopPaused)
 }
 
 func (r *commandRuntime) pullRequestList(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/pull-requests")
-	})
+	}, writeHumanPullRequestList)
 }
 
 func (r *commandRuntime) pullRequestShow(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		repo, prNumber, err := parsePullRequestRef(args[0])
 		if err != nil {
 			return nil, err
 		}
 		return r.getJSON(ctx, pullRequestPath(repo, prNumber))
-	})
+	}, writeHumanPullRequestShow)
 }
 
 func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		repo, prNumber, err := parsePullRequestRef(args[0])
 		if err != nil {
 			return nil, err
 		}
 		return r.getJSON(ctx, pullRequestPath(repo, prNumber)+"/status")
-	})
+	}, writeHumanPullRequestStatus)
 }
 
 func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		repo, prNumber, err := parsePullRequestRef(args[0])
 		if err != nil {
 			return nil, err
@@ -169,11 +171,13 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
+	}, func(w io.Writer, payload json.RawMessage) error {
+		return writeHumanReviewCreate(w, payload, getBoolFlag(cmd, "loop"))
 	})
 }
 
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		query := url.Values{}
 		addQueryString(query, "type", getStringFlag(cmd, "type"))
 		addQueryString(query, "projectId", getStringFlag(cmd, "project"))
@@ -184,24 +188,26 @@ func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.getJSON(ctx, path)
-	})
+	}, writeHumanActiveRuns)
 }
 
 func (r *commandRuntime) loopLogs(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/loops/"+url.PathEscape(strings.TrimSpace(args[0]))+"/logs")
+	}, func(w io.Writer, payload json.RawMessage) error {
+		return writeHumanLoopLogs(w, payload, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail"))
 	})
 }
 
 func (r *commandRuntime) stopLoop(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		selector := strings.TrimSpace(args[0])
 		return r.postJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(selector)+"/stop", nil)
-	})
+	}, writeHumanStopLoop)
 }
 
 func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		query := url.Values{}
 		addQueryString(query, "loopId", getStringFlag(cmd, "loop"))
 
@@ -211,11 +217,11 @@ func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.getJSON(ctx, path)
-	})
+	}, writeHumanRunList)
 }
 
 func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		issueNumberValue := strings.TrimSpace(getStringFlag(cmd, "issue"))
 		prompt := strings.TrimSpace(getStringFlag(cmd, "prompt"))
 		specPath := strings.TrimSpace(getStringFlag(cmd, "spec"))
@@ -245,11 +251,11 @@ func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		return r.postJSON(ctx, "/api/v1/workers", body)
-	})
+	}, writeHumanWorkerCreate)
 }
 
 func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
-	return r.jsonCommand(cmd, func(ctx context.Context) (any, error) {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		issueNumber, err := parsePositiveInt(strings.TrimSpace(getStringFlag(cmd, "issue")), "--issue")
 		if err != nil {
 			return nil, err
@@ -259,17 +265,17 @@ func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
 		setString(body, "projectId", getStringFlag(cmd, "project"))
 
 		return r.postJSON(ctx, "/api/v1/planners", body)
-	})
+	}, writeHumanPlannerCreate)
 }
 
-func (r *commandRuntime) jsonCommand(cmd *cobra.Command, fn func(ctx context.Context) (any, error)) error {
-	if !getBoolFlag(cmd, "json") {
-		return notPortedCommand(cmd, nil)
-	}
-
+func (r *commandRuntime) outputCommand(cmd *cobra.Command, fn func(ctx context.Context) (json.RawMessage, error), human func(io.Writer, json.RawMessage) error) error {
 	payload, err := fn(cmd.Context())
 	if err != nil {
 		return err
+	}
+
+	if !getBoolFlag(cmd, "json") {
+		return human(cmd.OutOrStdout(), payload)
 	}
 
 	return writeJSON(cmd.OutOrStdout(), payload)

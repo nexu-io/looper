@@ -251,18 +251,139 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 	assertJSONContains(t, stdout, "id", "project_1")
 }
 
-func TestStatusWithoutJSONRemainsNotPorted(t *testing.T) {
+func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {
 	t.Parallel()
 
-	exitCode, stdout, stderr := runApp(t, "status")
-	if exitCode != 2 {
-		t.Fatalf("Run([status]) exit code = %d, want 2", exitCode)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{
+			"service":   map[string]any{"healthy": true, "version": "1.2.3", "daemonMode": "full", "startedAt": "2026-04-20T10:00:00.000Z"},
+			"storage":   map[string]any{"dbPath": "/tmp/looper.sqlite", "schemaVersion": "12", "healthy": true, "pendingMigrations": []string{}},
+			"scheduler": map[string]any{"healthy": true, "queuedItems": 2, "runningItems": 1},
+			"loops": map[string]any{
+				"planner":  map[string]any{"running": 0, "paused": 1, "failed": 0},
+				"reviewer": map[string]any{"running": 1, "paused": 0, "failed": 0},
+				"worker":   map[string]any{"running": 2, "paused": 0, "failed": 1},
+				"fixer":    map[string]any{"running": 0, "paused": 0, "failed": 0},
+			},
+			"tools":         map[string]any{"bun": true, "git": true, "gh": false, "osascript": true},
+			"notifications": map[string]any{"inAppEnabled": true, "osascriptEnabled": false},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "status", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status]) exit code = %d, want 0", exitCode)
 	}
-	if stdout != "" {
-		t.Fatalf("Run([status]) stdout = %q, want empty string", stdout)
+	if stderr != "" {
+		t.Fatalf("Run([status]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stderr, "looper: command support has not been ported yet: status\n"; got != want {
-		t.Fatalf("Run([status]) stderr = %q, want %q", got, want)
+	for _, want := range []string{"Service", "healthy    : yes", "version    : 1.2.3", "Storage", "Scheduler", "type", "reviewer", "Tools", "gh        : no", "Notifications"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([status]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestConfigShowWithoutJSONPrintsJSON(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_config", map[string]any{"server": map[string]any{"authMode": "none"}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config show]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "server", map[string]any{"authMode": "none"})
+}
+
+func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "project", "list", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project list]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project list]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"id", "repoPath", "project_1", "/tmp/repo", "acme/looper"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([project list]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestPSWithoutJSONPrintsEmptyMessage(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "No running or queued loops.\n"; got != want {
+		t.Fatalf("Run([ps]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{"seq": 12, "loopId": "loop_1", "loopType": "reviewer", "loopStatus": "running", "run": map[string]any{"runId": "run_1", "currentStep": "review"}, "agent": map[string]any{"vendor": "openai", "pid": 1234, "status": "running", "stdout": "line1\nline2\nline3\n", "stderr": "err1\nerr2\n"}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--tail", "2", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --tail 2]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --tail 2]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: openai · pid 1234 · running", "line2", "line3"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "line1") {
+		t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, did not expect trimmed line", stdout)
 	}
 }
 
