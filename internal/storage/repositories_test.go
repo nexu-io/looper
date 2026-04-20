@@ -67,6 +67,30 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
+	agentCommand := `{"command":"codex","args":["exec","prompt"]}`
+	agentCWD := "/tmp/looper"
+	agentOutput := `{"stdout":"ok","stderr":""}`
+	pid := int64(12345)
+	if err := repos.AgentExecutions.Upsert(ctx, AgentExecutionRecord{
+		ID:              "agent_1",
+		RunID:           strPtr("run_1"),
+		LoopID:          strPtr("loop_1"),
+		ProjectID:       strPtr("project_1"),
+		Vendor:          "codex",
+		Status:          "running",
+		PID:             &pid,
+		CommandJSON:     &agentCommand,
+		CWD:             &agentCWD,
+		HeartbeatCount:  2,
+		OutputJSON:      &agentOutput,
+		StartedAt:       now,
+		LastHeartbeatAt: &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
 	headSHA := "abc123"
 	if err := repos.PullRequestSnapshots.Upsert(ctx, PullRequestSnapshotRecord{
 		ID:         "snapshot_1",
@@ -182,6 +206,30 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 	if latestRun == nil || latestRun.ID != "run_1" {
 		t.Fatalf("Runs.GetLatestByLoopID() = %#v, want run_1", latestRun)
+	}
+
+	agentExecution, err := repos.AgentExecutions.GetByID(ctx, "agent_1")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if agentExecution == nil || agentExecution.ID != "agent_1" || agentExecution.HeartbeatCount != 2 {
+		t.Fatalf("AgentExecutions.GetByID() = %#v, want agent_1 with heartbeat_count=2", agentExecution)
+	}
+
+	latestExecution, err := repos.AgentExecutions.GetLatestByRunID(ctx, "run_1")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetLatestByRunID() error = %v", err)
+	}
+	if latestExecution == nil || latestExecution.ID != "agent_1" {
+		t.Fatalf("AgentExecutions.GetLatestByRunID() = %#v, want agent_1", latestExecution)
+	}
+
+	activeExecutions, err := repos.AgentExecutions.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("AgentExecutions.ListActive() error = %v", err)
+	}
+	if len(activeExecutions) != 1 || activeExecutions[0].ID != "agent_1" {
+		t.Fatalf("AgentExecutions.ListActive() = %#v, want [agent_1]", activeExecutions)
 	}
 
 	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, repo, prNumber)

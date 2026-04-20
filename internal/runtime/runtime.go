@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/powerformer/looper/internal/bootstrap"
@@ -471,7 +473,54 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	eventsWritten := int64(0)
 	summary := createEmptyRecoverySummary()
 	summary.StartedAt = nowISO
-	summary.OrphanAgentCleanup.Warning = "agent execution recovery has not been ported yet"
+	summary.OrphanAgentCleanup.Attempted = true
+	if repositories.AgentExecutions != nil {
+		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
+		if err != nil {
+			return RecoverySummary{}, err
+		}
+		for _, execution := range activeExecutions {
+			if execution.PID == nil || *execution.PID <= 0 {
+				continue
+			}
+			pid := int(*execution.PID)
+			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+				if r.logger != nil {
+					r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+				}
+				continue
+			}
+
+			cleaned := execution
+			cleaned.Status = "killed"
+			if cleaned.ErrorMessage == nil {
+				cleaned.ErrorMessage = stringPtr("Killed during looperd recovery")
+			}
+			cleaned.EndedAt = stringPtr(nowISO)
+			cleaned.UpdatedAt = nowISO
+			if err := repositories.AgentExecutions.Upsert(ctx, cleaned); err != nil {
+				return RecoverySummary{}, err
+			}
+			summary.OrphanAgentCleanup.CleanedCount += 1
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "agent.killed",
+				ProjectID:  execution.ProjectID,
+				LoopID:     execution.LoopID,
+				RunID:      execution.RunID,
+				EntityType: stringPtr("agent_execution"),
+				EntityID:   stringPtr(execution.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"pid":         pid,
+					"recoveredAt": nowISO,
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+		}
+	}
 
 	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
 	if err != nil {

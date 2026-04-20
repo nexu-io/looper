@@ -418,6 +418,77 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	pid := int64(999999)
+	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:             "agent_orphan_1",
+		Vendor:         "codex",
+		Status:         "running",
+		PID:            &pid,
+		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
+		CWD:            stringPtr(workingDir),
+		HeartbeatCount: 0,
+		StartedAt:      nowISO,
+		CreatedAt:      nowISO,
+		UpdatedAt:      nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_orphan_1")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if agentExecution == nil || agentExecution.Status != "killed" || agentExecution.EndedAt == nil {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want killed with ended_at", agentExecution)
+	}
+
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_1")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(agent_execution) error = %v", err)
+	}
+	if !containsEventType(events, "agent.killed") {
+		t.Fatalf("agent_execution events = %#v, want agent.killed", events)
+	}
+
+	recovery := rt.RecoverySummary()
+	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 1 {
+		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + cleanedCount=1", recovery.OrphanAgentCleanup)
+	}
+}
+
 func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
 	t.Parallel()
 

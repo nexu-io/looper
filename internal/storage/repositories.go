@@ -18,6 +18,7 @@ type Repositories struct {
 	Projects             *ProjectsRepository
 	Loops                *LoopsRepository
 	Runs                 *RunsRepository
+	AgentExecutions      *AgentExecutionsRepository
 	PullRequestSnapshots *PullRequestSnapshotsRepository
 	Events               *EventsRepository
 	Locks                *LocksRepository
@@ -31,6 +32,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Projects:             &ProjectsRepository{q: q},
 		Loops:                &LoopsRepository{q: q},
 		Runs:                 &RunsRepository{q: q},
+		AgentExecutions:      &AgentExecutionsRepository{q: q},
 		PullRequestSnapshots: &PullRequestSnapshotsRepository{q: q},
 		Events:               &EventsRepository{q: q},
 		Locks:                &LocksRepository{q: q, now: time.Now},
@@ -83,6 +85,30 @@ type RunRecord struct {
 	EndedAt           *string
 	CreatedAt         string
 	UpdatedAt         string
+}
+
+type AgentExecutionRecord struct {
+	ID               string
+	ProjectID        *string
+	LoopID           *string
+	RunID            *string
+	Vendor           string
+	Status           string
+	PID              *int64
+	CommandJSON      *string
+	CWD              *string
+	Summary          *string
+	ParseStatus      *string
+	CompletionSignal *string
+	HeartbeatCount   int64
+	LastHeartbeatAt  *string
+	OutputJSON       *string
+	ErrorMessage     *string
+	StartedAt        string
+	EndedAt          *string
+	MetadataJSON     *string
+	CreatedAt        string
+	UpdatedAt        string
 }
 
 type PullRequestSnapshotRecord struct {
@@ -468,6 +494,8 @@ func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
 
 type RunsRepository struct{ q sqliteQuerier }
 
+type AgentExecutionsRepository struct{ q sqliteQuerier }
+
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at)
@@ -545,6 +573,74 @@ func (r *RunsRepository) ListByLoop(ctx context.Context, loopID string) ([]RunRe
 	defer rows.Close()
 
 	return scanRuns(rows)
+}
+
+func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExecutionRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, started_at, ended_at, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			project_id=excluded.project_id,
+			loop_id=excluded.loop_id,
+			run_id=excluded.run_id,
+			vendor=excluded.vendor,
+			status=excluded.status,
+			pid=excluded.pid,
+			command_json=excluded.command_json,
+			cwd=excluded.cwd,
+			summary=excluded.summary,
+			parse_status=excluded.parse_status,
+			completion_signal=excluded.completion_signal,
+			heartbeat_count=excluded.heartbeat_count,
+			last_heartbeat_at=excluded.last_heartbeat_at,
+			output_json=excluded.output_json,
+			error_message=excluded.error_message,
+			started_at=excluded.started_at,
+			ended_at=excluded.ended_at,
+			metadata_json=excluded.metadata_json,
+			updated_at=excluded.updated_at
+	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("upsert agent execution: %w", err)
+	}
+
+	return nil
+}
+
+func (r *AgentExecutionsRepository) GetByID(ctx context.Context, id string) (*AgentExecutionRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM agent_executions WHERE id = ?`, id)
+	record, err := scanAgentExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get agent execution by id: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *AgentExecutionsRepository) GetLatestByRunID(ctx context.Context, runID string) (*AgentExecutionRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM agent_executions WHERE run_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, runID)
+	record, err := scanAgentExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest agent execution by run id: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *AgentExecutionsRepository) ListActive(ctx context.Context) ([]AgentExecutionRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list active agent executions: %w", err)
+	}
+	defer rows.Close()
+
+	return scanAgentExecutions(rows)
 }
 
 type PullRequestSnapshotsRepository struct{ q sqliteQuerier }
@@ -1153,6 +1249,87 @@ func scanRuns(rows *sql.Rows) ([]RunRecord, error) {
 	}
 
 	return records, nil
+}
+
+func scanAgentExecutions(rows *sql.Rows) ([]AgentExecutionRecord, error) {
+	records := make([]AgentExecutionRecord, 0)
+	for rows.Next() {
+		record, err := scanAgentExecution(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent execution rows: %w", err)
+	}
+
+	return records, nil
+}
+
+func scanAgentExecution(row interface{ Scan(...any) error }) (AgentExecutionRecord, error) {
+	var (
+		record           AgentExecutionRecord
+		projectID        sql.NullString
+		loopID           sql.NullString
+		runID            sql.NullString
+		pid              sql.NullInt64
+		commandJSON      sql.NullString
+		cwd              sql.NullString
+		summary          sql.NullString
+		parseStatus      sql.NullString
+		completionSignal sql.NullString
+		lastHeartbeatAt  sql.NullString
+		outputJSON       sql.NullString
+		errorMessage     sql.NullString
+		endedAt          sql.NullString
+		metadataJSON     sql.NullString
+	)
+
+	err := row.Scan(
+		&record.ID,
+		&projectID,
+		&loopID,
+		&runID,
+		&record.Vendor,
+		&record.Status,
+		&pid,
+		&commandJSON,
+		&cwd,
+		&summary,
+		&parseStatus,
+		&completionSignal,
+		&record.HeartbeatCount,
+		&lastHeartbeatAt,
+		&outputJSON,
+		&errorMessage,
+		&record.StartedAt,
+		&endedAt,
+		&metadataJSON,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return AgentExecutionRecord{}, err
+	}
+
+	record.ProjectID = nullableString(projectID)
+	record.LoopID = nullableString(loopID)
+	record.RunID = nullableString(runID)
+	record.PID = nullableInt64(pid)
+	record.CommandJSON = nullableString(commandJSON)
+	record.CWD = nullableString(cwd)
+	record.Summary = nullableString(summary)
+	record.ParseStatus = nullableString(parseStatus)
+	record.CompletionSignal = nullableString(completionSignal)
+	record.LastHeartbeatAt = nullableString(lastHeartbeatAt)
+	record.OutputJSON = nullableString(outputJSON)
+	record.ErrorMessage = nullableString(errorMessage)
+	record.EndedAt = nullableString(endedAt)
+	record.MetadataJSON = nullableString(metadataJSON)
+
+	return record, nil
 }
 
 func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {

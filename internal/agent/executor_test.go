@@ -1,0 +1,188 @@
+package agent
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/storage"
+)
+
+func TestResolveSpawnVendorParity(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	command, args := ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorClaudeCode, Model: &model}, "hello")
+	if command != "claude" {
+		t.Fatalf("claude command = %q, want claude", command)
+	}
+	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
+		t.Fatalf("claude args = %#v, want --model <model> --print <prompt>", args)
+	}
+
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex, Model: &model}, "hello")
+	if command != "codex" {
+		t.Fatalf("codex command = %q, want codex", command)
+	}
+	if len(args) < 4 || args[0] != "exec" || args[1] != "--model" || args[len(args)-1] != "hello" {
+		t.Fatalf("codex args = %#v, want exec --model <model> <prompt>", args)
+	}
+
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorOpenCode, Model: &model}, "hello")
+	if command != "opencode" {
+		t.Fatalf("opencode command = %q, want opencode", command)
+	}
+	if len(args) < 4 || args[0] != "run" || args[1] != "--model" || args[len(args)-1] != "hello" {
+		t.Fatalf("opencode args = %#v, want run --model <model> <prompt>", args)
+	}
+
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCursorCLI, Model: &model}, "hello")
+	if command != "agent" {
+		t.Fatalf("cursor command = %q, want agent", command)
+	}
+	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
+		t.Fatalf("cursor args = %#v, want --model <model> --print <prompt>", args)
+	}
+}
+
+func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'ok\n'; printf 'LOOPER_COMPLETION={\"summary\":\"done\"}\n'"}}},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_1", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result.Status = %q, want completed", result.Status)
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_1")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.Status != "completed" || record.EndedAt == nil {
+		t.Fatalf("agent execution record = %#v, want completed with endedAt", record)
+	}
+
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "agent_1")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEvent(events, "agent.invoked") || !containsEvent(events, "agent.completed") {
+		t.Fatalf("agent events = %#v, want invoked + completed", events)
+	}
+}
+
+func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3; do printf \"beat$i\\n\"; sleep 0.05; done"}}}, Repos: repos})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := execHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_hb")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.HeartbeatCount < 3 || record.LastHeartbeatAt == nil {
+		t.Fatalf("heartbeat record = %#v, want >=3 heartbeats with timestamp", record)
+	}
+}
+
+func TestExecutorTimeoutMarksTimeout(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 1"}}}, Repos: repos})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 100 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" {
+		t.Fatalf("timeout status = %q, want timeout", result.Status)
+	}
+}
+
+func TestExecutorExplicitKillMarksKilled(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 2"}}}, Repos: repos})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := execHandle.Kill("test kill"); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "killed" {
+		t.Fatalf("result status = %q, want killed", result.Status)
+	}
+}
+
+func openAgentCoordinator(t *testing.T) *storage.SQLiteCoordinator {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "agent.sqlite")
+	backupDir := filepath.Join(t.TempDir(), "backup")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{BackupDir: backupDir})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = coordinator.Close()
+	})
+	return coordinator
+}
+
+func containsEvent(events []storage.EventLogRecord, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
