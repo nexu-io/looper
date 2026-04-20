@@ -5,15 +5,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/projects"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/storage"
 	"github.com/powerformer/looper/internal/version"
@@ -25,6 +28,8 @@ const (
 	apiBasePath         = "/api/v1"
 	javaScriptISOString = "2006-01-02T15:04:05.000Z"
 )
+
+var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
 type RuntimeState interface {
 	Services() looperdruntime.Services
@@ -122,6 +127,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		return
+	case apiBasePath + "/projects":
+		payload, err := h.buildProjectsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
 		return
 	}
 
@@ -667,6 +685,218 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 		normalized["eventsWritten"] = summary.EventsWritten
 	}
 
+	return normalized
+}
+
+type projectsListResponse struct {
+	Items []projectResponse `json:"items"`
+}
+
+type projectResponse struct {
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	RepoPath     string  `json:"repoPath"`
+	BaseBranch   string  `json:"baseBranch"`
+	Archived     bool    `json:"archived"`
+	Repo         *string `json:"repo"`
+	WorktreeRoot *string `json:"worktreeRoot"`
+	CreatedAt    string  `json:"createdAt"`
+	UpdatedAt    string  `json:"updatedAt"`
+}
+
+type createProjectResponse struct {
+	projectResponse
+	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
+	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
+	Warnings               []string `json:"warnings"`
+}
+
+type projectService interface {
+	List(context.Context) ([]storage.ProjectRecord, error)
+	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
+}
+
+func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
+	services := h.context.Runtime.Services()
+	if services.Projects == nil {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeProjectsUnavailable,
+			status:  http.StatusInternalServerError,
+			message: "Project management is not available in this runtime",
+		}
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		items, err := services.Projects.List(r.Context())
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		responseItems := make([]projectResponse, 0, len(items))
+		for _, item := range items {
+			responseItems = append(responseItems, serializeProject(item, h.context.Config.Defaults.BaseBranch))
+		}
+		return projectsListResponse{Items: responseItems}, nil
+	case http.MethodPost:
+		return h.buildCreateProjectResponse(r, services.Projects)
+	default:
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeMethodNotAllowed,
+			status:  http.StatusMethodNotAllowed,
+			message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/projects"),
+		}
+	}
+}
+
+type createProjectRequest struct {
+	RepoPath     *string `json:"repoPath"`
+	ID           *string `json:"id"`
+	Name         *string `json:"name"`
+	BaseBranch   *string `json:"baseBranch"`
+	WorktreeRoot *string `json:"worktreeRoot"`
+	Repo         *string `json:"repo"`
+}
+
+func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
+	body := createProjectRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	}
+
+	repoPath := strings.TrimSpace(derefString(body.RepoPath))
+	if repoPath == "" {
+		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repoPath is required"}
+	}
+
+	providedID := strings.TrimSpace(derefString(body.ID))
+	idSource := "derived"
+	projectID := providedID
+	if projectID == "" {
+		projectID = deriveProjectIDFromRepoPath(repoPath)
+	} else {
+		idSource = "explicit"
+	}
+
+	name := strings.TrimSpace(derefString(body.Name))
+	if name == "" {
+		name = projectID
+	}
+
+	baseBranch := strings.TrimSpace(derefString(body.BaseBranch))
+	if baseBranch == "" {
+		baseBranch = h.context.Config.Defaults.BaseBranch
+	}
+
+	result, err := service.AddProject(r.Context(), projects.AddInput{
+		ID:           projectID,
+		Name:         name,
+		RepoPath:     repoPath,
+		BaseBranch:   baseBranch,
+		IDSource:     idSource,
+		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
+		Repo:         normalizeOptionalString(body.Repo),
+	})
+	if err != nil {
+		var collision projects.ProjectIDCollisionError
+		switch {
+		case errors.As(err, &collision):
+			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeProjectIDConflict, status: http.StatusConflict, message: err.Error()}
+		case strings.HasPrefix(err.Error(), "invalid project id"):
+			message := strings.Replace(err.Error(), "invalid project id", "Invalid project id", 1)
+			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: message}
+		default:
+			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	}
+
+	return createProjectResponse{
+		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
+		DiscoveredPullRequests: result.DiscoveredPullRequests,
+		DiscoveredWorktrees:    result.DiscoveredWorktrees,
+		Warnings:               append([]string{}, result.Warnings...),
+	}, nil
+}
+
+func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {
+	metadata := parseProjectMetadata(project.MetadataJSON)
+
+	baseBranch := defaultBaseBranch
+	if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+		baseBranch = *project.BaseBranch
+	}
+
+	return projectResponse{
+		ID:           project.ID,
+		Name:         project.Name,
+		RepoPath:     project.RepoPath,
+		BaseBranch:   baseBranch,
+		Archived:     project.Archived,
+		Repo:         stringMetadataPtr(metadata, "repo"),
+		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
+		CreatedAt:    project.CreatedAt,
+		UpdatedAt:    project.UpdatedAt,
+	}
+}
+
+func parseProjectMetadata(metadataJSON *string) map[string]any {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return map[string]any{}
+	}
+
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return map[string]any{}
+	}
+
+	return metadata
+}
+
+func stringMetadataPtr(metadata map[string]any, key string) *string {
+	value, ok := metadata[key]
+	if !ok {
+		return nil
+	}
+
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	result := text
+	return &result
+}
+
+func normalizeOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+
+	return &trimmed
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func deriveProjectIDFromRepoPath(repoPath string) string {
+	segments := strings.FieldsFunc(repoPath, func(r rune) bool { return r == '/' || r == '\\' })
+	lastSegment := "project"
+	if len(segments) > 0 {
+		lastSegment = segments[len(segments)-1]
+	}
+	normalized := strings.Trim(nonProjectIDPattern.ReplaceAllString(strings.ToLower(lastSegment), "-"), "-")
+	if normalized == "" {
+		return "project"
+	}
 	return normalized
 }
 

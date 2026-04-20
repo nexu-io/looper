@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/projects"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -325,6 +327,194 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandlerProjectsListRouteSuccess(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	baseBranch := "main"
+
+	err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "project_1",
+		Name:         "Looper",
+		RepoPath:     "/tmp/looper",
+		BaseBranch:   &baseBranch,
+		Archived:     false,
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	})
+	if err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+	assertEqual(t, body["requestId"], "fixture-request-id")
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+
+	project := items[0].(map[string]any)
+	assertEqual(t, project["id"], "project_1")
+	assertEqual(t, project["name"], "Looper")
+	assertEqual(t, project["repoPath"], "/tmp/looper")
+	assertEqual(t, project["baseBranch"], "main")
+	assertEqual(t, project["archived"], false)
+	assertEqual(t, project["repo"], "acme/looper")
+	if project["worktreeRoot"] != nil {
+		t.Fatalf("worktreeRoot = %#v, want nil", project["worktreeRoot"])
+	}
+	assertEqual(t, project["createdAt"], nowISO)
+	assertEqual(t, project["updatedAt"], nowISO)
+}
+
+func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
+	fixture := newTestFixture(t)
+	reqBody := []byte(`{"repoPath":"C:\\\\tmp/repos/Looper Repo"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader(reqBody))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+	assertEqual(t, body["requestId"], "fixture-request-id")
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper-repo")
+	assertEqual(t, data["name"], "looper-repo")
+	assertEqual(t, data["baseBranch"], fixture.config.Defaults.BaseBranch)
+	assertEqual(t, data["archived"], false)
+	if data["repo"] != nil {
+		t.Fatalf("repo = %#v, want nil", data["repo"])
+	}
+	if data["worktreeRoot"] != nil {
+		t.Fatalf("worktreeRoot = %#v, want nil", data["worktreeRoot"])
+	}
+	assertEqual(t, data["discoveredPullRequests"], float64(0))
+	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	warnings, ok := data["warnings"].([]any)
+	if !ok || len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
+func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
+	fixture := newTestFixture(t)
+	projectService := fixture.runtime.Services().Projects
+
+	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+	var artifact struct {
+		Cases []errorArtifactCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	stubUnavailableRuntime := fixedRuntimeState{services: looperdruntime.Services{Projects: nil}}
+	tests := []struct {
+		caseID  string
+		runtime RuntimeState
+		body    string
+		wantID  bool
+		custom  *errorArtifactCase
+	}{
+		{
+			caseID:  "projects-unavailable",
+			runtime: stubUnavailableRuntime,
+			body:    `{"repoPath":"/tmp/repos/looper","name":"Looper"}`,
+			wantID:  true,
+		},
+		{
+			caseID:  "invalid-project-id",
+			runtime: fixture.runtime,
+			body:    `{"repoPath":"/tmp/repos/looper","id":"../../tmp","name":"Looper"}`,
+			wantID:  true,
+		},
+		{
+			caseID:  "internal-error",
+			runtime: fixedRuntimeState{services: looperdruntime.Services{Projects: &projects.Service{Repos: nil}}},
+			body:    `{"repoPath":"/tmp/repos/looper","id":"looper","name":"Looper"}`,
+			wantID:  false,
+			custom: &errorArtifactCase{ExpectedStatus: http.StatusInternalServerError, Body: struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}{Error: struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}{Code: "INTERNAL_ERROR", Message: "projects repository is not configured"}}},
+		},
+	}
+
+	seedConflictProject(t, projectService)
+
+	for _, tt := range tests {
+		t.Run(tt.caseID, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(tt.body)))
+			if tt.wantID {
+				req.Header.Set("x-request-id", "error-request-id")
+			}
+			recorder := httptest.NewRecorder()
+			NewHandler(Context{Config: fixture.config, Runtime: tt.runtime}).ServeHTTP(recorder, req)
+
+			want := findArtifactCase(t, artifact.Cases, tt.caseID)
+			if tt.custom != nil {
+				want = *tt.custom
+			}
+			if recorder.Code != want.ExpectedStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errorMap := body["error"].(map[string]any)
+			assertEqual(t, errorMap["code"], want.Body.Error.Code)
+			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+		})
+	}
+}
+
+func TestHandlerProjectsCreateRouteMapsProjectIDConflict(t *testing.T) {
+	fixture := newTestFixture(t)
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","id":"looper"}`)))
+
+	_, err := h.buildCreateProjectResponse(req, fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			return projects.AddResult{}, projects.ProjectIDCollisionError{ProjectID: "looper"}
+		},
+	})
+
+	if err == nil {
+		t.Fatal("buildCreateProjectResponse() error = nil, want conflict error")
+	}
+	typed, ok := err.(apiError)
+	if !ok {
+		t.Fatalf("error type = %T, want apiError", err)
+	}
+	assertEqual(t, string(typed.code), "PROJECT_ID_CONFLICT")
+	assertEqual(t, typed.status, http.StatusConflict)
+	assertEqual(t, typed.message, "Derived project id collides with an existing explicit project: looper")
 }
 
 func TestServerServesStatusEndpoint(t *testing.T) {
@@ -659,6 +849,58 @@ func (noopLogger) Warn(string, map[string]any)  {}
 func (noopLogger) Error(string, map[string]any) {}
 
 var _ bootstrap.Logger = noopLogger{}
+
+type fixedRuntimeState struct {
+	services looperdruntime.Services
+}
+
+func (s fixedRuntimeState) Services() looperdruntime.Services {
+	return s.services
+}
+
+func (s fixedRuntimeState) StartedAt() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+func seedConflictProject(t *testing.T, service *projects.Service) {
+	t.Helper()
+	if service == nil || service.Repos == nil || service.Repos.Projects == nil {
+		t.Fatal("projects service is not configured for conflict seed")
+	}
+	nowISO := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC).Format(javaScriptISOString)
+	metadata := `{"repo":null,"worktreeRoot":null,"source":"api"}`
+	if err := service.Repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "looper",
+		Name:         "Looper",
+		RepoPath:     "/tmp/repos/looper",
+		BaseBranch:   stringPtr("main"),
+		Archived:     false,
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(conflict) error = %v", err)
+	}
+}
+
+type fakeProjectService struct {
+	list       func(context.Context) ([]storage.ProjectRecord, error)
+	addProject func(context.Context, projects.AddInput) (projects.AddResult, error)
+}
+
+func (f fakeProjectService) List(ctx context.Context) ([]storage.ProjectRecord, error) {
+	if f.list != nil {
+		return f.list(ctx)
+	}
+	return nil, nil
+}
+
+func (f fakeProjectService) AddProject(ctx context.Context, input projects.AddInput) (projects.AddResult, error) {
+	if f.addProject != nil {
+		return f.addProject(ctx, input)
+	}
+	return projects.AddResult{}, nil
+}
 
 type errorArtifactCase struct {
 	ID             string `json:"id"`
