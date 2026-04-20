@@ -12,12 +12,32 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
-	app := cliapp.New(cliapp.Deps{Stdout: stdout, Stderr: stderr})
-	return app.Run(context.Background(), args)
+type appRunner interface {
+	Run(context.Context, []string) int
 }
 
-func writeUsage(w io.Writer) {
-	app := cliapp.New(cliapp.Deps{Stdout: w, Stderr: io.Discard})
-	_ = app.Run(context.Background(), []string{"--help"})
+type runDeps struct {
+	ctx    context.Context
+	newApp func(cliapp.Deps) appRunner
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	return runWithDeps(args, stdout, stderr, runDeps{})
+}
+
+func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
+	ctx := deps.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	newApp := deps.newApp
+	if newApp == nil {
+		newApp = func(appDeps cliapp.Deps) appRunner {
+			return cliapp.New(appDeps)
+		}
+	}
+
+	app := newApp(cliapp.Deps{Stdout: stdout, Stderr: stderr})
+	return app.Run(ctx, args)
 }

@@ -152,6 +152,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:   "upgrade",
 				short: "Check or upgrade Looper installations",
+				runE:  runtime.upgrade,
 				localFlags: []flagSpec{
 					boolFlag("check", "Check available CLI and daemon updates"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
