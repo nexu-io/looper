@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"regexp"
 	"testing"
 
 	"github.com/powerformer/looper/internal/bootstrap"
@@ -14,8 +15,14 @@ import (
 func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
+	bootstrapCalled := false
 
-	exitCode := run([]string{"--version"}, stdout, stderr)
+	exitCode := runWithDeps([]string{"--version"}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			bootstrapCalled = true
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
 
 	if exitCode != 0 {
 		t.Fatalf("run([--version]) exit code = %d, want 0", exitCode)
@@ -23,6 +30,14 @@ func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 
 	if got, want := stdout.String(), version.Value+"\n"; got != want {
 		t.Fatalf("run([--version]) stdout = %q, want %q", got, want)
+	}
+
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\n$`).MatchString(stdout.String()) {
+		t.Fatalf("run([--version]) stdout = %q, want only a semantic version followed by newline", stdout.String())
+	}
+
+	if bootstrapCalled {
+		t.Fatal("bootstrapImpl was called for --version")
 	}
 
 	if got := stderr.String(); got != "" {
@@ -33,8 +48,14 @@ func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 func TestRunPrefersVersionFlagOverOtherArguments(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
+	bootstrapCalled := false
 
-	exitCode := run([]string{"serve", "--version"}, stdout, stderr)
+	exitCode := runWithDeps([]string{"serve", "--version"}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			bootstrapCalled = true
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
 
 	if exitCode != 0 {
 		t.Fatalf("run([serve --version]) exit code = %d, want 0", exitCode)
@@ -46,6 +67,10 @@ func TestRunPrefersVersionFlagOverOtherArguments(t *testing.T) {
 
 	if got := stderr.String(); got != "" {
 		t.Fatalf("run([serve --version]) stderr = %q, want empty string", got)
+	}
+
+	if bootstrapCalled {
+		t.Fatal("bootstrapImpl was called for serve --version")
 	}
 }
 
