@@ -8,9 +8,9 @@ This repository currently contains:
 - `cmd/looper` — the supported `looper` CLI binary
 - `apps/looperd` — legacy TypeScript daemon sources retained during cutover
 - `apps/cli` — legacy TypeScript CLI sources retained during cutover
-- `apps/web` — a placeholder web app
+- `apps/web` — an unsupported placeholder workspace package reserved for a future web UI
 
-The current product is the daemon + CLI. The web app is not implemented yet.
+The current product is the daemon + CLI. `apps/web` is not implemented, is not a supported surface, and is not part of release artifacts in the current phase.
 
 ## Requirements
 
@@ -238,7 +238,7 @@ Manual review examples:
 
 ### `apps/web`
 
-Currently a stub that only logs a placeholder message.
+Retained as an unsupported placeholder workspace package. It currently only logs a placeholder message, is not shipped in releases, and should not be treated as part of the supported product until a real web UI is scoped.
 
 ## Configuration
 

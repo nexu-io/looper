@@ -12,8 +12,7 @@ This checklist defines the explicit decision gates that must be reviewed before 
   1. Make Go binaries the default supported implementation.
   2. Switch CI and release pipelines to Go-first.
   3. Remove Bun from the required production runtime path.
-  4. Decide and document the fate of `apps/web`.
-  5. Retire or archive the TypeScript implementation after parity is proven.
+  4. Retire or archive the TypeScript implementation after parity is proven.
 
 ## How to use this checklist
 
@@ -59,9 +58,10 @@ This checklist defines the explicit decision gates that must be reviewed before 
 - [ ] Bun is no longer required on the production runtime path for supported installs and upgrades.
   - Blocking task: `Remove Bun from the required production runtime path`
   - Current status: supported docs now point to the Go release binaries, but `.github/workflows/release.yml` still publishes the CLI through npm and production runtime assumptions still need cleanup.
-- [ ] The fate of `apps/web` is explicitly documented so the cutover does not leave an ambiguous supported surface.
+- [x] The fate of `apps/web` is explicitly documented so the cutover does not leave an ambiguous supported surface.
   - Blocking task: `Decide and document the fate of apps/web`
-  - Current status: `apps/web/src/index.ts` is still only a placeholder.
+  - Current status: `apps/web` is retained only as an unsupported placeholder workspace package and is not part of the supported release surface.
+  - Evidence: `artifacts/apps-web-fate.md`, `README.md`
 - [ ] The TypeScript implementation has an explicit maintenance, archive, or removal plan.
   - Blocking task: `Retire or archive the TypeScript implementation after parity is proven`
 

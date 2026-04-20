@@ -149,5 +149,5 @@
 - [x] Make Go binaries the default supported implementation
 - [ ] Switch CI and release pipelines to Go-first
 - [ ] Remove Bun from the required production runtime path
-- [ ] Decide and document the fate of `apps/web`
+- [x] Decide and document the fate of `apps/web`
 - [ ] Retire or archive the TypeScript implementation after parity is proven
