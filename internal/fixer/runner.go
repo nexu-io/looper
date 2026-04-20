@@ -14,6 +14,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/eventlog"
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -1409,7 +1410,29 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	if len(input.Commands) == 0 {
 		return ValidationResult{Passed: true, Summary: "No validation commands configured"}, nil
 	}
-	return ValidationResult{}, fmt.Errorf("validation runner is not configured")
+
+	outputs := make([]string, 0, len(input.Commands)*2)
+	for _, command := range input.Commands {
+		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-lc", command}, CWD: input.CWD})
+		if err != nil {
+			output := "Unknown validation failure"
+			var commandErr *shell.CommandExecutionError
+			if errors.As(err, &commandErr) {
+				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
+			} else {
+				output = err.Error()
+			}
+			return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation failed: %s", command), Output: output}, nil
+		}
+		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+			outputs = append(outputs, stdout)
+		}
+		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+			outputs = append(outputs, stderr)
+		}
+	}
+
+	return ValidationResult{Passed: true, Summary: "Validation passed", Output: strings.Join(outputs, "\n")}, nil
 }
 
 type eventInput struct {

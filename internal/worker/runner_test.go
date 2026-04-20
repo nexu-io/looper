@@ -202,6 +202,48 @@ func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	}
 }
 
+func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{})
+	result, err := runner.runValidation(context.Background(), ValidationInput{
+		CWD:      t.TempDir(),
+		Commands: []string{"printf 'hello'", "printf 'warn' >&2"},
+	})
+	if err != nil {
+		t.Fatalf("runValidation() error = %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("result = %#v, want passed", result)
+	}
+	if result.Summary != "Validation passed" {
+		t.Fatalf("Summary = %q, want Validation passed", result.Summary)
+	}
+	if result.Output != "hello\nwarn" {
+		t.Fatalf("Output = %q, want joined shell output", result.Output)
+	}
+}
+
+func TestRunValidationReturnsCommandFailureOutput(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{})
+	result, err := runner.runValidation(context.Background(), ValidationInput{
+		CWD:      t.TempDir(),
+		Commands: []string{"printf 'bad' >&2; exit 9"},
+	})
+	if err != nil {
+		t.Fatalf("runValidation() error = %v", err)
+	}
+	if result.Passed {
+		t.Fatalf("result = %#v, want failed validation", result)
+	}
+	if result.Summary != "Validation failed: printf 'bad' >&2; exit 9" {
+		t.Fatalf("Summary = %q, want command-specific failure", result.Summary)
+	}
+	if result.Output != "bad" {
+		t.Fatalf("Output = %q, want stderr output", result.Output)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
