@@ -329,6 +329,96 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 	}
 }
 
+func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
+	routes := loadResponseArtifact(t)
+	fixture := newTestFixture(t)
+	seedEventAndPullRequestRouteData(t, fixture.runtime)
+
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now },
+	})
+
+	tests := []struct {
+		routeID string
+		method  string
+		path    string
+	}{
+		{routeID: "events.list", method: http.MethodGet, path: "/api/v1/events?limit=1"},
+		{routeID: "events.entity", method: http.MethodGet, path: "/api/v1/events/loop/loop_1"},
+		{routeID: "pullRequests.list", method: http.MethodGet, path: "/api/v1/pull-requests"},
+		{routeID: "pullRequests.detail", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42"},
+		{routeID: "pullRequests.status", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42/status"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.routeID, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Header.Set("x-request-id", "fixture-request-id")
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", recorder.Code)
+			}
+
+			actual := normalizeResponseValue(parseJSONValue(t, recorder.Body.Bytes()), fixture.rootDir)
+			want := findResponseArtifactRoute(t, routes, tt.routeID)
+			if !responseFixtureMatches(actual, want.Body) {
+				actualJSON, _ := json.MarshalIndent(actual, "", "  ")
+				wantJSON, _ := json.MarshalIndent(want.Body, "", "  ")
+				t.Fatalf("normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
+			}
+		})
+	}
+}
+
+func TestHandlerEventAndPullRequestRouteErrorsMatchArtifactCases(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedEventAndPullRequestRouteData(t, fixture.runtime)
+
+	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+	var artifact struct {
+		Cases []errorArtifactCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	tests := []struct {
+		caseID string
+		method string
+		path   string
+	}{
+		{caseID: "validation-failed", method: http.MethodGet, path: "/api/v1/events?limit=0"},
+		{caseID: "pr-not-found", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/999"},
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	for _, tt := range tests {
+		t.Run(tt.caseID, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Header.Set("x-request-id", "error-request-id")
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+
+			want := findArtifactCase(t, artifact.Cases, tt.caseID)
+			if recorder.Code != want.ExpectedStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errorMap := body["error"].(map[string]any)
+			assertEqual(t, errorMap["code"], want.Body.Error.Code)
+			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+		})
+	}
+}
+
 func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -1450,6 +1540,51 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
 	seedStatusData(t, rt)
+}
+
+func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) {
+	t.Helper()
+	seedStatusData(t, rt)
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	if _, err := rt.Services().Coordinator.DB().ExecContext(context.Background(), `DELETE FROM event_logs`); err != nil {
+		t.Fatalf("DELETE FROM event_logs error = %v", err)
+	}
+
+	if err := rt.Services().Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID:               "event_1",
+		EventType:        "loop.created",
+		ProjectID:        stringPtr("project_1"),
+		LoopID:           stringPtr("loop_1"),
+		EntityType:       stringPtr("loop"),
+		EntityID:         stringPtr("loop_1"),
+		ActorType:        stringPtr("system"),
+		ActorID:          stringPtr("looperd"),
+		ActorDisplayName: stringPtr("looperd"),
+		PayloadJSON:      `{"status":"running"}`,
+		CreatedAt:        nowISO,
+	}); err != nil {
+		t.Fatalf("Events.Append(event_1) error = %v", err)
+	}
+
+	if err := rt.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:                    "prs_1",
+		ProjectID:             "project_1",
+		Repo:                  "acme/looper",
+		PRNumber:              42,
+		HeadSHA:               "abc123",
+		BaseSHA:               stringPtr("base123"),
+		Title:                 stringPtr("Runtime foundation"),
+		Body:                  stringPtr("Adds recovery and API"),
+		Author:                stringPtr("octocat"),
+		ChecksSummary:         stringPtr("green"),
+		UnresolvedThreadCount: int64Ptr(1),
+		ReviewState:           stringPtr("changes_requested"),
+		CapturedAt:            nowISO,
+		CreatedAt:             nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(prs_1) error = %v", err)
+	}
 }
 
 func seedRunRouteData(t *testing.T, rt *looperdruntime.Runtime) {

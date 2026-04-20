@@ -137,6 +137,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, h.buildConfigResponse())
 		return
+	case apiBasePath + "/events":
+		payload, err := h.buildEventsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/pull-requests":
+		payload, err := h.buildPullRequestsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
 	case apiBasePath + "/projects":
 		payload, err := h.buildProjectsRouteResponse(r)
 		if err != nil {
@@ -219,6 +245,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if strings.HasPrefix(path, apiBasePath+"/loops/") {
 		payload, err := h.buildLoopRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
+	if strings.HasPrefix(path, apiBasePath+"/events/") {
+		payload, err := h.buildEntityEventsRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
+	if strings.HasPrefix(path, apiBasePath+"/pull-requests/") {
+		payload, err := h.buildPullRequestRouteResponse(r, path)
 		if err != nil {
 			var typed apiError
 			if !asAPIError(err, &typed) {
@@ -800,6 +856,74 @@ type loopsListResponse struct {
 	Items []loopResponse `json:"items"`
 }
 
+type eventsListResponse struct {
+	Items []eventResponse `json:"items"`
+}
+
+type entityEventsResponse struct {
+	EntityType string          `json:"entityType"`
+	EntityID   string          `json:"entityId"`
+	Items      []eventResponse `json:"items"`
+}
+
+type eventResponse struct {
+	ID               string  `json:"id"`
+	EventType        string  `json:"eventType"`
+	ProjectID        *string `json:"projectId"`
+	LoopID           *string `json:"loopId"`
+	RunID            *string `json:"runId"`
+	EntityType       *string `json:"entityType"`
+	EntityID         *string `json:"entityId"`
+	CorrelationID    *string `json:"correlationId"`
+	CausationID      *string `json:"causationId"`
+	ActorType        *string `json:"actorType"`
+	ActorID          *string `json:"actorId"`
+	ActorDisplayName *string `json:"actorDisplayName"`
+	PayloadJSON      string  `json:"payloadJson"`
+	CreatedAt        string  `json:"createdAt"`
+	Payload          any     `json:"payload"`
+}
+
+type pullRequestsListResponse struct {
+	Items []pullRequestResponse `json:"items"`
+}
+
+type pullRequestResponse struct {
+	Repo                  string  `json:"repo"`
+	PRNumber              int64   `json:"prNumber"`
+	ProjectID             *string `json:"projectId"`
+	HeadSHA               *string `json:"headSha"`
+	BaseSHA               *string `json:"baseSha"`
+	Title                 *string `json:"title"`
+	Body                  *string `json:"body"`
+	Author                *string `json:"author"`
+	DiffRef               *string `json:"diffRef"`
+	ChecksSummary         *string `json:"checksSummary"`
+	UnresolvedThreadCount int64   `json:"unresolvedThreadCount"`
+	ReviewState           *string `json:"reviewState"`
+	CapturedAt            *string `json:"capturedAt"`
+	Reviewer              *string `json:"reviewer"`
+	Fixer                 *string `json:"fixer"`
+}
+
+type pullRequestStatusResponse struct {
+	Repo                  string                `json:"repo"`
+	PRNumber              int64                 `json:"prNumber"`
+	ReviewState           *string               `json:"reviewState"`
+	ChecksSummary         *string               `json:"checksSummary"`
+	UnresolvedThreadCount int64                 `json:"unresolvedThreadCount"`
+	CapturedAt            string                `json:"capturedAt"`
+	Reviewer              *string               `json:"reviewer"`
+	Fixer                 *string               `json:"fixer"`
+	LoopStatus            pullRequestLoopStatus `json:"loopStatus"`
+}
+
+type pullRequestLoopStatus struct {
+	Loops           []string `json:"loops"`
+	LatestRunStatus *string  `json:"latestRunStatus"`
+	RunningRunCount int      `json:"runningRunCount"`
+}
+
 type loopResponse struct {
 	ID           string  `json:"id"`
 	Seq          int64   `json:"seq"`
@@ -1046,6 +1170,362 @@ func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, err
 	}
 
 	return runsListResponse{Items: items}, nil
+}
+
+func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return eventsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return eventsListResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/events")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 {
+			return eventsListResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "limit must be a positive integer"}
+		}
+		limit = parsed
+	}
+
+	items, err := services.Repositories.Events.List(r.Context(), limit)
+	if err != nil {
+		return eventsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	responseItems := make([]eventResponse, 0, len(items))
+	for _, item := range items {
+		responseItems = append(responseItems, serializeEvent(item))
+	}
+
+	return eventsListResponse{Items: responseItems}, nil
+}
+
+func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (entityEventsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+	}
+
+	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/events/"), "/")
+	entityType, err := decodePathSegment(parts, 0)
+	if err != nil {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "entityType and entityId are required"}
+	}
+	entityID, err := decodePathSegment(parts, 1)
+	if err != nil {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "entityType and entityId are required"}
+	}
+	if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+
+	items, err := services.Repositories.Events.ListByEntity(r.Context(), entityType, entityID)
+	if err != nil {
+		return entityEventsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	responseItems := make([]eventResponse, 0, len(items))
+	for _, item := range items {
+		responseItems = append(responseItems, serializeEvent(item))
+	}
+
+	return entityEventsResponse{EntityType: entityType, EntityID: entityID, Items: responseItems}, nil
+}
+
+func (h *Handler) buildPullRequestsRouteResponse(r *http.Request) (pullRequestsListResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.PullRequestSnapshots == nil || services.Repositories.Loops == nil {
+		return pullRequestsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return pullRequestsListResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/pull-requests")}
+	}
+
+	snapshots, err := services.Repositories.PullRequestSnapshots.List(r.Context())
+	if err != nil {
+		return pullRequestsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	latestSnapshots := dedupeLatestSnapshots(snapshots)
+	loops, err := services.Repositories.Loops.List(r.Context())
+	if err != nil {
+		return pullRequestsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	identities := collectPullRequestIdentities(latestSnapshots, loops)
+	snapshotByKey := map[string]storage.PullRequestSnapshotRecord{}
+	for _, snapshot := range latestSnapshots {
+		snapshotByKey[fmt.Sprintf("%s#%d", snapshot.Repo, snapshot.PRNumber)] = snapshot
+	}
+
+	items := make([]pullRequestResponse, 0, len(identities))
+	for _, identity := range identities {
+		snapshot, ok := snapshotByKey[fmt.Sprintf("%s#%d", identity.Repo, identity.PRNumber)]
+		if ok {
+			items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, &snapshot))
+			continue
+		}
+		items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, nil))
+	}
+
+	return pullRequestsListResponse{Items: items}, nil
+}
+
+func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (any, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.PullRequestSnapshots == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+	}
+
+	rawPath := normalizePath(r.URL.EscapedPath())
+	parts := strings.Split(strings.TrimPrefix(rawPath, apiBasePath+"/pull-requests/"), "/")
+	if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repo and prNumber are required"}
+	}
+	repo, err := url.PathUnescape(strings.TrimSpace(parts[0]))
+	if err != nil || strings.TrimSpace(repo) == "" {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repo and prNumber are required"}
+	}
+	prNumber, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil || prNumber <= 0 {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "prNumber must be a positive integer"}
+	}
+
+	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatest(r.Context(), repo, prNumber)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if snapshot == nil {
+		return nil, apiError{code: pkgapi.ErrorCodePRNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", repo, prNumber)}
+	}
+
+	if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
+		if strings.TrimSpace(parts[2]) == "status" {
+			if len(parts) > 3 && strings.TrimSpace(parts[3]) != "" {
+				return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+			}
+			return h.buildPullRequestStatusResponse(r.Context(), *snapshot), nil
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+
+	return h.serializePullRequestListItem(repo, prNumber, snapshot), nil
+}
+
+func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) pullRequestStatusResponse {
+	loopMatches := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
+	runs := make([]storage.RunRecord, 0)
+	for _, loop := range loopMatches {
+		loopRuns, err := h.context.Runtime.Services().Repositories.Runs.ListByLoop(ctx, loop.ID)
+		if err != nil {
+			continue
+		}
+		runs = append(runs, loopRuns...)
+	}
+
+	var latestRunStatus *string
+	if len(runs) > 0 {
+		latestRunStatus = &runs[0].Status
+	}
+	runningRunCount := 0
+	for _, run := range runs {
+		if run.Status == string(domain.RunStatusRunning) {
+			runningRunCount++
+		}
+	}
+
+	unresolvedThreadCount := int64(0)
+	if snapshot.UnresolvedThreadCount != nil {
+		unresolvedThreadCount = *snapshot.UnresolvedThreadCount
+	}
+
+	return pullRequestStatusResponse{
+		Repo:                  snapshot.Repo,
+		PRNumber:              snapshot.PRNumber,
+		ReviewState:           snapshot.ReviewState,
+		ChecksSummary:         snapshot.ChecksSummary,
+		UnresolvedThreadCount: unresolvedThreadCount,
+		CapturedAt:            snapshot.CapturedAt,
+		Reviewer:              findLatestLoopStatus(loopMatches, string(domain.LoopTypeReviewer)),
+		Fixer:                 findLatestLoopStatus(loopMatches, string(domain.LoopTypeFixer)),
+		LoopStatus: pullRequestLoopStatus{
+			Loops:           pullRequestLoopStates(loopMatches),
+			LatestRunStatus: latestRunStatus,
+			RunningRunCount: runningRunCount,
+		},
+	}
+}
+
+func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumber int64) []storage.LoopRecord {
+	loops, err := h.context.Runtime.Services().Repositories.Loops.List(ctx)
+	if err != nil {
+		return nil
+	}
+	matches := make([]storage.LoopRecord, 0)
+	for _, loop := range loops {
+		if loop.Repo != nil && loop.PRNumber != nil && *loop.Repo == repo && *loop.PRNumber == prNumber {
+			matches = append(matches, loop)
+		}
+	}
+	return matches
+}
+
+func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snapshot *storage.PullRequestSnapshotRecord) pullRequestResponse {
+	loopMatches := h.findPullRequestLoops(context.Background(), repo, prNumber)
+	var projectID *string
+	if snapshot != nil {
+		projectID = &snapshot.ProjectID
+	} else if len(loopMatches) > 0 {
+		projectID = &loopMatches[0].ProjectID
+	}
+
+	unresolvedThreadCount := int64(0)
+	if snapshot != nil && snapshot.UnresolvedThreadCount != nil {
+		unresolvedThreadCount = *snapshot.UnresolvedThreadCount
+	}
+
+	return pullRequestResponse{
+		Repo:                  repo,
+		PRNumber:              prNumber,
+		ProjectID:             projectID,
+		HeadSHA:               snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return &s.HeadSHA }),
+		BaseSHA:               snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.BaseSHA }),
+		Title:                 snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.Title }),
+		Body:                  snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.Body }),
+		Author:                snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.Author }),
+		DiffRef:               snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.DiffRef }),
+		ChecksSummary:         snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ChecksSummary }),
+		UnresolvedThreadCount: unresolvedThreadCount,
+		ReviewState:           snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ReviewState }),
+		CapturedAt:            snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return &s.CapturedAt }),
+		Reviewer:              findLatestLoopStatus(loopMatches, string(domain.LoopTypeReviewer)),
+		Fixer:                 findLatestLoopStatus(loopMatches, string(domain.LoopTypeFixer)),
+	}
+}
+
+func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(storage.PullRequestSnapshotRecord) *string) *string {
+	if snapshot == nil {
+		return nil
+	}
+	return getter(*snapshot)
+}
+
+func dedupeLatestSnapshots(snapshots []storage.PullRequestSnapshotRecord) []storage.PullRequestSnapshotRecord {
+	seen := map[string]struct{}{}
+	deduped := make([]storage.PullRequestSnapshotRecord, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		key := fmt.Sprintf("%s#%d", snapshot.Repo, snapshot.PRNumber)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, snapshot)
+	}
+	return deduped
+}
+
+type pullRequestIdentity struct {
+	Repo      string
+	PRNumber  int64
+	ProjectID string
+}
+
+func collectPullRequestIdentities(snapshots []storage.PullRequestSnapshotRecord, loops []storage.LoopRecord) []pullRequestIdentity {
+	seen := map[string]struct{}{}
+	identities := make([]pullRequestIdentity, 0)
+	appendIdentity := func(repo *string, prNumber *int64, projectID string) {
+		if repo == nil || prNumber == nil {
+			return
+		}
+		key := fmt.Sprintf("%s#%d", *repo, *prNumber)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		identities = append(identities, pullRequestIdentity{Repo: *repo, PRNumber: *prNumber, ProjectID: projectID})
+	}
+
+	for _, snapshot := range snapshots {
+		repo := snapshot.Repo
+		prNumber := snapshot.PRNumber
+		appendIdentity(&repo, &prNumber, snapshot.ProjectID)
+	}
+	for _, loop := range loops {
+		appendIdentity(loop.Repo, loop.PRNumber, loop.ProjectID)
+	}
+	return identities
+}
+
+func findLatestLoopStatus(loops []storage.LoopRecord, loopType string) *string {
+	for _, loop := range loops {
+		if loop.Type == loopType {
+			status := loop.Status
+			return &status
+		}
+	}
+	return nil
+}
+
+func pullRequestLoopStates(loops []storage.LoopRecord) []string {
+	items := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		items = append(items, loop.Status)
+	}
+	return items
+}
+
+func serializeEvent(event storage.EventLogRecord) eventResponse {
+	return eventResponse{
+		ID:               event.ID,
+		EventType:        event.EventType,
+		ProjectID:        event.ProjectID,
+		LoopID:           event.LoopID,
+		RunID:            event.RunID,
+		EntityType:       event.EntityType,
+		EntityID:         event.EntityID,
+		CorrelationID:    event.CorrelationID,
+		CausationID:      event.CausationID,
+		ActorType:        event.ActorType,
+		ActorID:          event.ActorID,
+		ActorDisplayName: event.ActorDisplayName,
+		PayloadJSON:      event.PayloadJSON,
+		CreatedAt:        event.CreatedAt,
+		Payload:          parsePayloadJSON(event.PayloadJSON),
+	}
+}
+
+func parsePayloadJSON(payloadJSON string) any {
+	var parsed any
+	if err := json.Unmarshal([]byte(payloadJSON), &parsed); err != nil {
+		return payloadJSON
+	}
+	return parsed
+}
+
+func decodePathSegment(parts []string, index int) (string, error) {
+	if index >= len(parts) {
+		return "", fmt.Errorf("missing path segment")
+	}
+	segment := strings.TrimSpace(parts[index])
+	if segment == "" {
+		return "", fmt.Errorf("missing path segment")
+	}
+	decoded, err := url.PathUnescape(segment)
+	if err != nil {
+		return "", err
+	}
+	decoded = strings.TrimSpace(decoded)
+	if decoded == "" {
+		return "", fmt.Errorf("missing path segment")
+	}
+	return decoded, nil
 }
 
 func (h *Handler) buildActiveRunsResponse(r *http.Request) (activeRunsListResponse, error) {
