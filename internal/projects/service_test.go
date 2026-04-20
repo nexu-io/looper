@@ -2,6 +2,7 @@ package projects
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,6 +34,46 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"api"}` {
 		t.Fatalf("AddProject().Project.MetadataJSON = %v, want api metadata", result.Project.MetadataJSON)
+	}
+}
+
+func TestServiceAddProjectReturnsConflictForExplicitExistingID(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+
+	_, err := service.AddProject(ctx, AddInput{
+		ID:         "looper",
+		Name:       "Looper",
+		RepoPath:   "/tmp/looper",
+		BaseBranch: "main",
+		IDSource:   "explicit",
+	})
+	if err != nil {
+		t.Fatalf("initial AddProject() error = %v", err)
+	}
+
+	_, err = service.AddProject(ctx, AddInput{
+		ID:         "looper",
+		Name:       "Looper Again",
+		RepoPath:   "/tmp/looper-again",
+		BaseBranch: "main",
+		IDSource:   "explicit",
+	})
+	if err == nil {
+		t.Fatal("duplicate AddProject() error = nil, want ProjectIDCollisionError")
+	}
+
+	var conflict ProjectIDCollisionError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("duplicate AddProject() error = %T, want ProjectIDCollisionError", err)
+	}
+	if conflict.ProjectID != "looper" {
+		t.Fatalf("conflict.ProjectID = %q, want looper", conflict.ProjectID)
 	}
 }
 

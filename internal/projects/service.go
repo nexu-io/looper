@@ -65,6 +65,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
+	if existing != nil && input.IDSource != "derived" {
+		return AddResult{}, ProjectIDCollisionError{ProjectID: input.ID}
+	}
 	projectID := input.ID
 	if existing == nil {
 		projectID = normalizeProjectID(input)

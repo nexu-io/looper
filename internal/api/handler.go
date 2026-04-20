@@ -46,6 +46,7 @@ type RuntimeState interface {
 type Context struct {
 	Config               config.Config
 	Runtime              RuntimeState
+	ProjectsService      projectService
 	Now                  func() time.Time
 	RecoverySummary      func() any
 	StopLoop             func(context.Context, string, string) (any, error)
@@ -1083,8 +1084,14 @@ type projectService interface {
 }
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
-	services := h.context.Runtime.Services()
-	if services.Projects == nil {
+	service := h.context.ProjectsService
+	if service == nil {
+		runtimeProjects := h.context.Runtime.Services().Projects
+		if runtimeProjects != nil {
+			service = runtimeProjects
+		}
+	}
+	if service == nil {
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeProjectsUnavailable,
 			status:  http.StatusInternalServerError,
@@ -1094,7 +1101,7 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 
 	switch r.Method {
 	case http.MethodGet:
-		items, err := services.Projects.List(r.Context())
+		items, err := service.List(r.Context())
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
@@ -1105,7 +1112,7 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 		}
 		return projectsListResponse{Items: responseItems}, nil
 	case http.MethodPost:
-		return h.buildCreateProjectResponse(r, services.Projects)
+		return h.buildCreateProjectResponse(r, service)
 	default:
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeMethodNotAllowed,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -258,6 +259,7 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 		{caseID: "auth-misconfigured", method: http.MethodGet, path: "/api/v1/status", headers: map[string]string{"x-request-id": "error-request-id"}, cfg: misconfiguredCfg},
 		{caseID: "unauthorized", method: http.MethodGet, path: "/api/v1/status", headers: map[string]string{"x-request-id": "error-request-id"}, cfg: authCfg},
 		{caseID: "method-not-allowed", method: http.MethodDelete, path: "/api/v1/status", headers: map[string]string{"x-request-id": "error-request-id"}, cfg: cfg},
+		{caseID: "route-not-found", method: http.MethodGet, path: "/api/v1/does-not-exist", cfg: cfg},
 	}
 
 	for _, tt := range tests {
@@ -275,10 +277,7 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			body := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := body["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -411,10 +410,7 @@ func TestHandlerEventAndPullRequestRouteErrorsMatchArtifactCases(t *testing.T) {
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			body := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := body["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -507,7 +503,6 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 
 func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
-	projectService := fixture.runtime.Services().Projects
 
 	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
 	raw, err := os.ReadFile(artifactPath)
@@ -523,11 +518,11 @@ func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 
 	stubUnavailableRuntime := fixedRuntimeState{services: looperdruntime.Services{Projects: nil}}
 	tests := []struct {
-		caseID  string
-		runtime RuntimeState
-		body    string
-		wantID  bool
-		custom  *errorArtifactCase
+		caseID          string
+		runtime         RuntimeState
+		projectsService projectService
+		body            string
+		wantID          bool
 	}{
 		{
 			caseID:  "projects-unavailable",
@@ -536,29 +531,35 @@ func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 			wantID:  true,
 		},
 		{
-			caseID:  "invalid-project-id",
+			caseID:          "invalid-project-id",
+			runtime:         fixture.runtime,
+			projectsService: fixture.runtime.Services().Projects,
+			body:            `{"repoPath":"/tmp/repos/looper","id":"../../tmp","name":"Looper"}`,
+			wantID:          true,
+		},
+		{
+			caseID:  "project-id-conflict",
 			runtime: fixture.runtime,
-			body:    `{"repoPath":"/tmp/repos/looper","id":"../../tmp","name":"Looper"}`,
-			wantID:  true,
+			projectsService: fakeProjectService{
+				addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+					return projects.AddResult{}, projects.ProjectIDCollisionError{ProjectID: "looper"}
+				},
+			},
+			body:   `{"repoPath":"/tmp/repos/looper","id":"looper","name":"Looper"}`,
+			wantID: true,
 		},
 		{
 			caseID:  "internal-error",
-			runtime: fixedRuntimeState{services: looperdruntime.Services{Projects: &projects.Service{Repos: nil}}},
-			body:    `{"repoPath":"/tmp/repos/looper","id":"looper","name":"Looper"}`,
-			wantID:  false,
-			custom: &errorArtifactCase{ExpectedStatus: http.StatusInternalServerError, Body: struct {
-				Error struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}{Error: struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			}{Code: "INTERNAL_ERROR", Message: "projects repository is not configured"}}},
+			runtime: fixture.runtime,
+			projectsService: fakeProjectService{
+				addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+					return projects.AddResult{}, errors.New("boom")
+				},
+			},
+			body:   `{"repoPath":"/tmp/repos/looper","id":"looper","name":"Looper"}`,
+			wantID: false,
 		},
 	}
-
-	seedConflictProject(t, projectService)
 
 	for _, tt := range tests {
 		t.Run(tt.caseID, func(t *testing.T) {
@@ -567,19 +568,13 @@ func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 				req.Header.Set("x-request-id", "error-request-id")
 			}
 			recorder := httptest.NewRecorder()
-			NewHandler(Context{Config: fixture.config, Runtime: tt.runtime}).ServeHTTP(recorder, req)
+			NewHandler(Context{Config: fixture.config, Runtime: tt.runtime, ProjectsService: tt.projectsService}).ServeHTTP(recorder, req)
 
 			want := findArtifactCase(t, artifact.Cases, tt.caseID)
-			if tt.custom != nil {
-				want = *tt.custom
-			}
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			body := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := body["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -705,10 +700,7 @@ func TestHandlerLoopRouteErrorsMatchArtifactCases(t *testing.T) {
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			responseBody := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := responseBody["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -913,10 +905,7 @@ func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			body := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := body["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -1237,10 +1226,7 @@ func TestHandlerRunRouteErrorsMatchArtifactCases(t *testing.T) {
 			if recorder.Code != want.ExpectedStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, want.ExpectedStatus)
 			}
-			body := parseJSONMap(t, recorder.Body.Bytes())
-			errorMap := body["error"].(map[string]any)
-			assertEqual(t, errorMap["code"], want.Body.Error.Code)
-			assertEqual(t, errorMap["message"], want.Body.Error.Message)
+			assertErrorArtifactMatch(t, parseJSONMap(t, recorder.Body.Bytes()), want)
 		})
 	}
 }
@@ -1871,6 +1857,23 @@ func findArtifactCase(t *testing.T, cases []errorArtifactCase, caseID string) er
 	return errorArtifactCase{}
 }
 
+func assertErrorArtifactMatch(t *testing.T, body map[string]any, want errorArtifactCase) {
+	t.Helper()
+
+	assertEqual(t, body["ok"], false)
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], want.Body.Error.Code)
+	assertEqual(t, errorMap["message"], want.Body.Error.Message)
+
+	requestID, ok := body["requestId"].(string)
+	if !ok || strings.TrimSpace(requestID) == "" {
+		t.Fatalf("requestId = %#v, want non-empty string", body["requestId"])
+	}
+	if want.Body.RequestID != "" && want.Body.RequestID != "<uuid>" {
+		assertEqual(t, requestID, want.Body.RequestID)
+	}
+}
+
 func stringPtr(value string) *string {
 	return &value
 }
@@ -1944,7 +1947,9 @@ type errorArtifactCase struct {
 	ID             string `json:"id"`
 	ExpectedStatus int    `json:"expectedStatus"`
 	Body           struct {
-		Error struct {
+		OK        bool   `json:"ok"`
+		RequestID string `json:"requestId"`
+		Error     struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
