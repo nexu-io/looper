@@ -129,7 +129,7 @@
 
 ## Preferred execution order during Phases 4-7
 
-- [ ] Port status/config foundations before deeper runtime automation
+- [x] Port status/config foundations before deeper runtime automation
 - [ ] Port project management before deeper loop/run automation
 - [ ] Delay process execution and agent orchestration until storage/contracts are stable
 
