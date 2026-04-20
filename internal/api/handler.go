@@ -116,6 +116,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/config":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+
+		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		return
 	}
 
 	h.writeError(w, requestID, apiError{
@@ -350,6 +357,66 @@ type statusTools struct {
 	Git       bool `json:"git"`
 	GH        bool `json:"gh"`
 	Osascript bool `json:"osascript"`
+}
+
+type configResponse struct {
+	Server        configServerResponse      `json:"server"`
+	Storage       config.StorageConfig      `json:"storage"`
+	Scheduler     config.SchedulerConfig    `json:"scheduler"`
+	Agent         config.AgentConfig        `json:"agent"`
+	Logging       config.LoggingConfig      `json:"logging"`
+	Notifications config.NotificationConfig `json:"notifications"`
+	Tools         config.ToolPathsConfig    `json:"tools"`
+	Daemon        configDaemonResponse      `json:"daemon"`
+	Package       config.PackageConfig      `json:"package"`
+	Defaults      config.DefaultsConfig     `json:"defaults"`
+	Projects      []config.ProjectRefConfig `json:"projects"`
+}
+
+type configServerResponse struct {
+	Host                 string          `json:"host"`
+	Port                 int             `json:"port"`
+	BaseURL              *string         `json:"baseUrl,omitempty"`
+	AuthMode             config.AuthMode `json:"authMode"`
+	LocalTokenConfigured bool            `json:"localTokenConfigured"`
+}
+
+type configDaemonResponse struct {
+	Mode             config.DaemonMode `json:"mode"`
+	PlistPath        *string           `json:"plistPath,omitempty"`
+	LogDir           string            `json:"logDir"`
+	WorkingDirectory string            `json:"workingDirectory"`
+	Environment      map[string]string `json:"environment"`
+}
+
+func (h *Handler) buildConfigResponse() configResponse {
+	cfg := h.context.Config
+
+	return configResponse{
+		Server: configServerResponse{
+			Host:                 cfg.Server.Host,
+			Port:                 cfg.Server.Port,
+			BaseURL:              cfg.Server.BaseURL,
+			AuthMode:             cfg.Server.AuthMode,
+			LocalTokenConfigured: cfg.Server.LocalToken != nil && *cfg.Server.LocalToken != "",
+		},
+		Storage:       cfg.Storage,
+		Scheduler:     cfg.Scheduler,
+		Agent:         cfg.Agent,
+		Logging:       cfg.Logging,
+		Notifications: cfg.Notifications,
+		Tools:         cfg.Tools,
+		Daemon: configDaemonResponse{
+			Mode:             cfg.Daemon.Mode,
+			PlistPath:        cfg.Daemon.PlistPath,
+			LogDir:           cfg.Daemon.LogDir,
+			WorkingDirectory: cfg.Daemon.WorkingDirectory,
+			Environment:      cfg.Daemon.Environment,
+		},
+		Package:  cfg.Package,
+		Defaults: cfg.Defaults,
+		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
+	}
 }
 
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {

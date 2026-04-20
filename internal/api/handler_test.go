@@ -87,6 +87,41 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["running"], float64(1))
 }
 
+func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+	assertEqual(t, body["requestId"], "fixture-request-id")
+
+	data := body["data"].(map[string]any)
+	server := data["server"].(map[string]any)
+	storageInfo := data["storage"].(map[string]any)
+	daemon := data["daemon"].(map[string]any)
+
+	assertEqual(t, server["host"], cfg.Server.Host)
+	assertEqual(t, server["port"], float64(cfg.Server.Port))
+	assertEqual(t, server["authMode"], string(cfg.Server.AuthMode))
+	assertEqual(t, server["localTokenConfigured"], false)
+	assertEqual(t, storageInfo["mode"], cfg.Storage.Mode)
+	assertEqual(t, daemon["mode"], string(cfg.Daemon.Mode))
+	assertEqual(t, daemon["workingDirectory"], cfg.Daemon.WorkingDirectory)
+	if _, ok := daemon["shutdownTimeoutMs"]; ok {
+		t.Fatalf("daemon.shutdownTimeoutMs should be omitted from config response: %#v", daemon)
+	}
+	if _, ok := server["localToken"]; ok {
+		t.Fatalf("server.localToken should be omitted from config response: %#v", server)
+	}
+}
+
 func TestHandlerAuthMisconfigured(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.Server.AuthMode = config.AuthModeLocalToken
@@ -246,7 +281,7 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 	}
 }
 
-func TestHandlerMatchesFrozenSuccessArtifactsForStatusRoutes(t *testing.T) {
+func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedStatusData(t, fixture.runtime)
 
@@ -260,11 +295,14 @@ func TestHandlerMatchesFrozenSuccessArtifactsForStatusRoutes(t *testing.T) {
 		},
 	})
 
-	for _, routeID := range []string{"healthz.get", "status.get"} {
+	for _, routeID := range []string{"healthz.get", "status.get", "config.get"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
-			if routeID == "status.get" {
+			switch routeID {
+			case "status.get":
 				path = "/api/v1/status"
+			case "config.get":
+				path = "/api/v1/config"
 			}
 
 			req := httptest.NewRequest(http.MethodGet, path, nil)
