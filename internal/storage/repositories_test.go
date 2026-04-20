@@ -110,6 +110,31 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 		t.Fatalf("Events.Append() error = %v", err)
 	}
 
+	notificationSubtitle := "runtime"
+	notificationDedupe := "looperd.started:system:looperd"
+	notificationPayload := `{"title":"Looper"}`
+	if err := repos.Notifications.Upsert(ctx, NotificationRecord{
+		ID:          "notification_1",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		RunID:       &runID,
+		EntityType:  strPtr("notification"),
+		EntityID:    strPtr("looperd.started"),
+		Channel:     "in_app",
+		Level:       "success",
+		Title:       "Looper",
+		Subtitle:    &notificationSubtitle,
+		Body:        "Started",
+		Status:      "success",
+		DedupeKey:   &notificationDedupe,
+		PayloadJSON: &notificationPayload,
+		SentAt:      &now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("Notifications.Upsert() error = %v", err)
+	}
+
 	lockReason := "reviewer"
 	acquired, err := repos.Locks.Acquire(ctx, LockRecord{
 		Key:       "pr:acme/looper:42",
@@ -181,6 +206,22 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 	if lock == nil || lock.Owner != "reviewer-loop" {
 		t.Fatalf("Locks.Get() = %#v, want owner reviewer-loop", lock)
+	}
+
+	notifications, err := repos.Notifications.List(ctx, 10)
+	if err != nil {
+		t.Fatalf("Notifications.List() error = %v", err)
+	}
+	if len(notifications) != 1 || notifications[0].DedupeKey == nil || *notifications[0].DedupeKey != notificationDedupe {
+		t.Fatalf("Notifications.List() = %#v, want notification with dedupe key %q", notifications, notificationDedupe)
+	}
+
+	latestNotification, err := repos.Notifications.GetLatestByDedupe(ctx, "in_app", notificationDedupe)
+	if err != nil {
+		t.Fatalf("Notifications.GetLatestByDedupe() error = %v", err)
+	}
+	if latestNotification == nil || latestNotification.ID != "notification_1" {
+		t.Fatalf("Notifications.GetLatestByDedupe() = %#v, want notification_1", latestNotification)
 	}
 
 	worktree, err := repos.Worktrees.GetByBranch(ctx, "project_1", "feature/loop-1")

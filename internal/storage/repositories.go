@@ -22,6 +22,7 @@ type Repositories struct {
 	Events               *EventsRepository
 	Locks                *LocksRepository
 	Queue                *QueueRepository
+	Notifications        *NotificationsRepository
 	Worktrees            *WorktreesRepository
 }
 
@@ -34,6 +35,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Events:               &EventsRepository{q: q},
 		Locks:                &LocksRepository{q: q, now: time.Now},
 		Queue:                &QueueRepository{q: q},
+		Notifications:        &NotificationsRepository{q: q},
 		Worktrees:            &WorktreesRepository{q: q},
 	}
 }
@@ -172,6 +174,27 @@ type QueueFailInput struct {
 	UpdatedAt    string
 }
 
+type NotificationRecord struct {
+	ID           string
+	ProjectID    *string
+	LoopID       *string
+	RunID        *string
+	EntityType   *string
+	EntityID     *string
+	Channel      string
+	Level        string
+	Title        string
+	Subtitle     *string
+	Body         string
+	Status       string
+	DedupeKey    *string
+	ErrorMessage *string
+	PayloadJSON  *string
+	SentAt       *string
+	CreatedAt    string
+	UpdatedAt    string
+}
+
 type WorktreeRecord struct {
 	ID           string
 	ProjectID    string
@@ -185,6 +208,77 @@ type WorktreeRecord struct {
 	CreatedAt    string
 	UpdatedAt    string
 	CleanedAt    *string
+}
+
+type NotificationsRepository struct{ q sqliteQuerier }
+
+func (r *NotificationsRepository) Upsert(ctx context.Context, record NotificationRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO notifications (id, project_id, loop_id, run_id, entity_type, entity_id, channel, level, title, subtitle, body, status, dedupe_key, error_message, payload_json, sent_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			project_id=excluded.project_id,
+			loop_id=excluded.loop_id,
+			run_id=excluded.run_id,
+			entity_type=excluded.entity_type,
+			entity_id=excluded.entity_id,
+			channel=excluded.channel,
+			level=excluded.level,
+			title=excluded.title,
+			subtitle=excluded.subtitle,
+			body=excluded.body,
+			status=excluded.status,
+			dedupe_key=excluded.dedupe_key,
+			error_message=excluded.error_message,
+			payload_json=excluded.payload_json,
+			sent_at=excluded.sent_at,
+			updated_at=excluded.updated_at
+	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.Channel, record.Level, record.Title, record.Subtitle, record.Body, record.Status, record.DedupeKey, record.ErrorMessage, record.PayloadJSON, record.SentAt, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("upsert notification: %w", err)
+	}
+
+	return nil
+}
+
+func (r *NotificationsRepository) GetByID(ctx context.Context, id string) (*NotificationRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE id = ?`, id)
+	record, err := scanNotification(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get notification by id: %w", err)
+	}
+
+	return &record, nil
+}
+
+func (r *NotificationsRepository) List(ctx context.Context, limit int64) ([]NotificationRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list notifications: %w", err)
+	}
+	defer rows.Close()
+
+	return scanNotifications(rows)
+}
+
+func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel, dedupeKey string) (*NotificationRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE channel = ? AND dedupe_key = ? ORDER BY created_at DESC LIMIT 1`, channel, dedupeKey)
+	record, err := scanNotification(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest notification by dedupe: %w", err)
+	}
+
+	return &record, nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }
@@ -1198,6 +1292,76 @@ func scanEventLog(row interface{ Scan(...any) error }) (EventLogRecord, error) {
 	record.ActorType = nullableString(actorType)
 	record.ActorID = nullableString(actorID)
 	record.ActorDisplayName = nullableString(actorDisplayName)
+
+	return record, nil
+}
+
+func scanNotifications(rows *sql.Rows) ([]NotificationRecord, error) {
+	records := make([]NotificationRecord, 0)
+	for rows.Next() {
+		record, err := scanNotification(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate notification rows: %w", err)
+	}
+
+	return records, nil
+}
+
+func scanNotification(row interface{ Scan(...any) error }) (NotificationRecord, error) {
+	var (
+		record       NotificationRecord
+		projectID    sql.NullString
+		loopID       sql.NullString
+		runID        sql.NullString
+		entityType   sql.NullString
+		entityID     sql.NullString
+		subtitle     sql.NullString
+		dedupeKey    sql.NullString
+		errorMessage sql.NullString
+		payloadJSON  sql.NullString
+		sentAt       sql.NullString
+	)
+
+	err := row.Scan(
+		&record.ID,
+		&projectID,
+		&loopID,
+		&runID,
+		&entityType,
+		&entityID,
+		&record.Channel,
+		&record.Level,
+		&record.Title,
+		&subtitle,
+		&record.Body,
+		&record.Status,
+		&dedupeKey,
+		&errorMessage,
+		&payloadJSON,
+		&sentAt,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return NotificationRecord{}, err
+	}
+
+	record.ProjectID = nullableString(projectID)
+	record.LoopID = nullableString(loopID)
+	record.RunID = nullableString(runID)
+	record.EntityType = nullableString(entityType)
+	record.EntityID = nullableString(entityID)
+	record.Subtitle = nullableString(subtitle)
+	record.DedupeKey = nullableString(dedupeKey)
+	record.ErrorMessage = nullableString(errorMessage)
+	record.PayloadJSON = nullableString(payloadJSON)
+	record.SentAt = nullableString(sentAt)
 
 	return record, nil
 }
