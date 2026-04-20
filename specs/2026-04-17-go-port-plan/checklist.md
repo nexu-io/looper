@@ -125,7 +125,7 @@
 - [x] Re-validate Git/GitHub/spec-PR integration behavior at the end of the rewrite
 - [ ] Run end-to-end local workflow validation on sample repos
 - [ ] Run end-to-end validation for reviewer, fixer, planner, and worker flows that remain in scope
-- [ ] Validate Go install/upgrade flows end to end
+- [x] Validate Go install/upgrade flows end to end
 
 ## Preferred execution order during Phases 4-7
 
