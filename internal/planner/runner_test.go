@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -56,6 +57,12 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
+	}
+	if len(github.addLabelCalls) != 1 || len(github.addLabelCalls[0].Labels) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReviewingLabel {
+		t.Fatalf("addLabelCalls = %#v, want spec-reviewing label", github.addLabelCalls)
+	}
+	if got := github.createPRCalls[0].Body; !strings.Contains(got, "\nSpec: ") {
+		t.Fatalf("createPR body = %q, want Spec path line", got)
 	}
 	if !strings.Contains(agent.starts[0].Prompt, "When finished, print exactly one final line to stdout in this format:") {
 		t.Fatalf("prompt = %q, want completion instruction", agent.starts[0].Prompt)

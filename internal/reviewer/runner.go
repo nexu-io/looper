@@ -11,6 +11,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/eventlog"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -56,8 +57,6 @@ const (
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
 
-	specReviewingLabel    = "looper:spec-reviewing"
-	specReadyLabel        = "looper:spec-ready"
 	agentCompletionMarker = "__LOOPER_RESULT__"
 )
 
@@ -375,7 +374,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	specPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: specReviewingLabel})
+	specPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: specpr.ReviewingLabel})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -847,14 +846,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 	}
 	if reviewEvent == ReviewEventApprove && (phase == "spec" || checkpointPhase == "spec") && isSpecReviewClean(postSubmitDetail) {
-		if hasLabel(postSubmitDetail.Labels, specReviewingLabel) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
+			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+				return checkpoint, err
 			}
 		}
-		if !hasLabel(postSubmitDetail.Labels, specReadyLabel) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
+			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+				return checkpoint, err
 			}
 		}
 	}
@@ -1575,42 +1574,15 @@ func derefInt64(value *int64) int64 {
 	return *value
 }
 
-func hasLabel(labels []string, target string) bool {
-	target = normalizeLogin(target)
-	for _, label := range labels {
-		if normalizeLogin(label) == target {
-			return true
-		}
-	}
-	return false
-}
-
 func resolvePullRequestPhase(labels []string) string {
-	if hasLabel(labels, specReviewingLabel) {
+	if specpr.ResolvePullRequestPhase(labels) == specpr.PhaseSpec {
 		return "spec"
 	}
 	return "implementation"
 }
 
 func isSpecReviewClean(detail PullRequestDetail) bool {
-	return countUnresolvedReviewThreads(detail.Comments) == 0 && !strings.EqualFold(detail.ReviewDecision, "CHANGES_REQUESTED")
-}
-
-func countUnresolvedReviewThreads(comments []map[string]any) int {
-	count := 0
-	for _, comment := range comments {
-		if state, ok := comment["state"].(string); ok && state != "" {
-			if !strings.EqualFold(state, "RESOLVED") {
-				count++
-			}
-			continue
-		}
-		isResolved, _ := comment["isResolved"].(bool)
-		if !isResolved {
-			count++
-		}
-	}
-	return count
+	return specpr.IsReviewClean(detail.ReviewDecision, detail.Comments)
 }
 
 func detailLabels(detail *checkpointDetail) []string {

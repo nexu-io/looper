@@ -15,6 +15,7 @@ import (
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -26,7 +27,6 @@ const (
 	stepNotify          PlannerStep = "notify"
 
 	discoveryLabel = "looper:plan"
-	specReviewing  = "looper:spec-reviewing"
 
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 10 * time.Minute
@@ -629,7 +629,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
 		return checkpoint, nil
 	}
-	if !hasLabel(detail.Labels, discoveryLabel) {
+	if !specpr.HasLabel(detail.Labels, discoveryLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
 		return checkpoint, nil
 	}
@@ -778,11 +778,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
 	}
-	if !stringInSlice(specReviewing, checkpoint.Publish.LabelsAdded) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specReviewing}, CWD: input.Project.RepoPath}); err != nil {
+	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, specReviewing)
+		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, specpr.ReviewingLabel)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
@@ -1217,16 +1217,6 @@ func appendCompletionInstruction(prompt string) string {
 
 func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }
 
-func hasLabel(labels []string, target string) bool {
-	target = normalizeLogin(target)
-	for _, label := range labels {
-		if normalizeLogin(label) == target {
-			return true
-		}
-	}
-	return false
-}
-
 func includesLogin(values []string, target string) bool {
 	target = normalizeLogin(target)
 	for _, value := range values {
@@ -1238,7 +1228,7 @@ func includesLogin(values []string, target string) bool {
 }
 
 func shouldClaimIssue(issue IssueSummary, login string) bool {
-	return includesLogin(issue.Assignees, login) && hasLabel(issue.Labels, discoveryLabel)
+	return includesLogin(issue.Assignees, login) && specpr.HasLabel(issue.Labels, discoveryLabel)
 }
 
 func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string, currentLogin string) []string {

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/shell"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -39,7 +39,6 @@ const (
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
 
-	specReadyLabel             = "looper:spec-ready"
 	workerBranchSlugMaxLength  = 30
 	workerBranchSlugMaxWords   = 5
 	workerBranchHashLength     = 16
@@ -601,7 +600,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specReadyLabel}, CWD: input.Project.RepoPath})
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
@@ -895,7 +894,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.Branch = firstNonEmpty(detail.HeadRefName, work.Branch)
 		work.HeadSHA = firstNonEmpty(detail.HeadSHA, work.HeadSHA)
 		work.ExecutionMode = "push-existing"
-		work.SpecPath = firstNonEmpty(work.SpecPath, parseSpecPathFromPullRequestBody(detail.Body))
+		work.SpecPath = firstNonEmpty(work.SpecPath, specpr.ParseSpecPathFromPullRequestBody(detail.Body))
 		work.Reviewers = append([]string(nil), detail.ReviewRequests...)
 		if work.SpecPath == "" {
 			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
@@ -1359,16 +1358,6 @@ func buildWorkerLoopHash(loopID string) string {
 
 func buildDefaultIssueWorkerTitle(repo string, issueNumber int64) string {
 	return fmt.Sprintf("Implement %s#%d", repo, issueNumber)
-}
-
-var specPathPattern = regexp.MustCompile(`(?mi)^spec:\s*(\S+)\s*$`)
-
-func parseSpecPathFromPullRequestBody(body string) string {
-	matches := specPathPattern.FindStringSubmatch(body)
-	if len(matches) < 2 {
-		return ""
-	}
-	return strings.TrimSpace(matches[1])
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {

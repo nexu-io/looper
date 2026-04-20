@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/infra/shell"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -759,11 +760,11 @@ func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "5319e7"
-	case "looper:spec-reviewing":
+	case specpr.ReviewingLabel:
 		return "1d76db"
-	case "looper:spec-ready":
+	case specpr.ReadyLabel:
 		return "0e8a16"
-	case "looper:needs-human":
+	case specpr.NeedsHumanLabel:
 		return "d93f0b"
 	default:
 		return "5319e7"
@@ -774,11 +775,11 @@ func resolveLabelDescription(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "Picked up automatically by planner"
-	case "looper:spec-reviewing":
+	case specpr.ReviewingLabel:
 		return "Spec PR is under review"
-	case "looper:spec-ready":
+	case specpr.ReadyLabel:
 		return "Spec PR is ready for implementation"
-	case "looper:needs-human":
+	case specpr.NeedsHumanLabel:
 		return "Looper requires manual intervention"
 	default:
 		return "Managed by looper"

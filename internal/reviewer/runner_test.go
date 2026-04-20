@@ -48,7 +48,7 @@ func TestProcessClaimedItemRetriesPublishFromCheckpointWithoutRerunningReview(t 
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -205,13 +205,16 @@ type fakeGitHubGateway struct {
 	changeHeadOnSecondView  bool
 	viewCalls               int
 	submitCalls             []SubmitReviewInput
+	addedLabels             []PullRequestLabelsInput
+	removedLabels           []PullRequestLabelsInput
 	prComments              []PullRequestCommentInput
 	addedReactions          []PullRequestReactionInput
 	removedReactions        []PullRequestReactionInput
+	labels                  []string
 }
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}, nil
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
@@ -224,7 +227,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", HeadSHA: headSHA, BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"octocat"}, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts"}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"octocat"}, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts"}, nil
 }
 
 func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
@@ -259,10 +262,28 @@ func (g *fakeGitHubGateway) RemovePullRequestReaction(_ context.Context, input P
 	return nil
 }
 
-func (*fakeGitHubGateway) AddPullRequestLabels(context.Context, PullRequestLabelsInput) error {
+func (g *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
+	g.addedLabels = append(g.addedLabels, input)
+	g.labels = append(g.labels, input.Labels...)
 	return nil
 }
-func (*fakeGitHubGateway) RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error {
+
+func (g *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
+	g.removedLabels = append(g.removedLabels, input)
+	remaining := make([]string, 0, len(g.labels))
+	for _, candidate := range g.labels {
+		remove := false
+		for _, label := range input.Labels {
+			if strings.EqualFold(candidate, label) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			remaining = append(remaining, candidate)
+		}
+	}
+	g.labels = remaining
 	return nil
 }
 
