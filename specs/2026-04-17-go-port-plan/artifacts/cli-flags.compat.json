@@ -19,7 +19,6 @@
       "db-path",
       "log-dir",
       "daemon-mode",
-      "bun-path",
       "git-path",
       "gh-path",
       "osascript-path"
@@ -83,13 +82,6 @@
       "syntax": "--daemon-mode <mode>",
       "valueKind": "string",
       "semantics": "Override daemon.mode for CLI config loading and daemon-management flows.",
-      "forwarded": true
-    },
-    {
-      "name": "bun-path",
-      "syntax": "--bun-path <path>",
-      "valueKind": "string",
-      "semantics": "Forward an explicit Bun binary path into daemon startup/config loading.",
       "forwarded": true
     },
     {

@@ -275,7 +275,6 @@ Selected looperd environment overrides:
 - `LOOPER_LOG_DIR`
 - `LOOPER_DAEMON_MODE`
 - `LOOPER_WORKING_DIRECTORY`
-- `LOOPER_BUN_PATH`
 - `LOOPER_GIT_PATH`
 - `LOOPER_GH_PATH`
 - `LOOPER_OSASCRIPT_PATH`
@@ -297,7 +296,6 @@ Selected CLI config flags:
 - `--db-path`
 - `--log-dir`
 - `--daemon-mode`
-- `--bun-path`
 - `--git-path`
 - `--gh-path`
 - `--osascript-path`

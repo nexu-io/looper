@@ -23,7 +23,6 @@ worker    2        0       1
 fixer     0        0       0     
 
 Tools
-  bun       : yes
   git       : yes
   gh        : no
   osascript : yes

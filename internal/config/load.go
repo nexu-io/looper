@@ -206,13 +206,6 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			daemonMode := DaemonMode(value)
 			ensureDaemonConfig(&parsed.overrides).Mode = &daemonMode
 			index = nextIndex
-		case matchesFlag(arg, "--bun-path"):
-			value, nextIndex, err := takeValue(index, "--bun-path")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureToolPathsConfig(&parsed.overrides).BunPath = stringPtr(value)
-			index = nextIndex
 		case matchesFlag(arg, "--git-path"):
 			value, nextIndex, err := takeValue(index, "--git-path")
 			if err != nil {
@@ -351,9 +344,6 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) PartialConfig {
 		if parsed := parseBoolean(value); parsed != nil {
 			ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
 		}
-	}
-	if value, ok := lookupEnv("LOOPER_BUN_PATH"); ok {
-		ensureToolPathsConfig(&overrides).BunPath = stringPtr(value)
 	}
 	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)

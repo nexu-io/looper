@@ -473,7 +473,7 @@ func (r *commandRuntime) isLooperdProcess(ctx context.Context, pid int) (bool, e
 	if executable == looperdBinaryName {
 		return true, nil
 	}
-	if executable != "node" && executable != "bun" {
+	if executable != "node" {
 		return false, nil
 	}
 	if len(tokens) < 2 {

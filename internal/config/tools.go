@@ -15,14 +15,12 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 	}
 
 	paths := ToolPathsConfig{
-		BunPath:       cloneStringPtr(configured.BunPath),
 		GitPath:       cloneStringPtr(configured.GitPath),
 		GHPath:        cloneStringPtr(configured.GHPath),
 		OsascriptPath: cloneStringPtr(configured.OsascriptPath),
 	}
 
 	detection := map[string]ToolDetectionStatus{
-		"bunPath":       toolDetectionStatusFor(paths.BunPath),
 		"gitPath":       toolDetectionStatusFor(paths.GitPath),
 		"ghPath":        toolDetectionStatusFor(paths.GHPath),
 		"osascriptPath": toolDetectionStatusFor(paths.OsascriptPath),
@@ -33,7 +31,6 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		executable string
 		target     **string
 	}{
-		{key: "bunPath", executable: "bun", target: &paths.BunPath},
 		{key: "gitPath", executable: "git", target: &paths.GitPath},
 		{key: "ghPath", executable: "gh", target: &paths.GHPath},
 		{key: "osascriptPath", executable: "osascript", target: &paths.OsascriptPath},

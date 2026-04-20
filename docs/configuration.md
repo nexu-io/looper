@@ -102,7 +102,6 @@ Example minimal `~/.looper/config.json`:
     }
   },
   "tools": {
-    "bunPath": "/Users/you/.bun/bin/bun",
     "gitPath": "/usr/bin/git",
     "ghPath": "/opt/homebrew/bin/gh",
     "osascriptPath": "/usr/bin/osascript"
@@ -194,7 +193,6 @@ If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resol
 
 ### `tools`
 
-- `bunPath`
 - `gitPath`
 - `ghPath`
 - `osascriptPath`
@@ -279,7 +277,6 @@ Supported environment overrides:
 - `LOOPER_LOG_DIR`
 - `LOOPER_DAEMON_MODE`
 - `LOOPER_WORKING_DIRECTORY`
-- `LOOPER_BUN_PATH`
 - `LOOPER_GIT_PATH`
 - `LOOPER_GH_PATH`
 - `LOOPER_OSASCRIPT_PATH`
@@ -300,7 +297,7 @@ Example:
 LOOPER_CONFIG="$HOME/.looper/config.json" \
 LOOPER_PORT=4321 \
 LOOPER_ALLOW_AUTO_PUSH=false \
-bun run dev
+looperd
 ```
 
 ## CLI flag overrides
@@ -313,7 +310,6 @@ Supported `looperd` flags:
 - `--db-path`
 - `--log-dir`
 - `--daemon-mode`
-- `--bun-path`
 - `--git-path`
 - `--gh-path`
 - `--osascript-path`
@@ -324,7 +320,7 @@ Supported `looperd` flags:
 Example:
 
 ```bash
-bun run --cwd apps/looperd dev -- \
+looperd \
   --config "$HOME/.looper/config.json" \
   --port 4321 \
   --allow-auto-push=false
@@ -355,16 +351,16 @@ That means if you set `projects` in the config file, the entire projects array c
 
 ## Recommended first-time setup
 
-1. Install `bun`, `git`, and `gh`
+1. Install `git` and `gh`
 2. Create `~/.looper/config.json`
 3. Add at least one project in `projects`
 4. Set `agent.vendor`
-5. Start the daemon with `bun run dev` or your installed `looperd`
+5. Start the daemon with your installed `looperd` (or `go run ./cmd/looperd` while developing)
 6. Run `looper config show` to inspect the effective config
 
 ## Troubleshooting
 
-### `tools.bunPath`, `tools.gitPath`, or `tools.ghPath` could not be resolved
+### `tools.gitPath` or `tools.ghPath` could not be resolved
 
 Set explicit paths in the config file, or make sure the binaries are on `PATH` for the environment that starts `looperd`.
 

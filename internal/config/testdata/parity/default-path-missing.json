@@ -12,7 +12,6 @@
       "LOOPER_ALLOW_AUTO_COMMIT": "false",
       "LOOPER_ALLOW_AUTO_PUSH": "false",
       "LOOPER_ALLOW_AUTO_APPROVE": "true",
-      "LOOPER_BUN_PATH": "/envonly/bun",
       "LOOPER_GIT_PATH": "/envonly/git",
       "LOOPER_GH_PATH": "/envonly/gh",
       "LOOPER_OSASCRIPT_PATH": "/envonly/osascript"
@@ -54,7 +53,6 @@
         }
       },
       "tools": {
-        "bunPath": "/envonly/bun",
         "gitPath": "/envonly/git",
         "ghPath": "/envonly/gh",
         "osascriptPath": "/envonly/osascript"
@@ -85,7 +83,6 @@
       "configPath": "__TMP__/configs/missing.json",
       "configFilePresent": false,
       "toolDetection": {
-        "bunPath": "configured",
         "gitPath": "configured",
         "ghPath": "configured",
         "osascriptPath": "configured"

@@ -19,7 +19,7 @@ Source of truth inspected from:
   - command-local flag names
   - forwarded-vs-local semantics
   - command-level flag meanings
-- Only `--config`, `--host`, `--port`, `--db-path`, `--log-dir`, `--daemon-mode`, `--bun-path`, `--git-path`, `--gh-path`, and `--osascript-path` are forwarded by `extractConfigArgs()` into daemon/config-loading flows.
+- Only `--config`, `--host`, `--port`, `--db-path`, `--log-dir`, `--daemon-mode`, `--git-path`, `--gh-path`, and `--osascript-path` are forwarded by `extractConfigArgs()` into daemon/config-loading flows.
 - `--json` is global but intentionally not forwarded.
 
 ## Implemented commands

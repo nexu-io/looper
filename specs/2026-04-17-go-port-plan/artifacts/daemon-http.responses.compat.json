@@ -118,7 +118,6 @@
             "osascriptEnabled": true
           },
           "tools": {
-            "bun": true,
             "git": true,
             "gh": true,
             "osascript": true
@@ -169,7 +168,6 @@
             }
           },
           "tools": {
-            "bunPath": "/usr/bin/bun",
             "gitPath": "/usr/bin/git",
             "ghPath": "/usr/bin/gh",
             "osascriptPath": "/usr/bin/osascript"

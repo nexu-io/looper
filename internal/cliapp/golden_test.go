@@ -64,7 +64,7 @@ func TestCLIGoldenOutputs(t *testing.T) {
 							"worker":   map[string]any{"running": 2, "paused": 0, "failed": 1},
 							"fixer":    map[string]any{"running": 0, "paused": 0, "failed": 0},
 						},
-						"tools":         map[string]any{"bun": true, "git": true, "gh": false, "osascript": true},
+						"tools":         map[string]any{"git": true, "gh": false, "osascript": true},
 						"notifications": map[string]any{"inAppEnabled": true, "osascriptEnabled": false},
 					}))
 				}))

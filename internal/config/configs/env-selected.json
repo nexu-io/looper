@@ -37,9 +37,7 @@
     "inApp": true,
     "osascript": {
       "enabled": true,
-      "soundForLevels": [
-        "failure"
-      ],
+      "soundForLevels": ["failure"],
       "throttleWindowSeconds": 120
     }
   },
@@ -74,7 +72,6 @@
     "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturesenv-config-path794540115/001/launchd.sqlite"
   },
   "tools": {
-    "bunPath": "/cfg/bun",
     "ghPath": "/cfg/gh",
     "gitPath": "/cfg/git",
     "osascriptPath": "/cfg/osascript"

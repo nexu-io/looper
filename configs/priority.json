@@ -20,7 +20,6 @@
     }
   },
   "tools": {
-    "bunPath": "/file/bun",
     "gitPath": "/file/git",
     "ghPath": "/file/gh"
   },

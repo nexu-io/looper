@@ -40,7 +40,6 @@
     "dbPath": "/var/folders/qc/b9xm79rd3h1d7k619h0lm3240000gn/T/TestLoadFileMatchesFrozenParityFixturescli-file-env-priority2864654040/001/file.sqlite"
   },
   "tools": {
-    "bunPath": "/file/bun",
     "ghPath": "/file/gh",
     "gitPath": "/file/git"
   }

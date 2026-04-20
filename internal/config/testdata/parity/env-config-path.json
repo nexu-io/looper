@@ -48,7 +48,6 @@
           }
         },
         "tools": {
-          "bunPath": "/cfg/bun",
           "gitPath": "/cfg/git",
           "ghPath": "/cfg/gh",
           "osascriptPath": "/cfg/osascript"
@@ -132,7 +131,6 @@
         }
       },
       "tools": {
-        "bunPath": "/cfg/bun",
         "gitPath": "/cfg/git",
         "ghPath": "/cfg/gh",
         "osascriptPath": "/cfg/osascript"
@@ -173,7 +171,6 @@
       "configPath": "__TMP__/configs/env-selected.json",
       "configFilePresent": true,
       "toolDetection": {
-        "bunPath": "configured",
         "gitPath": "configured",
         "ghPath": "configured",
         "osascriptPath": "configured"

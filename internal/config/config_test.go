@@ -18,7 +18,7 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:        cwd,
 		ConfigPath: configPath,
-		LookPath:   fakeLookPath(map[string]string{"bun": "/detected/bun", "git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
@@ -44,12 +44,8 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 		t.Fatalf("LoadFile().Partial.Server = %#v, want nil", loaded.Partial.Server)
 	}
 
-	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/detected/bun" {
-		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/detected/bun")
-	}
-
-	if got := loaded.Metadata.ToolDetection["bunPath"]; got != ToolDetectionStatusDetected {
-		t.Fatalf("LoadFile().Metadata.ToolDetection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
+	if got := loaded.Metadata.ToolDetection["gitPath"]; got != ToolDetectionStatusDetected {
+		t.Fatalf("LoadFile().Metadata.ToolDetection[gitPath] = %q, want %q", got, ToolDetectionStatusDetected)
 	}
 }
 
@@ -115,7 +111,7 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:      t.TempDir(),
-		LookPath: fakeLookPath(map[string]string{"bun": "/detected/bun", "git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+		LookPath: fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
@@ -148,17 +144,10 @@ func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T)
 		LookupEnv: mapEnvLookup(map[string]string{
 			"LOOPER_GH_PATH": "/env/gh",
 		}),
-		LookPath: fakeLookPath(map[string]string{
-			"bun":       "/detected/bun",
-			"osascript": "/detected/osascript",
-		}),
+		LookPath: fakeLookPath(map[string]string{"osascript": "/detected/osascript"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
-	}
-
-	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/detected/bun" {
-		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/detected/bun")
 	}
 
 	if loaded.Config.Tools.GitPath == nil || *loaded.Config.Tools.GitPath != "/file/git" {
@@ -171,10 +160,6 @@ func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T)
 
 	if loaded.Config.Tools.OsascriptPath == nil || *loaded.Config.Tools.OsascriptPath != "/detected/osascript" {
 		t.Fatalf("LoadFile().Config.Tools.OsascriptPath = %v, want %q", loaded.Config.Tools.OsascriptPath, "/detected/osascript")
-	}
-
-	if got := loaded.Metadata.ToolDetection["bunPath"]; got != ToolDetectionStatusDetected {
-		t.Fatalf("LoadFile().Metadata.ToolDetection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
 	}
 
 	if got := loaded.Metadata.ToolDetection["gitPath"]; got != ToolDetectionStatusConfigured {
@@ -195,13 +180,7 @@ func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 
 	result := DetectToolPaths(ToolPathsConfig{
 		GitPath: &configuredGitPath,
-	}, fakeLookPath(map[string]string{
-		"bun": "/detected/bun",
-	}))
-
-	if result.Paths.BunPath == nil || *result.Paths.BunPath != "/detected/bun" {
-		t.Fatalf("DetectToolPaths().Paths.BunPath = %v, want %q", result.Paths.BunPath, "/detected/bun")
-	}
+	}, fakeLookPath(map[string]string{}))
 
 	if result.Paths.GitPath == nil || *result.Paths.GitPath != configuredGitPath {
 		t.Fatalf("DetectToolPaths().Paths.GitPath = %v, want %q", result.Paths.GitPath, configuredGitPath)
@@ -209,10 +188,6 @@ func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 
 	if result.Paths.GHPath != nil {
 		t.Fatalf("DetectToolPaths().Paths.GHPath = %v, want nil", result.Paths.GHPath)
-	}
-
-	if got := result.Detection["bunPath"]; got != ToolDetectionStatusDetected {
-		t.Fatalf("DetectToolPaths().Detection[bunPath] = %q, want %q", got, ToolDetectionStatusDetected)
 	}
 
 	if got := result.Detection["gitPath"]; got != ToolDetectionStatusConfigured {
@@ -239,7 +214,7 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 		"daemon": {"logDir": %q, "workingDirectory": %q},
 		"storage": {"dbPath": %q},
 		"notifications": {"osascript": {"enabled": true, "throttleWindowSeconds": 60}},
-		"tools": {"bunPath": "/file/bun", "gitPath": "/file/git", "ghPath": "/file/gh"},
+		"tools": {"gitPath": "/file/git", "ghPath": "/file/gh"},
 		"defaults": {"allowAutoCommit": false}
 	}`, logDir, cwd, dbPath)
 	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
@@ -261,7 +236,6 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 			"LOOPER_LOG_DIR":              filepath.Join(cwd, "env-logs"),
 			"LOOPER_OSASCRIPT_ENABLED":    "false",
 			"LOOPER_IN_APP_NOTIFICATIONS": "false",
-			"LOOPER_BUN_PATH":             "/env/bun",
 			"LOOPER_GH_PATH":              "/env/gh",
 			"LOOPER_ALLOW_AUTO_COMMIT":    "true",
 			"LOOPER_ALLOW_AUTO_APPROVE":   "true",
@@ -291,10 +265,6 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 
 	if loaded.Config.Daemon.WorkingDirectory != filepath.Join(cwd, "env-workspace") {
 		t.Fatalf("LoadFile().Config.Daemon.WorkingDirectory = %q, want %q", loaded.Config.Daemon.WorkingDirectory, filepath.Join(cwd, "env-workspace"))
-	}
-
-	if loaded.Config.Tools.BunPath == nil || *loaded.Config.Tools.BunPath != "/env/bun" {
-		t.Fatalf("LoadFile().Config.Tools.BunPath = %v, want %q", loaded.Config.Tools.BunPath, "/env/bun")
 	}
 
 	if loaded.Config.Tools.GitPath == nil || *loaded.Config.Tools.GitPath != "/cli/git" {
@@ -638,7 +608,6 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 	pollInterval := 45
 	throttleWindow := 120
 	maxFiles := 9
-	bunPath := "/custom/bin/bun"
 	localToken := "secret"
 	baseURL := "http://127.0.0.1:9999"
 	vendor := AgentVendorOpenCode
@@ -685,7 +654,7 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 			},
 		},
 		Tools: &PartialToolPathsConfig{
-			BunPath: &bunPath,
+			GitPath: stringPtr("/custom/bin/git"),
 		},
 		Daemon: &PartialDaemonConfig{
 			Mode:              &daemonMode,
@@ -777,12 +746,8 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 		t.Fatalf("Normalize().Notifications.Osascript.ThrottleWindowSeconds = %d, want %d", config.Notifications.Osascript.ThrottleWindowSeconds, 120)
 	}
 
-	if config.Tools.BunPath == nil || *config.Tools.BunPath != bunPath {
-		t.Fatalf("Normalize().Tools.BunPath = %v, want %q", config.Tools.BunPath, bunPath)
-	}
-
-	if config.Tools.GitPath != nil {
-		t.Fatalf("Normalize().Tools.GitPath = %v, want nil", config.Tools.GitPath)
+	if config.Tools.GitPath == nil || *config.Tools.GitPath != "/custom/bin/git" {
+		t.Fatalf("Normalize().Tools.GitPath = %v, want %q", config.Tools.GitPath, "/custom/bin/git")
 	}
 
 	if config.Daemon.Mode != DaemonModeLaunchd {

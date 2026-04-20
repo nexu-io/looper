@@ -76,7 +76,6 @@ Source: `apps/cli/src/index.ts:282-294`, `apps/cli/src/index.ts:2473-2516`
 | `notifications.osascript.enabled` | boolean | `true` | requires `tools.osascriptPath` when enabled |
 | `notifications.osascript.soundForLevels` | optional array of `action_required`/`failure` | `["action_required", "failure"]` | invalid entries rejected |
 | `notifications.osascript.throttleWindowSeconds` | integer | `60` | must be positive integer |
-| `tools.bunPath` | optional string path | auto-detected if absent | required overall; also required for `daemon.mode=launchd` |
 | `tools.gitPath` | optional string path | auto-detected if absent | required overall |
 | `tools.ghPath` | optional string path | auto-detected if absent | required overall |
 | `tools.osascriptPath` | optional string path | auto-detected if absent | required only when osascript notifications are enabled |
@@ -126,7 +125,6 @@ Validation source: `apps/looperd/src/config/validate.ts:77-365`
 | `LOOPER_ALLOW_AUTO_COMMIT` | `defaults.allowAutoCommit` | same boolean parsing |
 | `LOOPER_ALLOW_AUTO_PUSH` | `defaults.allowAutoPush` | same boolean parsing |
 | `LOOPER_ALLOW_AUTO_APPROVE` | `defaults.allowAutoApprove` | same boolean parsing |
-| `LOOPER_BUN_PATH` | `tools.bunPath` | explicit path beats auto-detection |
 | `LOOPER_GIT_PATH` | `tools.gitPath` | explicit path beats auto-detection |
 | `LOOPER_GH_PATH` | `tools.ghPath` | explicit path beats auto-detection |
 | `LOOPER_OSASCRIPT_PATH` | `tools.osascriptPath` | explicit path beats auto-detection |
@@ -158,7 +156,6 @@ Source: `apps/cli/src/index.ts:2478-2516`, `apps/cli/src/index.ts:289-294`
 | `--db-path <path>` | `storage.dbPath` | string override |
 | `--log-dir <path>` | `daemon.logDir` | string override |
 | `--daemon-mode <mode>` | `daemon.mode` | string override, validated later |
-| `--bun-path <path>` | `tools.bunPath` | explicit path beats auto-detection |
 | `--git-path <path>` | `tools.gitPath` | explicit path beats auto-detection |
 | `--gh-path <path>` | `tools.ghPath` | explicit path beats auto-detection |
 | `--allow-auto-commit <bool>` | `defaults.allowAutoCommit` | boolean parse |
@@ -185,7 +182,6 @@ Machine-verifiable freeze artifact: `specs/2026-04-17-go-port-plan/artifacts/cli
 | `--db-path <path>` | CLI config load + daemon launch args | forwarded even though CLI config only reads host/port/daemon fields |
 | `--log-dir <path>` | CLI config load + daemon launch args | forwarded |
 | `--daemon-mode <mode>` | CLI config load + daemon launch args | forwarded |
-| `--bun-path <path>` | daemon launch args | forwarded |
 | `--git-path <path>` | daemon launch args | forwarded |
 | `--gh-path <path>` | daemon launch args | forwarded |
 | `--osascript-path <path>` | daemon launch args | forwarded |

@@ -171,10 +171,6 @@ func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, parti
 }
 
 func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfig) {
-	if partial.BunPath != nil {
-		config.BunPath = stringPtr(*partial.BunPath)
-	}
-
 	if partial.GitPath != nil {
 		config.GitPath = stringPtr(*partial.GitPath)
 	}

@@ -36,14 +36,11 @@
     "inApp": true,
     "osascript": {
       "enabled": true,
-      "soundForLevels": [
-        "failure"
-      ],
+      "soundForLevels": ["failure"],
       "throttleWindowSeconds": 120
     }
   },
   "tools": {
-    "bunPath": "/cfg/bun",
     "gitPath": "/cfg/git",
     "ghPath": "/cfg/gh",
     "osascriptPath": "/cfg/osascript"

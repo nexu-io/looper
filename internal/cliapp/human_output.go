@@ -39,7 +39,6 @@ type statusOutput struct {
 		OsascriptEnabled bool `json:"osascriptEnabled"`
 	} `json:"notifications"`
 	Tools struct {
-		Bun       bool `json:"bun"`
 		Git       bool `json:"git"`
 		GH        bool `json:"gh"`
 		Osascript bool `json:"osascript"`
@@ -175,7 +174,7 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	fmt.Fprintln(w)
 	printTable(w, []string{"type", "running", "paused", "failed"}, []tableRow{{"type": "planner", "running": data.Loops.Planner.Running, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed}, {"type": "reviewer", "running": data.Loops.Reviewer.Running, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed}, {"type": "worker", "running": data.Loops.Worker.Running, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed}, {"type": "fixer", "running": data.Loops.Fixer.Running, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed}})
 	fmt.Fprintln(w)
-	printSection(w, "Tools", [][2]any{{"bun", data.Tools.Bun}, {"git", data.Tools.Git}, {"gh", data.Tools.GH}, {"osascript", data.Tools.Osascript}})
+	printSection(w, "Tools", [][2]any{{"git", data.Tools.Git}, {"gh", data.Tools.GH}, {"osascript", data.Tools.Osascript}})
 	fmt.Fprintln(w)
 	printSection(w, "Notifications", [][2]any{{"inAppEnabled", data.Notifications.InAppEnabled}, {"osascriptEnabled", data.Notifications.OsascriptEnabled}})
 	return nil

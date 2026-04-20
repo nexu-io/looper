@@ -13,7 +13,6 @@ Flags:
   --lines <count>             Line count
 
 Global Flags:
-  --bun-path <path>           Bun binary path
   --config <path>             Config path
   --daemon-mode <mode>        Daemon mode
   --db-path <path>            Database path

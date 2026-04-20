@@ -532,7 +532,6 @@ type statusNotifications struct {
 }
 
 type statusTools struct {
-	Bun       bool `json:"bun"`
 	Git       bool `json:"git"`
 	GH        bool `json:"gh"`
 	Osascript bool `json:"osascript"`
@@ -673,7 +672,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			OsascriptEnabled: h.context.Config.Notifications.Osascript.Enabled,
 		},
 		Tools: statusTools{
-			Bun:       hasValue(h.context.Config.Tools.BunPath),
 			Git:       hasValue(h.context.Config.Tools.GitPath),
 			GH:        hasValue(h.context.Config.Tools.GHPath),
 			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),

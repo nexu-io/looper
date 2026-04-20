@@ -21,7 +21,6 @@
       "LOOPER_LOG_DIR": "__TMP__/env-logs",
       "LOOPER_OSASCRIPT_ENABLED": "false",
       "LOOPER_IN_APP_NOTIFICATIONS": "false",
-      "LOOPER_BUN_PATH": "/env/bun",
       "LOOPER_GH_PATH": "/env/gh",
       "LOOPER_ALLOW_AUTO_COMMIT": "true",
       "LOOPER_ALLOW_AUTO_APPROVE": "true"
@@ -49,7 +48,6 @@
           }
         },
         "tools": {
-          "bunPath": "/file/bun",
           "gitPath": "/file/git",
           "ghPath": "/file/gh"
         },
@@ -117,7 +115,6 @@
         }
       },
       "tools": {
-        "bunPath": "/env/bun",
         "gitPath": "/cli/git",
         "ghPath": "/env/gh",
         "osascriptPath": "/cli/osascript"
@@ -156,7 +153,6 @@
       "configPath": "__TMP__/configs/priority.json",
       "configFilePresent": true,
       "toolDetection": {
-        "bunPath": "configured",
         "gitPath": "configured",
         "ghPath": "configured",
         "osascriptPath": "configured"
