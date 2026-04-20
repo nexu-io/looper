@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,6 +159,58 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	}
 }
 
+func TestExecutorCapturesConcurrentStdoutAndStderr(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `for i in 1 2 3; do printf "out$i\n"; printf "err$i\n" >&2; sleep 0.02; done`}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_streams", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result.Status = %q, want completed", result.Status)
+	}
+	if result.Stdout == "" || result.Stderr == "" {
+		t.Fatalf("result = %#v, want both stdout and stderr captured", result)
+	}
+	for _, want := range []string{"out1", "out2", "out3"} {
+		if !containsText(result.Stdout, want) {
+			t.Fatalf("stdout = %q, want %q", result.Stdout, want)
+		}
+	}
+	for _, want := range []string{"err1", "err2", "err3"} {
+		if !containsText(result.Stderr, want) {
+			t.Fatalf("stderr = %q, want %q", result.Stderr, want)
+		}
+	}
+}
+
+func TestExecutorBoundsCapturedOutputToTail(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'abcdefgh'; printf '12345678' >&2`}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_bounded", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, MaxOutputBytes: 4})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Stdout != "efgh" {
+		t.Fatalf("stdout = %q, want efgh", result.Stdout)
+	}
+	if result.Stderr != "5678" {
+		t.Fatalf("stderr = %q, want 5678", result.Stderr)
+	}
+}
+
 func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -176,6 +229,47 @@ func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 	}
 	if result.Status != "timeout" {
 		t.Fatalf("timeout status = %q, want timeout", result.Status)
+	}
+}
+
+func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'beat\n'; sleep 1"}}}})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout", result.Status)
+	}
+}
+
+func TestExecutorKillEscalationForcesExitAfterGracePeriod(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 0.05; done`}}}})
+	startedAt := time.Now()
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill_escalation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 50 * time.Millisecond, GracefulShutdown: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout", result.Status)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("Wait() elapsed = %s, want kill escalation to finish promptly", elapsed)
 	}
 }
 
@@ -228,4 +322,8 @@ func containsEvent(events []storage.EventLogRecord, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func containsText(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
 }

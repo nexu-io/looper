@@ -43,6 +43,7 @@ type RunInput struct {
 	Prompt           string
 	WorkingDirectory string
 	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
 	GracefulShutdown time.Duration
 	MaxOutputBytes   int
 	Metadata         map[string]any
@@ -148,9 +149,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		startedAtISO:       startedAtISO,
 		process:            cmd,
 		timeout:            input.Timeout,
+		heartbeatTimeout:   input.HeartbeatTimeout,
 		gracefulShutdown:   input.GracefulShutdown,
 		maxOutputBytes:     maxOutputBytes,
 		lastHeartbeatAtISO: startedAtISO,
+		lastOutputAt:       startedAt,
 		status:             "running",
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
@@ -177,9 +180,11 @@ type execution struct {
 	startedAtISO       string
 	process            *exec.Cmd
 	timeout            time.Duration
+	heartbeatTimeout   time.Duration
 	gracefulShutdown   time.Duration
 	maxOutputBytes     int
 	lastHeartbeatAtISO string
+	lastOutputAt       time.Time
 
 	mu             sync.Mutex
 	status         string
@@ -234,21 +239,36 @@ func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPip
 		killReason      string
 		graceKillTimer  <-chan time.Time
 		timeoutTimer    <-chan time.Time
+		inactivityTimer *time.Ticker
+		terminateOnce   sync.Once
 		terminateSignal = func() {
-			if x.process.Process == nil {
-				return
-			}
-			_ = x.process.Process.Signal(syscall.SIGTERM)
-			grace := x.gracefulShutdown
-			if grace <= 0 {
-				grace = 5 * time.Second
-			}
-			graceKillTimer = time.After(grace)
+			terminateOnce.Do(func() {
+				if x.process.Process == nil {
+					return
+				}
+				if err := x.process.Process.Signal(syscall.SIGTERM); err != nil && err != os.ErrProcessDone {
+					_ = x.process.Process.Kill()
+					return
+				}
+				grace := x.gracefulShutdown
+				if grace <= 0 {
+					grace = 5 * time.Second
+				}
+				graceKillTimer = time.After(grace)
+			})
 		}
 	)
 
 	if x.timeout > 0 {
 		timeoutTimer = time.After(x.timeout)
+	}
+	if x.heartbeatTimeout > 0 {
+		interval := x.heartbeatTimeout
+		if interval > time.Second {
+			interval = time.Second
+		}
+		inactivityTimer = time.NewTicker(interval)
+		defer inactivityTimer.Stop()
 	}
 
 	waiting := true
@@ -259,6 +279,22 @@ func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPip
 		case <-timeoutTimer:
 			timeoutTimer = nil
 			timedOut = true
+			if killReason == "" {
+				killReason = "agent timed out"
+			}
+			x.setStatus("timeout")
+			terminateSignal()
+		case <-tickerChan(inactivityTimer):
+			if timedOut || killed || x.process.ProcessState != nil {
+				continue
+			}
+			if x.timeSinceLastOutput() < x.heartbeatTimeout {
+				continue
+			}
+			timedOut = true
+			if killReason == "" {
+				killReason = fmt.Sprintf("agent heartbeat timed out after %s", x.heartbeatTimeout)
+			}
 			x.setStatus("timeout")
 			terminateSignal()
 		case reason := <-x.killCh:
@@ -332,10 +368,12 @@ func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPip
 }
 
 func (x *execution) onOutput(stream string, chunk []byte) {
-	nowISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+	now := x.executor.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
 	x.mu.Lock()
 	x.heartbeatCount++
 	x.lastHeartbeatAtISO = nowISO
+	x.lastOutputAt = now
 	if stream == "stdout" {
 		x.stdout = appendTailBounded(x.stdout, chunk, x.maxOutputBytes)
 	} else {
@@ -486,6 +524,15 @@ func (x *execution) heartbeatCountValue() int64 {
 	return x.heartbeatCount
 }
 
+func (x *execution) timeSinceLastOutput() time.Duration {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.lastOutputAt.IsZero() {
+		return 0
+	}
+	return x.executor.now().UTC().Sub(x.lastOutputAt)
+}
+
 type streamCapture struct {
 	onChunk func([]byte)
 }
@@ -619,6 +666,13 @@ func appendTailBounded(existing []byte, chunk []byte, maxBytes int) []byte {
 		return combined
 	}
 	return append([]byte{}, combined[len(combined)-maxBytes:]...)
+}
+
+func tickerChan(ticker *time.Ticker) <-chan time.Time {
+	if ticker == nil {
+		return nil
+	}
+	return ticker.C
 }
 
 func parseCompletion(stdout, stderr string) completionParse {
