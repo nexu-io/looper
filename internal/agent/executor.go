@@ -20,7 +20,6 @@ import (
 const (
 	defaultMaxOutputBytes = 256 * 1024
 	completionMarkerEnv   = "LOOPER_COMPLETION_MARKER"
-	completionMarkerValue = "LOOPER_COMPLETION="
 )
 
 type ExecutorConfig struct {
@@ -52,13 +51,26 @@ type RunInput struct {
 }
 
 type Result struct {
-	Status         string
-	Summary        string
-	Stdout         string
-	Stderr         string
-	ParseStatus    string
-	HeartbeatCount int64
-	PID            int
+	Status           string
+	Summary          string
+	Stdout           string
+	Stderr           string
+	ParseStatus      string
+	CompletionSignal string
+	Artifacts        []string
+	ChangedFiles     []string
+	Commits          []string
+	HeartbeatCount   int64
+	PID              int
+}
+
+type completionParse struct {
+	ParseStatus      string
+	CompletionSignal string
+	Summary          string
+	Artifacts        []string
+	ChangedFiles     []string
+	Commits          []string
 }
 
 type Execution interface {
@@ -107,7 +119,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	cmd.Env = append(cmd.Env,
 		"LOOPER_PROMPT="+input.Prompt,
-		completionMarkerEnv+"="+completionMarkerValue,
+		completionMarkerEnv+"="+CompletionMarkerPrefix,
 	)
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -273,22 +285,26 @@ func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPip
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
 	status := x.finalStatus(timedOut, killed)
-	parseStatus, summary := parseCompletion(stdout, stderr)
-	if summary == "" {
-		summary = summarizeLogs(stdout, stderr)
+	completion := parseCompletion(stdout, stderr)
+	if completion.Summary == "" {
+		completion.Summary = summarizeLogs(stdout, stderr)
 	}
 	if waitErr != nil && status == "failed" && strings.TrimSpace(stderr) == "" {
 		stderr = waitErr.Error()
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 	result := Result{
-		Status:         status,
-		Summary:        summary,
-		Stdout:         stdout,
-		Stderr:         stderr,
-		ParseStatus:    parseStatus,
-		HeartbeatCount: x.heartbeatCountValue(),
-		PID:            pidOrZero(x.process.Process),
+		Status:           status,
+		Summary:          completion.Summary,
+		Stdout:           stdout,
+		Stderr:           stderr,
+		ParseStatus:      completion.ParseStatus,
+		CompletionSignal: completion.CompletionSignal,
+		Artifacts:        append([]string(nil), completion.Artifacts...),
+		ChangedFiles:     append([]string(nil), completion.ChangedFiles...),
+		Commits:          append([]string(nil), completion.Commits...),
+		HeartbeatCount:   x.heartbeatCountValue(),
+		PID:              pidOrZero(x.process.Process),
 	}
 
 	errorMessage := ""
@@ -394,27 +410,29 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	outputJSON := mustJSON(map[string]string{"stdout": result.Stdout, "stderr": result.Stderr})
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
+	completionSignal := emptyToNil(result.CompletionSignal)
 	record := storage.AgentExecutionRecord{
-		ID:              x.executionID,
-		ProjectID:       emptyToNil(x.input.ProjectID),
-		LoopID:          emptyToNil(x.input.LoopID),
-		RunID:           emptyToNil(x.input.RunID),
-		Vendor:          string(x.executor.config.Vendor),
-		Status:          status,
-		PID:             int64PtrIfPositive(pid),
-		CommandJSON:     &commandJSON,
-		CWD:             &x.input.WorkingDirectory,
-		Summary:         emptyToNil(result.Summary),
-		ParseStatus:     &parseStatus,
-		HeartbeatCount:  result.HeartbeatCount,
-		LastHeartbeatAt: &x.lastHeartbeatAtISO,
-		OutputJSON:      &outputJSON,
-		ErrorMessage:    emptyToNil(errorMessage),
-		StartedAt:       x.startedAtISO,
-		EndedAt:         &endedAtISO,
-		MetadataJSON:    &metadata,
-		CreatedAt:       x.startedAtISO,
-		UpdatedAt:       endedAtISO,
+		ID:               x.executionID,
+		ProjectID:        emptyToNil(x.input.ProjectID),
+		LoopID:           emptyToNil(x.input.LoopID),
+		RunID:            emptyToNil(x.input.RunID),
+		Vendor:           string(x.executor.config.Vendor),
+		Status:           status,
+		PID:              int64PtrIfPositive(pid),
+		CommandJSON:      &commandJSON,
+		CWD:              &x.input.WorkingDirectory,
+		Summary:          emptyToNil(result.Summary),
+		ParseStatus:      &parseStatus,
+		CompletionSignal: completionSignal,
+		HeartbeatCount:   result.HeartbeatCount,
+		LastHeartbeatAt:  &x.lastHeartbeatAtISO,
+		OutputJSON:       &outputJSON,
+		ErrorMessage:     emptyToNil(errorMessage),
+		StartedAt:        x.startedAtISO,
+		EndedAt:          &endedAtISO,
+		MetadataJSON:     &metadata,
+		CreatedAt:        x.startedAtISO,
+		UpdatedAt:        endedAtISO,
 	}
 	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
 }
@@ -603,24 +621,48 @@ func appendTailBounded(existing []byte, chunk []byte, maxBytes int) []byte {
 	return append([]byte{}, combined[len(combined)-maxBytes:]...)
 }
 
-func parseCompletion(stdout, stderr string) (string, string) {
+func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
 	lines := strings.Split(raw, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, completionMarkerValue) {
-			payload := strings.TrimPrefix(line, completionMarkerValue)
+		if strings.HasPrefix(line, CompletionMarkerPrefix) {
+			payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-				return "invalid_json", ""
+				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
+			}
+			result := completionParse{
+				ParseStatus:      "parsed",
+				CompletionSignal: CompletionMarkerPrefix,
+				Artifacts:        asStringSlice(parsed["artifacts"]),
+				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
+				Commits:          asStringSlice(parsed["commits"]),
 			}
 			if summary, ok := parsed["summary"].(string); ok {
-				return "parsed", summary
+				result.Summary = summary
 			}
-			return "parsed", ""
+			return result
 		}
 	}
-	return "missing", ""
+	return completionParse{ParseStatus: "missing"}
+}
+
+func asStringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		if stringsValue, okStrings := value.([]string); okStrings {
+			return append([]string(nil), stringsValue...)
+		}
+		return []string{}
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if text, ok := item.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
 }
 
 func summarizeLogs(stdout, stderr string) string {

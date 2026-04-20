@@ -54,7 +54,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'ok\n'; printf 'LOOPER_COMPLETION={\"summary\":\"done\"}\n'"}}},
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"]}\n'`}}},
 		Repos:  repos,
 		Now: func() time.Time {
 			now = now.Add(10 * time.Millisecond)
@@ -74,6 +74,12 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	if result.Status != "completed" {
 		t.Fatalf("result.Status = %q, want completed", result.Status)
 	}
+	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.Summary != "done" {
+		t.Fatalf("result = %#v, want parsed completion marker result", result)
+	}
+	if len(result.Artifacts) != 1 || result.Artifacts[0] != "spec.md" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "main.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
+		t.Fatalf("result parsed fields = %#v, want artifacts/changedFiles/commits", result)
+	}
 
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_1")
 	if err != nil {
@@ -82,6 +88,9 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	if record == nil || record.Status != "completed" || record.EndedAt == nil {
 		t.Fatalf("agent execution record = %#v, want completed with endedAt", record)
 	}
+	if record.ParseStatus == nil || *record.ParseStatus != "parsed" || record.CompletionSignal == nil || *record.CompletionSignal != CompletionMarkerPrefix {
+		t.Fatalf("agent execution record = %#v, want parse status + completion signal", record)
+	}
 
 	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "agent_1")
 	if err != nil {
@@ -89,6 +98,40 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	}
 	if !containsEvent(events, "agent.invoked") || !containsEvent(events, "agent.completed") {
 		t.Fatalf("agent events = %#v, want invoked + completed", events)
+	}
+}
+
+func TestExecutorMissingCompletionFallsBackToLastLogLine(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'first\nsecond\n'"}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_missing", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.ParseStatus != "missing" || result.CompletionSignal != "" || result.Summary != "second" {
+		t.Fatalf("result = %#v, want missing parse status and fallback summary", result)
+	}
+}
+
+func TestExecutorInvalidJSONCompletionPreservesSignalAndFallsBackToLogs(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'before\n'; printf '__LOOPER_RESULT__={bad json}\n'`}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_invalid", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.ParseStatus != "invalid_json" || result.CompletionSignal != CompletionMarkerPrefix || result.Summary != "__LOOPER_RESULT__={bad json}" {
+		t.Fatalf("result = %#v, want invalid_json with fallback summary and signal", result)
 	}
 }
 

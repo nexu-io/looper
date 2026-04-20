@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
@@ -56,8 +57,6 @@ const (
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
-
-	agentCompletionMarker = "__LOOPER_RESULT__"
 )
 
 type PullRequestSummary struct {
@@ -1336,12 +1335,8 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"For multiline inline comments, startLine/startSide must identify the first line and line/side the last line; omit startLine/startSide for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"Do not approve. If the review is clean, return verdict=clean with comments=[].",
-		"When finished, print exactly one final line to stdout in this format:",
-		agentCompletionMarker+`={"summary":"<one-sentence summary>"}`,
-		"Do not wrap that line in markdown.",
-		"Do not print anything after that line.",
 	)
-	return strings.Join(parts, "\n\n")
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
 func parseReviewFeedback(result AgentResult) parsedReviewFeedback {
@@ -1359,7 +1354,7 @@ func parseReviewFeedback(result AgentResult) parsedReviewFeedback {
 func extractReviewOutput(stdout string) string {
 	lines := make([]string, 0)
 	for _, line := range strings.Split(stdout, "\n") {
-		if strings.HasPrefix(line, "__LOOPER_RESULT__=") {
+		if strings.HasPrefix(line, agent.CompletionMarkerPrefix) {
 			continue
 		}
 		lines = append(lines, line)
@@ -1437,7 +1432,7 @@ func summarizeLogs(stdout string) string {
 	lines := make([]string, 0)
 	for _, line := range strings.Split(stdout, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "__LOOPER_RESULT__=") {
+		if trimmed == "" || strings.HasPrefix(trimmed, agent.CompletionMarkerPrefix) {
 			continue
 		}
 		lines = append(lines, trimmed)

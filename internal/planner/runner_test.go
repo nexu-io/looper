@@ -67,6 +67,9 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	if !strings.Contains(agent.starts[0].Prompt, "When finished, print exactly one final line to stdout in this format:") {
 		t.Fatalf("prompt = %q, want completion instruction", agent.starts[0].Prompt)
 	}
+	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
+		t.Fatalf("prompt = %q, want canonical completion marker", agent.starts[0].Prompt)
+	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)

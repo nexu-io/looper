@@ -61,8 +61,8 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
 	}
-	if !strings.Contains(agent.starts[0].Prompt, agentCompletionInstruction) {
-		t.Fatalf("prompt = %q, want completion instruction", agent.starts[0].Prompt)
+	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
+		t.Fatalf("prompt = %q, want canonical completion instruction", agent.starts[0].Prompt)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
@@ -1674,7 +1675,7 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 		"Only perform repair changes for the listed fix items.",
 		"Avoid pushing branches or changing remote review state; Looper will handle follow-up repository actions after your edits.",
 	)
-	return strings.Join(parts, "\n\n")
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
 func buildFixerCommitMessage(prNumber int64) string {

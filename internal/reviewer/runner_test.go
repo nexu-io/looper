@@ -164,6 +164,23 @@ func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *t
 	}
 }
 
+func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
+	t.Parallel()
+
+	stdout := strings.Join([]string{
+		`{"verdict":"clean","body":"","comments":[]}`,
+		`__LOOPER_RESULT__={"summary":"ok"}`,
+	}, "\n")
+	output := extractReviewOutput(stdout)
+	if strings.Contains(output, "__LOOPER_RESULT__") {
+		t.Fatalf("output = %q, want marker stripped", output)
+	}
+	parsed, ok := parseStructuredReviewOutput(output)
+	if !ok || !parsed.Clean {
+		t.Fatalf("parsed = %#v, %v, want clean structured review", parsed, ok)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories

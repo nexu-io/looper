@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
@@ -32,8 +33,6 @@ const (
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
-
-	agentCompletionMarker = "__LOOPER_RESULT__"
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
@@ -162,6 +161,7 @@ type AgentResult struct {
 	Status  string
 	Summary string
 	Stdout  string
+	Commits []string
 }
 
 type AgentExecution interface {
@@ -706,7 +706,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if !strings.EqualFold(result.Status, "completed") {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Planner agent "+result.Status), kind: FailureRetryableTransient}
 	}
-	checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout}
+	checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...)}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1182,7 +1182,7 @@ func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, w
 		"- Keep the implementation scope aligned to the issue",
 		"- Commit the spec changes on the current branch so the PR can be opened",
 	}, "\n"))
-	return appendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
 func buildPullRequestBody(issue checkpointIssue, worktree checkpointWorktree, writeSpec *checkpointWriteSpec) string {
@@ -1203,16 +1203,6 @@ func readAgentsBlock(projectRepoPath string) string {
 		return ""
 	}
 	return "AGENTS.md:\n" + string(content)
-}
-
-func appendCompletionInstruction(prompt string) string {
-	return strings.Join([]string{
-		prompt,
-		"When finished, print exactly one final line to stdout in this format:",
-		agentCompletionMarker + `={"summary":"<one-sentence summary>"}`,
-		"Do not wrap that line in markdown.",
-		"Do not print anything after that line.",
-	}, "\n\n")
 }
 
 func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
@@ -39,11 +40,10 @@ const (
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
 
-	workerBranchSlugMaxLength  = 30
-	workerBranchSlugMaxWords   = 5
-	workerBranchHashLength     = 16
-	workerPRDedupeLookupLimit  = 1000
-	agentCompletionInstruction = "When finished, print exactly one final line to stdout in this format: __LOOPER_RESULT__ {\"status\":\"completed\",\"summary\":\"<summary>\"}"
+	workerBranchSlugMaxLength = 30
+	workerBranchSlugMaxWords  = 5
+	workerBranchHashLength    = 16
+	workerPRDedupeLookupLimit = 1000
 )
 
 var workerStepSequence = []WorkerStep{
@@ -199,11 +199,11 @@ type AgentRunInput struct {
 }
 
 type AgentResult struct {
-	Status  string
-	Summary string
-	Stdout  string
-	Commits []string
-	Files   []string
+	Status       string
+	Summary      string
+	Stdout       string
+	ChangedFiles []string
+	Commits      []string
 }
 
 type AgentExecution interface {
@@ -730,7 +730,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if result.Status != "completed" {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent %s", result.Status)), kind: FailureRetryableTransient}
 	}
-	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ChangedFiles: append([]string(nil), result.Files...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
+	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1225,8 +1225,7 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 	} else {
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 	}
-	parts = append(parts, agentCompletionInstruction)
-	return strings.Join(parts, "\n\n"), nil
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), nil
 }
 
 func buildAgentPullRequestInstruction(work workerInput) string {
