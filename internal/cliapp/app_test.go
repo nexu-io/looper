@@ -7,10 +7,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/powerformer/looper/internal/agent"
+	"github.com/powerformer/looper/internal/api"
+	"github.com/powerformer/looper/internal/config"
+	gitinfra "github.com/powerformer/looper/internal/infra/git"
+	looperdruntime "github.com/powerformer/looper/internal/runtime"
+	"github.com/powerformer/looper/internal/worker"
 	pkgapi "github.com/powerformer/looper/pkg/api"
 )
 
@@ -399,6 +407,313 @@ func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	if strings.Contains(stdout, "line1") {
 		t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, did not expect trimmed line", stdout)
 	}
+}
+
+func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktree(t *testing.T) {
+	repoPath := initSampleGitRepo(t)
+	runtimeRoot := t.TempDir()
+
+	cfg, err := config.DefaultConfig(runtimeRoot)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	backupDir := filepath.Join(runtimeRoot, "backups")
+	cfg.Storage.DBPath = filepath.Join(runtimeRoot, "state", "looper.sqlite")
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Daemon.WorkingDirectory = runtimeRoot
+	vendor := config.AgentVendor("custom")
+	cfg.Agent.Vendor = &vendor
+	cfg.Agent.Params = map[string]any{
+		"command": "/bin/sh",
+		"args": []any{
+			"-c",
+			`printf 'smoke-change\n' >> smoke-output.txt; printf '__LOOPER_RESULT__={"summary":"smoke complete","changedFiles":["smoke-output.txt"]}\n'`,
+		},
+	}
+
+	rt := looperdruntime.New(looperdruntime.Options{
+		Config: cfg,
+		RunSchedulerTick: func(ctx context.Context, services looperdruntime.Services) error {
+			runner := worker.New(worker.Options{
+				DB:    services.Coordinator.DB(),
+				Repos: services.Repositories,
+				Git: smokeGitGateway{gateway: gitinfra.New(gitinfra.Options{
+					GitPath: "git",
+					Repos:   services.Repositories,
+				})},
+				AgentExecutor: smokeAgentExecutor{executor: agent.New(agent.ExecutorOptions{
+					Config: agent.ExecutorConfig{
+						Vendor: *cfg.Agent.Vendor,
+						Params: cfg.Agent.Params,
+						Env:    cfg.Agent.Env,
+					},
+					Repos: services.Repositories,
+				})},
+				AllowAutoCommit: true,
+				OpenPRStrategy:  config.OpenPRStrategyManual,
+			})
+			_, err := runner.ProcessNext(ctx, "smoke-worker")
+			return err
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Runtime.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		rt.Stop("test cleanup")
+	})
+
+	server := httptest.NewServer(api.NewHandler(api.Context{
+		Config:               cfg,
+		Runtime:              rt,
+		TriggerSchedulerTick: rt.TriggerSchedulerTick,
+	}))
+	t.Cleanup(server.Close)
+
+	configPath := writeCLIConfig(t, server.URL, "")
+
+	exitCode, statusJSON, stderr := runApp(t, "status", "--json", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([status --json]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+	var statusPayload map[string]any
+	if err := json.Unmarshal([]byte(statusJSON), &statusPayload); err != nil {
+		t.Fatalf("json.Unmarshal(statusJSON) error = %v", err)
+	}
+	service, _ := statusPayload["service"].(map[string]any)
+	if service == nil {
+		t.Fatalf("status payload service = %#v, want object", statusPayload["service"])
+	}
+	if got := service["healthy"]; got != true {
+		t.Fatalf("status payload service.healthy = %#v, want true", got)
+	}
+	if got := service["daemonMode"]; got != "foreground" {
+		t.Fatalf("status payload service.daemonMode = %#v, want foreground", got)
+	}
+
+	exitCode, configJSON, stderr := runApp(t, "config", "show", "--json", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([config show --json]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+	var configPayload map[string]any
+	if err := json.Unmarshal([]byte(configJSON), &configPayload); err != nil {
+		t.Fatalf("json.Unmarshal(configJSON) error = %v", err)
+	}
+	daemonConfig, _ := configPayload["daemon"].(map[string]any)
+	if daemonConfig == nil {
+		t.Fatalf("config payload daemon = %#v, want object", configPayload["daemon"])
+	}
+	if got := daemonConfig["mode"]; got != string(cfg.Daemon.Mode) {
+		t.Fatalf("config payload daemon.mode = %#v, want %q", got, cfg.Daemon.Mode)
+	}
+	if got := daemonConfig["workingDirectory"]; got != cfg.Daemon.WorkingDirectory {
+		t.Fatalf("config payload daemon.workingDirectory = %#v, want %q", got, cfg.Daemon.WorkingDirectory)
+	}
+
+	exitCode, addJSON, stderr := runApp(t, "project", "add", repoPath, "--id", "smoke-project", "--repo", "acme/looper", "--base-branch", "main", "--json", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([project add ... --json]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+	assertJSONContains(t, addJSON, "id", "smoke-project")
+
+	exitCode, projectListJSON, stderr := runApp(t, "project", "list", "--json", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([project list --json]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+	if !strings.Contains(projectListJSON, "smoke-project") {
+		t.Fatalf("project list JSON = %q, want smoke-project", projectListJSON)
+	}
+
+	exitCode, workJSON, stderr := runApp(t, "work", "--project", "smoke-project", "--repo", "acme/looper", "--base-branch", "main", "--title", "Smoke run", "--prompt", "Create smoke output", "--json", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([work ... --json]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+	var workResult map[string]any
+	if err := json.Unmarshal([]byte(workJSON), &workResult); err != nil {
+		t.Fatalf("json.Unmarshal(workJSON) error = %v", err)
+	}
+	loopID, _ := workResult["id"].(string)
+	if strings.TrimSpace(loopID) == "" {
+		t.Fatalf("work result id = %#v, want non-empty loop id", workResult["id"])
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		exitCode, runListJSON, runStderr := runApp(t, "run", "list", "--loop", loopID, "--json", "--config", configPath)
+		if exitCode != 0 || runStderr != "" {
+			t.Fatalf("Run([run list --loop ... --json]) = (%d, %q), want (0, empty)", exitCode, runStderr)
+		}
+		var runList struct {
+			Items []struct {
+				Status string `json:"status"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(runListJSON), &runList); err != nil {
+			t.Fatalf("json.Unmarshal(runListJSON) error = %v", err)
+		}
+		hasSuccess := false
+		for _, item := range runList.Items {
+			if item.Status == "success" {
+				hasSuccess = true
+				break
+			}
+		}
+		if hasSuccess {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for successful run; last run list payload: %s", runListJSON)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	runRecord, err := rt.Services().Repositories.Runs.GetLatestByLoopID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Runs.GetLatestByLoopID() error = %v", err)
+	}
+	if runRecord == nil || runRecord.Status != "success" {
+		t.Fatalf("run record = %#v, want success", runRecord)
+	}
+
+	worktrees, err := rt.Services().Repositories.Worktrees.ListByProject(context.Background(), "smoke-project")
+	if err != nil {
+		t.Fatalf("Worktrees.ListByProject() error = %v", err)
+	}
+	if len(worktrees) == 0 {
+		t.Fatalf("Worktrees.ListByProject() = %#v, want at least one worktree", worktrees)
+	}
+	changedPath := filepath.Join(worktrees[0].WorktreePath, "smoke-output.txt")
+	changed, err := os.ReadFile(changedPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", changedPath, err)
+	}
+	if !strings.Contains(string(changed), "smoke-change") {
+		t.Fatalf("%s content = %q, want smoke-change", changedPath, string(changed))
+	}
+}
+
+func initSampleGitRepo(t *testing.T) string {
+	t.Helper()
+
+	repoPath := filepath.Join(t.TempDir(), "sample-repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	runGit(t, repoPath, "init", "-b", "main")
+	runGit(t, repoPath, "config", "user.name", "Looper Smoke")
+	runGit(t, repoPath, "config", "user.email", "smoke@looper.dev")
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("# smoke\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(README.md) error = %v", err)
+	}
+	runGit(t, repoPath, "add", "README.md")
+	runGit(t, repoPath, "commit", "-m", "initial")
+	return repoPath
+}
+
+func runGit(t *testing.T, repoPath string, args ...string) {
+	t.Helper()
+
+	commandArgs := append([]string{"-C", repoPath}, args...)
+	out, err := exec.Command("git", commandArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+}
+
+type smokeGitGateway struct {
+	gateway *gitinfra.Gateway
+}
+
+func (g smokeGitGateway) CreateWorktree(ctx context.Context, input worker.CreateWorktreeInput) (worker.CreateWorktreeResult, error) {
+	record, err := g.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{
+		ProjectID:         input.ProjectID,
+		RepoPath:          input.RepoPath,
+		WorktreeRoot:      input.WorktreeRoot,
+		Branch:            input.Branch,
+		BaseBranch:        input.BaseBranch,
+		PRNumber:          input.PRNumber,
+		ProtectedBranches: append([]string{}, input.ProtectedBranches...),
+		CheckoutMode:      gitinfra.CheckoutMode(input.CheckoutMode),
+	})
+	if err != nil {
+		return worker.CreateWorktreeResult{}, err
+	}
+	return worker.CreateWorktreeResult{
+		WorktreePath: record.WorktreePath,
+		Branch:       record.Branch,
+		BaseBranch:   strings.TrimSpace(derefString(record.BaseBranch)),
+		HeadSHA:      strings.TrimSpace(derefString(record.HeadSHA)),
+		WorktreeID:   record.ID,
+	}, nil
+}
+
+func (g smokeGitGateway) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
+	prepared, err := g.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{
+		WorktreePath:    input.WorktreePath,
+		Branch:          input.Branch,
+		ExpectedHeadSHA: input.ExpectedHeadSHA,
+		Remote:          input.Remote,
+	})
+	if err != nil {
+		return worker.PrepareWorktreeResult{}, err
+	}
+	return worker.PrepareWorktreeResult{HeadSHA: prepared.HeadSHA, Clean: prepared.Clean}, nil
+}
+
+func (g smokeGitGateway) Push(ctx context.Context, input worker.PushInput) error {
+	return g.gateway.Push(ctx, gitinfra.PushInput{
+		WorktreePath:      input.WorktreePath,
+		Branch:            input.Branch,
+		Remote:            input.Remote,
+		ProtectedBranches: append([]string{}, input.ProtectedBranches...),
+	})
+}
+
+type smokeAgentExecutor struct {
+	executor *agent.ConfiguredExecutor
+}
+
+func (e smokeAgentExecutor) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
+	execution, err := e.executor.Start(ctx, agent.RunInput{
+		ExecutionID:      input.ExecutionID,
+		ProjectID:        input.ProjectID,
+		LoopID:           input.LoopID,
+		RunID:            input.RunID,
+		Prompt:           input.Prompt,
+		WorkingDirectory: input.WorkingDirectory,
+		Timeout:          input.Timeout,
+		Metadata:         input.Metadata,
+		IdempotencyKey:   input.IdempotencyKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return smokeAgentExecution{execution: execution}, nil
+}
+
+type smokeAgentExecution struct {
+	execution agent.Execution
+}
+
+func (e smokeAgentExecution) Wait(ctx context.Context) (worker.AgentResult, error) {
+	result, err := e.execution.Wait(ctx)
+	if err != nil {
+		return worker.AgentResult{}, err
+	}
+	return worker.AgentResult{
+		Status:       result.Status,
+		Summary:      result.Summary,
+		Stdout:       result.Stdout,
+		ChangedFiles: append([]string{}, result.ChangedFiles...),
+		Commits:      append([]string{}, result.Commits...),
+	}, nil
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
