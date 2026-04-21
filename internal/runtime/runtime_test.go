@@ -479,7 +479,7 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 		Vendor:         "codex",
 		Status:         "running",
 		PID:            &pid,
-		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
+		CommandJSON:    stringPtr(`{"command":"codex","args":["exec","fix failing tests"]}`),
 		CWD:            stringPtr(workingDir),
 		HeartbeatCount: 0,
 		StartedAt:      nowISO,
@@ -499,7 +499,7 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 			return startedAt
 		},
 		ReadProcessCommand: func(context.Context, int) (string, error) {
-			return "codex exec --json", nil
+			return "codex exec fix failing tests", nil
 		},
 		SignalProcess: func(gotPID int, signal syscall.Signal) error {
 			if gotPID != int(pid) || signal != syscall.SIGTERM {

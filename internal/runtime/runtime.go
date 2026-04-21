@@ -789,6 +789,10 @@ func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) e
 	})
 }
 
+func (r *Runtime) ExecutionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (matches bool, running bool, err error) {
+	return r.executionMatchesProcess(ctx, execution, pid)
+}
+
 func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.Repositories, reason string) error {
 	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
@@ -861,18 +865,24 @@ func expectedExecutionCommandTokens(execution storage.AgentExecutionRecord) ([]s
 }
 
 func commandPrefixMatches(expected, actual []string) bool {
-	if len(expected) == 0 || len(actual) < len(expected) {
+	if len(expected) == 0 || len(actual) == 0 {
 		return false
 	}
 	if filepath.Base(expected[0]) != filepath.Base(actual[0]) {
 		return false
 	}
-	for i := 1; i < len(expected); i++ {
+	if len(expected) == 1 {
+		return true
+	}
+	if len(actual) < len(expected)-1 {
+		return false
+	}
+	for i := 1; i < len(expected)-1; i++ {
 		if expected[i] != actual[i] {
 			return false
 		}
 	}
-	return true
+	return strings.Join(actual[len(expected)-1:], " ") == expected[len(expected)-1]
 }
 
 func splitProcessCommand(command string) []string {

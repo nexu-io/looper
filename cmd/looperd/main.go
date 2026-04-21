@@ -16,6 +16,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
+	"github.com/powerformer/looper/internal/storage"
 	"github.com/powerformer/looper/internal/version"
 )
 
@@ -95,6 +96,8 @@ type stopLoopResult struct {
 
 type signalProcessFunc func(int, syscall.Signal) error
 
+type executionMatchesProcessFunc func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
+
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	runtimeValue, err := looperdruntime.Start(ctx, deps)
 	if err != nil {
@@ -110,7 +113,7 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		Config:  deps.Config,
 		Runtime: rt,
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
-			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill)
+			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
@@ -154,7 +157,7 @@ func (d *daemonRuntime) WaitForShutdown() {
 	}
 }
 
-func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc) (any, error) {
+func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
 	result := stopLoopResult{Stopped: false, LoopID: loopID}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
@@ -194,6 +197,15 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	pid := int(*latestExecution.PID)
+	if executionMatchesProcess != nil {
+		matches, running, err := executionMatchesProcess(ctx, *latestExecution, pid)
+		if err != nil {
+			return nil, err
+		}
+		if !running || !matches {
+			return result, nil
+		}
+	}
 	result.PID = *latestExecution.PID
 	if signal != nil {
 		if err := signal(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
