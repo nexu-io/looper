@@ -112,6 +112,32 @@ func TestRunBootstrapsLooperdByDefault(t *testing.T) {
 	}
 }
 
+func TestRunPrintsHelpWhenHelpFlagAppearsAfterOtherArgs(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	bootstrapCalled := false
+
+	exitCode := runWithDeps([]string{"--config", "/tmp/config.json", "--help"}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			bootstrapCalled = true
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("run([--config /tmp/config.json --help]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("run([--config /tmp/config.json --help]) stderr = %q, want empty string", got)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("Usage:")) {
+		t.Fatalf("run([--config /tmp/config.json --help]) stdout = %q, want usage text", stdout.String())
+	}
+	if bootstrapCalled {
+		t.Fatal("bootstrapImpl was called for --help")
+	}
+}
+
 func TestRunFormatsConfigValidationErrors(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}

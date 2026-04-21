@@ -368,6 +368,28 @@ func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T)
 	}
 }
 
+func TestLoadFileRejectsInvalidCLIPortOverride(t *testing.T) {
+	_, err := LoadFile(LoadFileOptions{Args: []string{"--port", "abc"}, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got, want := err.Error(), `invalid value for --port: "abc" is not an integer`; got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
+func TestLoadFileRejectsInvalidEnvPortOverride(t *testing.T) {
+	_, err := LoadFile(LoadFileOptions{LookupEnv: mapEnvLookup(map[string]string{"LOOPER_PORT": "abc"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got, want := err.Error(), `invalid value for LOOPER_PORT: "abc" is not an integer`; got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
 func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

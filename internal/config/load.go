@@ -89,7 +89,10 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
-	envOverrides := buildEnvOverrides(lookupEnv)
+	envOverrides, err := buildEnvOverrides(lookupEnv)
+	if err != nil {
+		return LoadedFileConfig{}, err
+	}
 
 	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
 	if err != nil {
@@ -180,9 +183,11 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
-			if parsedValue := parseInteger(value); parsedValue != nil {
-				ensureServerConfig(&parsed.overrides).Port = parsedValue
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --port: %q is not an integer", value)
 			}
+			ensureServerConfig(&parsed.overrides).Port = parsedValue
 			index = nextIndex
 		case matchesFlag(arg, "--db-path"):
 			value, nextIndex, err := takeValue(index, "--db-path")
@@ -266,17 +271,13 @@ func matchesFlag(arg string, flag string) bool {
 	return arg == flag || strings.HasPrefix(arg, flag+"=")
 }
 
-func parseInteger(value string) *int {
-	if value == "" {
-		return nil
-	}
-
+func parseInteger(value string) (*int, error) {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
-	return &parsed
+	return &parsed, nil
 }
 
 func parseBoolean(value string) *bool {
@@ -296,16 +297,18 @@ func parseBoolean(value string) *bool {
 	}
 }
 
-func buildEnvOverrides(lookupEnv EnvLookupFunc) PartialConfig {
+func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	var overrides PartialConfig
 
 	if value, ok := lookupEnv("LOOPER_HOST"); ok {
 		ensureServerConfig(&overrides).Host = stringPtr(value)
 	}
 	if value, ok := lookupEnv("LOOPER_PORT"); ok {
-		if parsed := parseInteger(value); parsed != nil {
-			ensureServerConfig(&overrides).Port = parsed
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_PORT: %q is not an integer", value)
 		}
+		ensureServerConfig(&overrides).Port = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_DB_PATH"); ok {
 		ensureStorageConfig(&overrides).DBPath = stringPtr(value)
@@ -355,7 +358,7 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) PartialConfig {
 		ensureToolPathsConfig(&overrides).OsascriptPath = stringPtr(value)
 	}
 
-	return overrides
+	return overrides, nil
 }
 
 func ensureServerConfig(partial *PartialConfig) *PartialServerConfig {

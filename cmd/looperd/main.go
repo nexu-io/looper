@@ -40,7 +40,7 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
-	if len(args) > 0 && (isHelpArg(args[0]) || args[0] == "help") {
+	if hasHelpArg(args) || (len(args) > 0 && args[0] == "help") {
 		writeUsage(stdout)
 		return 0
 	}
@@ -216,6 +216,10 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 func hasVersionArg(args []string) bool {
 	return slices.Contains(args, "--version")
+}
+
+func hasHelpArg(args []string) bool {
+	return slices.ContainsFunc(args, isHelpArg)
 }
 
 func isHelpArg(arg string) bool {
