@@ -299,6 +299,27 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 	}
 }
 
+func TestIsLooperdProcessAcceptsQuotedExecutablePathWithSpaces(t *testing.T) {
+	t.Parallel()
+
+	runtime := &commandRuntime{app: &App{deps: Deps{RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		if command != "ps" || len(args) < 2 || args[1] != "1234" {
+			return commandExecutionResult{ExitCode: 1}, nil
+		}
+		return commandExecutionResult{Stdout: `"/Applications/Looper Tools/looperd" --config "/tmp/looper config.json"` + "\n", ExitCode: 0}, nil
+	}}}}
+
+	isLooperd, err := runtime.isLooperdProcess(context.Background(), 1234)
+	if err != nil {
+		t.Fatalf("isLooperdProcess() error = %v", err)
+	}
+	if !isLooperd {
+		t.Fatal("isLooperdProcess() = false, want true")
+	}
+}
+
 func TestDaemonLogsJSONReturnsTail(t *testing.T) {
 	t.Parallel()
 

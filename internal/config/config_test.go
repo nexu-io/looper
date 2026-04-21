@@ -390,6 +390,28 @@ func TestLoadFileRejectsInvalidEnvPortOverride(t *testing.T) {
 	}
 }
 
+func TestLoadFileRejectsInvalidCLIBooleanOverride(t *testing.T) {
+	_, err := LoadFile(LoadFileOptions{Args: []string{"--allow-auto-push", "maybe"}, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got, want := err.Error(), `invalid value for --allow-auto-push: "maybe" is not a boolean`; got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
+func TestLoadFileRejectsInvalidEnvBooleanOverride(t *testing.T) {
+	_, err := LoadFile(LoadFileOptions{LookupEnv: mapEnvLookup(map[string]string{"LOOPER_ALLOW_AUTO_PUSH": "tru"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got, want := err.Error(), `invalid value for LOOPER_ALLOW_AUTO_PUSH: "tru" is not a boolean`; got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
 func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

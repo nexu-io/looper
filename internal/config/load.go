@@ -230,27 +230,33 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
-			if parsedValue := parseBoolean(value); parsedValue != nil {
-				ensureDefaultsConfig(&parsed.overrides).AllowAutoCommit = parsedValue
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-commit: %q is not a boolean", value)
 			}
+			ensureDefaultsConfig(&parsed.overrides).AllowAutoCommit = parsedValue
 			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-push"):
 			value, nextIndex, err := takeValue(index, "--allow-auto-push")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
-			if parsedValue := parseBoolean(value); parsedValue != nil {
-				ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-push: %q is not a boolean", value)
 			}
+			ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
 			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-approve"):
 			value, nextIndex, err := takeValue(index, "--allow-auto-approve")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
-			if parsedValue := parseBoolean(value); parsedValue != nil {
-				ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-approve: %q is not a boolean", value)
 			}
+			ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
 			index = nextIndex
 		case matchesFlag(arg, "--osascript-path"):
 			value, nextIndex, err := takeValue(index, "--osascript-path")
@@ -280,20 +286,20 @@ func parseInteger(value string) (*int, error) {
 	return &parsed, nil
 }
 
-func parseBoolean(value string) *bool {
+func parseBoolean(value string) (*bool, error) {
 	if value == "" {
-		return nil
+		return nil, fmt.Errorf("boolean value cannot be empty")
 	}
 
 	switch strings.ToLower(value) {
 	case "1", "true", "yes", "on":
 		parsed := true
-		return &parsed
+		return &parsed, nil
 	case "0", "false", "no", "off":
 		parsed := false
-		return &parsed
+		return &parsed, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("invalid boolean")
 	}
 }
 
@@ -324,29 +330,39 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		ensureDaemonConfig(&overrides).WorkingDirectory = stringPtr(value)
 	}
 	if value, ok := lookupEnv("LOOPER_IN_APP_NOTIFICATIONS"); ok {
-		if parsed := parseBoolean(value); parsed != nil {
-			ensureNotificationConfig(&overrides).InApp = parsed
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_IN_APP_NOTIFICATIONS: %q is not a boolean", value)
 		}
+		ensureNotificationConfig(&overrides).InApp = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_OSASCRIPT_ENABLED"); ok {
-		if parsed := parseBoolean(value); parsed != nil {
-			ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_OSASCRIPT_ENABLED: %q is not a boolean", value)
 		}
+		ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_COMMIT"); ok {
-		if parsed := parseBoolean(value); parsed != nil {
-			ensureDefaultsConfig(&overrides).AllowAutoCommit = parsed
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ALLOW_AUTO_COMMIT: %q is not a boolean", value)
 		}
+		ensureDefaultsConfig(&overrides).AllowAutoCommit = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_PUSH"); ok {
-		if parsed := parseBoolean(value); parsed != nil {
-			ensureDefaultsConfig(&overrides).AllowAutoPush = parsed
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ALLOW_AUTO_PUSH: %q is not a boolean", value)
 		}
+		ensureDefaultsConfig(&overrides).AllowAutoPush = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_APPROVE"); ok {
-		if parsed := parseBoolean(value); parsed != nil {
-			ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ALLOW_AUTO_APPROVE: %q is not a boolean", value)
 		}
+		ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)

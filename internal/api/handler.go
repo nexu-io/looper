@@ -2812,8 +2812,33 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 				return storage.LoopRecord{}, err
 			}
 		case domain.LoopStatusRunning:
-			if _, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO); err != nil {
+			requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO)
+			if err != nil {
 				return storage.LoopRecord{}, err
+			}
+			if requeued == 0 {
+				latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
+				if err != nil {
+					return storage.LoopRecord{}, err
+				}
+				if latestQueue != nil {
+					replacement := *latestQueue
+					replacement.ID = generateRequestID()
+					replacement.Status = "queued"
+					replacement.AvailableAt = nowISO
+					replacement.Attempts = 0
+					replacement.ClaimedBy = nil
+					replacement.ClaimedAt = nil
+					replacement.StartedAt = nil
+					replacement.FinishedAt = nil
+					replacement.LastError = nil
+					replacement.LastErrorKind = nil
+					replacement.CreatedAt = nowISO
+					replacement.UpdatedAt = nowISO
+					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+						return storage.LoopRecord{}, err
+					}
+				}
 			}
 		}
 

@@ -829,6 +829,24 @@ func (r *QueueRepository) GetByID(ctx context.Context, id string) (*QueueItemRec
 	return &record, nil
 }
 
+func (r *QueueRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE loop_id = ?
+		ORDER BY updated_at DESC, created_at DESC, id DESC
+		LIMIT 1
+	`, loopID)
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest queue item by loop: %w", err)
+	}
+
+	return &record, nil
+}
+
 func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items ORDER BY created_at DESC`)
 	if err != nil {

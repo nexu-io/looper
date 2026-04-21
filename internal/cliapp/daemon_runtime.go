@@ -458,13 +458,7 @@ func (r *commandRuntime) isLooperdProcess(ctx context.Context, pid int) (bool, e
 		return false, nil
 	}
 
-	tokens := make([]string, 0)
-	for _, token := range strings.Fields(command) {
-		trimmed := strings.Trim(token, `"'`)
-		if trimmed != "" {
-			tokens = append(tokens, trimmed)
-		}
-	}
+	tokens := splitProcessCommand(command)
 	if len(tokens) == 0 {
 		return false, nil
 	}
@@ -480,6 +474,54 @@ func (r *commandRuntime) isLooperdProcess(ctx context.Context, pid int) (bool, e
 		return false, nil
 	}
 	return filepath.Base(tokens[1]) == looperdBinaryName, nil
+}
+
+func splitProcessCommand(command string) []string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+
+	tokens := make([]string, 0)
+	var current strings.Builder
+	var quote rune
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, current.String())
+		current.Reset()
+	}
+
+	for _, r := range command {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		switch {
+		case r == '\\' && quote != 0:
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	flush()
+	return tokens
 }
 
 func (r *commandRuntime) readProcessCommand(ctx context.Context, pid int) (string, error) {

@@ -913,6 +913,61 @@ func TestHandlerWorkerAndPlannerRoutesMatchFrozenSuccessArtifacts(t *testing.T) 
 	}
 }
 
+func TestHandlerLoopStartCreatesReplacementQueueItemWhenLatestWorkIsTerminal(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_restart"
+	loopID := "loop_worker_restart"
+	targetID := "project:project_restart"
+	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+	finishedAt := fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString)
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_terminal", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_restart", Priority: storage.QueuePriorityWorker, Status: "failed", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, FinishedAt: &finishedAt, PayloadJSON: &payload, LastError: stringPtr("boom"), LastErrorKind: stringPtr("non_retryable"), CreatedAt: nowISO, UpdatedAt: finishedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(Queue.List()) = %d, want 2", len(items))
+	}
+
+	var replacement *storage.QueueItemRecord
+	for index := range items {
+		if items[index].ID != "queue_worker_terminal" {
+			replacement = &items[index]
+			break
+		}
+	}
+	if replacement == nil {
+		t.Fatal("replacement queue item = nil, want new queued item")
+	}
+	if replacement.Status != "queued" || replacement.Attempts != 0 || replacement.FinishedAt != nil || replacement.LastError != nil || replacement.LastErrorKind != nil {
+		t.Fatalf("replacement queue item = %#v, want clean queued item", replacement)
+	}
+	if replacement.PayloadJSON == nil || *replacement.PayloadJSON != payload {
+		t.Fatalf("replacement.PayloadJSON = %v, want %q", replacement.PayloadJSON, payload)
+	}
+}
+
 func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedLoopRouteData(t, fixture.runtime)
