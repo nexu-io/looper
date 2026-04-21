@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/powerformer/looper/internal/cliapp"
+	"github.com/powerformer/looper/internal/version"
 )
 
 type contextKey struct{}
@@ -117,5 +118,33 @@ func TestRunUsesDefaultCLIAppFactory(t *testing.T) {
 		if !bytes.Contains(stdout.Bytes(), []byte(want)) {
 			t.Fatalf("run([--help]) stdout = %q, want to contain %q", stdout.String(), want)
 		}
+	}
+}
+
+func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	called := false
+
+	exitCode := runWithDeps([]string{"--version"}, stdout, stderr, runDeps{
+		newApp: func(cliapp.Deps) appRunner {
+			called = true
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps([--version]) exit code = %d, want 0", exitCode)
+	}
+	if called {
+		t.Fatal("newApp was called for --version")
+	}
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }

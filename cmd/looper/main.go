@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/powerformer/looper/internal/cliapp"
+	"github.com/powerformer/looper/internal/version"
 )
 
 func main() {
@@ -26,6 +29,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
+	if slices.Contains(args, "--version") {
+		_, _ = fmt.Fprintln(stdout, version.Value)
+		return 0
+	}
+
 	ctx := deps.ctx
 	if ctx == nil {
 		ctx = context.Background()

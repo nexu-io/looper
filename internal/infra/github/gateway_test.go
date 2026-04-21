@@ -213,14 +213,12 @@ func TestGatewayResolveReviewThreadReturnsNotFound(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptPath := filepath.Join(rootDir, "gh")
 	writeExecutable(t, scriptPath, `#!/bin/sh
-case "$*" in
-  *"threadId=thread-missing"*)
-    printf '{"data":{"node":null}}'
-    ;;
-  *)
-    printf '{}'
-    ;;
-esac
+args="$*"
+if printf '%s' "$args" | grep -Fq 'threadId=thread-missing'; then
+  printf '{"data":{"node":null}}'
+else
+  printf '{}'
+fi
 `)
 	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
 	err := gateway.ResolveReviewThread(context.Background(), ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-missing"})
@@ -234,17 +232,14 @@ func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptPath := filepath.Join(rootDir, "gh")
 	writeExecutable(t, scriptPath, `#!/bin/sh
-case "$*" in
-  "pr view"*)
-    printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}'
-    ;;
-  *"reviewThreads"*)
-    printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
-    ;;
-  *)
-    printf '{}'
-    ;;
-esac
+args="$*"
+if printf '%s' "$args" | grep -Fq 'pr view'; then
+  printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}'
+elif printf '%s' "$args" | grep -Fq 'reviewThreads'; then
+  printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
+else
+  printf '{}'
+fi
 `)
 	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
 	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
@@ -286,15 +281,12 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptPath := filepath.Join(rootDir, "gh")
 	writeExecutable(t, scriptPath, `#!/bin/sh
-case "$*" in
-  "api repos/acme/looper/issues/42/labels/looper%3Aspec-ready --method DELETE")
-    printf 'gh: HTTP 404: label does not exist (https://api.github.com/...)' >&2
-    exit 1
-    ;;
-  *)
-    printf '{}'
-    ;;
-esac
+args="$*"
+if printf '%s' "$args" | grep -Fq 'api repos/acme/looper/issues/42/labels/looper%3Aspec-ready --method DELETE'; then
+  printf 'gh: HTTP 404: label does not exist (https://api.github.com/...)' >&2
+  exit 1
+fi
+printf '{}'
 `)
 	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
 	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:spec-ready"}}); err != nil {
