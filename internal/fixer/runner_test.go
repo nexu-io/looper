@@ -212,6 +212,45 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	}
 }
 
+func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_running", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_running"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.recoverClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}, fmt.Errorf("persist step failed"))
+	if err != nil {
+		t.Fatalf("recoverClaimedItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_running")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	}
+}
+
 func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

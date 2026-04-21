@@ -2670,6 +2670,9 @@ func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePul
 	if projectRepo == nil || *projectRepo != input.Repo {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
 	}
+	if snapshot.ProjectID != input.ProjectID {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
+	}
 	return snapshot.PRNumber, nil
 }
 

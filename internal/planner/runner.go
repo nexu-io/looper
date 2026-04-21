@@ -419,10 +419,42 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	if _, failErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message); failErr != nil {
+	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	if failErr != nil {
 		return nil, failErr
 	}
+	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
+		return nil, err
+	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
+	if queueItem.LoopID == nil {
+		return nil
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+	if err != nil {
+		return err
+	}
+	if loop == nil || loop.Status != "running" {
+		return nil
+	}
+	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.LastRunAt = stringPtr(r.nowISO())
+		if failedQueue != nil && failedQueue.Status == "queued" {
+			updated.Status = "queued"
+			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+		} else {
+			if failureKind == FailureManualIntervention {
+				updated.Status = "paused"
+			} else {
+				updated.Status = "failed"
+			}
+			updated.NextRunAt = nil
+		}
+	})
+	return err
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {

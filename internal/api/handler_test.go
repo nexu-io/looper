@@ -1145,6 +1145,59 @@ func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
 	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
 }
 
+func TestHandlerWorkerCreateRejectsPullRequestSnapshotFromDifferentProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "project_2",
+		Name:         "Looper Duplicate",
+		RepoPath:     "/tmp/repos/looper-duplicate",
+		BaseBranch:   &baseBranch,
+		Archived:     false,
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_project_2_latest",
+		ProjectID:  "project_2",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "head-project-2",
+		CapturedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString),
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(project_2) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","prNumber":42,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(2 * time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "PULL_REQUEST_PROJECT_MISMATCH")
+	assertEqual(t, errMap["message"], "Pull request acme/looper#42 does not belong to project project_1")
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 0 {
+		t.Fatalf("Queue.List() = %#v, want no enqueued worker", queueItems)
+	}
+}
+
 func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
