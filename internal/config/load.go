@@ -101,6 +101,12 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 
 	toolDetection := DetectToolPaths(config.Tools, options.LookPath)
 	config.Tools = toolDetection.Paths
+	if config.Notifications.Osascript.Enabled && isNilOrEmptyString(config.Tools.OsascriptPath) {
+		return LoadedFileConfig{}, &ConfigValidationError{Issues: []ValidationIssue{{
+			Path:    "tools.osascriptPath",
+			Message: "is required when notifications.osascript.enabled is true",
+		}}}
+	}
 
 	if err := Validate(config); err != nil {
 		return LoadedFileConfig{}, err

@@ -1697,6 +1697,19 @@ func TestHandlerRunRouteErrorsMatchArtifactCases(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), completedRun); err != nil {
 		t.Fatalf("Runs.Upsert(completed) error = %v", err)
 	}
+	existingLoop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), "loop_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID(loop_1) error = %v", err)
+	}
+	if existingLoop == nil {
+		t.Fatal("loop_1 missing from fixture")
+	}
+	completedLoop := *existingLoop
+	completedLoop.Status = "completed"
+	completedLoop.UpdatedAt = completedAt
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), completedLoop); err != nil {
+		t.Fatalf("Loops.Upsert(completed) error = %v", err)
+	}
 
 	tests := []struct {
 		caseID  string
@@ -1936,6 +1949,56 @@ func TestActiveRunsIncludesRunningLoopWithoutRun(t *testing.T) {
 		t.Fatalf("len(items) = %d, want 1", len(items))
 	}
 	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], "loop_reviewer_running_only")
+	assertEqual(t, item["runId"], nil)
+	assertEqual(t, item["type"], "reviewer")
+	assertEqual(t, item["status"], "running")
+	target := item["target"].(map[string]any)
+	assertEqual(t, target["label"], "acme/looper#43")
+}
+
+func TestActiveRunDetailIncludesRunningLoopWithoutRun(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_reviewer_running_only",
+		Seq:        7,
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:43"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(43),
+		Status:     "running",
+		LastRunAt:  stringPtr(nowISO),
+		NextRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/loop_reviewer_running_only", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	item := body["data"].(map[string]any)
 	assertEqual(t, item["loopId"], "loop_reviewer_running_only")
 	assertEqual(t, item["runId"], nil)
 	assertEqual(t, item["type"], "reviewer")

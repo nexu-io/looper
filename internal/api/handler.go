@@ -1621,7 +1621,7 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 }
 
 func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID string) (activeRunView, error) {
-	items, err := h.buildActiveRunViews(ctx, false)
+	items, err := h.buildActiveRunViews(ctx, true)
 	if err != nil {
 		return activeRunView{}, err
 	}

@@ -453,6 +453,39 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
 }
 
+func TestLoadFileRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	logDir := filepath.Join(cwd, "logs")
+	dbPath := filepath.Join(cwd, "looper.sqlite")
+
+	contents := fmt.Sprintf(`{
+		"daemon": {"logDir": %q, "workingDirectory": %q},
+		"storage": {"dbPath": %q},
+		"notifications": {"osascript": {"enabled": true, "throttleWindowSeconds": 60}}
+	}`, logDir, cwd, dbPath)
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{}),
+	})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "tools.osascriptPath", "is required when notifications.osascript.enabled is true")
+}
+
 func TestValidateAllowsLegacyProjectIDsForUpgradeCompatibility(t *testing.T) {
 	config, err := DefaultConfig(t.TempDir())
 	if err != nil {
