@@ -884,6 +884,24 @@ func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey stri
 	return &record, nil
 }
 
+func (r *QueueRepository) FindActiveByLoopID(ctx context.Context, loopID string) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE loop_id = ? AND status IN ('queued', 'running')
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, loopID)
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find active queue item by loop: %w", err)
+	}
+
+	return &record, nil
+}
+
 func (r *QueueRepository) ListScheduled(ctx context.Context, nowISO string, limit int64) ([]QueueItemRecord, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1063,7 +1081,11 @@ func (r *QueueRepository) RequeueLatestCancelledByLoop(ctx context.Context, loop
 			last_error_kind = NULL,
 			updated_at = ?
 		WHERE id = ? AND status = 'cancelled'
-	`, queuedAt, queuedAt, queueID)
+			AND NOT EXISTS (
+				SELECT 1 FROM queue_items
+				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
+			)
+	`, queuedAt, queuedAt, queueID, loopID, queueID)
 	if err != nil {
 		return 0, fmt.Errorf("requeue latest cancelled queue item by loop: %w", err)
 	}

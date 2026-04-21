@@ -862,6 +862,120 @@ func TestHandlerLoopStatusMutationsReconcileQueueItems(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopStartIsIdempotentWhenQueueItemAlreadyActive(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_status"
+	loopID := "loop_worker_status"
+	targetID := "project:project_status"
+	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "running", MetadataJSON: &metadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_status", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	triggered := 0
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }, TriggerSchedulerTick: func() { triggered++ }})
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	queueItems, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop = %d, want 1", len(matched))
+	}
+	assertEqual(t, matched[0].Status, "queued")
+	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerLoopStartDoesNotRequeueCancelledItemWhenAnotherQueueItemIsActive(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	now := fixture.now.UTC()
+	nowISO := now.Format(javaScriptISOString)
+	projectID := "project_status"
+	loopID := "loop_worker_status"
+	targetID := "project:project_status"
+	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+	olderISO := now.Add(-time.Minute).Format(javaScriptISOString)
+	newerISO := now.Add(time.Minute).Format(javaScriptISOString)
+	finishedISO := now.Add(2 * time.Minute).Format(javaScriptISOString)
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_active", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_status", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: olderISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: olderISO, UpdatedAt: olderISO}); err != nil {
+		t.Fatalf("Queue.Upsert(active) error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_cancelled", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_status", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: newerISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payload, FinishedAt: &finishedISO, CreatedAt: newerISO, UpdatedAt: newerISO}); err != nil {
+		t.Fatalf("Queue.Upsert(cancelled) error = %v", err)
+	}
+
+	triggered := 0
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return now.Add(3 * time.Minute) }, TriggerSchedulerTick: func() { triggered++ }})
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	activeQueue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_worker_active")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(active) error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.Status != "queued" {
+		t.Fatalf("active queue = %#v, want queued", activeQueue)
+	}
+	cancelledQueue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_worker_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(cancelled) error = %v", err)
+	}
+	if cancelledQueue == nil || cancelledQueue.Status != "cancelled" {
+		t.Fatalf("cancelled queue = %#v, want cancelled", cancelledQueue)
+	}
+	queueItems, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 2 {
+		t.Fatalf("queue items for loop = %d, want 2", len(matched))
+	}
+	assertEqual(t, triggered, 1)
+}
+
 func TestHandlerWorkerAndPlannerRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)
@@ -1280,6 +1394,49 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 		if loop.Type == "reveiwer" {
 			t.Fatalf("persisted unsupported loop type: %#v", loop)
 		}
+	}
+}
+
+func TestHandlerCreateLoopRejectsWorkerAndPlannerWithoutAgentConfigured(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	configWithoutAgent := fixture.config
+	configWithoutAgent.Agent.Vendor = nil
+
+	tests := []struct {
+		name    string
+		body    string
+		message string
+	}{
+		{
+			name:    "worker",
+			body:    `{"projectId":"project_1","type":"worker","targetType":"project","targetId":"project_1","metadata":{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}}`,
+			message: "Cannot create worker loop without config.agent.vendor",
+		},
+		{
+			name:    "planner",
+			body:    `{"projectId":"project_1","type":"planner","targetType":"issue","repo":"acme/looper","issueNumber":123}`,
+			message: "Cannot create planner loop without config.agent.vendor",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(tt.body)))
+			req.Header.Set("x-request-id", "error-request-id")
+			req.Header.Set("content-type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", recorder.Code)
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errMap := body["error"].(map[string]any)
+			assertEqual(t, errMap["code"], "AGENT_NOT_CONFIGURED")
+			assertEqual(t, errMap["message"], tt.message)
+		})
 	}
 }
 

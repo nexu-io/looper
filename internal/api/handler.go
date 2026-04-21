@@ -2091,7 +2091,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		status = string(domain.LoopStatusRunning)
 	}
 
-	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer)) && !isCodingAgentConfigured(h.context.Config) {
+	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot create %s loop without config.agent.vendor", loopType)}
 	}
 
@@ -2787,11 +2787,30 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 				return storage.LoopRecord{}, err
 			}
 			if requeued == 0 {
+				activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
+				if err != nil {
+					return storage.LoopRecord{}, err
+				}
+				if activeQueue != nil {
+					break
+				}
 				latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
 				if err != nil {
 					return storage.LoopRecord{}, err
 				}
 				if latestQueue != nil {
+					if latestQueue.Status == "queued" || latestQueue.Status == "running" {
+						break
+					}
+					if latestQueue.DedupeKey != "" {
+						activeQueue, err := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
+						if err != nil {
+							return storage.LoopRecord{}, err
+						}
+						if activeQueue != nil {
+							break
+						}
+					}
 					replacement := *latestQueue
 					replacement.ID = generateRequestID()
 					replacement.Status = "queued"
@@ -2820,6 +2839,9 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if status == domain.LoopStatusRunning && h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
 	}
 
 	return serializeLoop(updated), nil
