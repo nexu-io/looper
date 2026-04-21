@@ -2551,6 +2551,16 @@ func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerP
 		if project == nil {
 			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", *input.ProjectID)}
 		}
+		if input.Repo != nil {
+			configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")))
+			requestedRepo := strings.TrimSpace(*input.Repo)
+			if configuredRepo != "" && configuredRepo != requestedRepo {
+				if input.PRNumber != nil {
+					return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", requestedRepo, *input.PRNumber, *input.ProjectID)}
+				}
+				return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", *input.ProjectID, configuredRepo, requestedRepo)}
+			}
+		}
 		return *project, nil
 	}
 

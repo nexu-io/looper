@@ -1422,6 +1422,33 @@ func TestHandlerWorkerCreateRejectsPullRequestSnapshotFromDifferentProject(t *te
 	}
 }
 
+func TestHandlerWorkerCreateRejectsRepoMismatchForExplicitProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","title":"Wire runtime","prompt":"Wire runtime","repo":"other/repo","baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
+	assertEqual(t, errMap["message"], "project project_1 is configured for repo acme/looper, not other/repo")
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 0 {
+		t.Fatalf("Queue.List() = %#v, want no enqueued worker", queueItems)
+	}
+}
+
 func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

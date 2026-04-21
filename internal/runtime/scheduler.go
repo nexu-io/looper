@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/powerformer/looper/internal/agent"
@@ -623,51 +624,58 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 
-	errs := make([]error, 0)
+	errCh := make(chan error, len(queueItems))
+	var wg sync.WaitGroup
 	for _, item := range queueItems {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
-		switch item.Type {
-		case "planner":
-			if input.Planner == nil {
-				errs = append(errs, fmt.Errorf("planner runner is not configured"))
-				continue
+		wg.Add(1)
+		go func(item storage.QueueItemRecord) {
+			defer wg.Done()
+
+			claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
+			switch item.Type {
+			case "planner":
+				if input.Planner == nil {
+					errCh <- fmt.Errorf("planner runner is not configured")
+					return
+				}
+				_, err := input.Planner.ProcessNext(ctx, claimedBy)
+				errCh <- wrapSchedulerQueueError(item.Type, err)
+			case "reviewer":
+				if input.Reviewer == nil {
+					errCh <- fmt.Errorf("reviewer runner is not configured")
+					return
+				}
+				_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
+				errCh <- wrapSchedulerQueueError(item.Type, err)
+			case "fixer":
+				if input.Fixer == nil {
+					errCh <- fmt.Errorf("fixer runner is not configured")
+					return
+				}
+				_, err := input.Fixer.ProcessNext(ctx, claimedBy)
+				errCh <- wrapSchedulerQueueError(item.Type, err)
+			case "worker":
+				if input.Worker == nil {
+					errCh <- fmt.Errorf("worker runner is not configured")
+					return
+				}
+				_, err := input.Worker.ProcessNext(ctx, claimedBy)
+				errCh <- wrapSchedulerQueueError(item.Type, err)
+			default:
+				errCh <- fmt.Errorf("unsupported queue item type %q", item.Type)
 			}
-			_, err := input.Planner.ProcessNext(ctx, claimedBy)
-			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
-				errs = append(errs, wrapped)
-			}
-		case "reviewer":
-			if input.Reviewer == nil {
-				errs = append(errs, fmt.Errorf("reviewer runner is not configured"))
-				continue
-			}
-			_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
-			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
-				errs = append(errs, wrapped)
-			}
-		case "fixer":
-			if input.Fixer == nil {
-				errs = append(errs, fmt.Errorf("fixer runner is not configured"))
-				continue
-			}
-			_, err := input.Fixer.ProcessNext(ctx, claimedBy)
-			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
-				errs = append(errs, wrapped)
-			}
-		case "worker":
-			if input.Worker == nil {
-				errs = append(errs, fmt.Errorf("worker runner is not configured"))
-				continue
-			}
-			_, err := input.Worker.ProcessNext(ctx, claimedBy)
-			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
-				errs = append(errs, wrapped)
-			}
-		default:
-			errs = append(errs, fmt.Errorf("unsupported queue item type %q", item.Type))
+		}(item)
+	}
+	wg.Wait()
+	close(errCh)
+
+	errs := make([]error, 0)
+	for err := range errCh {
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	if len(errs) == 0 {

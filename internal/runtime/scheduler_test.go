@@ -5,6 +5,8 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +92,23 @@ func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	}
 	if len(plannerRunner.processClaims) != 1 || len(reviewerRunner.processClaims) != 1 || len(fixerRunner.processClaims) != 1 || len(workerRunner.processClaims) != 1 {
 		t.Fatalf("process claims = planner:%#v reviewer:%#v fixer:%#v worker:%#v, want one each", plannerRunner.processClaims, reviewerRunner.processClaims, fixerRunner.processClaims, workerRunner.processClaims)
+	}
+}
+
+func TestRunScheduledQueueItemsProcessesItemsConcurrently(t *testing.T) {
+	t.Parallel()
+
+	runner := &parallelWorkerScheduler{
+		secondStarted: make(chan struct{}),
+	}
+	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{Type: "worker"}, {Type: "worker"}}, defaultSchedulerTickInput{
+		Worker: runner,
+	})
+	if err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&runner.calls); got != 2 {
+		t.Fatalf("worker ProcessNext calls = %d, want 2", got)
 	}
 }
 
@@ -186,6 +205,7 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 }
 
 type stubPlannerScheduler struct {
+	mu            sync.Mutex
 	discoverCalls []planner.DiscoveryInput
 	processClaims []string
 	discoverErr   error
@@ -193,16 +213,21 @@ type stubPlannerScheduler struct {
 }
 
 func (s *stubPlannerScheduler) DiscoverIssues(_ context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
 	return planner.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) (*planner.ProcessResult, error) {
+	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
+	s.mu.Unlock()
 	return nil, s.processErr
 }
 
 type stubReviewerScheduler struct {
+	mu            sync.Mutex
 	discoverCalls []reviewer.DiscoveryInput
 	processClaims []string
 	discoverErr   error
@@ -210,16 +235,21 @@ type stubReviewerScheduler struct {
 }
 
 func (s *stubReviewerScheduler) DiscoverPullRequests(_ context.Context, input reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error) {
+	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
 	return reviewer.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubReviewerScheduler) ProcessNext(_ context.Context, claimedBy string) (*reviewer.ProcessResult, error) {
+	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
+	s.mu.Unlock()
 	return nil, s.processErr
 }
 
 type stubFixerScheduler struct {
+	mu            sync.Mutex
 	discoverCalls []fixer.DiscoveryInput
 	processClaims []string
 	discoverErr   error
@@ -227,21 +257,48 @@ type stubFixerScheduler struct {
 }
 
 func (s *stubFixerScheduler) DiscoverPullRequests(_ context.Context, input fixer.DiscoveryInput) (fixer.DiscoveryResult, error) {
+	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
 	return fixer.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubFixerScheduler) ProcessNext(_ context.Context, claimedBy string) (*fixer.ProcessResult, error) {
+	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
+	s.mu.Unlock()
 	return nil, s.processErr
 }
 
 type stubWorkerScheduler struct {
+	mu            sync.Mutex
 	processClaims []string
 	processErr    error
 }
 
 func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (*worker.ProcessResult, error) {
+	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
+	s.mu.Unlock()
 	return nil, s.processErr
+}
+
+type parallelWorkerScheduler struct {
+	calls         int32
+	secondStarted chan struct{}
+}
+
+func (s *parallelWorkerScheduler) ProcessNext(_ context.Context, _ string) (*worker.ProcessResult, error) {
+	switch atomic.AddInt32(&s.calls, 1) {
+	case 1:
+		select {
+		case <-s.secondStarted:
+			return nil, nil
+		case <-time.After(250 * time.Millisecond):
+			return nil, errors.New("second worker item did not start concurrently")
+		}
+	case 2:
+		close(s.secondStarted)
+	}
+	return nil, nil
 }
