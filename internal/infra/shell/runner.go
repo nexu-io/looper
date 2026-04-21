@@ -3,7 +3,6 @@ package shell
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -68,32 +67,14 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		cmd.Stdin = strings.NewReader(options.Stdin)
 	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return Result{}, fmt.Errorf("open stdout pipe: %w", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return Result{}, fmt.Errorf("open stderr pipe: %w", err)
-	}
+	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
+	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
+	cmd.Stdout = stdoutBuffer
+	cmd.Stderr = stderrBuffer
 
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
-
-	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
-	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
-
-	var copyGroup sync.WaitGroup
-	copyGroup.Add(2)
-	go func() {
-		defer copyGroup.Done()
-		_, _ = io.Copy(stdoutBuffer, stdoutPipe)
-	}()
-	go func() {
-		defer copyGroup.Done()
-		_, _ = io.Copy(stderrBuffer, stderrPipe)
-	}()
 
 	waitCh := make(chan error, 1)
 	go func() {
@@ -151,8 +132,6 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			}
 		}
 	}
-
-	copyGroup.Wait()
 
 	duration := time.Since(startedAt)
 	result := Result{

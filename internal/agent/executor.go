@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -123,18 +122,6 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		completionMarkerEnv+"="+CompletionMarkerPrefix,
 	)
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("open stdout pipe: %w", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("open stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start agent command: %w", err)
-	}
-
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = defaultMaxOutputBytes
@@ -158,11 +145,16 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 	}
+	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
+	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start agent command: %w", err)
+	}
 
 	x.persistStatus("running", nil, nil, nil)
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory}, startedAtISO)
 
-	go x.run(ctx, stdoutPipe, stderrPipe)
+	go x.run(ctx)
 	return x, nil
 }
 
@@ -214,21 +206,7 @@ func (x *execution) Kill(reason string) error {
 	return nil
 }
 
-func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser) {
-	stdoutWriter := &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
-	stderrWriter := &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
-
-	var copyWG sync.WaitGroup
-	copyWG.Add(2)
-	go func() {
-		defer copyWG.Done()
-		_, _ = io.Copy(stdoutWriter, stdoutPipe)
-	}()
-	go func() {
-		defer copyWG.Done()
-		_, _ = io.Copy(stderrWriter, stderrPipe)
-	}()
-
+func (x *execution) run(ctx context.Context) {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- x.process.Wait() }()
 
@@ -317,7 +295,6 @@ func (x *execution) run(ctx context.Context, stdoutPipe io.ReadCloser, stderrPip
 		}
 	}
 
-	copyWG.Wait()
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
 	status := x.finalStatus(timedOut, killed)
