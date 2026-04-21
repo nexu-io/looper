@@ -758,41 +758,96 @@ func TestHandlerLoopRouteErrorsMatchArtifactCases(t *testing.T) {
 	}
 }
 
-func TestHandlerLoopStartRejectsFixerWithoutAgentConfigured(t *testing.T) {
+func TestHandlerLoopStartRejectsCodingLoopsWithoutAgentConfigured(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedLoopRouteData(t, fixture.runtime)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID:         "loop_fixer_no_agent",
-		Seq:        4,
-		ProjectID:  "project_1",
-		Type:       "fixer",
-		TargetType: "pull_request",
-		TargetID:   stringPtr("pr:acme/looper:99"),
-		Repo:       stringPtr("acme/looper"),
-		PRNumber:   int64Ptr(99),
-		Status:     "paused",
-		CreatedAt:  nowISO,
-		UpdatedAt:  nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
 
 	configWithoutAgent := fixture.config
 	configWithoutAgent.Agent.Vendor = nil
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_fixer_no_agent/start", nil)
-	req.Header.Set("x-request-id", "error-request-id")
-	recorder := httptest.NewRecorder()
-
-	NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", recorder.Code)
+	tests := []struct {
+		name       string
+		loopID     string
+		loopType   string
+		targetType string
+		targetID   *string
+		repo       *string
+		prNumber   *int64
+		message    string
+	}{
+		{
+			name:       "fixer",
+			loopID:     "loop_fixer_no_agent",
+			loopType:   "fixer",
+			targetType: "pull_request",
+			targetID:   stringPtr("pr:acme/looper:99"),
+			repo:       stringPtr("acme/looper"),
+			prNumber:   int64Ptr(99),
+			message:    "Cannot start fixer loop without config.agent.vendor",
+		},
+		{
+			name:       "reviewer",
+			loopID:     "loop_reviewer_no_agent",
+			loopType:   "reviewer",
+			targetType: "pull_request",
+			targetID:   stringPtr("pr:acme/looper:100"),
+			repo:       stringPtr("acme/looper"),
+			prNumber:   int64Ptr(100),
+			message:    "Cannot start reviewer loop without config.agent.vendor",
+		},
+		{
+			name:       "worker",
+			loopID:     "loop_worker_no_agent",
+			loopType:   "worker",
+			targetType: "project",
+			targetID:   stringPtr("project:project_1"),
+			repo:       stringPtr("acme/looper"),
+			message:    "Cannot start worker loop without config.agent.vendor",
+		},
+		{
+			name:       "planner",
+			loopID:     "loop_planner_no_agent",
+			loopType:   "planner",
+			targetType: "issue",
+			targetID:   stringPtr("issue:acme/looper:101"),
+			repo:       stringPtr("acme/looper"),
+			message:    "Cannot start planner loop without config.agent.vendor",
+		},
 	}
-	body := parseJSONMap(t, recorder.Body.Bytes())
-	errorMap := body["error"].(map[string]any)
-	assertEqual(t, errorMap["code"], "AGENT_NOT_CONFIGURED")
-	assertEqual(t, errorMap["message"], "Cannot start fixer loop without config.agent.vendor")
+
+	for i, tt := range tests {
+		if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+			ID:         tt.loopID,
+			Seq:        int64(i + 4),
+			ProjectID:  "project_1",
+			Type:       tt.loopType,
+			TargetType: tt.targetType,
+			TargetID:   tt.targetID,
+			Repo:       tt.repo,
+			PRNumber:   tt.prNumber,
+			Status:     "paused",
+			CreatedAt:  nowISO,
+			UpdatedAt:  nowISO,
+		}); err != nil {
+			t.Fatalf("Loops.Upsert() error = %v", err)
+		}
+
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+tt.loopID+"/start", nil)
+			req.Header.Set("x-request-id", "error-request-id")
+			recorder := httptest.NewRecorder()
+
+			NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", recorder.Code)
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errorMap := body["error"].(map[string]any)
+			assertEqual(t, errorMap["code"], "AGENT_NOT_CONFIGURED")
+			assertEqual(t, errorMap["message"], tt.message)
+		})
+	}
 }
 
 func TestHandlerLoopStatusMutationsReconcileQueueItems(t *testing.T) {
@@ -1393,6 +1448,36 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	for _, loop := range loops {
 		if loop.Type == "reveiwer" {
 			t.Fatalf("persisted unsupported loop type: %#v", loop)
+		}
+	}
+}
+
+func TestHandlerCreateLoopRejectsUnsupportedLoopStatus(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"planner","targetType":"issue","repo":"acme/looper","issueNumber":42,"status":"bogus"}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
+	assertEqual(t, errMap["message"], "loop.status must be one of: idle, queued, running, paused, completed, failed, interrupted")
+
+	loops, err := fixture.runtime.Services().Repositories.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	for _, loop := range loops {
+		if loop.Type == "planner" && loop.Status == "bogus" {
+			t.Fatalf("persisted unsupported loop status: %#v", loop)
 		}
 	}
 }

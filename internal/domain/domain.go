@@ -116,6 +116,15 @@ func AssertKnownLoopType(loopType LoopType) error {
 	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer)
 }
 
+func AssertKnownLoopStatus(status LoopStatus) error {
+	for candidate := range loopStatusTransitions {
+		if candidate == status {
+			return nil
+		}
+	}
+	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
+}
+
 func IsActiveLoopStatus(status LoopStatus) bool {
 	_, ok := activeLoopStatuses[status]
 	return ok

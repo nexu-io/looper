@@ -2090,6 +2090,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if status == "" {
 		status = string(domain.LoopStatusRunning)
 	}
+	if err := domain.AssertKnownLoopStatus(domain.LoopStatus(status)); err != nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+	}
 
 	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot create %s loop without config.agent.vendor", loopType)}
@@ -2758,7 +2761,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
 
-		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer)) && !isCodingAgentConfigured(h.context.Config) {
+		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
 		}
 
