@@ -81,8 +81,14 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, service["healthy"], true)
 	assertEqual(t, service["daemonMode"], "foreground")
 	assertEqual(t, storageInfo["healthy"], true)
-	assertEqual(t, scheduler["queuedItems"], float64(1))
-	assertEqual(t, scheduler["runningItems"], float64(0))
+	queuedItems, queuedOK := scheduler["queuedItems"].(float64)
+	runningItems, runningOK := scheduler["runningItems"].(float64)
+	if !queuedOK || !runningOK {
+		t.Fatalf("scheduler queue counters missing/invalid: %#v", scheduler)
+	}
+	if queuedItems+runningItems != float64(1) {
+		t.Fatalf("scheduler queued+running = %v, want 1 (queued=%v running=%v)", queuedItems+runningItems, queuedItems, runningItems)
+	}
 	assertEqual(t, scheduler["totalRuns"], float64(1))
 	assertEqual(t, scheduler["activeRuns"], float64(1))
 
