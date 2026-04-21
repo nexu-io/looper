@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify-go:
+  verify:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
 
