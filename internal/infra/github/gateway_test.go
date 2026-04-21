@@ -296,8 +296,12 @@ printf '{}'
 
 func writeExecutable(t *testing.T, path, contents string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
-		t.Fatalf("os.WriteFile(%s) error = %v", path, err)
+	tempPath := path + ".tmp"
+	if err := os.WriteFile(tempPath, []byte(contents), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%s) error = %v", tempPath, err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		t.Fatalf("os.Rename(%s, %s) error = %v", tempPath, path, err)
 	}
 }
 
