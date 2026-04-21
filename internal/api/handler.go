@@ -2211,6 +2211,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		}
 		return loopResponse{}, mapLoopCreateError(err)
 	}
+	if record.Type == string(domain.LoopTypeReviewer) && record.Status == string(domain.LoopStatusQueued) && h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
+	}
 
 	return serializeLoop(record), nil
 }
@@ -2560,6 +2563,9 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return plannerCreateResponse{}, typed
 		}
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
 	}
 
 	return plannerCreateResponse{loopResponse: serializeLoop(record), IssueNumber: *issueNumber}, nil

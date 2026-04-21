@@ -1230,6 +1230,32 @@ func TestHandlerCreateLoopReviewerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, queue.DedupeKey, "reviewer:acme/looper:99")
 }
 
+func TestHandlerCreateLoopReviewerTriggersSchedulerTickHook(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		TriggerSchedulerTick: func() {
+			triggered++
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"manual":true,"followUpdates":false}}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	assertEqual(t, triggered, 1)
+}
+
 func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)
@@ -1353,6 +1379,32 @@ func TestHandlerWorkersCreateTriggersSchedulerTickHook(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","prompt":"Wire runtime","repo":"acme/looper","baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerPlannersCreateTriggersSchedulerTickHook(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		TriggerSchedulerTick: func() {
+			triggered++
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77}`)))
 	req.Header.Set("x-request-id", "fixture-request-id")
 	req.Header.Set("content-type", "application/json")
 	recorder := httptest.NewRecorder()
