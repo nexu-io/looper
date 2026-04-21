@@ -10,7 +10,7 @@ For the default supported macOS install flow:
 - `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
 - `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
 
-The previous npm-based CLI install path remains available only as a compatibility fallback during the remaining cutover work.
+The archived TypeScript implementation is retained only as a repository reference and is not part of the supported install path.
 
 The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
@@ -216,7 +216,7 @@ Defaults:
 
 ### `package`
 
-- `distribution`: install-channel metadata retained for compatibility with the legacy npm-based CLI path; current default supported installs use the Go release binaries instead
+- `distribution`: install-channel metadata retained for compatibility with legacy installs; current supported installs use the Go release binaries
 - `autoMigrateOnStartup`: run DB migrations on startup
 - `requireBackupBeforeMigrate`: require a backup before migrations
 

@@ -100,7 +100,6 @@ type pullRequestOutput struct {
 	Type                  string  `json:"type"`
 	ID                    string  `json:"id"`
 	IssueNumber           *int64  `json:"issueNumber"`
-	TitleText             string  `json:"title"`
 	LoopStatus            struct {
 		LatestRunStatus *string `json:"latestRunStatus"`
 	} `json:"loopStatus"`
@@ -397,7 +396,11 @@ func writeHumanWorkerCreate(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode worker response: %w", err)
 	}
-	printSection(w, "Worker started", [][2]any{{"id", data.ID}, {"title", data.TitleText}, {"status", data.Status}})
+	title := ""
+	if data.Title != nil {
+		title = *data.Title
+	}
+	printSection(w, "Worker started", [][2]any{{"id", data.ID}, {"title", title}, {"status", data.Status}})
 	return nil
 }
 

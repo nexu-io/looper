@@ -51,7 +51,7 @@
             "healthy": true,
             "version": "0.2.1",
             "build": {
-              "versionSource": "apps/cli/package.json",
+              "versionSource": "internal/version/version.go",
               "gitCommitSha": null,
               "buildTimestamp": null
             },

@@ -2,7 +2,7 @@ package version
 
 const (
 	defaultVersion       = "0.2.1"
-	defaultVersionSource = "apps/cli/package.json"
+	defaultVersionSource = "internal/version/version.go"
 )
 
 // These variables are shared by all Go binaries and can be overridden at build

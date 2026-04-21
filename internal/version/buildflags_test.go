@@ -60,12 +60,12 @@ func TestBuildOverridesFromEnvUsesOptionalBuildMetadata(t *testing.T) {
 func TestLDFlagsMatchesVersionVariables(t *testing.T) {
 	ldflags := LDFlags(BuildOverrides{
 		Version:        "1.2.3",
-		VersionSource:  "apps/cli/package.json",
+		VersionSource:  "internal/version/version.go",
 		GitCommitSHA:   "abc123",
 		BuildTimestamp: "2026-04-17T00:00:00Z",
 	})
 
-	const want = "-X github.com/powerformer/looper/internal/version.Value=1.2.3 -X github.com/powerformer/looper/internal/version.VersionSource=apps/cli/package.json -X github.com/powerformer/looper/internal/version.GitCommitSHA=abc123 -X github.com/powerformer/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
+	const want = "-X github.com/powerformer/looper/internal/version.Value=1.2.3 -X github.com/powerformer/looper/internal/version.VersionSource=internal/version/version.go -X github.com/powerformer/looper/internal/version.GitCommitSHA=abc123 -X github.com/powerformer/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
 	if ldflags != want {
 		t.Fatalf("LDFlags(...) = %q, want %q", ldflags, want)
 	}
@@ -83,7 +83,7 @@ func TestLDFlagsInjectIntoBuiltBinary(t *testing.T) {
 		"-ldflags",
 		LDFlags(BuildOverrides{
 			Version:        "9.9.9",
-			VersionSource:  "apps/cli/package.json",
+			VersionSource:  "internal/version/version.go",
 			GitCommitSHA:   "deadbeef",
 			BuildTimestamp: "2026-04-17T12:34:56Z",
 		}),
@@ -104,7 +104,7 @@ func TestLDFlagsInjectIntoBuiltBinary(t *testing.T) {
 	}
 
 	got := strings.TrimSpace(string(runOutput))
-	const want = `{"version":"9.9.9","metadata":{"versionSource":"apps/cli/package.json","gitCommitSha":"deadbeef","buildTimestamp":"2026-04-17T12:34:56Z"}}`
+	const want = `{"version":"9.9.9","metadata":{"versionSource":"internal/version/version.go","gitCommitSha":"deadbeef","buildTimestamp":"2026-04-17T12:34:56Z"}}`
 	if got != want {
 		t.Fatalf("built helper output = %s, want %s", got, want)
 	}

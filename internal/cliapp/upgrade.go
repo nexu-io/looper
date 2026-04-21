@@ -6,15 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 )
-
-const cliPackageName = "@powerformer/looper"
 
 type upgradeCheckSummary struct {
 	CLI    upgradeCLISummary    `json:"cli"`
@@ -230,35 +226,17 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 }
 
 func (r *commandRuntime) fetchLatestCLIVersion(ctx context.Context) (string, error) {
-	requestURL := fmt.Sprintf("https://registry.npmjs.org/%s/latest", url.QueryEscape(cliPackageName))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	release, err := r.fetchReleaseMetadata(ctx, "")
 	if err != nil {
-		return "", fmt.Errorf("build npm metadata request: %w", err)
-	}
-	req.Header.Set("User-Agent", looperdUserAgent)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.httpClient().Do(req)
-	if err != nil {
-		return "", fmt.Errorf("fetch npm metadata for %s: %w", cliPackageName, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Failed to fetch npm metadata for %s (status %s)", cliPackageName, resp.Status)
+		return "", err
 	}
 
-	var payload struct {
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", fmt.Errorf("decode npm metadata for %s: %w", cliPackageName, err)
-	}
-	if strings.TrimSpace(payload.Version) == "" {
-		return "", fmt.Errorf("npm metadata for %s is missing version", cliPackageName)
+	versionText := normalizeVersion(release.TagName)
+	if versionText == "" {
+		return "", fmt.Errorf("latest looper release metadata is missing tag_name")
 	}
 
-	return strings.TrimSpace(payload.Version), nil
+	return versionText, nil
 }
 
 func (r *commandRuntime) fetchLatestDaemonRelease(ctx context.Context) (latestDaemonReleaseInfo, error) {

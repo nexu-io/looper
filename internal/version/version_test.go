@@ -19,7 +19,7 @@ func TestCurrentUsesSharedBuildMetadata(t *testing.T) {
 	})
 
 	Value = "1.2.3"
-	VersionSource = "apps/cli/package.json"
+	VersionSource = "internal/version/version.go"
 	GitCommitSHA = "abc123"
 	BuildTimestamp = "2026-04-17T00:00:00Z"
 
@@ -29,8 +29,8 @@ func TestCurrentUsesSharedBuildMetadata(t *testing.T) {
 		t.Fatalf("Current().Version = %q, want %q", info.Version, "1.2.3")
 	}
 
-	if info.Metadata.VersionSource != "apps/cli/package.json" {
-		t.Fatalf("Current().Metadata.VersionSource = %q, want %q", info.Metadata.VersionSource, "apps/cli/package.json")
+	if info.Metadata.VersionSource != "internal/version/version.go" {
+		t.Fatalf("Current().Metadata.VersionSource = %q, want %q", info.Metadata.VersionSource, "internal/version/version.go")
 	}
 
 	if info.Metadata.GitCommitSHA == nil || *info.Metadata.GitCommitSHA != "abc123" {
@@ -102,7 +102,7 @@ func TestCurrentJSONMatchesStatusMetadataShape(t *testing.T) {
 		t.Fatalf("json.Marshal(Current()) error = %v", err)
 	}
 
-	const want = `{"version":"0.2.1","metadata":{"versionSource":"apps/cli/package.json","gitCommitSha":null,"buildTimestamp":null}}`
+	const want = `{"version":"0.2.1","metadata":{"versionSource":"internal/version/version.go","gitCommitSha":null,"buildTimestamp":null}}`
 	if string(encoded) != want {
 		t.Fatalf("json.Marshal(Current()) = %s, want %s", encoded, want)
 	}

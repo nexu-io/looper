@@ -1,6 +1,7 @@
 {
   "name": "@looper/looperd",
   "private": true,
+  "description": "Archived legacy TypeScript daemon snapshot retained for reference only.",
   "type": "module",
   "scripts": {
     "codegen": "bun run scripts/generate-artifacts.ts",

@@ -32,8 +32,6 @@ func TestUpgradeCheckPrintsSummary(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://registry.npmjs.org/%40powerformer%2Flooper/latest":
-				return jsonResponse(t, http.StatusOK, `{"version":"0.2.1"}`), nil
 			case "https://api.github.com/repos/powerformer/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
 			default:

@@ -1,6 +1,7 @@
 {
   "name": "@looper/web",
   "private": true,
+  "description": "Archived placeholder TypeScript workspace package retained for reference only.",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",

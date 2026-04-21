@@ -6,11 +6,12 @@ This repository currently contains:
 
 - `cmd/looperd` — the supported `looperd` daemon binary
 - `cmd/looper` — the supported `looper` CLI binary
-- `apps/looperd` — legacy TypeScript daemon sources retained during cutover
-- `apps/cli` — legacy TypeScript CLI sources retained during cutover
-- `apps/web` — an unsupported placeholder workspace package reserved for a future web UI
+- `internal/` and `pkg/` — the active Go implementation
+- `apps/looperd` — archived legacy TypeScript daemon sources retained for reference only
+- `apps/cli` — archived legacy TypeScript CLI sources retained for reference only
+- `apps/web` — archived placeholder TypeScript package retained for reference only
 
-The current product is the daemon + CLI. `apps/web` is not implemented, is not a supported surface, and is not part of release artifacts in the current phase.
+The current product is the Go daemon + CLI. The TypeScript directories under `apps/` are no longer part of the supported build, CI, or release workflows.
 
 ## Requirements
 
@@ -48,12 +49,6 @@ Recommended path:
 1. Download the matching `looper` release artifact for your macOS architecture from GitHub Releases.
 2. Rename it to `looper` if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
-
-Compatibility fallback during the remaining cutover work:
-
-```bash
-npm install -g @powerformer/looper
-```
 
 ### Install the daemon
 
@@ -110,7 +105,7 @@ Current phase behavior:
 - `looper upgrade --daemon` installs or upgrades the managed daemon binary
 - full `looper upgrade` for CLI + daemon together is not implemented yet
 - after a daemon upgrade, restart manually with `looper daemon restart`
-- if you installed `looper` from a GitHub Release binary instead of npm, replace that CLI binary manually for now; `looper upgrade --check` still compares the CLI against npm registry metadata
+- replace the `looper` CLI binary manually when a newer GitHub Release is available
 
 ### From source
 
@@ -135,23 +130,7 @@ In another shell, run the CLI from source:
 go run ./cmd/looper -- status
 ```
 
-If you need to work on the legacy TypeScript implementation during the transition, install workspace dependencies from the repo root:
-
-```bash
-bun install
-```
-
-Then start the legacy daemon from source:
-
-```bash
-bun run dev
-```
-
-In another shell, run the legacy CLI from source:
-
-```bash
-bun run looper -- status
-```
+If you need to inspect the archived TypeScript implementation, use the source under `apps/` as historical reference only. It is no longer validated by CI or shipped in release artifacts.
 
 ### Compatibility and version policy
 
@@ -159,61 +138,39 @@ bun run looper -- status
 - Short-lived version skew is allowed when the HTTP API remains compatible; the current expectation is that newer CLI builds should keep working with same-major daemons.
 - Management endpoints stay under `/api/v1/*` in the current phase, and minor releases should not introduce breaking protocol changes.
 - If the daemon is running, the CLI reads its current version from `/api/v1/status`; otherwise it falls back to `looperd --version`.
-- `looper upgrade --check` reads the latest CLI version from npm registry metadata and the latest daemon version from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed binary version; if no binary is found, daemon current version is reported as not installed.
+- `looper upgrade --check` reads the latest CLI and daemon versions from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed daemon binary version; if no binary is found, daemon current version is reported as not installed.
 - The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade --daemon` to update the managed binary.
 - Full major-version upgrade confirmation is not implemented in this phase because full `looper upgrade` is not implemented yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
 
 
-## Workspace commands
+## Development commands
 
 From the repo root:
 
-- `bun run dev` — run `apps/looperd`
-- `bun run looper -- <args>` — run the CLI directly from `apps/cli/src/index.ts` without rebuilding
-- `bun run build` — build `apps/looperd`, `apps/cli`, and `apps/web`
-- `bun run typecheck` — TypeScript project references check without emit
-- `bun run lint` — run Biome
-- `bun run test` — run all Bun tests
+- `go run ./cmd/looperd`
+- `go run ./cmd/looper -- <args>`
+- `go build ./...`
+- `go vet ./...`
+- `go test ./...`
+- `bun x @biomejs/biome check .`
 
-Package-scoped commands:
-
-- `bun run --cwd apps/looperd dev|build|typecheck`
-- `bun run --cwd apps/cli dev|build|typecheck|test`
-- `bun run --cwd apps/web dev|build|typecheck`
-
-Focused tests:
-
-- `bun test apps/looperd/src/config/load.test.ts`
-- `bun test tests/smoke.test.ts`
+The archived TypeScript directories under `apps/` remain in the repository only as legacy snapshots and should not be treated as active development targets unless you are doing explicit historical-reference work.
 
 ## Project structure
 
-### `apps/looperd`
+### `cmd/looperd`
 
-Daemon entry flow:
-
-`src/index.ts` → `bootstrapLooperd()` → runtime → Bun HTTP API server + SQLite store
-
-Responsibilities include:
+Supported daemon entrypoint. Responsibilities include:
 
 - loading and validating config
 - starting the SQLite-backed runtime
-- starting the Bun HTTP API server
+- serving the HTTP API
 - recovery on startup
 - writing logs and notifications
 
-### `apps/cli`
+### `cmd/looper`
 
-The CLI binary is `looper`.
-
-For local development, use one of these options:
-
-- `bun run looper -- ps` — runs the CLI from source without rebuilding
-- add a shell alias such as `alias looper='bun /absolute/path/to/looper/apps/cli/src/index.ts'` if you want to type `looper ps` directly during development
-
-Published installs should use the built `dist` entry declared in `apps/cli/package.json` and install the daemon separately via `looper daemon install`.
-
-The CLI connects to `looperd` over HTTP and supports commands under:
+Supported CLI entrypoint. The CLI connects to `looperd` over HTTP and supports commands under:
 
 - `project list|add`
 - `ps`
@@ -236,9 +193,9 @@ Manual review examples:
 - `looper review 123` — create a one-shot reviewer task for PR `123` in the current project
 - `looper review powerformer/looper#123 --loop` — keep re-reviewing that PR as new commits are pushed
 
-### `apps/web`
+### `apps/*`
 
-Retained as an unsupported placeholder workspace package. It currently only logs a placeholder message, is not shipped in releases, and should not be treated as part of the supported product until a real web UI is scoped.
+Archived legacy TypeScript snapshots retained for historical reference only. They are not shipped in releases and are not part of the supported product surface.
 
 ## Configuration
 
@@ -314,6 +271,5 @@ Selected CLI config flags:
 
 ## Development notes
 
-- This repo uses TypeScript project references from the root `tsconfig.json`; root typecheck runs with `--noEmit`.
 - Formatting and linting use Biome with spaces.
-- Build output lives in `apps/*/dist/`; do not edit generated files.
+- Build output lives in `dist/` and archived `apps/*/dist/`; do not edit generated files.
