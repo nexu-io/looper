@@ -1819,6 +1819,9 @@ func newTestFixture(t *testing.T) testFixture {
 		Now: func() time.Time {
 			return now
 		},
+		RunSchedulerTick: func(context.Context, looperdruntime.Services) error {
+			return nil
+		},
 	})
 
 	if err := rt.Start(context.Background()); err != nil {
