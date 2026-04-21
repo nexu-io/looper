@@ -2623,13 +2623,6 @@ type requirePullRequestTargetInput struct {
 
 func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePullRequestTargetInput) (int64, error) {
 	services := h.context.Runtime.Services()
-	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatest(ctx, input.Repo, input.PRNumber)
-	if err != nil {
-		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	if snapshot == nil {
-		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
-	}
 	project, err := services.Repositories.Projects.GetByID(ctx, input.ProjectID)
 	if err != nil {
 		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
@@ -2640,6 +2633,13 @@ func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePul
 	projectRepo := stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")
 	if projectRepo == nil || *projectRepo != input.Repo {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
+	}
+	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatestByProject(ctx, input.ProjectID, input.Repo, input.PRNumber)
+	if err != nil {
+		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if snapshot == nil {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
 	}
 	if snapshot.ProjectID != input.ProjectID {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}

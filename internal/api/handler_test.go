@@ -1369,7 +1369,7 @@ func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
 	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
 }
 
-func TestHandlerWorkerCreateRejectsPullRequestSnapshotFromDifferentProject(t *testing.T) {
+func TestHandlerWorkerCreateUsesProjectScopedPullRequestSnapshot(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -1386,6 +1386,17 @@ func TestHandlerWorkerCreateRejectsPullRequestSnapshotFromDifferentProject(t *te
 		UpdatedAt:    nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_project_1_latest",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "head-project-1",
+		CapturedAt: fixture.now.UTC().Format(javaScriptISOString),
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(project_1) error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
 		ID:         "prs_project_2_latest",
@@ -1406,19 +1417,21 @@ func TestHandlerWorkerCreateRejectsPullRequestSnapshotFromDifferentProject(t *te
 
 	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(2 * time.Minute) }}).ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", recorder.Code)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
-	errMap := body["error"].(map[string]any)
-	assertEqual(t, errMap["code"], "PULL_REQUEST_PROJECT_MISMATCH")
-	assertEqual(t, errMap["message"], "Pull request acme/looper#42 does not belong to project project_1")
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["status"], "queued")
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
 		t.Fatalf("Queue.List() error = %v", err)
 	}
-	if len(queueItems) != 0 {
-		t.Fatalf("Queue.List() = %#v, want no enqueued worker", queueItems)
+	if len(queueItems) != 1 {
+		t.Fatalf("Queue.List() = %#v, want one enqueued worker", queueItems)
+	}
+	if queueItems[0].ProjectID == nil || *queueItems[0].ProjectID != "project_1" {
+		t.Fatalf("queueItems[0].ProjectID = %#v, want project_1", queueItems[0].ProjectID)
 	}
 }
 

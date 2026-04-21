@@ -240,6 +240,14 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 		t.Fatalf("PullRequestSnapshots.GetLatest() = %#v, want headSha %q", snapshot, headSHA)
 	}
 
+	projectSnapshot, err := repos.PullRequestSnapshots.GetLatestByProject(ctx, "project_1", repo, prNumber)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.GetLatestByProject() error = %v", err)
+	}
+	if projectSnapshot == nil || projectSnapshot.HeadSHA != headSHA {
+		t.Fatalf("PullRequestSnapshots.GetLatestByProject() = %#v, want headSha %q", projectSnapshot, headSHA)
+	}
+
 	events, err := repos.Events.ListByEntity(ctx, "loop", "loop_1")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)

@@ -695,6 +695,19 @@ func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo str
 	return &record, nil
 }
 
+func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	record, err := scanPullRequestSnapshot(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest pull request snapshot by project: %w", err)
+	}
+
+	return &record, nil
+}
+
 type LocksRepository struct {
 	q   sqliteQuerier
 	now func() time.Time

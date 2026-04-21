@@ -634,6 +634,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			acquiredClaimedLock = true
 		}
 	}
+	defer func() {
+		if (acquiredClaimedLock || claimedLockKey != "") && claimedLockKey != "" {
+			if err := r.repos.Locks.Release(context.Background(), claimedLockKey); err != nil {
+				r.logWarn("fixer business lock release failed", map[string]any{"lockKey": claimedLockKey, "error": err.Error()})
+			}
+		}
+	}()
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -645,13 +652,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
 	r.logInfo("fixer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)})
-	defer func() {
-		if (acquiredClaimedLock || claimedLockKey != "") && claimedLockKey != "" {
-			if err := r.repos.Locks.Release(context.Background(), claimedLockKey); err != nil {
-				r.logWarn("fixer business lock release failed", map[string]any{"lockKey": claimedLockKey, "error": err.Error()})
-			}
-		}
-	}()
 	for _, step := range stepsFrom(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
