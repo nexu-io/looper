@@ -2146,7 +2146,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if domain.LoopType(loopType) == domain.LoopTypeReviewer && candidateStatus == domain.LoopStatusRunning {
+		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer) && candidateStatus == domain.LoopStatusRunning {
 			record.Status = string(domain.LoopStatusQueued)
 			candidateStatus = domain.LoopStatusQueued
 		}
@@ -2160,14 +2160,22 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 
-		if domain.LoopType(loopType) == domain.LoopTypeReviewer && candidateStatus == domain.LoopStatusQueued {
+		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer) && candidateStatus == domain.LoopStatusQueued {
 			repo := strings.TrimSpace(derefString(record.Repo))
 			if repo == "" || record.PRNumber == nil {
-				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewer loop requires repo and prNumber"}
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", loopType)}
 			}
 
 			prNumber := *record.PRNumber
-			dedupeKey := fmt.Sprintf("reviewer:%s:%d", repo, prNumber)
+			targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			lockKey := targetID
+			queueType := domain.LoopType(loopType)
+			dedupeKey := fmt.Sprintf("%s:%s", loopType, record.ID)
+			priority := storage.QueuePriorityFixer
+			if queueType == domain.LoopTypeReviewer {
+				dedupeKey = fmt.Sprintf("reviewer:%s:%d", repo, prNumber)
+				priority = storage.QueuePriorityReviewer
+			}
 			existingQueue, findErr := transactionRepos.Queue.FindActiveByDedupe(r.Context(), dedupeKey)
 			if findErr != nil {
 				return storage.LoopRecord{}, findErr
@@ -2175,19 +2183,17 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			if existingQueue == nil {
 				projectIDCopy := record.ProjectID
 				loopID := record.ID
-				targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-				lockKey := targetID
 				queueRecord := storage.QueueItemRecord{
 					ID:          generateRequestID(),
 					ProjectID:   &projectIDCopy,
 					LoopID:      &loopID,
-					Type:        string(domain.LoopTypeReviewer),
+					Type:        string(queueType),
 					TargetType:  string(domain.LoopTargetTypePullRequest),
 					TargetID:    targetID,
 					Repo:        &repo,
 					PRNumber:    &prNumber,
 					DedupeKey:   dedupeKey,
-					Priority:    2,
+					Priority:    priority,
 					Status:      "queued",
 					AvailableAt: nowISO,
 					Attempts:    0,
@@ -2211,7 +2217,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		}
 		return loopResponse{}, mapLoopCreateError(err)
 	}
-	if record.Type == string(domain.LoopTypeReviewer) && record.Status == string(domain.LoopStatusQueued) && h.context.TriggerSchedulerTick != nil {
+	if (record.Type == string(domain.LoopTypeReviewer) || record.Type == string(domain.LoopTypeFixer)) && record.Status == string(domain.LoopStatusQueued) && h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
 
