@@ -8,11 +8,13 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	looperdapi "github.com/powerformer/looper/internal/api"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/eventlog"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/version"
 )
@@ -82,6 +84,17 @@ type daemonRuntime struct {
 	stopOnce        sync.Once
 }
 
+type stopLoopResult struct {
+	Stopped     bool   `json:"stopped"`
+	LoopID      string `json:"loopId"`
+	RunID       string `json:"runId,omitempty"`
+	ExecutionID string `json:"executionId,omitempty"`
+	Vendor      string `json:"vendor,omitempty"`
+	PID         int64  `json:"pid,omitempty"`
+}
+
+type signalProcessFunc func(int, syscall.Signal) error
+
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	runtimeValue, err := looperdruntime.Start(ctx, deps)
 	if err != nil {
@@ -96,6 +109,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	handler := looperdapi.NewHandler(looperdapi.Context{
 		Config:  deps.Config,
 		Runtime: rt,
+		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
+			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill)
+		},
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
@@ -136,6 +152,66 @@ func (d *daemonRuntime) WaitForShutdown() {
 	if d.runtime != nil {
 		d.runtime.WaitForShutdown()
 	}
+}
+
+func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc) (any, error) {
+	result := stopLoopResult{Stopped: false, LoopID: loopID}
+	if services.Loops == nil {
+		return nil, fmt.Errorf("loops service is not configured")
+	}
+
+	reasonCopy := reason
+	paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
+	if err != nil {
+		return nil, err
+	}
+	result.Stopped = true
+	result.LoopID = paused.Loop.ID
+
+	if services.Repositories == nil || services.Repositories.Runs == nil {
+		return result, nil
+	}
+
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil || latestRun == nil || latestRun.Status != "running" {
+		return result, err
+	}
+	result.RunID = latestRun.ID
+
+	if services.Repositories.AgentExecutions == nil {
+		return result, nil
+	}
+
+	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
+	if err != nil || latestExecution == nil {
+		return result, err
+	}
+
+	result.ExecutionID = latestExecution.ID
+	result.Vendor = latestExecution.Vendor
+	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
+		return result, nil
+	}
+
+	pid := int(*latestExecution.PID)
+	result.PID = *latestExecution.PID
+	if signal != nil {
+		if err := signal(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return nil, err
+		}
+	}
+
+	updated := *latestExecution
+	updated.Status = "cancelling"
+	updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now().UTC())
+	if updated.ErrorMessage == nil {
+		updated.ErrorMessage = &reasonCopy
+	}
+	if err := services.Repositories.AgentExecutions.Upsert(ctx, updated); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 func hasVersionArg(args []string) bool {
