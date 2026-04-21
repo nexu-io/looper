@@ -2163,7 +2163,8 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 
-		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusQueued {
+		shouldQueue := ((domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusQueued) || (domain.LoopType(loopType) == domain.LoopTypePlanner && (candidateStatus == domain.LoopStatusRunning || candidateStatus == domain.LoopStatusQueued))
+		if shouldQueue {
 			queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 			if queueErr != nil {
 				return storage.LoopRecord{}, queueErr
@@ -2190,7 +2191,8 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		}
 		return loopResponse{}, mapLoopCreateError(err)
 	}
-	if (record.Type == string(domain.LoopTypeReviewer) || record.Type == string(domain.LoopTypeFixer) || record.Type == string(domain.LoopTypeWorker)) && record.Status == string(domain.LoopStatusQueued) && h.context.TriggerSchedulerTick != nil {
+	shouldTriggerScheduler := ((record.Type == string(domain.LoopTypeReviewer) || record.Type == string(domain.LoopTypeFixer) || record.Type == string(domain.LoopTypeWorker)) && record.Status == string(domain.LoopStatusQueued)) || (record.Type == string(domain.LoopTypePlanner) && (record.Status == string(domain.LoopStatusRunning) || record.Status == string(domain.LoopStatusQueued)))
+	if shouldTriggerScheduler && h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
 
@@ -2506,29 +2508,12 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, upsertErr
 		}
 
-		projectIDCopy := projectID
-		loopID := record.ID
-		lockKey := targetID
-		payloadJSON := fmt.Sprintf(`{"issueNumber":%d}`, *issueNumber)
-		queueRecord := storage.QueueItemRecord{
-			ID:          generateRequestID(),
-			ProjectID:   &projectIDCopy,
-			LoopID:      &loopID,
-			Type:        string(domain.LoopTypePlanner),
-			TargetType:  string(domain.LoopTargetTypeIssue),
-			TargetID:    targetID,
-			Repo:        repo,
-			PRNumber:    nil,
-			DedupeKey:   fmt.Sprintf("planner:%s:%d", *repo, *issueNumber),
-			Priority:    storage.QueuePriorityPlanner,
-			Status:      "queued",
-			AvailableAt: nowISO,
-			Attempts:    0,
-			MaxAttempts: int64(h.context.Config.Scheduler.RetryMaxAttempts),
-			LockKey:     &lockKey,
-			PayloadJSON: &payloadJSON,
-			CreatedAt:   nowISO,
-			UpdatedAt:   nowISO,
+		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, nil, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		if queueErr != nil {
+			return storage.LoopRecord{}, queueErr
+		}
+		if !ok {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "failed to build planner queue item"}
 		}
 		if upsertQueueErr := repos.Queue.Upsert(r.Context(), queueRecord); upsertQueueErr != nil {
 			return storage.LoopRecord{}, upsertQueueErr
@@ -2992,7 +2977,7 @@ func normalizeMetadataJSON(raw json.RawMessage) (*string, error) {
 
 func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.LoopTarget, nowISO string, metadataJSON *string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {
 	queueType := domain.LoopType(record.Type)
-	if queueType != domain.LoopTypeReviewer && queueType != domain.LoopTypeFixer && queueType != domain.LoopTypeWorker {
+	if queueType != domain.LoopTypeReviewer && queueType != domain.LoopTypeFixer && queueType != domain.LoopTypeWorker && queueType != domain.LoopTypePlanner {
 		return storage.QueueItemRecord{}, false, nil
 	}
 
@@ -3016,6 +3001,22 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 	}
 
 	switch queueType {
+	case domain.LoopTypePlanner:
+		repo := strings.TrimSpace(derefString(record.Repo))
+		issueNumber := target.IssueNumber
+		if target.TargetType != domain.LoopTargetTypeIssue || repo == "" || issueNumber <= 0 {
+			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
+		}
+		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		payloadJSON := fmt.Sprintf(`{"issueNumber":%d}`, issueNumber)
+		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
+		queueRecord.TargetID = lockKey
+		queueRecord.Repo = &repo
+		queueRecord.PRNumber = nil
+		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", record.ProjectID, record.ID, repo, issueNumber)
+		queueRecord.Priority = storage.QueuePriorityPlanner
+		queueRecord.LockKey = &lockKey
+		queueRecord.PayloadJSON = &payloadJSON
 	case domain.LoopTypeReviewer:
 		repo := strings.TrimSpace(derefString(record.Repo))
 		if repo == "" || record.PRNumber == nil {

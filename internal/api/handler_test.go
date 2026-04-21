@@ -1702,6 +1702,126 @@ func TestHandlerCreateLoopReviewerTriggersSchedulerTickHook(t *testing.T) {
 	assertEqual(t, triggered, 1)
 }
 
+func TestHandlerCreateLoopPlannerEnqueuesSchedulableLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		TriggerSchedulerTick: func() {
+			triggered++
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"planner","targetType":"issue","repo":"acme/looper","issueNumber":123}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	resp := parseJSONMap(t, recorder.Body.Bytes())
+	data := resp["data"].(map[string]any)
+	loopID := data["id"].(string)
+	assertEqual(t, data["status"], "running")
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop = %d, want 1", len(matched))
+	}
+	queue := matched[0]
+	assertEqual(t, queue.Type, "planner")
+	assertEqual(t, queue.Status, "queued")
+	assertEqual(t, queue.TargetType, "issue")
+	assertEqual(t, queue.TargetID, "issue:acme/looper:123")
+	assertEqual(t, queue.DedupeKey, "planner:project_1:"+loopID+":acme/looper:123")
+	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerLoopStartPlannerIgnoresOtherProjectsScopedDedupe(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	now := fixture.now.UTC()
+	nowISO := now.Format(javaScriptISOString)
+	targetID := "issue:acme/looper:77"
+	projectID := "project_planner_a"
+	loopID := "loop_planner_a"
+	otherProjectID := "project_planner_b"
+	otherLoopID := "loop_planner_b"
+	payload := `{"issueNumber":77}`
+	finishedAt := now.Add(-time.Minute).Format(javaScriptISOString)
+	otherAvailableAt := now.Add(-2 * time.Minute).Format(javaScriptISOString)
+
+	for _, project := range []storage.ProjectRecord{
+		{ID: projectID, Name: "Planner A", RepoPath: "/tmp/repos/planner-a", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: otherProjectID, Name: "Planner B", RepoPath: "/tmp/repos/planner-b", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := services.Repositories.Projects.Upsert(context.Background(), project); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
+		}
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(primary) error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: otherLoopID, Seq: 2, ProjectID: otherProjectID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(other) error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_terminal", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "planner:project_planner_a:loop_planner_a:acme/looper:77", Priority: storage.QueuePriorityPlanner, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LockKey: stringPtr(targetID), PayloadJSON: &payload, FinishedAt: &finishedAt, LastError: stringPtr("boom"), LastErrorKind: stringPtr("non_retryable"), CreatedAt: nowISO, UpdatedAt: finishedAt}); err != nil {
+		t.Fatalf("Queue.Upsert(primary terminal) error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_other_active", ProjectID: &otherProjectID, LoopID: &otherLoopID, Type: "planner", TargetType: "issue", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "planner:project_planner_b:loop_planner_b:acme/looper:77", Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: otherAvailableAt, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(targetID), PayloadJSON: &payload, CreatedAt: otherAvailableAt, UpdatedAt: otherAvailableAt}); err != nil {
+		t.Fatalf("Queue.Upsert(other active) error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return now.Add(time.Minute) }})
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range items {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 2 {
+		t.Fatalf("queue items for loop = %d, want 2", len(matched))
+	}
+
+	replacements := 0
+	for _, item := range matched {
+		if item.ID == "queue_planner_terminal" {
+			continue
+		}
+		replacements++
+		assertEqual(t, item.Status, "queued")
+		assertEqual(t, item.DedupeKey, "planner:project_planner_a:loop_planner_a:acme/looper:77")
+	}
+	assertEqual(t, replacements, 1)
+}
+
 func TestHandlerCreateLoopFixerEnqueuesSchedulableManualLoop(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
