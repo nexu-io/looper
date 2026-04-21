@@ -12,7 +12,7 @@ func TestRunCapturesStdoutAndStderr(t *testing.T) {
 	t.Parallel()
 	result, err := Run(context.Background(), Options{
 		Command: "/bin/sh",
-		Args:    []string{"-lc", `printf 'hello'; printf 'oops' >&2`},
+		Args:    []string{"-c", `printf 'hello'; printf 'oops' >&2`},
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -32,7 +32,7 @@ func TestRunReturnsCommandExecutionErrorOnNonZeroExit(t *testing.T) {
 	t.Parallel()
 	result, err := Run(context.Background(), Options{
 		Command: "/bin/sh",
-		Args:    []string{"-lc", `printf 'bad' >&2; exit 7`},
+		Args:    []string{"-c", `printf 'bad' >&2; exit 7`},
 	})
 	var commandErr *CommandExecutionError
 	if !errors.As(err, &commandErr) {
@@ -53,7 +53,7 @@ func TestRunTimesOutAndPreservesCapturedOutput(t *testing.T) {
 	t.Parallel()
 	result, err := Run(context.Background(), Options{
 		Command:          "/bin/sh",
-		Args:             []string{"-lc", `printf 'start'; sleep 1`},
+		Args:             []string{"-c", `printf 'start'; sleep 1`},
 		Timeout:          50 * time.Millisecond,
 		GracefulShutdown: 10 * time.Millisecond,
 	})
@@ -76,7 +76,7 @@ func TestRunBoundsCapturedOutput(t *testing.T) {
 	t.Parallel()
 	result, err := Run(context.Background(), Options{
 		Command:          "/bin/sh",
-		Args:             []string{"-lc", `printf 'abcdefghi'`},
+		Args:             []string{"-c", `printf 'abcdefghi'`},
 		MaxCapturedBytes: 4,
 	})
 	if err != nil {
@@ -96,7 +96,7 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	}()
 	_, err := Run(ctx, Options{
 		Command:          "/bin/sh",
-		Args:             []string{"-lc", `sleep 1`},
+		Args:             []string{"-c", `sleep 1`},
 		GracefulShutdown: 10 * time.Millisecond,
 	})
 	if !errors.Is(err, context.Canceled) {

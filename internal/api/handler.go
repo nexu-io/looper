@@ -2762,27 +2762,53 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
 	services := h.context.Runtime.Services()
-	loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
-	if err != nil {
-		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	if loop == nil {
-		return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-	}
-
-	if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer)) && !isCodingAgentConfigured(h.context.Config) {
-		return loopResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
-	}
-
-	updated := *loop
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	updated.Status = string(status)
-	updated.UpdatedAt = nowISO
-	if status == domain.LoopStatusRunning {
-		updated.NextRunAt = &nowISO
-	}
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if loop == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
 
-	if err := services.Repositories.Loops.Upsert(ctx, updated); err != nil {
+		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer)) && !isCodingAgentConfigured(h.context.Config) {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
+		}
+
+		updated := *loop
+		updated.Status = string(status)
+		updated.UpdatedAt = nowISO
+		if status == domain.LoopStatusRunning {
+			updated.NextRunAt = &nowISO
+		} else {
+			updated.NextRunAt = nil
+		}
+
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+
+		switch status {
+		case domain.LoopStatusPaused:
+			reason := "loop paused"
+			if _, err := repos.Queue.CancelByLoop(ctx, updated.ID, nowISO, &reason); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		case domain.LoopStatusRunning:
+			if _, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
+
+		return updated, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
+		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 

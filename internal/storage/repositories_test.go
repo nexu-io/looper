@@ -841,6 +841,32 @@ func TestQueueRecoveryHelpersRequeueAndCancelByLoop(t *testing.T) {
 			t.Fatalf("Queue.GetByID(%s) after cancel = %#v, want cancelled with reason", id, got)
 		}
 	}
+
+	revivedAt := "2026-04-11T12:11:00.000Z"
+	revivedCount, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, "loop_rec", revivedAt)
+	if err != nil {
+		t.Fatalf("Queue.RequeueLatestCancelledByLoop() error = %v", err)
+	}
+	if revivedCount != 1 {
+		t.Fatalf("Queue.RequeueLatestCancelledByLoop() = %d, want 1", revivedCount)
+	}
+
+	revivedID := ""
+	for _, id := range []string{"qi_run_1", "qi_run_2", "qi_queued"} {
+		got, getErr := repos.Queue.GetByID(ctx, id)
+		if getErr != nil {
+			t.Fatalf("Queue.GetByID(%s) after revive error = %v", id, getErr)
+		}
+		if got != nil && got.Status == "queued" {
+			revivedID = id
+			if got.FinishedAt != nil || got.LastError != nil || got.AvailableAt != revivedAt {
+				t.Fatalf("Queue.GetByID(%s) after revive = %#v, want queued with cleared terminal state", id, got)
+			}
+		}
+	}
+	if revivedID == "" {
+		t.Fatal("expected one cancelled queue item to be requeued")
+	}
 }
 
 func strPtr(value string) *string {

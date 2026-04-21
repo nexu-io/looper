@@ -795,6 +795,73 @@ func TestHandlerLoopStartRejectsFixerWithoutAgentConfigured(t *testing.T) {
 	assertEqual(t, errorMap["message"], "Cannot start fixer loop without config.agent.vendor")
 }
 
+func TestHandlerLoopStatusMutationsReconcileQueueItems(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_status"
+	loopID := "loop_worker_status"
+	targetID := "project:project_status"
+	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "running", MetadataJSON: &metadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_status", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+
+	pauseReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/pause", nil)
+	pauseRecorder := httptest.NewRecorder()
+	h.ServeHTTP(pauseRecorder, pauseReq)
+	if pauseRecorder.Code != http.StatusOK {
+		t.Fatalf("pause status = %d, want 200", pauseRecorder.Code)
+	}
+
+	pausedLoop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() after pause error = %v", err)
+	}
+	if pausedLoop == nil || pausedLoop.Status != "paused" || pausedLoop.NextRunAt != nil {
+		t.Fatalf("paused loop = %#v, want paused with nil next run", pausedLoop)
+	}
+	pausedQueue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_worker_status")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() after pause error = %v", err)
+	}
+	if pausedQueue == nil || pausedQueue.Status != "cancelled" {
+		t.Fatalf("paused queue = %#v, want cancelled", pausedQueue)
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	startedLoop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() after start error = %v", err)
+	}
+	if startedLoop == nil || startedLoop.Status != "running" || startedLoop.NextRunAt == nil {
+		t.Fatalf("started loop = %#v, want running with next run", startedLoop)
+	}
+	startedQueue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_worker_status")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() after start error = %v", err)
+	}
+	if startedQueue == nil || startedQueue.Status != "queued" || startedQueue.FinishedAt != nil || startedQueue.LastError != nil {
+		t.Fatalf("started queue = %#v, want requeued item", startedQueue)
+	}
+}
+
 func TestHandlerWorkerAndPlannerRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)

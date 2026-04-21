@@ -1018,6 +1018,69 @@ func (r *QueueRepository) RequeueRunningByLoop(ctx context.Context, loopID, queu
 	return affected, nil
 }
 
+func (r *QueueRepository) RequeueLatestCancelledByLoop(ctx context.Context, loopID, queuedAt string) (int64, error) {
+	queueID, err := r.findLatestCancelledQueueIDByLoop(ctx, loopID, true)
+	if err != nil {
+		return 0, err
+	}
+	if queueID == "" {
+		queueID, err = r.findLatestCancelledQueueIDByLoop(ctx, loopID, false)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if queueID == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			finished_at = NULL,
+			last_error = NULL,
+			last_error_kind = NULL,
+			updated_at = ?
+		WHERE id = ? AND status = 'cancelled'
+	`, queuedAt, queuedAt, queueID)
+	if err != nil {
+		return 0, fmt.Errorf("requeue latest cancelled queue item by loop: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeue latest cancelled queue item rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
+func (r *QueueRepository) findLatestCancelledQueueIDByLoop(ctx context.Context, loopID string, onlyUnstarted bool) (string, error) {
+	query := `
+		SELECT id
+		FROM queue_items
+		WHERE loop_id = ? AND status = 'cancelled'
+	`
+	args := []any{loopID}
+	if onlyUnstarted {
+		query += ` AND started_at IS NULL`
+	}
+	query += ` ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1`
+
+	row := r.q.QueryRowContext(ctx, query, args...)
+	var queueID string
+	if err := row.Scan(&queueID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get latest cancelled queue item by loop: %w", err)
+	}
+	return queueID, nil
+}
+
 func (r *QueueRepository) CancelByLoop(ctx context.Context, loopID, finishedAt string, reason *string) (int64, error) {
 	result, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
