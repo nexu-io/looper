@@ -7,14 +7,14 @@ import (
 	"testing"
 )
 
-func TestEmbeddedMigrationsMirrorTypeScriptSourceFiles(t *testing.T) {
+func TestEmbeddedMigrationsMirrorSourceFiles(t *testing.T) {
 	t.Parallel()
 
 	if len(EmbeddedMigrations) == 0 {
 		t.Fatal("EmbeddedMigrations is empty")
 	}
 
-	sourceDir := filepath.Join("..", "..", "apps", "looperd", "src", "storage", "sqlite", "migrations")
+	sourceDir := filepath.Join("migrations")
 	entries, err := os.ReadDir(sourceDir)
 	if err != nil {
 		t.Fatalf("os.ReadDir(%q) error = %v", sourceDir, err)

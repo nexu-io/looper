@@ -1,9 +1,5 @@
 # AGENTS.md
 
-## Rules
-
-- After every code change, run `biome format` on each modified file supported by Biome before finishing.
-
 ## Commands
 
 - Supported implementation is Go-first. Root commands are the source of truth:
@@ -12,17 +8,12 @@
   - `go build ./...`
   - `go vet ./...`
   - `go test ./...`
-  - `bun x @biomejs/biome check .`
-- The TypeScript directories under `apps/` are archived legacy snapshots. Do not treat them as active build targets unless the task explicitly requires legacy-reference work.
 
 ## Repo structure
 
 - `cmd/looperd` — supported `looperd` daemon entrypoint.
 - `cmd/looper` — supported `looper` CLI entrypoint.
 - `internal/` and `pkg/` — active Go implementation packages.
-- `apps/looperd` — archived TypeScript daemon snapshot.
-- `apps/cli` — archived TypeScript CLI snapshot.
-- `apps/web` — archived placeholder TypeScript package.
 
 ## Configuration & runtime
 
@@ -35,8 +26,7 @@
 
 ## Conventions
 
-- Formatting and linting use Biome (spaces). Make Biome-compatible edits only; do not hand-format to another style.
-- Build output lives in `dist/` and archived `apps/*/dist/`; do not edit generated files.
+- Build output lives in `dist/`; do not edit generated files.
 - CI (`.github/workflows/ci.yml`) runs on PR updates: `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`.
 
 ## Review guidelines

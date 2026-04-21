@@ -64,7 +64,7 @@
         "environment": {}
       },
       "package": {
-        "distribution": "npm",
+        "distribution": "github-release",
         "autoMigrateOnStartup": true,
         "requireBackupBeforeMigrate": false
       },

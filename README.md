@@ -7,11 +7,8 @@ This repository currently contains:
 - `cmd/looperd` — the supported `looperd` daemon binary
 - `cmd/looper` — the supported `looper` CLI binary
 - `internal/` and `pkg/` — the active Go implementation
-- `apps/looperd` — archived legacy TypeScript daemon sources retained for reference only
-- `apps/cli` — archived legacy TypeScript CLI sources retained for reference only
-- `apps/web` — archived placeholder TypeScript package retained for reference only
 
-The current product is the Go daemon + CLI. The TypeScript directories under `apps/` are no longer part of the supported build, CI, or release workflows.
+The current product is the Go daemon + CLI.
 
 ## Requirements
 
@@ -24,7 +21,6 @@ For the default supported install path:
 For source development:
 
 - Go `1.22`
-- [Bun](https://bun.sh/) `1.3.12`
 - `git`
 - `gh`
 - `osascript` if macOS notifications stay enabled
@@ -130,8 +126,6 @@ In another shell, run the CLI from source:
 go run ./cmd/looper -- status
 ```
 
-If you need to inspect the archived TypeScript implementation, use the source under `apps/` as historical reference only. It is no longer validated by CI or shipped in release artifacts.
-
 ### Compatibility and version policy
 
 - CLI and daemon are published from the same git tag and should normally share the same version.
@@ -152,9 +146,6 @@ From the repo root:
 - `go build ./...`
 - `go vet ./...`
 - `go test ./...`
-- `bun x @biomejs/biome check .`
-
-The archived TypeScript directories under `apps/` remain in the repository only as legacy snapshots and should not be treated as active development targets unless you are doing explicit historical-reference work.
 
 ## Project structure
 
@@ -192,10 +183,6 @@ Manual review examples:
 
 - `looper review 123` — create a one-shot reviewer task for PR `123` in the current project
 - `looper review powerformer/looper#123 --loop` — keep re-reviewing that PR as new commits are pushed
-
-### `apps/*`
-
-Archived legacy TypeScript snapshots retained for historical reference only. They are not shipped in releases and are not part of the supported product surface.
 
 ## Configuration
 
@@ -271,5 +258,4 @@ Selected CLI config flags:
 
 ## Development notes
 
-- Formatting and linting use Biome with spaces.
-- Build output lives in `dist/` and archived `apps/*/dist/`; do not edit generated files.
+- Build output lives in `dist/`; do not edit generated files.

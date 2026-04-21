@@ -24,9 +24,8 @@ var migrationFilePattern = regexp.MustCompile(`^(\d{4}_[a-zA-Z0-9_\-]+)\.sql$`)
 //go:embed migrations/*.sql
 var embeddedMigrationFiles embed.FS
 
-// EmbeddedMigrations mirrors the current TypeScript SQLite migrations in a
-// deterministic order so the Go rewrite can reuse the same schema evolution
-// inputs while the migration runner is ported.
+// EmbeddedMigrations embeds the repository's SQLite migrations in a
+// deterministic order for runtime use and migration validation.
 var EmbeddedMigrations = mustLoadEmbeddedMigrations()
 
 func mustLoadEmbeddedMigrations() []EmbeddedMigration {

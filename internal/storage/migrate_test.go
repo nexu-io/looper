@@ -361,7 +361,7 @@ func TestMigrationRunnerDoesNotRecordFailedMigration(t *testing.T) {
 	assertDescriptors(t, status.Pending, []string{"0002_broken"})
 }
 
-func TestMigrationRunnerHandlesForeignKeyPragmasLikeTypeScriptRunner(t *testing.T) {
+func TestMigrationRunnerHandlesForeignKeyPragmasCorrectly(t *testing.T) {
 	t.Parallel()
 
 	db := openTestSQLiteDB(t)
@@ -455,15 +455,15 @@ func TestMigrationRunnerRollsBackForeignKeyPragmaMigrationSideEffectsOnFailure(t
 	}
 }
 
-func TestMigrationRunnerAppliesPendingMigrationsOnTypeScriptCreatedDatabasesAcrossVersions(t *testing.T) {
+func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	latestFixtureID := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID
-	latestDB := openSQLiteDBAtPath(t, writeTypeScriptCreatedDBFixture(t, latestFixtureID))
+	latestDB := openSQLiteDBAtPath(t, writeLegacyDBFixture(t, latestFixtureID))
 	latestSchema := readSQLiteSchemaSnapshot(t, latestDB)
 
-	const typeScriptAppliedAt = "2026-04-17T12:00:00.000Z"
+	const legacyAppliedAt = "2026-04-17T12:00:00.000Z"
 	const goAppliedAt = "2026-04-17T13:00:00.000Z"
 
 	for version := 1; version <= len(EmbeddedMigrations); version++ {
@@ -473,7 +473,7 @@ func TestMigrationRunnerAppliesPendingMigrationsOnTypeScriptCreatedDatabasesAcro
 		t.Run(fixtureID, func(t *testing.T) {
 			t.Parallel()
 
-			db := openSQLiteDBAtPath(t, writeTypeScriptCreatedDBFixture(t, fixtureID))
+			db := openSQLiteDBAtPath(t, writeLegacyDBFixture(t, fixtureID))
 			runner := NewMigrationRunner(db, MigrationRunnerOptions{
 				Migrations: EmbeddedMigrations,
 				Now: func() time.Time {
@@ -489,7 +489,7 @@ func TestMigrationRunnerAppliesPendingMigrationsOnTypeScriptCreatedDatabasesAcro
 			wantAppliedIDs := migrationIDsForPrefix(version)
 			wantPendingIDs := migrationIDsForSuffix(version)
 			assertDescriptors(t, status.Available, migrationIDsForPrefix(len(EmbeddedMigrations)))
-			assertAppliedMigrations(t, status.Applied, wantAppliedIDs, typeScriptAppliedAt)
+			assertAppliedMigrations(t, status.Applied, wantAppliedIDs, legacyAppliedAt)
 			assertDescriptors(t, status.Pending, wantPendingIDs)
 
 			result, err := runner.RunPending(ctx)
@@ -509,7 +509,7 @@ func TestMigrationRunnerAppliesPendingMigrationsOnTypeScriptCreatedDatabasesAcro
 				t.Fatalf("runner.Status() after run error = %v", err)
 			}
 
-			assertAppliedMigrationsWithSplitTimestamps(t, status.Applied, migrationIDsForPrefix(len(EmbeddedMigrations)), version, typeScriptAppliedAt, goAppliedAt)
+			assertAppliedMigrationsWithSplitTimestamps(t, status.Applied, migrationIDsForPrefix(len(EmbeddedMigrations)), version, legacyAppliedAt, goAppliedAt)
 			if len(status.Pending) != 0 {
 				t.Fatalf("runner.Status().Pending after run = %v, want empty", status.Pending)
 			}
@@ -593,7 +593,7 @@ func readSQLiteSchemaSnapshot(t *testing.T, db *sql.DB) []sqliteSchemaEntry {
 	return entries
 }
 
-func writeTypeScriptCreatedDBFixture(t *testing.T, fixtureID string) string {
+func writeLegacyDBFixture(t *testing.T, fixtureID string) string {
 	t.Helper()
 
 	encodedFixture, err := os.ReadFile(filepath.Join("testdata", "ts-created-migration-versions", fixtureID+".sqlite.base64"))

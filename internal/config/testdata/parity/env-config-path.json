@@ -61,7 +61,7 @@
           }
         },
         "package": {
-          "distribution": "npm",
+          "distribution": "github-release",
           "autoMigrateOnStartup": false,
           "requireBackupBeforeMigrate": true
         },
@@ -144,7 +144,7 @@
         }
       },
       "package": {
-        "distribution": "npm",
+        "distribution": "github-release",
         "autoMigrateOnStartup": false,
         "requireBackupBeforeMigrate": true
       },

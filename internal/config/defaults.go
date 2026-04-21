@@ -96,7 +96,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Environment:       map[string]string{},
 		},
 		Package: PackageConfig{
-			Distribution:               "npm",
+			Distribution:               "github-release",
 			AutoMigrateOnStartup:       true,
 			RequireBackupBeforeMigrate: false,
 		},

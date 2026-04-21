@@ -263,7 +263,7 @@ func readAppliedMigrations(ctx context.Context, conn *sql.Conn) ([]AppliedMigrat
 func runMigration(ctx context.Context, conn *sql.Conn, migration EmbeddedMigration, now func() time.Time) error {
 	if usesForeignKeyPragma(migration.SQL) {
 		// SQLite ignores PRAGMA foreign_keys changes inside a transaction, so we
-		// mirror the TypeScript runner and switch the connection setting before the
+		// switch the connection setting before the
 		// migration transaction begins, then restore it afterward.
 		previousForeignKeysSetting, err := readForeignKeysSetting(ctx, conn)
 		if err != nil {

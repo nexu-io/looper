@@ -1,8 +1,6 @@
 .ralph/
 node_modules/
 dist/
-apps/*/dist/
-*.tsbuildinfo
 *.test
 /looper
 /looperd

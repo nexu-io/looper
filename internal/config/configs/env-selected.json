@@ -43,7 +43,7 @@
   },
   "package": {
     "autoMigrateOnStartup": false,
-    "distribution": "npm",
+    "distribution": "github-release",
     "requireBackupBeforeMigrate": true
   },
   "projects": [
