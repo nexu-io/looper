@@ -69,6 +69,7 @@ type Runtime struct {
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
 	runSchedulerTick       RunSchedulerTickFunc
+	defaultSchedulerTick   RunSchedulerTickFunc
 	customSchedulerTick    bool
 	shutdownTimeout        time.Duration
 
@@ -105,11 +106,6 @@ func New(options Options) *Runtime {
 
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
-	if runSchedulerTick == nil {
-		runSchedulerTick = func(context.Context, Services) error {
-			return nil
-		}
-	}
 
 	shutdownTimeout := options.ShutdownTimeout
 	if shutdownTimeout <= 0 {
@@ -119,7 +115,7 @@ func New(options Options) *Runtime {
 		shutdownTimeout = time.Second
 	}
 
-	return &Runtime{
+	rt := &Runtime{
 		config:                 options.Config,
 		logger:                 options.Logger,
 		now:                    now,
@@ -131,6 +127,10 @@ func New(options Options) *Runtime {
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 	}
+	if !customSchedulerTick {
+		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
+	}
+	return rt
 }
 
 func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
@@ -335,7 +335,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		r.runSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.now)
+		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.now)
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.mu.Unlock()
@@ -471,10 +471,23 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	if services.Repositories == nil {
 		return
 	}
+	if tick == nil {
+		return
+	}
 
 	if err := tick(ctx, services); err != nil && r.logger != nil {
 		r.logger.Warn("looperd scheduler tick failed", map[string]any{"error": err.Error()})
 	}
+}
+
+func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Services) error {
+	r.mu.RLock()
+	tick := r.defaultSchedulerTick
+	r.mu.RUnlock()
+	if tick == nil {
+		return fmt.Errorf("default scheduler tick is not configured")
+	}
+	return tick(ctx, services)
 }
 
 func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage.Repositories, now time.Time) (RecoverySummary, error) {

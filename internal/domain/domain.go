@@ -107,6 +107,15 @@ var loopStepsByType = map[LoopType][]string{
 	LoopTypeFixer:    FixerSteps,
 }
 
+func AssertKnownLoopType(loopType LoopType) error {
+	for _, candidate := range LoopTypes {
+		if candidate == loopType {
+			return nil
+		}
+	}
+	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer)
+}
+
 func IsActiveLoopStatus(status LoopStatus) bool {
 	_, ok := activeLoopStatuses[status]
 	return ok
@@ -136,6 +145,9 @@ func PRLockKey(repo string, prNumber int64) string {
 }
 
 func AssertLoopTypeMatchesTarget(loopType LoopType, target LoopTarget) error {
+	if err := AssertKnownLoopType(loopType); err != nil {
+		return err
+	}
 	switch loopType {
 	case LoopTypeWorker:
 		if target.TargetType != LoopTargetTypeProject && target.TargetType != LoopTargetTypePullRequest {

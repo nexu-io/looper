@@ -1261,20 +1261,22 @@ func (h *Handler) buildPullRequestsRouteResponse(r *http.Request) (pullRequestsL
 	if err != nil {
 		return pullRequestsListResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
+	loopMatchesByPullRequest := groupPullRequestLoops(loops)
 	identities := collectPullRequestIdentities(latestSnapshots, loops)
 	snapshotByKey := map[string]storage.PullRequestSnapshotRecord{}
 	for _, snapshot := range latestSnapshots {
-		snapshotByKey[fmt.Sprintf("%s#%d", snapshot.Repo, snapshot.PRNumber)] = snapshot
+		snapshotByKey[pullRequestKey(snapshot.Repo, snapshot.PRNumber)] = snapshot
 	}
 
 	items := make([]pullRequestResponse, 0, len(identities))
 	for _, identity := range identities {
-		snapshot, ok := snapshotByKey[fmt.Sprintf("%s#%d", identity.Repo, identity.PRNumber)]
+		loopMatches := loopMatchesByPullRequest[pullRequestKey(identity.Repo, identity.PRNumber)]
+		snapshot, ok := snapshotByKey[pullRequestKey(identity.Repo, identity.PRNumber)]
 		if ok {
-			items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, &snapshot))
+			items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, &snapshot, loopMatches))
 			continue
 		}
-		items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, nil))
+		items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, nil, loopMatches))
 	}
 
 	return pullRequestsListResponse{Items: items}, nil
@@ -1321,7 +1323,7 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	return h.serializePullRequestListItem(repo, prNumber, snapshot), nil
+	return h.serializePullRequestListItem(repo, prNumber, snapshot, h.findPullRequestLoops(r.Context(), repo, prNumber)), nil
 }
 
 func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) pullRequestStatusResponse {
@@ -1334,6 +1336,15 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 		}
 		runs = append(runs, loopRuns...)
 	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		if runs[i].StartedAt != runs[j].StartedAt {
+			return runs[i].StartedAt > runs[j].StartedAt
+		}
+		if runs[i].UpdatedAt != runs[j].UpdatedAt {
+			return runs[i].UpdatedAt > runs[j].UpdatedAt
+		}
+		return runs[i].ID > runs[j].ID
+	})
 
 	var latestRunStatus *string
 	if len(runs) > 0 {
@@ -1382,8 +1393,7 @@ func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumbe
 	return matches
 }
 
-func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snapshot *storage.PullRequestSnapshotRecord) pullRequestResponse {
-	loopMatches := h.findPullRequestLoops(context.Background(), repo, prNumber)
+func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snapshot *storage.PullRequestSnapshotRecord, loopMatches []storage.LoopRecord) pullRequestResponse {
 	var projectID *string
 	if snapshot != nil {
 		projectID = &snapshot.ProjectID
@@ -1420,6 +1430,22 @@ func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(sto
 		return nil
 	}
 	return getter(*snapshot)
+}
+
+func pullRequestKey(repo string, prNumber int64) string {
+	return fmt.Sprintf("%s#%d", repo, prNumber)
+}
+
+func groupPullRequestLoops(loops []storage.LoopRecord) map[string][]storage.LoopRecord {
+	grouped := make(map[string][]storage.LoopRecord)
+	for _, loop := range loops {
+		if loop.Repo == nil || loop.PRNumber == nil {
+			continue
+		}
+		key := pullRequestKey(*loop.Repo, *loop.PRNumber)
+		grouped[key] = append(grouped[key], loop)
+	}
+	return grouped
 }
 
 func dedupeLatestSnapshots(snapshots []storage.PullRequestSnapshotRecord) []storage.PullRequestSnapshotRecord {
@@ -2006,6 +2032,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	loopType := strings.TrimSpace(derefString(body.Type))
 	if loopType == "" {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "type is required"}
+	}
+	if err := domain.AssertKnownLoopType(domain.LoopType(loopType)); err != nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 	}
 
 	targetType := strings.TrimSpace(derefString(body.TargetType))

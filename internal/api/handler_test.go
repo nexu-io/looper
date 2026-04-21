@@ -1072,6 +1072,113 @@ func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
 	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
 }
 
+func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reveiwer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
+	assertEqual(t, errMap["message"], "loop.type must be one of: planner, reviewer, worker, fixer")
+
+	loops, err := fixture.runtime.Services().Repositories.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	for _, loop := range loops {
+		if loop.Type == "reveiwer" {
+			t.Fatalf("persisted unsupported loop type: %#v", loop)
+		}
+	}
+}
+
+func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedEventAndPullRequestRouteData(t, fixture.runtime)
+	services := fixture.runtime.Services()
+
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_1",
+		Seq:        2,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:42"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(42),
+		Status:     "queued",
+		CreatedAt:  "2026-04-11T12:01:00.000Z",
+		UpdatedAt:  "2026-04-11T12:01:00.000Z",
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_fixer_1) error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:        "run_reviewer_old",
+		LoopID:    "loop_1",
+		Status:    "running",
+		StartedAt: "2026-04-11T12:00:00.000Z",
+		CreatedAt: "2026-04-11T12:00:00.000Z",
+		UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_reviewer_old) error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:        "run_fixer_new",
+		LoopID:    "loop_fixer_1",
+		Status:    "failed",
+		StartedAt: "2026-04-11T12:05:00.000Z",
+		CreatedAt: "2026-04-11T12:05:00.000Z",
+		UpdatedAt: "2026-04-11T12:06:00.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_fixer_new) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopStatus := data["loopStatus"].(map[string]any)
+	assertEqual(t, loopStatus["latestRunStatus"], "failed")
+	assertEqual(t, loopStatus["runningRunCount"], float64(2))
+}
+
+func TestSerializePullRequestListItemUsesProvidedLoopMatches(t *testing.T) {
+	h := NewHandler(Context{})
+	item := h.serializePullRequestListItem("acme/looper", 42, nil, []storage.LoopRecord{{
+		ID:         "loop_reviewer_1",
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(42),
+		Status:     "running",
+		CreatedAt:  "2026-04-11T12:00:00.000Z",
+		UpdatedAt:  "2026-04-11T12:00:00.000Z",
+	}})
+
+	if item.ProjectID == nil || *item.ProjectID != "project_1" {
+		t.Fatalf("ProjectID = %v, want project_1", item.ProjectID)
+	}
+	if item.Reviewer == nil || *item.Reviewer != "running" {
+		t.Fatalf("Reviewer = %v, want running", item.Reviewer)
+	}
+}
+
 func TestHandlerWorkersCreateAllowsConcurrentProjectWorkers(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

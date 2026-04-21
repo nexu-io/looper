@@ -318,6 +318,43 @@ func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartConfiguresDefaultSchedulerTickAtStartup(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+	if rt.runSchedulerTick == nil {
+		t.Fatal("runSchedulerTick = nil before Start(), want startup wrapper")
+	}
+	if rt.defaultSchedulerTick != nil {
+		t.Fatal("defaultSchedulerTick configured before Start(), want deferred startup injection")
+	}
+
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	if rt.defaultSchedulerTick == nil {
+		t.Fatal("defaultSchedulerTick = nil after Start(), want injected scheduler implementation")
+	}
+	if err := rt.runSchedulerTick(context.Background(), rt.Services()); err != nil {
+		t.Fatalf("runSchedulerTick() error = %v", err)
+	}
+	if rt.customSchedulerTick {
+		t.Fatal("customSchedulerTick = true, want false for default scheduler")
+	}
+}
+
 func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	t.Parallel()
 
