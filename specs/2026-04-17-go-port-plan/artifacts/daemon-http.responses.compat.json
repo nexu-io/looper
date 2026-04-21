@@ -385,7 +385,7 @@
           "configJson": null,
           "metadataJson": null,
           "lastRunAt": null,
-          "nextRunAt": null,
+          "nextRunAt": "<generated-timestamp>",
           "createdAt": "<generated-timestamp>",
           "updatedAt": "<generated-timestamp>"
         },
@@ -459,7 +459,7 @@
           "configJson": null,
           "metadataJson": null,
           "lastRunAt": "2026-04-11T12:00:00.000Z",
-          "nextRunAt": null,
+          "nextRunAt": "<generated-timestamp>",
           "createdAt": "2026-04-11T12:00:00.000Z",
           "updatedAt": "<generated-timestamp>"
         },
