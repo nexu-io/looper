@@ -577,6 +577,118 @@ func TestRuntimeRecoveryRebuildsMissingQueueItemForRequeuedLoop(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+	runningAt := "2026-04-17T12:30:00.000Z"
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "main"
+	projectID := "project_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:         projectID,
+		Name:       "Looper",
+		RepoPath:   filepath.Join(workingDir, "repo"),
+		BaseBranch: &baseBranch,
+		Archived:   false,
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	prNumber := int64(99)
+	metadata := `{"worker":{"title":"Repair queue","prompt":"Rebuild queue item","repo":"acme/looper","baseBranch":"main"}}`
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_requeued",
+		Seq:          1,
+		ProjectID:    projectID,
+		Type:         "worker",
+		TargetType:   "pull_request",
+		TargetID:     stringPtr("pr:acme/looper:99"),
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &prNumber,
+		Status:       "running",
+		MetadataJSON: &metadata,
+		NextRunAt:    stringPtr(nowISO),
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_requeued) error = %v", err)
+	}
+	if err := seedRepos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_requeued",
+		ProjectID:   &projectID,
+		LoopID:      stringPtr("loop_requeued"),
+		Type:        "worker",
+		TargetType:  "pull_request",
+		TargetID:    "pr:acme/looper:99",
+		DedupeKey:   "worker:project_1:acme/looper:99",
+		Priority:    1,
+		Status:      "running",
+		AvailableAt: nowISO,
+		Attempts:    1,
+		MaxAttempts: 3,
+		ClaimedBy:   stringPtr("worker-a"),
+		ClaimedAt:   stringPtr(runningAt),
+		StartedAt:   stringPtr(runningAt),
+		CreatedAt:   nowISO,
+		UpdatedAt:   runningAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_requeued) error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	assertLoopStatus(t, services.Repositories, "loop_requeued", "queued")
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_requeued")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_requeued) error = %v", err)
+	}
+	if queue == nil {
+		t.Fatal("Queue.GetByID(queue_requeued) = nil, want recovered queue item")
+	}
+	if queue.Status != "queued" {
+		t.Fatalf("queue.Status = %q, want queued", queue.Status)
+	}
+	if queue.ClaimedBy != nil || queue.ClaimedAt != nil || queue.StartedAt != nil {
+		t.Fatalf("queue claim fields = %#v/%#v/%#v, want cleared", queue.ClaimedBy, queue.ClaimedAt, queue.StartedAt)
+	}
+
+	requeuedEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_requeued")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_requeued) error = %v", err)
+	}
+	if !containsEventType(requeuedEvents, "looperd.recovery.loop_requeued") {
+		t.Fatalf("loop_requeued events = %#v, want requeue event", requeuedEvents)
+	}
+}
+
 func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	t.Parallel()
 

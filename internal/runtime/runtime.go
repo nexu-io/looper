@@ -619,11 +619,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		if latestRun == nil {
-			continue
-		}
-
-		if latestRun.Status == "running" {
+		if latestRun != nil && latestRun.Status == "running" {
 			interrupted := *latestRun
 			interrupted.Status = "interrupted"
 			if interrupted.ErrorMessage == nil {
@@ -654,11 +650,13 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			eventsWritten += 1
 		}
 
-		if shouldRequeueLoop(loop, *latestRun) {
+		if shouldRequeueLoop(loop, latestRun) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
 			requeuedLoop.NextRunAt = stringPtr(nowISO)
-			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			if latestRun != nil {
+				requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			}
 			requeuedLoop.UpdatedAt = nowISO
 			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 				return RecoverySummary{}, err
@@ -1151,12 +1149,15 @@ func createEmptyRecoverySummary() RecoverySummary {
 	}
 }
 
-func shouldRequeueLoop(loop storage.LoopRecord, latestRun storage.RunRecord) bool {
+func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
 	if loop.Status == "paused" {
 		return false
 	}
 	if loop.Status == "completed" || loop.Status == "failed" {
 		return false
+	}
+	if latestRun == nil {
+		return loop.Status == "running"
 	}
 
 	return loop.Status == "running" || latestRun.Status == "interrupted"
