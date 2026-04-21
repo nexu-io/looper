@@ -1511,6 +1511,64 @@ func TestHandlerCreateLoopFixerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, triggered, 1)
 }
 
+func TestHandlerCreateLoopWorkerEnqueuesSchedulableManualLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		TriggerSchedulerTick: func() {
+			triggered++
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	resp := parseJSONMap(t, recorder.Body.Bytes())
+	data := resp["data"].(map[string]any)
+	loopID := data["id"].(string)
+	assertEqual(t, data["status"], "queued")
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop = %d, want 1", len(matched))
+	}
+	queue := matched[0]
+	assertEqual(t, queue.Type, "worker")
+	assertEqual(t, queue.Status, "queued")
+	assertEqual(t, queue.TargetType, "pull_request")
+	assertEqual(t, queue.TargetID, "pr:acme/looper:99")
+	assertEqual(t, queue.DedupeKey, "worker:project_1:acme/looper:99")
+	if queue.PayloadJSON == nil {
+		t.Fatal("queue.PayloadJSON = nil, want worker payload")
+	}
+	payload := parseJSONObject(queue.PayloadJSON)
+	assertEqual(t, payload["title"], "Implement worker loop")
+	assertEqual(t, payload["prompt"], "Do the thing")
+	assertEqual(t, payload["baseBranch"], "main")
+	assertEqual(t, triggered, 1)
+}
+
 func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)

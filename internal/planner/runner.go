@@ -1046,7 +1046,7 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
-	dedupeKey := buildPlannerDedupeKey(input.Repo, input.IssueNumber)
+	dedupeKey := buildPlannerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.IssueNumber)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
@@ -1285,8 +1285,8 @@ func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopR
 func buildIssueTargetID(repo string, issueNumber int64) string {
 	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 }
-func buildPlannerDedupeKey(repo string, issueNumber int64) string {
-	return fmt.Sprintf("planner:%s:%d", repo, issueNumber)
+func buildPlannerDedupeKey(projectID, loopID, repo string, issueNumber int64) string {
+	return fmt.Sprintf("planner:%s:%s:%s:%d", projectID, loopID, repo, issueNumber)
 }
 func buildIssueLockKey(repo string, issueNumber int64) string {
 	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)

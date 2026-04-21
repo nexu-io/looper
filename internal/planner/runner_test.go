@@ -30,8 +30,59 @@ func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Type != "planner" || queue.DedupeKey != "planner:acme/looper:42" {
+	if queue == nil || queue.Type != "planner" || queue.DedupeKey != "planner:project_1:"+result.CreatedLoopIDs[0]+":acme/looper:42" {
 		t.Fatalf("queue = %#v, want planner queue for issue 42", queue)
+	}
+}
+
+func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper"}`
+	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Looper Duplicate", RepoPath: filepath.Join(t.TempDir(), "repo-2"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	project1Loop, err := fixture.repos.Loops.GetByID(context.Background(), "missing")
+	if err != nil || project1Loop != nil {
+		t.Fatalf("Loops.GetByID(missing) = (%#v, %v), want (nil, nil)", project1Loop, err)
+	}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue(project_1) error = %v", err)
+	}
+	project1Queue := storage.QueueItemRecord{ID: "queue_existing", ProjectID: stringPtr("project_1"), LoopID: &loopResult.record.ID, Type: "planner", TargetType: "issue", TargetID: buildIssueTargetID("acme/looper", issue.Number), Repo: stringPtr("acme/looper"), DedupeKey: buildPlannerDedupeKey("project_1", loopResult.record.ID, "acme/looper", issue.Number), Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(buildIssueLockKey("acme/looper", issue.Number)), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), project1Queue); err != nil {
+		t.Fatalf("Queue.Upsert(existing) error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{issues: []IssueSummary{issue}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_2", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 {
+		t.Fatalf("result = %#v, want one queue item and one loop", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItems[0].ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil {
+		t.Fatal("Queue.GetByID() = nil, want created queue")
+	}
+	if queue.DedupeKey != "planner:project_2:"+result.CreatedLoopIDs[0]+":acme/looper:42" {
+		t.Fatalf("queue.DedupeKey = %q, want project-scoped dedupe key", queue.DedupeKey)
+	}
+	allQueueItems, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(allQueueItems) != 2 {
+		t.Fatalf("len(Queue.List()) = %d, want 2", len(allQueueItems))
 	}
 }
 

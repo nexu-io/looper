@@ -381,7 +381,7 @@
           "targetId": "project:project_1",
           "repo": null,
           "prNumber": null,
-          "status": "running",
+          "status": "queued",
           "configJson": null,
           "metadataJson": null,
           "lastRunAt": null,
