@@ -527,7 +527,7 @@ func splitProcessCommand(command string) []string {
 func (r *commandRuntime) readProcessCommand(ctx context.Context, pid int) (string, error) {
 	result, err := r.runCommand(ctx, "ps", []string{"-p", fmt.Sprintf("%d", pid), "-o", "command="}, daemonCommandTimeout)
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("inspect process %d with ps: %w", pid, err)
 	}
 	if result.ExitCode != 0 {
 		return "", nil

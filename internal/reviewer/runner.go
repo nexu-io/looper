@@ -558,6 +558,28 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
 	claimedLockKey := ""
+	acquiredClaimedLock := false
+	if resumedRun.Resumed && resumedRun.StartStep != stepClaim {
+		claimedLockKey = checkpoint.ClaimedLockKey
+		if claimedLockKey == "" {
+			claimedLockKey = derefString(queueItem.LockKey)
+			if claimedLockKey == "" {
+				claimedLockKey = buildPullRequestLockKey(queueItem)
+			}
+		}
+		if claimedLockKey != "" {
+			nowISO := r.nowISO()
+			reason := "reviewer-run-resume"
+			acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: queueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
+			if err != nil {
+				return ProcessResult{}, err
+			}
+			if !acquired {
+				return ProcessResult{}, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", claimedLockKey), kind: FailureRetryableTransient}
+			}
+			acquiredClaimedLock = true
+		}
+	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -569,7 +591,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
 	defer func() {
-		if claimedLockKey != "" {
+		if (acquiredClaimedLock || claimedLockKey != "") && claimedLockKey != "" {
 			if err := r.repos.Locks.Release(context.Background(), claimedLockKey); err != nil {
 				r.logWarn("reviewer business lock release failed", map[string]any{"lockKey": claimedLockKey, "error": err.Error()})
 			}
@@ -628,6 +650,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if step == stepClaim {
 			claimedLockKey = checkpoint.ClaimedLockKey
+			acquiredClaimedLock = claimedLockKey != ""
 		}
 		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
 		if err != nil {

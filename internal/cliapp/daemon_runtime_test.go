@@ -299,6 +299,75 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 	}
 }
 
+func TestDaemonStartReturnsProcessInspectionFailureForExistingPID(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	spawned := false
+	removed := false
+
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			if path == pidFilePath {
+				return []byte("1234\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.5.0\n", ExitCode: 0}, nil
+			}
+			if command == "ps" && len(args) >= 2 && args[1] == "1234" {
+				return commandExecutionResult{}, context.DeadlineExceeded
+			}
+			return commandExecutionResult{ExitCode: 1}, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid == 1234 && signal == 0 {
+				return nil
+			}
+			return nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			_ = cwd
+			_ = env
+			spawned = true
+			return 4321, nil
+		},
+		RemoveFile: func(path string) error {
+			if path == pidFilePath {
+				removed = true
+			}
+			return nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start"})
+	if exitCode == 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "inspect process 1234 with ps") {
+		t.Fatalf("stderr = %q, want process inspection failure", stderr.String())
+	}
+	if spawned {
+		t.Fatal("SpawnDetached() called, want existing daemon start aborted")
+	}
+	if removed {
+		t.Fatal("RemoveFile() called, want pid file preserved on ps failure")
+	}
+}
+
 func TestIsLooperdProcessAcceptsQuotedExecutablePathWithSpaces(t *testing.T) {
 	t.Parallel()
 

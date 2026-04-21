@@ -171,6 +171,59 @@ func TestProcessClaimedItemRetriesPublishFromCheckpointWithoutRerunningReview(t 
 	}
 }
 
+func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.repos.Locks.SetNow(fixture.now)
+	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim1, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim1 == nil {
+		t.Fatalf("first ClaimNextOfType() = (%#v, %v), want claimed item", claim1, err)
+	}
+	first, err := runner.ProcessClaimedItem(context.Background(), *claim1)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable-after-resume publish failure", first)
+	}
+	fixture.advance(5 * time.Second)
+	claim2, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim2 == nil {
+		t.Fatalf("retry ClaimNextOfType() = (%#v, %v), want claimed item", claim2, err)
+	}
+	lockKey := buildPullRequestLockKey(*claim2)
+	if acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "other-reviewer", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	} else if !acquired {
+		t.Fatal("Locks.Acquire() = false, want competing lock holder")
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim2)
+	if err == nil || !contains(err.Error(), lockKey) {
+		t.Fatalf("ProcessClaimedItem(retry) error = %v, want lock reacquire failure", err)
+	}
+	if result != (ProcessResult{}) {
+		t.Fatalf("result = %#v, want zero result on resume lock failure", result)
+	}
+	if len(github.submitCalls) != 1 {
+		t.Fatalf("len(github.submitCalls) = %d, want 1 (resume should stop before publish)", len(github.submitCalls))
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim2.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "running" {
+		t.Fatalf("queue = %#v, want still-running claimed item after setup failure", queue)
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
