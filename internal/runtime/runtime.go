@@ -16,6 +16,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/domain"
 	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/loops"
@@ -667,6 +668,11 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if err != nil {
 				return RecoverySummary{}, err
 			}
+			if recoveredQueueItems == 0 {
+				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+					return RecoverySummary{}, err
+				}
+			}
 			summary.LoopsRequeued += 1
 			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 				ID:         newRuntimeEventID(),
@@ -809,6 +815,188 @@ func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.
 func defaultSyncConfiguredProjects(ctx context.Context, repositories *storage.Repositories, cfg config.Config, now time.Time) error {
 	service := &projects.Service{Repos: repositories, Now: func() time.Time { return now }}
 	return service.SyncConfigured(ctx, cfg, now)
+}
+
+func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {
+	activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue != nil {
+		return nil
+	}
+
+	latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if latestQueue != nil {
+		if latestQueue.Status == "queued" || latestQueue.Status == "running" {
+			return nil
+		}
+		if latestQueue.DedupeKey != "" {
+			activeByDedupe, err := repositories.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
+			if err != nil {
+				return err
+			}
+			if activeByDedupe != nil {
+				return nil
+			}
+		}
+
+		replacement := *latestQueue
+		replacement.ID = newRuntimeEventID()
+		replacement.Status = "queued"
+		replacement.AvailableAt = nowISO
+		replacement.Attempts = 0
+		replacement.ClaimedBy = nil
+		replacement.ClaimedAt = nil
+		replacement.StartedAt = nil
+		replacement.FinishedAt = nil
+		replacement.LastError = nil
+		replacement.LastErrorKind = nil
+		replacement.CreatedAt = nowISO
+		replacement.UpdatedAt = nowISO
+		return repositories.Queue.Upsert(ctx, replacement)
+	}
+
+	queueRecord, ok, err := buildRecoveryQueueItem(loop, nowISO, maxAttempts)
+	if err != nil || !ok {
+		return err
+	}
+	return repositories.Queue.Upsert(ctx, queueRecord)
+}
+
+func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {
+	queueType := domain.LoopType(loop.Type)
+	if queueType != domain.LoopTypePlanner && queueType != domain.LoopTypeReviewer && queueType != domain.LoopTypeFixer && queueType != domain.LoopTypeWorker {
+		return storage.QueueItemRecord{}, false, nil
+	}
+
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	queueRecord := storage.QueueItemRecord{
+		ID:          newRuntimeEventID(),
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        loop.Type,
+		TargetType:  loop.TargetType,
+		TargetID:    strings.TrimSpace(derefString(loop.TargetID)),
+		Repo:        loop.Repo,
+		PRNumber:    loop.PRNumber,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		Attempts:    0,
+		MaxAttempts: maxAttempts,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}
+
+	switch queueType {
+	case domain.LoopTypePlanner:
+		repo := strings.TrimSpace(derefString(loop.Repo))
+		issueNumber, err := parseIssueNumberFromTargetID(queueRecord.TargetID)
+		if err != nil || repo == "" || loop.TargetType != string(domain.LoopTargetTypeIssue) {
+			if err == nil {
+				err = fmt.Errorf("planner loop requires repo and issue target")
+			}
+			return storage.QueueItemRecord{}, false, err
+		}
+		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		payloadJSON := fmt.Sprintf(`{"issueNumber":%d}`, issueNumber)
+		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
+		queueRecord.TargetID = lockKey
+		queueRecord.Repo = &repo
+		queueRecord.PRNumber = nil
+		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, issueNumber)
+		queueRecord.Priority = storage.QueuePriorityPlanner
+		queueRecord.LockKey = &lockKey
+		queueRecord.PayloadJSON = &payloadJSON
+	case domain.LoopTypeReviewer:
+		repo := strings.TrimSpace(derefString(loop.Repo))
+		if repo == "" || loop.PRNumber == nil || loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+			return storage.QueueItemRecord{}, false, fmt.Errorf("reviewer loop requires repo and pull request target")
+		}
+		prNumber := *loop.PRNumber
+		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
+		queueRecord.TargetID = lockKey
+		queueRecord.Repo = &repo
+		queueRecord.PRNumber = &prNumber
+		queueRecord.DedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, prNumber)
+		queueRecord.Priority = storage.QueuePriorityReviewer
+		queueRecord.LockKey = &lockKey
+	case domain.LoopTypeFixer:
+		repo := strings.TrimSpace(derefString(loop.Repo))
+		if repo == "" || loop.PRNumber == nil || loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+			return storage.QueueItemRecord{}, false, fmt.Errorf("fixer loop requires repo and pull request target")
+		}
+		prNumber := *loop.PRNumber
+		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
+		queueRecord.TargetID = lockKey
+		queueRecord.Repo = &repo
+		queueRecord.PRNumber = &prNumber
+		queueRecord.DedupeKey = fmt.Sprintf("fixer:%s", loop.ID)
+		queueRecord.Priority = storage.QueuePriorityFixer
+		queueRecord.LockKey = &lockKey
+	case domain.LoopTypeWorker:
+		payloadJSON := buildRecoveryWorkerPayloadJSON(loop.MetadataJSON)
+		if payloadJSON != nil {
+			queueRecord.PayloadJSON = payloadJSON
+		}
+		queueRecord.Priority = storage.QueuePriorityWorker
+		lockKey := fmt.Sprintf("worker:%s", loop.ID)
+		queueRecord.DedupeKey = fmt.Sprintf("worker:%s", loop.ID)
+		if loop.TargetType == string(domain.LoopTargetTypePullRequest) {
+			repo := strings.TrimSpace(derefString(loop.Repo))
+			if repo == "" || loop.PRNumber == nil {
+				return storage.QueueItemRecord{}, false, fmt.Errorf("worker loop requires repo and prNumber")
+			}
+			prNumber := *loop.PRNumber
+			lockKey = fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
+			queueRecord.TargetID = lockKey
+			queueRecord.Repo = &repo
+			queueRecord.PRNumber = &prNumber
+			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, prNumber)
+		}
+		queueRecord.LockKey = &lockKey
+	}
+
+	return queueRecord, true, nil
+}
+
+func buildRecoveryWorkerPayloadJSON(metadataJSON *string) *string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return nil
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return nil
+	}
+	workerMeta, ok := metadata["worker"].(map[string]any)
+	if !ok || len(workerMeta) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(workerMeta)
+	if err != nil {
+		return nil
+	}
+	text := string(encoded)
+	return &text
+}
+
+func parseIssueNumberFromTargetID(targetID string) (int64, error) {
+	parts := strings.Split(strings.TrimSpace(targetID), ":")
+	if len(parts) != 3 || parts[0] != "issue" {
+		return 0, fmt.Errorf("invalid issue target id %q", targetID)
+	}
+	var issueNumber int64
+	if _, err := fmt.Sscanf(parts[2], "%d", &issueNumber); err != nil || issueNumber <= 0 {
+		return 0, fmt.Errorf("invalid issue target id %q", targetID)
+	}
+	return issueNumber, nil
 }
 
 func formatJavaScriptISOString(value time.Time) string {

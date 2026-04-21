@@ -1543,6 +1543,60 @@ func TestHandlerWorkerCreateRejectsRepoMismatchForExplicitProject(t *testing.T) 
 	}
 }
 
+func TestHandlerCreateLoopRejectsPullRequestRepoMismatchForExplicitProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"other/repo","prNumber":42}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "PULL_REQUEST_PROJECT_MISMATCH")
+	assertEqual(t, errMap["message"], "Pull request other/repo#42 does not belong to project project_1")
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 0 {
+		t.Fatalf("Queue.List() = %#v, want no enqueued loop", queueItems)
+	}
+}
+
+func TestHandlerCreateLoopRejectsIssueRepoMismatchForExplicitProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"planner","targetType":"issue","repo":"other/repo","issueNumber":77}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
+	assertEqual(t, errMap["message"], "project project_1 is configured for repo acme/looper, not other/repo")
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 0 {
+		t.Fatalf("Queue.List() = %#v, want no enqueued loop", queueItems)
+	}
+}
+
 func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

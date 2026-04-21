@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -453,6 +454,126 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 	}
 	if containsEventType(requeuedEvents, "looperd.recovery.loop_queue_normalized") {
 		t.Fatalf("loop_requeued events = %#v, want no normalization event", requeuedEvents)
+	}
+}
+
+func TestRuntimeRecoveryRebuildsMissingQueueItemForRequeuedLoop(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "main"
+	projectID := "project_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:         projectID,
+		Name:       "Looper",
+		RepoPath:   filepath.Join(workingDir, "repo"),
+		BaseBranch: &baseBranch,
+		Archived:   false,
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	prNumber := int64(99)
+	metadata := `{"worker":{"title":"Repair queue","prompt":"Rebuild queue item","repo":"acme/looper","baseBranch":"main"}}`
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_requeued",
+		Seq:          1,
+		ProjectID:    projectID,
+		Type:         "worker",
+		TargetType:   "pull_request",
+		TargetID:     stringPtr("pr:acme/looper:99"),
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &prNumber,
+		Status:       "running",
+		MetadataJSON: &metadata,
+		NextRunAt:    stringPtr(nowISO),
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_requeued) error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:        "run_requeued",
+		LoopID:    "loop_requeued",
+		Status:    "running",
+		StartedAt: nowISO,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_requeued) error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	assertLoopStatus(t, services.Repositories, "loop_requeued", "queued")
+	queueItems, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == "loop_requeued" {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop_requeued = %#v, want 1 rebuilt queue item", matched)
+	}
+	queue := matched[0]
+	if queue.Status != "queued" {
+		t.Fatalf("queue.Status = %q, want queued", queue.Status)
+	}
+	if queue.TargetID != "pr:acme/looper:99" {
+		t.Fatalf("queue.TargetID = %q, want pr:acme/looper:99", queue.TargetID)
+	}
+	if queue.DedupeKey != "worker:project_1:acme/looper:99" {
+		t.Fatalf("queue.DedupeKey = %q, want worker:project_1:acme/looper:99", queue.DedupeKey)
+	}
+	if queue.PayloadJSON == nil {
+		t.Fatal("queue.PayloadJSON = nil, want rebuilt worker payload")
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal([]byte(*queue.PayloadJSON), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(queue.PayloadJSON) error = %v", err)
+	}
+	if payload["title"] != "Repair queue" {
+		t.Fatalf("payload title = %#v, want Repair queue", payload["title"])
+	}
+
+	requeuedEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_requeued")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_requeued) error = %v", err)
+	}
+	if !containsEventType(requeuedEvents, "looperd.recovery.loop_requeued") {
+		t.Fatalf("loop_requeued events = %#v, want requeue event", requeuedEvents)
 	}
 }
 
@@ -1033,6 +1154,7 @@ func openMigratedCoordinator(t *testing.T, dbPath, backupDir string) *storage.SQ
 
 func seedLoopWithRun(t *testing.T, repos *storage.Repositories, projectID, loopID string, seq int64, loopStatus, runStatus, nowISO string) {
 	t.Helper()
+	prNumber := int64(99)
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
 		ID:         loopID,
 		Seq:        seq,
@@ -1040,6 +1162,8 @@ func seedLoopWithRun(t *testing.T, repos *storage.Repositories, projectID, loopI
 		Type:       "worker",
 		TargetType: "pull_request",
 		TargetID:   stringPtr("pr:acme/looper:99"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   &prNumber,
 		Status:     loopStatus,
 		NextRunAt:  stringPtr(nowISO),
 		CreatedAt:  nowISO,

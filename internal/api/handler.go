@@ -2121,6 +2121,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		if project == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", projectID)}
 		}
+		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+			return storage.LoopRecord{}, err
+		}
 
 		existing, err := transactionRepos.Loops.List(r.Context())
 		if err != nil {
@@ -3461,6 +3464,24 @@ func parseProjectMetadata(metadataJSON *string) map[string]any {
 	}
 
 	return metadata
+}
+
+func validateLoopTargetProjectCompatibility(projectID string, projectMetadata map[string]any, target domain.LoopTarget) error {
+	configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(projectMetadata, "repo")))
+	if configuredRepo == "" {
+		return nil
+	}
+
+	targetRepo := strings.TrimSpace(target.Repo)
+	if targetRepo == "" || configuredRepo == targetRepo {
+		return nil
+	}
+
+	if target.TargetType == domain.LoopTargetTypePullRequest && target.PRNumber > 0 {
+		return apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", targetRepo, target.PRNumber, projectID)}
+	}
+
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", projectID, configuredRepo, targetRepo)}
 }
 
 func stringMetadataPtr(metadata map[string]any, key string) *string {
