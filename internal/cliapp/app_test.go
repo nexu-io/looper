@@ -375,6 +375,41 @@ func TestPSWithoutJSONPrintsEmptyMessage(t *testing.T) {
 	}
 }
 
+func TestPSWithoutJSONShowsRunningLoopWithoutRunRow(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{{
+			"seq":         42,
+			"type":        "reviewer",
+			"status":      "running",
+			"currentStep": "review",
+			"target":      map[string]any{"label": "acme/looper#123"},
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if strings.Contains(stdout, "No running or queued loops.") {
+		t.Fatalf("Run([ps]) stdout = %q, did not expect empty-state message", stdout)
+	}
+	for _, want := range []string{"reviewer", "acme/looper#123", "running"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([ps]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	t.Parallel()
 

@@ -1108,6 +1108,61 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	}
 }
 
+func TestHandlerCreateLoopReviewerEnqueuesSchedulableManualLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"manual":true,"followUpdates":false}}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	resp := parseJSONMap(t, recorder.Body.Bytes())
+	data := resp["data"].(map[string]any)
+	loopID := data["id"].(string)
+	assertEqual(t, data["status"], "queued")
+
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("Loops.GetByID() = nil, want created loop")
+	}
+	if loop.MetadataJSON == nil {
+		t.Fatal("loop.MetadataJSON = nil, want manual metadata")
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, metadata["manual"], true)
+	assertEqual(t, metadata["followUpdates"], false)
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop = %d, want 1", len(matched))
+	}
+	queue := matched[0]
+	assertEqual(t, queue.Type, "reviewer")
+	assertEqual(t, queue.Status, "queued")
+	assertEqual(t, queue.TargetType, "pull_request")
+	assertEqual(t, queue.TargetID, "pr:acme/looper:99")
+	assertEqual(t, queue.DedupeKey, "reviewer:acme/looper:99")
+}
+
 func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)
@@ -1555,6 +1610,60 @@ func TestServerServesStatusEndpoint(t *testing.T) {
 	if _, err := io.ReadAll(response.Body); err != nil {
 		t.Fatalf("ReadAll(response.Body) error = %v", err)
 	}
+}
+
+func TestActiveRunsIncludesRunningLoopWithoutRun(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_reviewer_running_only",
+		Seq:        7,
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:43"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(43),
+		Status:     "running",
+		LastRunAt:  stringPtr(nowISO),
+		NextRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], "loop_reviewer_running_only")
+	assertEqual(t, item["runId"], nil)
+	assertEqual(t, item["type"], "reviewer")
+	assertEqual(t, item["status"], "running")
+	target := item["target"].(map[string]any)
+	assertEqual(t, target["label"], "acme/looper#43")
 }
 
 type testFixture struct {

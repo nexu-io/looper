@@ -1569,7 +1569,7 @@ func (h *Handler) buildActiveRunsResponse(r *http.Request) (activeRunsListRespon
 		return activeRunsListResponse{}, err
 	}
 
-	items, err := h.buildActiveRunViews(r.Context())
+	items, err := h.buildActiveRunViews(r.Context(), true)
 	if err != nil {
 		return activeRunsListResponse{}, err
 	}
@@ -1621,7 +1621,7 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 }
 
 func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID string) (activeRunView, error) {
-	items, err := h.buildActiveRunViews(ctx)
+	items, err := h.buildActiveRunViews(ctx, false)
 	if err != nil {
 		return activeRunView{}, err
 	}
@@ -1633,7 +1633,7 @@ func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID strin
 	return activeRunView{}, apiError{code: pkgapi.ErrorCodeActiveRunNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Active run not found for loop: %s", loopID)}
 }
 
-func (h *Handler) buildActiveRunViews(ctx context.Context) ([]activeRunView, error) {
+func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWithoutRuns bool) ([]activeRunView, error) {
 	services := h.context.Runtime.Services()
 	if services.Repositories == nil || services.Repositories.Runs == nil || services.Repositories.Loops == nil || services.Repositories.Queue == nil || services.Repositories.AgentExecutions == nil || services.Repositories.Projects == nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
@@ -1674,6 +1674,24 @@ func (h *Handler) buildActiveRunViews(ctx context.Context) ([]activeRunView, err
 			if _, ok := queuedLoopIDs[loop.ID]; ok {
 				queuedLoops = append(queuedLoops, loop)
 			}
+		}
+	}
+
+	runningLoopsWithoutRuns := make([]storage.LoopRecord, 0)
+	if includeRunningLoopsWithoutRuns {
+		runningLoopIDs := make(map[string]struct{}, len(activeRuns))
+		for _, run := range activeRuns {
+			runningLoopIDs[run.LoopID] = struct{}{}
+		}
+
+		for _, loop := range loopsList {
+			if loop.Status != string(domain.LoopStatusRunning) {
+				continue
+			}
+			if _, ok := runningLoopIDs[loop.ID]; ok {
+				continue
+			}
+			runningLoopsWithoutRuns = append(runningLoopsWithoutRuns, loop)
 		}
 	}
 
@@ -1732,7 +1750,33 @@ func (h *Handler) buildActiveRunViews(ctx context.Context) ([]activeRunView, err
 		})
 	}
 
-	items := append(runningViews, queuedViews...)
+	runningLoopViews := make([]activeRunView, 0, len(runningLoopsWithoutRuns))
+	for _, loop := range runningLoopsWithoutRuns {
+		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+		runningLoopViews = append(runningLoopViews, activeRunView{
+			Seq:         loop.Seq,
+			RunID:       nil,
+			LoopID:      loop.ID,
+			ProjectID:   loop.ProjectID,
+			Type:        loop.Type,
+			Status:      loop.Status,
+			CurrentStep: nil,
+			StartedAt:   startedAt,
+			Target:      target,
+			Agent:       nil,
+			Worktree:    nil,
+		})
+	}
+
+	items := append(runningViews, runningLoopViews...)
+	items = append(items, queuedViews...)
 	sort.Slice(items, func(i, j int) bool {
 		return compareActiveRunViews(items[i], items[j]) < 0
 	})
@@ -2102,12 +2146,60 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
+		if domain.LoopType(loopType) == domain.LoopTypeReviewer && candidateStatus == domain.LoopStatusRunning {
+			record.Status = string(domain.LoopStatusQueued)
+			candidateStatus = domain.LoopStatusQueued
+		}
 		if candidateStatus == domain.LoopStatusRunning {
+			record.NextRunAt = &nowISO
+		} else if candidateStatus == domain.LoopStatusQueued {
 			record.NextRunAt = &nowISO
 		}
 
 		if err := transactionRepos.Loops.Upsert(r.Context(), record); err != nil {
 			return storage.LoopRecord{}, err
+		}
+
+		if domain.LoopType(loopType) == domain.LoopTypeReviewer && candidateStatus == domain.LoopStatusQueued {
+			repo := strings.TrimSpace(derefString(record.Repo))
+			if repo == "" || record.PRNumber == nil {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewer loop requires repo and prNumber"}
+			}
+
+			prNumber := *record.PRNumber
+			dedupeKey := fmt.Sprintf("reviewer:%s:%d", repo, prNumber)
+			existingQueue, findErr := transactionRepos.Queue.FindActiveByDedupe(r.Context(), dedupeKey)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if existingQueue == nil {
+				projectIDCopy := record.ProjectID
+				loopID := record.ID
+				targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+				lockKey := targetID
+				queueRecord := storage.QueueItemRecord{
+					ID:          generateRequestID(),
+					ProjectID:   &projectIDCopy,
+					LoopID:      &loopID,
+					Type:        string(domain.LoopTypeReviewer),
+					TargetType:  string(domain.LoopTargetTypePullRequest),
+					TargetID:    targetID,
+					Repo:        &repo,
+					PRNumber:    &prNumber,
+					DedupeKey:   dedupeKey,
+					Priority:    2,
+					Status:      "queued",
+					AvailableAt: nowISO,
+					Attempts:    0,
+					MaxAttempts: int64(h.context.Config.Scheduler.RetryMaxAttempts),
+					LockKey:     &lockKey,
+					CreatedAt:   nowISO,
+					UpdatedAt:   nowISO,
+				}
+				if upsertQueueErr := transactionRepos.Queue.Upsert(r.Context(), queueRecord); upsertQueueErr != nil {
+					return storage.LoopRecord{}, upsertQueueErr
+				}
+			}
 		}
 
 		return record, nil
