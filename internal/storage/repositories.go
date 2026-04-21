@@ -839,6 +839,15 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	return scanQueueItems(rows)
 }
 
+func (r *QueueRepository) CountByStatus(ctx context.Context, status string) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE status = ?`, status)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count queue items by status: %w", err)
+	}
+	return count, nil
+}
+
 func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
 		SELECT * FROM queue_items

@@ -1,0 +1,726 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/powerformer/looper/internal/agent"
+	"github.com/powerformer/looper/internal/bootstrap"
+	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/fixer"
+	gitinfra "github.com/powerformer/looper/internal/infra/git"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
+	"github.com/powerformer/looper/internal/infra/notify"
+	"github.com/powerformer/looper/internal/planner"
+	"github.com/powerformer/looper/internal/reviewer"
+	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/worker"
+)
+
+type plannerScheduler interface {
+	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
+	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
+}
+
+type reviewerScheduler interface {
+	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
+	ProcessNext(context.Context, string) (*reviewer.ProcessResult, error)
+}
+
+type fixerScheduler interface {
+	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
+	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
+}
+
+type workerScheduler interface {
+	ProcessNext(context.Context, string) (*worker.ProcessResult, error)
+}
+
+type defaultSchedulerTickInput struct {
+	Repos             *storage.Repositories
+	Logger            bootstrap.Logger
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	Planner           plannerScheduler
+	Reviewer          reviewerScheduler
+	Fixer             fixerScheduler
+	Worker            workerScheduler
+}
+
+type agentExecutionNotificationInput struct {
+	ExecutionID string
+	ProjectID   string
+	LoopID      string
+	RunID       string
+	Title       string
+	Subtitle    string
+	Body        string
+	DedupeKey   string
+}
+
+type plannerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+
+func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
+	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]planner.IssueSummary, 0, len(issues))
+	for _, issue := range issues {
+		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+	}
+	return result, nil
+}
+
+func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
+	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return planner.IssueDetail{}, err
+	}
+	return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels}, nil
+}
+
+func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
+func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
+	if err != nil {
+		return planner.CreatePullRequestResult{}, err
+	}
+	return planner.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input planner.PullRequestLabelsInput) error {
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
+	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
+}
+
+type plannerGitAdapter struct{ gateway *gitinfra.Gateway }
+
+func (a plannerGitAdapter) CreateWorktree(ctx context.Context, input planner.CreateWorktreeInput) (planner.CreateWorktreeResult, error) {
+	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, ProtectedBranches: input.ProtectedBranches})
+	if err != nil {
+		return planner.CreateWorktreeResult{}, err
+	}
+	return planner.CreateWorktreeResult{ID: worktree.ID, WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, BaseBranch: derefString(worktree.BaseBranch)}, nil
+}
+
+func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) error {
+	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+}
+
+type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type plannerAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return plannerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return planner.AgentResult{}, err
+	}
+	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: result.Commits}, nil
+}
+
+type reviewerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+
+func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+	for _, pr := range pullRequests {
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, Author: pr.Author, ReviewRequests: pr.ReviewRequests})
+	}
+	return result, nil
+}
+
+func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
+func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
+	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments}, nil
+}
+
+func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, input reviewer.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+}
+
+func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input reviewer.SubmitReviewInput) error {
+	comments := make([]githubinfra.ReviewComment, 0, len(input.Comments))
+	for _, comment := range input.Comments {
+		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+	}
+	return a.gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(input.Event), Body: input.Body, CommitID: input.CommitID, Comments: comments, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) AddPullRequestComment(ctx context.Context, input reviewer.PullRequestCommentInput) error {
+	return a.gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: input.Body, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return reviewerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return reviewer.AgentResult{}, err
+	}
+	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus}, nil
+}
+
+type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+
+func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
+	for _, pr := range pullRequests {
+		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, HeadSHA: pr.HeadSHA})
+	}
+	return result, nil
+}
+
+func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
+	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, Checks: detail.Checks, HasConflicts: detail.HasConflicts}, nil
+}
+
+func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
+	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+type fixerGitAdapter struct{ gateway *gitinfra.Gateway }
+
+func (a fixerGitAdapter) CreateWorktree(ctx context.Context, input fixer.CreateWorktreeInput) (fixer.CreateWorktreeResult, error) {
+	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
+	if err != nil {
+		return fixer.CreateWorktreeResult{}, err
+	}
+	return fixer.CreateWorktreeResult{WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, HeadSHA: derefString(worktree.HeadSHA)}, nil
+}
+
+func (a fixerGitAdapter) PrepareWorktree(ctx context.Context, input fixer.PrepareWorktreeInput) (fixer.PrepareWorktreeResult, error) {
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	if err != nil {
+		return fixer.PrepareWorktreeResult{}, err
+	}
+	return fixer.PrepareWorktreeResult{HeadSHA: result.HeadSHA, Clean: result.Clean}, nil
+}
+
+func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHeadInput) (fixer.InspectHeadResult, error) {
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	if err != nil {
+		return fixer.InspectHeadResult{}, err
+	}
+	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+}
+
+func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	if err != nil {
+		return fixer.CommitResult{}, err
+	}
+	return fixer.CommitResult{CommitSHA: result.CommitSHA}, nil
+}
+
+func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
+	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+}
+
+func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.CleanupWorktreeInput) error {
+	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+}
+
+type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type fixerAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return fixerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return fixer.AgentResult{}, err
+	}
+	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus}, nil
+}
+
+type workerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+
+func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]worker.PullRequestSummary, 0, len(pullRequests))
+	for _, pr := range pullRequests {
+		result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName})
+	}
+	return result, nil
+}
+
+func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
+	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.PullRequestDetail{}, err
+	}
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, ReviewRequests: detail.ReviewRequests}, nil
+}
+
+func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
+	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.IssueDetail{}, err
+	}
+	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL}, nil
+}
+
+func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
+	if err != nil {
+		return worker.CreatePullRequestResult{}, err
+	}
+	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
+	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
+}
+
+type workerGitAdapter struct{ gateway *gitinfra.Gateway }
+
+func (a workerGitAdapter) CreateWorktree(ctx context.Context, input worker.CreateWorktreeInput) (worker.CreateWorktreeResult, error) {
+	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
+	if err != nil {
+		return worker.CreateWorktreeResult{}, err
+	}
+	return worker.CreateWorktreeResult{WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, BaseBranch: derefString(worktree.BaseBranch), HeadSHA: derefString(worktree.HeadSHA), WorktreeID: worktree.ID}, nil
+}
+
+func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	if err != nil {
+		return worker.PrepareWorktreeResult{}, err
+	}
+	return worker.PrepareWorktreeResult{HeadSHA: result.HeadSHA, Clean: result.Clean}, nil
+}
+
+func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
+	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+}
+
+type workerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type workerAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return workerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return worker.AgentResult{}, err
+	}
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
+}
+
+func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, now func() time.Time) RunSchedulerTickFunc {
+	if now == nil {
+		now = time.Now
+	}
+	if repos == nil || coordinator == nil {
+		return func(context.Context, Services) error {
+			return fmt.Errorf("default scheduler dependencies are not configured")
+		}
+	}
+	if cfg.Agent.Vendor == nil {
+		return func(context.Context, Services) error { return nil }
+	}
+	notificationGateway := notify.NewGateway(notify.Options{
+		Config:        cfg.Notifications,
+		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		Repositories:  repos,
+		Now:           now,
+	})
+	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
+		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
+			ID:         input.ExecutionID,
+			ProjectID:  input.ProjectID,
+			LoopID:     input.LoopID,
+			RunID:      input.RunID,
+			Level:      "info",
+			Title:      input.Title,
+			Subtitle:   input.Subtitle,
+			Body:       input.Body,
+			EntityType: "agent_execution",
+			EntityID:   input.ExecutionID,
+			DedupeKey:  input.DedupeKey,
+		})
+		return nil
+	}
+
+	var plannerRunner plannerScheduler
+	var reviewerRunner reviewerScheduler
+	var fixerRunner fixerScheduler
+	var workerRunner workerScheduler
+
+	agentExecutor := agent.New(agent.ExecutorOptions{
+		Config: agent.ExecutorConfig{
+			Vendor: *cfg.Agent.Vendor,
+			Model:  cfg.Agent.Model,
+			Params: cfg.Agent.Params,
+			Env:    cfg.Agent.Env,
+		},
+		Repos: repos,
+		Now:   now,
+	})
+	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	plannerRunner = planner.New(planner.Options{
+		DB:               coordinator.DB(),
+		Repos:            repos,
+		GitHub:           plannerGitHubAdapter{gateway: githubGateway},
+		Git:              plannerGitAdapter{gateway: gitGateway},
+		AgentExecutor:    plannerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:           logger,
+		Now:              now,
+		AllowAutoPush:    boolPtr(cfg.Defaults.AllowAutoPush),
+		RetryBaseDelay:   retryBaseDelay,
+		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
+			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+		},
+	})
+	reviewerRunner = reviewer.New(reviewer.Options{
+		DB:               coordinator.DB(),
+		Repos:            repos,
+		GitHub:           reviewerGitHubAdapter{gateway: githubGateway},
+		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:           logger,
+		Now:              now,
+		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+		RetryBaseDelay:   retryBaseDelay,
+		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
+			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+		},
+	})
+	fixerRunner = fixer.New(fixer.Options{
+		DB:               coordinator.DB(),
+		Repos:            repos,
+		GitHub:           fixerGitHubAdapter{gateway: githubGateway},
+		Git:              fixerGitAdapter{gateway: gitGateway},
+		AgentExecutor:    fixerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:           logger,
+		Now:              now,
+		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,
+		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
+		AllowRiskyFixes:  cfg.Defaults.AllowRiskyFixes,
+		RetryBaseDelay:   retryBaseDelay,
+		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
+			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+		},
+	})
+	workerRunner = worker.New(worker.Options{
+		DB:               coordinator.DB(),
+		Repos:            repos,
+		GitHub:           workerGitHubAdapter{gateway: githubGateway},
+		Git:              workerGitAdapter{gateway: gitGateway},
+		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:           logger,
+		Now:              now,
+		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,
+		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
+		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
+		RetryBaseDelay:   retryBaseDelay,
+		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		OnAgentExecutionStarted: func(ctx context.Context, input worker.AgentExecutionStartedInput) error {
+			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Worker", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+		},
+	})
+
+	return func(ctx context.Context, services Services) error {
+		return runDefaultSchedulerTick(ctx, defaultSchedulerTickInput{
+			Repos:             services.Repositories,
+			Logger:            logger,
+			Now:               now,
+			MaxConcurrentRuns: cfg.Scheduler.MaxConcurrentRuns,
+			Planner:           plannerRunner,
+			Reviewer:          reviewerRunner,
+			Fixer:             fixerRunner,
+			Worker:            workerRunner,
+		})
+	}
+}
+
+func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) error {
+	if input.Repos == nil || input.Repos.Projects == nil {
+		return nil
+	}
+
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	errs := make([]error, 0)
+	appendErr := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	projectsList, err := input.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projectsList {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if project.Archived {
+			continue
+		}
+		repo := repoFromProjectMetadata(project.MetadataJSON)
+		if repo == "" {
+			if input.Logger != nil {
+				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
+			}
+			continue
+		}
+		if input.Planner != nil {
+			_, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("planner discovery", project.ID, repo, err))
+		}
+		if input.Reviewer != nil {
+			_, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("reviewer discovery", project.ID, repo, err))
+		}
+		if input.Fixer != nil {
+			_, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("fixer discovery", project.ID, repo, err))
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+	if err != nil {
+		appendErr(err)
+		availableSlots = 0
+	}
+	if availableSlots > 0 && input.Repos.Queue != nil {
+		nowISO := formatJavaScriptISOString(now().UTC())
+		queueItems, err := input.Repos.Queue.ListScheduled(ctx, nowISO, int64(availableSlots))
+		if err != nil {
+			appendErr(err)
+		} else {
+			appendErr(runScheduledQueueItems(ctx, queueItems, input))
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, maxConcurrentRuns int) (int, error) {
+	if repos == nil || repos.Queue == nil {
+		return 0, nil
+	}
+	if maxConcurrentRuns <= 0 {
+		return 0, nil
+	}
+	runningCount, err := repos.Queue.CountByStatus(ctx, "running")
+	if err != nil {
+		return 0, err
+	}
+	available := maxConcurrentRuns - int(runningCount)
+	if available < 0 {
+		return 0, nil
+	}
+	return available, nil
+}
+
+func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
+	if len(queueItems) == 0 {
+		return nil
+	}
+
+	errs := make([]error, 0)
+	for _, item := range queueItems {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
+		switch item.Type {
+		case "planner":
+			if input.Planner == nil {
+				errs = append(errs, fmt.Errorf("planner runner is not configured"))
+				continue
+			}
+			_, err := input.Planner.ProcessNext(ctx, claimedBy)
+			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
+				errs = append(errs, wrapped)
+			}
+		case "reviewer":
+			if input.Reviewer == nil {
+				errs = append(errs, fmt.Errorf("reviewer runner is not configured"))
+				continue
+			}
+			_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
+			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
+				errs = append(errs, wrapped)
+			}
+		case "fixer":
+			if input.Fixer == nil {
+				errs = append(errs, fmt.Errorf("fixer runner is not configured"))
+				continue
+			}
+			_, err := input.Fixer.ProcessNext(ctx, claimedBy)
+			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
+				errs = append(errs, wrapped)
+			}
+		case "worker":
+			if input.Worker == nil {
+				errs = append(errs, fmt.Errorf("worker runner is not configured"))
+				continue
+			}
+			_, err := input.Worker.ProcessNext(ctx, claimedBy)
+			if wrapped := wrapSchedulerQueueError(item.Type, err); wrapped != nil {
+				errs = append(errs, wrapped)
+			}
+		default:
+			errs = append(errs, fmt.Errorf("unsupported queue item type %q", item.Type))
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+func repoFromProjectMetadata(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	repo, _ := metadata["repo"].(string)
+	return strings.TrimSpace(repo)
+}
+
+func wrapSchedulerError(action, projectID, repo string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s failed for project %s (%s): %w", action, projectID, repo, err)
+}
+
+func wrapSchedulerQueueError(queueType string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s processing failed: %w", queueType, err)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func summarizeCheckStates(checks []map[string]any) string {
+	if len(checks) == 0 {
+		return ""
+	}
+	states := make([]string, 0, len(checks))
+	for _, check := range checks {
+		state, _ := check["conclusion"].(string)
+		if strings.TrimSpace(state) == "" {
+			state, _ = check["state"].(string)
+		}
+		state = strings.TrimSpace(state)
+		if state == "" {
+			continue
+		}
+		states = append(states, state)
+	}
+	return strings.Join(states, ", ")
+}

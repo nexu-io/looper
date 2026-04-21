@@ -164,6 +164,39 @@ func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *t
 	}
 }
 
+func TestProcessClaimedItemNotifiesWhenReviewAgentStarts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `{"verdict":"clean","body":"","comments":[]}`}}}
+	notifications := make([]AgentExecutionStartedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, OnAgentExecutionStarted: func(_ context.Context, input AgentExecutionStartedInput) error {
+		notifications = append(notifications, input)
+		return nil
+	}})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claimed, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(notifications) != 1 {
+		t.Fatalf("len(notifications) = %d, want 1", len(notifications))
+	}
+	if notifications[0].Subtitle != "acme/looper#42" || notifications[0].Body != "Review started" {
+		t.Fatalf("notifications[0] = %#v, want review-start payload", notifications[0])
+	}
+}
+
 func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
 	t.Parallel()
 

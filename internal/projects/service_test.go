@@ -219,6 +219,45 @@ func TestServiceSyncConfiguredPreservesMetadataLayout(t *testing.T) {
 	}
 }
 
+func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 7, 46, 20, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	baseBranch := "main"
+	metadata := `{"repo":"powerformer/looper","source":"api"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "other", Name: "Other", RepoPath: "/tmp/other"}}
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	project, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != metadata {
+		t.Fatalf("project = %#v, want existing project preserved", project)
+	}
+	other, err := repos.Projects.GetByID(context.Background(), "other")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(other) error = %v", err)
+	}
+	if other == nil || other.Name != "Other" {
+		t.Fatalf("other = %#v, want configured project upserted", other)
+	}
+}
+
 func openCoordinator(t *testing.T) *storage.SQLiteCoordinator {
 	t.Helper()
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "service.sqlite"), storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})

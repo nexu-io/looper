@@ -197,32 +197,46 @@ type AgentExecutor interface {
 	Start(context.Context, AgentRunInput) (AgentExecution, error)
 }
 
+type AgentExecutionStartedInput struct {
+	ExecutionID string
+	ProjectID   string
+	LoopID      string
+	RunID       string
+	Subtitle    string
+	Body        string
+	DedupeKey   string
+}
+
+type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
+
 type Options struct {
-	DB               *sql.DB
-	Repos            *storage.Repositories
-	GitHub           GitHubGateway
-	AgentExecutor    AgentExecutor
-	Logger           bootstrap.Logger
-	Now              func() time.Time
-	AgentTimeout     time.Duration
-	ClaimTTL         time.Duration
-	AllowAutoApprove bool
-	RetryBaseDelay   time.Duration
-	RetryMaxAttempts int64
+	DB                      *sql.DB
+	Repos                   *storage.Repositories
+	GitHub                  GitHubGateway
+	AgentExecutor           AgentExecutor
+	Logger                  bootstrap.Logger
+	Now                     func() time.Time
+	AgentTimeout            time.Duration
+	ClaimTTL                time.Duration
+	AllowAutoApprove        bool
+	RetryBaseDelay          time.Duration
+	RetryMaxAttempts        int64
+	OnAgentExecutionStarted AgentExecutionStartedFunc
 }
 
 type Runner struct {
-	db               *sql.DB
-	repos            *storage.Repositories
-	github           GitHubGateway
-	agentExecutor    AgentExecutor
-	logger           bootstrap.Logger
-	now              func() time.Time
-	agentTimeout     time.Duration
-	claimTTL         time.Duration
-	allowAutoApprove bool
-	retryBaseDelay   time.Duration
-	retryMaxAttempts int64
+	db                      *sql.DB
+	repos                   *storage.Repositories
+	github                  GitHubGateway
+	agentExecutor           AgentExecutor
+	logger                  bootstrap.Logger
+	now                     func() time.Time
+	agentTimeout            time.Duration
+	claimTTL                time.Duration
+	allowAutoApprove        bool
+	retryBaseDelay          time.Duration
+	retryMaxAttempts        int64
+	onAgentExecutionStarted AgentExecutionStartedFunc
 }
 
 type DiscoveryInput struct {
@@ -344,17 +358,18 @@ func New(options Options) *Runner {
 		retryMax = defaultRetryMax
 	}
 	return &Runner{
-		db:               options.DB,
-		repos:            options.Repos,
-		github:           options.GitHub,
-		agentExecutor:    options.AgentExecutor,
-		logger:           options.Logger,
-		now:              now,
-		agentTimeout:     agentTimeout,
-		claimTTL:         claimTTL,
-		allowAutoApprove: options.AllowAutoApprove,
-		retryBaseDelay:   retryBaseDelay,
-		retryMaxAttempts: retryMax,
+		db:                      options.DB,
+		repos:                   options.Repos,
+		github:                  options.GitHub,
+		agentExecutor:           options.AgentExecutor,
+		logger:                  options.Logger,
+		now:                     now,
+		agentTimeout:            agentTimeout,
+		claimTTL:                claimTTL,
+		allowAutoApprove:        options.AllowAutoApprove,
+		retryBaseDelay:          retryBaseDelay,
+		retryMaxAttempts:        retryMax,
+		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 	}
 }
 
@@ -714,9 +729,15 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if input.Checkpoint.Snapshot == nil {
 		return input.Checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, input.Checkpoint), WorkingDirectory: input.Project.RepoPath, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: fmt.Sprintf("reviewer:%s:%s", input.Loop.ID, input.Checkpoint.Snapshot.HeadSHA)})
+	executionID := eventlog.NewEventID("agent")
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, input.Checkpoint), WorkingDirectory: input.Project.RepoPath, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: fmt.Sprintf("reviewer:%s:%s", input.Loop.ID, input.Checkpoint.Snapshot.HeadSHA)})
 	if err != nil {
 		return input.Checkpoint, err
+	}
+	if r.onAgentExecutionStarted != nil {
+		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Review started", DedupeKey: "runtime.agent.started:reviewer:" + input.Run.ID}); err != nil && r.logger != nil {
+			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
+		}
 	}
 	_ = r.tryAddReaction(ctx, input, "eyes")
 	result, err := execution.Wait(ctx)

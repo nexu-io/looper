@@ -668,7 +668,7 @@ func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	defer db.Close()
 }
 
-func TestRuntimeStopWaitsForInFlightSchedulerWork(t *testing.T) {
+func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -678,59 +678,30 @@ func TestRuntimeStopWaitsForInFlightSchedulerWork(t *testing.T) {
 	}
 
 	cfg.Storage.DBPath = workingDir + "/runtime.sqlite"
-
-	rt := New(Options{Config: cfg, Logger: &testLogger{}})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-
-	finishWork := rt.trackInFlightWork("queue_1")
-	stopDone := make(chan struct{})
-	go func() {
-		defer close(stopDone)
-		rt.Stop("SIGTERM")
-	}()
-
-	select {
-	case <-stopDone:
-		t.Fatal("Stop() returned before in-flight work completed")
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	finishWork()
-
-	select {
-	case <-stopDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop() did not return after in-flight work completed")
-	}
-}
-
-func TestRuntimeStopTimesOutWaitingForHungInFlightSchedulerWork(t *testing.T) {
-	workingDir := t.TempDir()
-	cfg, err := config.DefaultConfig(workingDir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-
-	cfg.Storage.DBPath = workingDir + "/runtime.sqlite"
 	cfg.Daemon.ShutdownTimeoutMS = 25
+	blockCh := make(chan struct{})
+	defer close(blockCh)
 	logger := &testLogger{}
-	rt := New(Options{Config: cfg, Logger: logger})
+	rt := New(Options{
+		Config: cfg,
+		Logger: logger,
+		RunSchedulerTick: func(context.Context, Services) error {
+			<-blockCh
+			return nil
+		},
+	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 
-	_ = rt.trackInFlightWork("queue_hung")
 	started := time.Now()
 	rt.Stop("SIGTERM")
 	elapsed := time.Since(started)
 	if elapsed > 250*time.Millisecond {
 		t.Fatalf("Stop() elapsed = %v, want timeout-bounded shutdown", elapsed)
 	}
-
-	if !logger.containsMessage("looperd stop timed out waiting for in-flight scheduler work") {
-		t.Fatalf("logger entries = %#v, want timeout warning", logger.messages())
+	if !logger.containsMessage("looperd stop timed out waiting for scheduler loop") {
+		t.Fatalf("logger entries = %#v, want scheduler timeout warning", logger.messages())
 	}
 }
 

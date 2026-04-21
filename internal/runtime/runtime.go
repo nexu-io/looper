@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -70,21 +69,22 @@ type Runtime struct {
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
 	runSchedulerTick       RunSchedulerTickFunc
+	customSchedulerTick    bool
 	shutdownTimeout        time.Duration
 
-	mu            sync.RWMutex
-	startedAt     *time.Time
-	recovery      RecoverySummary
-	stopped       bool
-	services      Services
-	startErr      error
-	startOnce     sync.Once
-	shutdownOnce  sync.Once
-	shutdownCh    chan struct{}
-	schedulerStop chan struct{}
-	schedulerDone chan struct{}
-	schedulerWake chan struct{}
-	inFlightWork  map[string]chan struct{}
+	mu              sync.RWMutex
+	startedAt       *time.Time
+	recovery        RecoverySummary
+	stopped         bool
+	services        Services
+	startErr        error
+	startOnce       sync.Once
+	shutdownOnce    sync.Once
+	shutdownCh      chan struct{}
+	schedulerStop   chan struct{}
+	schedulerDone   chan struct{}
+	schedulerWake   chan struct{}
+	schedulerCancel context.CancelFunc
 }
 
 func New(options Options) *Runtime {
@@ -104,6 +104,7 @@ func New(options Options) *Runtime {
 	}
 
 	runSchedulerTick := options.RunSchedulerTick
+	customSchedulerTick := runSchedulerTick != nil
 	if runSchedulerTick == nil {
 		runSchedulerTick = func(context.Context, Services) error {
 			return nil
@@ -125,10 +126,10 @@ func New(options Options) *Runtime {
 		openSQLiteCoordinator:  openSQLiteCoordinator,
 		syncConfiguredProjects: syncConfiguredProjects,
 		runSchedulerTick:       runSchedulerTick,
+		customSchedulerTick:    customSchedulerTick,
 		shutdownTimeout:        shutdownTimeout,
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
-		inFlightWork:           make(map[string]chan struct{}),
 	}
 }
 
@@ -166,8 +167,6 @@ func (r *Runtime) Stop(reason string) {
 		repositories := r.services.Repositories
 		r.mu.Unlock()
 
-		r.waitForInFlightSchedulerWorkOnStop()
-
 		if repositories != nil {
 			if err := r.appendStoppedEvent(context.Background(), repositories, reason); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime stop event failed", map[string]any{"error": err.Error()})
@@ -190,33 +189,6 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopped", map[string]any{"reason": reason})
 		}
 	})
-}
-
-// trackInFlightWork registers a unit of scheduler-owned work so shutdown can
-// wait for it to finish before tearing down shared runtime services.
-func (r *Runtime) trackInFlightWork(id string) func() {
-	if id == "" {
-		return func() {}
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	doneCh := make(chan struct{})
-	r.inFlightWork[id] = doneCh
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			r.mu.Lock()
-			current, ok := r.inFlightWork[id]
-			if ok && current == doneCh {
-				delete(r.inFlightWork, id)
-			}
-			r.mu.Unlock()
-			close(doneCh)
-		})
-	}
 }
 
 func (r *Runtime) WaitForShutdown() {
@@ -342,7 +314,6 @@ func (r *Runtime) start(ctx context.Context) error {
 	if err := r.syncConfiguredProjects(ctx, repositories, r.config, startedAt); err != nil {
 		return err
 	}
-
 	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, startedAt)
 	if err != nil {
 		return err
@@ -362,22 +333,33 @@ func (r *Runtime) start(ctx context.Context) error {
 		Loops:        loopService,
 		Runs:         runService,
 	}
+	schedulerDisabled := false
+	if !r.customSchedulerTick {
+		r.runSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.now)
+		schedulerDisabled = r.config.Agent.Vendor == nil
+	}
 	r.mu.Unlock()
+	if schedulerDisabled && r.logger != nil {
+		r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+	}
 
 	if err := r.appendStartedEvent(context.Background(), startedAt); err != nil {
 		return err
 	}
-	r.startSchedulerLoop()
+	if !schedulerDisabled {
+		r.startSchedulerLoop()
+	}
 
 	started = true
 
 	if r.logger != nil {
 		r.logger.Info("looperd runtime assembled", map[string]any{
-			"dbPath":          r.config.Storage.DBPath,
-			"projectCount":    len(r.config.Projects),
-			"autoMigrate":     r.config.Package.AutoMigrateOnStartup,
-			"backupRequired":  r.config.Package.RequireBackupBeforeMigrate,
-			"recoverySummary": recoverySummary,
+			"dbPath":                 r.config.Storage.DBPath,
+			"projectCount":           len(r.config.Projects),
+			"autoMigrate":            r.config.Package.AutoMigrateOnStartup,
+			"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
+			"recoverySummary":        recoverySummary,
+			"schedulerDefaultActive": !r.customSchedulerTick && !schedulerDisabled,
 		})
 	}
 
@@ -389,24 +371,26 @@ func (r *Runtime) startSchedulerLoop() {
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
+	schedulerCtx, schedulerCancel := context.WithCancel(context.Background())
 
 	r.mu.Lock()
 	r.schedulerStop = stopCh
 	r.schedulerDone = doneCh
 	r.schedulerWake = wakeCh
+	r.schedulerCancel = schedulerCancel
 	r.mu.Unlock()
 
 	go func() {
 		defer close(doneCh)
 
-		r.executeSchedulerTick(context.Background())
+		r.executeSchedulerTick(schedulerCtx)
 		if pollInterval <= 0 {
 			for {
 				select {
 				case <-stopCh:
 					return
 				case <-wakeCh:
-					r.executeSchedulerTick(context.Background())
+					r.executeSchedulerTick(schedulerCtx)
 				}
 			}
 		}
@@ -419,9 +403,9 @@ func (r *Runtime) startSchedulerLoop() {
 			case <-stopCh:
 				return
 			case <-wakeCh:
-				r.executeSchedulerTick(context.Background())
+				r.executeSchedulerTick(schedulerCtx)
 			case <-ticker.C:
-				r.executeSchedulerTick(context.Background())
+				r.executeSchedulerTick(schedulerCtx)
 			}
 		}
 	}()
@@ -431,51 +415,31 @@ func (r *Runtime) stopSchedulerLoop() {
 	r.mu.Lock()
 	stopCh := r.schedulerStop
 	doneCh := r.schedulerDone
+	cancel := r.schedulerCancel
 	r.schedulerStop = nil
 	r.schedulerDone = nil
 	r.schedulerWake = nil
+	r.schedulerCancel = nil
 	r.mu.Unlock()
 
 	if stopCh == nil || doneCh == nil {
+		if cancel != nil {
+			cancel()
+		}
 		return
 	}
 
+	if cancel != nil {
+		cancel()
+	}
 	close(stopCh)
-	<-doneCh
-}
-
-func (r *Runtime) waitForInFlightSchedulerWorkOnStop() {
-	r.mu.RLock()
-	if len(r.inFlightWork) == 0 {
-		r.mu.RUnlock()
-		return
-	}
-
-	ids := make([]string, 0, len(r.inFlightWork))
-	for id := range r.inFlightWork {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	work := make([]chan struct{}, 0, len(ids))
-	for _, id := range ids {
-		work = append(work, r.inFlightWork[id])
-	}
-	r.mu.RUnlock()
-
 	timer := time.NewTimer(r.shutdownTimeout)
 	defer timer.Stop()
-
-	for _, doneCh := range work {
-		select {
-		case <-doneCh:
-		case <-timer.C:
-			if r.logger != nil {
-				r.logger.Warn("looperd stop timed out waiting for in-flight scheduler work", map[string]any{
-					"timeoutMs":    r.shutdownTimeout.Milliseconds(),
-					"queueItemIds": ids,
-				})
-			}
-			return
+	select {
+	case <-doneCh:
+	case <-timer.C:
+		if r.logger != nil {
+			r.logger.Warn("looperd stop timed out waiting for scheduler loop", map[string]any{"timeoutMs": r.shutdownTimeout.Milliseconds()})
 		}
 	}
 }
@@ -500,14 +464,15 @@ func (r *Runtime) TriggerSchedulerTick() {
 }
 
 func (r *Runtime) executeSchedulerTick(ctx context.Context) {
-	services := r.Services()
+	r.mu.RLock()
+	services := r.services
+	tick := r.runSchedulerTick
+	r.mu.RUnlock()
 	if services.Repositories == nil {
 		return
 	}
-	finishWork := r.trackInFlightWork("scheduler-tick")
-	defer finishWork()
 
-	if err := r.runSchedulerTick(ctx, services); err != nil && r.logger != nil {
+	if err := tick(ctx, services); err != nil && r.logger != nil {
 		r.logger.Warn("looperd scheduler tick failed", map[string]any{"error": err.Error()})
 	}
 }
