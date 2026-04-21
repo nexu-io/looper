@@ -2102,6 +2102,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if err := domain.AssertLoopTypeMatchesTarget(domain.LoopType(loopType), target); err != nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+	}
 
 	metadataJSON, err := normalizeMetadataJSON(body.Metadata)
 	if err != nil {

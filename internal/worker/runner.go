@@ -493,6 +493,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
 	claimedLockKey := ""
+	acquiredClaimedLock := false
 	if resumedRun.StartStep != stepPrepareWork {
 		claimedLockKey = checkpoint.ClaimedLockKey
 	}
@@ -506,7 +507,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if !acquired {
 			return ProcessResult{}, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", claimedLockKey), kind: FailureRetryableTransient}
 		}
+		acquiredClaimedLock = true
 	}
+	defer func() {
+		if acquiredClaimedLock && claimedLockKey != "" {
+			_ = r.repos.Locks.Release(context.Background(), claimedLockKey)
+		}
+	}()
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -514,11 +521,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}); err != nil {
 		return ProcessResult{}, err
 	}
-	defer func() {
-		if claimedLockKey != "" {
-			_ = r.repos.Locks.Release(context.Background(), claimedLockKey)
-		}
-	}()
 
 	for _, step := range stepsFrom(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)

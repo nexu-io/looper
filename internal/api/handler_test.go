@@ -1509,6 +1509,46 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopStatus(t *testing.T) {
 	}
 }
 
+func TestHandlerCreateLoopRejectsIncompatibleLoopTypeAndTarget(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"project","targetId":"project_1","status":"paused"}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
+	assertEqual(t, errMap["message"], "reviewer loops must target a pull request")
+
+	loops, err := fixture.runtime.Services().Repositories.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	for _, loop := range loops {
+		if loop.ProjectID == "project_1" && loop.Type == "reviewer" && loop.TargetType == "project" {
+			t.Fatalf("persisted incompatible loop: %#v", loop)
+		}
+	}
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	for _, item := range queueItems {
+		if item.Type == "reviewer" && item.TargetType == "project" {
+			t.Fatalf("persisted incompatible queue item: %#v", item)
+		}
+	}
+}
+
 func TestHandlerCreateLoopRejectsWorkerAndPlannerWithoutAgentConfigured(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

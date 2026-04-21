@@ -171,6 +171,63 @@ func TestPublishResumeDoesNotRerunPriorSteps(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	queueItem, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopResult.record.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number}})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	checkpointJSON := `{"claimedLockKey":"` + buildIssueLockKey("acme/looper", issue.Number) + `"}`
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume", LoopID: loopResult.record.ID, Status: "failed", LastCompletedStep: stringPtr(string(stepDiscoverIssues)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER loops_fail_running_resume_planner
+		BEFORE UPDATE ON loops
+		FOR EACH ROW
+		WHEN NEW.id = '`+loopResult.record.ID+`' AND NEW.status = 'running'
+		BEGIN
+			SELECT RAISE(FAIL, 'forced loop update failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if claim.ID != queueItem.ID {
+		t.Fatalf("claim.ID = %q, want %q", claim.ID, queueItem.ID)
+	}
+	_, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err == nil || !strings.Contains(err.Error(), "forced loop update failure") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want forced loop update failure", err)
+	}
+	lockKey := buildIssueLockKey("acme/looper", issue.Number)
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want released claimed lock", lock)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "retry", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() = false, want claimed lock to be immediately reacquirable")
+	}
+}
+
 func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

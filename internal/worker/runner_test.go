@@ -123,6 +123,50 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 }
 
+func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	checkpointJSON := `{"claimedLockKey":"worker:project_1"}`
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume", LoopID: "loop_worker_1", Status: "failed", LastCompletedStep: stringPtr(string(stepPrepareWork)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER loops_fail_running_resume_worker
+		BEFORE UPDATE ON loops
+		FOR EACH ROW
+		WHEN NEW.id = 'loop_worker_1' AND NEW.status = 'running'
+		BEGIN
+			SELECT RAISE(FAIL, 'forced loop update failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	_, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err == nil || !strings.Contains(err.Error(), "forced loop update failure") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want forced loop update failure", err)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), "worker:project_1")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want released claimed lock", lock)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: "worker:project_1", Owner: "retry", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() = false, want claimed lock to be immediately reacquirable")
+	}
+}
+
 func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
