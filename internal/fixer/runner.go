@@ -539,9 +539,17 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 	}
 	result, err := r.ProcessClaimedItem(ctx, *item)
 	if err != nil {
-		return nil, err
+		return r.recoverClaimedItem(ctx, *item, err)
 	}
 	return &result, nil
+}
+
+func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+	failure := r.classifyFailure(err)
+	if _, failErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message); failErr != nil {
+		return nil, failErr
+	}
+	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {

@@ -157,6 +157,37 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 }
 
+func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	claimedWorker, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-0", "worker")
+	if err != nil || claimedWorker == nil {
+		t.Fatalf("initial ClaimNextOfType() = (%#v, %v), want claimed worker", claimedWorker, err)
+	}
+	projectID := "project_1"
+	nowISO := fixture.nowISO()
+	payload := `{"repo":"acme/looper","baseBranch":"main","prompt":"test"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_missing_worker", ProjectID: &projectID, Type: "worker", TargetType: "issue", TargetID: "issue:acme/looper:99", Repo: stringPtr("acme/looper"), DedupeKey: "worker:acme/looper:99", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessNext(context.Background(), "worker-1")
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable || !strings.Contains(result.Summary, "requires loopId") {
+		t.Fatalf("result = %#v, want non-retryable missing-loopId failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_missing_worker")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed", queue)
+	}
+}
+
 func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

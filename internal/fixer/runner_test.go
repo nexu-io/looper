@@ -185,6 +185,33 @@ func TestProcessClaimedItemRestartsFromDiscoverAfterRemoteHeadChangeAtPush(t *te
 	}
 }
 
+func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	projectID := "project_1"
+	prNumber := int64(99)
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_missing_fixer", ProjectID: &projectID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:99", Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:99:test", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessNext(context.Background(), "fixer-worker-1")
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "requires loopId") {
+		t.Fatalf("result = %#v, want non-retryable missing-loopId failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_missing_fixer")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed", queue)
+	}
+}
+
 func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

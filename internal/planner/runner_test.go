@@ -160,6 +160,32 @@ func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 	}
 }
 
+func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	projectID := "project_1"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_missing_planner", ProjectID: &projectID, Type: "planner", TargetType: "issue", TargetID: "issue:acme/looper:99", DedupeKey: "planner:acme/looper:99", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessNext(context.Background(), "planner-worker-1")
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable || !strings.Contains(result.Summary, "requires loopId") {
+		t.Fatalf("result = %#v, want non-retryable missing-loopId failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_missing_planner")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed", queue)
+	}
+}
+
 func TestProcessClaimedItemUsesDefaultProjectWorktreeRootWhenProjectMetadataOmitsIt(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
