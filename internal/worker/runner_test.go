@@ -85,6 +85,13 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if len(worktrees) != 0 {
 		t.Fatalf("Worktrees.ListByProject() = %#v, want no direct runner upsert with fake gateway", worktrees)
 	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), "worker:loop_worker_1")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want prepare-work lock released after successful run", lock)
+	}
 }
 
 func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {

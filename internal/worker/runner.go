@@ -568,6 +568,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if step == stepPrepareWork {
 			claimedLockKey = checkpoint.ClaimedLockKey
+			acquiredClaimedLock = claimedLockKey != ""
 		}
 		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
 		if err != nil {

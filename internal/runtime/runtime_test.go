@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -472,7 +473,7 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	pid := int64(999999)
+	pid := int64(4242)
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID:             "agent_orphan_1",
 		Vendor:         "codex",
@@ -496,6 +497,15 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 		Logger: &testLogger{},
 		Now: func() time.Time {
 			return startedAt
+		},
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			return "codex exec --json", nil
+		},
+		SignalProcess: func(gotPID int, signal syscall.Signal) error {
+			if gotPID != int(pid) || signal != syscall.SIGTERM {
+				t.Fatalf("SignalProcess(%d, %v), want (%d, SIGTERM)", gotPID, signal, pid)
+			}
+			return nil
 		},
 	})
 	if err := rt.Start(context.Background()); err != nil {
@@ -523,6 +533,90 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	recovery := rt.RecoverySummary()
 	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 1 {
 		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + cleanedCount=1", recovery.OrphanAgentCleanup)
+	}
+}
+
+func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	pid := int64(4343)
+	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:             "agent_orphan_mismatch",
+		Vendor:         "codex",
+		Status:         "running",
+		PID:            &pid,
+		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
+		CWD:            stringPtr(workingDir),
+		HeartbeatCount: 0,
+		StartedAt:      nowISO,
+		CreatedAt:      nowISO,
+		UpdatedAt:      nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	logger := &testLogger{}
+	signaled := false
+	rt := New(Options{
+		Config: cfg,
+		Logger: logger,
+		Now: func() time.Time {
+			return startedAt
+		},
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			return "python unrelated.py", nil
+		},
+		SignalProcess: func(int, syscall.Signal) error {
+			signaled = true
+			return nil
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_orphan_mismatch")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if agentExecution == nil || agentExecution.Status != "running" || agentExecution.EndedAt != nil {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_mismatch) = %#v, want still running without ended_at", agentExecution)
+	}
+	if signaled {
+		t.Fatal("SignalProcess() called, want mismatched pid to be skipped")
+	}
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_mismatch")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(agent_execution) error = %v", err)
+	}
+	if containsEventType(events, "agent.killed") {
+		t.Fatalf("agent_execution events = %#v, want no agent.killed for mismatched pid", events)
+	}
+	recovery := rt.RecoverySummary()
+	if recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want cleanedCount=0", recovery.OrphanAgentCleanup)
+	}
+	if !logger.containsMessage("skipped orphan agent cleanup for mismatched pid") {
+		t.Fatalf("logger entries = %#v, want mismatched pid warning", logger.messages())
 	}
 }
 

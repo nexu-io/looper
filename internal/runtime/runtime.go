@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +29,10 @@ type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoord
 type SyncConfiguredProjectsFunc func(context.Context, *storage.Repositories, config.Config, time.Time) error
 
 type RunSchedulerTickFunc func(context.Context, Services) error
+
+type ReadProcessCommandFunc func(context.Context, int) (string, error)
+
+type SignalProcessFunc func(int, syscall.Signal) error
 
 type RecoverySummary struct {
 	StartedAt             string                     `json:"startedAt,omitempty"`
@@ -51,6 +58,8 @@ type Options struct {
 	OpenSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects SyncConfiguredProjectsFunc
 	RunSchedulerTick       RunSchedulerTickFunc
+	ReadProcessCommand     ReadProcessCommandFunc
+	SignalProcess          SignalProcessFunc
 }
 
 type Services struct {
@@ -71,6 +80,8 @@ type Runtime struct {
 	runSchedulerTick       RunSchedulerTickFunc
 	defaultSchedulerTick   RunSchedulerTickFunc
 	customSchedulerTick    bool
+	readProcessCommand     ReadProcessCommandFunc
+	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
 
 	mu              sync.RWMutex
@@ -107,6 +118,16 @@ func New(options Options) *Runtime {
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
 
+	readProcessCommand := options.ReadProcessCommand
+	if readProcessCommand == nil {
+		readProcessCommand = defaultReadProcessCommand
+	}
+
+	signalProcess := options.SignalProcess
+	if signalProcess == nil {
+		signalProcess = defaultSignalProcess
+	}
+
 	shutdownTimeout := options.ShutdownTimeout
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = time.Duration(options.Config.Daemon.ShutdownTimeoutMS) * time.Millisecond
@@ -123,6 +144,8 @@ func New(options Options) *Runtime {
 		syncConfiguredProjects: syncConfiguredProjects,
 		runSchedulerTick:       runSchedulerTick,
 		customSchedulerTick:    customSchedulerTick,
+		readProcessCommand:     readProcessCommand,
+		signalProcess:          signalProcess,
 		shutdownTimeout:        shutdownTimeout,
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
@@ -506,11 +529,26 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				continue
 			}
 			pid := int(*execution.PID)
-			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
+			if err != nil {
 				if r.logger != nil {
-					r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+					r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
 				}
 				continue
+			}
+			if running && !matches {
+				if r.logger != nil {
+					r.logger.Warn("skipped orphan agent cleanup for mismatched pid", map[string]any{"executionId": execution.ID, "pid": pid})
+				}
+				continue
+			}
+			if running {
+				if err := r.signalProcess(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+					if r.logger != nil {
+						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+					}
+					continue
+				}
 			}
 
 			cleaned := execution
@@ -783,6 +821,123 @@ func appendSystemEvent(ctx context.Context, repositories *storage.Repositories, 
 	record.ActorID = stringPtr("looperd")
 	record.ActorDisplayName = stringPtr("looperd")
 	return repositories.Events.Append(ctx, record)
+}
+
+func (r *Runtime) executionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (matches bool, running bool, err error) {
+	processCommand, err := r.readProcessCommand(ctx, pid)
+	if err != nil {
+		return false, false, err
+	}
+	processCommand = strings.TrimSpace(processCommand)
+	if processCommand == "" {
+		return false, false, nil
+	}
+	expectedTokens, err := expectedExecutionCommandTokens(execution)
+	if err != nil {
+		return false, true, err
+	}
+	actualTokens := splitProcessCommand(processCommand)
+	return commandPrefixMatches(expectedTokens, actualTokens), true, nil
+}
+
+func expectedExecutionCommandTokens(execution storage.AgentExecutionRecord) ([]string, error) {
+	if execution.CommandJSON == nil || strings.TrimSpace(*execution.CommandJSON) == "" {
+		return nil, fmt.Errorf("missing execution command metadata")
+	}
+	var payload struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal([]byte(*execution.CommandJSON), &payload); err != nil {
+		return nil, fmt.Errorf("parse execution command metadata: %w", err)
+	}
+	if strings.TrimSpace(payload.Command) == "" {
+		return nil, fmt.Errorf("missing execution command")
+	}
+	tokens := make([]string, 0, len(payload.Args)+1)
+	tokens = append(tokens, payload.Command)
+	tokens = append(tokens, payload.Args...)
+	return tokens, nil
+}
+
+func commandPrefixMatches(expected, actual []string) bool {
+	if len(expected) == 0 || len(actual) < len(expected) {
+		return false
+	}
+	if filepath.Base(expected[0]) != filepath.Base(actual[0]) {
+		return false
+	}
+	for i := 1; i < len(expected); i++ {
+		if expected[i] != actual[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func splitProcessCommand(command string) []string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+
+	tokens := make([]string, 0)
+	var current strings.Builder
+	var quote rune
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, current.String())
+		current.Reset()
+	}
+
+	for _, r := range command {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		switch {
+		case r == '\\' && quote != 0:
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	flush()
+	return tokens
+}
+
+func defaultReadProcessCommand(ctx context.Context, pid int) (string, error) {
+	cmd := exec.CommandContext(ctx, "ps", "-p", fmt.Sprintf("%d", pid), "-o", "command=")
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", nil
+		}
+		return "", fmt.Errorf("inspect process %d with ps: %w", pid, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func defaultSignalProcess(pid int, signal syscall.Signal) error {
+	return syscall.Kill(pid, signal)
 }
 
 func createEmptyRecoverySummary() RecoverySummary {
