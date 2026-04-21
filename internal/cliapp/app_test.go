@@ -561,6 +561,70 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 }
 
+func TestLoopStartUsesExplicitProjectForPullRequestTarget(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper A", "repoPath": "/tmp/repos/looper-a", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}, {"id": "project_2", "name": "Looper B", "repoPath": "/tmp/repos/looper-b", "repo": "acme/looper", "updatedAt": "2026-04-20T10:01:00.000Z"}}}))
+		case "/api/v1/loops":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_2"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_2", "projectId": "project_2", "repo": "acme/looper", "prNumber": 42, "status": "running"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "loop", "start", "--type", "reviewer", "--pr", "acme/looper#42", "--project", "project_2", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([loop start ...]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([loop start ...]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "Loop started") {
+		t.Fatalf("Run([loop start ...]) stdout = %q, want to contain %q", stdout, "Loop started")
+	}
+}
+
+func TestLoopStartRequiresExplicitProjectWhenRepoMatchesMultipleProjects(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper A", "repoPath": "/tmp/repos/looper-a", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}, {"id": "project_2", "name": "Looper B", "repoPath": "/tmp/repos/looper-b", "repo": "acme/looper", "updatedAt": "2026-04-20T10:01:00.000Z"}}}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "loop", "start", "--type", "reviewer", "--pr", "acme/looper#42", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([loop start ...]) exit code = 0, want non-zero")
+	}
+	if stdout != "" {
+		t.Fatalf("Run([loop start ...]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "--project is required") {
+		t.Fatalf("Run([loop start ...]) stderr = %q, want to contain %q", stderr, "--project is required")
+	}
+}
+
 func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktree(t *testing.T) {
 	repoPath := initSampleGitRepo(t)
 	runtimeRoot := t.TempDir()

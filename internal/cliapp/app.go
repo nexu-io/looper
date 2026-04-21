@@ -178,7 +178,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List loops", runE: runtime.loopList}),
-					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart}),
+					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
 					newCommand(commandSpec{use: "pause", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause}),
 				},
 			}),

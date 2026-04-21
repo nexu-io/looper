@@ -85,7 +85,7 @@ func (r *commandRuntime) loopStart(cmd *cobra.Command, args []string) error {
 			return nil, err
 		}
 
-		projectID, err := r.lookupPullRequestProjectID(ctx, repo, prNumber)
+		projectID, err := r.resolveLoopStartProjectID(ctx, repo, strings.TrimSpace(getStringFlag(cmd, "project")))
 		if err != nil {
 			return nil, err
 		}
@@ -348,23 +348,16 @@ func (r *commandRuntime) postJSON(ctx context.Context, path string, body any) (j
 	return payload, nil
 }
 
-func (r *commandRuntime) lookupPullRequestProjectID(ctx context.Context, repo string, prNumber int64) (string, error) {
-	payload, err := r.getJSON(ctx, pullRequestPath(repo, prNumber))
+func (r *commandRuntime) resolveLoopStartProjectID(ctx context.Context, repo string, explicitProjectID string) (string, error) {
+	projects, err := r.listProjects(ctx)
 	if err != nil {
 		return "", err
 	}
-
-	var pr struct {
-		ProjectID string `json:"projectId"`
+	project, err := resolveProjectForRepo(projects, repo, explicitProjectID)
+	if err != nil {
+		return "", err
 	}
-	if err := json.Unmarshal(payload, &pr); err != nil {
-		return "", fmt.Errorf("decode pull request response: %w", err)
-	}
-	if strings.TrimSpace(pr.ProjectID) == "" {
-		return "", fmt.Errorf("pull request response missing projectId")
-	}
-
-	return pr.ProjectID, nil
+	return project.ID, nil
 }
 
 func writeJSON(w io.Writer, payload any) error {

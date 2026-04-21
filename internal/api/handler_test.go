@@ -1335,7 +1335,103 @@ func TestHandlerCreateLoopReviewerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, queue.Status, "queued")
 	assertEqual(t, queue.TargetType, "pull_request")
 	assertEqual(t, queue.TargetID, "pr:acme/looper:99")
-	assertEqual(t, queue.DedupeKey, "reviewer:acme/looper:99")
+	assertEqual(t, queue.DedupeKey, "reviewer:project_1:"+loopID+":acme/looper:99")
+}
+
+func TestHandlerCreateLoopReviewerEnqueuesAcrossProjectsForSamePullRequest(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "project_2",
+		Name:         "Looper Duplicate",
+		RepoPath:     "/tmp/repos/looper-duplicate",
+		BaseBranch:   &baseBranch,
+		Archived:     false,
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_project_2_99",
+		ProjectID:  "project_2",
+		Repo:       "acme/looper",
+		PRNumber:   99,
+		HeadSHA:    "head-project-2",
+		CapturedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString),
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(project_2) error = %v", err)
+	}
+	project1ID := "project_1"
+	loop1ID := "loop_existing"
+	prNumber := int64(99)
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         loop1ID,
+		Seq:        1,
+		ProjectID:  project1ID,
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:99"),
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(existing) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_existing",
+		ProjectID:   &project1ID,
+		LoopID:      &loop1ID,
+		Type:        "reviewer",
+		TargetType:  "pull_request",
+		TargetID:    "pr:acme/looper:99",
+		Repo:        stringPtr("acme/looper"),
+		PRNumber:    &prNumber,
+		DedupeKey:   "reviewer:project_1:loop_existing:acme/looper:99",
+		Priority:    storage.QueuePriorityReviewer,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		Attempts:    0,
+		MaxAttempts: 3,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(existing) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_2","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"manual":true,"followUpdates":false}}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(2 * time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	resp := parseJSONMap(t, recorder.Body.Bytes())
+	data := resp["data"].(map[string]any)
+	loopID := data["id"].(string)
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	matched := []storage.QueueItemRecord{}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("queue items for loop = %d, want 1", len(matched))
+	}
+	assertEqual(t, matched[0].DedupeKey, "reviewer:project_2:"+loopID+":acme/looper:99")
 }
 
 func TestHandlerCreateLoopReviewerTriggersSchedulerTickHook(t *testing.T) {

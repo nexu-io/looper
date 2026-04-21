@@ -2173,7 +2173,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			dedupeKey := fmt.Sprintf("%s:%s", loopType, record.ID)
 			priority := storage.QueuePriorityFixer
 			if queueType == domain.LoopTypeReviewer {
-				dedupeKey = fmt.Sprintf("reviewer:%s:%d", repo, prNumber)
+				dedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", record.ProjectID, record.ID, repo, prNumber)
 				priority = storage.QueuePriorityReviewer
 			}
 			existingQueue, findErr := transactionRepos.Queue.FindActiveByDedupe(r.Context(), dedupeKey)
