@@ -256,6 +256,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				use:   "jump [id]",
 				short: "Print shell command for a loop worktree",
 				args:  cobra.MaximumNArgs(1),
+				runE:  runtime.jump,
 				localFlags: []flagSpec{
 					boolFlag("print-path", "Print the worktree path only"),
 					stringFlag("shell-integration", "shell", "Print shell integration helper"),

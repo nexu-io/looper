@@ -404,6 +404,128 @@ func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	}
 }
 
+func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "jump", "12", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([jump 12]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([jump 12]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "cd -- '/tmp/worktree'\n"; got != want {
+		t.Fatalf("Run([jump 12]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "jump", "12", "--print-path", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([jump 12 --print-path]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([jump 12 --print-path]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "/tmp/worktree\n"; got != want {
+		t.Fatalf("Run([jump 12 --print-path]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestJumpWithShellIntegrationPrintsHelper(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "jump", "--shell-integration", "bash")
+	if exitCode != 0 {
+		t.Fatalf("Run([jump --shell-integration bash]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([jump --shell-integration bash]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "lj() { eval \"$(looper jump \"$@\")\"; }\n"; got != want {
+		t.Fatalf("Run([jump --shell-integration bash]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_1"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			if got, want := body["repo"], "acme/looper"; got != want {
+				t.Fatalf("body.repo = %#v, want %#v", got, want)
+			}
+			if got, want := body["prNumber"], float64(123); got != want {
+				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"review", "123", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([review 123]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([review 123]) stderr = %q, want empty string", got)
+	}
+	if got := stdout.String(); !strings.Contains(got, "acme/looper#123") {
+		t.Fatalf("Run([review 123]) stdout = %q, want to contain %q", got, "acme/looper#123")
+	}
+}
+
 func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktree(t *testing.T) {
 	repoPath := initSampleGitRepo(t)
 	runtimeRoot := t.TempDir()

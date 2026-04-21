@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -143,17 +145,9 @@ func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) er
 
 func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
-		repo, prNumber, err := parsePullRequestRef(args[0])
+		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
 		if err != nil {
 			return nil, err
-		}
-
-		projectID := strings.TrimSpace(getStringFlag(cmd, "project"))
-		if projectID == "" {
-			projectID, err = r.lookupPullRequestProjectID(ctx, repo, prNumber)
-			if err != nil {
-				return nil, err
-			}
 		}
 
 		body := map[string]any{
@@ -173,6 +167,52 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 	}, func(w io.Writer, payload json.RawMessage) error {
 		return writeHumanReviewCreate(w, payload, getBoolFlag(cmd, "loop"))
 	})
+}
+
+func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
+	shell := strings.TrimSpace(getStringFlag(cmd, "shell-integration"))
+	if shell != "" {
+		helper, err := buildShellIntegration(shell)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), helper)
+		return err
+	}
+
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return fmt.Errorf("Usage: looper jump <id>")
+	}
+
+	payload, err := r.getJSON(cmd.Context(), "/api/v1/runs/active/"+url.PathEscape(strings.TrimSpace(args[0])))
+	if err != nil {
+		return err
+	}
+
+	var data activeRunDetailOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode active run response: %w", err)
+	}
+	if data.Worktree == nil || strings.TrimSpace(data.Worktree.Path) == "" {
+		return fmt.Errorf("Loop %s has no active worktree path", strings.TrimSpace(args[0]))
+	}
+
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), map[string]any{
+			"seq":       data.Seq,
+			"loopId":    data.LoopID,
+			"projectId": data.ProjectID,
+			"worktree":  data.Worktree,
+		})
+	}
+
+	if getBoolFlag(cmd, "print-path") {
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), data.Worktree.Path)
+		return err
+	}
+
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), "cd -- "+quoteShellArg(data.Worktree.Path))
+	return err
 }
 
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
@@ -337,6 +377,165 @@ func pullRequestPath(repo string, prNumber int64) string {
 	return "/api/v1/pull-requests/" + url.PathEscape(repo) + "/" + strconv.FormatInt(prNumber, 10)
 }
 
+type activeRunDetailOutput struct {
+	Seq       int64  `json:"seq"`
+	LoopID    string `json:"loopId"`
+	ProjectID string `json:"projectId"`
+	Worktree  *struct {
+		ID     *string `json:"id"`
+		Path   string  `json:"path"`
+		Branch *string `json:"branch"`
+	} `json:"worktree"`
+}
+
+func (r *commandRuntime) resolveReviewTarget(ctx context.Context, value string, explicitProjectID string) (string, string, int64, error) {
+	projects, err := r.listProjects(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	repo, prNumber, repoQualified, err := parseOptionalPullRequestRef(value)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	if repoQualified {
+		project, err := resolveProjectForRepo(projects, repo, explicitProjectID)
+		if err != nil {
+			return "", "", 0, err
+		}
+		return project.ID, repo, prNumber, nil
+	}
+
+	project, err := r.resolveExplicitOrCurrentProject(projects, explicitProjectID)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if project.Repo == nil || strings.TrimSpace(*project.Repo) == "" {
+		return "", "", 0, fmt.Errorf("project %s is missing a configured repo", project.ID)
+	}
+
+	return project.ID, strings.TrimSpace(*project.Repo), prNumber, nil
+}
+
+func (r *commandRuntime) listProjects(ctx context.Context) ([]projectOutput, error) {
+	payload, err := r.getJSON(ctx, "/api/v1/projects")
+	if err != nil {
+		return nil, err
+	}
+
+	var data projectsListOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return nil, fmt.Errorf("decode projects response: %w", err)
+	}
+	return data.Items, nil
+}
+
+func (r *commandRuntime) resolveExplicitOrCurrentProject(projects []projectOutput, explicitProjectID string) (projectOutput, error) {
+	if explicitProjectID != "" {
+		for _, project := range projects {
+			if project.ID == explicitProjectID {
+				return project, nil
+			}
+		}
+		return projectOutput{}, fmt.Errorf("project not found: %s", explicitProjectID)
+	}
+
+	cwd, err := r.getwd()
+	if err != nil {
+		return projectOutput{}, fmt.Errorf("determine current working directory: %w", err)
+	}
+	return resolveProjectForCWD(projects, cwd)
+}
+
+func resolveProjectForRepo(projects []projectOutput, repo string, explicitProjectID string) (projectOutput, error) {
+	if explicitProjectID != "" {
+		for _, project := range projects {
+			if project.ID != explicitProjectID {
+				continue
+			}
+			configuredRepo := ""
+			if project.Repo != nil {
+				configuredRepo = strings.TrimSpace(*project.Repo)
+			}
+			if configuredRepo != repo {
+				if configuredRepo == "" {
+					configuredRepo = "no repo"
+				}
+				return projectOutput{}, fmt.Errorf("project %s is configured for %s, not %s", explicitProjectID, configuredRepo, repo)
+			}
+			return project, nil
+		}
+		return projectOutput{}, fmt.Errorf("project not found: %s", explicitProjectID)
+	}
+
+	matches := make([]projectOutput, 0, 1)
+	for _, project := range projects {
+		if project.Repo != nil && strings.TrimSpace(*project.Repo) == repo {
+			matches = append(matches, project)
+		}
+	}
+	if len(matches) == 0 {
+		return projectOutput{}, fmt.Errorf("--project is required (no project configured for repo %s)", repo)
+	}
+	if len(matches) > 1 {
+		return projectOutput{}, fmt.Errorf("--project is required (multiple projects are configured for repo %s)", repo)
+	}
+	return matches[0], nil
+}
+
+func resolveProjectForCWD(projects []projectOutput, cwd string) (projectOutput, error) {
+	normalizedCWD := normalizeComparablePath(cwd)
+	type rankedProject struct {
+		project            projectOutput
+		normalizedRepoPath string
+	}
+
+	matches := make([]rankedProject, 0, len(projects))
+	for _, project := range projects {
+		normalizedRepoPath := normalizeComparablePath(project.RepoPath)
+		if isWithinProjectRepo(normalizedCWD, normalizedRepoPath) {
+			matches = append(matches, rankedProject{project: project, normalizedRepoPath: normalizedRepoPath})
+		}
+	}
+	if len(matches) == 0 {
+		return projectOutput{}, fmt.Errorf("--project is required (no project matched cwd %s)", normalizedCWD)
+	}
+
+	best := matches[0]
+	for _, candidate := range matches[1:] {
+		if len(candidate.normalizedRepoPath) > len(best.normalizedRepoPath) {
+			best = candidate
+		}
+	}
+	for _, candidate := range matches {
+		if candidate.project.ID != best.project.ID && len(candidate.normalizedRepoPath) == len(best.normalizedRepoPath) {
+			return projectOutput{}, fmt.Errorf("--project is required (multiple projects matched cwd %s)", normalizedCWD)
+		}
+	}
+
+	return best.project, nil
+}
+
+func isWithinProjectRepo(cwd string, repoPath string) bool {
+	return cwd == repoPath || strings.HasPrefix(cwd, repoPath+string(os.PathSeparator))
+}
+
+func normalizeComparablePath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(trimmed)
+	if err != nil {
+		absPath = filepath.Clean(trimmed)
+	}
+	if strings.HasPrefix(absPath, "/private/") {
+		return strings.TrimPrefix(absPath, "/private")
+	}
+	return absPath
+}
+
 func parsePullRequestRef(value string) (string, int64, error) {
 	trimmed := strings.TrimSpace(value)
 	parts := strings.Split(trimmed, "#")
@@ -355,6 +554,23 @@ func parsePullRequestRef(value string) (string, int64, error) {
 	}
 
 	return repo, prNumber, nil
+}
+
+func parseOptionalPullRequestRef(value string) (string, int64, bool, error) {
+	trimmed := strings.TrimSpace(value)
+	if strings.Contains(trimmed, "#") {
+		repo, prNumber, err := parsePullRequestRef(trimmed)
+		if err != nil {
+			return "", 0, false, err
+		}
+		return repo, prNumber, true, nil
+	}
+
+	prNumber, err := parsePositiveInt(trimmed, "pull request number")
+	if err != nil {
+		return "", 0, false, fmt.Errorf("pull request reference must be <repo>#<number> or <number>")
+	}
+	return "", prNumber, false, nil
 }
 
 func parsePositiveInt(value string, flag string) (int64, error) {
@@ -386,6 +602,21 @@ func addQueryString(query url.Values, key, value string) {
 func getStringFlag(cmd *cobra.Command, name string) string {
 	value, _ := cmd.Flags().GetString(name)
 	return value
+}
+
+func quoteShellArg(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func buildShellIntegration(shell string) (string, error) {
+	switch shell {
+	case "bash", "zsh":
+		return `lj() { eval "$(looper jump "$@")"; }`, nil
+	case "fish":
+		return "function lj\n  eval (looper jump $argv)\nend", nil
+	default:
+		return "", fmt.Errorf("Unsupported shell: %s", shell)
+	}
 }
 
 func getBoolFlag(cmd *cobra.Command, name string) bool {
