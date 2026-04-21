@@ -489,9 +489,45 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 	}
 	result, err := r.ProcessClaimedItem(ctx, *item)
 	if err != nil {
+		if cleanupErr := r.finalizeClaimSetupFailure(ctx, *item, err); cleanupErr != nil {
+			return nil, errors.Join(err, cleanupErr)
+		}
 		return nil, err
 	}
 	return &result, nil
+}
+
+func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storage.QueueItemRecord, cause error) error {
+	failure := r.classifyFailure(cause)
+	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	if err != nil {
+		return err
+	}
+	if queueItem.LoopID == nil {
+		return nil
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+	if err != nil {
+		return err
+	}
+	if loop == nil {
+		return nil
+	}
+	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.LastRunAt = stringPtr(r.nowISO())
+		if failedQueue != nil && failedQueue.Status == "queued" {
+			updated.Status = "queued"
+			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+		} else {
+			if failure.kind == FailureManualIntervention {
+				updated.Status = "paused"
+			} else {
+				updated.Status = "failed"
+			}
+			updated.NextRunAt = nil
+		}
+	})
+	return err
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
@@ -561,7 +597,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}
 			latest.ResumePolicy = resumePolicy
-			_, _ = r.completeRun(ctx, run, "failed", failure.message, failure.message, latest)
+			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+				return ProcessResult{}, err
+			}
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
 			r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "failureKind": string(failure.kind), "summary": failure.message})

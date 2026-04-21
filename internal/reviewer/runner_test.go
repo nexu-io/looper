@@ -197,6 +197,109 @@ func TestProcessClaimedItemNotifiesWhenReviewAgentStarts(t *testing.T) {
 	}
 }
 
+func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER reviewer_runs_fail_start
+		BEFORE INSERT ON runs
+		WHEN NEW.status = 'running'
+		BEGIN
+			SELECT RAISE(FAIL, 'start run blocked');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	discovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+
+	result, err := runner.ProcessNext(context.Background(), "reviewer-worker-1")
+	if err == nil || !contains(err.Error(), "start run blocked") {
+		t.Fatalf("ProcessNext() error = %v, want start run blocked", err)
+	}
+	if result != nil {
+		t.Fatalf("ProcessNext() = %#v, want nil result", result)
+	}
+	queue, getErr := fixture.repos.Queue.GetByID(context.Background(), discovery.QueueItems[0].ID)
+	if getErr != nil {
+		t.Fatalf("Queue.GetByID() error = %v", getErr)
+	}
+	if queue == nil || queue.Status != "failed" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want failed queue item with non_retryable error kind", queue)
+	}
+	if queue.LastError == nil || !contains(*queue.LastError, "start run blocked") {
+		t.Fatalf("queue.LastError = %#v, want start run blocked", queue.LastError)
+	}
+}
+
+func TestProcessClaimedItemReturnsWhenCompleteRunFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER reviewer_runs_fail_complete_insert
+		BEFORE INSERT ON runs
+		WHEN NEW.status != 'running'
+		BEGIN
+			SELECT RAISE(FAIL, 'complete run blocked');
+		END;
+	`); err != nil {
+		t.Fatalf("create insert trigger error = %v", err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER reviewer_runs_fail_complete_update
+		BEFORE UPDATE ON runs
+		WHEN NEW.status != 'running'
+		BEGIN
+			SELECT RAISE(FAIL, 'complete run blocked');
+		END;
+	`); err != nil {
+		t.Fatalf("create update trigger error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err == nil || !contains(err.Error(), "complete run blocked") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want complete run blocked", err)
+	}
+	if result != (ProcessResult{}) {
+		t.Fatalf("ProcessClaimedItem() = %#v, want zero result on completeRun failure", result)
+	}
+	queue, getErr := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if getErr != nil {
+		t.Fatalf("Queue.GetByID() error = %v", getErr)
+	}
+	if queue == nil || queue.Status != "running" || queue.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want still-running claimed item", queue)
+	}
+	loop, getErr := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if getErr != nil {
+		t.Fatalf("Loops.GetByID() error = %v", getErr)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v, want still-running loop", loop)
+	}
+	runs, getErr := fixture.repos.Runs.ListByLoop(context.Background(), *claim.LoopID)
+	if getErr != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", getErr)
+	}
+	if len(runs) != 1 || runs[0].Status != "running" {
+		t.Fatalf("runs = %#v, want single running run", runs)
+	}
+}
+
 func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
 	t.Parallel()
 
