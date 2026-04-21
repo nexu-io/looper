@@ -1137,6 +1137,87 @@ func TestHandlerLoopStartCreatesReplacementQueueItemWhenLatestWorkIsTerminal(t *
 	}
 }
 
+func TestHandlerLoopStartCreatesQueueItemWhenLoopHasNoQueueHistory(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_no_history"
+	loopID := "loop_worker_no_history"
+	targetID := "project:project_no_history"
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 4, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: stringPtr("acme/looper"), Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", startRecorder.Code)
+	}
+
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(Queue.List()) = %d, want 1", len(items))
+	}
+	assertEqual(t, items[0].LoopID != nil && *items[0].LoopID == loopID, true)
+	assertEqual(t, items[0].Status, "queued")
+	assertEqual(t, items[0].TargetID, targetID)
+	if items[0].PayloadJSON == nil || *items[0].PayloadJSON == "" {
+		t.Fatalf("queue payload = %v, want worker payload", items[0].PayloadJSON)
+	}
+}
+
+func TestHandlerLoopStartRejectsConflictingActiveLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_conflict"
+	targetID := "pr:acme/looper:43"
+	activeLoopID := "loop_active"
+	pausedLoopID := "loop_paused"
+	prNumber := int64(43)
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for _, loop := range []storage.LoopRecord{
+		{ID: activeLoopID, Seq: 5, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: pausedLoopID, Seq: 6, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := services.Repositories.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+pausedLoopID+"/start", nil)
+	startRecorder := httptest.NewRecorder()
+	h.ServeHTTP(startRecorder, startReq)
+	if startRecorder.Code != http.StatusConflict {
+		t.Fatalf("start status = %d, want 409", startRecorder.Code)
+	}
+	body := parseJSONMap(t, startRecorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "LOOP_CONFLICT")
+
+	pausedLoop, err := services.Repositories.Loops.GetByID(context.Background(), pausedLoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if pausedLoop == nil || pausedLoop.Status != "paused" {
+		t.Fatalf("paused loop = %#v, want paused", pausedLoop)
+	}
+}
+
 func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedLoopRouteData(t, fixture.runtime)
@@ -1831,6 +1912,36 @@ func TestHandlerCreateLoopPlannerEnqueuesSchedulableLoop(t *testing.T) {
 	assertEqual(t, queue.TargetID, "issue:acme/looper:123")
 	assertEqual(t, queue.DedupeKey, "planner:project_1:"+loopID+":acme/looper:123")
 	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerCreateLoopNormalizesProjectTargetID(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"project","targetId":"project:project:project_1","metadata":{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}},"status":"paused"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	resp := parseJSONMap(t, recorder.Body.Bytes())
+	data := resp["data"].(map[string]any)
+	assertEqual(t, data["targetId"], "project:project_1")
+	loopID := data["id"].(string)
+
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.TargetID == nil {
+		t.Fatalf("loop = %#v, want project target id", loop)
+	}
+	assertEqual(t, *loop.TargetID, "project:project_1")
 }
 
 func TestHandlerLoopStartPlannerIgnoresOtherProjectsScopedDedupe(t *testing.T) {

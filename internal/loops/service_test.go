@@ -82,6 +82,19 @@ func TestServiceCreateRejectsConflictingActiveLoop(t *testing.T) {
 	}
 }
 
+func TestTargetFromRecordNormalizesRepeatedProjectPrefix(t *testing.T) {
+	t.Parallel()
+
+	targetID := "project:project:project_1"
+	target, err := targetFromRecord(storage.LoopRecord{ID: "loop_1", TargetType: string(domain.LoopTargetTypeProject), TargetID: &targetID})
+	if err != nil {
+		t.Fatalf("targetFromRecord() error = %v", err)
+	}
+	if target.ProjectID != "project_1" {
+		t.Fatalf("targetFromRecord().ProjectID = %q, want project_1", target.ProjectID)
+	}
+}
+
 func openCoordinator(t *testing.T) *storage.SQLiteCoordinator {
 	t.Helper()
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "loops.sqlite"), storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})

@@ -292,7 +292,11 @@ func prNumberFromTarget(target domain.LoopTarget) *int64 {
 }
 
 func trimTargetPrefix(targetID string) string {
-	return strings.TrimPrefix(targetID, "project:")
+	normalized := strings.TrimSpace(targetID)
+	for strings.HasPrefix(normalized, "project:") {
+		normalized = strings.TrimPrefix(normalized, "project:")
+	}
+	return normalized
 }
 
 func stringPointer(value string) *string {

@@ -2127,7 +2127,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 		candidateStatus := domain.LoopStatus(status)
-		if err := assertUniqueActiveLoopCompat(existing, projectID, domain.LoopType(loopType), target, candidateStatus); err != nil {
+		if err := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopType(loopType), target, candidateStatus); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -2350,7 +2350,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
-		if uniqueErr := assertUniqueActiveLoopCompat(existing, projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
+		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
 		}
 
@@ -2487,7 +2487,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
-		if uniqueErr := assertUniqueActiveLoopCompat(existing, projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning); uniqueErr != nil {
+		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
 		}
 
@@ -2763,6 +2763,20 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
 		}
 
+		if status == domain.LoopStatusRunning {
+			target, targetErr := loopTargetFromRecordCompat(*loop)
+			if targetErr != nil {
+				return storage.LoopRecord{}, targetErr
+			}
+			existing, listErr := repos.Loops.List(ctx)
+			if listErr != nil {
+				return storage.LoopRecord{}, listErr
+			}
+			if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusRunning); uniqueErr != nil {
+				return storage.LoopRecord{}, uniqueErr
+			}
+		}
+
 		updated := *loop
 		updated.Status = string(status)
 		updated.UpdatedAt = nowISO
@@ -2799,6 +2813,10 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 				if err != nil {
 					return storage.LoopRecord{}, err
 				}
+				target, targetErr := loopTargetFromRecordCompat(updated)
+				if targetErr != nil {
+					return storage.LoopRecord{}, targetErr
+				}
 				if latestQueue != nil {
 					if latestQueue.Status == "queued" || latestQueue.Status == "running" {
 						break
@@ -2827,6 +2845,16 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 					replacement.UpdatedAt = nowISO
 					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
+					}
+				} else {
+					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(updated, target, nowISO, updated.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+					if queueErr != nil {
+						return storage.LoopRecord{}, queueErr
+					}
+					if ok {
+						if err := repos.Queue.Upsert(ctx, queueRecord); err != nil {
+							return storage.LoopRecord{}, err
+						}
 					}
 				}
 			}
@@ -2935,7 +2963,7 @@ func serializeRun(run storage.RunRecord) runResponse {
 func buildLoopTarget(targetType string, body createLoopRequest) (domain.LoopTarget, error) {
 	switch targetType {
 	case string(domain.LoopTargetTypeProject):
-		targetID := strings.TrimSpace(derefString(body.TargetID))
+		targetID := normalizeProjectTargetID(derefString(body.TargetID))
 		if targetID == "" {
 			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "targetId is required"}
 		}
@@ -3123,7 +3151,7 @@ func prNumberFromTargetCompat(target domain.LoopTarget) *int64 {
 func loopTargetKeyCompat(target domain.LoopTarget) string {
 	switch target.TargetType {
 	case domain.LoopTargetTypeProject:
-		return "project:" + target.ProjectID
+		return "project:" + normalizeProjectTargetID(target.ProjectID)
 	case domain.LoopTargetTypeIssue:
 		return fmt.Sprintf("issue:%s:%d", target.Repo, target.IssueNumber)
 	default:
@@ -3131,13 +3159,13 @@ func loopTargetKeyCompat(target domain.LoopTarget) string {
 	}
 }
 
-func assertUniqueActiveLoopCompat(existing []storage.LoopRecord, projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) error {
+func assertUniqueActiveLoopCompat(existing []storage.LoopRecord, candidateID, projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) error {
 	if !domain.IsActiveLoopStatus(status) {
 		return nil
 	}
 
 	for _, loop := range existing {
-		if !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+		if loop.ID == candidateID || !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
 			continue
 		}
 
@@ -3164,10 +3192,7 @@ func loopTargetKeyFromRecordCompat(loop storage.LoopRecord) string {
 		if loop.TargetID == nil {
 			return "project:"
 		}
-		if strings.HasPrefix(*loop.TargetID, "project:") {
-			return *loop.TargetID
-		}
-		return "project:" + *loop.TargetID
+		return "project:" + normalizeProjectTargetID(*loop.TargetID)
 	case string(domain.LoopTargetTypeIssue):
 		if loop.TargetID == nil {
 			return "issue:"
@@ -3179,6 +3204,44 @@ func loopTargetKeyFromRecordCompat(loop storage.LoopRecord) string {
 		}
 		return fmt.Sprintf("pull_request:%s:%d", *loop.Repo, *loop.PRNumber)
 	}
+}
+
+func loopTargetFromRecordCompat(loop storage.LoopRecord) (domain.LoopTarget, error) {
+	target := domain.LoopTarget{TargetType: domain.LoopTargetType(loop.TargetType)}
+	switch target.TargetType {
+	case domain.LoopTargetTypeProject:
+		if loop.TargetID == nil {
+			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("project loop %s has no target id", loop.ID)}
+		}
+		target.ProjectID = normalizeProjectTargetID(*loop.TargetID)
+	case domain.LoopTargetTypeIssue:
+		if loop.Repo == nil || loop.TargetID == nil {
+			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("issue loop %s is missing target data", loop.ID)}
+		}
+		target.Repo = *loop.Repo
+		index := strings.LastIndex(*loop.TargetID, ":")
+		if index < 0 || index+1 >= len(*loop.TargetID) {
+			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("issue loop %s has invalid target id %q", loop.ID, *loop.TargetID)}
+		}
+		if _, err := fmt.Sscanf((*loop.TargetID)[index+1:], "%d", &target.IssueNumber); err != nil {
+			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("issue loop %s has invalid issue number: %v", loop.ID, err)}
+		}
+	default:
+		if loop.Repo == nil || loop.PRNumber == nil {
+			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("pull request loop %s is missing target data", loop.ID)}
+		}
+		target.Repo = *loop.Repo
+		target.PRNumber = *loop.PRNumber
+	}
+	return target, nil
+}
+
+func normalizeProjectTargetID(targetID string) string {
+	normalized := strings.TrimSpace(targetID)
+	for strings.HasPrefix(normalized, "project:") {
+		normalized = strings.TrimPrefix(normalized, "project:")
+	}
+	return normalized
 }
 
 func parseIssueNumber(targetID string) (int64, error) {
