@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 func DefaultLooperHome() (string, error) {
@@ -79,7 +80,7 @@ func DefaultConfig(cwd string) (Config, error) {
 		Notifications: NotificationConfig{
 			InApp: true,
 			Osascript: OsascriptNotificationConfig{
-				Enabled: true,
+				Enabled: runtime.GOOS == "darwin",
 				SoundForLevels: []NotificationSoundLevel{
 					NotificationSoundLevelActionRequired,
 					NotificationSoundLevelFailure,

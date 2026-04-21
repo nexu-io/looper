@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -641,8 +642,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatal("DefaultConfig().Notifications.InApp = false, want true")
 	}
 
-	if !config.Notifications.Osascript.Enabled {
-		t.Fatal("DefaultConfig().Notifications.Osascript.Enabled = false, want true")
+	if got, want := config.Notifications.Osascript.Enabled, runtime.GOOS == "darwin"; got != want {
+		t.Fatalf("DefaultConfig().Notifications.Osascript.Enabled = %v, want %v", got, want)
 	}
 
 	if config.Daemon.Mode != DaemonModeForeground {
