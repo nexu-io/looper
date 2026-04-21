@@ -569,7 +569,7 @@ func resolveClaudeArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 
 func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string {
 	resolved := append([]string{}, args...)
-	if len(resolved) == 0 || resolved[0] != "exec" {
+	if !containsArg(resolved, "exec") {
 		resolved = append([]string{"exec"}, resolved...)
 	}
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
@@ -581,7 +581,7 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 
 func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, prompt string) []string {
 	resolved := append([]string{}, args...)
-	if len(resolved) == 0 || resolved[0] != "run" {
+	if !containsArg(resolved, "run") {
 		resolved = append([]string{"run"}, resolved...)
 	}
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
@@ -615,6 +615,15 @@ func hasAnyFlag(args []string, flags []string) bool {
 			if arg == flag {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func containsArg(args []string, target string) bool {
+	for _, arg := range args {
+		if arg == target {
+			return true
 		}
 	}
 	return false

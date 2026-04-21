@@ -48,6 +48,40 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	}
 }
 
+func TestResolveSpawnCodexDoesNotDuplicateExecSubcommand(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	command, args := ResolveSpawn(ExecutorConfig{
+		Vendor: config.AgentVendorCodex,
+		Model:  &model,
+		Params: map[string]any{"args": []any{"--profile", "test", "exec"}},
+	}, "hello")
+	if command != "codex" {
+		t.Fatalf("codex command = %q, want codex", command)
+	}
+	if strings.Join(args, " ") != "--model gpt-5 --profile test exec hello" {
+		t.Fatalf("codex args = %#v, want single exec subcommand preserved", args)
+	}
+}
+
+func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	command, args := ResolveSpawn(ExecutorConfig{
+		Vendor: config.AgentVendorOpenCode,
+		Model:  &model,
+		Params: map[string]any{"args": []any{"--profile", "test", "run"}},
+	}, "hello")
+	if command != "opencode" {
+		t.Fatalf("opencode command = %q, want opencode", command)
+	}
+	if strings.Join(args, " ") != "--model gpt-5 --profile test run hello" {
+		t.Fatalf("opencode args = %#v, want single run subcommand preserved", args)
+	}
+}
+
 func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	t.Parallel()
 
