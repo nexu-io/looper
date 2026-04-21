@@ -67,7 +67,10 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	if len(fixerRunner.discoverCalls) != 1 || fixerRunner.discoverCalls[0].Repo != "powerformer/looper" {
 		t.Fatalf("fixer discover calls = %#v, want stored project repo", fixerRunner.discoverCalls)
 	}
-	if len(workerRunner.processClaims) != 1 {
+	waitForSchedulerCondition(t, func() bool {
+		return workerRunner.processClaimCount() == 1
+	})
+	if workerRunner.processClaimCount() != 1 {
 		t.Fatalf("worker process claims = %#v, want one queued worker run", workerRunner.processClaims)
 	}
 }
@@ -90,7 +93,10 @@ func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runScheduledQueueItems() error = %v", err)
 	}
-	if len(plannerRunner.processClaims) != 1 || len(reviewerRunner.processClaims) != 1 || len(fixerRunner.processClaims) != 1 || len(workerRunner.processClaims) != 1 {
+	waitForSchedulerCondition(t, func() bool {
+		return plannerRunner.processClaimCount() == 1 && reviewerRunner.processClaimCount() == 1 && fixerRunner.processClaimCount() == 1 && workerRunner.processClaimCount() == 1
+	})
+	if plannerRunner.processClaimCount() != 1 || reviewerRunner.processClaimCount() != 1 || fixerRunner.processClaimCount() != 1 || workerRunner.processClaimCount() != 1 {
 		t.Fatalf("process claims = planner:%#v reviewer:%#v fixer:%#v worker:%#v, want one each", plannerRunner.processClaims, reviewerRunner.processClaims, fixerRunner.processClaims, workerRunner.processClaims)
 	}
 }
@@ -107,9 +113,42 @@ func TestRunScheduledQueueItemsProcessesItemsConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runScheduledQueueItems() error = %v", err)
 	}
+	waitForSchedulerCondition(t, func() bool {
+		return atomic.LoadInt32(&runner.calls) == 2
+	})
 	if got := atomic.LoadInt32(&runner.calls); got != 2 {
 		t.Fatalf("worker ProcessNext calls = %d, want 2", got)
 	}
+}
+
+func TestRunScheduledQueueItemsReturnsBeforeClaimedRunsFinish(t *testing.T) {
+	t.Parallel()
+
+	runner := &blockingWorkerScheduler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	returned := make(chan error, 1)
+	go func() {
+		returned <- runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{Type: "worker"}}, defaultSchedulerTickInput{Worker: runner})
+	}()
+
+	select {
+	case <-runner.started:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("worker ProcessNext did not start")
+	}
+
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatalf("runScheduledQueueItems() error = %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("runScheduledQueueItems() did not return before claimed run finished")
+	}
+
+	close(runner.release)
 }
 
 func TestRunScheduledQueueItemsRejectsUnsupportedType(t *testing.T) {
@@ -199,7 +238,10 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "planner discovery failed") {
 		t.Fatalf("runDefaultSchedulerTick() error = %v, want joined discovery error", err)
 	}
-	if len(workerRunner.processClaims) != 1 {
+	waitForSchedulerCondition(t, func() bool {
+		return workerRunner.processClaimCount() == 1
+	})
+	if workerRunner.processClaimCount() != 1 {
 		t.Fatalf("worker process claims = %#v, want queue processing to continue", workerRunner.processClaims)
 	}
 }
@@ -226,6 +268,12 @@ func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) 
 	return nil, s.processErr
 }
 
+func (s *stubPlannerScheduler) processClaimCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processClaims)
+}
+
 type stubReviewerScheduler struct {
 	mu            sync.Mutex
 	discoverCalls []reviewer.DiscoveryInput
@@ -246,6 +294,12 @@ func (s *stubReviewerScheduler) ProcessNext(_ context.Context, claimedBy string)
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
+}
+
+func (s *stubReviewerScheduler) processClaimCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processClaims)
 }
 
 type stubFixerScheduler struct {
@@ -270,6 +324,12 @@ func (s *stubFixerScheduler) ProcessNext(_ context.Context, claimedBy string) (*
 	return nil, s.processErr
 }
 
+func (s *stubFixerScheduler) processClaimCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processClaims)
+}
+
 type stubWorkerScheduler struct {
 	mu            sync.Mutex
 	processClaims []string
@@ -281,6 +341,12 @@ func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
+}
+
+func (s *stubWorkerScheduler) processClaimCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processClaims)
 }
 
 type parallelWorkerScheduler struct {
@@ -301,4 +367,32 @@ func (s *parallelWorkerScheduler) ProcessNext(_ context.Context, _ string) (*wor
 		close(s.secondStarted)
 	}
 	return nil, nil
+}
+
+type blockingWorkerScheduler struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*worker.ProcessResult, error) {
+	s.once.Do(func() {
+		close(s.started)
+	})
+	<-s.release
+	return nil, nil
+}
+
+func waitForSchedulerCondition(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !condition() {
+		t.Fatal("condition not satisfied before timeout")
+	}
 }

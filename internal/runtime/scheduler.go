@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/powerformer/looper/internal/agent"
@@ -624,64 +623,68 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 
-	errCh := make(chan error, len(queueItems))
-	var wg sync.WaitGroup
+	errList := make([]error, 0)
 	for _, item := range queueItems {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		wg.Add(1)
-		go func(item storage.QueueItemRecord) {
-			defer wg.Done()
 
-			claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
-			switch item.Type {
-			case "planner":
-				if input.Planner == nil {
-					errCh <- fmt.Errorf("planner runner is not configured")
-					return
-				}
-				_, err := input.Planner.ProcessNext(ctx, claimedBy)
-				errCh <- wrapSchedulerQueueError(item.Type, err)
-			case "reviewer":
-				if input.Reviewer == nil {
-					errCh <- fmt.Errorf("reviewer runner is not configured")
-					return
-				}
-				_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
-				errCh <- wrapSchedulerQueueError(item.Type, err)
-			case "fixer":
-				if input.Fixer == nil {
-					errCh <- fmt.Errorf("fixer runner is not configured")
-					return
-				}
-				_, err := input.Fixer.ProcessNext(ctx, claimedBy)
-				errCh <- wrapSchedulerQueueError(item.Type, err)
-			case "worker":
-				if input.Worker == nil {
-					errCh <- fmt.Errorf("worker runner is not configured")
-					return
-				}
-				_, err := input.Worker.ProcessNext(ctx, claimedBy)
-				errCh <- wrapSchedulerQueueError(item.Type, err)
-			default:
-				errCh <- fmt.Errorf("unsupported queue item type %q", item.Type)
-			}
-		}(item)
-	}
-	wg.Wait()
-	close(errCh)
-
-	errs := make([]error, 0)
-	for err := range errCh {
+		process, err := schedulerQueueProcessor(item.Type, input)
 		if err != nil {
-			errs = append(errs, err)
+			errList = append(errList, err)
+			continue
 		}
+
+		go func(item storage.QueueItemRecord, process func(context.Context, string) error) {
+			claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
+			if err := process(ctx, claimedBy); err != nil && input.Logger != nil {
+				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "error": err.Error()})
+			}
+		}(item, process)
 	}
-	if len(errs) == 0 {
+	if len(errList) == 0 {
 		return nil
 	}
-	return errors.Join(errs...)
+	return errors.Join(errList...)
+}
+
+func schedulerQueueProcessor(queueType string, input defaultSchedulerTickInput) (func(context.Context, string) error, error) {
+	switch queueType {
+	case "planner":
+		if input.Planner == nil {
+			return nil, fmt.Errorf("planner runner is not configured")
+		}
+		return func(ctx context.Context, claimedBy string) error {
+			_, err := input.Planner.ProcessNext(ctx, claimedBy)
+			return wrapSchedulerQueueError(queueType, err)
+		}, nil
+	case "reviewer":
+		if input.Reviewer == nil {
+			return nil, fmt.Errorf("reviewer runner is not configured")
+		}
+		return func(ctx context.Context, claimedBy string) error {
+			_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
+			return wrapSchedulerQueueError(queueType, err)
+		}, nil
+	case "fixer":
+		if input.Fixer == nil {
+			return nil, fmt.Errorf("fixer runner is not configured")
+		}
+		return func(ctx context.Context, claimedBy string) error {
+			_, err := input.Fixer.ProcessNext(ctx, claimedBy)
+			return wrapSchedulerQueueError(queueType, err)
+		}, nil
+	case "worker":
+		if input.Worker == nil {
+			return nil, fmt.Errorf("worker runner is not configured")
+		}
+		return func(ctx context.Context, claimedBy string) error {
+			_, err := input.Worker.ProcessNext(ctx, claimedBy)
+			return wrapSchedulerQueueError(queueType, err)
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported queue item type %q", queueType)
+	}
 }
 
 func repoFromProjectMetadata(metadataJSON *string) string {
