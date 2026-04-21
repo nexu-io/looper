@@ -38,8 +38,60 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.DedupeKey != "reviewer:acme/looper:42" {
+	if queue == nil || queue.Status != "queued" || queue.DedupeKey != "reviewer:project_1:"+result.CreatedLoopIDs[0]+":acme/looper:42" {
 		t.Fatalf("queue = %#v, want queued reviewer item", queue)
+	}
+}
+
+func TestEnqueueScopesReviewerDedupeKeyToLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project2ID := "project_2"
+	loop1ID := "loop_1"
+	loop2ID := "loop_2"
+	nowISO := fixture.nowISO()
+	baseBranch := "main"
+	repoPath2 := filepath.Join(t.TempDir(), "repo-2")
+	repo := "acme/looper"
+	prNumber := int64(42)
+
+	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: project2ID, Name: "Looper Two", RepoPath: repoPath2, BaseBranch: &baseBranch, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	for _, loop := range []storage.LoopRecord{
+		{ID: loop1ID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: loop2ID, Seq: 2, ProjectID: project2ID, Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	first, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop1ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue(first) error = %v", err)
+	}
+	second, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: project2ID, LoopID: loop2ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue(second) error = %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("enqueue(second) reused queue item %q across loops", second.ID)
+	}
+	if second.LoopID == nil || *second.LoopID != loop2ID {
+		t.Fatalf("second loopID = %#v, want %q", second.LoopID, loop2ID)
+	}
+	if second.DedupeKey != buildReviewerDedupeKey(project2ID, loop2ID, repo, prNumber) {
+		t.Fatalf("second dedupe key = %q, want scoped reviewer key", second.DedupeKey)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(Queue.List()) = %d, want 2", len(items))
 	}
 }
 

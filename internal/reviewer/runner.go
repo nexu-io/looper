@@ -1149,7 +1149,7 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
-	dedupeKey := fmt.Sprintf("reviewer:%s:%d", input.Repo, input.PRNumber)
+	dedupeKey := buildReviewerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
@@ -1167,6 +1167,10 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		return storage.QueueItemRecord{}, err
 	}
 	return queueItem, nil
+}
+
+func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) string {
+	return fmt.Sprintf("reviewer:%s:%s:%s:%d", projectID, loopID, repo, prNumber)
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {

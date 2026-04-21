@@ -1305,7 +1305,7 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
-	dedupeKey := buildFixerDedupeKey(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)
+	dedupeKey := buildFixerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
@@ -1685,8 +1685,8 @@ func buildPullRequestTargetID(repo string, prNumber int64) string {
 	return fmt.Sprintf("pr:%s:%d", repo, prNumber)
 }
 
-func buildFixerDedupeKey(repo string, prNumber int64, headSHA, fixItemsHash string) string {
-	return fmt.Sprintf("fixer:%s:%d:%s:%s", repo, prNumber, headSHA, fixItemsHash)
+func buildFixerDedupeKey(projectID, loopID, repo string, prNumber int64, headSHA, fixItemsHash string) string {
+	return fmt.Sprintf("fixer:%s:%s:%s:%d:%s:%s", projectID, loopID, repo, prNumber, headSHA, fixItemsHash)
 }
 
 func hashFixItems(items []FixItem) string {
