@@ -2028,6 +2028,7 @@ func newTestFixture(t *testing.T) testFixture {
 	cfg.Storage.BackupDir = &backupDir
 	cfg.Daemon.LogDir = filepath.Join(rootDir, "logs")
 	cfg.Daemon.WorkingDirectory = rootDir
+	cfg.Notifications.Osascript.Enabled = true
 	cfg.Tools.GitPath = stringPtr("/usr/bin/git")
 	cfg.Tools.GHPath = stringPtr("/usr/bin/gh")
 	cfg.Tools.OsascriptPath = stringPtr("/usr/bin/osascript")
