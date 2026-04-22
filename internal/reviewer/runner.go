@@ -11,6 +11,7 @@ import (
 
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -21,6 +22,7 @@ const (
 	stepFilter   ReviewerStep = "filter"
 	stepClaim    ReviewerStep = "claim"
 	stepSnapshot ReviewerStep = "snapshot"
+	stepWorktree ReviewerStep = "worktree"
 	stepReview   ReviewerStep = "review"
 	stepPublish  ReviewerStep = "publish"
 )
@@ -30,6 +32,7 @@ var reviewerStepSequence = []ReviewerStep{
 	stepFilter,
 	stepClaim,
 	stepSnapshot,
+	stepWorktree,
 	stepReview,
 	stepPublish,
 }
@@ -81,11 +84,50 @@ type PullRequestDetail struct {
 	Labels         []string
 	HeadSHA        string
 	BaseSHA        string
+	HeadRefName    string
+	BaseRefName    string
 	Author         string
 	ReviewRequests []string
 	ChecksSummary  string
 	Diff           string
 	Comments       []map[string]any
+}
+
+type CreateWorktreeInput struct {
+	ProjectID         string
+	RepoPath          string
+	WorktreeRoot      string
+	Branch            string
+	BaseBranch        string
+	PRNumber          int64
+	ProtectedBranches []string
+	CheckoutMode      string
+}
+
+type CreateWorktreeResult struct {
+	WorktreePath string
+	Branch       string
+	HeadSHA      string
+}
+
+type PrepareWorktreeInput struct {
+	WorktreePath    string
+	Branch          string
+	ExpectedHeadSHA string
+	Remote          string
+}
+
+type PrepareWorktreeResult struct {
+	HeadSHA string
+	Clean   bool
+}
+
+type CleanupWorktreeInput struct {
+	ProjectID         string
+	RepoPath          string
+	WorktreePath      string
+	Branch            string
+	ProtectedBranches []string
 }
 
 type transientFailure interface{ Temporary() bool }
@@ -170,6 +212,12 @@ type GitHubGateway interface {
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 }
 
+type GitGateway interface {
+	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
+	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
+	CleanupWorktree(context.Context, CleanupWorktreeInput) error
+}
+
 type AgentRunInput struct {
 	ExecutionID      string
 	ProjectID        string
@@ -213,6 +261,7 @@ type Options struct {
 	DB                      *sql.DB
 	Repos                   *storage.Repositories
 	GitHub                  GitHubGateway
+	Git                     GitGateway
 	AgentExecutor           AgentExecutor
 	Logger                  bootstrap.Logger
 	Now                     func() time.Time
@@ -228,6 +277,7 @@ type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories
 	github                  GitHubGateway
+	git                     GitGateway
 	agentExecutor           AgentExecutor
 	logger                  bootstrap.Logger
 	now                     func() time.Time
@@ -265,6 +315,7 @@ type reviewerCheckpoint struct {
 	Detail         *checkpointDetail        `json:"detail,omitempty"`
 	ClaimedLockKey string                   `json:"claimedLockKey,omitempty"`
 	Snapshot       *checkpointSnapshot      `json:"snapshot,omitempty"`
+	Worktree       *checkpointWorktree      `json:"worktree,omitempty"`
 	PendingReview  *pendingReviewCheckpoint `json:"pendingReview,omitempty"`
 	SkipReason     string                   `json:"skipReason,omitempty"`
 }
@@ -277,7 +328,18 @@ type checkpointDetail struct {
 	Labels         []string `json:"labels,omitempty"`
 	HeadSHA        string   `json:"headSha,omitempty"`
 	BaseSHA        string   `json:"baseSha,omitempty"`
+	HeadRefName    string   `json:"headRefName,omitempty"`
+	BaseRefName    string   `json:"baseRefName,omitempty"`
 	Author         string   `json:"author,omitempty"`
+}
+
+type checkpointWorktree struct {
+	Path       string `json:"path,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	BaseBranch string `json:"baseBranch,omitempty"`
+	HeadSHA    string `json:"headSha,omitempty"`
+	PreparedAt string `json:"preparedAt,omitempty"`
+	CleanedAt  string `json:"cleanedAt,omitempty"`
 }
 
 type checkpointSnapshot struct {
@@ -361,6 +423,7 @@ func New(options Options) *Runner {
 		db:                      options.DB,
 		repos:                   options.Repos,
 		github:                  options.GitHub,
+		git:                     options.Git,
 		agentExecutor:           options.AgentExecutor,
 		logger:                  options.Logger,
 		now:                     now,
@@ -658,6 +721,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if loopErr != nil {
 				return ProcessResult{}, loopErr
 			}
+			if failedQueue == nil || failedQueue.Status != "queued" {
+				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
+			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if step == stepClaim {
@@ -691,6 +757,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 	status := "success"
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
@@ -718,6 +785,8 @@ func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepI
 		return r.runClaimStep(ctx, input)
 	case stepSnapshot:
 		return r.runSnapshotStep(ctx, input)
+	case stepWorktree:
+		return r.runPrepareWorktreeStep(ctx, input)
 	case stepReview:
 		return r.runReviewStep(ctx, input)
 	case stepPublish:
@@ -733,7 +802,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, Author: detail.Author}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -795,17 +864,83 @@ func (r *Runner) runSnapshotStep(ctx context.Context, input stepInput) (reviewer
 	return checkpoint, nil
 }
 
-func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
-	if input.Checkpoint.PendingReview != nil {
-		return input.Checkpoint, nil
+func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.SkipReason != "" {
+		return checkpoint, nil
 	}
-	if input.Checkpoint.Snapshot == nil {
-		return input.Checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
+	if checkpoint.Worktree != nil && checkpoint.Worktree.PreparedAt != "" {
+		return checkpoint, nil
+	}
+	if r.git == nil {
+		return checkpoint, fmt.Errorf("reviewer git gateway is not configured")
+	}
+	if checkpoint.Detail == nil {
+		return checkpoint, &loopError{message: "Missing PR detail checkpoint for worktree step", kind: FailureRetryableTransient}
+	}
+	if checkpoint.Snapshot == nil {
+		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for worktree step", kind: FailureRetryableTransient}
+	}
+	branch := strings.TrimSpace(checkpoint.Detail.HeadRefName)
+	if branch == "" {
+		return checkpoint, &loopError{message: fmt.Sprintf("Missing pull request head ref for %s#%d", input.Repo, input.PRNumber), kind: FailureManualIntervention}
+	}
+	baseBranch := firstNonEmpty(strings.TrimSpace(checkpoint.Detail.BaseRefName), derefString(input.Project.BaseBranch), "main")
+	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
+	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
+	if worktreeRoot == "" {
+		resolvedRoot, err := config.DefaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
+		worktreeRoot = resolvedRoot
+	}
+	protectedBranches := make([]string, 0, 2)
+	if candidate := strings.TrimSpace(checkpoint.Detail.BaseRefName); candidate != "" {
+		protectedBranches = append(protectedBranches, candidate)
+	}
+	if candidate := strings.TrimSpace(derefString(input.Project.BaseBranch)); candidate != "" {
+		protectedBranches = append(protectedBranches, candidate)
+	}
+	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: baseBranch, ProtectedBranches: protectedBranches, CheckoutMode: "detached"})
+	if err != nil {
+		return checkpoint, err
+	}
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	if err != nil {
+		return checkpoint, err
+	}
+	if !prepared.Clean {
+		return checkpoint, &loopError{message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
+	}
+	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, BaseBranch: baseBranch, HeadSHA: prepared.HeadSHA, PreparedAt: r.nowISO()}
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	var err error
+	if checkpoint.PendingReview != nil {
+		return checkpoint, nil
+	}
+	if checkpoint.Snapshot == nil {
+		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
+	}
+	if checkpoint.Worktree == nil {
+		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
+		if err != nil {
+			return input.Checkpoint, err
+		}
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, input.Checkpoint), WorkingDirectory: input.Project.RepoPath, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: fmt.Sprintf("reviewer:%s:%s", input.Loop.ID, input.Checkpoint.Snapshot.HeadSHA)})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: fmt.Sprintf("reviewer:%s:%s", input.Loop.ID, checkpoint.Snapshot.HeadSHA)})
 	if err != nil {
-		return input.Checkpoint, err
+		return checkpoint, err
 	}
 	if r.onAgentExecutionStarted != nil {
 		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Review started", DedupeKey: "runtime.agent.started:reviewer:" + input.Run.ID}); err != nil && r.logger != nil {
@@ -816,11 +951,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	result, err := execution.Wait(ctx)
 	if err != nil {
 		_ = r.tryRemoveReaction(ctx, input, "eyes")
-		return input.Checkpoint, err
+		return checkpoint, err
 	}
 	if result.Status != "completed" {
 		_ = r.tryRemoveReaction(ctx, input, "eyes")
-		return input.Checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Reviewer agent %s", result.Status)), kind: FailureRetryableTransient}
+		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Reviewer agent %s", result.Status)), kind: FailureRetryableTransient}
 	}
 	feedback := parseReviewFeedback(result)
 	if !feedback.Clean && len(feedback.Comments) == 0 {
@@ -829,10 +964,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if result.ParseStatus == "invalid_json" {
 			kind = FailureNonRetryable
 		}
-		return input.Checkpoint, &loopError{message: "Reviewer agent produced no actionable review comments", kind: kind}
+		return checkpoint, &loopError{message: "Reviewer agent produced no actionable review comments", kind: kind}
 	}
-	checkpoint := input.Checkpoint
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: input.Checkpoint.Snapshot.HeadSHA, Event: ternaryReviewEvent(feedback.Clean), Body: feedback.Body, Summary: result.Summary, Comments: feedback.Comments, Clean: feedback.Clean}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: ternaryReviewEvent(feedback.Clean), Body: feedback.Body, Summary: result.Summary, Comments: feedback.Comments, Clean: feedback.Clean}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1517,6 +1651,28 @@ func normalizePendingReviewCheckpoint(pending pendingReviewCheckpoint) pendingRe
 		pending.Comments = []reviewFeedbackComment{}
 	}
 	return pending
+}
+
+func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {
+	if r.git == nil || checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
+		return
+	}
+	protectedBranches := []string{}
+	if baseBranch := strings.TrimSpace(derefString(project.BaseBranch)); baseBranch != "" {
+		protectedBranches = append(protectedBranches, baseBranch)
+	}
+	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: protectedBranches}); err != nil {
+		r.logWarn("reviewer worktree cleanup failed", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "error": err.Error()})
+		return
+	}
+	checkpoint.Worktree.CleanedAt = r.nowISO()
+}
+
+func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error) {
+	if checkpoint.Worktree == nil {
+		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
+	}
+	return checkpoint.Worktree, nil
 }
 
 func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {
