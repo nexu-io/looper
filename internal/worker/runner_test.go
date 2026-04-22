@@ -47,6 +47,20 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
 	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+		if err != nil {
+			t.Fatalf("Queue.GetByID() in notification callback error = %v", err)
+		}
+		if queue == nil || queue.Status != "completed" {
+			t.Fatalf("queue during notification = %#v, want completed queue item", queue)
+		}
+		loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+		if err != nil {
+			t.Fatalf("Loops.GetByID() in notification callback error = %v", err)
+		}
+		if loop == nil || loop.Status != "completed" || loop.NextRunAt != nil {
+			t.Fatalf("loop during notification = %#v, want completed loop", loop)
+		}
 		completed = append(completed, input)
 		return nil
 	}})
@@ -566,6 +580,47 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	}
+}
+
+func TestRecoverClaimedItemDoesNotReusePreviousRunID(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	priorStartedAt := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC).Format(time.RFC3339Nano)
+	claimedAt := time.Date(2024, time.January, 2, 3, 5, 5, 0, time.UTC).Format(time.RFC3339Nano)
+	loopTarget := "project:project_1"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_prior_run", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := `{"work":{"title":"Older worker run"}}`
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_prior", LoopID: "loop_worker_prior_run", Status: "success", CheckpointJSON: &checkpointJSON, StartedAt: priorStartedAt, EndedAt: &priorStartedAt, CreatedAt: priorStartedAt, UpdatedAt: priorStartedAt}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_prior_run"
+	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_prior_run", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_prior_run", Priority: 1, Status: "running", AvailableAt: nowISO, ClaimedAt: &claimedAt, Attempts: 0, MaxAttempts: 1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	completed := make([]RunCompletedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
+	}})
+
+	result, err := runner.recoverClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_worker_prior_run", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_prior_run", Priority: 1, Status: "running", AvailableAt: nowISO, ClaimedAt: &claimedAt, Attempts: 0, MaxAttempts: 1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}, fmt.Errorf("project lookup failed"))
+	if err != nil {
+		t.Fatalf("recoverClaimedItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
+	}
+	if len(completed) != 1 {
+		t.Fatalf("completed = %#v, want one recovery notification", completed)
+	}
+	if completed[0].RunID != "" {
+		t.Fatalf("completed[0].RunID = %q, want empty run ID for recovery before new run creation", completed[0].RunID)
 	}
 }
 

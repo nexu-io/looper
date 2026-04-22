@@ -618,7 +618,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
 	}
@@ -633,6 +632,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
+	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
 
@@ -1225,9 +1225,11 @@ func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem stor
 	runID := ""
 	checkpoint := workerCheckpoint{}
 	if latestRun, runErr := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID); runErr == nil && latestRun != nil {
-		runID = latestRun.ID
-		if parsed, parseErr := parseCheckpoint(latestRun.CheckpointJSON); parseErr == nil {
-			checkpoint = parsed
+		if runMatchesQueueAttempt(queueItem, *latestRun) {
+			runID = latestRun.ID
+			if parsed, parseErr := parseCheckpoint(latestRun.CheckpointJSON); parseErr == nil {
+				checkpoint = parsed
+			}
 		}
 	}
 	r.notifyRunCompleted(ctx, RunCompletedInput{
@@ -1241,6 +1243,13 @@ func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem stor
 		PullRequestNumber: pullRequestNumber(checkpoint.PullRequest),
 		PullRequestURL:    pullRequestURL(checkpoint.PullRequest),
 	})
+}
+
+func runMatchesQueueAttempt(queueItem storage.QueueItemRecord, run storage.RunRecord) bool {
+	if queueItem.ClaimedAt == nil || *queueItem.ClaimedAt == "" {
+		return run.Status == "running"
+	}
+	return run.StartedAt >= *queueItem.ClaimedAt
 }
 
 func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind QueueFailureKind, summary string) RunCompletedInput {
