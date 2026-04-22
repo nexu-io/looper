@@ -1341,7 +1341,7 @@ func issueRepoFromURL(raw string) string {
 }
 
 func issueLookupRepo(work workerInput) string {
-	return firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(work.IssueURL))
+	return firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(work.IssueURL), work.Repo)
 }
 
 func resolvedIssueRepo(work workerInput, issue IssueDetail) string {

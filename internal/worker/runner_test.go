@@ -197,7 +197,7 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	}
 }
 
-func TestResolveWorkerInputDefersIssueRepoFallbackUntilAfterHydration(t *testing.T) {
+func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/powerformer/looper/issues/27"}}
@@ -227,8 +227,8 @@ func TestResolveWorkerInputDefersIssueRepoFallbackUntilAfterHydration(t *testing
 	if len(github.viewIssueCalls) != 1 {
 		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
 	}
-	if github.viewIssueCalls[0].Repo != "" {
-		t.Fatalf("ViewIssue repo = %q, want empty repo before hydration inference", github.viewIssueCalls[0].Repo)
+	if github.viewIssueCalls[0].Repo != "acme/looper" {
+		t.Fatalf("ViewIssue repo = %q, want worker repo fallback for hydration lookup", github.viewIssueCalls[0].Repo)
 	}
 	if work.IssueRepo != "powerformer/looper" {
 		t.Fatalf("work.IssueRepo = %q, want powerformer/looper", work.IssueRepo)
