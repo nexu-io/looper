@@ -1186,7 +1186,9 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	updatedQueue.TargetID = targetID
 	updatedQueue.Repo = stringPtr(repo)
 	updatedQueue.PRNumber = int64Ptr(pr.Number)
-	updatedQueue.LockKey = stringPtr(targetID)
+	if !strings.HasPrefix(derefString(queueItem.LockKey), "issue:") {
+		updatedQueue.LockKey = stringPtr(targetID)
+	}
 	projectID := derefString(queueItem.ProjectID)
 	if projectID != "" {
 		updatedQueue.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, repo, pr.Number)
