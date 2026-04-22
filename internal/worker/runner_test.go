@@ -94,6 +94,48 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 }
 
+func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
+	t.Parallel()
+	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "powerformer/looper", IssueNumber: 27, IssueURL: "https://github.com/powerformer/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
+	if !strings.Contains(body, "Issue: powerformer/looper#27") {
+		t.Fatalf("body = %q, want issue repo reference", body)
+	}
+	if !strings.Contains(body, "Closes powerformer/looper#27") {
+		t.Fatalf("body = %q, want cross-repo closing reference", body)
+	}
+	if strings.Contains(body, "Closes #27") {
+		t.Fatalf("body = %q, want fully qualified cross-repo closing reference only", body)
+	}
+}
+
+func TestBuildPullRequestBodyUsesBareClosingReferenceForSameRepo(t *testing.T) {
+	t.Parallel()
+	body := buildPullRequestBody(workerInput{Repo: "powerformer/looper", IssueRepo: "powerformer/looper", IssueNumber: 27}, nil, nil)
+	if !strings.Contains(body, "Closes #27") {
+		t.Fatalf("body = %q, want same-repo closing reference", body)
+	}
+	if strings.Contains(body, "Closes powerformer/looper#27") {
+		t.Fatalf("body = %q, want unqualified same-repo closing reference", body)
+	}
+}
+
+func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
+	t.Parallel()
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/powerformer/looper/issues/27"})
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if issueRepoFromURL("https://gitlab.com/powerformer/looper/issues/27") != "" {
+		t.Fatal("issueRepoFromURL() should ignore non-GitHub hosts")
+	}
+	if issueRepoFromURL("https://github.com/powerformer/looper/issues/not-a-number") != "" {
+		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
+	}
+	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes powerformer/looper#27") {
+		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work))
+	}
+}
+
 func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

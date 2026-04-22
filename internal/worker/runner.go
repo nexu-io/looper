@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -290,10 +292,12 @@ type ProcessResult struct {
 }
 
 type workerInput struct {
-	Title         string   `json:"title,omitempty"`
-	Prompt        string   `json:"prompt,omitempty"`
-	SpecPath      string   `json:"specPath,omitempty"`
-	Repo          string   `json:"repo,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+	SpecPath string `json:"specPath,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
+	IssueRepo     string   `json:"issueRepo,omitempty"`
 	BaseBranch    string   `json:"baseBranch,omitempty"`
 	ExecutionMode string   `json:"executionMode,omitempty"`
 	IssueNumber   int64    `json:"issueNumber,omitempty"`
@@ -914,7 +918,10 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	if work.IssueNumber > 0 && strings.TrimSpace(work.IssueRepo) == "" {
+		work.IssueRepo = work.Repo
+	}
 	if work.Repo == "" {
 		return workerInput{}, &loopError{message: "worker.repo is required", kind: FailureNonRetryable}
 	}
@@ -1290,9 +1297,50 @@ func buildAgentPullRequestInstruction(work workerInput) string {
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
 	}
 	if work.IssueNumber > 0 {
-		parts = append(parts, fmt.Sprintf("Include `Closes #%d` in the PR body.", work.IssueNumber))
+		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
 	}
 	return strings.Join(parts, "\n")
+}
+
+func formatIssueClosingReference(prRepo, issueRepo string, issueNumber int64) string {
+	if issueNumber <= 0 {
+		return ""
+	}
+	issueRepo = strings.TrimSpace(issueRepo)
+	if issueRepo == "" || strings.EqualFold(strings.TrimSpace(prRepo), issueRepo) {
+		return fmt.Sprintf("#%d", issueNumber)
+	}
+	return fmt.Sprintf("%s#%d", issueRepo, issueNumber)
+}
+
+func formatIssueReference(issueRepo string, issueNumber int64) string {
+	if issueNumber <= 0 {
+		return ""
+	}
+	issueRepo = strings.TrimSpace(issueRepo)
+	if issueRepo == "" {
+		return fmt.Sprintf("#%d", issueNumber)
+	}
+	return fmt.Sprintf("%s#%d", issueRepo, issueNumber)
+}
+
+func issueRepoFromURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(parsed.Host)
+	if host != "github.com" && host != "www.github.com" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 4 || !strings.EqualFold(parts[2], "issues") {
+		return ""
+	}
+	if _, err := strconv.ParseInt(parts[3], 10, 64); err != nil {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 func readSpecBlock(projectRepoPath, specPath string) (string, error) {
@@ -1321,10 +1369,10 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 		lines = append(lines, "", "## Agent Summary", execution.Summary)
 	}
 	if work.IssueNumber > 0 {
-		lines = append(lines, "", fmt.Sprintf("Issue: %s#%d", work.Repo, work.IssueNumber))
+		lines = append(lines, "", "Issue: "+formatIssueReference(firstNonEmpty(work.IssueRepo, work.Repo), work.IssueNumber))
 	}
 	if work.IssueURL != "" {
-		lines = append(lines, fmt.Sprintf("Issue URL: %s", work.IssueURL))
+		lines = append(lines, "", fmt.Sprintf("Issue URL: %s", work.IssueURL))
 	}
 	if work.SpecPath != "" {
 		lines = append(lines, "", fmt.Sprintf("Spec: %s", work.SpecPath))
@@ -1333,7 +1381,7 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 		lines = append(lines, "", fmt.Sprintf("Prompt: %s", work.Prompt))
 	}
 	if work.IssueNumber > 0 {
-		lines = append(lines, "", fmt.Sprintf("Closes #%d", work.IssueNumber))
+		lines = append(lines, "", "Closes "+formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1344,6 +1392,7 @@ func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInpu
 		work.Title = issue.Title
 	}
 	work.Prompt = buildIssuePrompt(work.Repo, issue)
+	work.IssueRepo = firstNonEmpty(work.IssueRepo, issueRepoFromURL(issue.URL), work.Repo)
 	work.IssueURL = issue.URL
 	return work
 }
