@@ -305,6 +305,72 @@ func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *test
 	}
 }
 
+func TestCreateRunContextFailsWhenResumeStartsAfterRepairWithoutParsedResult(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_resume_parse_status",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &loopTarget,
+		Repo:       &repo,
+		PRNumber:   &prNumber,
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		Repair: &checkpointRepair{
+			Summary:     "upstream server_error",
+			ParseStatus: "",
+		},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_repair",
+		LoopID:            "loop_fixer_resume_parse_status",
+		Status:            "failed",
+		LastCompletedStep: stringPtr(string(stepRepair)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_resume_parse_status")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want loop record")
+	}
+
+	_, err = runner.createRunContext(context.Background(), *loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want parse-status failure")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
+	}
+	if !contains(err.Error(), "server_error") {
+		t.Fatalf("error = %q, want upstream summary", err.Error())
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverAfterRemoteHeadChangeAtPush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

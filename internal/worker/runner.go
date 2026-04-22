@@ -1044,6 +1044,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
+	if err := validateWorkerResumeCheckpoint(startStep, checkpoint); err != nil {
+		return resumedRunContext{}, err
+	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: checkpoint.Work, ClaimedLockKey: checkpoint.ClaimedLockKey, Worktree: checkpoint.Worktree, Plan: checkpoint.Plan, Execution: checkpoint.Execution, Validation: checkpoint.Validation, PullRequest: checkpoint.PullRequest, SkipReason: checkpoint.SkipReason})
@@ -1380,6 +1383,15 @@ func nextWorkerStep(step WorkerStep) WorkerStep {
 		}
 	}
 	return ""
+}
+
+func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheckpoint) error {
+	switch startStep {
+	case stepValidate, stepOpenPR:
+		return validateCompletedExecutionCheckpoint(checkpoint.Execution)
+	default:
+		return nil
+	}
 }
 
 func asWorkerStep(value string) WorkerStep {

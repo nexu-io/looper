@@ -1188,6 +1188,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			}
 		}
 	}
+	if err := validateFixerResumeCheckpoint(startStep, resumedCheckpoint); err != nil {
+		return resumedRunContext{}, err
+	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscoverPR
 	initialCheckpoint := fixerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
@@ -1608,6 +1611,15 @@ func previousFixerStep(step FixerStep) FixerStep {
 		}
 	}
 	return ""
+}
+
+func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
+	switch startStep {
+	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+		return validateCompletedRepairCheckpoint(checkpoint.Repair)
+	default:
+		return nil
+	}
 }
 
 func asFixerStep(value string) FixerStep {

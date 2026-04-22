@@ -205,6 +205,54 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	}
 }
 
+func TestCreateRunContextFailsWhenResumeStartsAfterExecuteWithoutParsedResult(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Execution: &checkpointExecution{
+			Status:      "completed",
+			Summary:     "upstream server_error",
+			ParseStatus: "",
+		},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_execute",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want loop record")
+	}
+
+	_, err = runner.createRunContext(context.Background(), *loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want parse-status failure")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
+	}
+	if !strings.Contains(err.Error(), "server_error") {
+		t.Fatalf("error = %q, want upstream summary", err.Error())
+	}
+}
+
 func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
 	t.Parallel()
 	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "powerformer/looper", IssueNumber: 27, IssueURL: "https://github.com/powerformer/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
