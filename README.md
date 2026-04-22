@@ -29,18 +29,28 @@ For source development:
 
 ## Installation
 
-Looper now uses Go binaries as the default supported implementation:
+Looper now uses Go binaries as the default supported implementation.
 
-- install the `looper` CLI from GitHub Releases
-- install `looperd` separately as a managed macOS binary with `looper daemon install`
+Recommended path:
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/install.sh | sh
+```
+
+That installer:
+
+- detects the current macOS architecture
+- downloads the matching `looper` release artifact
+- verifies the published `sha256`
+- installs `looper` into a user-writable location
+
+GitHub Releases continue to publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`.
 
 Linux daemon artifacts are not supported in this phase.
 
 ### Install the CLI
 
-Recommended path:
+Fallback manual path:
 
 1. Download the matching `looper` release artifact for your macOS architecture from GitHub Releases.
 2. Rename it to `looper` if needed.
@@ -50,8 +60,12 @@ Recommended path:
 
 Recommended path:
 
+Until `looper bootstrap` lands, first-run setup remains:
+
 ```bash
 looper daemon install
+looper daemon start
+looper status
 ```
 
 This command:
@@ -69,12 +83,6 @@ Manual fallback:
 
 Daemon lookup order is fixed to `~/.looper/bin/looperd`, then `$PATH`.
 
-### Start the daemon
-
-```bash
-looper daemon start
-```
-
 Phase 1 process management is intentionally minimal. `looper daemon start` writes a pid file and launches the daemon, but it does not provide full background supervision.
 
 ### Verify the install
@@ -85,6 +93,14 @@ In another shell, verify the install and daemon connection:
 looper status
 looper daemon status
 ```
+
+### Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/uninstall.sh | sh
+```
+
+The uninstall script removes the CLI binary, the managed daemon binary, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees.
 
 ### Upgrade
 
