@@ -292,7 +292,7 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	}
 }
 
-func TestGithubCLIAutoPROpeningAvailableRequiresConfiguredAuthenticatedCLI(t *testing.T) {
+func TestGithubCLIAutoPROpeningAvailableRechecksAuthenticatedCLIWithoutConfiguredPath(t *testing.T) {
 	t.Parallel()
 
 	rootDir := t.TempDir()
@@ -329,8 +329,8 @@ esac
 	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "powerformer/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
 	}
-	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
-		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false when gh path is not configured")
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true when gateway can recheck authenticated gh cli without configured path")
 	}
 }
 

@@ -635,7 +635,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
-	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" || githubGateway == nil {
+	if githubGateway == nil {
 		return false
 	}
 	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, githubAuthHostname(repo))
