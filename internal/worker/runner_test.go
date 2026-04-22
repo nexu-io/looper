@@ -383,6 +383,12 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
 		t.Fatalf("first = %#v, want retryable_after_resume failure", first)
 	}
+	if len(github.updateIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.updateIssueCommentCalls) after retryable failure = %d, want 1 non-terminal refresh", len(github.updateIssueCommentCalls))
+	}
+	if body := github.updateIssueCommentCalls[0].Body; !strings.Contains(body, "started work") || strings.Contains(body, "stopped work") || strings.Contains(body, "paused work") {
+		t.Fatalf("retryable issue comment body = %q, want in-progress status without terminal failure text", body)
+	}
 	fixture.advance(5 * time.Second)
 	claim2, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	second, err := runner.ProcessClaimedItem(context.Background(), *claim2)

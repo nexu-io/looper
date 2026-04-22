@@ -639,11 +639,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}); err != nil {
 				return ProcessResult{}, err
 			}
-			terminalStatus := issueClaimStatusFailed
-			if failure.kind == FailureManualIntervention {
-				terminalStatus = issueClaimStatusPaused
-			}
-			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, terminalStatus, failure.message)
+			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, issueClaimStatusForFailure(latest, failedQueue, failure.kind), failure.message)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if step == stepPrepareWork {
@@ -1450,6 +1446,19 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 		return true
 	}
 	return failedQueue != nil && failedQueue.Status != "queued" && failedQueue.Status != "cancelled"
+}
+
+func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind QueueFailureKind) string {
+	if failedQueue != nil && failedQueue.Status == "queued" {
+		if checkpoint.PullRequest != nil && strings.TrimSpace(checkpoint.PullRequest.URL) != "" {
+			return issueClaimStatusPRLinked
+		}
+		return issueClaimStatusRunning
+	}
+	if kind == FailureManualIntervention {
+		return issueClaimStatusPaused
+	}
+	return issueClaimStatusFailed
 }
 
 func statusForCheckpoint(checkpoint workerCheckpoint) string {
