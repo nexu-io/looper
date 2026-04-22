@@ -2419,6 +2419,80 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerWorkerCreatePreservesPlannerPRWhenSnapshotIsMissing(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	issueTargetID := "issue:acme/looper:77"
+	prNumber := int64(42)
+	metadata := `{"prNumber":42,"specPath":"specs/planner.md"}`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_planner_missing_snapshot",
+		Seq:          1,
+		ProjectID:    "project_1",
+		Type:         "planner",
+		TargetType:   "issue",
+		TargetID:     &issueTargetID,
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &prNumber,
+		Status:       "running",
+		MetadataJSON: &metadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_planner_missing_snapshot) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopID := data["id"].(string)
+
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("Loops.GetByID() = nil, want created worker loop")
+	}
+	assertEqual(t, loop.TargetType, "pull_request")
+	if loop.PRNumber == nil || *loop.PRNumber != prNumber {
+		t.Fatalf("loop.PRNumber = %#v, want %d", loop.PRNumber, prNumber)
+	}
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var queueItem *storage.QueueItemRecord
+	for i := range queueItems {
+		if queueItems[i].LoopID != nil && *queueItems[i].LoopID == loopID {
+			queueItem = &queueItems[i]
+			break
+		}
+	}
+	if queueItem == nil || queueItem.PayloadJSON == nil {
+		t.Fatalf("worker queue payload missing for loop %s", loopID)
+	}
+	assertEqual(t, queueItem.TargetType, "pull_request")
+	assertEqual(t, queueItem.TargetID, "pr:acme/looper:42")
+	if queueItem.PRNumber == nil || *queueItem.PRNumber != prNumber {
+		t.Fatalf("queueItem.PRNumber = %#v, want %d", queueItem.PRNumber, prNumber)
+	}
+	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
+	assertEqual(t, payload["specPath"], "specs/planner.md")
+	assertEqual(t, payload["prNumber"], float64(prNumber))
+}
+
 func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)
