@@ -87,6 +87,18 @@ type agentExecutionNotificationInput struct {
 	DedupeKey   string
 }
 
+type workerRunCompletedNotificationInput struct {
+	ProjectID         string
+	LoopID            string
+	RunID             string
+	Subtitle          string
+	Status            string
+	Summary           string
+	FailureKind       worker.QueueFailureKind
+	PullRequestNumber int64
+	PullRequestURL    string
+}
+
 type plannerGitHubAdapter struct{ gateway *githubinfra.Gateway }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
@@ -456,6 +468,45 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		})
 		return nil
 	}
+	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
+		payload := notify.SystemNotificationPayload{
+			ProjectID:  input.ProjectID,
+			LoopID:     input.LoopID,
+			RunID:      input.RunID,
+			Subtitle:   input.Subtitle,
+			EntityType: "run",
+			EntityID:   input.RunID,
+		}
+		switch {
+		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
+			payload.Level = "action_required"
+			payload.Title = "Looper Worker Needs Attention"
+			payload.Body = input.Summary
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", input.RunID)
+		case input.Status == "failed":
+			payload.Level = "failure"
+			payload.Title = "Looper Worker Failed"
+			payload.Body = input.Summary
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.failed:%s", input.RunID)
+		case input.Status == "skipped":
+			payload.Level = "action_required"
+			payload.Title = "Looper Worker Needs Attention"
+			payload.Body = input.Summary
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", input.RunID)
+		case input.PullRequestNumber > 0:
+			payload.Level = "action_required"
+			payload.Title = "Looper Worker Opened a PR"
+			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
+		default:
+			payload.Level = "success"
+			payload.Title = "Looper Worker Completed"
+			payload.Body = runtimeFirstNonEmpty(input.Summary, "Worker completed successfully")
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
+		}
+		notificationGateway.Notify(ctx, payload)
+		return nil
+	}
 
 	var plannerRunner plannerScheduler
 	var reviewerRunner reviewerScheduler
@@ -532,8 +583,8 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
-		OnAgentExecutionStarted: func(ctx context.Context, input worker.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Worker", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
+			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
 
@@ -769,6 +820,15 @@ func wrapSchedulerQueueError(queueType string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s processing failed: %w", queueType, err)
+}
+
+func runtimeFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func boolPtr(value bool) *bool {

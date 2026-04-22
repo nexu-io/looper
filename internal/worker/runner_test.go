@@ -45,7 +45,11 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+	completed := make([]RunCompletedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
+	}})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	if err != nil || claim == nil {
@@ -60,6 +64,12 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
+	}
+	if len(completed) != 1 {
+		t.Fatalf("len(completed) = %d, want 1", len(completed))
+	}
+	if completed[0].Status != "success" || completed[0].PullRequestNumber != 101 || completed[0].PullRequestURL != "https://example/pr/101" {
+		t.Fatalf("completed[0] = %#v, want success with PR details", completed[0])
 	}
 	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
 		t.Fatalf("prompt = %q, want canonical completion instruction", agent.starts[0].Prompt)
@@ -291,7 +301,11 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+	started := make([]AgentExecutionStartedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnAgentExecutionStarted: func(_ context.Context, input AgentExecutionStartedInput) error {
+		started = append(started, input)
+		return nil
+	}})
 
 	claim1, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	first, err := runner.ProcessClaimedItem(context.Background(), *claim1)
@@ -312,6 +326,9 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1 (execute should not rerun)", len(agent.starts))
+	}
+	if len(started) != 1 {
+		t.Fatalf("len(started) = %d, want 1 (start notification should not repeat on resume)", len(started))
 	}
 	if len(git.createCalls) != 1 {
 		t.Fatalf("len(git.createCalls) = %d, want 1 (worktree should not rerun)", len(git.createCalls))
@@ -371,8 +388,12 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
+	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
 		return ValidationResult{Passed: false, Summary: "Validation failed"}, nil
+	}, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
 	}})
 
 	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
@@ -382,6 +403,12 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
 		t.Fatalf("result = %#v, want manual_intervention failure", result)
+	}
+	if len(completed) != 1 {
+		t.Fatalf("len(completed) = %d, want 1", len(completed))
+	}
+	if completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || completed[0].Summary != "Validation failed" {
+		t.Fatalf("completed[0] = %#v, want manual intervention completion notice", completed[0])
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
@@ -510,7 +537,11 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_running", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_running", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	completed := make([]RunCompletedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
+	}})
 
 	result, err := runner.recoverClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_worker_running", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_running", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}, fmt.Errorf("persist step failed"))
 	if err != nil {
@@ -518,6 +549,9 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
 		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
+	}
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureNonRetryable {
+		t.Fatalf("completed = %#v, want terminal recovery notification", completed)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_running")
 	if err != nil {
@@ -532,6 +566,30 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	}
+}
+
+func TestProcessClaimedItemSkippedFlowEmitsCompletionNotification(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
+	completed := make([]RunCompletedInput, 0, 1)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: false, OpenPRStrategy: config.OpenPRStrategyAllDone, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
+	}})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "manual PR opening required") {
+		t.Fatalf("result = %#v, want skipped manual intervention summary", result)
+	}
+	if len(completed) != 1 || completed[0].Status != "skipped" || !strings.Contains(completed[0].Summary, "manual PR opening required") {
+		t.Fatalf("completed = %#v, want skipped completion notification", completed)
 	}
 }
 

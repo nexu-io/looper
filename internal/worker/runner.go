@@ -241,6 +241,20 @@ type AgentExecutionStartedInput struct {
 
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
+type RunCompletedInput struct {
+	ProjectID         string
+	LoopID            string
+	RunID             string
+	Subtitle          string
+	Status            string
+	Summary           string
+	FailureKind       QueueFailureKind
+	PullRequestNumber int64
+	PullRequestURL    string
+}
+
+type RunCompletedFunc func(context.Context, RunCompletedInput) error
+
 type Options struct {
 	DB                      *sql.DB
 	Repos                   *storage.Repositories
@@ -259,6 +273,7 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnRunCompleted          RunCompletedFunc
 }
 
 type Runner struct {
@@ -279,6 +294,7 @@ type Runner struct {
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	onRunCompleted          RunCompletedFunc
 }
 
 type ProcessResult struct {
@@ -411,6 +427,7 @@ func New(options Options) *Runner {
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
+		onRunCompleted:          options.OnRunCompleted,
 	}
 }
 
@@ -441,6 +458,9 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
 		return nil, err
+	}
+	if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+		r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
@@ -558,6 +578,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if err != nil {
 				return ProcessResult{}, err
 			}
+			if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+				r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.kind, failure.message))
+			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
 				if updated.Status == "paused" {
@@ -595,6 +618,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
+	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
 	}
@@ -1180,6 +1204,88 @@ func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerC
 		return fmt.Sprintf("Opened pull request for worker %s: %s", loop.ID, checkpoint.PullRequest.URL)
 	}
 	return fmt.Sprintf("Completed worker %s", loop.ID)
+}
+
+func (r *Runner) notifyRunCompleted(ctx context.Context, input RunCompletedInput) {
+	if r.onRunCompleted != nil {
+		if err := r.onRunCompleted(ctx, input); err != nil && r.logger != nil {
+			r.logger.Warn("worker completion notification failed", map[string]any{"loopId": input.LoopID, "runId": input.RunID, "error": err.Error()})
+		}
+	}
+}
+
+func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem storage.QueueItemRecord, failure *loopError) {
+	if queueItem.LoopID == nil {
+		return
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+	if err != nil || loop == nil {
+		return
+	}
+	runID := ""
+	checkpoint := workerCheckpoint{}
+	if latestRun, runErr := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID); runErr == nil && latestRun != nil {
+		runID = latestRun.ID
+		if parsed, parseErr := parseCheckpoint(latestRun.CheckpointJSON); parseErr == nil {
+			checkpoint = parsed
+		}
+	}
+	r.notifyRunCompleted(ctx, RunCompletedInput{
+		ProjectID:         loop.ProjectID,
+		LoopID:            loop.ID,
+		RunID:             runID,
+		Subtitle:          runNotificationSubtitle(*loop, checkpoint),
+		Status:            "failed",
+		Summary:           failure.message,
+		FailureKind:       failure.kind,
+		PullRequestNumber: pullRequestNumber(checkpoint.PullRequest),
+		PullRequestURL:    pullRequestURL(checkpoint.PullRequest),
+	})
+}
+
+func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind QueueFailureKind, summary string) RunCompletedInput {
+	return RunCompletedInput{
+		ProjectID:         project.ID,
+		LoopID:            loop.ID,
+		RunID:             run.ID,
+		Subtitle:          runNotificationSubtitle(loop, checkpoint),
+		Status:            status,
+		Summary:           summary,
+		FailureKind:       failureKind,
+		PullRequestNumber: pullRequestNumber(checkpoint.PullRequest),
+		PullRequestURL:    pullRequestURL(checkpoint.PullRequest),
+	}
+}
+
+func runNotificationSubtitle(loop storage.LoopRecord, checkpoint workerCheckpoint) string {
+	if checkpoint.Work != nil && strings.TrimSpace(checkpoint.Work.Title) != "" {
+		return checkpoint.Work.Title
+	}
+	if loop.TargetType != "" && loop.TargetID != nil && strings.TrimSpace(*loop.TargetID) != "" {
+		return *loop.TargetID
+	}
+	return loop.ID
+}
+
+func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueItemRecord) bool {
+	if kind == FailureManualIntervention {
+		return true
+	}
+	return failedQueue != nil && failedQueue.Status != "queued" && failedQueue.Status != "cancelled"
+}
+
+func statusForCheckpoint(checkpoint workerCheckpoint) string {
+	if checkpoint.SkipReason != "" {
+		return "skipped"
+	}
+	return "success"
+}
+
+func pullRequestURL(pr *checkpointPullPR) string {
+	if pr == nil {
+		return ""
+	}
+	return strings.TrimSpace(pr.URL)
 }
 
 func (r *Runner) canAgentCreatePR(work workerInput) bool {
