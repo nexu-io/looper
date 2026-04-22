@@ -648,6 +648,47 @@ func TestProcessClaimedItemSkippedFlowEmitsCompletionNotification(t *testing.T) 
 	}
 }
 
+func TestProcessClaimedItemSkipsAutoPROpenWhenGitHubCLIUnavailable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
+	completed := make([]RunCompletedInput, 0, 1)
+	githubCLIAvailable := false
+	runner := New(Options{
+		DB:                 fixture.coordinator.DB(),
+		Repos:              fixture.repos,
+		GitHub:             &fakeGitHubGateway{},
+		GitHubCLIAvailable: &githubCLIAvailable,
+		Git:                git,
+		AgentExecutor:      agent,
+		Logger:             fixture.logger,
+		Now:                fixture.now,
+		AllowAutoCommit:    true,
+		AllowAutoPush:      true,
+		OpenPRStrategy:     config.OpenPRStrategyAllDone,
+		OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+			completed = append(completed, input)
+			return nil
+		},
+	})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "GitHub CLI unavailable") {
+		t.Fatalf("result = %#v, want skipped GitHub CLI unavailable summary", result)
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("len(git.pushCalls) = %d, want 0 when PR opening is gated before push", len(git.pushCalls))
+	}
+	if len(completed) != 1 || completed[0].Status != "skipped" || !strings.Contains(completed[0].Summary, "GitHub CLI unavailable") {
+		t.Fatalf("completed = %#v, want skipped completion notification for missing GitHub CLI", completed)
+	}
+}
+
 func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

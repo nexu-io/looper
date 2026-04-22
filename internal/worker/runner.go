@@ -259,6 +259,7 @@ type Options struct {
 	DB                      *sql.DB
 	Repos                   *storage.Repositories
 	GitHub                  GitHubGateway
+	GitHubCLIAvailable      *bool
 	Git                     GitGateway
 	AgentExecutor           AgentExecutor
 	Logger                  bootstrap.Logger
@@ -290,6 +291,7 @@ type Runner struct {
 	validationRunner        ValidationRunner
 	allowAutoCommit         bool
 	allowAutoPush           bool
+	githubCLIAvailable      bool
 	openPRStrategy          config.OpenPRStrategy
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -405,6 +407,10 @@ func New(options Options) *Runner {
 	if retryMaxAttempts <= 0 {
 		retryMaxAttempts = defaultRetryMax
 	}
+	githubCLIAvailable := options.GitHub != nil
+	if options.GitHubCLIAvailable != nil {
+		githubCLIAvailable = *options.GitHubCLIAvailable
+	}
 	strategy := options.OpenPRStrategy
 	if strategy == "" {
 		strategy = config.OpenPRStrategyManual
@@ -423,6 +429,7 @@ func New(options Options) *Runner {
 		validationRunner:        options.ValidationRunner,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
+		githubCLIAvailable:      githubCLIAvailable,
 		openPRStrategy:          strategy,
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
@@ -867,6 +874,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
 		checkpoint.SkipReason = fmt.Sprintf("Worker completed; PR opening is manual for %s", input.Loop.ID)
+		checkpoint.ResumePolicy = "manual_intervention"
+		return checkpoint, nil
+	}
+	if !r.githubCLIAvailable {
+		checkpoint.SkipReason = fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.ResumePolicy = "manual_intervention"
 		return checkpoint, nil
 	}
