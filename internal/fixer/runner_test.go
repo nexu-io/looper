@@ -309,6 +309,7 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
 	repo := "acme/looper"
 	prNumber := int64(42)
 	loopTarget := "pr:acme/looper:42"
@@ -328,8 +329,12 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
 	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		Worktree: &checkpointWorktree{
+			Path:   filepath.Join(t.TempDir(), "wt-42"),
+			Branch: "feature/fix-42",
+		},
 		Repair: &checkpointRepair{
 			Summary:     "upstream server_error",
 			ParseStatus: "",
@@ -399,6 +404,12 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	}
 	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
+	}
+	if git.cleanupCalls[0].WorktreePath == "" || git.cleanupCalls[0].Branch != "feature/fix-42" {
+		t.Fatalf("cleanup call = %#v, want persisted worktree cleanup", git.cleanupCalls[0])
 	}
 }
 
