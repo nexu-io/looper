@@ -454,11 +454,13 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
-		if failedQueue != nil && failedQueue.Status == "queued" {
+		if updated.Status == "paused" {
+			updated.NextRunAt = nil
+		} else if failedQueue != nil && failedQueue.Status == "queued" {
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention {
+			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -554,11 +556,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
-				if failedQueue != nil && failedQueue.Status == "queued" {
+				if updated.Status == "paused" {
+					updated.NextRunAt = nil
+				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention {
+					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"

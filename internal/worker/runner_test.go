@@ -208,6 +208,72 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}, wait: func(ctx context.Context) error {
+		loopID := ""
+		items, err := fixture.repos.Queue.List(ctx)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			if item.Type == "worker" && item.Status == "running" && item.LoopID != nil {
+				loopID = *item.LoopID
+				break
+			}
+		}
+		if loopID == "" {
+			return fmt.Errorf("running worker queue item not found")
+		}
+		loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return err
+		}
+		if loop == nil {
+			return fmt.Errorf("loop not found: %s", loopID)
+		}
+		loop.Status = "paused"
+		loop.NextRunAt = nil
+		loop.UpdatedAt = fixture.nowISO()
+		if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+			return err
+		}
+		reason := "loop paused"
+		if _, err := fixture.repos.Queue.CancelByLoop(ctx, loopID, fixture.nowISO(), &reason); err != nil {
+			return err
+		}
+		return context.DeadlineExceeded
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable_transient failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue = %#v, want queued retry", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop with nil next run", loop)
+	}
+}
+
 func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -533,6 +599,8 @@ type fakeAgentExecutor struct {
 	starts  []AgentRunInput
 	results []AgentResult
 	index   int
+	waitErr error
+	wait    func(context.Context) error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
@@ -542,12 +610,26 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 		result = f.results[f.index]
 	}
 	f.index++
-	return fakeAgentExecution{result: result}, nil
+	return fakeAgentExecution{result: result, waitErr: f.waitErr, wait: f.wait}, nil
 }
 
-type fakeAgentExecution struct{ result AgentResult }
+type fakeAgentExecution struct {
+	result  AgentResult
+	waitErr error
+	wait    func(context.Context) error
+}
 
-func (f fakeAgentExecution) Wait(context.Context) (AgentResult, error) { return f.result, nil }
+func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
+	if f.wait != nil {
+		if err := f.wait(ctx); err != nil {
+			return AgentResult{}, err
+		}
+	}
+	if f.waitErr != nil {
+		return AgentResult{}, f.waitErr
+	}
+	return f.result, nil
+}
 
 type testLogger struct{}
 
