@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -170,6 +171,37 @@ func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	}
 	if run.LastCompletedStep != nil && *run.LastCompletedStep == string(stepOpenPR) {
 		t.Fatalf("run = %#v, want open-pr to remain incomplete", run)
+	}
+}
+
+func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{})
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Checkpoint: workerCheckpoint{
+			Execution: &checkpointExecution{
+				Status:      "completed",
+				Summary:     "upstream server_error",
+				ParseStatus: "",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("runExecuteStep() error = nil, want parse-status failure")
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
+		t.Fatalf("checkpoint.Execution = %#v, want completed checkpoint preserved", checkpoint.Execution)
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
+	}
+	if !strings.Contains(err.Error(), "server_error") {
+		t.Fatalf("error = %q, want upstream summary", err.Error())
 	}
 }
 

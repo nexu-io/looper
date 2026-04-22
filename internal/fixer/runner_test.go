@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -271,6 +272,36 @@ func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) 
 	}
 	if run.LastCompletedStep != nil && *run.LastCompletedStep == string(stepRecheck) {
 		t.Fatalf("run = %#v, want downstream steps to remain incomplete", run)
+	}
+}
+
+func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{})
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Checkpoint: fixerCheckpoint{
+			Repair: &checkpointRepair{
+				Summary:     "upstream server_error",
+				ParseStatus: "",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("runRepairStep() error = nil, want parse-status failure")
+	}
+	if checkpoint.Repair == nil {
+		t.Fatal("checkpoint.Repair = nil, want checkpoint preserved")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
+	}
+	if !contains(err.Error(), "server_error") {
+		t.Fatalf("error = %q, want upstream summary", err.Error())
 	}
 }
 

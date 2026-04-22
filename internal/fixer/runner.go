@@ -420,6 +420,19 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
+	if repair == nil {
+		return nil
+	}
+	if repair.ParseStatus == "parsed" {
+		return nil
+	}
+	return &loopError{
+		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
+		kind:    FailureRetryableTransient,
+	}
+}
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -885,6 +898,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
+		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if len(checkpoint.FixItems) == 0 {
@@ -920,8 +936,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if !strings.EqualFold(result.Status, "completed") {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Fixer agent "+result.Status), kind: FailureRetryableTransient}
 	}
-	if result.ParseStatus != "parsed" {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(result.ParseStatus, "missing"))), kind: FailureRetryableTransient}
+	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		return checkpoint, err
 	}
 	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, CompletedAt: r.nowISO()}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
