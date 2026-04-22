@@ -65,6 +65,7 @@ type RestoreWorktreeInput struct {
 type PrepareWorktreeInput struct {
 	WorktreePath    string
 	Branch          string
+	Ref             string
 	ExpectedHeadSHA string
 	Remote          string
 }
@@ -503,17 +504,27 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
 	}
-	if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, input.Branch); err != nil {
+	targetSpec := strings.TrimSpace(input.Ref)
+	resetRef := "FETCH_HEAD"
+	errorRef := targetSpec
+	if targetSpec == "" {
+		targetSpec = strings.TrimSpace(input.Branch)
+		resetRef = remote + "/" + targetSpec
+		errorRef = targetSpec
+	}
+	if targetSpec == "" {
+		return PrepareWorktreeResult{}, fmt.Errorf("branch or ref is required")
+	}
+	if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, targetSpec); err != nil {
 		return PrepareWorktreeResult{}, err
 	}
 
-	remoteRef := remote + "/" + input.Branch
-	remoteHeadSHA, err := g.getRevision(ctx, input.WorktreePath, remoteRef)
+	remoteHeadSHA, err := g.getRevision(ctx, input.WorktreePath, resetRef)
 	if err != nil {
 		return PrepareWorktreeResult{}, err
 	}
 	if input.ExpectedHeadSHA != "" && remoteHeadSHA != input.ExpectedHeadSHA {
-		return PrepareWorktreeResult{}, &RemoteHeadChangedError{Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, ActualHeadSHA: remoteHeadSHA}
+		return PrepareWorktreeResult{}, &RemoteHeadChangedError{Branch: errorRef, ExpectedHeadSHA: input.ExpectedHeadSHA, ActualHeadSHA: remoteHeadSHA}
 	}
 
 	statusBeforeReset, err := g.readStatus(ctx, input.WorktreePath)
@@ -529,7 +540,7 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 		return PrepareWorktreeResult{}, err
 	}
 	if remoteHeadSHA != "" && localHeadSHA != remoteHeadSHA {
-		if err := g.runGit(ctx, input.WorktreePath, nil, "reset", "--hard", remoteRef); err != nil {
+		if err := g.runGit(ctx, input.WorktreePath, nil, "reset", "--hard", resetRef); err != nil {
 			return PrepareWorktreeResult{}, err
 		}
 	}

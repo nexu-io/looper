@@ -448,6 +448,38 @@ func TestGatewayPrepareWorktreeDetectsRemoteHeadChanges(t *testing.T) {
 	}
 }
 
+func TestGatewayPrepareWorktreeSupportsExplicitRef(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "reviewer/pr-42",
+		BaseBranch:   "main",
+		PRNumber:     42,
+		CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "reviewer/pr-42", Ref: "refs/heads/feature/fixer"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree() error = %v", err)
+	}
+	if !prepared.Clean {
+		t.Fatal("PrepareWorktree().Clean = false, want true")
+	}
+	remoteHeadSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "refs/remotes/origin/feature/fixer"))
+	if prepared.HeadSHA != remoteHeadSHA {
+		t.Fatalf("PrepareWorktree().HeadSHA = %q, want %q", prepared.HeadSHA, remoteHeadSHA)
+	}
+}
+
 func TestGatewayBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
 	t.Parallel()
 

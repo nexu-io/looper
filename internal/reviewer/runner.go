@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -113,6 +114,7 @@ type CreateWorktreeResult struct {
 type PrepareWorktreeInput struct {
 	WorktreePath    string
 	Branch          string
+	Ref             string
 	ExpectedHeadSHA string
 	Remote          string
 }
@@ -869,7 +871,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if checkpoint.Worktree != nil && checkpoint.Worktree.PreparedAt != "" {
+	if reviewerWorktreePrepared(checkpoint) {
 		return checkpoint, nil
 	}
 	if r.git == nil {
@@ -881,11 +883,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for worktree step", kind: FailureRetryableTransient}
 	}
-	branch := strings.TrimSpace(checkpoint.Detail.HeadRefName)
-	if branch == "" {
-		return checkpoint, &loopError{message: fmt.Sprintf("Missing pull request head ref for %s#%d", input.Repo, input.PRNumber), kind: FailureManualIntervention}
-	}
+	branch := reviewerWorktreeBranch(input.PRNumber, checkpoint)
 	baseBranch := firstNonEmpty(strings.TrimSpace(checkpoint.Detail.BaseRefName), derefString(input.Project.BaseBranch), "main")
+	prRef := pullRequestHeadRef(input.PRNumber)
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
 	if worktreeRoot == "" {
@@ -906,7 +906,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if err != nil {
 		return checkpoint, err
 	}
-	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -927,7 +927,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
-	if checkpoint.Worktree == nil {
+	if reviewerWorktreeNeedsPrepare(checkpoint) {
 		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
 		if err != nil {
 			return input.Checkpoint, err
@@ -1673,6 +1673,43 @@ func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error)
 		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
 	}
 	return checkpoint.Worktree, nil
+}
+
+func reviewerWorktreePrepared(checkpoint reviewerCheckpoint) bool {
+	if reviewerWorktreeNeedsPrepare(checkpoint) {
+		return false
+	}
+	return checkpoint.Worktree.PreparedAt != ""
+}
+
+func reviewerWorktreeNeedsPrepare(checkpoint reviewerCheckpoint) bool {
+	if checkpoint.Worktree == nil {
+		return true
+	}
+	worktree := checkpoint.Worktree
+	if strings.TrimSpace(worktree.Path) == "" || strings.TrimSpace(worktree.Branch) == "" || worktree.CleanedAt != "" {
+		return true
+	}
+	_, err := os.Stat(worktree.Path)
+	return err != nil
+}
+
+func reviewerWorktreeBranch(prNumber int64, checkpoint reviewerCheckpoint) string {
+	if checkpoint.Detail != nil {
+		if branch := strings.TrimSpace(checkpoint.Detail.HeadRefName); branch != "" {
+			return branch
+		}
+	}
+	if checkpoint.Worktree != nil {
+		if branch := strings.TrimSpace(checkpoint.Worktree.Branch); branch != "" {
+			return branch
+		}
+	}
+	return fmt.Sprintf("pr-%d-head", prNumber)
+}
+
+func pullRequestHeadRef(prNumber int64) string {
+	return fmt.Sprintf("refs/pull/%d/head", prNumber)
 }
 
 func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {

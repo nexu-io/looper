@@ -3,6 +3,7 @@ package reviewer
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -385,6 +386,87 @@ func TestProcessClaimedItemRunsReviewerInDedicatedWorktree(t *testing.T) {
 	}
 }
 
+func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  *project,
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if git.createCalls[0].Branch != "pr-42-head" {
+		t.Fatalf("create branch = %q, want fallback branch", git.createCalls[0].Branch)
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
+	}
+	if git.prepareCalls[0].Ref != "refs/pull/42/head" {
+		t.Fatalf("prepare ref = %q, want PR head ref", git.prepareCalls[0].Ref)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Branch != "pr-42-head" {
+		t.Fatalf("checkpoint worktree = %#v, want fallback branch", checkpoint.Worktree)
+	}
+}
+
+func TestRunReviewStepRepreparesMissingReviewerWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `{"verdict":"clean","body":"","comments":[]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_1"},
+		Run:      storage.RunRecord{ID: "run_1"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "deleted-worktree"), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 || len(git.prepareCalls) != 1 {
+		t.Fatalf("createCalls=%d prepareCalls=%d, want 1 each", len(git.createCalls), len(git.prepareCalls))
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	if agent.starts[0].WorkingDirectory != git.worktreePath {
+		t.Fatalf("agent working dir = %q, want %q", agent.starts[0].WorkingDirectory, git.worktreePath)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.worktreePath {
+		t.Fatalf("checkpoint worktree = %#v, want recreated worktree path", checkpoint.Worktree)
+	}
+}
+
 func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -711,6 +793,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if path == "" {
 		path = filepath.Join("/tmp", "reviewer-worktree")
 		f.worktreePath = path
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return CreateWorktreeResult{}, err
 	}
 	return CreateWorktreeResult{WorktreePath: path, Branch: input.Branch, HeadSHA: "abc123"}, nil
 }
