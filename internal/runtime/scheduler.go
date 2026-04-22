@@ -547,7 +547,6 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:   now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
-	githubCLIAvailable := githubCLIAutoPROpeningAvailable(cfg, githubGateway, logger)
 	plannerRunner = planner.New(planner.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
@@ -596,19 +595,21 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	workerRunner = worker.New(worker.Options{
-		DB:                 coordinator.DB(),
-		Repos:              repos,
-		GitHub:             workerGitHubAdapter{gateway: githubGateway},
-		GitHubCLIAvailable: boolPtr(githubCLIAvailable),
-		Git:                workerGitAdapter{gateway: gitGateway},
-		AgentExecutor:      workerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:             logger,
-		Now:                now,
-		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-		OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
-		RetryBaseDelay:     retryBaseDelay,
-		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		GitHub: workerGitHubAdapter{gateway: githubGateway},
+		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
+			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
+		},
+		Git:              workerGitAdapter{gateway: gitGateway},
+		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:           logger,
+		Now:              now,
+		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,
+		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
+		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
+		RetryBaseDelay:   retryBaseDelay,
+		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
@@ -633,18 +634,31 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	}
 }
 
-func githubCLIAutoPROpeningAvailable(cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger) bool {
+func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" || githubGateway == nil {
 		return false
 	}
-	authenticated, err := githubGateway.IsAuthenticated(context.Background(), "")
+	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, githubAuthHostname(repo))
 	if err != nil {
 		if logger != nil {
-			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error()})
+			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error(), "repo": repo, "hostname": githubAuthHostname(repo)})
 		}
 		return false
 	}
 	return authenticated
+}
+
+func githubAuthHostname(repo string) string {
+	const defaultHost = "github.com"
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultHost
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0])
+	}
+	return defaultHost
 }
 
 func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) error {

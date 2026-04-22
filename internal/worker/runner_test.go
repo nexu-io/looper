@@ -689,6 +689,50 @@ func TestProcessClaimedItemSkipsAutoPROpenWhenGitHubCLIUnavailable(t *testing.T)
 	}
 }
 
+func TestProcessClaimedItemRechecksGitHubCLIAvailabilityAtRunTime(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
+	checkCalls := 0
+	runner := New(Options{
+		DB:                 fixture.coordinator.DB(),
+		Repos:              fixture.repos,
+		GitHub:             github,
+		GitHubCLIAvailable: func() *bool { value := false; return &value }(),
+		GitHubCLIAutoPROpeningAvailable: func(context.Context, string, string) bool {
+			checkCalls++
+			return true
+		},
+		Git:             git,
+		AgentExecutor:   agent,
+		Logger:          fixture.logger,
+		Now:             fixture.now,
+		AllowAutoCommit: true,
+		AllowAutoPush:   true,
+		OpenPRStrategy:  config.OpenPRStrategyAllDone,
+	})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 101 {
+		t.Fatalf("result = %#v, want success with opened PR", result)
+	}
+	if checkCalls == 0 {
+		t.Fatal("runtime GitHub CLI availability check was not called")
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want 1 after runtime auth recovery", len(git.pushCalls))
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 1 after runtime auth recovery", len(github.createPRCalls))
+	}
+}
+
 func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

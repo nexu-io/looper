@@ -516,8 +516,12 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 	return CreatePullRequestResult{Number: parsePRNumberFromURL(prURL), URL: prURL}, nil
 }
 
-func (g *Gateway) IsAuthenticated(ctx context.Context, cwd string) (bool, error) {
-	_, err := g.runGh(ctx, cwd, "", "auth", "status")
+func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bool, error) {
+	args := []string{"auth", "status"}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", strings.TrimSpace(hostname))
+	}
+	_, err := g.runGh(ctx, cwd, "", args...)
 	if err == nil {
 		return true, nil
 	}
