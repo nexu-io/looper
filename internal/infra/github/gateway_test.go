@@ -227,6 +227,30 @@ fi
 	}
 }
 
+func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
+	t.Parallel()
+	rootDir := t.TempDir()
+	scriptPath := filepath.Join(rootDir, "gh")
+	writeExecutable(t, scriptPath, `#!/bin/sh
+case "$*" in
+  "auth status")
+    exit 1
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
+	authenticated, err := gateway.IsAuthenticated(context.Background(), "")
+	if err != nil {
+		t.Fatalf("IsAuthenticated() error = %v", err)
+	}
+	if authenticated {
+		t.Fatal("IsAuthenticated() = true, want false for unauthenticated gh cli")
+	}
+}
+
 func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	t.Parallel()
 	rootDir := t.TempDir()

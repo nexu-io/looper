@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -513,6 +514,18 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 		return CreatePullRequestResult{}, &shell.CommandExecutionError{Message: "gh pr create returned an empty URL", Result: result}
 	}
 	return CreatePullRequestResult{Number: parsePRNumberFromURL(prURL), URL: prURL}, nil
+}
+
+func (g *Gateway) IsAuthenticated(ctx context.Context, cwd string) (bool, error) {
+	_, err := g.runGh(ctx, cwd, "", "auth", "status")
+	if err == nil {
+		return true, nil
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {

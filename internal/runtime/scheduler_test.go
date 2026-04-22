@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -10,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/fixer"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/planner"
 	"github.com/powerformer/looper/internal/reviewer"
 	"github.com/powerformer/looper/internal/storage"
@@ -288,6 +291,48 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	}
 }
 
+func TestGithubCLIAutoPROpeningAvailableRequiresConfiguredAuthenticatedCLI(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	authenticatedPath := filepath.Join(rootDir, "gh-authenticated")
+	writeExecutable(t, authenticatedPath, `#!/bin/sh
+case "$*" in
+  "auth status")
+    exit 0
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+	unauthenticatedPath := filepath.Join(rootDir, "gh-unauthenticated")
+	writeExecutable(t, unauthenticatedPath, `#!/bin/sh
+case "$*" in
+  "auth status")
+    exit 1
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+
+	logger := &testLogger{}
+	authenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: authenticatedPath, CWD: rootDir})
+	unauthenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: unauthenticatedPath, CWD: rootDir})
+
+	if !githubCLIAutoPROpeningAvailable(config.Config{Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for authenticated gh cli")
+	}
+	if githubCLIAutoPROpeningAvailable(config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
+	}
+	if githubCLIAutoPROpeningAvailable(config.Config{}, authenticatedGateway, logger) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false when gh path is not configured")
+	}
+}
+
 type stubPlannerScheduler struct {
 	mu             sync.Mutex
 	discoverCalls  []planner.DiscoveryInput
@@ -500,5 +545,12 @@ func waitForSchedulerCondition(t *testing.T, condition func() bool) {
 	}
 	if !condition() {
 		t.Fatal("condition not satisfied before timeout")
+	}
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
 	}
 }

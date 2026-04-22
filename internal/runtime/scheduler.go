@@ -547,6 +547,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:   now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	githubCLIAvailable := githubCLIAutoPROpeningAvailable(cfg, githubGateway, logger)
 	plannerRunner = planner.New(planner.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
@@ -598,7 +599,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		DB:                 coordinator.DB(),
 		Repos:              repos,
 		GitHub:             workerGitHubAdapter{gateway: githubGateway},
-		GitHubCLIAvailable: boolPtr(cfg.Tools.GHPath != nil && strings.TrimSpace(*cfg.Tools.GHPath) != ""),
+		GitHubCLIAvailable: boolPtr(githubCLIAvailable),
 		Git:                workerGitAdapter{gateway: gitGateway},
 		AgentExecutor:      workerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -630,6 +631,20 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Worker:            workerRunner,
 		})
 	}
+}
+
+func githubCLIAutoPROpeningAvailable(cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger) bool {
+	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" || githubGateway == nil {
+		return false
+	}
+	authenticated, err := githubGateway.IsAuthenticated(context.Background(), "")
+	if err != nil {
+		if logger != nil {
+			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error()})
+		}
+		return false
+	}
+	return authenticated
 }
 
 func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) error {
