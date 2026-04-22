@@ -448,7 +448,7 @@ func (r *Runtime) stopSchedulerLoop() {
 	stopCh := r.schedulerStop
 	doneCh := r.schedulerDone
 	cancel := r.schedulerCancel
-	r.schedulerTasks = nil
+	taskTracker := r.schedulerTasks
 	r.schedulerStop = nil
 	r.schedulerDone = nil
 	r.schedulerWake = nil
@@ -475,6 +475,12 @@ func (r *Runtime) stopSchedulerLoop() {
 			r.logger.Warn("looperd stop timed out waiting for scheduler loop", map[string]any{"timeoutMs": r.shutdownTimeout.Milliseconds()})
 		}
 	}
+
+	r.mu.Lock()
+	if r.schedulerTasks == taskTracker {
+		r.schedulerTasks = nil
+	}
+	r.mu.Unlock()
 }
 
 func (r *Runtime) TriggerSchedulerTick() {

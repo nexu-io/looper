@@ -1069,6 +1069,58 @@ func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
 	}
 }
 
+func TestRuntimeStopSchedulerLoopKeepsTaskTrackerUntilLoopStops(t *testing.T) {
+	t.Parallel()
+
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	cancelCalled := make(chan struct{}, 1)
+	taskTracker := &schedulerTaskTracker{}
+	rt := &Runtime{shutdownTimeout: time.Second}
+	rt.schedulerStop = stopCh
+	rt.schedulerDone = doneCh
+	rt.schedulerTasks = taskTracker
+	rt.schedulerCancel = func() {
+		select {
+		case cancelCalled <- struct{}{}:
+		default:
+		}
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		rt.stopSchedulerLoop()
+	}()
+
+	select {
+	case <-cancelCalled:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("stopSchedulerLoop() did not invoke cancel")
+	}
+
+	rt.mu.RLock()
+	currentTracker := rt.schedulerTasks
+	rt.mu.RUnlock()
+	if currentTracker != taskTracker {
+		t.Fatal("schedulerTasks cleared before scheduler loop stopped")
+	}
+
+	close(doneCh)
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stopSchedulerLoop() did not return after scheduler loop stopped")
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.schedulerTasks != nil {
+		t.Fatal("schedulerTasks not cleared after scheduler loop stopped")
+	}
+}
+
 func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchanged(t *testing.T) {
 	t.Parallel()
 
