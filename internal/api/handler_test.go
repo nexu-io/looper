@@ -2823,6 +2823,122 @@ func TestActiveRunsIncludesRunningLoopWithoutRun(t *testing.T) {
 	assertEqual(t, target["label"], "acme/looper#43")
 }
 
+func TestActiveRunsExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_paused",
+		Seq:        8,
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:52"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(52),
+		Status:     "paused",
+		LastRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:              "run_stale",
+		LoopID:          "loop_paused",
+		Status:          "running",
+		CurrentStep:     stringPtr("review"),
+		StartedAt:       nowISO,
+		LastHeartbeatAt: stringPtr(nowISO),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 0 {
+		t.Fatalf("len(items) = %d, want 0", len(items))
+	}
+}
+
+func TestActiveRunDetailExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_paused",
+		Seq:        8,
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:52"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(52),
+		Status:     "paused",
+		LastRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:              "run_stale",
+		LoopID:          "loop_paused",
+		Status:          "running",
+		CurrentStep:     stringPtr("review"),
+		StartedAt:       nowISO,
+		LastHeartbeatAt: stringPtr(nowISO),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/8", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "ACTIVE_RUN_NOT_FOUND")
+}
+
 func TestActiveRunDetailIncludesRunningLoopWithoutRun(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

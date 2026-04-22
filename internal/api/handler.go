@@ -1713,6 +1713,9 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !ok {
 			continue
 		}
+		if loop.Status != string(domain.LoopStatusRunning) {
+			continue
+		}
 		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
 		if err != nil {
 			return nil, err
