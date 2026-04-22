@@ -2823,7 +2823,7 @@ func TestActiveRunsIncludesRunningLoopWithoutRun(t *testing.T) {
 	assertEqual(t, target["label"], "acme/looper#43")
 }
 
-func TestActiveRunsExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
+func TestActiveRunsIncludesPausedLoopWithRunningRun(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 
@@ -2877,12 +2877,16 @@ func TestActiveRunsExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	items := body["data"].(map[string]any)["items"].([]any)
-	if len(items) != 0 {
-		t.Fatalf("len(items) = %d, want 0", len(items))
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
 	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], "loop_paused")
+	assertEqual(t, item["runId"], "run_stale")
+	assertEqual(t, item["status"], "running")
 }
 
-func TestActiveRunDetailExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
+func TestActiveRunDetailIncludesPausedLoopWithRunningRun(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 
@@ -2931,12 +2935,14 @@ func TestActiveRunDetailExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/8", nil)
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", recorder.Code)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
-	errorMap := body["error"].(map[string]any)
-	assertEqual(t, errorMap["code"], "ACTIVE_RUN_NOT_FOUND")
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["loopId"], "loop_paused")
+	assertEqual(t, data["runId"], "run_stale")
+	assertEqual(t, data["status"], "running")
 }
 
 func TestActiveRunDetailIncludesRunningLoopWithoutRun(t *testing.T) {
