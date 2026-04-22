@@ -365,8 +365,17 @@ func TestProcessClaimedItemRunsReviewerInDedicatedWorktree(t *testing.T) {
 	if len(git.createCalls) != 1 {
 		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
 	}
+	if git.createCalls[0].Branch != "pr-42-head" {
+		t.Fatalf("create branch = %q, want PR-scoped branch", git.createCalls[0].Branch)
+	}
 	if len(git.prepareCalls) != 1 {
 		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
+	}
+	if git.prepareCalls[0].Branch != "pr-42-head" {
+		t.Fatalf("prepare branch = %q, want PR-scoped branch", git.prepareCalls[0].Branch)
+	}
+	if git.prepareCalls[0].Ref != "refs/pull/42/head" {
+		t.Fatalf("prepare ref = %q, want PR head ref", git.prepareCalls[0].Ref)
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
@@ -423,6 +432,25 @@ func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T)
 	}
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Branch != "pr-42-head" {
 		t.Fatalf("checkpoint worktree = %#v, want fallback branch", checkpoint.Worktree)
+	}
+}
+
+func TestReviewerWorktreeBranchIgnoresHeadRefName(t *testing.T) {
+	t.Parallel()
+
+	branch := reviewerWorktreeBranch(42, reviewerCheckpoint{
+		Detail:   &checkpointDetail{HeadRefName: "patch-1"},
+		Worktree: &checkpointWorktree{Branch: "pr-42-head"},
+	})
+	if branch != "pr-42-head" {
+		t.Fatalf("reviewerWorktreeBranch() = %q, want existing PR-scoped branch", branch)
+	}
+
+	branch = reviewerWorktreeBranch(42, reviewerCheckpoint{
+		Detail: &checkpointDetail{HeadRefName: "main"},
+	})
+	if branch != "pr-42-head" {
+		t.Fatalf("reviewerWorktreeBranch() = %q, want PR-scoped fallback", branch)
 	}
 }
 

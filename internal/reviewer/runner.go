@@ -1695,11 +1695,6 @@ func reviewerWorktreeNeedsPrepare(checkpoint reviewerCheckpoint) bool {
 }
 
 func reviewerWorktreeBranch(prNumber int64, checkpoint reviewerCheckpoint) string {
-	if checkpoint.Detail != nil {
-		if branch := strings.TrimSpace(checkpoint.Detail.HeadRefName); branch != "" {
-			return branch
-		}
-	}
 	if checkpoint.Worktree != nil {
 		if branch := strings.TrimSpace(checkpoint.Worktree.Branch); branch != "" {
 			return branch
