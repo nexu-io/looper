@@ -2281,6 +2281,144 @@ func TestHandlerCreateLoopWorkerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, triggered, 1)
 }
 
+func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	olderISO := fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString)
+	newerISO := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+	issueTargetID := "issue:acme/looper:77"
+	openPayloadBytes, err := json.Marshal(map[string]any{
+		"detail": map[string]any{
+			"state": "OPEN",
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(open payload) error = %v", err)
+	}
+	openPayloadJSON := string(openPayloadBytes)
+	closedPayloadBytes, err := json.Marshal(map[string]any{
+		"detail": map[string]any{
+			"state": "CLOSED",
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(closed payload) error = %v", err)
+	}
+	closedPayloadJSON := string(closedPayloadBytes)
+	olderPRNumber := int64(42)
+	newerPRNumber := int64(43)
+	olderMetadata := `{"prNumber":42,"specPath":"specs/older-open.md"}`
+	newerMetadata := `{"prNumber":43,"specPath":"specs/newer-closed.md"}`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_planner_older_open",
+		Seq:          1,
+		ProjectID:    "project_1",
+		Type:         "planner",
+		TargetType:   "issue",
+		TargetID:     &issueTargetID,
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &olderPRNumber,
+		Status:       "completed",
+		MetadataJSON: &olderMetadata,
+		CreatedAt:    olderISO,
+		UpdatedAt:    olderISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_planner_older_open) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_planner_newer_closed",
+		Seq:          2,
+		ProjectID:    "project_1",
+		Type:         "planner",
+		TargetType:   "issue",
+		TargetID:     &issueTargetID,
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &newerPRNumber,
+		Status:       "completed",
+		MetadataJSON: &newerMetadata,
+		CreatedAt:    newerISO,
+		UpdatedAt:    newerISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_planner_newer_closed) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:          "prs_planner_older_open",
+		ProjectID:   "project_1",
+		Repo:        "acme/looper",
+		PRNumber:    olderPRNumber,
+		HeadSHA:     "head-older-open",
+		PayloadJSON: &openPayloadJSON,
+		CapturedAt:  olderISO,
+		CreatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(prs_planner_older_open) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:          "prs_planner_newer_closed",
+		ProjectID:   "project_1",
+		Repo:        "acme/looper",
+		PRNumber:    newerPRNumber,
+		HeadSHA:     "head-newer-closed",
+		PayloadJSON: &closedPayloadJSON,
+		CapturedAt:  newerISO,
+		CreatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(prs_planner_newer_closed) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(2 * time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopID := data["id"].(string)
+
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("Loops.GetByID() = nil, want created worker loop")
+	}
+	assertEqual(t, loop.TargetType, "project")
+	if loop.PRNumber != nil {
+		t.Fatalf("loop.PRNumber = %#v, want nil", loop.PRNumber)
+	}
+
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var queueItem *storage.QueueItemRecord
+	for i := range queueItems {
+		if queueItems[i].LoopID != nil && *queueItems[i].LoopID == loopID {
+			queueItem = &queueItems[i]
+			break
+		}
+	}
+	if queueItem == nil || queueItem.PayloadJSON == nil {
+		t.Fatalf("worker queue payload missing for loop %s", loopID)
+	}
+	assertEqual(t, queueItem.TargetType, "project")
+	assertEqual(t, queueItem.TargetID, "project:project_1")
+	if queueItem.PRNumber != nil {
+		t.Fatalf("queueItem.PRNumber = %#v, want nil", queueItem.PRNumber)
+	}
+	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
+	assertEqual(t, payload["specPath"], "specs/newer-closed.md")
+	if _, ok := payload["prNumber"]; ok {
+		t.Fatalf("payload[\"prNumber\"] present = %#v, want omitted", payload["prNumber"])
+	}
+}
+
 func TestHandlerPullRequestStatusUsesLatestRunAcrossLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)

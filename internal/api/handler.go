@@ -2678,7 +2678,6 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	targetID := fmt.Sprintf("issue:%s:%d", input.Repo, input.IssueNumber)
-	var fallback *workerPlannerMatch
 	for _, loop := range loopsList {
 		if loop.ProjectID != input.ProjectID || loop.Type != string(domain.LoopTypePlanner) || loop.TargetType != string(domain.LoopTargetTypeIssue) || derefString(loop.TargetID) != targetID {
 			continue
@@ -2690,14 +2689,11 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 		}
 		match := &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}
 		if prNumber == nil || !h.isPlannerPullRequestOpen(ctx, input.ProjectID, input.Repo, *prNumber) {
-			if fallback == nil {
-				fallback = &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}
-			}
-			continue
+			return &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}, nil
 		}
 		return match, nil
 	}
-	return fallback, nil
+	return nil, nil
 }
 
 func (h *Handler) isPlannerPullRequestOpen(ctx context.Context, projectID, repo string, prNumber int64) bool {
