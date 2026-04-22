@@ -1318,16 +1318,27 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 			if len(parts) > 3 && strings.TrimSpace(parts[3]) != "" {
 				return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 			}
-			return h.buildPullRequestStatusResponse(r.Context(), *snapshot), nil
+			response, err := h.buildPullRequestStatusResponse(r.Context(), *snapshot)
+			if err != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+			}
+			return response, nil
 		}
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	return h.serializePullRequestListItem(repo, prNumber, snapshot, h.findPullRequestLoops(r.Context(), repo, prNumber)), nil
+	loopMatches, err := h.findPullRequestLoops(r.Context(), repo, prNumber)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	return h.serializePullRequestListItem(repo, prNumber, snapshot, loopMatches), nil
 }
 
-func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) pullRequestStatusResponse {
-	loopMatches := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
+func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) (pullRequestStatusResponse, error) {
+	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
+	if err != nil {
+		return pullRequestStatusResponse{}, err
+	}
 	runs := make([]storage.RunRecord, 0)
 	for _, loop := range loopMatches {
 		loopRuns, err := h.context.Runtime.Services().Repositories.Runs.ListByLoop(ctx, loop.ID)
@@ -1376,13 +1387,13 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 			LatestRunStatus: latestRunStatus,
 			RunningRunCount: runningRunCount,
 		},
-	}
+	}, nil
 }
 
-func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumber int64) []storage.LoopRecord {
+func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumber int64) ([]storage.LoopRecord, error) {
 	loops, err := h.context.Runtime.Services().Repositories.Loops.List(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	matches := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
@@ -1390,7 +1401,7 @@ func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumbe
 			matches = append(matches, loop)
 		}
 	}
-	return matches
+	return matches, nil
 }
 
 func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snapshot *storage.PullRequestSnapshotRecord, loopMatches []storage.LoopRecord) pullRequestResponse {

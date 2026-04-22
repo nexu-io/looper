@@ -396,6 +396,34 @@ func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemFailsWhenCreatedPRNumberIsMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 0, URL: "https://example/pr/unparsed"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !strings.Contains(result.Summary, "requires a pull request number") {
+		t.Fatalf("result = %#v, want retryable_after_resume missing-pr-number failure", result)
+	}
+	if len(github.reviewerCalls) != 0 {
+		t.Fatalf("len(github.reviewerCalls) = %d, want 0", len(github.reviewerCalls))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || (loop.MetadataJSON != nil && strings.Contains(*loop.MetadataJSON, `"prNumber":0`)) {
+		t.Fatalf("loop = %#v, want no persisted PR number 0", loop)
+	}
+}
+
 func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{})

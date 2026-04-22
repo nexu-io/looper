@@ -876,6 +876,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	if created.Number <= 0 {
+		return checkpoint, &loopError{message: "Worker create-pr requires a pull request number", kind: FailureRetryableAfterResume}
+	}
 	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
 	if err := r.persistPullRequestReference(ctx, input.Loop, work.Repo, pr); err != nil {

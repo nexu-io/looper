@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -199,6 +200,84 @@ func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	if got := routeBody["requestId"].(string); got == "" {
 		t.Fatal("generated requestId is empty")
 	}
+}
+
+func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
+	fixture := newTestFixture(t)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_loops_fail_detail",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: fixture.now.UTC().Format(javaScriptISOString),
+		CreatedAt:  fixture.now.UTC().Format(javaScriptISOString),
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+
+	services := fixture.runtime.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
+		if strings.Contains(query, "SELECT * FROM loops ORDER BY updated_at DESC, seq DESC") {
+			return errors.New("database is locked")
+		}
+		return nil
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixedRuntimeState{services: services}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "INTERNAL_ERROR")
+	assertEqual(t, errMap["message"], "list loops: database is locked")
+}
+
+func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
+	fixture := newTestFixture(t)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_loops_fail_status",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: fixture.now.UTC().Format(javaScriptISOString),
+		CreatedAt:  fixture.now.UTC().Format(javaScriptISOString),
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+
+	services := fixture.runtime.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
+		if strings.Contains(query, "SELECT * FROM loops ORDER BY updated_at DESC, seq DESC") {
+			return errors.New("database is locked")
+		}
+		return nil
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixedRuntimeState{services: services}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "INTERNAL_ERROR")
+	assertEqual(t, errMap["message"], "list loops: database is locked")
 }
 
 func TestHandlerHealthzReturnsUnhealthyEnvelopeWhenStorageCheckFails(t *testing.T) {
@@ -3272,6 +3351,28 @@ var _ bootstrap.Logger = noopLogger{}
 
 type fixedRuntimeState struct {
 	services looperdruntime.Services
+}
+
+type errorInjectingQuerier struct {
+	db         *sql.DB
+	queryError func(query string) error
+}
+
+func (q errorInjectingQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q errorInjectingQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if q.queryError != nil {
+		if err := q.queryError(query); err != nil {
+			return nil, err
+		}
+	}
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q errorInjectingQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
 }
 
 func (s fixedRuntimeState) Services() looperdruntime.Services {
