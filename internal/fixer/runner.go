@@ -1835,6 +1835,8 @@ func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fix
 	switch failedStep {
 	case stepRepair, stepReconcileCommits, stepValidate, stepPush:
 		return true
+	case stepResolveComments, stepRecheck:
+		return validateCompletedRepairCheckpoint(checkpoint.Repair) != nil
 	default:
 		return false
 	}

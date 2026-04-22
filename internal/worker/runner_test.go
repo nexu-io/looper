@@ -205,6 +205,69 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	}
 }
 
+func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		Execution:      &checkpointExecution{Status: "completed", Summary: "upstream server_error"},
+		Validation:     &ValidationResult{Passed: true, Summary: "stale"},
+		PullRequest:    &checkpointPullPR{Number: 101, URL: "https://example/pr/101"},
+		SkipReason:     "stale skip reason",
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_validate",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want worker loop")
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepExecute {
+		t.Fatalf("resumed = %#v, want resumed execute replay", resumed)
+	}
+	if resumed.Checkpoint.Execution != nil {
+		t.Fatalf("Execution = %#v, want cleared execution checkpoint", resumed.Checkpoint.Execution)
+	}
+	if resumed.Checkpoint.Validation != nil {
+		t.Fatalf("Validation = %#v, want cleared validation checkpoint", resumed.Checkpoint.Validation)
+	}
+	if resumed.Checkpoint.PullRequest != nil {
+		t.Fatalf("PullRequest = %#v, want cleared pull request checkpoint", resumed.Checkpoint.PullRequest)
+	}
+	if resumed.Checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want cleared skip reason", resumed.Checkpoint.SkipReason)
+	}
+	if resumed.Checkpoint.Worktree == nil || resumed.Checkpoint.Plan == nil {
+		t.Fatalf("checkpoint = %#v, want preserved worktree and plan", resumed.Checkpoint)
+	}
+	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPlan) {
+		t.Fatalf("run.LastCompletedStep = %#v, want plan", resumed.Run.LastCompletedStep)
+	}
+}
+
 func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testing.T) {
 	t.Parallel()
 
