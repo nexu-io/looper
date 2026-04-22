@@ -276,10 +276,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					boolFlag("stderr", "Show stderr instead of stdout"),
 					stringFlag("tail", "count", "Show the last N lines"),
 					boolFlag("full", "Show the full output"),
+					boolFlag("follow", "Stream new log output until the run exits (human output only)"),
 				},
 				exampleLines: []string{
 					"$ looper logs 12",
 					"$ looper logs 12 --stderr --tail 50",
+					"$ looper logs 12 --follow",
 				},
 			}),
 			newCommand(commandSpec{use: "stop <id>", short: "Stop an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12"}}),

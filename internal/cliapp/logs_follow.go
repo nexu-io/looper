@@ -1,0 +1,157 @@
+package cliapp
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+type loopLogsFollowChunk struct {
+	RunID       *string `json:"runId,omitempty"`
+	CurrentStep *string `json:"currentStep,omitempty"`
+	ExecutionID *string `json:"executionId,omitempty"`
+	Vendor      *string `json:"vendor,omitempty"`
+	PID         *int64  `json:"pid,omitempty"`
+	Status      *string `json:"status,omitempty"`
+	Content     string  `json:"content"`
+}
+
+func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error {
+	if _, err := parseOptionalPositiveInt(getStringFlag(cmd, "tail"), "--tail"); err != nil {
+		return err
+	}
+
+	client, err := r.apiClient()
+	if err != nil {
+		return err
+	}
+
+	query := url.Values{}
+	query.Set("follow", "1")
+	if getBoolFlag(cmd, "stderr") {
+		query.Set("stderr", "1")
+	}
+
+	response, err := client.Stream(cmd.Context(), "/api/v1/loops/"+url.PathEscape(loopID)+"/logs?"+query.Encode(), "text/event-stream")
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	defer response.Body.Close()
+
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lastExecutionID := ""
+	lastRunID := ""
+	sawEnd := false
+
+	for {
+		eventName, payload, err := readServerSentEvent(scanner)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			if sawEnd && errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("log stream terminated unexpectedly")
+			}
+			return err
+		}
+
+		switch eventName {
+		case "snapshot":
+			data, decodeErr := decodeLoopLogsOutput(json.RawMessage(payload))
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if err := writeHumanLoopLogsSnapshot(cmd.OutOrStdout(), data, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail"), true); err != nil {
+				return err
+			}
+			if data.Agent != nil {
+				lastExecutionID = data.Agent.ExecutionID
+			}
+			if data.Run != nil {
+				lastRunID = data.Run.RunID
+			}
+		case "chunk":
+			var chunk loopLogsFollowChunk
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				return fmt.Errorf("decode loop logs stream chunk: %w", err)
+			}
+			if chunk.ExecutionID != nil && *chunk.ExecutionID != "" && *chunk.ExecutionID != lastExecutionID {
+				if lastExecutionID != "" || lastRunID != "" {
+					if _, err := fmt.Fprintln(cmd.OutOrStdout()); err != nil {
+						return err
+					}
+				}
+				if chunk.RunID != nil && *chunk.RunID != lastRunID {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Run %s · step: %s\n", *chunk.RunID, formatScalar(chunk.CurrentStep)); err != nil {
+						return err
+					}
+					lastRunID = *chunk.RunID
+				}
+				if chunk.RunID != nil && lastRunID == "" {
+					lastRunID = *chunk.RunID
+				}
+				if chunk.Vendor != nil && chunk.Status != nil {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Agent: %s · pid %s · %s\n\n", *chunk.Vendor, formatScalar(chunk.PID), *chunk.Status); err != nil {
+						return err
+					}
+				}
+				lastExecutionID = *chunk.ExecutionID
+			}
+			if _, err := io.WriteString(cmd.OutOrStdout(), chunk.Content); err != nil {
+				return err
+			}
+		case "end":
+			sawEnd = true
+			return nil
+		}
+	}
+}
+
+func readServerSentEvent(scanner *bufio.Scanner) (string, string, error) {
+	eventName := "message"
+	dataLines := make([]string, 0, 1)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if len(dataLines) == 0 {
+				continue
+			}
+			return eventName, strings.Join(dataLines, "\n"), nil
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			data := strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+			dataLines = append(dataLines, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", "", err
+	}
+	if len(dataLines) > 0 {
+		return eventName, strings.Join(dataLines, "\n"), nil
+	}
+	return "", "", io.EOF
+}

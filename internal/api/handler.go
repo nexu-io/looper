@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,9 +31,10 @@ import (
 )
 
 const (
-	requestIDHeaderName = "x-request-id"
-	apiBasePath         = "/api/v1"
-	javaScriptISOString = "2006-01-02T15:04:05.000Z"
+	requestIDHeaderName        = "x-request-id"
+	apiBasePath                = "/api/v1"
+	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
+	loopLogsFollowPollInterval = 200 * time.Millisecond
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -245,6 +247,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(path, apiBasePath+"/loops/") {
+		if isFollowLoopLogsRequest(r, path) {
+			if err := h.streamLoopLogsRoute(w, r, path, requestID); err != nil {
+				var typed apiError
+				if !asAPIError(err, &typed) {
+					typed = internalServerError(err)
+				}
+				h.writeError(w, requestID, typed)
+			}
+			return
+		}
 		payload, err := h.buildLoopRouteResponse(r, path)
 		if err != nil {
 			var typed apiError
@@ -316,6 +328,16 @@ type apiError struct {
 	status  int
 	message string
 	details any
+}
+
+type loopLogsFollowChunkEvent struct {
+	RunID       *string `json:"runId,omitempty"`
+	CurrentStep *string `json:"currentStep,omitempty"`
+	ExecutionID *string `json:"executionId,omitempty"`
+	Vendor      *string `json:"vendor,omitempty"`
+	PID         *int64  `json:"pid,omitempty"`
+	Status      *string `json:"status,omitempty"`
+	Content     string  `json:"content"`
 }
 
 func (e apiError) Error() string {
@@ -2024,6 +2046,169 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
+}
+
+func isFollowLoopLogsRequest(r *http.Request, path string) bool {
+	if r.Method != http.MethodGet || !strings.HasSuffix(path, "/logs") {
+		return false
+	}
+	value := strings.TrimSpace(r.URL.Query().Get("follow"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func (h *Handler) streamLoopLogsRoute(w http.ResponseWriter, r *http.Request, path string, requestID string) error {
+	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/loops/"), "/")
+	selector, err := urlPathSegment(parts, 0)
+	if err != nil {
+		return err
+	}
+	if len(parts) != 2 || strings.TrimSpace(parts[1]) != "logs" {
+		return apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+
+	loop, err := h.resolveLoop(r.Context(), selector)
+	if err != nil {
+		return err
+	}
+
+	return h.streamLoopLogs(w, r, requestID, loop, queryBool(r.URL.Query(), "stderr"))
+}
+
+func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, requestID string, loop storage.LoopRecord, stderr bool) error {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Streaming is not supported by this response writer"}
+	}
+
+	current, err := h.buildLoopLogsResponse(r.Context(), loop)
+	if err != nil {
+		return err
+	}
+
+	w.Header().Set(requestIDHeaderName, requestID)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if err := writeSSEEvent(w, flusher, "snapshot", current); err != nil {
+		return nil
+	}
+
+	observedRunID := ""
+	if current.Run != nil {
+		observedRunID = current.Run.RunID
+	}
+	previousExecutionID, previousContent := loopLogsStreamState(current, stderr)
+	if shouldTerminateLoopLogsFollow(current, observedRunID) {
+		return nil
+	}
+
+	ticker := time.NewTicker(loopLogsFollowPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return nil
+		case <-ticker.C:
+		}
+
+		current, err = h.buildLoopLogsResponse(r.Context(), loop)
+		if err != nil {
+			continue
+		}
+		if observedRunID == "" && current.Run != nil {
+			observedRunID = current.Run.RunID
+		}
+
+		nextExecutionID, nextContent := loopLogsStreamState(current, stderr)
+		chunk := appendedLogChunk(previousExecutionID, previousContent, nextExecutionID, nextContent)
+		if chunk != "" {
+			event := loopLogsFollowChunkEvent{Content: chunk}
+			if current.Run != nil {
+				event.RunID = &current.Run.RunID
+				event.CurrentStep = current.Run.CurrentStep
+			}
+			if current.Agent != nil {
+				event.ExecutionID = &current.Agent.ExecutionID
+				event.Vendor = &current.Agent.Vendor
+				event.PID = current.Agent.PID
+				event.Status = &current.Agent.Status
+			}
+			if err := writeSSEEvent(w, flusher, "chunk", event); err != nil {
+				return nil
+			}
+		}
+
+		previousExecutionID, previousContent = nextExecutionID, nextContent
+		if shouldTerminateLoopLogsFollow(current, observedRunID) {
+			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
+			return nil
+		}
+	}
+}
+
+func queryBool(values url.Values, key string) bool {
+	value := strings.TrimSpace(values.Get(key))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func writeSSEEvent(w io.Writer, flusher http.Flusher, event string, payload any) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", encoded); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func loopLogsStreamState(resp loopLogsResponse, stderr bool) (string, string) {
+	if resp.Agent == nil {
+		return "", ""
+	}
+	content := resp.Agent.Stdout
+	if stderr {
+		content = resp.Agent.Stderr
+	}
+	return resp.Agent.ExecutionID, content
+}
+
+func appendedLogChunk(previousExecutionID, previousContent, currentExecutionID, currentContent string) string {
+	if currentExecutionID == "" {
+		return ""
+	}
+	if previousExecutionID == "" || currentExecutionID != previousExecutionID {
+		return currentContent
+	}
+	if currentContent == previousContent {
+		return ""
+	}
+	if strings.HasPrefix(currentContent, previousContent) {
+		return currentContent[len(previousContent):]
+	}
+	return currentContent
+}
+
+func shouldTerminateLoopLogsFollow(resp loopLogsResponse, observedRunID string) bool {
+	if observedRunID == "" {
+		if resp.Run == nil {
+			return !domain.IsActiveLoopStatus(domain.LoopStatus(resp.LoopStatus))
+		}
+		observedRunID = resp.Run.RunID
+	}
+	if resp.Run == nil {
+		return true
+	}
+	if resp.Run.RunID != observedRunID {
+		return true
+	}
+	return domain.IsTerminalRunStatus(domain.RunStatus(resp.Run.Status))
 }
 
 type createLoopRequest struct {

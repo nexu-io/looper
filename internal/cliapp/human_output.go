@@ -136,14 +136,16 @@ type loopLogsOutput struct {
 	LoopStatus string `json:"loopStatus"`
 	Run        *struct {
 		RunID       string  `json:"runId"`
+		Status      string  `json:"status"`
 		CurrentStep *string `json:"currentStep"`
 	} `json:"run"`
 	Agent *struct {
-		Vendor string `json:"vendor"`
-		PID    *int64 `json:"pid"`
-		Status string `json:"status"`
-		Stdout string `json:"stdout"`
-		Stderr string `json:"stderr"`
+		ExecutionID string `json:"executionId"`
+		Vendor      string `json:"vendor"`
+		PID         *int64 `json:"pid"`
+		Status      string `json:"status"`
+		Stdout      string `json:"stdout"`
+		Stderr      string `json:"stderr"`
 	} `json:"agent"`
 }
 
@@ -299,64 +301,117 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 }
 
 func writeHumanLoopLogs(w io.Writer, payload json.RawMessage, stderr bool, full bool, tail string) error {
+	data, err := decodeLoopLogsOutput(payload)
+	if err != nil {
+		return err
+	}
+	return writeHumanLoopLogsSnapshot(w, data, stderr, full, tail, false)
+}
+
+func decodeLoopLogsOutput(payload json.RawMessage) (loopLogsOutput, error) {
 	var data loopLogsOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
-		return fmt.Errorf("decode loop logs response: %w", err)
+		return loopLogsOutput{}, fmt.Errorf("decode loop logs response: %w", err)
+	}
+	return data, nil
+}
+
+func writeHumanLoopLogsSnapshot(w io.Writer, data loopLogsOutput, stderr bool, full bool, tail string, follow bool) error {
+	if err := writeHumanLoopLogsHeader(w, data); err != nil {
+		return err
+	}
+	if data.Agent == nil {
+		message := "No agent output for the current step."
+		if follow && loopLogsCanContinue(data) {
+			message = "Waiting for agent output..."
+		}
+		_, err := fmt.Fprintln(w, message)
+		return err
+	}
+	if err := writeHumanLoopLogsRunAgent(w, data); err != nil {
+		return err
 	}
 
-	stream := ""
-	if data.Agent != nil {
-		if stderr {
-			stream = data.Agent.Stderr
-		} else {
-			stream = data.Agent.Stdout
+	content, err := loopLogsInitialContent(data, stderr, full, tail)
+	if err != nil {
+		return err
+	}
+	if content == "" {
+		message := "No output captured."
+		if follow && loopLogsCanContinue(data) {
+			message = "Waiting for log output..."
 		}
+		_, err := fmt.Fprintln(w, message)
+		return err
 	}
 
-	var tailCount *int
-	if !full {
-		parsed, err := parseOptionalPositiveInt(tail, "--tail")
-		if err != nil {
-			return err
-		}
-		if parsed == nil {
-			defaultTail := 100
-			tailCount = &defaultTail
-		} else {
-			converted := int(*parsed)
-			tailCount = &converted
-		}
-	}
+	return writeLoopLogContent(w, content)
+}
 
+func writeHumanLoopLogsHeader(w io.Writer, data loopLogsOutput) error {
 	if _, err := fmt.Fprintf(w, "Loop #%d · %s · %s\n", data.Seq, data.LoopType, data.LoopStatus); err != nil {
 		return err
 	}
 	if data.Run != nil {
-		if _, err := fmt.Fprintf(w, "Run %s · step: %s\n", data.Run.RunID, formatScalar(data.Run.CurrentStep)); err != nil {
-			return err
-		}
-	} else if _, err := fmt.Fprintln(w, "Run - · step: -"); err != nil {
+		_, err := fmt.Fprintf(w, "Run %s · step: %s\n", data.Run.RunID, formatScalar(data.Run.CurrentStep))
 		return err
 	}
+	_, err := fmt.Fprintln(w, "Run - · step: -")
+	return err
+}
 
+func writeHumanLoopLogsRunAgent(w io.Writer, data loopLogsOutput) error {
 	if data.Agent == nil {
-		_, err := fmt.Fprintln(w, "No agent output for the current step.")
-		return err
+		return nil
 	}
+	_, err := fmt.Fprintf(w, "Agent: %s · pid %s · %s\n\n", data.Agent.Vendor, formatScalar(data.Agent.PID), data.Agent.Status)
+	return err
+}
 
-	if _, err := fmt.Fprintf(w, "Agent: %s · pid %s · %s\n\n", data.Agent.Vendor, formatScalar(data.Agent.PID), data.Agent.Status); err != nil {
-		return err
+func loopLogsSelectedContent(data loopLogsOutput, stderr bool) string {
+	if data.Agent == nil {
+		return ""
 	}
+	if stderr {
+		return data.Agent.Stderr
+	}
+	return data.Agent.Stdout
+}
 
-	content := stream
-	if tailCount != nil {
-		content = tailText(content, *tailCount)
+func loopLogsInitialContent(data loopLogsOutput, stderr bool, full bool, tail string) (string, error) {
+	content := loopLogsSelectedContent(data, stderr)
+	if full {
+		return content, nil
 	}
-	if content == "" {
-		_, err := fmt.Fprintln(w, "No output captured.")
-		return err
+	parsed, err := parseOptionalPositiveInt(tail, "--tail")
+	if err != nil {
+		return "", err
 	}
+	count := 100
+	if parsed != nil {
+		count = int(*parsed)
+	}
+	return tailText(content, count), nil
+}
 
+func loopLogsCanContinue(data loopLogsOutput) bool {
+	if data.Run == nil {
+		switch data.LoopStatus {
+		case "idle", "queued", "running", "paused":
+			return true
+		default:
+			return false
+		}
+	}
+	switch data.Run.Status {
+	case "queued", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeLoopLogContent(w io.Writer, content string) error {
 	for _, line := range strings.Split(content, "\n") {
 		if _, err := fmt.Fprintln(w, line); err != nil {
 			return err

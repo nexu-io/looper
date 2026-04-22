@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"slices"
+	"syscall"
 
 	"github.com/powerformer/looper/internal/cliapp"
 	"github.com/powerformer/looper/internal/version"
@@ -36,7 +38,9 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 
 	ctx := deps.ctx
 	if ctx == nil {
-		ctx = context.Background()
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
 	}
 
 	newApp := deps.newApp

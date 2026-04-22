@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,11 +25,16 @@ import (
 
 func runApp(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	return runAppWithContext(t, context.Background(), args...)
+}
+
+func runAppWithContext(t *testing.T, ctx context.Context, args ...string) (int, string, string) {
+	t.Helper()
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{Stdout: stdout, Stderr: stderr})
-	exitCode := app.Run(context.Background(), args)
+	exitCode := app.Run(ctx, args)
 
 	return exitCode, stdout.String(), stderr.String()
 }
@@ -436,6 +442,101 @@ func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	}
 	if strings.Contains(stdout, "line1") {
 		t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, did not expect trimmed line", stdout)
+	}
+}
+
+func TestLogsFollowStreamsNewOutput(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("follow"); got != "1" {
+			t.Fatalf("follow query = %q, want 1", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: snapshot\n")
+		_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"openai\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"line1\\n\",\"stderr\":\"\"}}\n\n")
+		_, _ = io.WriteString(w, "event: chunk\n")
+		_, _ = io.WriteString(w, "data: {\"runId\":\"run_1\",\"currentStep\":\"review\",\"executionId\":\"exec_1\",\"vendor\":\"openai\",\"pid\":1234,\"status\":\"running\",\"content\":\"line2\\n\"}\n\n")
+		_, _ = io.WriteString(w, "event: end\n")
+		_, _ = io.WriteString(w, "data: {\"reason\":\"run_completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--follow", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --follow]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: openai · pid 1234 · running", "line1", "line2"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestLogsFollowRejectsJSON(t *testing.T) {
+	t.Parallel()
+
+	exitCode, _, stderr := runApp(t, "logs", "loop_1", "--follow", "--json")
+	if exitCode == 0 {
+		t.Fatal("Run([logs loop_1 --follow --json]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "--json cannot be combined with --follow") {
+		t.Fatalf("Run([logs loop_1 --follow --json]) stderr = %q, want follow/json error", stderr)
+	}
+}
+
+func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: snapshot\n")
+		_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"openai\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"\",\"stderr\":\"\"}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	exitCode, stdout, stderr := runAppWithContext(t, ctx, "logs", "loop_1", "--follow", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --follow]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "Waiting for log output...") {
+		t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want waiting message", stdout)
+	}
+}
+
+func TestLogsHelpIncludesFollowFlag(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "logs", "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([logs --help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs --help]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "--follow") {
+		t.Fatalf("Run([logs --help]) stdout = %q, want --follow flag", stdout)
 	}
 }
 

@@ -231,6 +231,13 @@ func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) loopLogs(cmd *cobra.Command, args []string) error {
+	if getBoolFlag(cmd, "follow") {
+		if getBoolFlag(cmd, "json") {
+			return fmt.Errorf("--json cannot be combined with --follow")
+		}
+		return r.followLoopLogs(cmd, strings.TrimSpace(args[0]))
+	}
+
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/loops/"+url.PathEscape(strings.TrimSpace(args[0]))+"/logs")
 	}, func(w io.Writer, payload json.RawMessage) error {

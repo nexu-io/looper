@@ -52,28 +52,38 @@ func (c *DaemonAPIClient) Get(ctx context.Context, path string, out any) error {
 	return c.request(ctx, http.MethodGet, path, nil, out)
 }
 
+func (c *DaemonAPIClient) Stream(ctx context.Context, path string, accept string) (*http.Response, error) {
+	request, err := c.buildRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(accept) != "" {
+		request.Header.Set("Accept", accept)
+	}
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("looperd is not reachable: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		defer response.Body.Close()
+		if decodeErr := decodeAPIResponse(response, nil); decodeErr != nil {
+			return nil, decodeErr
+		}
+		return nil, &DaemonAPIError{Message: fmt.Sprintf("Request failed with status %d", response.StatusCode), Status: response.StatusCode}
+	}
+
+	return response, nil
+}
+
 func (c *DaemonAPIClient) Post(ctx context.Context, path string, body any, out any) error {
 	return c.request(ctx, http.MethodPost, path, body, out)
 }
 
 func (c *DaemonAPIClient) request(ctx context.Context, method, path string, body any, out any) error {
-	var requestBody io.Reader
-	if body != nil {
-		payload, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("marshal request body: %w", err)
-		}
-		requestBody = bytes.NewReader(payload)
-	}
-
-	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, requestBody)
+	request, err := c.buildRequest(ctx, method, path, body)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-
-	request.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+		return err
 	}
 
 	response, err := c.httpClient.Do(request)
@@ -83,6 +93,29 @@ func (c *DaemonAPIClient) request(ctx context.Context, method, path string, body
 	defer response.Body.Close()
 
 	return decodeAPIResponse(response, out)
+}
+
+func (c *DaemonAPIClient) buildRequest(ctx context.Context, method, path string, body any) (*http.Request, error) {
+	var requestBody io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal request body: %w", err)
+		}
+		requestBody = bytes.NewReader(payload)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	request.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+	}
+
+	return request, nil
 }
 
 func decodeAPIResponse(response *http.Response, out any) error {
