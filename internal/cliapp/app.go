@@ -14,23 +14,24 @@ import (
 )
 
 type Deps struct {
-	Stdin         io.Reader
-	Stdout        io.Writer
-	Stderr        io.Writer
-	HTTPClient    *http.Client
-	HomeDir       string
-	Platform      string
-	Arch          string
-	LookPath      config.LookPathFunc
-	RunCommand    runCommandFunc
-	SpawnDetached spawnDetachedFunc
-	KillProcess   killProcessFunc
-	ReadFile      readFileFunc
-	WriteFile     writeFileFunc
-	RemoveFile    removeFileFunc
-	MkdirAll      mkdirAllFunc
-	Sleep         sleepFunc
-	Getwd         getwdFunc
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	HTTPClient     *http.Client
+	HomeDir        string
+	Platform       string
+	Arch           string
+	LookPath       config.LookPathFunc
+	RunCommand     runCommandFunc
+	SpawnDetached  spawnDetachedFunc
+	KillProcess    killProcessFunc
+	ReadFile       readFileFunc
+	WriteFile      writeFileFunc
+	RemoveFile     removeFileFunc
+	MkdirAll       mkdirAllFunc
+	Sleep          sleepFunc
+	Getwd          getwdFunc
+	ExecutablePath string
 }
 
 type App struct {
@@ -175,10 +176,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				runE:  runtime.upgrade,
 				localFlags: []flagSpec{
 					boolFlag("check", "Check available CLI and daemon updates"),
+					boolFlag("cli", "Upgrade the looper CLI binary when self-upgrade is allowed"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
 				},
 				exampleLines: []string{
 					"$ looper upgrade --check",
+					"$ looper upgrade --cli",
 					"$ looper upgrade --daemon",
 				},
 			}),

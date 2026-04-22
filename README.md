@@ -107,17 +107,21 @@ The uninstall script removes the CLI binary, the managed daemon binary, and upda
 Unified upgrade entrypoint:
 
 ```bash
+looper upgrade
 looper upgrade --check
+looper upgrade --cli
 looper upgrade --daemon
 ```
 
 Current phase behavior:
 
 - `looper upgrade --check` shows current/latest CLI and daemon versions
+- `looper upgrade` is the unified entrypoint: it attempts CLI self-upgrade when safe, then upgrades the managed daemon
+- `looper upgrade --cli` upgrades the `looper` binary only when the current install looks like a release-binary install
 - `looper upgrade --daemon` installs or upgrades the managed daemon binary
-- full `looper upgrade` for CLI + daemon together is not implemented yet
+- Homebrew and dev / `go install` installs refuse CLI self-upgrade and print the matching manual command instead
 - after a daemon upgrade, restart manually with `looper daemon restart`
-- replace the `looper` CLI binary manually when a newer GitHub Release is available
+- manifest-gated upgrade, rollback, and channel switching are not implemented in this phase yet
 
 ### From source
 
@@ -149,8 +153,8 @@ go run ./cmd/looper -- status
 - Management endpoints stay under `/api/v1/*` in the current phase, and minor releases should not introduce breaking protocol changes.
 - If the daemon is running, the CLI reads its current version from `/api/v1/status`; otherwise it falls back to `looperd --version`.
 - `looper upgrade --check` reads the latest CLI and daemon versions from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed daemon binary version; if no binary is found, daemon current version is reported as not installed.
-- The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade --daemon` to update the managed binary.
-- Full major-version upgrade confirmation is not implemented in this phase because full `looper upgrade` is not implemented yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
+- The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade` / `looper upgrade --daemon` to update the managed binary.
+- Full major-version upgrade confirmation is not implemented in this phase yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
 
 
 ## Development commands

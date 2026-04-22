@@ -77,24 +77,98 @@ func TestUpgradeRejectsCombiningCheckAndDaemon(t *testing.T) {
 	if exitCode != 1 {
 		t.Fatalf("Run([upgrade --check --daemon]) exit code = %d, want 1", exitCode)
 	}
-	if !strings.Contains(stderr.String(), "--check and --daemon cannot be combined") {
+	if !strings.Contains(stderr.String(), "--check, --cli, and --daemon cannot be combined") {
 		t.Fatalf("stderr = %q, want combination error", stderr.String())
 	}
 }
 
-func TestUpgradeWithoutFlagsExplainsNotImplemented(t *testing.T) {
+func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	binary := []byte{1, 2, 3, 4}
+	checksumText := "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a  looperd-darwin-arm64\n"
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return nil, fmt.Errorf("daemon offline")
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://api.github.com/repos/powerformer/looper/releases/tags/v0.3.0":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			if command == looperdBinaryName && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([upgrade]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "CLI self-upgrade skipped") {
+		t.Fatalf("stdout = %q, want CLI refusal guidance", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
+		t.Fatalf("stdout = %q, want daemon continuation note", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Installed looperd 0.3.0") {
+		t.Fatalf("stdout = %q, want daemon install message", stdout.String())
+	}
+}
+
+func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	app := New(Deps{Stdout: stdout, Stderr: stderr})
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() == "https://api.github.com/repos/powerformer/looper/releases/latest" {
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
+			}
+			t.Fatalf("unexpected request URL %q", req.URL.String())
+			return nil, nil
+		}),
+	})
 
-	exitCode := app.Run(context.Background(), []string{"upgrade"})
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--cli"})
 	if exitCode != 1 {
-		t.Fatalf("Run([upgrade]) exit code = %d, want 1", exitCode)
+		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 1", exitCode)
 	}
-	if !strings.Contains(stderr.String(), "Full `looper upgrade` (CLI + daemon) is not implemented yet") {
-		t.Fatalf("stderr = %q, want bare-upgrade guidance", stderr.String())
+	if !strings.Contains(stderr.String(), "brew upgrade looper") {
+		t.Fatalf("stderr = %q, want brew guidance", stderr.String())
 	}
 }
 

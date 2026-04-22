@@ -2,10 +2,14 @@ package cliapp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/powerformer/looper/internal/version"
@@ -54,14 +58,55 @@ type daemonUpgradeOutput struct {
 	Skipped         *bool   `json:"skipped,omitempty"`
 }
 
+type cliUpgradeOutput struct {
+	Changed         bool    `json:"changed"`
+	CurrentVersion  string  `json:"currentVersion"`
+	LatestVersion   string  `json:"latestVersion"`
+	BinaryPath      *string `json:"binaryPath,omitempty"`
+	PreviousBinary  *string `json:"previousBinary,omitempty"`
+	DownloadedFrom  *string `json:"downloadedFrom,omitempty"`
+	InstallSource   string  `json:"installSource"`
+	Skipped         *bool   `json:"skipped,omitempty"`
+	Refused         *bool   `json:"refused,omitempty"`
+	RefusedGuidance *string `json:"refusedGuidance,omitempty"`
+}
+
+type cliInstallSource string
+
+const (
+	cliInstallSourceRelease  cliInstallSource = "release-binary"
+	cliInstallSourceHomebrew cliInstallSource = "homebrew"
+	cliInstallSourceDev      cliInstallSource = "dev"
+	cliInstallSourceUnknown  cliInstallSource = "unknown"
+)
+
+type cliUpgradeRefusedError struct {
+	message string
+}
+
+func (e *cliUpgradeRefusedError) Error() string {
+	return e.message
+}
+
 func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 	_ = args
 
 	check := getBoolFlag(cmd, "check")
+	cliOnly := getBoolFlag(cmd, "cli")
 	daemonOnly := getBoolFlag(cmd, "daemon")
 
-	if check && daemonOnly {
-		return fmt.Errorf("--check and --daemon cannot be combined")
+	selectedPaths := 0
+	if check {
+		selectedPaths++
+	}
+	if cliOnly {
+		selectedPaths++
+	}
+	if daemonOnly {
+		selectedPaths++
+	}
+	if selectedPaths > 1 {
+		return fmt.Errorf("--check, --cli, and --daemon cannot be combined")
 	}
 
 	if check {
@@ -79,7 +124,12 @@ func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 		return r.upgradeDaemon(cmd)
 	}
 
-	return fmt.Errorf("Full `looper upgrade` (CLI + daemon) is not implemented yet. Use `looper upgrade --check` or `looper upgrade --daemon`.")
+	if cliOnly {
+		_, err := r.upgradeCLI(cmd)
+		return err
+	}
+
+	return r.upgradeUnified(cmd)
 }
 
 func (r *commandRuntime) collectUpgradeCheckSummary(ctx context.Context) (upgradeCheckSummary, error) {
@@ -109,16 +159,24 @@ func (r *commandRuntime) collectUpgradeCheckSummary(ctx context.Context) (upgrad
 
 	summary := upgradeCheckSummary{
 		CLI: upgradeCLISummary{
-			CurrentVersion:  version.Current().Version,
-			LatestVersion:   latestCLIVersion,
-			UpdateAvailable: normalizeVersion(version.Current().Version) != normalizeVersion(latestCLIVersion),
+			CurrentVersion: version.Current().Version,
+			LatestVersion:  latestCLIVersion,
 		},
 		Daemon: upgradeDaemonSummary{LatestVersion: latestDaemonRelease.Version, Source: "not-installed"},
 	}
+	cliUpgradeAvailable, err := isSemverUpgradeAvailable(version.Current().Version, latestCLIVersion)
+	if err != nil {
+		return upgradeCheckSummary{}, fmt.Errorf("compare CLI versions: %w", err)
+	}
+	summary.CLI.UpdateAvailable = cliUpgradeAvailable
 
 	if currentDaemon != nil {
 		summary.Daemon.CurrentVersion = stringPtr(currentDaemon.Version)
-		summary.Daemon.UpdateAvailable = normalizeVersion(currentDaemon.Version) != normalizeVersion(latestDaemonRelease.Version)
+		daemonUpgradeAvailable, err := isSemverUpgradeAvailable(currentDaemon.Version, latestDaemonRelease.Version)
+		if err != nil {
+			return upgradeCheckSummary{}, fmt.Errorf("compare daemon versions: %w", err)
+		}
+		summary.Daemon.UpdateAvailable = daemonUpgradeAvailable
 		summary.Daemon.Installed = currentDaemon.Source == "installed-binary"
 		summary.Daemon.Source = currentDaemon.Source
 		summary.Daemon.BinaryPath = currentDaemon.BinaryPath
@@ -157,7 +215,14 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 	}
 
 	needsInstall := managedDaemon == nil
-	needsUpgrade := needsInstall || currentVersion == nil || normalizeVersion(*currentVersion) != normalizeVersion(latestRelease.Version)
+	needsUpgrade := needsInstall || currentVersion == nil
+	if !needsUpgrade {
+		available, err := isSemverUpgradeAvailable(*currentVersion, latestRelease.Version)
+		if err != nil {
+			return fmt.Errorf("compare daemon versions: %w", err)
+		}
+		needsUpgrade = available
+	}
 	if !needsUpgrade {
 		output := daemonUpgradeOutput{
 			Changed:        false,
@@ -299,6 +364,217 @@ func (r *commandRuntime) readUpgradeDaemonVersion(ctx context.Context, command s
 
 func normalizeVersion(value string) string {
 	return strings.TrimPrefix(strings.TrimSpace(value), "v")
+}
+
+func (r *commandRuntime) upgradeUnified(cmd *cobra.Command) error {
+	_, cliErr := r.upgradeCLI(cmd)
+	if cliErr != nil {
+		var refused *cliUpgradeRefusedError
+		if !errors.As(cliErr, &refused) {
+			return cliErr
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "CLI self-upgrade skipped: %s\n", refused.message); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Proceeding with daemon upgrade..."); err != nil {
+		return err
+	}
+	return r.upgradeDaemon(cmd)
+}
+
+func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error) {
+	ctx := cmd.Context()
+	latestRelease, err := r.fetchReleaseMetadata(ctx, "")
+	if err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	latestVersion := normalizeVersion(latestRelease.TagName)
+	if latestVersion == "" {
+		return cliUpgradeOutput{}, fmt.Errorf("latest looper release metadata is missing tag_name")
+	}
+
+	execPath, err := r.executablePath()
+	if err != nil {
+		return cliUpgradeOutput{}, fmt.Errorf("resolve current looper path: %w", err)
+	}
+	installSource := detectCLIInstallSource(execPath)
+	guidance := cliRefusalGuidance(installSource, execPath)
+	if installSource != cliInstallSourceRelease {
+		refused := true
+		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
+		if getBoolFlag(cmd, "json") {
+			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
+				return cliUpgradeOutput{}, err
+			}
+		}
+		return result, &cliUpgradeRefusedError{message: guidance}
+	}
+
+	available, err := isSemverUpgradeAvailable(version.Current().Version, latestVersion)
+	if err != nil {
+		return cliUpgradeOutput{}, fmt.Errorf("compare CLI versions: %w", err)
+	}
+	if !available {
+		skipped := true
+		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Skipped: &skipped}
+		if getBoolFlag(cmd, "json") {
+			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
+				return cliUpgradeOutput{}, err
+			}
+		}
+		if !getBoolFlag(cmd, "json") {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looper is already up to date (%s)\n", version.Current().Version); err != nil {
+				return cliUpgradeOutput{}, err
+			}
+		}
+		return result, nil
+	}
+
+	target, err := resolveLooperTarget(r.platform(), r.arch())
+	if err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	binaryAsset, checksumAsset, err := findLooperReleaseAssets(latestRelease, target)
+	if err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL)
+	if err != nil {
+		return cliUpgradeOutput{}, fmt.Errorf("failed to download looper binary: %w", err)
+	}
+	checksumText, err := r.downloadChecksum(ctx, checksumAsset.BrowserDownloadURL)
+	if err != nil {
+		return cliUpgradeOutput{}, fmt.Errorf("failed to download looper checksum: %w", err)
+	}
+	expectedChecksum, err := parseChecksum(checksumText)
+	if err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	actualChecksum := sha256.Sum256(binaryBytes)
+	if hex.EncodeToString(actualChecksum[:]) != expectedChecksum {
+		return cliUpgradeOutput{}, fmt.Errorf("downloaded looper checksum mismatch: expected %s, received %s", expectedChecksum, hex.EncodeToString(actualChecksum[:]))
+	}
+	if err := replaceBinaryAtomically(execPath, binaryBytes); err != nil {
+		return cliUpgradeOutput{}, err
+	}
+
+	prevPath := execPath + ".prev"
+	result := cliUpgradeOutput{Changed: true, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), PreviousBinary: stringPtr(prevPath), DownloadedFrom: stringPtr(binaryAsset.BrowserDownloadURL), InstallSource: string(installSource)}
+	if getBoolFlag(cmd, "json") {
+		if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
+			return cliUpgradeOutput{}, err
+		}
+		return result, nil
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Upgraded looper %s → %s at %s\n", version.Current().Version, latestVersion, execPath); err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Previous binary kept at %s\n", prevPath); err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", binaryAsset.BrowserDownloadURL); err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	return result, nil
+}
+
+func detectCLIInstallSource(execPath string) cliInstallSource {
+	path := strings.ToLower(execPath)
+	if strings.Contains(path, "/cellar/") || strings.Contains(path, "/homebrew/") {
+		return cliInstallSourceHomebrew
+	}
+	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") || strings.Contains(path, "/tmp/") {
+		return cliInstallSourceDev
+	}
+	base := strings.ToLower(filepath.Base(path))
+	if base != "looper" {
+		return cliInstallSourceUnknown
+	}
+	if strings.HasSuffix(path, "/.local/bin/looper") || strings.HasSuffix(path, "/usr/local/bin/looper") || strings.HasSuffix(path, "/.looper/bin/looper") {
+		return cliInstallSourceRelease
+	}
+	return cliInstallSourceUnknown
+}
+
+func (r *commandRuntime) executablePath() (string, error) {
+	if value := strings.TrimSpace(r.app.deps.ExecutablePath); value != "" {
+		return value, nil
+	}
+	return os.Executable()
+}
+
+func cliRefusalGuidance(source cliInstallSource, execPath string) string {
+	switch source {
+	case cliInstallSourceHomebrew:
+		return "this looper binary looks Homebrew-managed. Upgrade with `brew upgrade looper` (or your tap formula)."
+	case cliInstallSourceDev:
+		return "this looper binary looks like a dev/go-install build. Reinstall with `go install ./cmd/looper` (or rebuild locally)."
+	default:
+		return fmt.Sprintf("cannot safely self-upgrade looper from %q. Reinstall from a release binary or use your package manager.", execPath)
+	}
+}
+
+func resolveLooperTarget(platform string, arch string) (string, error) {
+	if platform == "darwin" && arch == "arm64" {
+		return "darwin-arm64", nil
+	}
+	if platform == "darwin" && (arch == "amd64" || arch == "x64") {
+		return "darwin-x64", nil
+	}
+	return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: darwin-arm64, darwin-x64", platform, arch)
+}
+
+func findLooperReleaseAssets(release githubReleasePayload, target string) (githubReleaseAsset, githubReleaseAsset, error) {
+	binaryName := "looper-" + target
+	checksumName := binaryName + ".sha256"
+	var binaryAsset githubReleaseAsset
+	var checksumAsset githubReleaseAsset
+	for _, asset := range release.Assets {
+		if asset.Name == binaryName {
+			binaryAsset = asset
+		}
+		if asset.Name == checksumName {
+			checksumAsset = asset
+		}
+	}
+	if strings.TrimSpace(binaryAsset.BrowserDownloadURL) == "" {
+		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("release is missing asset %q", binaryName)
+	}
+	if strings.TrimSpace(checksumAsset.BrowserDownloadURL) == "" {
+		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("release is missing asset %q", checksumName)
+	}
+	return binaryAsset, checksumAsset, nil
+}
+
+func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {
+	installDir := filepath.Dir(installPath)
+	tempInstallPath := installPath + ".new"
+	prevPath := installPath + ".prev"
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return fmt.Errorf("create install directory: %w", err)
+	}
+	if err := os.WriteFile(tempInstallPath, binaryBytes, 0o755); err != nil {
+		_ = removeTempInstallFile(tempInstallPath)
+		return fmt.Errorf("write staged binary: %w", err)
+	}
+	if err := os.Chmod(tempInstallPath, 0o755); err != nil {
+		_ = removeTempInstallFile(tempInstallPath)
+		return fmt.Errorf("chmod staged binary: %w", err)
+	}
+	if _, err := os.Stat(installPath); err == nil {
+		_ = os.Remove(prevPath)
+		if err := os.Rename(installPath, prevPath); err != nil {
+			_ = removeTempInstallFile(tempInstallPath)
+			return fmt.Errorf("preserve previous looper binary: %w", err)
+		}
+	}
+	if err := os.Rename(tempInstallPath, installPath); err != nil {
+		_ = removeTempInstallFile(tempInstallPath)
+		return fmt.Errorf("replace looper binary: %w", err)
+	}
+	return nil
 }
 
 func writeHumanUpgradeSummary(w io.Writer, summary upgradeCheckSummary) error {
