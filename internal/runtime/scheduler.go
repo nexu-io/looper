@@ -452,7 +452,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
 }
 
 func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {

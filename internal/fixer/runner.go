@@ -920,6 +920,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if !strings.EqualFold(result.Status, "completed") {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Fixer agent "+result.Status), kind: FailureRetryableTransient}
 	}
+	if result.ParseStatus != "parsed" {
+		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(result.ParseStatus, "missing"))), kind: FailureRetryableTransient}
+	}
 	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, CompletedAt: r.nowISO()}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil

@@ -204,6 +204,7 @@ type AgentResult struct {
 	Status       string
 	Summary      string
 	Stdout       string
+	ParseStatus  string
 	ChangedFiles []string
 	Commits      []string
 }
@@ -356,6 +357,7 @@ type checkpointPlan struct {
 type checkpointExecution struct {
 	Status       string   `json:"status,omitempty"`
 	Summary      string   `json:"summary,omitempty"`
+	ParseStatus  string   `json:"parseStatus,omitempty"`
 	ChangedFiles []string `json:"changedFiles,omitempty"`
 	Commits      []string `json:"commits,omitempty"`
 	Stdout       string   `json:"stdout,omitempty"`
@@ -819,7 +821,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if result.Status != "completed" {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent %s", result.Status)), kind: FailureRetryableTransient}
 	}
-	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
+	if result.ParseStatus != "parsed" {
+		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent completed without valid structured result (parse status: %s)", firstNonEmpty(result.ParseStatus, "missing"))), kind: FailureRetryableTransient}
+	}
+	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
