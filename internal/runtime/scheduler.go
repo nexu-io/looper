@@ -469,6 +469,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		return nil
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
+		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
 		payload := notify.SystemNotificationPayload{
 			ProjectID:  input.ProjectID,
 			LoopID:     input.LoopID,
@@ -482,17 +483,17 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			payload.Level = "action_required"
 			payload.Title = "Looper Worker Needs Attention"
 			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", input.RunID)
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
 		case input.Status == "failed":
 			payload.Level = "failure"
 			payload.Title = "Looper Worker Failed"
 			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.failed:%s", input.RunID)
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.failed:%s", workerNotificationKeyID)
 		case input.Status == "skipped":
 			payload.Level = "action_required"
 			payload.Title = "Looper Worker Needs Attention"
 			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", input.RunID)
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
 		case input.PullRequestNumber > 0:
 			payload.Level = "action_required"
 			payload.Title = "Looper Worker Opened a PR"
