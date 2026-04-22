@@ -633,7 +633,7 @@ func (g *Gateway) remoteBranchExists(ctx context.Context, repoPath, remote, bran
 		return true, nil
 	}
 	var commandErr *shell.CommandExecutionError
-	if errors.As(err, &commandErr) {
+	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
 		return false, nil
 	}
 	return false, err
@@ -701,11 +701,18 @@ func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant
 }
 
 func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (bool, error) {
+	if _, err := os.Stat(worktreePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
 	_, err := g.runGitResult(ctx, worktreePath, nil, "status", "--porcelain", "--untracked-files=all")
 	if err == nil {
 		return true, nil
 	}
-	return false, nil
+	return false, err
 }
 
 func (g *Gateway) isDetachedWorktree(ctx context.Context, worktreePath string) (bool, error) {

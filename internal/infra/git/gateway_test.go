@@ -498,6 +498,69 @@ func TestGatewayResolveDetachedStartPointPropagatesFetchFailure(t *testing.T) {
 	}
 }
 
+func TestGatewayRemoteBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	gateway := fixture.gateway()
+
+	exists, err := gateway.remoteBranchExists(ctx, fixture.repoPath, "origin", "feature/missing")
+	if err != nil {
+		t.Fatalf("remoteBranchExists(missing) error = %v", err)
+	}
+	if exists {
+		t.Fatal("remoteBranchExists(missing) = true, want false")
+	}
+
+	nonRepoPath := filepath.Join(fixture.rootDir, "not-a-repo")
+	mustMkdirAll(t, nonRepoPath)
+	exists, err = gateway.remoteBranchExists(ctx, nonRepoPath, "origin", "feature/missing")
+	if err == nil {
+		t.Fatal("remoteBranchExists(non-repo) error = nil, want error")
+	}
+	if exists {
+		t.Fatal("remoteBranchExists(non-repo) = true, want false")
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("remoteBranchExists(non-repo) error = %T, want *shell.CommandExecutionError", err)
+	}
+	if commandErr.Result.ExitCode == 1 {
+		t.Fatalf("remoteBranchExists(non-repo) exit code = %d, want non-1", commandErr.Result.ExitCode)
+	}
+}
+
+func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	brokenWorktreePath := filepath.Join(fixture.worktreeRoot, "broken-worktree")
+	mustMkdirAll(t, brokenWorktreePath)
+	metadata := `{"recovered":false}`
+	baseBranch := "main"
+	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "broken-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: brokenWorktreePath, Branch: "feature/fixer", BaseBranch: &baseBranch, Status: "active", MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout)}); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+
+	_, err := gateway.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, Branch: "feature/fixer", WorktreeRoot: fixture.worktreeRoot})
+	if err == nil {
+		t.Fatal("RestoreWorktree() error = nil, want health check failure")
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("RestoreWorktree() error = %T, want *shell.CommandExecutionError", err)
+	}
+	if commandErr.Result.ExitCode == 1 {
+		t.Fatalf("RestoreWorktree() exit code = %d, want non-1 health check failure", commandErr.Result.ExitCode)
+	}
+}
+
 type fixture struct {
 	rootDir      string
 	repoPath     string
