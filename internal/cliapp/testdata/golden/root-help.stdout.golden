@@ -2,21 +2,22 @@ Usage:
   looper [flags]
 
 Subcommands:
-  status   Show service status
-  project  Project commands
-  config   Config commands
-  daemon   Daemon commands
-  upgrade  Check or upgrade Looper installations
-  loop     Loop commands
-  work     Create a worker run
-  plan     Create a planner run
-  pr       Pull request commands
-  review   Create a reviewer task for a pull request
-  ps       Show running loops
-  jump     Print shell command for a loop worktree
-  logs     Show logs for a loop
-  stop     Stop an active loop
-  run      Run commands
+  status     Show service status
+  bootstrap  Run first-time setup
+  project    Project commands
+  config     Config commands
+  daemon     Daemon commands
+  upgrade    Check or upgrade Looper installations
+  loop       Loop commands
+  work       Create a worker run
+  plan       Create a planner run
+  pr         Pull request commands
+  review     Create a reviewer task for a pull request
+  ps         Show running loops
+  jump       Print shell command for a loop worktree
+  logs       Show logs for a loop
+  stop       Stop an active loop
+  run        Run commands
 
 Flags:
   --config <path>             Config path

@@ -8,17 +8,20 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
 type Deps struct {
+	Stdin         io.Reader
 	Stdout        io.Writer
 	Stderr        io.Writer
 	HTTPClient    *http.Client
 	HomeDir       string
 	Platform      string
 	Arch          string
+	LookPath      config.LookPathFunc
 	RunCommand    runCommandFunc
 	SpawnDetached spawnDetachedFunc
 	KillProcess   killProcessFunc
@@ -89,10 +92,27 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
+			newCommand(commandSpec{
+				use:   "bootstrap",
+				short: "Run first-time setup",
+				runE:  runtime.bootstrap,
+				localFlags: []flagSpec{
+					boolFlag("yes", "Run non-interactively with defaults"),
+					boolFlag("force", "Reinstall the managed daemon binary even if it already exists"),
+					stringFlag("agent-vendor", "vendor", "Agent vendor for generated config"),
+					stringFlag("project-path", "path", "Add a default project from a local repository path"),
+					boolFlag("enable-local-token", "Enable server.authMode=local-token for generated config"),
+					boolFlag("disable-osascript", "Disable osascript notifications for generated config"),
+				},
+				exampleLines: []string{
+					"$ looper bootstrap",
+					"$ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode",
+				},
+			}),
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
@@ -305,6 +325,9 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	addFlags(root.PersistentFlags(), globalFlags())
 	root.SetOut(a.stdout())
 	root.SetErr(a.stderr())
+	if a.deps.Stdin != nil {
+		root.SetIn(a.deps.Stdin)
+	}
 	root.SilenceErrors = true
 	root.SilenceUsage = true
 	root.CompletionOptions.DisableDefaultCmd = true

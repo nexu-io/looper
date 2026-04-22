@@ -1,0 +1,330 @@
+package cliapp
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	projectPath := filepath.Join(cwd, "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectPath) error = %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	binary := []byte("looperd-binary")
+	checksum := sha256.Sum256(binary)
+	checksumText := hex.EncodeToString(checksum[:]) + "  looperd-darwin-arm64\n"
+
+	var daemonStarted atomic.Bool
+	var spawnCalls atomic.Int32
+	var statusCalls atomic.Int32
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			}
+
+			switch req.URL.Path {
+			case "/api/v1/status", "/api/v1/healthz":
+				statusCalls.Add(1)
+				if !daemonStarted.Load() {
+					return nil, fmt.Errorf("daemon offline")
+				}
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				if _, err := os.Stat(managedPath); err != nil {
+					return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+				}
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			if command == "ps" && len(args) == 4 && args[0] == "-p" && args[2] == "-o" && args[3] == "command=" {
+				return commandExecutionResult{ExitCode: 0, Stdout: managedPath + "\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = args
+			_ = cwd
+			_ = env
+			if command != managedPath {
+				return 0, fmt.Errorf("unexpected command %q", command)
+			}
+			spawnCalls.Add(1)
+			daemonStarted.Store(true)
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid == 4321 && signal == 0 {
+				return nil
+			}
+			return fmt.Errorf("unexpected kill(%d, %d)", pid, signal)
+		},
+		Sleep: func(duration time.Duration) {
+			_ = duration
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--project-path", projectPath, "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap --yes]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes]) stderr = %q, want empty string", stderr.String())
+	}
+	if spawnCalls.Load() != 1 {
+		t.Fatalf("spawnDetached calls = %d, want 1", spawnCalls.Load())
+	}
+	if statusCalls.Load() < 2 {
+		t.Fatalf("status checks = %d, want at least 2", statusCalls.Load())
+	}
+
+	for _, rel := range []string{".looper/bin", ".looper/backups", ".looper/logs"} {
+		path := filepath.Join(homeDir, rel)
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("expected runtime directory %q to exist, err=%v", path, err)
+		}
+	}
+
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(rawConfig, &decoded); err != nil {
+		t.Fatalf("Unmarshal(config) error = %v", err)
+	}
+	projects, ok := decoded["projects"].([]any)
+	if !ok || len(projects) == 0 {
+		t.Fatalf("config projects = %#v, want non-empty array", decoded["projects"])
+	}
+
+	out := stdout.String()
+	for _, want := range []string{"Bootstrap complete", "configCreated", "yes", "projectAdded", "daemonInstallState", "installed", "apiReachable", "yes", "Next steps:", "- looper status"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout = %q, want to contain %q", out, want)
+		}
+	}
+	if strings.Contains(out, "looper project add /path/to/repo") {
+		t.Fatalf("stdout = %q, did not expect manual project-add step", out)
+	}
+}
+
+func TestBootstrapPreflightFailsWhenRequiredToolsMissing(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		LookPath: func(file string) (string, error) {
+			if file == "osascript" {
+				return "/usr/bin/osascript", nil
+			}
+			return "", fmt.Errorf("not found")
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected network request %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--config", configPath})
+	if exitCode != 1 {
+		t.Fatalf("Run([bootstrap --yes]) exit code = %d, want 1", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes]) stdout = %q, want empty string", stdout.String())
+	}
+	for _, want := range []string{"bootstrap preflight failed", "missing required tools: git, gh", "Install them manually", "brew install git gh"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want to contain %q", stderr.String(), want)
+		}
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("config path exists unexpectedly after preflight failure: %v", err)
+	}
+}
+
+func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	projectPath := filepath.Join(cwd, "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectPath) error = %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "bootstrap-existing.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	existingConfig := map[string]any{
+		"server": map[string]any{"baseUrl": "http://daemon.test", "authMode": "none"},
+		"projects": []map[string]any{{
+			"id":         "repo",
+			"name":       "repo",
+			"repoPath":   projectPath,
+			"baseBranch": "main",
+		}},
+	}
+	raw, err := json.Marshal(existingConfig)
+	if err != nil {
+		t.Fatalf("Marshal(existingConfig) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath) error = %v", err)
+	}
+	before := string(raw)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var spawnCalls atomic.Int32
+	var installAssetCalls atomic.Int32
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64", "https://example.invalid/looperd-darwin-arm64.sha256":
+				installAssetCalls.Add(1)
+				t.Fatalf("unexpected daemon asset download request %q", req.URL.String())
+				return nil, nil
+			}
+			if req.URL.String() == "http://daemon.test/api/v1/status" {
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+			}
+			if req.URL.String() == "http://daemon.test/api/v1/healthz" {
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
+			}
+			t.Fatalf("unexpected request URL %q", req.URL.String())
+			return nil, nil
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			_ = cwd
+			_ = env
+			spawnCalls.Add(1)
+			return 0, fmt.Errorf("spawn should not be called in idempotent flow")
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--project-path", projectPath, "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want empty string", stderr.String())
+	}
+	if spawnCalls.Load() != 0 {
+		t.Fatalf("spawnDetached calls = %d, want 0", spawnCalls.Load())
+	}
+	if installAssetCalls.Load() != 0 {
+		t.Fatalf("daemon asset download calls = %d, want 0", installAssetCalls.Load())
+	}
+
+	assertJSONContains(t, stdout.String(), "configCreated", false)
+	assertJSONContains(t, stdout.String(), "projectAdded", false)
+	assertJSONContains(t, stdout.String(), "daemonInstallState", "already-installed")
+	assertJSONContains(t, stdout.String(), "daemonInstalled", false)
+	assertJSONContains(t, stdout.String(), "daemonRunning", true)
+	assertJSONContains(t, stdout.String(), "apiReachable", true)
+	assertJSONContains(t, stdout.String(), "nextSteps", []any{"looper status"})
+
+	afterRaw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	if string(afterRaw) != before {
+		t.Fatalf("config changed unexpectedly\nbefore=%s\nafter=%s", before, string(afterRaw))
+	}
+}
