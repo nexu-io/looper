@@ -2652,6 +2652,176 @@ func TestHandlerLoopLogsFollowEmitsEndForTerminalSnapshot(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopLogsFollowDoesNotStreamNextRunChunks(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_1",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		RunID:           stringPtr("run_1"),
+		Vendor:          "openai",
+		Status:          "running",
+		PID:             int64Ptr(1234),
+		HeartbeatCount:  1,
+		LastHeartbeatAt: stringPtr(nowISO),
+		StartedAt:       nowISO,
+		OutputJSON:      stringPtr(`{"stdout":"line1\n","stderr":""}`),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(agent_exec_1) error = %v", err)
+	}
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+
+		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+		if getRunErr != nil || updatedRun == nil {
+			return
+		}
+		run := *updatedRun
+		run.Status = "success"
+		run.EndedAt = &completedAt
+		run.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
+
+		nextStartedAt := fixture.now.Add(2 * time.Minute).UTC().Format(javaScriptISOString)
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+			ID:                "run_2",
+			LoopID:            "loop_1",
+			Status:            "running",
+			CurrentStep:       stringPtr("review"),
+			LastCompletedStep: stringPtr("snapshot"),
+			StartedAt:         nextStartedAt,
+			LastHeartbeatAt:   stringPtr(nextStartedAt),
+			CreatedAt:         nextStartedAt,
+			UpdatedAt:         nextStartedAt,
+		})
+		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+			ID:              "agent_exec_2",
+			ProjectID:       stringPtr("project_1"),
+			LoopID:          stringPtr("loop_1"),
+			RunID:           stringPtr("run_2"),
+			Vendor:          "openai",
+			Status:          "running",
+			PID:             int64Ptr(5678),
+			HeartbeatCount:  1,
+			LastHeartbeatAt: stringPtr(nextStartedAt),
+			StartedAt:       nextStartedAt,
+			OutputJSON:      stringPtr(`{"stdout":"run2-line1\n","stderr":""}`),
+			CreatedAt:       nextStartedAt,
+			UpdatedAt:       nextStartedAt,
+		})
+	}()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll() error = %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: snapshot") {
+		t.Fatalf("stream body = %q, want snapshot event", text)
+	}
+	if !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body = %q, want end event", text)
+	}
+	if strings.Contains(text, "run2-line1\\n") {
+		t.Fatalf("stream body = %q, did not expect next run chunk", text)
+	}
+	if strings.Contains(text, "event: chunk") {
+		t.Fatalf("stream body = %q, did not expect chunk event from next run", text)
+	}
+}
+
+func TestHandlerLoopLogsFollowEmitsEndWhenLoopTerminatesBeforeRunStarts(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_no_run",
+		Seq:        2,
+		ProjectID:  "project_1",
+		Type:       "reviewer",
+		TargetType: "pull_request",
+		TargetID:   stringPtr("pr:acme/looper:99"),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(99),
+		Status:     "running",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_no_run) error = %v", err)
+	}
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_no_run/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		loop, getLoopErr := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), "loop_no_run")
+		if getLoopErr != nil || loop == nil {
+			return
+		}
+		updatedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+		updatedLoop := *loop
+		updatedLoop.Status = "completed"
+		updatedLoop.UpdatedAt = updatedAt
+		_ = fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), updatedLoop)
+	}()
+
+	bodyCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		body, readErr := io.ReadAll(response.Body)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+		bodyCh <- body
+	}()
+
+	var body []byte
+	select {
+	case body = <-bodyCh:
+	case err := <-errCh:
+		t.Fatalf("io.ReadAll() error = %v", err)
+	case <-time.After(5 * time.Second):
+		_ = response.Body.Close()
+		t.Fatal("timed out waiting for loop logs follow stream")
+	}
+
+	text := string(body)
+	if !strings.Contains(text, "event: snapshot") {
+		t.Fatalf("stream body = %q, want snapshot event", text)
+	}
+	if !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body = %q, want end event", text)
+	}
+	if strings.Contains(text, "event: chunk") {
+		t.Fatalf("stream body = %q, did not expect chunk event", text)
+	}
+}
+
 func seedWorkerPlannerArtifactsData(t *testing.T, rt *looperdruntime.Runtime, now time.Time) {
 	t.Helper()
 	nowISO := now.UTC().Format(javaScriptISOString)

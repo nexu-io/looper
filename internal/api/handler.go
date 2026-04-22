@@ -2121,6 +2121,10 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 		if observedRunID == "" && current.Run != nil {
 			observedRunID = current.Run.RunID
 		}
+		if shouldTerminateLoopLogsFollowBeforeChunk(current, observedRunID) {
+			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
+			return nil
+		}
 
 		nextExecutionID, nextContent := loopLogsStreamState(current, stderr)
 		chunk := appendedLogChunk(previousExecutionID, previousContent, nextExecutionID, nextContent)
@@ -2210,6 +2214,19 @@ func shouldTerminateLoopLogsFollow(resp loopLogsResponse, observedRunID string) 
 		return true
 	}
 	return domain.IsTerminalRunStatus(domain.RunStatus(resp.Run.Status))
+}
+
+func shouldTerminateLoopLogsFollowBeforeChunk(resp loopLogsResponse, observedRunID string) bool {
+	if !shouldTerminateLoopLogsFollow(resp, observedRunID) {
+		return false
+	}
+	if observedRunID == "" {
+		return resp.Run == nil
+	}
+	if resp.Run == nil {
+		return true
+	}
+	return resp.Run.RunID != observedRunID
 }
 
 type createLoopRequest struct {
@@ -3078,6 +3095,12 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
 	services := h.context.Runtime.Services()
+	if latestLoop, err := services.Repositories.Loops.GetByID(ctx, loop.ID); err != nil {
+		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	} else if latestLoop != nil {
+		loop = *latestLoop
+	}
+
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
