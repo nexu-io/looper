@@ -264,10 +264,12 @@ func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 		issueNumberValue := strings.TrimSpace(getStringFlag(cmd, "issue"))
 		prompt := strings.TrimSpace(getStringFlag(cmd, "prompt"))
 		specPath := strings.TrimSpace(getStringFlag(cmd, "spec"))
+		projectID := strings.TrimSpace(getStringFlag(cmd, "project"))
+		repo := strings.TrimSpace(getStringFlag(cmd, "repo"))
+		resolvedProjectID := projectID
 
 		body := map[string]any{}
-		setString(body, "projectId", getStringFlag(cmd, "project"))
-		setString(body, "repo", getStringFlag(cmd, "repo"))
+		setString(body, "repo", repo)
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
 
 		if issueNumberValue != "" {
@@ -279,11 +281,27 @@ func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 				return nil, err
 			}
 			body["issueNumber"] = issueNumber
+
+			if resolvedProjectID == "" && repo == "" {
+				projects, err := r.listProjects(ctx)
+				if err != nil {
+					return nil, err
+				}
+
+				project, err := r.resolveExplicitOrCurrentProject(projects, "")
+				if err != nil {
+					return nil, err
+				}
+
+				resolvedProjectID = project.ID
+			}
 		} else {
 			setString(body, "title", getStringFlag(cmd, "title"))
 			setString(body, "prompt", prompt)
 			setString(body, "specPath", specPath)
 		}
+
+		setString(body, "projectId", resolvedProjectID)
 
 		if issueNumberValue != "" && strings.TrimSpace(getStringFlag(cmd, "title")) != "" {
 			setString(body, "title", getStringFlag(cmd, "title"))

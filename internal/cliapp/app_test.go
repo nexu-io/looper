@@ -561,6 +561,124 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 }
 
+func TestWorkCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/workers":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_1"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			if _, ok := body["repo"]; ok {
+				t.Fatalf("body.repo = %#v, want omitted when inferred from current project", body["repo"])
+			}
+			if got, want := body["issueNumber"], float64(54); got != want {
+				t.Fatalf("body.issueNumber = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_worker", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "status": "queued", "issueNumber": 54, "title": "Implement issue #54", "baseBranch": "main"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"work", "--issue", "54", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([work --issue 54]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([work --issue 54]) stderr = %q, want empty string", got)
+	}
+	if got := stdout.String(); !strings.Contains(got, "Worker started") {
+		t.Fatalf("Run([work --issue 54]) stdout = %q, want to contain %q", got, "Worker started")
+	}
+}
+
+func TestWorkCreateIssueRequiresExplicitProjectWhenCurrentProjectIsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	repoPath := filepath.Join(rootPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper A", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}, {"id": "project_2", "name": "Looper B", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:01:00.000Z"}}}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"work", "--issue", "54", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([work --issue 54]) exit code = 0, want non-zero")
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("Run([work --issue 54]) stdout = %q, want empty string", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "--project is required") {
+		t.Fatalf("Run([work --issue 54]) stderr = %q, want to contain %q", got, "--project is required")
+	}
+}
+
+func TestResolveProjectForCWDPrefersMostSpecificRepoPath(t *testing.T) {
+	t.Parallel()
+
+	projects := []projectOutput{
+		{ID: "project_parent", RepoPath: "/tmp/repos/looper", Repo: stringPtr("acme/looper")},
+		{ID: "project_child", RepoPath: "/tmp/repos/looper/submodule", Repo: stringPtr("acme/looper-submodule")},
+	}
+
+	project, err := resolveProjectForCWD(projects, "/tmp/repos/looper/submodule/internal")
+	if err != nil {
+		t.Fatalf("resolveProjectForCWD() error = %v", err)
+	}
+	if got, want := project.ID, "project_child"; got != want {
+		t.Fatalf("resolveProjectForCWD().ID = %q, want %q", got, want)
+	}
+}
+
 func TestLoopStartUsesExplicitProjectForPullRequestTarget(t *testing.T) {
 	t.Parallel()
 
