@@ -932,7 +932,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		return workerInput{}, &loopError{message: "worker.prompt or worker.specPath is required", kind: FailureNonRetryable}
 	}
 	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && work.Prompt == "" && work.SpecPath == "" && r.github != nil {
-		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: work.Repo, IssueNumber: work.IssueNumber, CWD: project.RepoPath})
+		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: firstNonEmpty(work.IssueRepo, work.Repo), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
