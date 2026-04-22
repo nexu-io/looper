@@ -139,6 +139,20 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	}
 }
 
+func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *testing.T) {
+	t.Parallel()
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/powerformer/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want issue repo inferred from source issue URL", work.Prompt)
+	}
+	if work.IssueURL != "https://github.com/powerformer/looper/issues/27" {
+		t.Fatalf("IssueURL = %q, want source issue URL preserved", work.IssueURL)
+	}
+}
+
 func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -221,6 +235,50 @@ func TestResolveWorkerInputDefersIssueRepoFallbackUntilAfterHydration(t *testing
 	}
 	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
+	}
+}
+
+func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/powerformer/looper/issues/27","baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/powerformer/looper/issues/27","baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	work, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("resolveWorkerInput() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
+	}
+	if github.viewIssueCalls[0].Repo != "powerformer/looper" {
+		t.Fatalf("ViewIssue repo = %q, want powerformer/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
+	}
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("work.IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
+	}
+	if strings.Contains(work.Prompt, "Implement GitHub issue acme/looper#27") {
+		t.Fatalf("Prompt = %q, want prompt to avoid worker repo issue reference", work.Prompt)
 	}
 }
 

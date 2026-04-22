@@ -929,7 +929,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		return workerInput{}, &loopError{message: "worker.prompt or worker.specPath is required", kind: FailureNonRetryable}
 	}
 	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && work.Prompt == "" && work.SpecPath == "" && r.github != nil {
-		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: strings.TrimSpace(work.IssueRepo), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
+		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(work), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
@@ -1340,6 +1340,14 @@ func issueRepoFromURL(raw string) string {
 	return parts[0] + "/" + parts[1]
 }
 
+func issueLookupRepo(work workerInput) string {
+	return firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(work.IssueURL))
+}
+
+func resolvedIssueRepo(work workerInput, issue IssueDetail) string {
+	return firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(issue.URL), issueRepoFromURL(work.IssueURL), work.Repo)
+}
+
 func readSpecBlock(projectRepoPath, specPath string) (string, error) {
 	if specPath == "" {
 		return "", nil
@@ -1388,9 +1396,9 @@ func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInpu
 	if work.Title == "Worker run" || work.Title == fallbackTitle {
 		work.Title = issue.Title
 	}
-	work.IssueRepo = firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(issue.URL), work.Repo)
+	work.IssueRepo = resolvedIssueRepo(work, issue)
 	work.Prompt = buildIssuePrompt(work.IssueRepo, issue)
-	work.IssueURL = issue.URL
+	work.IssueURL = firstNonEmpty(issue.URL, work.IssueURL)
 	return work
 }
 
