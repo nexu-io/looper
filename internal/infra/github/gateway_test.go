@@ -296,23 +296,12 @@ printf '{}'
 
 func writeExecutable(t *testing.T, path, contents string) {
 	t.Helper()
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-	if err != nil {
-		t.Fatalf("os.OpenFile(%s) error = %v", path, err)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(contents), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%s) error = %v", tmpPath, err)
 	}
-	if _, err := file.WriteString(contents); err != nil {
-		_ = file.Close()
-		t.Fatalf("file.WriteString(%s) error = %v", path, err)
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		t.Fatalf("file.Sync(%s) error = %v", path, err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("file.Close(%s) error = %v", path, err)
-	}
-	if err := os.Chmod(path, 0o755); err != nil {
-		t.Fatalf("os.Chmod(%s) error = %v", path, err)
+	if err := os.Rename(tmpPath, path); err != nil {
+		t.Fatalf("os.Rename(%s, %s) error = %v", tmpPath, path, err)
 	}
 }
 
