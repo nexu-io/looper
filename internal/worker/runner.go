@@ -675,6 +675,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if lockKey == "" {
 		if work.ExecutionMode == "push-existing" && work.Repo != "" && work.PRNumber > 0 {
 			lockKey = fmt.Sprintf("pr:%s:%d", work.Repo, work.PRNumber)
+		} else if input.Loop.TargetType == "issue" && work.Repo != "" && work.IssueNumber > 0 {
+			lockKey = fmt.Sprintf("issue:%s:%d", work.Repo, work.IssueNumber)
 		} else {
 			lockKey = fmt.Sprintf("worker:%s", input.Loop.ID)
 		}
@@ -896,7 +898,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.persistPullRequestReference(ctx, input.Loop, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
+		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
 			return checkpoint, err
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
@@ -908,7 +910,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.persistPullRequestReference(ctx, input.Loop, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
+		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
 			return checkpoint, err
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
@@ -924,7 +926,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
-	if err := r.persistPullRequestReference(ctx, input.Loop, work.Repo, pr); err != nil {
+	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.PullRequest = &pr
@@ -1163,19 +1165,34 @@ func (r *Runner) assignReviewersIfNeeded(ctx context.Context, work workerInput, 
 	return r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: work.Repo, PRNumber: prNumber, Reviewers: append([]string(nil), work.Reviewers...), CWD: cwd})
 }
 
-func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.LoopRecord, repo string, pr checkpointPullPR) error {
+func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, repo string, pr checkpointPullPR) error {
 	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
 	if err != nil {
 		return err
 	}
+	targetID := fmt.Sprintf("pr:%s:%d", repo, pr.Number)
 	_, err = r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.Repo = stringPtr(repo)
-		if updated.TargetType == "pull_request" {
-			updated.PRNumber = int64Ptr(pr.Number)
-		}
+		updated.TargetType = "pull_request"
+		updated.TargetID = stringPtr(targetID)
+		updated.PRNumber = int64Ptr(pr.Number)
 		updated.MetadataJSON = stringPtr(metadataJSON)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	updatedQueue := queueItem
+	updatedQueue.TargetType = "pull_request"
+	updatedQueue.TargetID = targetID
+	updatedQueue.Repo = stringPtr(repo)
+	updatedQueue.PRNumber = int64Ptr(pr.Number)
+	updatedQueue.LockKey = stringPtr(targetID)
+	projectID := derefString(queueItem.ProjectID)
+	if projectID != "" {
+		updatedQueue.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, repo, pr.Number)
+	}
+	updatedQueue.UpdatedAt = r.nowISO()
+	return r.repos.Queue.Upsert(ctx, updatedQueue)
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {

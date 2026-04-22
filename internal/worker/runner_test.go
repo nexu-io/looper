@@ -92,8 +92,15 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "completed" || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"prNumber":101`) {
+	if loop == nil || loop.Status != "completed" || loop.TargetType != "pull_request" || loop.TargetID == nil || *loop.TargetID != "pr:acme/looper:101" || loop.PRNumber == nil || *loop.PRNumber != 101 || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"prNumber":101`) {
 		t.Fatalf("loop = %#v, want completed loop with PR metadata", loop)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.TargetType != "pull_request" || queue.TargetID != "pr:acme/looper:101" || queue.LockKey == nil || *queue.LockKey != "pr:acme/looper:101" || queue.PRNumber == nil || *queue.PRNumber != 101 {
+		t.Fatalf("queue = %#v, want retargeted queue item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil {
@@ -115,6 +122,83 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 	if lock != nil {
 		t.Fatalf("lock = %#v, want prepare-work lock released after successful run", lock)
+	}
+}
+
+func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueTarget := "issue:acme/looper:27"
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_worker_issue",
+		Seq:          2,
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     &issueTarget,
+		Repo:         stringPtr("acme/looper"),
+		Status:       "queued",
+		MetadataJSON: &loopMetadata,
+		NextRunAt:    stringPtr(fixture.nowISO()),
+		CreatedAt:    fixture.nowISO(),
+		UpdatedAt:    fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(issue worker) error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_issue"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_worker_issue",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "worker",
+		TargetType:  "issue",
+		TargetID:    issueTarget,
+		Repo:        stringPtr("acme/looper"),
+		DedupeKey:   "worker:project_1:acme/looper:27",
+		Priority:    1,
+		Status:      "queued",
+		AvailableAt: fixture.nowISO(),
+		Attempts:    0,
+		MaxAttempts: 1,
+		PayloadJSON: &payload,
+		CreatedAt:   fixture.nowISO(),
+		UpdatedAt:   fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(issue queue) error = %v", err)
+	}
+
+	runner := New(Options{
+		DB:              fixture.coordinator.DB(),
+		Repos:           fixture.repos,
+		GitHub:          &fakeGitHubGateway{},
+		Git:             &fakeGitGateway{},
+		AgentExecutor:   &fakeAgentExecutor{},
+		Logger:          fixture.logger,
+		Now:             fixture.now,
+		OpenPRStrategy:  config.OpenPRStrategyManual,
+		AllowAutoCommit: true,
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-issue", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed issue worker", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:27")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want released issue lock", lock)
 	}
 }
 

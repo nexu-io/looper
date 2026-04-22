@@ -8,6 +8,9 @@ func TestAssertLoopTypeMatchesTarget(t *testing.T) {
 	if err := AssertLoopTypeMatchesTarget(LoopTypePlanner, LoopTarget{TargetType: LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 42}); err != nil {
 		t.Fatalf("AssertLoopTypeMatchesTarget(planner, issue) error = %v", err)
 	}
+	if err := AssertLoopTypeMatchesTarget(LoopTypeWorker, LoopTarget{TargetType: LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 42}); err != nil {
+		t.Fatalf("AssertLoopTypeMatchesTarget(worker, issue) error = %v", err)
+	}
 	if err := AssertLoopTypeMatchesTarget(LoopTypeReviewer, LoopTarget{TargetType: LoopTargetTypeProject, ProjectID: "project_1"}); err == nil {
 		t.Fatal("AssertLoopTypeMatchesTarget(reviewer, project) error = nil, want failure")
 	}
@@ -49,6 +52,27 @@ func TestAssertUniqueActiveLoopRejectsConflict(t *testing.T) {
 		Type:      LoopTypeReviewer,
 		Status:    LoopStatusQueued,
 		Target:    LoopTarget{TargetType: LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42},
+	})
+	if err == nil {
+		t.Fatal("AssertUniqueActiveLoop() error = nil, want failure")
+	}
+}
+
+func TestAssertUniqueActiveLoopRejectsIssueWorkerConflict(t *testing.T) {
+	t.Parallel()
+
+	err := AssertUniqueActiveLoop([]LoopSummary{{
+		ID:        "loop_1",
+		ProjectID: "project_1",
+		Type:      LoopTypeWorker,
+		Status:    LoopStatusRunning,
+		Target:    LoopTarget{TargetType: LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 42},
+	}}, LoopSummary{
+		ID:        "loop_2",
+		ProjectID: "project_1",
+		Type:      LoopTypeWorker,
+		Status:    LoopStatusQueued,
+		Target:    LoopTarget{TargetType: LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 42},
 	})
 	if err == nil {
 		t.Fatal("AssertUniqueActiveLoop() error = nil, want failure")
