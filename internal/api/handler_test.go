@@ -2866,6 +2866,101 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_1",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		RunID:           stringPtr("run_1"),
+		Vendor:          "codex",
+		Status:          "running",
+		PID:             int64Ptr(1234),
+		HeartbeatCount:  1,
+		LastHeartbeatAt: stringPtr(nowISO),
+		StartedAt:       nowISO,
+		OutputJSON:      stringPtr(`{"stdout":"","stderr":"codex line1\n"}`),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(agent_exec_1) error = %v", err)
+	}
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+		if getRunErr != nil || updatedRun == nil {
+			return
+		}
+		run := *updatedRun
+		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+		run.Status = "success"
+		run.EndedAt = &completedAt
+		run.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
+
+		updatedExec, getExecErr := fixture.runtime.Services().Repositories.AgentExecutions.GetLatestByRunID(context.Background(), "run_1")
+		if getExecErr != nil || updatedExec == nil {
+			return
+		}
+		exec := *updatedExec
+		exec.Status = "completed"
+		exec.EndedAt = &completedAt
+		exec.OutputJSON = stringPtr(`{"stdout":"","stderr":"codex line1\ncodex line2\n"}`)
+		exec.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), exec)
+	}()
+
+	bodyCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		body, readErr := io.ReadAll(response.Body)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+		bodyCh <- body
+	}()
+
+	var body []byte
+	select {
+	case body = <-bodyCh:
+	case err := <-errCh:
+		t.Fatalf("io.ReadAll() error = %v", err)
+	case <-time.After(5 * time.Second):
+		_ = response.Body.Close()
+		t.Fatal("timed out waiting for loop logs follow stream")
+	}
+	text := string(body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	if !strings.Contains(text, "event: snapshot") {
+		t.Fatalf("stream body = %q, want snapshot event", text)
+	}
+	if !strings.Contains(text, "\"stderr\":\"codex line1\\n\"") {
+		t.Fatalf("stream body = %q, want codex stderr in snapshot", text)
+	}
+	if !strings.Contains(text, "event: chunk") || !strings.Contains(text, "\"content\":\"codex line2\\n\"") {
+		t.Fatalf("stream body = %q, want chunk with appended codex stderr output", text)
+	}
+	if !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body = %q, want end event", text)
+	}
+}
+
 func TestHandlerLoopLogsFollowEmitsEndForTerminalSnapshot(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedRunRouteData(t, fixture.runtime)

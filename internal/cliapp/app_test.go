@@ -446,6 +446,45 @@ func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	}
 }
 
+func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{
+			"seq":        12,
+			"loopId":     "loop_1",
+			"loopType":   "reviewer",
+			"loopStatus": "running",
+			"run":        map[string]any{"runId": "run_1", "currentStep": "review"},
+			"agent": map[string]any{
+				"vendor": "codex",
+				"pid":    1234,
+				"status": "running",
+				"stdout": "",
+				"stderr": "codex line1\ncodex line2\n",
+			},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--tail", "2", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --tail 2]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --tail 2]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: codex · pid 1234 · running", "codex line1", "codex line2"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestLogsFollowStreamsNewOutput(t *testing.T) {
 	t.Parallel()
 
@@ -475,6 +514,44 @@ func TestLogsFollowStreamsNewOutput(t *testing.T) {
 		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
 	}
 	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: openai · pid 1234 · running", "line1", "line2"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("follow"); got != "1" {
+			t.Fatalf("follow query = %q, want 1", got)
+		}
+		if got := r.URL.Query().Get("stderr"); got != "" {
+			t.Fatalf("stderr query = %q, want empty string", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: snapshot\n")
+		_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"codex\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"\",\"stderr\":\"codex line1\\n\"}}\n\n")
+		_, _ = io.WriteString(w, "event: chunk\n")
+		_, _ = io.WriteString(w, "data: {\"runId\":\"run_1\",\"currentStep\":\"review\",\"executionId\":\"exec_1\",\"vendor\":\"codex\",\"pid\":1234,\"status\":\"running\",\"content\":\"codex line2\\n\"}\n\n")
+		_, _ = io.WriteString(w, "event: end\n")
+		_, _ = io.WriteString(w, "data: {\"reason\":\"run_completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--follow", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --follow]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: codex · pid 1234 · running", "codex line1", "codex line2"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
 		}
