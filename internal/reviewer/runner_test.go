@@ -368,6 +368,9 @@ func TestProcessClaimedItemRunsReviewerInDedicatedWorktree(t *testing.T) {
 	if git.createCalls[0].Branch != "pr-42-head" {
 		t.Fatalf("create branch = %q, want PR-scoped branch", git.createCalls[0].Branch)
 	}
+	if git.createCalls[0].PRNumber != 42 {
+		t.Fatalf("create PR number = %d, want 42", git.createCalls[0].PRNumber)
+	}
 	if len(git.prepareCalls) != 1 {
 		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
 	}
@@ -423,6 +426,9 @@ func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T)
 	}
 	if git.createCalls[0].Branch != "pr-42-head" {
 		t.Fatalf("create branch = %q, want fallback branch", git.createCalls[0].Branch)
+	}
+	if git.createCalls[0].PRNumber != 42 {
+		t.Fatalf("create PR number = %d, want 42", git.createCalls[0].PRNumber)
 	}
 	if len(git.prepareCalls) != 1 {
 		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
@@ -492,6 +498,57 @@ func TestRunReviewStepRepreparesMissingReviewerWorktree(t *testing.T) {
 	}
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.worktreePath {
 		t.Fatalf("checkpoint worktree = %#v, want recreated worktree path", checkpoint.Worktree)
+	}
+}
+
+func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	prNumber := int64(42)
+	loopTarget := "pr:42"
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	initialCheckpoint := reviewerCheckpoint{
+		Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+		Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "deleted-worktree"), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+	}
+	checkpointJSON := mustMarshalJSON(initialCheckpoint)
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:    *project,
+		Loop:       loop,
+		Run:        run,
+		Repo:       "acme/looper",
+		PRNumber:   prNumber,
+		Checkpoint: initialCheckpoint,
+	})
+	if err == nil || !contains(err.Error(), "no queued agent result") {
+		t.Fatalf("runReviewStep() error = %v, want no queued agent result", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.worktreePath {
+		t.Fatalf("checkpoint worktree = %#v, want recreated worktree path", checkpoint.Worktree)
+	}
+	persistedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persistedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", persistedRun, err)
+	}
+	persistedCheckpoint := parseCheckpoint(persistedRun.CheckpointJSON)
+	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != git.worktreePath {
+		t.Fatalf("persisted checkpoint worktree = %#v, want recreated worktree path", persistedCheckpoint.Worktree)
 	}
 }
 

@@ -902,7 +902,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if candidate := strings.TrimSpace(derefString(input.Project.BaseBranch)); candidate != "" {
 		protectedBranches = append(protectedBranches, candidate)
 	}
-	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: baseBranch, ProtectedBranches: protectedBranches, CheckoutMode: "detached"})
+	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: baseBranch, PRNumber: input.PRNumber, ProtectedBranches: protectedBranches, CheckoutMode: "detached"})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -931,6 +931,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
 		if err != nil {
 			return input.Checkpoint, err
+		}
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+			return checkpoint, err
 		}
 	}
 	worktree, err := requireWorktree(checkpoint)
