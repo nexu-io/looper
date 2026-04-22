@@ -108,7 +108,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			AllowAutoApprove: false,
 			AllowAutoMerge:   false,
 			AllowRiskyFixes:  false,
-			OpenPRStrategy:   OpenPRStrategyManual,
+			OpenPRStrategy:   OpenPRStrategyAllDone,
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

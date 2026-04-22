@@ -75,7 +75,7 @@
         "allowAutoApprove": true,
         "allowAutoMerge": false,
         "allowRiskyFixes": false,
-        "openPrStrategy": "manual"
+        "openPrStrategy": "all_done"
       },
       "projects": []
     },

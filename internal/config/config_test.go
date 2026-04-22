@@ -662,8 +662,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Daemon.WorkingDirectory = %q, want %q", config.Daemon.WorkingDirectory, "/tmp/looper-cwd")
 	}
 
-	if config.Defaults.OpenPRStrategy != OpenPRStrategyManual {
-		t.Fatalf("DefaultConfig().Defaults.OpenPRStrategy = %q, want %q", config.Defaults.OpenPRStrategy, OpenPRStrategyManual)
+	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
+		t.Fatalf("DefaultConfig().Defaults.OpenPRStrategy = %q, want %q", config.Defaults.OpenPRStrategy, OpenPRStrategyAllDone)
 	}
 
 	if len(config.Agent.Params) != 0 || len(config.Agent.Env) != 0 {

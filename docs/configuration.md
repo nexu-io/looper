@@ -124,7 +124,7 @@ Example minimal `~/.looper/config.json`:
     "allowAutoApprove": false,
     "allowAutoMerge": false,
     "allowRiskyFixes": false,
-    "openPrStrategy": "manual"
+    "openPrStrategy": "all_done"
   },
   "projects": [
     {
@@ -236,7 +236,7 @@ Default values:
 - `allowAutoApprove`: `false`
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
-- `openPrStrategy`: `manual`
+- `openPrStrategy`: `all_done`
 
 ### `projects`
 

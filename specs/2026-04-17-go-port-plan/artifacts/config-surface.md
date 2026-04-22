@@ -93,7 +93,7 @@ Source: `apps/cli/src/index.ts:282-294`, `apps/cli/src/index.ts:2473-2516`
 | `defaults.allowAutoApprove` | boolean | `false` | env/CLI overridable |
 | `defaults.allowAutoMerge` | boolean | `false` | config-file only today |
 | `defaults.allowRiskyFixes` | boolean | `false` | config-file only today |
-| `defaults.openPrStrategy` | optional `all_done` \| `first_commit` \| `manual` | `manual` | validated enum when set |
+| `defaults.openPrStrategy` | optional `all_done` \| `first_commit` \| `manual` | `all_done` | validated enum when set |
 | `projects[]` | array of project refs | `[]` | array replaces wholesale during merge |
 | `projects[].id` | string | none | required, unique, validated project id |
 | `projects[].name` | string | none | required |

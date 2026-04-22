@@ -111,7 +111,7 @@
             "allowAutoPush": true,
             "allowAutoApprove": false,
             "allowRiskyFixes": false,
-            "openPrStrategy": "manual"
+            "openPrStrategy": "all_done"
           },
           "notifications": {
             "inAppEnabled": true,
@@ -190,7 +190,7 @@
             "allowAutoApprove": false,
             "allowAutoMerge": false,
             "allowRiskyFixes": false,
-            "openPrStrategy": "manual"
+            "openPrStrategy": "all_done"
           },
           "projects": []
         },
