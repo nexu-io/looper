@@ -2710,7 +2710,8 @@ func (h *Handler) isPlannerPullRequestOpen(ctx context.Context, projectID, repo 
 	}
 	payload := parseJSONObject(snapshot.PayloadJSON)
 	detail, _ := payload["detail"].(map[string]any)
-	return strings.EqualFold(stringFromAnyDefault(detail["state"]), "open")
+	state := firstNonEmptyString(readStringAny(detail["state"]), readStringAny(detail["State"]))
+	return state != nil && strings.EqualFold(*state, "open")
 }
 
 func deriveWorkerTitle(prompt, specPath, repo *string, prNumber, issueNumber *int64) string {
