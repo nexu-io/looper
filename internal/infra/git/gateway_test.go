@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -433,6 +434,67 @@ func TestGatewayPrepareWorktreeDetectsRemoteHeadChanges(t *testing.T) {
 	}
 	if remoteHeadErr.ExpectedHeadSHA != prepared.HeadSHA {
 		t.Fatalf("RemoteHeadChangedError.ExpectedHeadSHA = %q, want %q", remoteHeadErr.ExpectedHeadSHA, prepared.HeadSHA)
+	}
+}
+
+func TestGatewayBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	exists, err := gateway.branchExists(ctx, fixture.repoPath, "missing")
+	if err != nil {
+		t.Fatalf("branchExists(missing) error = %v", err)
+	}
+	if exists {
+		t.Fatal("branchExists(missing) = true, want false")
+	}
+
+	nonRepoPath := filepath.Join(fixture.rootDir, "not-a-repo")
+	mustMkdirAll(t, nonRepoPath)
+	exists, err = gateway.branchExists(ctx, nonRepoPath, "missing")
+	if err == nil {
+		t.Fatal("branchExists(non-repo) error = nil, want error")
+	}
+	if exists {
+		t.Fatal("branchExists(non-repo) = true, want false")
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("branchExists(non-repo) error = %T, want *shell.CommandExecutionError", err)
+	}
+	if commandErr.Result.ExitCode == 1 {
+		t.Fatalf("branchExists(non-repo) exit code = %d, want non-1", commandErr.Result.ExitCode)
+	}
+}
+
+func TestGatewayResolveDetachedStartPointPropagatesFetchFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	runGit(t, fixture.repoPath, "remote", "set-url", "origin", filepath.Join(fixture.rootDir, "missing-remote.git"))
+	gateway := fixture.gateway()
+
+	_, err := gateway.resolveDetachedStartPoint(ctx, CreateWorktreeInput{
+		RepoPath:     fixture.repoPath,
+		Branch:       "feature/missing",
+		BaseBranch:   "main",
+		CheckoutMode: CheckoutModeDetached,
+	})
+	if err == nil {
+		t.Fatal("resolveDetachedStartPoint() error = nil, want fetch failure")
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("resolveDetachedStartPoint() error = %T, want *shell.CommandExecutionError", err)
+	}
+	if commandErr.Result.ExitCode == 1 {
+		t.Fatalf("resolveDetachedStartPoint() exit code = %d, want non-1 fetch failure", commandErr.Result.ExitCode)
 	}
 }
 

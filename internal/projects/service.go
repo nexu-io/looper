@@ -313,7 +313,7 @@ func assertValidProjectID(projectID string) error {
 }
 
 func containsProjectPathSeparator(projectID string) bool {
-	return strings.Contains(projectID, "/") || strings.Contains(projectID, `\\`)
+	return strings.Contains(projectID, "/") || strings.Contains(projectID, `\`)
 }
 
 func isWindowsAbsolute(projectID string) bool {

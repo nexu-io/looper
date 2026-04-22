@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,36 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"api"}` {
 		t.Fatalf("AddProject().Project.MetadataJSON = %v, want api metadata", result.Project.MetadataJSON)
+	}
+}
+
+func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+
+	_, err := service.AddProject(ctx, AddInput{
+		ID:         `foo\bar`,
+		Name:       "Looper",
+		RepoPath:   "/tmp/looper",
+		BaseBranch: "main",
+	})
+	if err == nil {
+		t.Fatal("AddProject() error = nil, want invalid project id")
+	}
+	if !strings.Contains(err.Error(), "invalid project id") {
+		t.Fatalf("AddProject() error = %v, want invalid project id", err)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, `foo\bar`)
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored != nil {
+		t.Fatalf("Projects.GetByID() = %#v, want nil", stored)
 	}
 }
 
