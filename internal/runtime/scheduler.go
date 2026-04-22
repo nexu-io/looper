@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/powerformer/looper/internal/agent"
@@ -25,20 +26,28 @@ import (
 type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
 }
 
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*reviewer.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*reviewer.ProcessResult, error)
 }
 
 type fixerScheduler interface {
 	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
 }
 
 type workerScheduler interface {
 	ProcessNext(context.Context, string) (*worker.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
+}
+
+type schedulerAsyncRunner interface {
+	Go(func())
 }
 
 type defaultSchedulerTickInput struct {
@@ -46,10 +55,25 @@ type defaultSchedulerTickInput struct {
 	Logger            bootstrap.Logger
 	Now               func() time.Time
 	MaxConcurrentRuns int
+	AsyncRunner       schedulerAsyncRunner
 	Planner           plannerScheduler
 	Reviewer          reviewerScheduler
 	Fixer             fixerScheduler
 	Worker            workerScheduler
+}
+
+type schedulerTaskTracker struct{ wg sync.WaitGroup }
+
+func (t *schedulerTaskTracker) Go(fn func()) {
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		fn()
+	}()
+}
+
+func (t *schedulerTaskTracker) Wait() {
+	t.wg.Wait()
 }
 
 type agentExecutionNotificationInput struct {
@@ -397,7 +421,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
 }
 
-func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, now func() time.Time) RunSchedulerTickFunc {
+func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
 	if now == nil {
 		now = time.Now
 	}
@@ -514,11 +538,16 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	})
 
 	return func(ctx context.Context, services Services) error {
+		var runner schedulerAsyncRunner
+		if asyncRunner != nil {
+			runner = asyncRunner()
+		}
 		return runDefaultSchedulerTick(ctx, defaultSchedulerTickInput{
 			Repos:             services.Repositories,
 			Logger:            logger,
 			Now:               now,
 			MaxConcurrentRuns: cfg.Scheduler.MaxConcurrentRuns,
+			AsyncRunner:       runner,
 			Planner:           plannerRunner,
 			Reviewer:          reviewerRunner,
 			Fixer:             fixerRunner,
@@ -585,13 +614,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		availableSlots = 0
 	}
 	if availableSlots > 0 && input.Repos.Queue != nil {
-		nowISO := formatJavaScriptISOString(now().UTC())
-		queueItems, err := input.Repos.Queue.ListScheduled(ctx, nowISO, int64(availableSlots))
-		if err != nil {
-			appendErr(err)
-		} else {
-			appendErr(runScheduledQueueItems(ctx, queueItems, input))
-		}
+		appendErr(claimAndRunScheduledQueueItems(ctx, availableSlots, input))
 	}
 
 	if len(errs) == 0 {
@@ -618,6 +641,32 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
+func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) error {
+	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
+		return nil
+	}
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
+	for i := 0; i < availableSlots; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		item, err := input.Repos.Queue.ClaimNext(ctx, nowISO, "scheduler")
+		if err != nil {
+			return err
+		}
+		if item == nil {
+			break
+		}
+		queueItems = append(queueItems, *item)
+	}
+	return runScheduledQueueItems(ctx, queueItems, input)
+}
+
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
 	if len(queueItems) == 0 {
 		return nil
@@ -629,18 +678,27 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			return err
 		}
 
-		process, err := schedulerQueueProcessor(item.Type, input)
+		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
 			errList = append(errList, err)
 			continue
 		}
+		item := item
+		processFn := process
 
-		go func(item storage.QueueItemRecord, process func(context.Context, string) error) {
-			claimedBy := fmt.Sprintf("scheduler-%s", item.Type)
-			if err := process(ctx, claimedBy); err != nil && input.Logger != nil {
-				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "error": err.Error()})
+		if input.AsyncRunner != nil {
+			input.AsyncRunner.Go(func() {
+				if err := processFn(ctx); err != nil && input.Logger != nil {
+					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
+				}
+			})
+			continue
+		}
+		go func() {
+			if err := processFn(ctx); err != nil && input.Logger != nil {
+				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 			}
-		}(item, process)
+		}()
 	}
 	if len(errList) == 0 {
 		return nil
@@ -648,42 +706,42 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 	return errors.Join(errList...)
 }
 
-func schedulerQueueProcessor(queueType string, input defaultSchedulerTickInput) (func(context.Context, string) error, error) {
-	switch queueType {
+func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
+	switch item.Type {
 	case "planner":
 		if input.Planner == nil {
 			return nil, fmt.Errorf("planner runner is not configured")
 		}
-		return func(ctx context.Context, claimedBy string) error {
-			_, err := input.Planner.ProcessNext(ctx, claimedBy)
-			return wrapSchedulerQueueError(queueType, err)
+		return func(ctx context.Context) error {
+			_, err := input.Planner.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	case "reviewer":
 		if input.Reviewer == nil {
 			return nil, fmt.Errorf("reviewer runner is not configured")
 		}
-		return func(ctx context.Context, claimedBy string) error {
-			_, err := input.Reviewer.ProcessNext(ctx, claimedBy)
-			return wrapSchedulerQueueError(queueType, err)
+		return func(ctx context.Context) error {
+			_, err := input.Reviewer.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	case "fixer":
 		if input.Fixer == nil {
 			return nil, fmt.Errorf("fixer runner is not configured")
 		}
-		return func(ctx context.Context, claimedBy string) error {
-			_, err := input.Fixer.ProcessNext(ctx, claimedBy)
-			return wrapSchedulerQueueError(queueType, err)
+		return func(ctx context.Context) error {
+			_, err := input.Fixer.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	case "worker":
 		if input.Worker == nil {
 			return nil, fmt.Errorf("worker runner is not configured")
 		}
-		return func(ctx context.Context, claimedBy string) error {
-			_, err := input.Worker.ProcessNext(ctx, claimedBy)
-			return wrapSchedulerQueueError(queueType, err)
+		return func(ctx context.Context) error {
+			_, err := input.Worker.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported queue item type %q", queueType)
+		return nil, fmt.Errorf("unsupported queue item type %q", item.Type)
 	}
 }
 

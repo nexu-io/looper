@@ -98,6 +98,7 @@ type Runtime struct {
 	schedulerDone   chan struct{}
 	schedulerWake   chan struct{}
 	schedulerCancel context.CancelFunc
+	schedulerTasks  *schedulerTaskTracker
 }
 
 func New(options Options) *Runtime {
@@ -359,7 +360,11 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.now)
+		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, func() schedulerAsyncRunner {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return r.schedulerTasks
+		}, r.now)
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.mu.Unlock()
@@ -396,16 +401,19 @@ func (r *Runtime) startSchedulerLoop() {
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
 	schedulerCtx, schedulerCancel := context.WithCancel(context.Background())
+	taskTracker := &schedulerTaskTracker{}
 
 	r.mu.Lock()
 	r.schedulerStop = stopCh
 	r.schedulerDone = doneCh
 	r.schedulerWake = wakeCh
 	r.schedulerCancel = schedulerCancel
+	r.schedulerTasks = taskTracker
 	r.mu.Unlock()
 
 	go func() {
 		defer close(doneCh)
+		defer taskTracker.Wait()
 
 		r.executeSchedulerTick(schedulerCtx)
 		if pollInterval <= 0 {
@@ -440,6 +448,7 @@ func (r *Runtime) stopSchedulerLoop() {
 	stopCh := r.schedulerStop
 	doneCh := r.schedulerDone
 	cancel := r.schedulerCancel
+	r.schedulerTasks = nil
 	r.schedulerStop = nil
 	r.schedulerDone = nil
 	r.schedulerWake = nil

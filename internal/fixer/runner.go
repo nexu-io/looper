@@ -537,9 +537,13 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 	if item == nil {
 		return nil, nil
 	}
-	result, err := r.ProcessClaimedItem(ctx, *item)
+	return r.ProcessClaimedQueueItem(ctx, *item)
+}
+
+func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
-		return r.recoverClaimedItem(ctx, *item, err)
+		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
 }
