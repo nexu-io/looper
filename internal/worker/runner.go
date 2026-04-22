@@ -576,6 +576,42 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	if err := validateWorkerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
+		failure := r.classifyFailure(err)
+		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+		if latest.ResumePolicy == "" {
+			latest.ResumePolicy = "replay_step"
+		}
+		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+			return ProcessResult{}, err
+		}
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+			r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.kind, failure.message))
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			if updated.Status == "paused" {
+				updated.NextRunAt = nil
+			} else if failedQueue != nil && failedQueue.Status == "queued" {
+				updated.Status = "queued"
+				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			} else {
+				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					updated.Status = "paused"
+				} else {
+					updated.Status = "failed"
+				}
+				updated.NextRunAt = nil
+			}
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+	}
 
 	for _, step := range stepsFrom(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
@@ -1043,9 +1079,6 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		if next := nextWorkerStep(lastCompletedStep); next != "" {
 			startStep = next
 		}
-	}
-	if err := validateWorkerResumeCheckpoint(startStep, checkpoint); err != nil {
-		return resumedRunContext{}, err
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
 	nowISO := r.nowISO()

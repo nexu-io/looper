@@ -669,6 +669,37 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
+		failure := r.classifyFailure(err)
+		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+		if latest.ResumePolicy == "" {
+			latest.ResumePolicy = "replay_step"
+		}
+		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+			return ProcessResult{}, err
+		}
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			if failedQueue != nil && failedQueue.Status == "queued" {
+				updated.Status = "queued"
+				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			} else {
+				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					updated.Status = "paused"
+				} else {
+					updated.Status = "failed"
+				}
+				updated.NextRunAt = nil
+			}
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -1187,9 +1218,6 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 				startStep = next
 			}
 		}
-	}
-	if err := validateFixerResumeCheckpoint(startStep, resumedCheckpoint); err != nil {
-		return resumedRunContext{}, err
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscoverPR
 	initialCheckpoint := fixerCheckpoint{ResumePolicy: "replay_step"}

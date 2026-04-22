@@ -305,7 +305,7 @@ func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *test
 	}
 }
 
-func TestCreateRunContextFailsWhenResumeStartsAfterRepairWithoutParsedResult(t *testing.T) {
+func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -347,27 +347,58 @@ func TestCreateRunContextFailsWhenResumeStartsAfterRepairWithoutParsedResult(t *
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
+	projectID := "project_1"
+	loopID := "loop_fixer_resume_parse_status"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_fixer_resume_parse_status",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "fixer",
+		TargetType:  "pull_request",
+		TargetID:    loopTarget,
+		Repo:        &repo,
+		PRNumber:    &prNumber,
+		DedupeKey:   "fixer:acme/looper:42:resume-parse",
+		Priority:    1,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		MaxAttempts: 1,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil {
+		t.Fatalf("ClaimNextOfType() error = %v", err)
+	}
+	if claim == nil {
+		t.Fatal("claim = nil, want claimed queue item")
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want failed retryable_transient result", result)
+	}
+
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_resume_parse_status")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed terminal queue item", queue)
+	}
+
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_resume_parse_status")
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil {
-		t.Fatal("loop = nil, want loop record")
-	}
-
-	_, err = runner.createRunContext(context.Background(), *loop)
-	if err == nil {
-		t.Fatal("createRunContext() error = nil, want parse-status failure")
-	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
-	}
-	if loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
-	}
-	if !contains(err.Error(), "server_error") {
-		t.Fatalf("error = %q, want upstream summary", err.Error())
+	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want failed terminal loop", loop)
 	}
 }
 
