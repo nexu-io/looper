@@ -296,26 +296,23 @@ printf '{}'
 
 func writeExecutable(t *testing.T, path, contents string) {
 	t.Helper()
-	tempFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
 	if err != nil {
-		t.Fatalf("os.CreateTemp(%s) error = %v", filepath.Dir(path), err)
+		t.Fatalf("os.OpenFile(%s) error = %v", path, err)
 	}
-	tempPath := tempFile.Name()
-	defer func() {
-		_ = os.Remove(tempPath)
-	}()
-	if _, err := tempFile.WriteString(contents); err != nil {
-		_ = tempFile.Close()
-		t.Fatalf("tempFile.WriteString(%s) error = %v", tempPath, err)
+	if _, err := file.WriteString(contents); err != nil {
+		_ = file.Close()
+		t.Fatalf("file.WriteString(%s) error = %v", path, err)
 	}
-	if err := tempFile.Close(); err != nil {
-		t.Fatalf("tempFile.Close(%s) error = %v", tempPath, err)
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("file.Sync(%s) error = %v", path, err)
 	}
-	if err := os.Chmod(tempPath, 0o755); err != nil {
-		t.Fatalf("os.Chmod(%s) error = %v", tempPath, err)
+	if err := file.Close(); err != nil {
+		t.Fatalf("file.Close(%s) error = %v", path, err)
 	}
-	if err := os.Rename(tempPath, path); err != nil {
-		t.Fatalf("os.Rename(%s, %s) error = %v", tempPath, path, err)
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("os.Chmod(%s) error = %v", path, err)
 	}
 }
 
