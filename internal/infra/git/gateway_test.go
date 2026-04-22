@@ -338,6 +338,17 @@ func TestGatewayIgnoresStoredWorktreesFromDifferentRepoPath(t *testing.T) {
 	}
 }
 
+func TestNormalizeComparablePathTrimsOnlyPrivateSlashPrefix(t *testing.T) {
+	t.Parallel()
+
+	if got := normalizeComparablePath("/private/var/tmp/repo"); got != "/var/tmp/repo" {
+		t.Fatalf("normalizeComparablePath(/private/var/tmp/repo) = %q, want %q", got, "/var/tmp/repo")
+	}
+	if got := normalizeComparablePath("/private-repo/worktree"); got != "/private-repo/worktree" {
+		t.Fatalf("normalizeComparablePath(/private-repo/worktree) = %q, want %q", got, "/private-repo/worktree")
+	}
+}
+
 func TestGatewayDoesNotTreatPrimaryCheckoutAsRestorableWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

@@ -1343,7 +1343,7 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 	for _, loop := range loopMatches {
 		loopRuns, err := h.context.Runtime.Services().Repositories.Runs.ListByLoop(ctx, loop.ID)
 		if err != nil {
-			continue
+			return pullRequestStatusResponse{}, err
 		}
 		runs = append(runs, loopRuns...)
 	}

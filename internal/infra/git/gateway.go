@@ -904,7 +904,10 @@ func normalizeComparablePath(path string) string {
 		resolved = path
 	}
 	resolved = filepath.ToSlash(filepath.Clean(resolved))
-	return strings.TrimPrefix(resolved, "/private")
+	if strings.HasPrefix(resolved, "/private/") {
+		return strings.TrimPrefix(resolved, "/private")
+	}
+	return resolved
 }
 
 func parseWorktreeList(output string) []WorktreeListEntry {

@@ -280,6 +280,32 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 	assertEqual(t, errMap["message"], "list loops: database is locked")
 }
 
+func TestHandlerPullRequestStatusReturnsInternalErrorWhenRunLookupFails(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedEventAndPullRequestRouteData(t, fixture.runtime)
+
+	services := fixture.runtime.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
+		if strings.Contains(query, "SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC") {
+			return errors.New("database is locked")
+		}
+		return nil
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixedRuntimeState{services: services}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "INTERNAL_ERROR")
+	assertEqual(t, errMap["message"], "list runs by loop: database is locked")
+}
+
 func TestHandlerHealthzReturnsUnhealthyEnvelopeWhenStorageCheckFails(t *testing.T) {
 	fixture := newTestFixture(t)
 	if err := fixture.runtime.Services().Coordinator.Close(); err != nil {
