@@ -128,7 +128,10 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo in prompt", work.Prompt)
 	}
-	if issueRepoFromURL("https://gitlab.com/powerformer/looper/issues/27") != "" {
+	if issueRepoFromURL("https://ghe.example.com/powerformer/looper/issues/27") != "powerformer/looper" {
+		t.Fatal("issueRepoFromURL() should infer issue repo from GitHub Enterprise URLs")
+	}
+	if issueRepoFromURL("https://gitlab.com/powerformer/looper/-/issues/27") != "" {
 		t.Fatal("issueRepoFromURL() should ignore non-GitHub hosts")
 	}
 	if issueRepoFromURL("https://github.com/powerformer/looper/issues/not-a-number") != "" {

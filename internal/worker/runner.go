@@ -1326,8 +1326,7 @@ func issueRepoFromURL(raw string) string {
 	if err != nil {
 		return ""
 	}
-	host := strings.ToLower(parsed.Host)
-	if host != "github.com" && host != "www.github.com" {
+	if parsed.Host == "" {
 		return ""
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
