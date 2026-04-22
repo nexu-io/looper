@@ -919,9 +919,6 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
 	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
-	if work.IssueNumber > 0 && strings.TrimSpace(work.IssueRepo) == "" {
-		work.IssueRepo = work.Repo
-	}
 	if work.Repo == "" {
 		return workerInput{}, &loopError{message: "worker.repo is required", kind: FailureNonRetryable}
 	}
@@ -932,7 +929,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		return workerInput{}, &loopError{message: "worker.prompt or worker.specPath is required", kind: FailureNonRetryable}
 	}
 	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && work.Prompt == "" && work.SpecPath == "" && r.github != nil {
-		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: firstNonEmpty(work.IssueRepo, work.Repo), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
+		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: strings.TrimSpace(work.IssueRepo), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
@@ -1391,8 +1388,8 @@ func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInpu
 	if work.Title == "Worker run" || work.Title == fallbackTitle {
 		work.Title = issue.Title
 	}
-	work.Prompt = buildIssuePrompt(work.Repo, issue)
-	work.IssueRepo = firstNonEmpty(work.IssueRepo, issueRepoFromURL(issue.URL), work.Repo)
+	work.IssueRepo = firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(issue.URL), work.Repo)
+	work.Prompt = buildIssuePrompt(work.IssueRepo, issue)
 	work.IssueURL = issue.URL
 	return work
 }
