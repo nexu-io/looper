@@ -32,6 +32,12 @@ case "$*" in
   "issue view"*)
     printf '{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}'
     ;;
+  "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started")
+    printf '{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}'
+    ;;
+  "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished")
+    printf '{}'
+    ;;
   "pr view"*)
     printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
     ;;
@@ -99,6 +105,13 @@ esac
 	if err != nil {
 		t.Fatalf("ViewIssue() error = %v", err)
 	}
+	comment, err := gateway.CreateIssueComment(context.Background(), IssueCommentInput{Repo: "acme/looper", IssueNumber: 8, Body: "Looper started"})
+	if err != nil {
+		t.Fatalf("CreateIssueComment() error = %v", err)
+	}
+	if err := gateway.UpdateIssueComment(context.Background(), UpdateIssueCommentInput{Repo: "acme/looper", CommentID: 91, Body: "Looper finished"}); err != nil {
+		t.Fatalf("UpdateIssueComment() error = %v", err)
+	}
 	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
 	if err != nil {
 		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
@@ -158,6 +171,9 @@ esac
 	if issueDetail.Number != 8 {
 		t.Fatalf("issueDetail.Number = %d, want 8", issueDetail.Number)
 	}
+	if comment.ID != 91 || comment.URL != "https://example.test/issues/8#issuecomment-91" {
+		t.Fatalf("comment = %#v, want parsed issue comment metadata", comment)
+	}
 	if snapshot.HeadSHA != "abc123" {
 		t.Fatalf("snapshot.HeadSHA = %q, want abc123", snapshot.HeadSHA)
 	}
@@ -190,6 +206,8 @@ esac
 		"pr list --repo acme/looper --state open --limit 30 --label phase-1",
 		"issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label phase-1",
 		"issue view 8 --repo acme/looper",
+		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
+		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
 		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper --force",
 		"label create ready --repo acme/looper --color 5319e7 --description Managed by looper --force",
 		"api repos/acme/looper/issues/42/labels --method POST -f labels[]=phase-1 -f labels[]=ready",

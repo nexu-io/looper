@@ -81,6 +81,25 @@ type IssueSummary struct {
 
 type IssueDetail = IssueSummary
 
+type IssueCommentInput struct {
+	Repo        string
+	IssueNumber int64
+	Body        string
+	CWD         string
+}
+
+type IssueCommentResult struct {
+	ID  int64
+	URL string
+}
+
+type UpdateIssueCommentInput struct {
+	Repo      string
+	CommentID int64
+	Body      string
+	CWD       string
+}
+
 type SubmitReviewInput struct {
 	Repo     string
 	PRNumber int64
@@ -297,6 +316,23 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Assignees: extractActorLogins(row["assignees"]),
 		Labels:    extractLabelNames(row["labels"]),
 	}, nil
+}
+
+func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber), "--method", "POST", "-f", "body="+input.Body)
+	if err != nil {
+		return IssueCommentResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return IssueCommentResult{}, err
+	}
+	return IssueCommentResult{ID: asInt64(row["id"]), URL: asString(row["html_url"])}, nil
+}
+
+func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
+	return err
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {

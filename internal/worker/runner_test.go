@@ -43,7 +43,7 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	github := &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 501, URL: "https://example/issues/27#issuecomment-501"}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
 	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
@@ -78,6 +78,24 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
+	}
+	if len(github.createIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1", len(github.createIssueCommentCalls))
+	}
+	if len(github.updateIssueCommentCalls) != 2 {
+		t.Fatalf("len(github.updateIssueCommentCalls) = %d, want 2", len(github.updateIssueCommentCalls))
+	}
+	if github.createIssueCommentCalls[0].Repo != "acme/looper" || github.createIssueCommentCalls[0].IssueNumber != 27 {
+		t.Fatalf("issue comment call = %#v, want acme/looper#27", github.createIssueCommentCalls[0])
+	}
+	if !strings.Contains(github.createIssueCommentCalls[0].Body, "started work") {
+		t.Fatalf("create issue comment body = %q, want running marker text", github.createIssueCommentCalls[0].Body)
+	}
+	if !strings.Contains(github.updateIssueCommentCalls[0].Body, "Linked pull request: https://example/pr/101") {
+		t.Fatalf("open-pr issue comment body = %q, want linked PR", github.updateIssueCommentCalls[0].Body)
+	}
+	if !strings.Contains(github.updateIssueCommentCalls[1].Body, "finished work") {
+		t.Fatalf("terminal issue comment body = %q, want success marker text", github.updateIssueCommentCalls[1].Body)
 	}
 	if len(completed) != 1 {
 		t.Fatalf("len(completed) = %d, want 1", len(completed))
@@ -115,6 +133,42 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 	if lock != nil {
 		t.Fatalf("lock = %#v, want prepare-work lock released after successful run", lock)
+	}
+}
+
+func TestProcessClaimedItemUsesIssueScopedLockForIssueWork(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{
+		DB:              fixture.coordinator.DB(),
+		Repos:           fixture.repos,
+		GitHub:          &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 501}},
+		Git:             &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}},
+		AgentExecutor:   &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done"}}},
+		Logger:          fixture.logger,
+		Now:             fixture.now,
+		AllowAutoCommit: true,
+		AllowAutoPush:   false,
+		OpenPRStrategy:  config.OpenPRStrategyAllDone,
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after manual PR gating", result)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:27")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want issue lock released", lock)
 	}
 }
 
@@ -313,7 +367,7 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
+	github := &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 501}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
 	started := make([]AgentExecutionStartedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnAgentExecutionStarted: func(_ context.Context, input AgentExecutionStartedInput) error {
@@ -349,6 +403,9 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 	if len(github.createPRCalls) != 2 {
 		t.Fatalf("len(github.createPRCalls) = %d, want 2", len(github.createPRCalls))
+	}
+	if len(github.createIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1 running marker across resume", len(github.createIssueCommentCalls))
 	}
 }
 
@@ -400,7 +457,7 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{}
+	github := &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 501}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
 	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
@@ -423,6 +480,9 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 	if completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || completed[0].Summary != "Validation failed" {
 		t.Fatalf("completed[0] = %#v, want manual intervention completion notice", completed[0])
+	}
+	if len(github.updateIssueCommentCalls) == 0 || !strings.Contains(github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body, "paused work") {
+		t.Fatalf("terminal issue comment updates = %#v, want paused marker body", github.updateIssueCommentCalls)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
@@ -766,7 +826,7 @@ func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr"}, "loop_worker_1")
+	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{openPRResponses: [][]PullRequestSummary{{}, {{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok"}}}
@@ -881,15 +941,16 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	loopTarget := "project:project_1"
-	loopMetadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &loopMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	loopTarget := "issue:acme/looper:27"
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &loopMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "project_1"
 	loopID := "loop_worker_1"
-	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project:project_1", Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	lockKey := "issue:acme/looper:27"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: lockKey, Repo: stringPtr("acme/looper"), DedupeKey: "worker:project_1:acme/looper:27", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	fixture := &runnerFixture{coordinator: coordinator, repos: repos, logger: &testLogger{}, current: now}
@@ -904,18 +965,21 @@ func (f *runnerFixture) nowISO() string {
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 type fakeGitHubGateway struct {
-	openPRs         []PullRequestSummary
-	openPRResponses [][]PullRequestSummary
-	openPRIndex     int
-	prDetail        PullRequestDetail
-	issueDetail     IssueDetail
-	viewIssueCalls  []ViewIssueInput
-	createPRResult  CreatePullRequestResult
-	createPRErrors  []error
-	createPRCalls   []CreatePullRequestInput
-	removeLabels    []PullRequestLabelsInput
-	reviewerCalls   []PullRequestReviewersInput
-	createPRIndex   int
+	openPRs                 []PullRequestSummary
+	openPRResponses         [][]PullRequestSummary
+	openPRIndex             int
+	prDetail                PullRequestDetail
+	issueDetail             IssueDetail
+	viewIssueCalls          []ViewIssueInput
+	createIssueCommentCalls []IssueCommentInput
+	updateIssueCommentCalls []UpdateIssueCommentInput
+	issueCommentResult      IssueCommentResult
+	createPRResult          CreatePullRequestResult
+	createPRErrors          []error
+	createPRCalls           []CreatePullRequestInput
+	removeLabels            []PullRequestLabelsInput
+	reviewerCalls           []PullRequestReviewersInput
+	createPRIndex           int
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -957,6 +1021,19 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 		detail.Title = "Issue"
 	}
 	return detail, nil
+}
+
+func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	f.createIssueCommentCalls = append(f.createIssueCommentCalls, input)
+	if f.issueCommentResult.ID == 0 {
+		return IssueCommentResult{ID: 1}, nil
+	}
+	return f.issueCommentResult, nil
+}
+
+func (f *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIssueCommentInput) error {
+	f.updateIssueCommentCalls = append(f.updateIssueCommentCalls, input)
+	return nil
 }
 
 func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {

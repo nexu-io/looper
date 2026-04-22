@@ -2388,7 +2388,7 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	if loop == nil {
 		t.Fatal("Loops.GetByID() = nil, want created worker loop")
 	}
-	assertEqual(t, loop.TargetType, "project")
+	assertEqual(t, loop.TargetType, "issue")
 	if loop.PRNumber != nil {
 		t.Fatalf("loop.PRNumber = %#v, want nil", loop.PRNumber)
 	}
@@ -2407,10 +2407,13 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	if queueItem == nil || queueItem.PayloadJSON == nil {
 		t.Fatalf("worker queue payload missing for loop %s", loopID)
 	}
-	assertEqual(t, queueItem.TargetType, "project")
-	assertEqual(t, queueItem.TargetID, "project:project_1")
+	assertEqual(t, queueItem.TargetType, "issue")
+	assertEqual(t, queueItem.TargetID, "issue:acme/looper:77")
 	if queueItem.PRNumber != nil {
 		t.Fatalf("queueItem.PRNumber = %#v, want nil", queueItem.PRNumber)
+	}
+	if queueItem.LockKey == nil || *queueItem.LockKey != "issue:acme/looper:77" {
+		t.Fatalf("queueItem.LockKey = %#v, want issue lock key", queueItem.LockKey)
 	}
 	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
 	assertEqual(t, payload["specPath"], "specs/newer-closed.md")

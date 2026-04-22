@@ -88,6 +88,25 @@ type IssueDetail struct {
 	URL    string
 }
 
+type IssueCommentInput struct {
+	Repo        string
+	IssueNumber int64
+	Body        string
+	CWD         string
+}
+
+type IssueCommentResult struct {
+	ID  int64
+	URL string
+}
+
+type UpdateIssueCommentInput struct {
+	Repo      string
+	CommentID int64
+	Body      string
+	CWD       string
+}
+
 type CreatePullRequestInput struct {
 	Repo       string
 	HeadBranch string
@@ -139,6 +158,8 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
+	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
+	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
@@ -329,15 +350,24 @@ type workerInput struct {
 }
 
 type workerCheckpoint struct {
-	ResumePolicy   string               `json:"resumePolicy,omitempty"`
-	Work           *workerInput         `json:"work,omitempty"`
-	ClaimedLockKey string               `json:"claimedLockKey,omitempty"`
-	Worktree       *checkpointWorktree  `json:"worktree,omitempty"`
-	Plan           *checkpointPlan      `json:"plan,omitempty"`
-	Execution      *checkpointExecution `json:"execution,omitempty"`
-	Validation     *ValidationResult    `json:"validation,omitempty"`
-	PullRequest    *checkpointPullPR    `json:"pullRequest,omitempty"`
-	SkipReason     string               `json:"skipReason,omitempty"`
+	ResumePolicy   string                `json:"resumePolicy,omitempty"`
+	Work           *workerInput          `json:"work,omitempty"`
+	ClaimedLockKey string                `json:"claimedLockKey,omitempty"`
+	IssueClaim     *checkpointIssueClaim `json:"issueClaim,omitempty"`
+	Worktree       *checkpointWorktree   `json:"worktree,omitempty"`
+	Plan           *checkpointPlan       `json:"plan,omitempty"`
+	Execution      *checkpointExecution  `json:"execution,omitempty"`
+	Validation     *ValidationResult     `json:"validation,omitempty"`
+	PullRequest    *checkpointPullPR     `json:"pullRequest,omitempty"`
+	SkipReason     string                `json:"skipReason,omitempty"`
+}
+
+type checkpointIssueClaim struct {
+	Repo        string `json:"repo,omitempty"`
+	IssueNumber int64  `json:"issueNumber,omitempty"`
+	CommentID   int64  `json:"commentId,omitempty"`
+	CommentURL  string `json:"commentUrl,omitempty"`
+	Status      string `json:"status,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -609,6 +639,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}); err != nil {
 				return ProcessResult{}, err
 			}
+			terminalStatus := issueClaimStatusFailed
+			if failure.kind == FailureManualIntervention {
+				terminalStatus = issueClaimStatusPaused
+			}
+			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, terminalStatus, failure.message)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if step == stepPrepareWork {
@@ -642,6 +677,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
+	finalIssueClaimStatus := issueClaimStatusSuccess
+	if checkpoint.SkipReason != "" {
+		finalIssueClaimStatus = issueClaimStatusPaused
+	}
+	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
 	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
@@ -675,6 +715,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if lockKey == "" {
 		if work.ExecutionMode == "push-existing" && work.Repo != "" && work.PRNumber > 0 {
 			lockKey = fmt.Sprintf("pr:%s:%d", work.Repo, work.PRNumber)
+		} else if work.IssueNumber > 0 {
+			lockKey = buildIssueLockKey(issueLookupRepo(work), work.IssueNumber)
 		} else {
 			lockKey = fmt.Sprintf("worker:%s", input.Loop.ID)
 		}
@@ -695,6 +737,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	checkpoint.SkipReason = ""
+	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusRunning, "")
 	return checkpoint, nil
 }
 
@@ -873,6 +916,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
 		checkpoint.PullRequest = &checkpointPullPR{Number: work.PRNumber, URL: prURL}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
@@ -901,6 +945,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
 	if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
@@ -913,6 +958,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
 	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: work.Repo, HeadBranch: worktree.Branch, BaseBranch: work.BaseBranch, Title: work.Title, Body: buildPullRequestBody(work, checkpoint.Plan, checkpoint.Execution), CWD: input.Project.RepoPath})
@@ -929,6 +975,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	checkpoint.PullRequest = &pr
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
 }
 
@@ -958,6 +1005,9 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
 	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	if work.IssueNumber == 0 && loop.TargetType == "issue" {
+		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
+	}
 	if work.Repo == "" {
 		return workerInput{}, &loopError{message: "worker.repo is required", kind: FailureNonRetryable}
 	}
@@ -1025,7 +1075,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: checkpoint.Work, ClaimedLockKey: checkpoint.ClaimedLockKey, Worktree: checkpoint.Worktree, Plan: checkpoint.Plan, Execution: checkpoint.Execution, Validation: checkpoint.Validation, PullRequest: checkpoint.PullRequest, SkipReason: checkpoint.SkipReason})
+	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: checkpoint.Work, ClaimedLockKey: checkpoint.ClaimedLockKey, IssueClaim: checkpoint.IssueClaim, Worktree: checkpoint.Worktree, Plan: checkpoint.Plan, Execution: checkpoint.Execution, Validation: checkpoint.Validation, PullRequest: checkpoint.PullRequest, SkipReason: checkpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed && lastCompletedStep != "" {
 		value := string(lastCompletedStep)
@@ -1072,6 +1122,25 @@ func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord
 		return storage.RunRecord{}, err
 	}
 	return updated, nil
+}
+
+func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint workerCheckpoint) error {
+	if r.repos == nil || r.repos.Runs == nil {
+		return fmt.Errorf("runs repository is not configured")
+	}
+	run, err := r.repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run == nil {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+	nowISO := r.nowISO()
+	encoded := mustMarshalJSON(checkpoint)
+	run.CheckpointJSON = &encoded
+	run.LastHeartbeatAt = &nowISO
+	run.UpdatedAt = nowISO
+	return r.repos.Runs.Upsert(ctx, *run)
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint) (storage.RunRecord, error) {
@@ -1219,6 +1288,91 @@ func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerC
 		return fmt.Sprintf("Opened pull request for worker %s: %s", loop.ID, checkpoint.PullRequest.URL)
 	}
 	return fmt.Sprintf("Completed worker %s", loop.ID)
+}
+
+const (
+	issueClaimStatusRunning  = "running"
+	issueClaimStatusPRLinked = "pr_linked"
+	issueClaimStatusSuccess  = "success"
+	issueClaimStatusFailed   = "failed"
+	issueClaimStatusPaused   = "paused"
+)
+
+func (r *Runner) syncIssueClaim(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, status, summary string) {
+	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
+		return
+	}
+	repo := issueLookupRepo(*checkpoint.Work)
+	if repo == "" {
+		return
+	}
+	body := buildIssueClaimCommentBody(input.Loop.ID, input.Run.ID, *checkpoint.Work, status, checkpoint.PullRequest, summary)
+	claim := checkpoint.IssueClaim
+	if claim == nil {
+		claim = &checkpointIssueClaim{Repo: repo, IssueNumber: checkpoint.Work.IssueNumber}
+		checkpoint.IssueClaim = claim
+	}
+	claim.Repo = repo
+	claim.IssueNumber = checkpoint.Work.IssueNumber
+	if claim.CommentID == 0 {
+		created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: checkpoint.Work.IssueNumber, Body: body, CWD: input.Project.RepoPath})
+		if err != nil {
+			r.logWarn("worker issue claim comment create failed", map[string]any{"loopId": input.Loop.ID, "repo": repo, "issueNumber": checkpoint.Work.IssueNumber, "error": err.Error()})
+			return
+		}
+		claim.CommentID = created.ID
+		claim.CommentURL = created.URL
+		claim.Status = status
+		if err := r.persistCheckpoint(ctx, input.Run.ID, *checkpoint); err != nil {
+			r.logWarn("worker issue claim checkpoint persist failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
+		}
+		return
+	}
+	if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: repo, CommentID: claim.CommentID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+		r.logWarn("worker issue claim comment update failed", map[string]any{"loopId": input.Loop.ID, "repo": repo, "issueNumber": checkpoint.Work.IssueNumber, "commentId": claim.CommentID, "error": err.Error()})
+		return
+	}
+	claim.Status = status
+	if err := r.persistCheckpoint(ctx, input.Run.ID, *checkpoint); err != nil {
+		r.logWarn("worker issue claim checkpoint persist failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
+	}
+}
+
+func buildIssueClaimCommentBody(loopID, runID string, work workerInput, status string, pr *checkpointPullPR, summary string) string {
+	lines := []string{
+		fmt.Sprintf("<!-- looper:issue-claim loop:%s run:%s issue:%s -->", loopID, runID, formatIssueReference(issueLookupRepo(work), work.IssueNumber)),
+	}
+	switch status {
+	case issueClaimStatusPRLinked:
+		lines = append(lines, "Looper is working on this issue.")
+		if pr != nil && pr.URL != "" {
+			lines = append(lines, "", "Linked pull request: "+pr.URL)
+		}
+	case issueClaimStatusSuccess:
+		lines = append(lines, "Looper finished work on this issue.")
+		if pr != nil && pr.URL != "" {
+			lines = append(lines, "", "Pull request: "+pr.URL)
+		}
+	case issueClaimStatusFailed:
+		lines = append(lines, "Looper stopped work on this issue with a failure.")
+		if summary != "" {
+			lines = append(lines, "", "Latest status: "+summary)
+		}
+	case issueClaimStatusPaused:
+		lines = append(lines, "Looper paused work on this issue.")
+		if summary != "" {
+			lines = append(lines, "", "Latest status: "+summary)
+		}
+	default:
+		lines = append(lines, "Looper has claimed this issue and started work.")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (r *Runner) logWarn(message string, payload map[string]any) {
+	if r.logger != nil {
+		r.logger.Warn(message, payload)
+	}
 }
 
 func (r *Runner) notifyRunCompleted(ctx context.Context, input RunCompletedInput) {
@@ -1393,6 +1547,22 @@ func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
 		return checkpointWorktree{}, &loopError{message: "missing worker worktree checkpoint", kind: FailureRetryableTransient}
 	}
 	return *checkpoint.Worktree, nil
+}
+
+func parseIssueNumberFromTargetID(targetID string) int64 {
+	parts := strings.Split(strings.TrimSpace(targetID), ":")
+	if len(parts) != 3 || parts[0] != "issue" {
+		return 0
+	}
+	value, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+func buildIssueLockKey(repo string, issueNumber int64) string {
+	return fmt.Sprintf("issue:%s:%d", strings.TrimSpace(repo), issueNumber)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool) (string, error) {
