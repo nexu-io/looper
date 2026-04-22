@@ -552,6 +552,96 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent failed"}, {Status: "completed", Summary: "Looks good", Stdout: `{"verdict":"clean","body":"","comments":[]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	firstClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || firstClaim == nil {
+		t.Fatalf("first ClaimNextOfType() = (%#v, %v), want claimed item", firstClaim, err)
+	}
+	firstResult, err := runner.ProcessClaimedItem(context.Background(), *firstClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableTransient {
+		t.Fatalf("first result = %#v, want retryable_transient failure", firstResult)
+	}
+
+	fixture.advance(5 * time.Second)
+	retryClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || retryClaim == nil {
+		t.Fatalf("retry ClaimNextOfType() = (%#v, %v), want claimed item", retryClaim, err)
+	}
+	retryResult, err := runner.ProcessClaimedItem(context.Background(), *retryClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(retry) error = %v", err)
+	}
+	if retryResult.Status != "success" {
+		t.Fatalf("retry result = %#v, want success", retryResult)
+	}
+	if len(git.createCalls) != 2 || len(git.prepareCalls) != 2 {
+		t.Fatalf("createCalls=%d prepareCalls=%d, want 2 each", len(git.createCalls), len(git.prepareCalls))
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("len(agent.starts) = %d, want 2", len(agent.starts))
+	}
+}
+
+func TestRunPrepareWorktreeStepPersistsCreatedWorktreeBeforeManualIntervention(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	clean := false
+	git := &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree"), prepareClean: &clean}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	prNumber := int64(42)
+	loopTarget := "pr:42"
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: "loop_1", Status: "running", CurrentStep: stringPtr(string(stepWorktree)), CheckpointJSON: stringPtr(mustMarshalJSON(reviewerCheckpoint{})), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  *project,
+		Run:      run,
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+		},
+	})
+	if err == nil || !contains(err.Error(), "manual intervention required") {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want manual intervention required", err)
+	}
+	persistedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persistedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", persistedRun, err)
+	}
+	persistedCheckpoint := parseCheckpoint(persistedRun.CheckpointJSON)
+	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != git.worktreePath {
+		t.Fatalf("persisted checkpoint worktree = %#v, want created worktree", persistedCheckpoint.Worktree)
+	}
+	if persistedCheckpoint.Worktree.PreparedAt != "" {
+		t.Fatalf("persisted checkpoint preparedAt = %q, want empty before failed prepare", persistedCheckpoint.Worktree.PreparedAt)
+	}
+}
+
 func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -906,6 +906,16 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if err != nil {
 		return checkpoint, err
 	}
+	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, BaseBranch: baseBranch}
+	if input.Run.ID != "" {
+		step := asReviewerStep(derefString(input.Run.CurrentStep))
+		if step == "" {
+			step = stepWorktree
+		}
+		if err := r.persistCheckpoint(ctx, input.Run.ID, step, checkpoint); err != nil {
+			return checkpoint, err
+		}
+	}
 	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		return checkpoint, err
@@ -913,7 +923,8 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if !prepared.Clean {
 		return checkpoint, &loopError{message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
-	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, BaseBranch: baseBranch, HeadSHA: prepared.HeadSHA, PreparedAt: r.nowISO()}
+	checkpoint.Worktree.HeadSHA = prepared.HeadSHA
+	checkpoint.Worktree.PreparedAt = r.nowISO()
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -927,7 +938,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
-	if reviewerWorktreeNeedsPrepare(checkpoint) {
+	if !reviewerWorktreePrepared(checkpoint) {
 		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
 		if err != nil {
 			return input.Checkpoint, err
@@ -1151,6 +1162,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			initialCheckpoint = reviewerCheckpoint{ResumePolicy: "replay_step"}
 		} else {
 			initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
+			if startStep == stepReview && initialCheckpoint.Worktree != nil {
+				initialCheckpoint.Worktree.PreparedAt = ""
+			}
 		}
 	}
 	nowISO := r.nowISO()
