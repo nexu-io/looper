@@ -503,6 +503,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
+		if loopResult.record.Status == "paused" {
+			result.Skipped++
+			continue
+		}
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
@@ -1283,6 +1287,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	}
 	for _, existing := range loops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
+			if existing.Status == "paused" {
+				return loopUpsertResult{record: existing, created: false}, nil
+			}
 			updated := existing
 			if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
 				updated.Status = "running"

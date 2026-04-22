@@ -680,6 +680,9 @@ func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	if claimed == nil || claimed.ID != "eligible_1" || claimed.Status != "running" {
 		t.Fatalf("Queue.ClaimNext() = %#v, want eligible_1 running", claimed)
 	}
+	if claimed.ClaimedBy == nil || *claimed.ClaimedBy != "worker-a" || claimed.ClaimedAt == nil || *claimed.ClaimedAt != now {
+		t.Fatalf("claimed metadata = %#v, want claimed_by worker-a and claimed_at %q", claimed, now)
+	}
 
 	claimedType, err := repos.Queue.ClaimNextOfType(ctx, now, "worker-b", "planner")
 	if err != nil {
@@ -687,6 +690,9 @@ func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	}
 	if claimedType == nil || claimedType.ID != "eligible_2" {
 		t.Fatalf("Queue.ClaimNextOfType() = %#v, want eligible_2", claimedType)
+	}
+	if claimedType.ClaimedBy == nil || *claimedType.ClaimedBy != "worker-b" || claimedType.ClaimedAt == nil || *claimedType.ClaimedAt != now {
+		t.Fatalf("claimedType metadata = %#v, want claimed_by worker-b and claimed_at %q", claimedType, now)
 	}
 }
 

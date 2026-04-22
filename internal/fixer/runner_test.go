@@ -54,6 +54,45 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	loop := storage.LoopRecord{ID: "loop_paused", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.CreatedLoopIDs) != 0 || len(result.QueueItems) != 0 {
+		t.Fatalf("result = %#v, want no created loops or queue items", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" || persisted.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop with nil next run", persisted)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("len(Queue.List()) = %d, want 0", len(items))
+	}
+}
+
 func TestEnqueueScopesFixerDedupeKeyToLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
