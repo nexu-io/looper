@@ -2678,6 +2678,7 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	targetID := fmt.Sprintf("issue:%s:%d", input.Repo, input.IssueNumber)
+	var fallback *workerPlannerMatch
 	for _, loop := range loopsList {
 		if loop.ProjectID != input.ProjectID || loop.Type != string(domain.LoopTypePlanner) || loop.TargetType != string(domain.LoopTargetTypeIssue) || derefString(loop.TargetID) != targetID {
 			continue
@@ -2687,9 +2688,29 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 		if prNumber == nil {
 			prNumber = int64MetadataPtr(metadata, "prNumber")
 		}
-		return &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}, nil
+		match := &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}
+		if prNumber == nil || !h.isPlannerPullRequestOpen(ctx, input.ProjectID, input.Repo, *prNumber) {
+			if fallback == nil {
+				fallback = &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}
+			}
+			continue
+		}
+		return match, nil
 	}
-	return nil, nil
+	return fallback, nil
+}
+
+func (h *Handler) isPlannerPullRequestOpen(ctx context.Context, projectID, repo string, prNumber int64) bool {
+	if prNumber <= 0 {
+		return false
+	}
+	snapshot, err := h.context.Runtime.Services().Repositories.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil || snapshot == nil {
+		return false
+	}
+	payload := parseJSONObject(snapshot.PayloadJSON)
+	detail, _ := payload["detail"].(map[string]any)
+	return strings.EqualFold(stringFromAnyDefault(detail["state"]), "open")
 }
 
 func deriveWorkerTitle(prompt, specPath, repo *string, prNumber, issueNumber *int64) string {
@@ -3508,6 +3529,14 @@ func stringMetadataPtr(metadata map[string]any, key string) *string {
 
 	result := text
 	return &result
+}
+
+func stringFromAnyDefault(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
 }
 
 func normalizeOptionalString(value *string) *string {
