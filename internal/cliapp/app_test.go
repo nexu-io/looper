@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -476,6 +477,34 @@ func TestLogsFollowStreamsNewOutput(t *testing.T) {
 	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: openai · pid 1234 · running", "line1", "line2"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestLogsFollowHandlesLargeSnapshotPayload(t *testing.T) {
+	t.Parallel()
+
+	largeOutput := strings.Repeat("x", 1024*1024+128) + "\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: snapshot\n")
+		_, _ = fmt.Fprintf(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"success\",\"run\":{\"runId\":\"run_1\",\"status\":\"success\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"openai\",\"pid\":1234,\"status\":\"completed\",\"stdout\":%q,\"stderr\":\"\"}}\n\n", largeOutput)
+		_, _ = io.WriteString(w, "event: end\n")
+		_, _ = io.WriteString(w, "data: {\"reason\":\"run_completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--follow", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --follow]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · success", "Run run_1 · step: review", "Agent: openai · pid 1234 · completed", largeOutput[:64], largeOutput[len(largeOutput)-65 : len(largeOutput)-1]} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --follow]) stdout missing expected content %q", want)
 		}
 	}
 }

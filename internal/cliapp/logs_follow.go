@@ -48,14 +48,13 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 	}
 	defer response.Body.Close()
 
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	reader := bufio.NewReader(response.Body)
 	lastExecutionID := ""
 	lastRunID := ""
 	sawEnd := false
 
 	for {
-		eventName, payload, err := readServerSentEvent(scanner)
+		eventName, payload, err := readServerSentEvent(reader)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil
@@ -121,14 +120,32 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 	}
 }
 
-func readServerSentEvent(scanner *bufio.Scanner) (string, string, error) {
+func readServerSentEvent(reader *bufio.Reader) (string, string, error) {
 	eventName := "message"
 	dataLines := make([]string, 0, 1)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			line = strings.TrimRight(line, "\r\n")
+			if errors.Is(err, io.EOF) {
+				if line == "" {
+					if len(dataLines) > 0 {
+						return eventName, strings.Join(dataLines, "\n"), nil
+					}
+					return "", "", io.EOF
+				}
+			} else {
+				return "", "", err
+			}
+		} else {
+			line = strings.TrimRight(line, "\r\n")
+		}
 		if line == "" {
 			if len(dataLines) == 0 {
+				if errors.Is(err, io.EOF) {
+					return "", "", io.EOF
+				}
 				continue
 			}
 			return eventName, strings.Join(dataLines, "\n"), nil
@@ -145,13 +162,8 @@ func readServerSentEvent(scanner *bufio.Scanner) (string, string, error) {
 			data = strings.TrimPrefix(data, " ")
 			dataLines = append(dataLines, data)
 		}
+		if errors.Is(err, io.EOF) {
+			return eventName, strings.Join(dataLines, "\n"), nil
+		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return "", "", err
-	}
-	if len(dataLines) > 0 {
-		return eventName, strings.Join(dataLines, "\n"), nil
-	}
-	return "", "", io.EOF
 }

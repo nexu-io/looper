@@ -2608,6 +2608,50 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopLogsFollowEmitsEndForTerminalSnapshot(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+	if err != nil {
+		t.Fatalf("Runs.GetByID(run_1) error = %v", err)
+	}
+	if run == nil {
+		t.Fatal("run_1 missing from fixture")
+	}
+	run.Status = "success"
+	run.EndedAt = &completedAt
+	run.UpdatedAt = completedAt
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), *run); err != nil {
+		t.Fatalf("Runs.Upsert(run_1) error = %v", err)
+	}
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll() error = %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: snapshot") {
+		t.Fatalf("stream body = %q, want snapshot event", text)
+	}
+	if !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body = %q, want end event", text)
+	}
+	if strings.Contains(text, "event: chunk") {
+		t.Fatalf("stream body = %q, did not expect chunk event for terminal snapshot", text)
+	}
+}
+
 func seedWorkerPlannerArtifactsData(t *testing.T, rt *looperdruntime.Runtime, now time.Time) {
 	t.Helper()
 	nowISO := now.UTC().Format(javaScriptISOString)

@@ -2100,6 +2100,7 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 	}
 	previousExecutionID, previousContent := loopLogsStreamState(current, stderr)
 	if shouldTerminateLoopLogsFollow(current, observedRunID) {
+		_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 		return nil
 	}
 
