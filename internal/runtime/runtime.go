@@ -963,9 +963,12 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 		queueRecord.DedupeKey = fmt.Sprintf("worker:%s", loop.ID)
 		if loop.TargetType == string(domain.LoopTargetTypeIssue) {
 			repo := strings.TrimSpace(derefString(loop.Repo))
-			issueNumber, err := parseIssueNumberFromTargetID(derefString(loop.TargetID))
-			if repo == "" || err != nil {
-				return storage.QueueItemRecord{}, false, fmt.Errorf("worker loop requires repo and issue target")
+			issueNumber, err := parseIssueNumberFromTargetID(queueRecord.TargetID)
+			if err != nil || repo == "" {
+				if err == nil {
+					err = fmt.Errorf("worker loop requires repo and issue target")
+				}
+				return storage.QueueItemRecord{}, false, err
 			}
 			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)

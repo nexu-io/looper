@@ -769,8 +769,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if lockKey == "" {
 		if work.ExecutionMode == "push-existing" && work.Repo != "" && work.PRNumber > 0 {
 			lockKey = fmt.Sprintf("pr:%s:%d", work.Repo, work.PRNumber)
-		} else if input.Loop.TargetType == "issue" && work.Repo != "" && work.IssueNumber > 0 {
-			lockKey = fmt.Sprintf("issue:%s:%d", work.Repo, work.IssueNumber)
+		} else if work.IssueNumber > 0 {
+			lockKey = buildIssueLockKey(issueLookupRepo(work), work.IssueNumber)
 		} else {
 			lockKey = fmt.Sprintf("worker:%s", input.Loop.ID)
 		}
@@ -1732,6 +1732,10 @@ func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
 		return checkpointWorktree{}, &loopError{message: "missing worker worktree checkpoint", kind: FailureRetryableTransient}
 	}
 	return *checkpoint.Worktree, nil
+}
+
+func buildIssueLockKey(repo string, issueNumber int64) string {
+	return fmt.Sprintf("issue:%s:%d", strings.TrimSpace(repo), issueNumber)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool) (string, error) {

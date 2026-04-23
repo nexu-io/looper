@@ -2415,6 +2415,9 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	if queueItem.PRNumber != nil {
 		t.Fatalf("queueItem.PRNumber = %#v, want nil", queueItem.PRNumber)
 	}
+	if queueItem.LockKey == nil || *queueItem.LockKey != "issue:acme/looper:77" {
+		t.Fatalf("queueItem.LockKey = %#v, want issue lock key", queueItem.LockKey)
+	}
 	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
 	assertEqual(t, payload["specPath"], "specs/newer-closed.md")
 	if _, ok := payload["prNumber"]; ok {

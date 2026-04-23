@@ -724,6 +724,12 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
 		t.Fatalf("first = %#v, want retryable_after_resume failure", first)
 	}
+	if len(github.updateIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.updateIssueCommentCalls) after retryable failure = %d, want 1 non-terminal refresh", len(github.updateIssueCommentCalls))
+	}
+	if body := github.updateIssueCommentCalls[0].Body; !strings.Contains(body, "started work") || strings.Contains(body, "stopped work") || strings.Contains(body, "paused work") {
+		t.Fatalf("retryable issue comment body = %q, want in-progress status without terminal failure text", body)
+	}
 	fixture.advance(5 * time.Second)
 	claim2, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	second, err := runner.ProcessClaimedItem(context.Background(), *claim2)
@@ -744,6 +750,9 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 	if len(github.createPRCalls) != 2 {
 		t.Fatalf("len(github.createPRCalls) = %d, want 2", len(github.createPRCalls))
+	}
+	if len(github.createIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1 running marker across resume", len(github.createIssueCommentCalls))
 	}
 }
 
@@ -818,6 +827,9 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 	if completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || completed[0].Summary != "Validation failed" {
 		t.Fatalf("completed[0] = %#v, want manual intervention completion notice", completed[0])
+	}
+	if len(github.updateIssueCommentCalls) == 0 || !strings.Contains(github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body, "paused work") {
+		t.Fatalf("terminal issue comment updates = %#v, want paused marker body", github.updateIssueCommentCalls)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
@@ -1161,7 +1173,7 @@ func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr"}, "loop_worker_1")
+	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{openPRResponses: [][]PullRequestSummary{{}, {{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
@@ -1205,6 +1217,42 @@ func TestProcessClaimedItemFailsWhenCreatedPRNumberIsMissing(t *testing.T) {
 	}
 	if loop == nil || (loop.MetadataJSON != nil && strings.Contains(*loop.MetadataJSON, `"prNumber":0`)) {
 		t.Fatalf("loop = %#v, want no persisted PR number 0", loop)
+	}
+}
+
+func TestProcessClaimedItemUsesIssueScopedLockForIssueWork(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{
+		DB:              fixture.coordinator.DB(),
+		Repos:           fixture.repos,
+		GitHub:          &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 501}},
+		Git:             &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}},
+		AgentExecutor:   &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}},
+		Logger:          fixture.logger,
+		Now:             fixture.now,
+		AllowAutoCommit: true,
+		AllowAutoPush:   false,
+		OpenPRStrategy:  config.OpenPRStrategyAllDone,
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after manual PR gating", result)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:27")
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want issue lock released", lock)
 	}
 }
 
@@ -1276,15 +1324,16 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	loopTarget := "project:project_1"
-	loopMetadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &loopMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	loopTarget := "issue:acme/looper:27"
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &loopMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "project_1"
 	loopID := "loop_worker_1"
-	payload := `{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project:project_1", Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	lockKey := "issue:acme/looper:27"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: lockKey, Repo: stringPtr("acme/looper"), DedupeKey: "worker:project_1:acme/looper:27", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	fixture := &runnerFixture{coordinator: coordinator, repos: repos, logger: &testLogger{}, current: now}
