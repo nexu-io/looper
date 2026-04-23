@@ -350,10 +350,7 @@ func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 		Stderr:         stderr,
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			if req.URL.String() == "https://api.github.com/repos/powerformer/looper/releases/latest" {
-				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
-			}
-			t.Fatalf("unexpected request URL %q", req.URL.String())
+			t.Fatalf("unexpected request before Homebrew refusal: %q", req.URL.String())
 			return nil, nil
 		}),
 	})

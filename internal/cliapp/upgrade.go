@@ -419,15 +419,6 @@ func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error
 
 func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput bool) (cliUpgradeOutput, error) {
 	ctx := cmd.Context()
-	latestRelease, err := r.fetchReleaseMetadata(ctx, "")
-	if err != nil {
-		return cliUpgradeOutput{}, err
-	}
-	latestVersion := normalizeVersion(latestRelease.TagName)
-	if latestVersion == "" {
-		return cliUpgradeOutput{}, fmt.Errorf("latest looper release metadata is missing tag_name")
-	}
-
 	execPath, err := r.executablePath()
 	if err != nil {
 		return cliUpgradeOutput{}, fmt.Errorf("resolve current looper path: %w", err)
@@ -436,13 +427,22 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	guidance := cliRefusalGuidance(installSource, execPath)
 	if installSource != cliInstallSourceRelease {
 		refused := true
-		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
+		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
 		if emitOutput && getBoolFlag(cmd, "json") {
 			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 				return cliUpgradeOutput{}, err
 			}
 		}
 		return result, &cliUpgradeRefusedError{message: guidance}
+	}
+
+	latestRelease, err := r.fetchReleaseMetadata(ctx, "")
+	if err != nil {
+		return cliUpgradeOutput{}, err
+	}
+	latestVersion := normalizeVersion(latestRelease.TagName)
+	if latestVersion == "" {
+		return cliUpgradeOutput{}, fmt.Errorf("latest looper release metadata is missing tag_name")
 	}
 
 	available, err := isSemverUpgradeAvailable(version.Current().Version, latestVersion)

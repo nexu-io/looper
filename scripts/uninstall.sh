@@ -43,7 +43,7 @@ is_installer_owned_cli_path() {
   dir="${path%/*}"
   case "$path" in
     "$HOME/.local/bin/looper"|"$HOME/.looper/bin/looper") return 0 ;;
-    /opt/homebrew/*|/usr/local/Homebrew/*|"$HOME/go/bin/looper"|"$HOME/.cargo/bin/looper"|"$HOME/.asdf/"*|"$HOME/.local/share/mise/"*) return 1 ;;
+    /opt/homebrew/*|/usr/local/Homebrew/*) return 1 ;;
     "$HOME"/*/looper)
       if in_path_dir "$dir"; then
         return 0

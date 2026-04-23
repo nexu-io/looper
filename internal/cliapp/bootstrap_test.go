@@ -161,6 +161,145 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 	}
 }
 
+func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	binary := []byte("looperd-binary")
+	checksum := sha256.Sum256(binary)
+	checksumText := hex.EncodeToString(checksum[:]) + "  looperd-darwin-arm64\n"
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var daemonStarted atomic.Bool
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			}
+			switch req.URL.Path {
+			case "/api/v1/status", "/api/v1/healthz":
+				if !daemonStarted.Load() {
+					return nil, fmt.Errorf("daemon offline")
+				}
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				if _, err := os.Stat(managedPath); err != nil {
+					return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+				}
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			if command == "ps" && len(args) == 4 && args[0] == "-p" && args[2] == "-o" && args[3] == "command=" {
+				return commandExecutionResult{ExitCode: 0, Stdout: managedPath + "\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = args
+			_ = cwd
+			_ = env
+			if command != managedPath {
+				return 0, fmt.Errorf("unexpected command %q", command)
+			}
+			daemonStarted.Store(true)
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid == 4321 && signal == 0 {
+				return nil
+			}
+			return fmt.Errorf("unexpected kill(%d, %d)", pid, signal)
+		},
+		Sleep: func(duration time.Duration) {
+			_ = duration
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want empty string", stderr.String())
+	}
+	var decoded bootstrapResult
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout is not valid bootstrap JSON: %v\nraw=%q", err, stdout.String())
+	}
+	if !decoded.DaemonRunning || !decoded.APIReachable {
+		t.Fatalf("bootstrap JSON daemon state = running:%v reachable:%v, want true/true", decoded.DaemonRunning, decoded.APIReachable)
+	}
+	if strings.Contains(stdout.String(), "Started looperd") || strings.Contains(stdout.String(), "PID file:") {
+		t.Fatalf("stdout contains daemon start chatter: %q", stdout.String())
+	}
+}
+
+func TestBootstrapPreflightHonorsConfigAndEnvToolOverrides(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	if err := os.WriteFile(configPath, []byte(`{"tools":{"gitPath":"/config/git","ghPath":"/config/gh"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath) error = %v", err)
+	}
+	t.Setenv("LOOPER_GH_PATH", "/env/gh")
+
+	app := New(Deps{
+		Platform: "darwin",
+		Arch:     "arm64",
+		LookPath: func(file string) (string, error) {
+			return "", fmt.Errorf("%s not on PATH", file)
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command != "/env/gh" || strings.Join(args, " ") != "auth status" {
+				t.Fatalf("RunCommand(%q, %#v), want env gh auth status", command, args)
+			}
+			return commandExecutionResult{ExitCode: 0}, nil
+		},
+	})
+	runtime := newCommandRuntime(app, []string{"bootstrap", "--yes"})
+	plan := bootstrapConfigPlan{}
+
+	if _, err := runtime.bootstrapPreflight(context.Background(), configPath, &plan); err != nil {
+		t.Fatalf("bootstrapPreflight() error = %v", err)
+	}
+}
+
 func TestBootstrapPreflightFailsWhenRequiredToolsMissing(t *testing.T) {
 	t.Parallel()
 

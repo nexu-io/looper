@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,7 +98,7 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 	}
 	result.Notes = append(result.Notes, planNotes...)
 
-	preflightNotes, err := r.bootstrapPreflight(ctx, &planned)
+	preflightNotes, err := r.bootstrapPreflight(ctx, configPath, &planned)
 	if err != nil {
 		return bootstrapResult{}, err
 	}
@@ -132,7 +133,7 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 		return bootstrapResult{}, err
 	}
 	if !apiReachable {
-		if err := r.daemonStart(cmd, nil); err != nil {
+		if err := r.daemonStartForBootstrap(cmd); err != nil {
 			return bootstrapResult{}, err
 		}
 		apiReachable, err = r.waitForBootstrapHealth(ctx, client)
@@ -250,22 +251,15 @@ func (r *commandRuntime) planBootstrapConfig(cmd *cobra.Command, cwd string, opt
 	return plan, nil, nil
 }
 
-func (r *commandRuntime) bootstrapPreflight(ctx context.Context, plan *bootstrapConfigPlan) ([]string, error) {
+func (r *commandRuntime) bootstrapPreflight(ctx context.Context, configPath string, plan *bootstrapConfigPlan) ([]string, error) {
 	if _, err := resolveLooperdTarget(r.platform(), r.arch()); err != nil {
 		return nil, err
 	}
 
-	configured := config.ToolPathsConfig{}
-	if value := strings.TrimSpace(extractToolPathOverride(ExtractConfigArgs(r.argv), "git-path")); value != "" {
-		configured.GitPath = stringPtr(value)
+	configured, err := r.bootstrapConfiguredToolPaths(configPath)
+	if err != nil {
+		return nil, err
 	}
-	if value := strings.TrimSpace(extractToolPathOverride(ExtractConfigArgs(r.argv), "gh-path")); value != "" {
-		configured.GHPath = stringPtr(value)
-	}
-	if value := strings.TrimSpace(extractToolPathOverride(ExtractConfigArgs(r.argv), "osascript-path")); value != "" {
-		configured.OsascriptPath = stringPtr(value)
-	}
-
 	detected := config.DetectToolPaths(configured, r.lookPath())
 	missing := make([]string, 0)
 	if detected.Paths.GitPath == nil || strings.TrimSpace(*detected.Paths.GitPath) == "" {
@@ -290,6 +284,68 @@ func (r *commandRuntime) bootstrapPreflight(ctx context.Context, plan *bootstrap
 		}
 	}
 	return notes, nil
+}
+
+func (r *commandRuntime) daemonStartForBootstrap(cmd *cobra.Command) error {
+	if !getBoolFlag(cmd, "json") {
+		return r.daemonStart(cmd, nil)
+	}
+
+	originalOut := cmd.OutOrStdout()
+	cmd.SetOut(io.Discard)
+	defer cmd.SetOut(originalOut)
+	return r.daemonStart(cmd, nil)
+}
+
+func (r *commandRuntime) bootstrapConfiguredToolPaths(configPath string) (config.ToolPathsConfig, error) {
+	configured := config.ToolPathsConfig{}
+	if partial, err := readBootstrapPartialConfigIfPresent(configPath); err != nil {
+		return config.ToolPathsConfig{}, err
+	} else if partial.Tools != nil {
+		configured.GitPath = cloneBootstrapStringPtr(partial.Tools.GitPath)
+		configured.GHPath = cloneBootstrapStringPtr(partial.Tools.GHPath)
+		configured.OsascriptPath = cloneBootstrapStringPtr(partial.Tools.OsascriptPath)
+	}
+
+	if value, ok := os.LookupEnv("LOOPER_GIT_PATH"); ok {
+		configured.GitPath = stringPtr(value)
+	}
+	if value, ok := os.LookupEnv("LOOPER_GH_PATH"); ok {
+		configured.GHPath = stringPtr(value)
+	}
+	if value, ok := os.LookupEnv("LOOPER_OSASCRIPT_PATH"); ok {
+		configured.OsascriptPath = stringPtr(value)
+	}
+
+	args := ExtractConfigArgs(r.argv)
+	if value := strings.TrimSpace(extractToolPathOverride(args, "git-path")); value != "" {
+		configured.GitPath = stringPtr(value)
+	}
+	if value := strings.TrimSpace(extractToolPathOverride(args, "gh-path")); value != "" {
+		configured.GHPath = stringPtr(value)
+	}
+	if value := strings.TrimSpace(extractToolPathOverride(args, "osascript-path")); value != "" {
+		configured.OsascriptPath = stringPtr(value)
+	}
+	return configured, nil
+}
+
+func readBootstrapPartialConfigIfPresent(path string) (config.PartialConfig, error) {
+	partial, err := readBootstrapPartialConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return config.PartialConfig{}, nil
+		}
+		return config.PartialConfig{}, err
+	}
+	return partial, nil
+}
+
+func cloneBootstrapStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	return stringPtr(*value)
 }
 
 func extractToolPathOverride(args []string, flag string) string {
