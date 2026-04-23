@@ -348,6 +348,110 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 	}
 }
 
+func TestDaemonStopStopsExistingPIDAndRemovesPIDFile(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	removeCalls := make([]string, 0)
+	killCalls := make([]struct {
+		pid    int
+		signal int
+	}, 0)
+	alive1234 := true
+
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			if strings.HasSuffix(path, filepath.Join(".looper", "looperd.pid")) {
+				return []byte("1234\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "ps" && len(args) >= 2 && args[1] == "1234" {
+				return commandExecutionResult{Stdout: managedPath + "\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1}, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			killCalls = append(killCalls, struct {
+				pid    int
+				signal int
+			}{pid: pid, signal: signal})
+			if pid == 1234 && signal == 0 {
+				if !alive1234 {
+					return os.ErrProcessDone
+				}
+				return nil
+			}
+			if pid == 1234 && signal == 15 {
+				alive1234 = false
+				return nil
+			}
+			return nil
+		},
+		RemoveFile: func(path string) error {
+			removeCalls = append(removeCalls, path)
+			return nil
+		},
+		Sleep: func(duration time.Duration) {
+			_ = duration
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "stop"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon stop]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([daemon stop]) stderr = %q, want empty string", stderr.String())
+	}
+	if len(removeCalls) == 0 || !strings.HasSuffix(removeCalls[0], filepath.Join(".looper", "looperd.pid")) {
+		t.Fatalf("removeCalls = %#v, want pid file removal", removeCalls)
+	}
+	if !strings.Contains(stdout.String(), "Stopped looperd pid 1234") {
+		t.Fatalf("stdout = %q, want stop confirmation", stdout.String())
+	}
+	if len(killCalls) < 3 {
+		t.Fatalf("killCalls = %#v, want liveness probe, SIGTERM, and exit probe", killCalls)
+	}
+	if killCalls[1].pid != 1234 || killCalls[1].signal != 15 {
+		t.Fatalf("killCalls = %#v, want SIGTERM for pid 1234", killCalls)
+	}
+}
+
+func TestDaemonStopWithoutPIDFileReportsNothingToStop(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "stop"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon stop]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([daemon stop]) stderr = %q, want empty string", stderr.String())
+	}
+	if got, want := stdout.String(), "No daemon pid file found; nothing to stop.\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
 func TestDaemonStartReturnsProcessInspectionFailureForExistingPID(t *testing.T) {
 	t.Parallel()
 

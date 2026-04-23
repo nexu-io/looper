@@ -192,51 +192,81 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
 	_ = args
 
-	pidFilePath, err := r.resolveDaemonPIDFilePath()
-	if err != nil {
-		return err
-	}
-
-	existingPID, ok := r.readPIDFile(pidFilePath)
-	if !ok {
-		if _, err := fmt.Fprintln(cmd.OutOrStdout(), "No daemon pid file found; starting daemon."); err != nil {
-			return err
-		}
-		return r.daemonStart(cmd, nil)
-	}
-
-	if !r.isProcessAlive(existingPID) {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Daemon pid %d is stale; starting daemon.\n", existingPID); err != nil {
-			return err
-		}
-		r.removePIDFile(pidFilePath)
-		return r.daemonStart(cmd, nil)
-	}
-
-	isLooperd, err := r.isLooperdProcess(cmd.Context(), existingPID)
-	if err != nil {
-		return err
-	}
-	if !isLooperd {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Daemon pid %d does not appear to be looperd; treating pid file as stale.\n", existingPID); err != nil {
-			return err
-		}
-		r.removePIDFile(pidFilePath)
-		return r.daemonStart(cmd, nil)
-	}
-
-	if err := r.killProcess(existingPID, int(syscall.SIGTERM)); err != nil {
-		return fmt.Errorf("stop looperd pid %d: %w", existingPID, err)
-	}
-	if err := r.waitForProcessExit(existingPID, 2*time.Second, 100*time.Millisecond); err != nil {
-		return err
-	}
-	r.removePIDFile(pidFilePath)
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Stopped looperd pid %d\n", existingPID); err != nil {
+	if _, err := r.stopDaemonProcess(cmd.Context(), cmd.OutOrStdout(), true); err != nil {
 		return err
 	}
 
 	return r.daemonStart(cmd, nil)
+}
+
+func (r *commandRuntime) daemonStop(cmd *cobra.Command, args []string) error {
+	_ = args
+
+	_, err := r.stopDaemonProcess(cmd.Context(), cmd.OutOrStdout(), false)
+	return err
+}
+
+func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, startIfMissing bool) (bool, error) {
+	pidFilePath, err := r.resolveDaemonPIDFilePath()
+	if err != nil {
+		return false, err
+	}
+
+	existingPID, ok := r.readPIDFile(pidFilePath)
+	if !ok {
+		if startIfMissing {
+			if _, err := fmt.Fprintln(out, "No daemon pid file found; starting daemon."); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		if _, err := fmt.Fprintln(out, "No daemon pid file found; nothing to stop."); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if !r.isProcessAlive(existingPID) {
+		if startIfMissing {
+			if _, err := fmt.Fprintf(out, "Daemon pid %d is stale; starting daemon.\n", existingPID); err != nil {
+				return false, err
+			}
+			r.removePIDFile(pidFilePath)
+			return false, nil
+		}
+		r.removePIDFile(pidFilePath)
+		if _, err := fmt.Fprintf(out, "Removed stale daemon pid file for pid %d\n", existingPID); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	isLooperd, err := r.isLooperdProcess(ctx, existingPID)
+	if err != nil {
+		return false, err
+	}
+	if !isLooperd {
+		if _, err := fmt.Fprintf(out, "Daemon pid %d does not appear to be looperd; treating pid file as stale.\n", existingPID); err != nil {
+			return false, err
+		}
+		r.removePIDFile(pidFilePath)
+		if startIfMissing {
+			return false, nil
+		}
+		return false, nil
+	}
+
+	if err := r.killProcess(existingPID, int(syscall.SIGTERM)); err != nil {
+		return false, fmt.Errorf("stop looperd pid %d: %w", existingPID, err)
+	}
+	if err := r.waitForProcessExit(existingPID, 2*time.Second, 100*time.Millisecond); err != nil {
+		return false, err
+	}
+	r.removePIDFile(pidFilePath)
+	if _, err := fmt.Fprintf(out, "Stopped looperd pid %d\n", existingPID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {

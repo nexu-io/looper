@@ -5,6 +5,7 @@ Subcommands:
   install  Install the managed daemon binary
   status   Show daemon status
   start    Start the daemon
+  stop     Stop the daemon
   restart  Restart the daemon
   logs     Show daemon logs
 
@@ -27,6 +28,7 @@ Global Flags:
 Examples:
 $ looper daemon install
 $ looper daemon start
+$ looper daemon stop
 $ looper daemon restart
 $ looper daemon status
 $ looper daemon logs --lines 50

@@ -151,7 +151,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "daemon",
 				short:           "Daemon commands",
-				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "start", description: "Start the daemon"}, {name: "restart", description: "Restart the daemon"}, {name: "logs", description: "Show daemon logs"}},
+				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "start", description: "Start the daemon"}, {name: "stop", description: "Stop the daemon"}, {name: "restart", description: "Restart the daemon"}, {name: "logs", description: "Show daemon logs"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
@@ -160,6 +160,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				exampleLines: []string{
 					"$ looper daemon install",
 					"$ looper daemon start",
+					"$ looper daemon stop",
 					"$ looper daemon restart",
 					"$ looper daemon status",
 					"$ looper daemon logs --lines 50",
@@ -168,6 +169,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),
 					newCommand(commandSpec{use: "status", short: "Show daemon status", runE: runtime.daemonStatus}),
 					newCommand(commandSpec{use: "start", short: "Start the daemon", runE: runtime.daemonStart}),
+					newCommand(commandSpec{use: "stop", short: "Stop the daemon", runE: runtime.daemonStop}),
 					newCommand(commandSpec{use: "restart", short: "Restart the daemon", runE: runtime.daemonRestart}),
 					newCommand(commandSpec{use: "logs", short: "Show daemon logs", runE: runtime.daemonLogs}),
 				},
