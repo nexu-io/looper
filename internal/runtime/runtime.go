@@ -961,7 +961,22 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 		queueRecord.Priority = storage.QueuePriorityWorker
 		lockKey := fmt.Sprintf("worker:%s", loop.ID)
 		queueRecord.DedupeKey = fmt.Sprintf("worker:%s", loop.ID)
-		if loop.TargetType == string(domain.LoopTargetTypePullRequest) {
+		if loop.TargetType == string(domain.LoopTargetTypeIssue) {
+			repo := strings.TrimSpace(derefString(loop.Repo))
+			issueNumber, err := parseIssueNumberFromTargetID(queueRecord.TargetID)
+			if err != nil || repo == "" {
+				if err == nil {
+					err = fmt.Errorf("worker loop requires repo and issue target")
+				}
+				return storage.QueueItemRecord{}, false, err
+			}
+			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
+			queueRecord.TargetID = lockKey
+			queueRecord.Repo = &repo
+			queueRecord.PRNumber = nil
+			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, issueNumber)
+		} else if loop.TargetType == string(domain.LoopTargetTypePullRequest) {
 			repo := strings.TrimSpace(derefString(loop.Repo))
 			if repo == "" || loop.PRNumber == nil {
 				return storage.QueueItemRecord{}, false, fmt.Errorf("worker loop requires repo and prNumber")

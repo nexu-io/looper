@@ -159,8 +159,8 @@ func AssertLoopTypeMatchesTarget(loopType LoopType, target LoopTarget) error {
 	}
 	switch loopType {
 	case LoopTypeWorker:
-		if target.TargetType != LoopTargetTypeProject && target.TargetType != LoopTargetTypePullRequest {
-			return fmt.Errorf("worker loops must target a project or pull request")
+		if target.TargetType != LoopTargetTypeProject && target.TargetType != LoopTargetTypePullRequest && target.TargetType != LoopTargetTypeIssue {
+			return fmt.Errorf("worker loops must target a project, issue, or pull request")
 		}
 	case LoopTypePlanner:
 		if target.TargetType != LoopTargetTypeIssue {

@@ -2393,10 +2393,11 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	if loop == nil {
 		t.Fatal("Loops.GetByID() = nil, want created worker loop")
 	}
-	assertEqual(t, loop.TargetType, "project")
+	assertEqual(t, loop.TargetType, "issue")
 	if loop.PRNumber != nil {
 		t.Fatalf("loop.PRNumber = %#v, want nil", loop.PRNumber)
 	}
+	assertEqual(t, derefString(loop.TargetID), "issue:acme/looper:77")
 
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
@@ -2412,10 +2413,15 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	if queueItem == nil || queueItem.PayloadJSON == nil {
 		t.Fatalf("worker queue payload missing for loop %s", loopID)
 	}
-	assertEqual(t, queueItem.TargetType, "project")
-	assertEqual(t, queueItem.TargetID, "project:project_1")
+	assertEqual(t, queueItem.TargetType, "issue")
+	assertEqual(t, queueItem.TargetID, "issue:acme/looper:77")
+	assertEqual(t, derefString(queueItem.LockKey), "issue:acme/looper:77")
+	assertEqual(t, queueItem.DedupeKey, "worker:project_1:acme/looper:77")
 	if queueItem.PRNumber != nil {
 		t.Fatalf("queueItem.PRNumber = %#v, want nil", queueItem.PRNumber)
+	}
+	if queueItem.LockKey == nil || *queueItem.LockKey != "issue:acme/looper:77" {
+		t.Fatalf("queueItem.LockKey = %#v, want issue lock key", queueItem.LockKey)
 	}
 	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))
 	assertEqual(t, payload["specPath"], "specs/newer-closed.md")
@@ -2650,6 +2656,41 @@ func TestHandlerWorkersCreateAllowsConcurrentProjectWorkers(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
+}
+
+func TestHandlerWorkersCreateRejectsDuplicateIssueWorkers(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_existing_issue_worker",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "worker",
+		TargetType: "issue",
+		TargetID:   stringPtr("issue:acme/looper:77"),
+		Repo:       stringPtr("acme/looper"),
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_issue_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	apiErr := body["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], "LOOP_CONFLICT")
 }
 
 func TestHandlerWorkersCreateTriggersSchedulerTickHook(t *testing.T) {

@@ -24,12 +24,14 @@ type Options struct {
 	GHPath string
 	CWD    string
 	Now    func() time.Time
+	GHRun  func(context.Context, shell.Options) (shell.Result, error)
 }
 
 type Gateway struct {
 	ghPath string
 	cwd    string
 	now    func() time.Time
+	ghRun  func(context.Context, shell.Options) (shell.Result, error)
 }
 
 type PullRequestSummary struct {
@@ -80,6 +82,25 @@ type IssueSummary struct {
 }
 
 type IssueDetail = IssueSummary
+
+type IssueCommentInput struct {
+	Repo        string
+	IssueNumber int64
+	Body        string
+	CWD         string
+}
+
+type IssueCommentResult struct {
+	ID  int64
+	URL string
+}
+
+type UpdateIssueCommentInput struct {
+	Repo      string
+	CommentID int64
+	Body      string
+	CWD       string
+}
 
 type SubmitReviewInput struct {
 	Repo     string
@@ -206,7 +227,11 @@ func New(options Options) *Gateway {
 	if now == nil {
 		now = time.Now
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now}
+	ghRun := options.GHRun
+	if ghRun == nil {
+		ghRun = shell.Run
+	}
+	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, ghRun: ghRun}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -297,6 +322,23 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Assignees: extractActorLogins(row["assignees"]),
 		Labels:    extractLabelNames(row["labels"]),
 	}, nil
+}
+
+func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber), "--method", "POST", "-f", "body="+input.Body)
+	if err != nil {
+		return IssueCommentResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return IssueCommentResult{}, err
+	}
+	return IssueCommentResult{ID: asInt64(row["id"]), URL: asString(row["html_url"])}, nil
+}
+
+func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
+	return err
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -675,7 +717,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []s
 }
 
 func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) (shell.Result, error) {
-	return shell.Run(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
+	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
 }
 
 func defaultLimit(limit int) int {

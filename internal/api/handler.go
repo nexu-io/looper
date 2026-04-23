@@ -2551,9 +2551,15 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetType := string(domain.LoopTargetTypeProject)
 	targetID := "project:" + projectID
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeProject, ProjectID: projectID}
 	if effectivePRNumber != nil {
 		targetType = string(domain.LoopTargetTypePullRequest)
 		targetID = fmt.Sprintf("pr:%s:%d", *repo, *effectivePRNumber)
+		target = domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: *repo, PRNumber: *effectivePRNumber}
+	} else if issueNumber != nil {
+		targetType = string(domain.LoopTargetTypeIssue)
+		targetID = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
+		target = domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 	}
 
 	workerPayload := struct {
@@ -2594,10 +2600,6 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			return storage.LoopRecord{}, seqErr
 		}
 
-		target := domain.LoopTarget{TargetType: domain.LoopTargetTypeProject, ProjectID: projectID}
-		if effectivePRNumber != nil {
-			target = domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: *repo, PRNumber: *effectivePRNumber}
-		}
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
@@ -2632,6 +2634,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		if effectivePRNumber != nil {
 			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *effectivePRNumber)
 			lockKey = fmt.Sprintf("pr:%s:%d", *repo, *effectivePRNumber)
+		} else if issueNumber != nil {
+			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *issueNumber)
+			lockKey = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
 		}
 		payloadJSON := string(queuePayloadJSONBytes)
 		queueRecord := storage.QueueItemRecord{
@@ -3388,7 +3393,19 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 		queueRecord.Priority = storage.QueuePriorityWorker
 		lockKey := fmt.Sprintf("worker:%s", record.ID)
 		queueRecord.DedupeKey = fmt.Sprintf("worker:%s", record.ID)
-		if target.TargetType == domain.LoopTargetTypePullRequest {
+		if target.TargetType == domain.LoopTargetTypeIssue {
+			repo := strings.TrimSpace(derefString(record.Repo))
+			issueNumber := target.IssueNumber
+			if repo == "" || issueNumber <= 0 {
+				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
+			}
+			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
+			queueRecord.TargetID = lockKey
+			queueRecord.Repo = &repo
+			queueRecord.PRNumber = nil
+			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", record.ProjectID, repo, issueNumber)
+		} else if target.TargetType == domain.LoopTargetTypePullRequest {
 			repo := strings.TrimSpace(derefString(record.Repo))
 			if repo == "" || record.PRNumber == nil {
 				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}

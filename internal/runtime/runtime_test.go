@@ -320,6 +320,41 @@ func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	}
 }
 
+func TestBuildRecoveryQueueItemRecordUsesIssueLockForWorkerTargets(t *testing.T) {
+	t.Parallel()
+
+	loop := storage.LoopRecord{
+		ID:           "loop_worker_issue",
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     stringPtr("issue:acme/looper:77"),
+		Repo:         stringPtr("acme/looper"),
+		Status:       "queued",
+		MetadataJSON: stringPtr(`{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}}`),
+	}
+
+	record, ok, err := buildRecoveryQueueItem(loop, "2026-04-17T12:34:56.000Z", 3)
+	if err != nil {
+		t.Fatalf("buildRecoveryQueueItemRecord() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("buildRecoveryQueueItemRecord() ok = false, want true")
+	}
+	if record.TargetType != "issue" {
+		t.Fatalf("record.TargetType = %q, want issue", record.TargetType)
+	}
+	if record.TargetID != "issue:acme/looper:77" {
+		t.Fatalf("record.TargetID = %q, want issue target id", record.TargetID)
+	}
+	if record.LockKey == nil || *record.LockKey != "issue:acme/looper:77" {
+		t.Fatalf("record.LockKey = %#v, want issue lock key", record.LockKey)
+	}
+	if record.DedupeKey != "worker:project_1:acme/looper:77" {
+		t.Fatalf("record.DedupeKey = %q, want issue dedupe key", record.DedupeKey)
+	}
+}
+
 func TestRuntimeStartConfiguresDefaultSchedulerTickAtStartup(t *testing.T) {
 	t.Parallel()
 

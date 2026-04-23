@@ -398,6 +398,18 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL}, nil
 }
 
+func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
+	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: input.Body, CWD: input.CWD})
+	if err != nil {
+		return worker.IssueCommentResult{}, err
+	}
+	return worker.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
+}
+
+func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: input.Body, CWD: input.CWD})
+}
+
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
 	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
 	if err != nil {
@@ -452,7 +464,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
 }
 
 func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
