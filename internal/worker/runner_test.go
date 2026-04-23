@@ -1299,18 +1299,21 @@ func (f *runnerFixture) nowISO() string {
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 type fakeGitHubGateway struct {
-	openPRs         []PullRequestSummary
-	openPRResponses [][]PullRequestSummary
-	openPRIndex     int
-	prDetail        PullRequestDetail
-	issueDetail     IssueDetail
-	viewIssueCalls  []ViewIssueInput
-	createPRResult  CreatePullRequestResult
-	createPRErrors  []error
-	createPRCalls   []CreatePullRequestInput
-	removeLabels    []PullRequestLabelsInput
-	reviewerCalls   []PullRequestReviewersInput
-	createPRIndex   int
+	openPRs                 []PullRequestSummary
+	openPRResponses         [][]PullRequestSummary
+	openPRIndex             int
+	prDetail                PullRequestDetail
+	issueDetail             IssueDetail
+	viewIssueCalls          []ViewIssueInput
+	createIssueCommentCalls []IssueCommentInput
+	updateIssueCommentCalls []UpdateIssueCommentInput
+	issueCommentResult      IssueCommentResult
+	createPRResult          CreatePullRequestResult
+	createPRErrors          []error
+	createPRCalls           []CreatePullRequestInput
+	removeLabels            []PullRequestLabelsInput
+	reviewerCalls           []PullRequestReviewersInput
+	createPRIndex           int
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1352,6 +1355,19 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 		detail.Title = "Issue"
 	}
 	return detail, nil
+}
+
+func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	f.createIssueCommentCalls = append(f.createIssueCommentCalls, input)
+	if f.issueCommentResult.ID == 0 {
+		return IssueCommentResult{ID: 1}, nil
+	}
+	return f.issueCommentResult, nil
+}
+
+func (f *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIssueCommentInput) error {
+	f.updateIssueCommentCalls = append(f.updateIssueCommentCalls, input)
+	return nil
 }
 
 func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
