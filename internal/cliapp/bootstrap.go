@@ -565,16 +565,11 @@ func bootstrapLocalToken() string {
 }
 
 func (r *commandRuntime) ensureBootstrapDaemon(ctx context.Context, force bool) (string, bool, error) {
-	release, err := r.fetchReleaseMetadata(ctx, "")
-	if err != nil {
-		return "", false, err
-	}
-	latestVersion := strings.TrimPrefix(strings.TrimSpace(release.TagName), "v")
 	installed, err := r.readManagedDaemonVersion(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	if !force && installed != nil && installed.Version == latestVersion {
+	if !force && installed != nil {
 		return "already-installed", false, nil
 	}
 	reinstall := force || installed != nil

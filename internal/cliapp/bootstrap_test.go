@@ -468,6 +468,78 @@ func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.
 	}
 }
 
+func TestBootstrapIdempotentSkipsGitHubWhenManagedDaemonInstalled(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "bootstrap-offline.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.WriteFile(configPath, []byte(`{"server":{"baseUrl":"http://daemon.test","authMode":"none"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath) error = %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://daemon.test/api/v1/status":
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+			case "http://daemon.test/api/v1/healthz":
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: "0.1.0\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			_ = cwd
+			_ = env
+			return 0, fmt.Errorf("spawn should not be called")
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want empty string", stderr.String())
+	}
+	assertJSONContains(t, stdout.String(), "daemonInstallState", "already-installed")
+	assertJSONContains(t, stdout.String(), "daemonInstalled", false)
+}
+
 func TestBootstrapAddsProjectWithoutPersistingRuntimeOverrides(t *testing.T) {
 	homeDir := t.TempDir()
 	cwd := t.TempDir()

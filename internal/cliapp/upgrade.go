@@ -464,6 +464,17 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 		}
 		return result, nil
 	}
+	if err := preflightSelfUpgradeReplace(execPath); err != nil {
+		refused := true
+		guidance := cliSelfUpgradeWriteGuidance(execPath, err)
+		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
+		if emitOutput && getBoolFlag(cmd, "json") {
+			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
+				return cliUpgradeOutput{}, err
+			}
+		}
+		return result, &cliUpgradeRefusedError{message: guidance}
+	}
 
 	target, err := resolveLooperTarget(r.platform(), r.arch())
 	if err != nil {
@@ -592,6 +603,36 @@ func cliRefusalGuidance(source cliInstallSource, execPath string) string {
 	default:
 		return fmt.Sprintf("cannot safely self-upgrade looper from %q. Reinstall from a release binary or use your package manager.", execPath)
 	}
+}
+
+func cliSelfUpgradeWriteGuidance(execPath string, err error) string {
+	return fmt.Sprintf("cannot self-upgrade looper at %q because the install location is not writable: %v. Reinstall looper into a user-writable directory or use your package manager for this installation.", execPath, err)
+}
+
+func preflightSelfUpgradeReplace(installPath string) error {
+	installDir := filepath.Dir(installPath)
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return fmt.Errorf("prepare install directory %q: %w", installDir, err)
+	}
+	tempFile, err := os.CreateTemp(installDir, ".looper-upgrade-check-*")
+	if err != nil {
+		return fmt.Errorf("create test file in %q: %w", installDir, err)
+	}
+	tempPath := tempFile.Name()
+	if err := tempFile.Close(); err != nil {
+		_ = removeTempInstallFile(tempPath)
+		return fmt.Errorf("close test file in %q: %w", installDir, err)
+	}
+	renamedPath := tempPath + ".rename"
+	_ = os.Remove(renamedPath)
+	if err := os.Rename(tempPath, renamedPath); err != nil {
+		_ = removeTempInstallFile(tempPath)
+		return fmt.Errorf("rename test file in %q: %w", installDir, err)
+	}
+	if err := removeTempInstallFile(renamedPath); err != nil {
+		return fmt.Errorf("remove test file in %q: %w", installDir, err)
+	}
+	return nil
 }
 
 func resolveLooperTarget(platform string, arch string) (string, error) {
