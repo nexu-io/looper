@@ -1168,6 +1168,7 @@ func (e smokeAgentExecution) Wait(ctx context.Context) (worker.AgentResult, erro
 		Status:       result.Status,
 		Summary:      result.Summary,
 		Stdout:       result.Stdout,
+		ParseStatus:  result.ParseStatus,
 		ChangedFiles: append([]string{}, result.ChangedFiles...),
 		Commits:      append([]string{}, result.Commits...),
 	}, nil

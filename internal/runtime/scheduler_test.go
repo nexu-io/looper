@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/fixer"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
@@ -20,6 +21,23 @@ import (
 	"github.com/powerformer/looper/internal/storage"
 	"github.com/powerformer/looper/internal/worker"
 )
+
+func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
+	t.Parallel()
+
+	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}}
+
+	result, err := adapter.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.ParseStatus != "parsed" {
+		t.Fatalf("ParseStatus = %q, want parsed", result.ParseStatus)
+	}
+	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
+		t.Fatalf("result = %#v, want propagated agent result fields", result)
+	}
+}
 
 func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *testing.T) {
 	t.Parallel()
@@ -586,4 +604,17 @@ func writeExecutable(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", path, err)
 	}
+}
+
+type stubAgentExecution struct {
+	result agent.Result
+	err    error
+}
+
+func (s stubAgentExecution) Wait(context.Context) (agent.Result, error) {
+	return s.result, s.err
+}
+
+func (s stubAgentExecution) Kill(string) error {
+	return nil
 }
