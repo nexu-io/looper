@@ -420,6 +420,19 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
+	if repair == nil {
+		return nil
+	}
+	if repair.ParseStatus == "parsed" {
+		return nil
+	}
+	return &loopError{
+		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
+		kind:    FailureRetryableTransient,
+	}
+}
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -656,6 +669,40 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
+		failure := r.classifyFailure(err)
+		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+		if latest.ResumePolicy == "" {
+			latest.ResumePolicy = "replay_step"
+		}
+		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+			return ProcessResult{}, err
+		}
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			if failedQueue != nil && failedQueue.Status == "queued" {
+				updated.Status = "queued"
+				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			} else {
+				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					updated.Status = "paused"
+				} else {
+					updated.Status = "failed"
+				}
+				updated.NextRunAt = nil
+			}
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		if failedQueue == nil || failedQueue.Status != "queued" {
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+		}
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -885,6 +932,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
+		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if len(checkpoint.FixItems) == 0 {
@@ -919,6 +969,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	if !strings.EqualFold(result.Status, "completed") {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Fixer agent "+result.Status), kind: FailureRetryableTransient}
+	}
+	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		return checkpoint, err
 	}
 	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, CompletedAt: r.nowISO()}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1591,6 +1644,15 @@ func previousFixerStep(step FixerStep) FixerStep {
 	return ""
 }
 
+func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
+	switch startStep {
+	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+		return validateCompletedRepairCheckpoint(checkpoint.Repair)
+	default:
+		return nil
+	}
+}
+
 func asFixerStep(value string) FixerStep {
 	for _, candidate := range fixerStepSequence {
 		if string(candidate) == value {
@@ -1773,6 +1835,8 @@ func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fix
 	switch failedStep {
 	case stepRepair, stepReconcileCommits, stepValidate, stepPush:
 		return true
+	case stepResolveComments, stepRecheck:
+		return validateCompletedRepairCheckpoint(checkpoint.Repair) != nil
 	default:
 		return false
 	}

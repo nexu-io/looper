@@ -375,7 +375,20 @@ func loopLogsSelectedContent(data loopLogsOutput, stderr bool) string {
 	if stderr {
 		return data.Agent.Stderr
 	}
+	if shouldDefaultLoopLogsToStderr(data) {
+		return data.Agent.Stderr
+	}
 	return data.Agent.Stdout
+}
+
+func shouldDefaultLoopLogsToStderr(data loopLogsOutput) bool {
+	if data.Agent == nil {
+		return false
+	}
+	if strings.TrimSpace(data.Agent.Vendor) != "codex" {
+		return false
+	}
+	return strings.TrimSpace(data.Agent.Stdout) == "" && strings.TrimSpace(data.Agent.Stderr) != ""
 }
 
 func loopLogsInitialContent(data loopLogsOutput, stderr bool, full bool, tail string) (string, error) {

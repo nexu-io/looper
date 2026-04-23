@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,283 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 	if run == nil || run.Status != "success" || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepRecheck) {
 		t.Fatalf("run = %#v, want success through recheck", run)
+	}
+}
+
+func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+		},
+	}
+	validationCalls := 0
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "upstream server_error", ParseStatus: "missing"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		validationCalls++
+		return ValidationResult{Passed: true, Summary: "ok"}, nil
+	}, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "server_error") {
+		t.Fatalf("result = %#v, want retryable failed result with upstream error", result)
+	}
+	if validationCalls != 0 {
+		t.Fatalf("validationCalls = %d, want repair failure to stop before validation", validationCalls)
+	}
+	if len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
+		t.Fatalf("push calls=%d resolve calls=%d, want 0/0 after invalid repair completion", len(git.pushCalls), len(github.resolveCalls))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued loop for retryable failure", loop)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepRepair) {
+		t.Fatalf("run = %#v, want failed run at repair step", run)
+	}
+	if run.LastCompletedStep != nil && *run.LastCompletedStep == string(stepRecheck) {
+		t.Fatalf("run = %#v, want downstream steps to remain incomplete", run)
+	}
+}
+
+func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{})
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Checkpoint: fixerCheckpoint{
+			Repair: &checkpointRepair{
+				Summary:     "upstream server_error",
+				ParseStatus: "",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("runRepairStep() error = nil, want parse-status failure")
+	}
+	if checkpoint.Repair == nil {
+		t.Fatal("checkpoint.Repair = nil, want checkpoint preserved")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
+	}
+	if !contains(err.Error(), "server_error") {
+		t.Fatalf("error = %q, want upstream summary", err.Error())
+	}
+}
+
+func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStatusIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_rewind_invalid_repair",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &loopTarget,
+		Repo:       &repo,
+		PRNumber:   &prNumber,
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ClaimedLockKey: "pr:acme/looper:42",
+		FixItems:       []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}},
+		Worktree:       &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "base-1", PreparedAt: nowISO},
+		Repair:         &checkpointRepair{Summary: "upstream server_error", ParseStatus: "", CompletedAt: nowISO},
+		Validation:     &ValidationResult{Passed: true, Summary: "stale"},
+		Push:           &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", PushedAt: nowISO},
+		ResolvedComments: &checkpointResolvedComments{
+			Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "resolved", UpdatedAt: nowISO}},
+		},
+		Recheck: &checkpointRecheck{RemainingFixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_recheck",
+		LoopID:            "loop_fixer_rewind_invalid_repair",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepRecheck)),
+		LastCompletedStep: stringPtr(string(stepResolveComments)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_rewind_invalid_repair")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want fixer loop")
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepPrepareWorktree {
+		t.Fatalf("resumed = %#v, want prepare-worktree rewind", resumed)
+	}
+	if resumed.Checkpoint.Repair != nil {
+		t.Fatalf("Repair = %#v, want cleared repair checkpoint", resumed.Checkpoint.Repair)
+	}
+	if resumed.Checkpoint.Validation != nil || resumed.Checkpoint.Push != nil || resumed.Checkpoint.ResolvedComments != nil || resumed.Checkpoint.Recheck != nil {
+		t.Fatalf("checkpoint = %#v, want post-repair checkpoints cleared", resumed.Checkpoint)
+	}
+	if resumed.Checkpoint.Worktree == nil || resumed.Checkpoint.Worktree.PreparedAt != "" {
+		t.Fatalf("Worktree = %#v, want worktree retained but marked for reprepare", resumed.Checkpoint.Worktree)
+	}
+	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepCollectFixes) {
+		t.Fatalf("run.LastCompletedStep = %#v, want collect-fixes", resumed.Run.LastCompletedStep)
+	}
+}
+
+func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_resume_parse_status",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &loopTarget,
+		Repo:       &repo,
+		PRNumber:   &prNumber,
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		Worktree: &checkpointWorktree{
+			Path:   filepath.Join(t.TempDir(), "wt-42"),
+			Branch: "feature/fix-42",
+		},
+		Repair: &checkpointRepair{
+			Summary:     "upstream server_error",
+			ParseStatus: "",
+		},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_repair",
+		LoopID:            "loop_fixer_resume_parse_status",
+		Status:            "failed",
+		LastCompletedStep: stringPtr(string(stepRepair)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_resume_parse_status"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_fixer_resume_parse_status",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "fixer",
+		TargetType:  "pull_request",
+		TargetID:    loopTarget,
+		Repo:        &repo,
+		PRNumber:    &prNumber,
+		DedupeKey:   "fixer:acme/looper:42:resume-parse",
+		Priority:    1,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		MaxAttempts: 1,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil {
+		t.Fatalf("ClaimNextOfType() error = %v", err)
+	}
+	if claim == nil {
+		t.Fatal("claim = nil, want claimed queue item")
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want failed retryable_transient result", result)
+	}
+
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_resume_parse_status")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "failed" {
+		t.Fatalf("queue = %#v, want failed terminal queue item", queue)
+	}
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_resume_parse_status")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
+	}
+	if git.cleanupCalls[0].WorktreePath == "" || git.cleanupCalls[0].Branch != "feature/fix-42" {
+		t.Fatalf("cleanup call = %#v, want persisted worktree cleanup", git.cleanupCalls[0])
 	}
 }
 
