@@ -1,9 +1,13 @@
 Usage:
   looper [flags]
 
+Version:
+  0.0.0-dev
+
 Subcommands:
   status     Show service status
   bootstrap  Run first-time setup
+  version    Show Looper version
   project    Project commands
   config     Config commands
   daemon     Daemon commands

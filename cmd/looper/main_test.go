@@ -148,3 +148,22 @@ func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }
+
+func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	exitCode := run([]string{"version"}, stdout, stderr)
+
+	if exitCode != 0 {
+		t.Fatalf("run([version]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("run([version]) stderr = %q, want empty string", got)
+	}
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("run([version]) stdout = %q, want %q", got, want)
+	}
+}

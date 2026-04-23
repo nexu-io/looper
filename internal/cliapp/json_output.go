@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -35,6 +36,16 @@ func (r *commandRuntime) configShow(cmd *cobra.Command, args []string) error {
 	}, func(w io.Writer, payload json.RawMessage) error {
 		return writeJSON(w, payload)
 	})
+}
+
+func (r *commandRuntime) version(cmd *cobra.Command, args []string) error {
+	_ = args
+	info := version.Current()
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), info)
+	}
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), info.Version)
+	return err
 }
 
 func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {

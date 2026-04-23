@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -93,7 +94,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -114,6 +115,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode",
 				},
 			}),
+			newCommand(commandSpec{use: "version", short: "Show Looper version", runE: runtime.version}),
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
@@ -396,6 +398,9 @@ func renderHelp(w io.Writer, cmd *cobra.Command, listedSubcommands []helpSubcomm
 	var output strings.Builder
 
 	_, _ = fmt.Fprintf(&output, "Usage:\n  %s\n", cmd.UseLine())
+	if cmd.Parent() == nil {
+		_, _ = fmt.Fprintf(&output, "\nVersion:\n  %s\n", version.Current().Version)
+	}
 
 	subcommands := listedSubcommands
 	if len(subcommands) == 0 {

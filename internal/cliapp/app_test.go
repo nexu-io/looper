@@ -20,6 +20,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
+	"github.com/powerformer/looper/internal/version"
 	"github.com/powerformer/looper/internal/worker"
 	pkgapi "github.com/powerformer/looper/pkg/api"
 )
@@ -90,6 +91,9 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([--help]) stderr = %q, want empty string", stderr)
 	}
+	if !strings.Contains(stdout, "Version:\n  "+version.Current().Version) {
+		t.Fatalf("Run([--help]) stdout = %q, want version section", stdout)
+	}
 
 	for _, syntax := range []string{
 		"--json",
@@ -107,6 +111,43 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 			t.Fatalf("Run([--help]) stdout = %q, want to contain %q", stdout, syntax)
 		}
 	}
+}
+
+func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "version")
+	if exitCode != 0 {
+		t.Fatalf("Run([version]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([version]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, version.Current().Version+"\n"; got != want {
+		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestVersionCommandJSONPrintsBuildMetadata(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "version", "--json")
+	if exitCode != 0 {
+		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "version", version.Current().Version)
+	assertJSONContains(t, stdout, "metadata", map[string]any{
+		"versionSource":   version.Current().Metadata.VersionSource,
+		"channel":         version.Current().Metadata.Channel,
+		"apiVersion":      version.Current().Metadata.APIVersion,
+		"minCliForDaemon": nil,
+		"minDaemonForCli": nil,
+		"gitCommitSha":    nil,
+		"buildTimestamp":  nil,
+	})
 }
 
 func TestNestedCommandParsingReachesLeafCommands(t *testing.T) {
