@@ -532,9 +532,6 @@ func detectCLIInstallSource(execPath string) cliInstallSource {
 	if strings.Contains(path, "/cellar/") || strings.Contains(path, "/homebrew/") {
 		return cliInstallSourceHomebrew
 	}
-	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") || strings.Contains(path, "/tmp/") {
-		return cliInstallSourceDev
-	}
 	base := strings.ToLower(filepath.Base(path))
 	if base != "looper" {
 		return cliInstallSourceUnknown
@@ -544,6 +541,9 @@ func detectCLIInstallSource(execPath string) cliInstallSource {
 	}
 	if isInstallerSelectedUserBinPath(execPath) {
 		return cliInstallSourceRelease
+	}
+	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") || strings.Contains(path, "/tmp/") {
+		return cliInstallSourceDev
 	}
 	return cliInstallSourceUnknown
 }
