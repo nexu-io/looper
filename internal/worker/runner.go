@@ -1111,6 +1111,18 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	return work, nil
 }
 
+func parseIssueNumberFromTargetID(targetID string) int64 {
+	parts := strings.Split(strings.TrimSpace(targetID), ":")
+	if len(parts) != 3 || parts[0] != "issue" {
+		return 0
+	}
+	value, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
@@ -1713,18 +1725,6 @@ func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoi
 	checkpoint.PullRequest = nil
 	checkpoint.SkipReason = ""
 	return checkpoint
-}
-
-func parseIssueNumberFromTargetID(targetID string) int64 {
-	parts := strings.Split(strings.TrimSpace(targetID), ":")
-	if len(parts) != 3 || parts[0] != "issue" {
-		return 0
-	}
-	value, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil || value <= 0 {
-		return 0
-	}
-	return value
 }
 
 func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
