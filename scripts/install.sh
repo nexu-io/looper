@@ -178,7 +178,10 @@ if [ "$install_dir" = "$HOME/.local/bin" ] && ! in_path_dir "$install_dir"; then
 fi
 
 log ""
-log "Current first-run flow:"
+log "Next steps:"
+log "  looper bootstrap"
+log "  looper status"
+log ""
+log "Manual daemon fallback/debug commands:"
 log "  looper daemon install"
 log "  looper daemon start"
-log "  looper status"

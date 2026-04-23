@@ -355,7 +355,7 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 		return false, false, fmt.Errorf("check config path %s: %w", configPath, err)
 	}
 
-	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), CWD: cwd, LookPath: r.lookPath()})
+	partial, err := readBootstrapPartialConfig(configPath)
 	if err != nil {
 		return false, false, err
 	}
@@ -363,11 +363,30 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 	if plan.ProjectPath == "" {
 		return false, false, nil
 	}
-	if hasBootstrapProject(loaded.Config.Projects, plan.ProjectPath) {
+	normalized, err := config.Normalize(cwd, partial)
+	if err != nil {
+		return false, false, err
+	}
+	if err := config.Validate(normalized); err != nil {
+		return false, false, err
+	}
+	if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
 		return false, false, nil
 	}
-	loaded.Config.Projects = append(loaded.Config.Projects, buildBootstrapProject(plan.ProjectPath, loaded.Config.Defaults.BaseBranch))
-	if err := writeBootstrapConfig(configPath, loaded.Config); err != nil {
+	projects := []config.ProjectRefConfig{}
+	if partial.Projects != nil {
+		projects = append(projects, (*partial.Projects)...)
+	}
+	projects = append(projects, buildBootstrapProject(plan.ProjectPath, normalized.Defaults.BaseBranch))
+	partial.Projects = &projects
+	updated, err := config.Normalize(cwd, partial)
+	if err != nil {
+		return false, false, err
+	}
+	if err := config.Validate(updated); err != nil {
+		return false, false, err
+	}
+	if err := writeBootstrapPartialConfig(configPath, partial); err != nil {
 		return false, false, err
 	}
 	return false, true, nil
@@ -395,6 +414,30 @@ func writeBootstrapConfig(path string, cfg config.Config) error {
 		return err
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal bootstrap config: %w", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write bootstrap config: %w", err)
+	}
+	return nil
+}
+
+func readBootstrapPartialConfig(path string) (config.PartialConfig, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return config.PartialConfig{}, fmt.Errorf("read bootstrap config: %w", err)
+	}
+	var partial config.PartialConfig
+	if err := json.Unmarshal(raw, &partial); err != nil {
+		return config.PartialConfig{}, fmt.Errorf("parse bootstrap config: %w", err)
+	}
+	return partial, nil
+}
+
+func writeBootstrapPartialConfig(path string, partial config.PartialConfig) error {
+	raw, err := json.MarshalIndent(partial, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal bootstrap config: %w", err)
 	}

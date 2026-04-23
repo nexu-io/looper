@@ -328,3 +328,111 @@ func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.
 		t.Fatalf("config changed unexpectedly\nbefore=%s\nafter=%s", before, string(afterRaw))
 	}
 }
+
+func TestBootstrapAddsProjectWithoutPersistingRuntimeOverrides(t *testing.T) {
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	projectPath := filepath.Join(cwd, "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectPath) error = %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "bootstrap-partial.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	before := `{"server":{"baseUrl":"http://daemon.test","authMode":"none"},"defaults":{"baseBranch":"trunk"}}`
+	if err := os.WriteFile(configPath, []byte(before), 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath) error = %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/detected/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
+			case "http://daemon.test/api/v1/status":
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+			case "http://daemon.test/api/v1/healthz":
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/detected/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			_ = cwd
+			_ = env
+			return 0, fmt.Errorf("spawn should not be called")
+		},
+	})
+
+	t.Setenv("LOOPER_PORT", "9999")
+	exitCode := app.Run(context.Background(), []string{"--host", "0.0.0.0", "--git-path", "/override/git", "bootstrap", "--yes", "--project-path", projectPath, "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([bootstrap]) stderr = %q, want empty string", stderr.String())
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal(config) error = %v\nraw=%s", err, string(raw))
+	}
+	server := decoded["server"].(map[string]any)
+	if _, ok := server["host"]; ok {
+		t.Fatalf("persisted server.host from CLI override: %s", string(raw))
+	}
+	if _, ok := server["port"]; ok {
+		t.Fatalf("persisted server.port from env override: %s", string(raw))
+	}
+	if _, ok := decoded["tools"]; ok {
+		t.Fatalf("persisted detected or overridden tools: %s", string(raw))
+	}
+	if _, ok := decoded["storage"]; ok {
+		t.Fatalf("persisted default-only storage config: %s", string(raw))
+	}
+	projects, ok := decoded["projects"].([]any)
+	if !ok || len(projects) != 1 {
+		t.Fatalf("projects = %#v, want one project", decoded["projects"])
+	}
+	project := projects[0].(map[string]any)
+	if project["baseBranch"] != "trunk" {
+		t.Fatalf("project.baseBranch = %v, want trunk", project["baseBranch"])
+	}
+}

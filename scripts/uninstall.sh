@@ -27,15 +27,33 @@ remove_if_exists() {
   fi
 }
 
+is_installer_owned_cli_path() {
+  path="$1"
+  case "$path" in
+    "$HOME/.local/bin/looper"|"$HOME/.looper/bin/looper") return 0 ;;
+    /opt/homebrew/*|/usr/local/Homebrew/*|"$HOME/go/bin/looper"|"$HOME/.cargo/bin/looper"|"$HOME/.asdf/"*|"$HOME/.local/share/mise/"*) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 cli_path="${LOOPER_INSTALL_PATH:-}"
-if [ -z "$cli_path" ] && command -v looper >/dev/null 2>&1; then
+explicit_cli_path=0
+if [ -n "$cli_path" ]; then
+  explicit_cli_path=1
+elif command -v looper >/dev/null 2>&1; then
   cli_path="$(command -v looper)"
 fi
 
 looper_home="$HOME/.looper"
 
 if [ -n "$cli_path" ]; then
-  remove_if_exists "$cli_path"
+  if is_installer_owned_cli_path "$cli_path"; then
+    remove_if_exists "$cli_path"
+  elif [ "$explicit_cli_path" -eq 1 ] && confirm "Remove CLI binary at $cli_path? This path is not recognized as installer-owned."; then
+    remove_if_exists "$cli_path"
+  else
+    log "Skipped CLI binary at $cli_path (not recognized as installer-owned; set LOOPER_INSTALL_PATH and confirm to remove)"
+  fi
 fi
 
 remove_if_exists "$looper_home/bin/looperd"

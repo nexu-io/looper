@@ -56,19 +56,26 @@ Fallback manual path:
 2. Rename it to `looper` if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
 
-### Install the daemon
+### First-Run Setup
 
 Recommended path:
 
-Until `looper bootstrap` lands, first-run setup remains:
+```bash
+looper bootstrap
+looper status
+```
+
+`looper bootstrap` initializes the runtime directories, creates or updates config, optionally registers a project, installs the managed daemon, starts it, and verifies health.
+
+Manual daemon fallback/debug commands:
 
 ```bash
 looper daemon install
 looper daemon start
-looper status
+looper daemon status
 ```
 
-This command:
+The managed daemon install command:
 
 - detects the current macOS architecture
 - downloads the matching GitHub Release artifact

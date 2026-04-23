@@ -607,9 +607,14 @@ func findLooperReleaseAssets(release githubReleasePayload, target string) (githu
 }
 
 func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {
+	return replaceBinaryAtomicallyWithRename(installPath, binaryBytes, os.Rename)
+}
+
+func replaceBinaryAtomicallyWithRename(installPath string, binaryBytes []byte, rename func(string, string) error) error {
 	installDir := filepath.Dir(installPath)
 	tempInstallPath := installPath + ".new"
 	prevPath := installPath + ".prev"
+	previousPreserved := false
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
 		return fmt.Errorf("create install directory: %w", err)
 	}
@@ -623,13 +628,19 @@ func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {
 	}
 	if _, err := os.Stat(installPath); err == nil {
 		_ = os.Remove(prevPath)
-		if err := os.Rename(installPath, prevPath); err != nil {
+		if err := rename(installPath, prevPath); err != nil {
 			_ = removeTempInstallFile(tempInstallPath)
 			return fmt.Errorf("preserve previous looper binary: %w", err)
 		}
+		previousPreserved = true
 	}
-	if err := os.Rename(tempInstallPath, installPath); err != nil {
+	if err := rename(tempInstallPath, installPath); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
+		if previousPreserved {
+			if restoreErr := rename(prevPath, installPath); restoreErr != nil {
+				return fmt.Errorf("replace looper binary: %w (failed to restore previous binary from %s: %v)", err, prevPath, restoreErr)
+			}
+		}
 		return fmt.Errorf("replace looper binary: %w", err)
 	}
 	return nil

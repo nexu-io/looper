@@ -153,6 +153,40 @@ func TestSelectUpgradeDaemonVersionStatePreservesAPIBinaryPath(t *testing.T) {
 	}
 }
 
+func TestReplaceBinaryAtomicallyRestoresPreviousOnFinalRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "looper")
+	original := []byte("original")
+	if err := os.WriteFile(installPath, original, 0o755); err != nil {
+		t.Fatalf("WriteFile(installPath) error = %v", err)
+	}
+
+	var renameCalls int
+	err := replaceBinaryAtomicallyWithRename(installPath, []byte("new"), func(oldPath string, newPath string) error {
+		renameCalls++
+		if renameCalls == 2 {
+			return fmt.Errorf("injected final rename failure")
+		}
+		return os.Rename(oldPath, newPath)
+	})
+	if err == nil {
+		t.Fatal("replaceBinaryAtomicallyWithRename() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "replace looper binary") {
+		t.Fatalf("error = %v, want replace context", err)
+	}
+	restored, readErr := os.ReadFile(installPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(installPath) error = %v", readErr)
+	}
+	if string(restored) != string(original) {
+		t.Fatalf("restored binary = %q, want %q", string(restored), string(original))
+	}
+	if _, statErr := os.Stat(installPath + ".new"); !os.IsNotExist(statErr) {
+		t.Fatalf("staged binary still exists or stat failed: %v", statErr)
+	}
+}
+
 func TestUpgradeRejectsCombiningCheckAndDaemon(t *testing.T) {
 	t.Parallel()
 
