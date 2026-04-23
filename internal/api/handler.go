@@ -2178,10 +2178,20 @@ func loopLogsStreamState(resp loopLogsResponse, stderr bool) (string, string) {
 		return "", ""
 	}
 	content := resp.Agent.Stdout
-	if stderr {
+	if stderr || shouldDefaultLoopLogsStreamToStderr(resp) {
 		content = resp.Agent.Stderr
 	}
 	return resp.Agent.ExecutionID, content
+}
+
+func shouldDefaultLoopLogsStreamToStderr(resp loopLogsResponse) bool {
+	if resp.Agent == nil {
+		return false
+	}
+	if strings.TrimSpace(resp.Agent.Vendor) != "codex" {
+		return false
+	}
+	return strings.TrimSpace(resp.Agent.Stdout) == "" && strings.TrimSpace(resp.Agent.Stderr) != ""
 }
 
 func appendedLogChunk(previousExecutionID, previousContent, currentExecutionID, currentContent string) string {
