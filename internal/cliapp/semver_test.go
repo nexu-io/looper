@@ -16,6 +16,10 @@ func TestIsSemverUpgradeAvailable(t *testing.T) {
 		{name: "newer current", current: "0.4.0", latest: "0.3.0", want: false},
 		{name: "stable newer than prerelease", current: "0.3.0", latest: "0.3.0-rc.1", want: false},
 		{name: "prerelease older than stable", current: "0.3.0-rc.1", latest: "0.3.0", want: true},
+		{name: "numeric prerelease newer", current: "0.3.0-rc.2", latest: "0.3.0-rc.10", want: true},
+		{name: "numeric prerelease older", current: "0.3.0-rc.10", latest: "0.3.0-rc.2", want: false},
+		{name: "numeric identifier lower precedence than text", current: "0.3.0-1", latest: "0.3.0-alpha", want: true},
+		{name: "longer prerelease newer when prefix equal", current: "0.3.0-alpha", latest: "0.3.0-alpha.1", want: true},
 	}
 
 	for _, testCase := range tests {

@@ -89,13 +89,78 @@ func compareSemver(current string, latest string) (int, error) {
 	if l.preRelease == "" {
 		return -1, nil
 	}
-	if c.preRelease < l.preRelease {
-		return -1, nil
+	return compareSemverPrerelease(c.preRelease, l.preRelease), nil
+}
+
+func compareSemverPrerelease(current string, latest string) int {
+	currentParts := strings.Split(current, ".")
+	latestParts := strings.Split(latest, ".")
+	maxParts := len(currentParts)
+	if len(latestParts) > maxParts {
+		maxParts = len(latestParts)
 	}
-	if c.preRelease > l.preRelease {
-		return 1, nil
+
+	for i := 0; i < maxParts; i++ {
+		if i >= len(currentParts) {
+			return -1
+		}
+		if i >= len(latestParts) {
+			return 1
+		}
+		cmp := compareSemverPrereleaseIdentifier(currentParts[i], latestParts[i])
+		if cmp != 0 {
+			return cmp
+		}
 	}
-	return 0, nil
+	return 0
+}
+
+func compareSemverPrereleaseIdentifier(current string, latest string) int {
+	currentNumeric := isSemverPrereleaseNumber(current)
+	latestNumeric := isSemverPrereleaseNumber(latest)
+	if currentNumeric && latestNumeric {
+		if len(current) < len(latest) {
+			return -1
+		}
+		if len(current) > len(latest) {
+			return 1
+		}
+		if current < latest {
+			return -1
+		}
+		if current > latest {
+			return 1
+		}
+		return 0
+	}
+	if currentNumeric {
+		return -1
+	}
+	if latestNumeric {
+		return 1
+	}
+	if current < latest {
+		return -1
+	}
+	if current > latest {
+		return 1
+	}
+	return 0
+}
+
+func isSemverPrereleaseNumber(value string) bool {
+	if value == "" {
+		return false
+	}
+	if len(value) > 1 && value[0] == '0' {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isSemverUpgradeAvailable(current string, latest string) (bool, error) {

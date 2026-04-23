@@ -71,6 +71,11 @@ type cliUpgradeOutput struct {
 	RefusedGuidance *string `json:"refusedGuidance,omitempty"`
 }
 
+type unifiedUpgradeOutput struct {
+	CLI    cliUpgradeOutput    `json:"cli"`
+	Daemon daemonUpgradeOutput `json:"daemon"`
+}
+
 type cliInstallSource string
 
 const (
@@ -188,23 +193,28 @@ func (r *commandRuntime) collectUpgradeCheckSummary(ctx context.Context) (upgrad
 }
 
 func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
+	_, err := r.upgradeDaemonWithOutput(cmd, true)
+	return err
+}
+
+func (r *commandRuntime) upgradeDaemonWithOutput(cmd *cobra.Command, emitOutput bool) (daemonUpgradeOutput, error) {
 	ctx := cmd.Context()
 	statusPayload, err := r.currentDaemonStatusPayload(ctx)
 	if err != nil {
-		return err
+		return daemonUpgradeOutput{}, err
 	}
 	managedDaemon, err := r.readManagedUpgradeDaemonVersion(ctx)
 	if err != nil {
-		return err
+		return daemonUpgradeOutput{}, err
 	}
 	pathDaemon, err := r.readPathUpgradeDaemonVersion(ctx)
 	if err != nil {
-		return err
+		return daemonUpgradeOutput{}, err
 	}
 	current := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
 	latestRelease, err := r.fetchLatestDaemonRelease(ctx)
 	if err != nil {
-		return err
+		return daemonUpgradeOutput{}, err
 	}
 
 	var currentVersion *string
@@ -219,7 +229,7 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 	if !needsUpgrade {
 		available, err := isSemverUpgradeAvailable(*currentVersion, latestRelease.Version)
 		if err != nil {
-			return fmt.Errorf("compare daemon versions: %w", err)
+			return daemonUpgradeOutput{}, fmt.Errorf("compare daemon versions: %w", err)
 		}
 		needsUpgrade = available
 	}
@@ -234,23 +244,26 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 		} else if current != nil {
 			output.BinaryPath = current.BinaryPath
 		}
-		if getBoolFlag(cmd, "json") {
-			return writeJSON(cmd.OutOrStdout(), output)
+		if emitOutput && getBoolFlag(cmd, "json") {
+			return output, writeJSON(cmd.OutOrStdout(), output)
+		}
+		if !emitOutput {
+			return output, nil
 		}
 
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd is already up to date (%s)\n", *currentVersion); err != nil {
-			return err
+			return daemonUpgradeOutput{}, err
 		}
 		if output.BinaryPath != nil {
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Managed binary: %s\n", *output.BinaryPath)
-			return err
+			return output, err
 		}
-		return nil
+		return output, nil
 	}
 
 	result, err := r.installManagedDaemon(ctx, true, latestRelease.Tag)
 	if err != nil {
-		return fmt.Errorf("Failed to upgrade looperd: %w", err)
+		return daemonUpgradeOutput{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
 	}
 
 	output := daemonUpgradeOutput{
@@ -261,33 +274,36 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 		DownloadedFrom:  result.DownloadedFrom,
 		Skipped:         boolPtr(result.Skipped),
 	}
-	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), output)
+	if emitOutput && getBoolFlag(cmd, "json") {
+		return output, writeJSON(cmd.OutOrStdout(), output)
+	}
+	if !emitOutput {
+		return output, nil
 	}
 
 	if managedDaemon == nil && pathDaemon != nil {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed managed looperd %s to %s (previously using %s)\n", latestRelease.Version, result.InstallPath, *pathDaemon.BinaryPath); err != nil {
-			return err
+			return daemonUpgradeOutput{}, err
 		}
 	} else if managedDaemon == nil {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed looperd %s to %s\n", latestRelease.Version, result.InstallPath); err != nil {
-			return err
+			return daemonUpgradeOutput{}, err
 		}
 	} else {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Upgraded looperd %s → %s at %s\n", managedDaemon.Version, latestRelease.Version, result.InstallPath); err != nil {
-			return err
+			return daemonUpgradeOutput{}, err
 		}
 	}
 	if result.DownloadedFrom != nil {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", *result.DownloadedFrom); err != nil {
-			return err
+			return daemonUpgradeOutput{}, err
 		}
 	}
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Restart the daemon to use the new version:"); err != nil {
-		return err
+		return daemonUpgradeOutput{}, err
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "  looper daemon restart")
-	return err
+	return output, err
 }
 
 func (r *commandRuntime) fetchLatestCLIVersion(ctx context.Context) (string, error) {
@@ -367,24 +383,41 @@ func normalizeVersion(value string) string {
 }
 
 func (r *commandRuntime) upgradeUnified(cmd *cobra.Command) error {
-	_, cliErr := r.upgradeCLI(cmd)
+	jsonOutput := getBoolFlag(cmd, "json")
+	cliOutput, cliErr := r.upgradeCLIWithOutput(cmd, !jsonOutput)
 	if cliErr != nil {
 		var refused *cliUpgradeRefusedError
 		if !errors.As(cliErr, &refused) {
 			return cliErr
 		}
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "CLI self-upgrade skipped: %s\n", refused.message); err != nil {
+		if !jsonOutput {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "CLI self-upgrade skipped: %s\n", refused.message); err != nil {
+				return err
+			}
+		}
+	}
+
+	if !jsonOutput {
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Proceeding with daemon upgrade..."); err != nil {
 			return err
 		}
 	}
 
-	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Proceeding with daemon upgrade..."); err != nil {
+	daemonOutput, err := r.upgradeDaemonWithOutput(cmd, !jsonOutput)
+	if err != nil {
 		return err
 	}
-	return r.upgradeDaemon(cmd)
+	if jsonOutput {
+		return writeJSON(cmd.OutOrStdout(), unifiedUpgradeOutput{CLI: cliOutput, Daemon: daemonOutput})
+	}
+	return nil
 }
 
 func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error) {
+	return r.upgradeCLIWithOutput(cmd, true)
+}
+
+func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput bool) (cliUpgradeOutput, error) {
 	ctx := cmd.Context()
 	latestRelease, err := r.fetchReleaseMetadata(ctx, "")
 	if err != nil {
@@ -404,7 +437,7 @@ func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error
 	if installSource != cliInstallSourceRelease {
 		refused := true
 		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
-		if getBoolFlag(cmd, "json") {
+		if emitOutput && getBoolFlag(cmd, "json") {
 			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 				return cliUpgradeOutput{}, err
 			}
@@ -419,12 +452,12 @@ func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error
 	if !available {
 		skipped := true
 		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Skipped: &skipped}
-		if getBoolFlag(cmd, "json") {
+		if emitOutput && getBoolFlag(cmd, "json") {
 			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 				return cliUpgradeOutput{}, err
 			}
 		}
-		if !getBoolFlag(cmd, "json") {
+		if emitOutput && !getBoolFlag(cmd, "json") {
 			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looper is already up to date (%s)\n", version.Current().Version); err != nil {
 				return cliUpgradeOutput{}, err
 			}
@@ -462,10 +495,13 @@ func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error
 
 	prevPath := execPath + ".prev"
 	result := cliUpgradeOutput{Changed: true, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), PreviousBinary: stringPtr(prevPath), DownloadedFrom: stringPtr(binaryAsset.BrowserDownloadURL), InstallSource: string(installSource)}
-	if getBoolFlag(cmd, "json") {
+	if emitOutput && getBoolFlag(cmd, "json") {
 		if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 			return cliUpgradeOutput{}, err
 		}
+		return result, nil
+	}
+	if !emitOutput {
 		return result, nil
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Upgraded looper %s → %s at %s\n", version.Current().Version, latestVersion, execPath); err != nil {
@@ -495,7 +531,29 @@ func detectCLIInstallSource(execPath string) cliInstallSource {
 	if strings.HasSuffix(path, "/.local/bin/looper") || strings.HasSuffix(path, "/usr/local/bin/looper") || strings.HasSuffix(path, "/.looper/bin/looper") {
 		return cliInstallSourceRelease
 	}
+	if isInstallerSelectedUserBinPath(execPath) {
+		return cliInstallSourceRelease
+	}
 	return cliInstallSourceUnknown
+}
+
+func isInstallerSelectedUserBinPath(execPath string) bool {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return false
+	}
+	execDir := filepath.Clean(filepath.Dir(execPath))
+	homeDir = filepath.Clean(homeDir)
+	if execDir == homeDir || !strings.HasPrefix(execDir, homeDir+string(os.PathSeparator)) {
+		return false
+	}
+
+	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.Clean(entry) == execDir {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *commandRuntime) executablePath() (string, error) {

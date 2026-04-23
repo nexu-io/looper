@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -145,6 +146,80 @@ func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *test
 	}
 }
 
+func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeDir, ".looper", "worktrees"), 0o755); err != nil {
+		t.Fatalf("create test worktree root: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	binary := []byte{1, 2, 3, 4}
+	checksumText := "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a  looperd-darwin-arm64\n"
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return nil, fmt.Errorf("daemon offline")
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://api.github.com/repos/powerformer/looper/releases/tags/v0.3.0":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			if command == looperdBinaryName && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([upgrade --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([upgrade --json]) stderr = %q, want empty string", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
+		t.Fatalf("stdout = %q, want JSON without human progress text", stdout.String())
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("unmarshal stdout JSON: %v\nraw=%q", err, stdout.String())
+	}
+	if _, ok := decoded["cli"].(map[string]any); !ok {
+		t.Fatalf("stdout JSON missing cli object: %#v", decoded)
+	}
+	if _, ok := decoded["daemon"].(map[string]any); !ok {
+		t.Fatalf("stdout JSON missing daemon object: %#v", decoded)
+	}
+}
+
 func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 	t.Parallel()
 
@@ -169,6 +244,20 @@ func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "brew upgrade looper") {
 		t.Fatalf("stderr = %q, want brew guidance", stderr.String())
+	}
+}
+
+func TestDetectCLIInstallSourceTreatsInstallerSelectedUserBinAsRelease(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		t.Skipf("cannot resolve user home directory: %v", err)
+	}
+	userBin := filepath.Join(homeDir, "bin")
+	t.Setenv("PATH", userBin)
+
+	got := detectCLIInstallSource(filepath.Join(userBin, "looper"))
+	if got != cliInstallSourceRelease {
+		t.Fatalf("detectCLIInstallSource(user PATH bin) = %q, want %q", got, cliInstallSourceRelease)
 	}
 }
 
