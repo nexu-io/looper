@@ -618,6 +618,7 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	completed := make([]RunCompletedInput, 0, 1)
 
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil {
@@ -653,7 +654,24 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+		if err != nil {
+			t.Fatalf("Queue.GetByID() in notification callback error = %v", err)
+		}
+		if queue == nil || queue.LockKey == nil || *queue.LockKey != issueTarget {
+			t.Fatalf("queue during notification = %#v, want in-flight issue lock key", queue)
+		}
+		lock, err := fixture.repos.Locks.Get(context.Background(), issueTarget)
+		if err != nil {
+			t.Fatalf("Locks.Get() in notification callback error = %v", err)
+		}
+		if lock == nil {
+			t.Fatal("issue lock during notification = nil, want held in-flight issue lock")
+		}
+		completed = append(completed, input)
+		return nil
+	}})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	if err != nil || claim == nil {
@@ -666,13 +684,23 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if result.Status != "success" || result.PullRequestNumber != 101 {
 		t.Fatalf("result = %#v, want success with PR 101", result)
 	}
+	if len(completed) != 1 {
+		t.Fatalf("len(completed) = %d, want 1", len(completed))
+	}
 
 	updatedQueue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() after run error = %v", err)
 	}
-	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != issueTarget {
-		t.Fatalf("queue = %#v, want retargeted queue item that preserves issue lock key", updatedQueue)
+	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != "pr:acme/looper:101" {
+		t.Fatalf("queue = %#v, want retargeted queue item with persisted PR lock key", updatedQueue)
+	}
+	issueLock, err := fixture.repos.Locks.Get(context.Background(), issueTarget)
+	if err != nil {
+		t.Fatalf("Locks.Get(issue) after run error = %v", err)
+	}
+	if issueLock != nil {
+		t.Fatalf("issue lock = %#v, want released after run", issueLock)
 	}
 }
 

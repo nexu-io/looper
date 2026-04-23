@@ -1000,6 +1000,19 @@ func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) e
 	return nil
 }
 
+func (r *QueueRepository) UpdateLockKey(ctx context.Context, id, lockKey, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET lock_key = ?, updated_at = ?
+		WHERE id = ?
+	`, lockKey, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("update queue item lock key: %w", err)
+	}
+
+	return nil
+}
+
 func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items

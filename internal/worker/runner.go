@@ -566,7 +566,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	defer func() {
 		if acquiredClaimedLock && claimedLockKey != "" {
-			_ = r.repos.Locks.Release(context.Background(), claimedLockKey)
+			releaseCtx := context.Background()
+			_ = r.repos.Locks.Release(releaseCtx, claimedLockKey)
+			if strings.HasPrefix(claimedLockKey, "issue:") && checkpoint.PullRequest != nil && checkpoint.Work != nil && checkpoint.Work.Repo != "" && checkpoint.PullRequest.Number > 0 {
+				prLockKey := fmt.Sprintf("pr:%s:%d", checkpoint.Work.Repo, checkpoint.PullRequest.Number)
+				if err := r.repos.Queue.UpdateLockKey(releaseCtx, queueItem.ID, prLockKey, r.nowISO()); err != nil && r.logger != nil {
+					r.logger.Warn("worker queue lock retarget failed", map[string]any{"queueItemId": queueItem.ID, "lockKey": prLockKey, "error": err.Error()})
+				}
+			}
 		}
 	}()
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
