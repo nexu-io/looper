@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -297,6 +298,30 @@ func TestBootstrapPreflightHonorsConfigAndEnvToolOverrides(t *testing.T) {
 
 	if _, err := runtime.bootstrapPreflight(context.Background(), configPath, &plan); err != nil {
 		t.Fatalf("bootstrapPreflight() error = %v", err)
+	}
+}
+
+func TestWaitForBootstrapHealthPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+
+	app := New(Deps{
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			_ = req
+			return nil, context.Canceled
+		}),
+		Sleep: func(duration time.Duration) {
+			t.Fatalf("Sleep(%s) called after bootstrap probe cancellation", duration)
+		},
+	})
+	runtime := newCommandRuntime(app, nil)
+	client := NewDaemonAPIClient(DaemonAPIClientOptions{BaseURL: "http://127.0.0.1", HTTPClient: app.deps.HTTPClient})
+
+	reachable, err := runtime.waitForBootstrapHealth(context.Background(), client)
+	if reachable {
+		t.Fatal("waitForBootstrapHealth(...) reachable = true, want false")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForBootstrapHealth(...) error = %v, want context.Canceled", err)
 	}
 }
 

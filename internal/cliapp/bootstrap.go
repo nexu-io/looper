@@ -591,11 +591,21 @@ func (r *commandRuntime) bootstrapAPIReachable(ctx context.Context, client *Daem
 	if err == nil {
 		return true, nil
 	}
+	if isBootstrapProbeContextError(err) {
+		return false, err
+	}
 	_, healthErr := r.getJSONWithClient(ctx, client, "/api/v1/healthz")
 	if healthErr == nil {
 		return true, nil
 	}
+	if isBootstrapProbeContextError(healthErr) {
+		return false, healthErr
+	}
 	return false, nil
+}
+
+func isBootstrapProbeContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (r *commandRuntime) waitForBootstrapHealth(ctx context.Context, client *DaemonAPIClient) (bool, error) {

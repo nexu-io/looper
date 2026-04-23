@@ -304,7 +304,12 @@ jobs:
           assert m["version"] == os.environ["EXPECTED_VERSION"], f"version mismatch: {m['version']}"
           assert m["channel"] == os.environ["EXPECTED_CHANNEL"], f"channel mismatch: {m['channel']}"
           assert m["apiVersion"] == "v1", f"apiVersion mismatch: {m['apiVersion']}"
-          assert m["schemaVersion"] == "0007_agent_execution_run_index", f"schemaVersion mismatch: {m['schemaVersion']}"
+          migration_files = sorted(
+              name for name in os.listdir("internal/storage/migrations")
+              if name.endswith(".sql")
+          )
+          expected_schema_version = migration_files[-1].removesuffix(".sql")
+          assert m["schemaVersion"] == expected_schema_version, f"schemaVersion mismatch: {m['schemaVersion']}"
           assert m["minCliForDaemon"], "minCliForDaemon missing"
           assert m["minDaemonForCli"], "minDaemonForCli missing"
           required = {
