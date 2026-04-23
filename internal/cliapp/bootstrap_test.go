@@ -325,6 +325,44 @@ func TestWaitForBootstrapHealthPropagatesCancellation(t *testing.T) {
 	}
 }
 
+func TestWaitForBootstrapHealthPropagatesDaemonAPIProbeError(t *testing.T) {
+	t.Parallel()
+
+	app := New(Deps{
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/api/v1/status":
+				return nil, fmt.Errorf("connection refused")
+			case "/api/v1/healthz":
+				return jsonResponse(t, http.StatusUnauthorized, `{"ok":false,"requestId":"req_401","error":{"code":"UNAUTHORIZED","message":"unauthorized"}}`), nil
+			default:
+				t.Fatalf("unexpected request path %q", req.URL.Path)
+				return nil, nil
+			}
+		}),
+		Sleep: func(duration time.Duration) {
+			t.Fatalf("Sleep(%s) called after daemon API probe error", duration)
+		},
+	})
+	runtime := newCommandRuntime(app, nil)
+	client := NewDaemonAPIClient(DaemonAPIClientOptions{BaseURL: "http://127.0.0.1", HTTPClient: app.deps.HTTPClient})
+
+	reachable, err := runtime.waitForBootstrapHealth(context.Background(), client)
+	if reachable {
+		t.Fatal("waitForBootstrapHealth(...) reachable = true, want false")
+	}
+	var apiErr *DaemonAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("waitForBootstrapHealth(...) error type = %T, want *DaemonAPIError", err)
+	}
+	if got, want := apiErr.Status, http.StatusUnauthorized; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+	if got, want := apiErr.Message, "unauthorized"; got != want {
+		t.Fatalf("message = %q, want %q", got, want)
+	}
+}
+
 func TestBootstrapPreflightFailsWhenRequiredToolsMissing(t *testing.T) {
 	t.Parallel()
 

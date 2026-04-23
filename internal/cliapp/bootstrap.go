@@ -601,11 +601,18 @@ func (r *commandRuntime) bootstrapAPIReachable(ctx context.Context, client *Daem
 	if isBootstrapProbeContextError(healthErr) {
 		return false, healthErr
 	}
+	if !isBootstrapProbeReachabilityError(healthErr) {
+		return false, healthErr
+	}
 	return false, nil
 }
 
 func isBootstrapProbeContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isBootstrapProbeReachabilityError(err error) bool {
+	return strings.HasPrefix(err.Error(), "looperd is not reachable:")
 }
 
 func (r *commandRuntime) waitForBootstrapHealth(ctx context.Context, client *DaemonAPIClient) (bool, error) {
