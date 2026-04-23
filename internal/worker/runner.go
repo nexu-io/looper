@@ -388,6 +388,19 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error {
+	if execution == nil || execution.Status != "completed" {
+		return nil
+	}
+	if execution.ParseStatus == "parsed" {
+		return nil
+	}
+	return &loopError{
+		message: firstNonEmpty(execution.Summary, fmt.Sprintf("Worker agent completed without valid structured result (parse status: %s)", firstNonEmpty(execution.ParseStatus, "missing"))),
+		kind:    FailureRetryableTransient,
+	}
+}
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -789,6 +802,9 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" {
+		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if !r.allowAutoCommit {
@@ -822,6 +838,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	}
 	if result.Status != "completed" {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent %s", result.Status)), kind: FailureRetryableTransient}
+	}
+	if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		return checkpoint, err
 	}
 	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
