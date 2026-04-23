@@ -67,6 +67,92 @@ func TestUpgradeCheckPrintsSummary(t *testing.T) {
 	}
 }
 
+func TestUpgradeCheckUsesManagedProvenanceFromStatusAPI(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return jsonResponse(t, http.StatusOK, `{"success":true,"data":{"service":{"version":"0.2.1","binary":{"path":"`+managedPath+`"}}}}`), nil
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.2.1\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--check", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([upgrade --check --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([upgrade --check --json]) stderr = %q, want empty string", stderr.String())
+	}
+	var decoded struct {
+		Daemon struct {
+			CurrentVersion string `json:"currentVersion"`
+			Installed      bool   `json:"installed"`
+			Source         string `json:"source"`
+			BinaryPath     string `json:"binaryPath"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("unmarshal stdout JSON: %v\nraw=%q", err, stdout.String())
+	}
+	if decoded.Daemon.CurrentVersion != "0.2.1" {
+		t.Fatalf("daemon.currentVersion = %q, want 0.2.1", decoded.Daemon.CurrentVersion)
+	}
+	if !decoded.Daemon.Installed {
+		t.Fatal("daemon.installed = false, want true")
+	}
+	if decoded.Daemon.Source != "installed-binary" {
+		t.Fatalf("daemon.source = %q, want installed-binary", decoded.Daemon.Source)
+	}
+	if decoded.Daemon.BinaryPath != managedPath {
+		t.Fatalf("daemon.binaryPath = %q, want %q", decoded.Daemon.BinaryPath, managedPath)
+	}
+}
+
+func TestSelectUpgradeDaemonVersionStatePreservesAPIBinaryPath(t *testing.T) {
+	t.Parallel()
+
+	managedPath := "/tmp/.looper/bin/looperd"
+	state := selectUpgradeDaemonVersionState(
+		json.RawMessage(`{"service":{"version":"0.2.1","binary":{"path":"`+managedPath+`"}}}`),
+		&upgradeDaemonVersionState{Version: "0.2.1", Source: "installed-binary", BinaryPath: stringPtr(managedPath)},
+		nil,
+	)
+	if state == nil {
+		t.Fatal("selectUpgradeDaemonVersionState() = nil, want state")
+	}
+	if state.Source != "installed-binary" {
+		t.Fatalf("state.Source = %q, want installed-binary", state.Source)
+	}
+	if state.BinaryPath == nil || *state.BinaryPath != managedPath {
+		t.Fatalf("state.BinaryPath = %v, want %q", state.BinaryPath, managedPath)
+	}
+}
+
 func TestUpgradeRejectsCombiningCheckAndDaemon(t *testing.T) {
 	t.Parallel()
 

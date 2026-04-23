@@ -649,8 +649,18 @@ func writeHumanUpgradeSummary(w io.Writer, summary upgradeCheckSummary) error {
 }
 
 func selectUpgradeDaemonVersionState(statusPayload json.RawMessage, managedDaemon *upgradeDaemonVersionState, pathDaemon *upgradeDaemonVersionState) *upgradeDaemonVersionState {
-	if versionText := extractDaemonVersion(statusPayload); versionText != "" {
-		return &upgradeDaemonVersionState{Version: versionText, Source: "api"}
+	serviceBinary := extractDaemonServiceBinary(statusPayload)
+	if serviceBinary.Version != "" {
+		state := &upgradeDaemonVersionState{Version: serviceBinary.Version, Source: "api"}
+		if serviceBinary.Path != "" {
+			state.BinaryPath = stringPtr(serviceBinary.Path)
+			if managedDaemon != nil && managedDaemon.BinaryPath != nil && serviceBinary.Path == *managedDaemon.BinaryPath {
+				state.Source = managedDaemon.Source
+			} else if pathDaemon != nil && pathDaemon.BinaryPath != nil && serviceBinary.Path == *pathDaemon.BinaryPath {
+				state.Source = pathDaemon.Source
+			}
+		}
+		return state
 	}
 	if managedDaemon != nil {
 		return managedDaemon
