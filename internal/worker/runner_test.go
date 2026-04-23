@@ -718,6 +718,58 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	}
 }
 
+func TestPersistPullRequestReferenceRollsBackLoopWhenQueueUpdateFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want seeded worker loop")
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil {
+		t.Fatal("queue = nil, want seeded worker queue")
+	}
+
+	originalTargetType := loop.TargetType
+	originalTargetID := derefString(loop.TargetID)
+	originalPRNumber := loop.PRNumber
+	queue.Status = "invalid"
+	err = runner.persistPullRequestReference(context.Background(), *loop, *queue, "acme/looper", checkpointPullPR{Number: 101, URL: "https://example/pr/101"})
+	if err == nil {
+		t.Fatal("persistPullRequestReference() error = nil, want queue upsert failure")
+	}
+
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID(updated) error = %v", err)
+	}
+	if updatedLoop == nil {
+		t.Fatal("updated loop = nil, want seeded worker loop")
+	}
+	if updatedLoop.TargetType != originalTargetType || derefString(updatedLoop.TargetID) != originalTargetID || updatedLoop.PRNumber != originalPRNumber {
+		t.Fatalf("loop after failed persist = %#v, want original target %s %s", updatedLoop, originalTargetType, originalTargetID)
+	}
+
+	updatedQueue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(updated) error = %v", err)
+	}
+	if updatedQueue == nil {
+		t.Fatal("updated queue = nil, want seeded worker queue")
+	}
+	if updatedQueue.TargetType != "issue" || updatedQueue.TargetID != "issue:acme/looper:27" || updatedQueue.PRNumber != nil {
+		t.Fatalf("queue after failed persist = %#v, want original issue target", updatedQueue)
+	}
+}
+
 func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

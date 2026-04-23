@@ -1326,21 +1326,14 @@ func (r *Runner) assignReviewersIfNeeded(ctx context.Context, work workerInput, 
 }
 
 func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, repo string, pr checkpointPullPR) error {
+	if r.db == nil {
+		return fmt.Errorf("worker runner database is not configured")
+	}
 	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
 	if err != nil {
 		return err
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, pr.Number)
-	_, err = r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Repo = stringPtr(repo)
-		updated.TargetType = "pull_request"
-		updated.TargetID = stringPtr(targetID)
-		updated.PRNumber = int64Ptr(pr.Number)
-		updated.MetadataJSON = stringPtr(metadataJSON)
-	})
-	if err != nil {
-		return err
-	}
 	updatedQueue := queueItem
 	updatedQueue.TargetType = "pull_request"
 	updatedQueue.TargetID = targetID
@@ -1353,8 +1346,30 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	if projectID != "" {
 		updatedQueue.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, repo, pr.Number)
 	}
-	updatedQueue.UpdatedAt = r.nowISO()
-	return r.repos.Queue.Upsert(ctx, updatedQueue)
+	nowISO := r.nowISO()
+	updatedQueue.UpdatedAt = nowISO
+
+	return storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("loop not found: %s", loop.ID)
+		}
+		updatedLoop := *current
+		updatedLoop.Repo = stringPtr(repo)
+		updatedLoop.TargetType = "pull_request"
+		updatedLoop.TargetID = stringPtr(targetID)
+		updatedLoop.PRNumber = int64Ptr(pr.Number)
+		updatedLoop.MetadataJSON = stringPtr(metadataJSON)
+		updatedLoop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, updatedLoop); err != nil {
+			return err
+		}
+		return repos.Queue.Upsert(ctx, updatedQueue)
+	})
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
