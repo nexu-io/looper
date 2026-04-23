@@ -695,6 +695,20 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != "pr:acme/looper:101" {
 		t.Fatalf("queue = %#v, want retargeted queue item with persisted PR lock key", updatedQueue)
 	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Runs.GetLatestByLoopID() error = %v", err)
+	}
+	if latestRun == nil {
+		t.Fatal("latestRun = nil, want persisted worker run")
+	}
+	latestCheckpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint(latestRun) error = %v", err)
+	}
+	if latestCheckpoint.ClaimedLockKey != "pr:acme/looper:101" {
+		t.Fatalf("checkpoint.ClaimedLockKey = %q, want pr:acme/looper:101", latestCheckpoint.ClaimedLockKey)
+	}
 	issueLock, err := fixture.repos.Locks.Get(context.Background(), issueTarget)
 	if err != nil {
 		t.Fatalf("Locks.Get(issue) after run error = %v", err)
@@ -753,6 +767,65 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 	if len(github.createIssueCommentCalls) != 1 {
 		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1 running marker across resume", len(github.createIssueCommentCalls))
+	}
+}
+
+func TestFindPreviousIssueClaimPrefersNewestMatchingRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	oldCheckpoint := mustMarshalJSON(workerCheckpoint{
+		IssueClaim: &checkpointIssueClaim{Repo: "acme/looper", IssueNumber: 27, CommentID: 101, Status: issueClaimStatusRunning},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_old_claim",
+		LoopID:         "loop_worker_1",
+		Status:         "failed",
+		CheckpointJSON: &oldCheckpoint,
+		StartedAt:      fixture.nowISO(),
+		CreatedAt:      fixture.nowISO(),
+		UpdatedAt:      fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(old claim) error = %v", err)
+	}
+
+	fixture.advance(time.Second)
+	newCheckpoint := mustMarshalJSON(workerCheckpoint{
+		IssueClaim: &checkpointIssueClaim{Repo: "acme/looper", IssueNumber: 27, CommentID: 202, Status: issueClaimStatusRunning},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_new_claim",
+		LoopID:         "loop_worker_1",
+		Status:         "failed",
+		CheckpointJSON: &newCheckpoint,
+		StartedAt:      fixture.nowISO(),
+		CreatedAt:      fixture.nowISO(),
+		UpdatedAt:      fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(new claim) error = %v", err)
+	}
+
+	fixture.advance(time.Second)
+	currentCheckpoint := mustMarshalJSON(workerCheckpoint{})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_current",
+		LoopID:         "loop_worker_1",
+		Status:         "running",
+		CheckpointJSON: &currentCheckpoint,
+		StartedAt:      fixture.nowISO(),
+		CreatedAt:      fixture.nowISO(),
+		UpdatedAt:      fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(current) error = %v", err)
+	}
+
+	claim := runner.findPreviousIssueClaim(context.Background(), "loop_worker_1", "run_current", "acme/looper", 27)
+	if claim == nil {
+		t.Fatal("findPreviousIssueClaim() = nil, want newest prior claim")
+	}
+	if claim.CommentID != 202 {
+		t.Fatalf("claim.CommentID = %d, want 202 from newest run", claim.CommentID)
 	}
 }
 

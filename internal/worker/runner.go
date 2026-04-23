@@ -600,8 +600,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			_ = r.repos.Locks.Release(releaseCtx, claimedLockKey)
 			if strings.HasPrefix(claimedLockKey, "issue:") && checkpoint.PullRequest != nil && checkpoint.Work != nil && checkpoint.Work.Repo != "" && checkpoint.PullRequest.Number > 0 {
 				prLockKey := fmt.Sprintf("pr:%s:%d", checkpoint.Work.Repo, checkpoint.PullRequest.Number)
-				if err := r.repos.Queue.UpdateLockKey(releaseCtx, queueItem.ID, prLockKey, r.nowISO()); err != nil && r.logger != nil {
-					r.logger.Warn("worker queue lock retarget failed", map[string]any{"queueItemId": queueItem.ID, "lockKey": prLockKey, "error": err.Error()})
+				if err := r.repos.Queue.UpdateLockKey(releaseCtx, queueItem.ID, prLockKey, r.nowISO()); err != nil {
+					if r.logger != nil {
+						r.logger.Warn("worker queue lock retarget failed", map[string]any{"queueItemId": queueItem.ID, "lockKey": prLockKey, "error": err.Error()})
+					}
+				} else {
+					checkpoint.ClaimedLockKey = prLockKey
+					if err := r.persistCheckpoint(releaseCtx, run.ID, checkpoint); err != nil && r.logger != nil {
+						r.logger.Warn("worker checkpoint lock retarget failed", map[string]any{"runId": run.ID, "queueItemId": queueItem.ID, "lockKey": prLockKey, "error": err.Error()})
+					}
 				}
 			}
 		}
@@ -1455,7 +1462,7 @@ func (r *Runner) findPreviousIssueClaim(ctx context.Context, loopID, currentRunI
 	if err != nil {
 		return nil
 	}
-	for i := len(runs) - 1; i >= 0; i-- {
+	for i := 0; i < len(runs); i++ {
 		if runs[i].ID == currentRunID {
 			continue
 		}
