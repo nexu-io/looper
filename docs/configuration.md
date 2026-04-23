@@ -38,6 +38,8 @@ Relative config paths are resolved from the current working directory used to st
 
 In the simplest setup, you can rely on defaults and only create a config file when you need to customize behavior.
 
+`agent.vendor` does not have a built-in default. If you want planner / reviewer / fixer / worker loops to run, set it explicitly.
+
 Example minimal `~/.looper/config.json`:
 
 ```json
@@ -78,7 +80,7 @@ Example minimal `~/.looper/config.json`:
   },
   "agent": {
     "vendor": "opencode",
-    "model": "gpt-5.4",
+    "model": "your-model-if-needed",
     "params": {
       "reasoning": "medium"
     },
@@ -172,6 +174,8 @@ Default storage paths:
 - `params`: free-form vendor-specific parameters
 - `env`: environment variables passed to the agent process
 
+`vendor` is required for agent-driven loops. If it is omitted, the daemon can still run, but planner / reviewer / fixer / worker loops cannot be created or started.
+
 ### `logging`
 
 - `level`: one of `debug`, `info`, `warn`, `error`
@@ -187,6 +191,11 @@ When `looperd.log` would exceed `maxSizeMB`, `looperd` rotates it to `looperd.lo
 - `osascript.soundForLevels`: subset of `action_required`, `failure`
 - `osascript.throttleWindowSeconds`: positive integer
 
+Default behavior:
+
+- on macOS, `notifications.osascript.enabled` defaults to `true`
+- on non-macOS platforms, it defaults to `false`
+
 If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resolve.
 
 ### `tools`
@@ -201,15 +210,17 @@ If these are omitted, `looperd` tries to detect them from `PATH`. Startup valida
 
 - `mode`: `foreground` or `launchd`
 - `logDir`: daemon log directory
+- `shutdownTimeoutMs`: graceful shutdown timeout in milliseconds
 - `workingDirectory`: working directory used by the daemon
-- `environment`: extra environment variables for the daemon process
+- `environment`: reserved daemon environment map; currently part of the config surface, but not a primary user-facing runtime control in the documented flow
 
-Current packaged install and CLI management flows document `foreground` as the active Phase 1 path. `launchd` remains part of the configuration surface, but full launchd-oriented lifecycle management is not the primary documented install flow here.
+Current packaged install and CLI management flows use `foreground` as the primary documented path. `launchd` remains part of the configuration surface, but it is not the primary documented install flow.
 
 Defaults:
 
 - `mode`: `foreground`
 - `logDir`: `~/.looper/logs`
+- `shutdownTimeoutMs`: `1000`
 - `workingDirectory`: current working directory when config is loaded
 
 ### `package`
@@ -292,11 +303,19 @@ Boolean environment variables accept:
 Example:
 
 ```bash
-LOOPER_CONFIG="$HOME/.looper/config.json" \
+LOOPER_CONFIG="$HOME/custom-looper/config.json" \
 LOOPER_PORT=4321 \
 LOOPER_ALLOW_AUTO_PUSH=false \
 looperd
 ```
+
+Example precedence:
+
+- if the config file sets port `4310`
+- and `LOOPER_PORT=5000` is exported
+- and `looperd --port 6000` is passed
+
+then the daemon uses port `6000`.
 
 ## CLI flag overrides
 
@@ -319,7 +338,7 @@ Example:
 
 ```bash
 looperd \
-  --config "$HOME/.looper/config.json" \
+  --config "$HOME/custom-looper/config.json" \
   --port 4321 \
   --allow-auto-push=false
 ```
@@ -355,6 +374,8 @@ That means if you set `projects` in the config file, the entire projects array c
 4. Set `agent.vendor`
 5. Start the daemon with your installed `looperd` (or `go run ./cmd/looperd` while developing)
 6. Run `looper config show` to inspect the effective config
+
+If you enable `server.authMode=local-token`, also export `LOOPER_TOKEN` before using the CLI.
 
 ## Troubleshooting
 

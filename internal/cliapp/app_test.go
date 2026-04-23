@@ -113,6 +113,79 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	}
 }
 
+func TestRootHelpIncludesFeedbackSubcommand(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([--help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([--help]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "feedback") || !strings.Contains(stdout, "Submit feedback as a GitHub issue") {
+		t.Fatalf("Run([--help]) stdout = %q, want feedback subcommand", stdout)
+	}
+}
+
+func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
+	t.Parallel()
+
+	scriptPath := filepath.Join(t.TempDir(), "fake-agent.sh")
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"printf 'agent started\\n'",
+		"printf 'https://github.com/powerformer/looper/issues/42\\n'",
+		"printf 'https://github.com/powerformer/looper/issues/321\\n'",
+		"printf '%s{\"summary\":\"created issue\"}\\n' \"$LOOPER_COMPLETION_MARKER\"",
+	}, "\n")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agent script: %v", err)
+	}
+
+	configPath := writeCLIConfigWithAgent(t, "http://127.0.0.1:1", string(config.AgentVendorOpenCode), map[string]any{"command": scriptPath})
+
+	exitCode, stdout, stderr := runApp(t, "feedback", "Great", "tool", "--title", "CLI Feedback", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([feedback ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([feedback ...]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "https://github.com/powerformer/looper/issues/321\n"; got != want {
+		t.Fatalf("Run([feedback ...]) stdout = %q, want %q", got, want)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "feedback", "Great", "tool", "--title", "CLI Feedback", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([feedback ... --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([feedback ... --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "repo", "powerformer/looper")
+	assertJSONContains(t, stdout, "titleHint", "CLI Feedback")
+	assertJSONContains(t, stdout, "message", "Great tool")
+	assertJSONContains(t, stdout, "issueUrl", "https://github.com/powerformer/looper/issues/321")
+	assertJSONContains(t, stdout, "summary", "created issue")
+}
+
+func TestFeedbackCommandRequiresMessage(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeCLIConfigWithAgent(t, "http://127.0.0.1:1", string(config.AgentVendorOpenCode), map[string]any{"command": "/bin/true"})
+	exitCode, stdout, stderr := runApp(t, "feedback", "--title", "Only title", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([feedback --title ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("Run([feedback --title ...]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "feedback message is required") {
+		t.Fatalf("Run([feedback --title ...]) stderr = %q, want missing message error", stderr)
+	}
+}
+
 func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
 	t.Parallel()
 
@@ -1317,6 +1390,32 @@ func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
 	}
 
 	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return configPath
+}
+
+func writeCLIConfigWithAgent(t *testing.T, baseURL string, vendor string, params map[string]any) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	configPayload := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  baseURL,
+			"authMode": "none",
+		},
+		"agent": map[string]any{
+			"vendor": vendor,
+			"params": params,
+		},
+	}
+
+	raw, err := json.Marshal(configPayload)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
