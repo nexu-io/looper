@@ -1172,9 +1172,12 @@ type fakeAgentExecutor struct {
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
-	result := AgentResult{Status: "completed", Summary: "done"}
+	result := AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}
 	if f.index < len(f.results) {
 		result = f.results[f.index]
+	}
+	if result.Status == "completed" && result.ParseStatus == "" {
+		result.ParseStatus = "parsed"
 	}
 	f.index++
 	return fakeAgentExecution{result: result, waitErr: f.waitErr, wait: f.wait}, nil
