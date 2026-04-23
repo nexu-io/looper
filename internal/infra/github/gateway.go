@@ -24,12 +24,14 @@ type Options struct {
 	GHPath string
 	CWD    string
 	Now    func() time.Time
+	GHRun  func(context.Context, shell.Options) (shell.Result, error)
 }
 
 type Gateway struct {
 	ghPath string
 	cwd    string
 	now    func() time.Time
+	ghRun  func(context.Context, shell.Options) (shell.Result, error)
 }
 
 type PullRequestSummary struct {
@@ -225,7 +227,11 @@ func New(options Options) *Gateway {
 	if now == nil {
 		now = time.Now
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now}
+	ghRun := options.GHRun
+	if ghRun == nil {
+		ghRun = shell.Run
+	}
+	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, ghRun: ghRun}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -711,7 +717,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []s
 }
 
 func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) (shell.Result, error) {
-	return shell.Run(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
+	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
 }
 
 func defaultLimit(limit int) int {
