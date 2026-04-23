@@ -27,11 +27,29 @@ remove_if_exists() {
   fi
 }
 
+in_path_dir() {
+  candidate="$1"
+  old_ifs=$IFS
+  IFS=:
+  for entry in $PATH; do
+    [ "$entry" = "$candidate" ] && IFS=$old_ifs && return 0
+  done
+  IFS=$old_ifs
+  return 1
+}
+
 is_installer_owned_cli_path() {
   path="$1"
+  dir="${path%/*}"
   case "$path" in
     "$HOME/.local/bin/looper"|"$HOME/.looper/bin/looper") return 0 ;;
     /opt/homebrew/*|/usr/local/Homebrew/*|"$HOME/go/bin/looper"|"$HOME/.cargo/bin/looper"|"$HOME/.asdf/"*|"$HOME/.local/share/mise/"*) return 1 ;;
+    "$HOME"/*/looper)
+      if in_path_dir "$dir"; then
+        return 0
+      fi
+      return 1
+      ;;
     *) return 1 ;;
   esac
 }
