@@ -1,5 +1,5 @@
 Upgrade check
-  cliCurrent            : 0.2.1
+  cliCurrent            : 0.0.0-dev
   cliLatest             : 0.3.0
   cliUpdateAvailable    : yes
   daemonCurrent         : 0.2.1

@@ -155,6 +155,8 @@ go run ./cmd/looper -- status
 - `looper upgrade --check` reads the latest CLI and daemon versions from GitHub Releases metadata. If the daemon is not running, the CLI falls back to the installed daemon binary version; if no binary is found, daemon current version is reported as not installed.
 - The CLI does not currently inject upgrade prompts into every command when the daemon is old; use `looper upgrade --check` to inspect drift and `looper upgrade` / `looper upgrade --daemon` to update the managed binary.
 - Full major-version upgrade confirmation is not implemented in this phase yet. If a future release needs breaking management API changes, it should move to a new API version such as `/api/v2/*` instead of silently breaking `/api/v1`.
+- Release builds are tag-driven (`vX.Y.Z` / `vX.Y.Z-rc.N`) and inject binary version metadata via ldflags; local default builds use `0.0.0-dev`.
+- The release workflow now publishes `manifest.json` alongside binaries/checksums as the machine-readable release contract (channel/apiVersion/schemaVersion/min-compatibility + artifact URL/sha256/size).
 
 
 ## Development commands

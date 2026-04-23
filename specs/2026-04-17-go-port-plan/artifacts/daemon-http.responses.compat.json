@@ -49,9 +49,13 @@
         "data": {
           "service": {
             "healthy": true,
-            "version": "0.2.1",
+            "version": "0.0.0-dev",
             "build": {
               "versionSource": "internal/version/version.go",
+              "channel": "dev",
+              "apiVersion": "v1",
+              "minCliForDaemon": null,
+              "minDaemonForCli": null,
               "gitCommitSha": null,
               "buildTimestamp": null
             },
