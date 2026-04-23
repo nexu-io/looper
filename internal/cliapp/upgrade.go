@@ -539,11 +539,11 @@ func detectCLIInstallSource(execPath string) cliInstallSource {
 	if strings.HasSuffix(path, "/.local/bin/looper") || strings.HasSuffix(path, "/usr/local/bin/looper") || strings.HasSuffix(path, "/.looper/bin/looper") {
 		return cliInstallSourceRelease
 	}
-	if isInstallerSelectedUserBinPath(execPath) {
-		return cliInstallSourceRelease
-	}
 	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") || strings.Contains(path, "/tmp/") {
 		return cliInstallSourceDev
+	}
+	if isInstallerSelectedUserBinPath(execPath) {
+		return cliInstallSourceRelease
 	}
 	return cliInstallSourceUnknown
 }

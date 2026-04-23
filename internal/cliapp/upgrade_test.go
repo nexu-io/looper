@@ -458,6 +458,20 @@ func TestDetectCLIInstallSourceTreatsInstallerSelectedUserBinAsRelease(t *testin
 	}
 }
 
+func TestDetectCLIInstallSourceTreatsGoBinAsDevBeforeUserBinRelease(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		t.Skipf("cannot resolve user home directory: %v", err)
+	}
+	goBin := filepath.Join(homeDir, "go", "bin")
+	t.Setenv("PATH", goBin)
+
+	got := detectCLIInstallSource(filepath.Join(goBin, "looper"))
+	if got != cliInstallSourceDev {
+		t.Fatalf("detectCLIInstallSource(go PATH bin) = %q, want %q", got, cliInstallSourceDev)
+	}
+}
+
 func TestUpgradeDaemonPrintsRestartHint(t *testing.T) {
 	t.Parallel()
 
