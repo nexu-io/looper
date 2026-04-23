@@ -11,6 +11,10 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  LOOPER_BUILD_MIN_CLI_FOR_DAEMON: "0.2.0"
+  LOOPER_BUILD_MIN_DAEMON_FOR_CLI: "0.2.0"
+
 jobs:
   prepare-go-release:
     runs-on: ubuntu-latest
@@ -279,8 +283,8 @@ jobs:
             -released "${{ needs.prepare-go-release.outputs.release-timestamp }}" \
             -channel "${{ needs.prepare-go-release.outputs.release-channel }}" \
             -api-version v1 \
-            -min-cli-for-daemon "0.2.0" \
-            -min-daemon-for-cli "0.2.0" \
+            -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
+            -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
             -required-assets "looper-darwin-arm64,looper-darwin-x64,looperd-darwin-arm64,looperd-darwin-x64" \
             -output release-assets/manifest.json
