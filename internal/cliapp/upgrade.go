@@ -557,10 +557,30 @@ func isInstallerSelectedUserBinPath(execPath string) bool {
 }
 
 func (r *commandRuntime) executablePath() (string, error) {
-	if value := strings.TrimSpace(r.app.deps.ExecutablePath); value != "" {
-		return value, nil
+	resolve := func(path string) string {
+		resolvedPath, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return path
+		}
+		resolvedPath = strings.TrimSpace(resolvedPath)
+		if resolvedPath == "" {
+			return path
+		}
+		return resolvedPath
 	}
-	return os.Executable()
+
+	if value := strings.TrimSpace(r.app.deps.ExecutablePath); value != "" {
+		return resolve(value), nil
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path, nil
+	}
+	return resolve(path), nil
 }
 
 func cliRefusalGuidance(source cliInstallSource, execPath string) string {

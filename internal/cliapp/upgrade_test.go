@@ -364,6 +364,47 @@ func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 	}
 }
 
+func TestUpgradeCLIRefusesHomebrewSymlinkWithGuidance(t *testing.T) {
+	t.Parallel()
+
+	homebrewRoot := t.TempDir()
+	targetPath := filepath.Join(homebrewRoot, "usr", "local", "Cellar", "looper", "0.2.1", "bin", "looper")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(target dir) error = %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(target) error = %v", err)
+	}
+
+	symlinkPath := filepath.Join(homebrewRoot, "usr", "local", "bin", "looper")
+	if err := os.MkdirAll(filepath.Dir(symlinkPath), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(symlink dir) error = %v", err)
+	}
+	if err := os.Symlink(targetPath, symlinkPath); err != nil {
+		t.Skipf("os.Symlink() unavailable: %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		ExecutablePath: symlinkPath,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected request before Homebrew refusal: %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--cli"})
+	if exitCode != 1 {
+		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 1", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "brew upgrade looper") {
+		t.Fatalf("stderr = %q, want brew guidance", stderr.String())
+	}
+}
+
 func TestDetectCLIInstallSourceTreatsInstallerSelectedUserBinAsRelease(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil || homeDir == "" {
