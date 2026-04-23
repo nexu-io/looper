@@ -316,8 +316,13 @@ func (r *commandRuntime) apiClientFromLoaded(loaded config.LoadedFileConfig) *Da
 }
 
 func (r *commandRuntime) detectDaemonVersionState(ctx context.Context, statusPayload json.RawMessage) (*daemonVersionState, error) {
-	if version := extractDaemonVersion(statusPayload); version != "" {
-		return &daemonVersionState{Version: version, Source: "api"}, nil
+	serviceBinary := extractDaemonServiceBinary(statusPayload)
+	if serviceBinary.Version != "" {
+		state := &daemonVersionState{Version: serviceBinary.Version, Source: "api"}
+		if serviceBinary.Path != "" {
+			state.BinaryPath = stringPtr(serviceBinary.Path)
+		}
+		return state, nil
 	}
 
 	managedVersion, err := r.readManagedDaemonVersion(ctx)
@@ -331,20 +336,36 @@ func (r *commandRuntime) detectDaemonVersionState(ctx context.Context, statusPay
 	return r.readPathDaemonVersion(ctx)
 }
 
-func extractDaemonVersion(payload json.RawMessage) string {
+type daemonServiceBinary struct {
+	Version string
+	Path    string
+}
+
+func extractDaemonServiceBinary(payload json.RawMessage) daemonServiceBinary {
 	if len(payload) == 0 {
-		return ""
+		return daemonServiceBinary{}
 	}
 
 	var decoded struct {
 		Service struct {
 			Version string `json:"version"`
+			Binary  struct {
+				Path string `json:"path"`
+			} `json:"binary"`
 		} `json:"service"`
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return ""
+		return daemonServiceBinary{}
 	}
-	return strings.TrimSpace(decoded.Service.Version)
+
+	return daemonServiceBinary{
+		Version: strings.TrimSpace(decoded.Service.Version),
+		Path:    strings.TrimSpace(decoded.Service.Binary.Path),
+	}
+}
+
+func extractDaemonVersion(payload json.RawMessage) string {
+	return extractDaemonServiceBinary(payload).Version
 }
 
 type resolvedDaemonBinary struct {

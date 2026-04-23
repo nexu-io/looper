@@ -75,12 +75,17 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 
 	data := body["data"].(map[string]any)
 	service := data["service"].(map[string]any)
+	binaryInfo := service["binary"].(map[string]any)
 	storageInfo := data["storage"].(map[string]any)
 	scheduler := data["scheduler"].(map[string]any)
 	loops := data["loops"].(map[string]any)
 
 	assertEqual(t, service["healthy"], true)
 	assertEqual(t, service["daemonMode"], "foreground")
+	binaryPath, ok := binaryInfo["path"].(string)
+	if !ok || strings.TrimSpace(binaryPath) == "" {
+		t.Fatalf("service.binary.path missing/invalid: %#v", binaryInfo["path"])
+	}
 	assertEqual(t, storageInfo["healthy"], true)
 	queuedItems, queuedOK := scheduler["queuedItems"].(float64)
 	runningItems, runningOK := scheduler["runningItems"].(float64)
@@ -4068,7 +4073,7 @@ func responseFixtureMatches(actual, expected any) bool {
 		case "<uuid>":
 			got, ok := actual.(string)
 			return ok && strings.Count(got, "-") == 4 && strings.TrimSpace(got) != ""
-		case "<generated-timestamp>", "<current-target>":
+		case "<generated-timestamp>", "<current-target>", "<daemon-executable-path>":
 			got, ok := actual.(string)
 			return ok && strings.TrimSpace(got) != ""
 		case "<artifact-name>":

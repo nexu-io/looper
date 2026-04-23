@@ -15,7 +15,8 @@
     "<uuid>": "Runtime-generated UUID.",
     "<generated-timestamp>": "Runtime-generated ISO-8601 timestamp.",
     "<current-target>": "Current looperd build target for the running platform.",
-    "<artifact-name>": "Compiled looperd artifact name for the current target."
+    "<artifact-name>": "Compiled looperd artifact name for the current target.",
+    "<daemon-executable-path>": "Resolved executable path of the running looperd process."
   },
   "routes": [
     {
@@ -66,6 +67,7 @@
             },
             "binary": {
               "name": "looperd",
+              "path": "<daemon-executable-path>",
               "installDir": "<home>/.looper/bin",
               "currentTarget": "<current-target>",
               "artifactName": "<artifact-name>",

@@ -503,10 +503,34 @@ type statusService struct {
 
 type statusBinary struct {
 	Name             string   `json:"name"`
+	Path             string   `json:"path,omitempty"`
 	InstallDir       string   `json:"installDir"`
 	CurrentTarget    string   `json:"currentTarget"`
 	ArtifactName     *string  `json:"artifactName"`
 	SupportedTargets []string `json:"supportedTargets"`
+}
+
+func daemonExecutablePath() string {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	executablePath = strings.TrimSpace(executablePath)
+	if executablePath == "" {
+		return ""
+	}
+
+	resolvedPath, err := filepath.EvalSymlinks(executablePath)
+	if err != nil {
+		return executablePath
+	}
+
+	resolvedPath = strings.TrimSpace(resolvedPath)
+	if resolvedPath == "" {
+		return executablePath
+	}
+
+	return resolvedPath
 }
 
 type statusStorage struct {
@@ -659,6 +683,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Recovery:   h.recoverySummary(),
 			Binary: statusBinary{
 				Name:             "looperd",
+				Path:             daemonExecutablePath(),
 				InstallDir:       installDir,
 				CurrentTarget:    currentTarget,
 				ArtifactName:     artifactName,
