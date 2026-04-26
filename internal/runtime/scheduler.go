@@ -125,6 +125,14 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
+func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
+	pr, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return planner.PullRequestDetail{}, err
+	}
+	return planner.PullRequestDetail{Number: pr.Number, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+}
+
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
 	if err != nil {

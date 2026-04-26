@@ -601,6 +601,7 @@ func (f *runnerFixture) nowISO() string {
 type fakeGitHubGateway struct {
 	issues           []IssueSummary
 	issueDetail      IssueDetail
+	prDetail         PullRequestDetail
 	createPRResult   CreatePullRequestResult
 	createPRErrors   []error
 	createPRIndex    int
@@ -626,6 +627,14 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 
 func (*fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
 	return "octocat", nil
+}
+
+func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	detail := f.prDetail
+	if detail.Number == 0 {
+		detail.Number = input.PRNumber
+	}
+	return detail, nil
 }
 
 func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {

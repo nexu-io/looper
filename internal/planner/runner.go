@@ -95,6 +95,20 @@ type CreatePullRequestResult struct {
 	URL    string
 }
 
+type ViewPullRequestInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type PullRequestDetail struct {
+	Number      int64
+	URL         string
+	State       string
+	HeadRefName string
+	BaseRefName string
+}
+
 type PullRequestLabelsInput struct {
 	Repo     string
 	PRNumber int64
@@ -113,6 +127,7 @@ type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
@@ -765,7 +780,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	prompt := buildPlannerPrompt(input.Project, issue, worktree)
+	prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 	if err != nil {
 		return checkpoint, err
@@ -861,9 +876,28 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	if checkpoint.Publish.PullRequest == nil {
 		if checkpoint.Lifecycle != nil && checkpoint.Lifecycle.PRNumber > 0 {
-			checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: checkpoint.Lifecycle.PRNumber, URL: checkpoint.Lifecycle.PRURL, Body: ""}
-			checkpoint.Lifecycle.PRAdopted = true
-			checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceAgent
+			adopted, err := r.validatedLifecyclePullRequest(ctx, input, *issue, *worktree, checkpoint.Lifecycle)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if adopted != nil {
+				checkpoint.Publish.PullRequest = adopted
+				checkpoint.Lifecycle.PRNumber = adopted.Number
+				checkpoint.Lifecycle.PRURL = adopted.URL
+				checkpoint.Lifecycle.PRAdopted = true
+				checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceAgent
+				if err := r.persistPlannerPullRequestReference(ctx, input, *issue, *worktree, *adopted); err != nil {
+					return checkpoint, wrapRetryableAfterResume(err)
+				}
+				if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
+					return checkpoint, wrapRetryableAfterResume(err)
+				}
+			} else {
+				checkpoint.Lifecycle.PRNumber = 0
+				checkpoint.Lifecycle.PRURL = ""
+				checkpoint.Lifecycle.PRAdopted = false
+				checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceNone
+			}
 		}
 	}
 	if checkpoint.Publish.PullRequest == nil {
@@ -880,17 +914,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		checkpoint.Lifecycle.PRNumber = pr.Number
 		checkpoint.Lifecycle.PRURL = pr.URL
 		checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
-		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-			updated.Repo = stringPtr(issue.Repo)
-			updated.PRNumber = &pr.Number
-		}); err != nil {
-			return checkpoint, wrapRetryableAfterResume(err)
-		}
-		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers})
-		if err != nil {
-			return checkpoint, wrapRetryableAfterResume(err)
-		}
-		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		if err := r.persistPlannerPullRequestReference(ctx, input, *issue, *worktree, checkpointPullRequest{Number: pr.Number, URL: pr.URL, Body: body}); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
@@ -927,6 +951,45 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, state *lifecycle.State) (*checkpointPullRequest, error) {
+	if state == nil || state.PRNumber <= 0 {
+		return nil, nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, err
+	}
+	if detail.State != "" && !strings.EqualFold(strings.TrimSpace(detail.State), "open") {
+		return nil, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(detail.HeadRefName), strings.TrimSpace(worktree.Branch)) || !strings.EqualFold(strings.TrimSpace(detail.BaseRefName), strings.TrimSpace(worktree.BaseBranch)) {
+		return nil, nil
+	}
+	prNumber := detail.Number
+	if prNumber == 0 {
+		prNumber = state.PRNumber
+	}
+	return &checkpointPullRequest{Number: prNumber, URL: firstNonEmpty(detail.URL, state.PRURL), Body: ""}, nil
+}
+
+func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, pr checkpointPullRequest) error {
+	if pr.Number == 0 {
+		return nil
+	}
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		updated.Repo = stringPtr(issue.Repo)
+		updated.PRNumber = &pr.Number
+	}); err != nil {
+		return err
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers})
+	if err != nil {
+		return err
+	}
+	_, err = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
+	return err
 }
 
 func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {
@@ -1295,7 +1358,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, worktree *checkpointWorktree) string {
+func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool) string {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -1312,15 +1375,33 @@ func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, w
 	if agentsBlock := readAgentsBlock(project.RepoPath); agentsBlock != "" {
 		parts = append(parts, agentsBlock)
 	}
-	parts = append(parts, strings.Join([]string{
+	requirements := []string{
 		"Requirements:",
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
-		"- Commit the spec changes on the current branch so the PR can be opened",
-	}, "\n"))
-	parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true))
+	}
+	if allowAutoPush {
+		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
+	} else {
+		requirements = append(requirements, "- Do not push the branch or open/update pull requests; leave repository publishing for Looper/manual follow-up")
+	}
+	parts = append(parts, strings.Join(requirements, "\n"))
+	if allowAutoPush {
+		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true))
+	} else {
+		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch))
+	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+}
+
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string) string {
+	return strings.Join([]string{
+		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
+		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
+		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
+		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
+	}, "\n")
 }
 
 func buildPullRequestBody(issue checkpointIssue, worktree checkpointWorktree, writeSpec *checkpointWriteSpec) string {
