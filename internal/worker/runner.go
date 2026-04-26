@@ -225,6 +225,7 @@ type AgentResult struct {
 	Status       string
 	Summary      string
 	Stdout       string
+	Stderr       string
 	ParseStatus  string
 	ChangedFiles []string
 	Commits      []string
@@ -924,7 +925,12 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, err
 	}
 	if result.Status != "completed" {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent %s", result.Status)), kind: FailureRetryableTransient}
+		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
+		kind := FailureRetryableTransient
+		if agent.IsAgentSetupFailureMessage(message) {
+			kind = FailureManualIntervention
+		}
+		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err

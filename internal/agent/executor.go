@@ -298,12 +298,25 @@ func (x *execution) run(ctx context.Context) {
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
 	status := x.finalStatus(timedOut, killed)
-	completion := parseCompletion(stdout, stderr)
-	if completion.Summary == "" {
-		completion.Summary = summarizeLogs(stdout, stderr)
-	}
 	if waitErr != nil && status == "failed" && strings.TrimSpace(stderr) == "" {
 		stderr = waitErr.Error()
+	}
+	errorMessage := ""
+	if status == "failed" || status == "timeout" || status == "killed" {
+		errorMessage = strings.TrimSpace(stderr)
+		if errorMessage == "" {
+			errorMessage = killReason
+		}
+	}
+	completion := parseCompletion(stdout, stderr)
+	if status != "completed" {
+		completion = completionParse{ParseStatus: "missing"}
+	}
+	if completion.Summary == "" {
+		completion.Summary = errorMessage
+		if completion.Summary == "" {
+			completion.Summary = summarizeLogs(stdout, stderr)
+		}
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 	result := Result{
@@ -320,13 +333,6 @@ func (x *execution) run(ctx context.Context) {
 		PID:              pidOrZero(x.process.Process),
 	}
 
-	errorMessage := ""
-	if status == "failed" || status == "timeout" || status == "killed" {
-		errorMessage = strings.TrimSpace(stderr)
-		if errorMessage == "" {
-			errorMessage = killReason
-		}
-	}
 	x.persistFinal(status, result, errorMessage, endedAtISO)
 	eventType := "agent.completed"
 	if status == "timeout" {
@@ -682,10 +688,46 @@ func parseCompletion(stdout, stderr string) completionParse {
 			if summary, ok := parsed["summary"].(string); ok {
 				result.Summary = summary
 			}
+			if isTemplateCompletion(result, parsed) {
+				continue
+			}
 			return result
 		}
 	}
 	return completionParse{ParseStatus: "missing"}
+}
+
+func isTemplateCompletion(result completionParse, parsed map[string]any) bool {
+	if strings.TrimSpace(result.Summary) != "<one-sentence summary>" {
+		return false
+	}
+	if len(parsed) != 1 {
+		return false
+	}
+	_, ok := parsed["summary"]
+	return ok
+}
+
+func IsAgentSetupFailureMessage(message string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	if normalized == "" {
+		return false
+	}
+	patterns := []string{
+		"requires a newer version",
+		"please upgrade to the latest app or cli",
+		"unsupported model",
+		"unknown model",
+		"invalid model",
+		"model is not supported",
+		"unrecognized model",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(normalized, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func asStringSlice(value any) []string {

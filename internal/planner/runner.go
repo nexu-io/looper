@@ -161,6 +161,7 @@ type AgentResult struct {
 	Status  string
 	Summary string
 	Stdout  string
+	Stderr  string
 	Commits []string
 }
 
@@ -752,7 +753,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Planner agent "+result.Status), kind: FailureRetryableTransient}
+		message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
+		kind := FailureRetryableTransient
+		if agent.IsAgentSetupFailureMessage(message) {
+			kind = FailureManualIntervention
+		}
+		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...)}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"

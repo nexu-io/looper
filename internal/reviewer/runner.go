@@ -236,6 +236,7 @@ type AgentResult struct {
 	Status      string
 	Summary     string
 	Stdout      string
+	Stderr      string
 	ParseStatus string
 }
 
@@ -969,7 +970,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if result.Status != "completed" {
 		_ = r.tryRemoveReaction(ctx, input, "eyes")
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Reviewer agent %s", result.Status)), kind: FailureRetryableTransient}
+		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Reviewer agent %s", result.Status))
+		kind := FailureRetryableTransient
+		if agent.IsAgentSetupFailureMessage(message) {
+			kind = FailureManualIntervention
+		}
+		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	feedback := parseReviewFeedback(result)
 	if !feedback.Clean && len(feedback.Comments) == 0 {

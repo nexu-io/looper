@@ -1018,6 +1018,7 @@ type loopLogsAgentPayload struct {
 	LastHeartbeatAt *string `json:"lastHeartbeatAt"`
 	Summary         *string `json:"summary"`
 	ParseStatus     *string `json:"parseStatus"`
+	ErrorMessage    *string `json:"errorMessage"`
 	Stdout          string  `json:"stdout"`
 	Stderr          string  `json:"stderr"`
 }
@@ -3212,6 +3213,7 @@ func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRe
 				LastHeartbeatAt: latestAgent.LastHeartbeatAt,
 				Summary:         latestAgent.Summary,
 				ParseStatus:     latestAgent.ParseStatus,
+				ErrorMessage:    latestAgent.ErrorMessage,
 				Stdout:          stdout,
 				Stderr:          stderr,
 			}

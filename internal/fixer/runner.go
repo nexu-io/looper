@@ -216,6 +216,7 @@ type AgentResult struct {
 	Status      string
 	Summary     string
 	Stdout      string
+	Stderr      string
 	ParseStatus string
 }
 
@@ -968,7 +969,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Fixer agent "+result.Status), kind: FailureRetryableTransient}
+		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
+		kind := FailureRetryableTransient
+		if agent.IsAgentSetupFailureMessage(message) {
+			kind = FailureManualIntervention
+		}
+		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err

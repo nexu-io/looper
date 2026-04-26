@@ -140,12 +140,13 @@ type loopLogsOutput struct {
 		CurrentStep *string `json:"currentStep"`
 	} `json:"run"`
 	Agent *struct {
-		ExecutionID string `json:"executionId"`
-		Vendor      string `json:"vendor"`
-		PID         *int64 `json:"pid"`
-		Status      string `json:"status"`
-		Stdout      string `json:"stdout"`
-		Stderr      string `json:"stderr"`
+		ExecutionID  string  `json:"executionId"`
+		Vendor       string  `json:"vendor"`
+		PID          *int64  `json:"pid"`
+		Status       string  `json:"status"`
+		ErrorMessage *string `json:"errorMessage"`
+		Stdout       string  `json:"stdout"`
+		Stderr       string  `json:"stderr"`
 	} `json:"agent"`
 }
 
@@ -364,7 +365,15 @@ func writeHumanLoopLogsRunAgent(w io.Writer, data loopLogsOutput) error {
 	if data.Agent == nil {
 		return nil
 	}
-	_, err := fmt.Fprintf(w, "Agent: %s · pid %s · %s\n\n", data.Agent.Vendor, formatScalar(data.Agent.PID), data.Agent.Status)
+	if _, err := fmt.Fprintf(w, "Agent: %s · pid %s · %s\n", data.Agent.Vendor, formatScalar(data.Agent.PID), data.Agent.Status); err != nil {
+		return err
+	}
+	if data.Agent.ErrorMessage != nil && strings.TrimSpace(*data.Agent.ErrorMessage) != "" {
+		if _, err := fmt.Fprintf(w, "Error: %s\n", strings.TrimSpace(*data.Agent.ErrorMessage)); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(w)
 	return err
 }
 

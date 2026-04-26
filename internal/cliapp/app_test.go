@@ -560,6 +560,30 @@ func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	}
 }
 
+func TestLogsWithoutJSONPrintsAgentErrorMessage(t *testing.T) {
+	t.Parallel()
+
+	errorMessage := "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{"seq": 12, "loopId": "loop_1", "loopType": "fixer", "loopStatus": "failed", "run": map[string]any{"runId": "run_1", "currentStep": "repair", "status": "failed"}, "agent": map[string]any{"vendor": "codex", "status": "failed", "errorMessage": errorMessage, "stdout": "", "stderr": errorMessage}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--tail", "2", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --tail 2]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --tail 2]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Agent: codex", "Error: " + errorMessage, errorMessage} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 	t.Parallel()
 

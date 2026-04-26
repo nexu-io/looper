@@ -171,7 +171,7 @@ func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentRe
 	if err != nil {
 		return planner.AgentResult{}, err
 	}
-	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: result.Commits}, nil
+	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits}, nil
 }
 
 type reviewerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -270,7 +270,7 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 	if err != nil {
 		return reviewer.AgentResult{}, err
 	}
-	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus}, nil
+	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus}, nil
 }
 
 type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -365,7 +365,7 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 	if err != nil {
 		return fixer.AgentResult{}, err
 	}
-	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus}, nil
+	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus}, nil
 }
 
 type workerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -464,7 +464,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
 }
 
 func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {

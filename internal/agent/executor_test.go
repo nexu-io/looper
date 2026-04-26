@@ -170,6 +170,48 @@ func TestExecutorInvalidJSONCompletionPreservesSignalAndFallsBackToLogs(t *testi
 	}
 }
 
+func TestExecutorFailedCommandIgnoresEchoedTemplateCompletion(t *testing.T) {
+	t.Parallel()
+
+	realError := "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"<one-sentence summary>"}\n'; printf "$REAL_ERROR\n" >&2; exit 1`}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_failed_template", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, Env: map[string]string{"REAL_ERROR": realError}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result.Status = %q, want failed", result.Status)
+	}
+	if result.ParseStatus != "missing" || result.CompletionSignal != "" {
+		t.Fatalf("result = %#v, want failed command to ignore echoed completion marker", result)
+	}
+	if !strings.Contains(result.Summary, realError) || strings.Contains(result.Summary, "<one-sentence summary>") {
+		t.Fatalf("result.Summary = %q, want real stderr without template placeholder", result.Summary)
+	}
+}
+
+func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseCompletion(CompletionMarkerPrefix+`{"summary":"<one-sentence summary>"}`+"\nreal work\n", "")
+	if parsed.ParseStatus != "missing" || parsed.Summary != "" {
+		t.Fatalf("parseCompletion() = %#v, want template placeholder ignored", parsed)
+	}
+}
+
+func TestIsAgentSetupFailureMessageDetectsCodexModelCompatibility(t *testing.T) {
+	t.Parallel()
+
+	message := "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."
+	if !IsAgentSetupFailureMessage(message) {
+		t.Fatalf("IsAgentSetupFailureMessage(%q) = false, want true", message)
+	}
+}
+
 func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	t.Parallel()
 
