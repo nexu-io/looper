@@ -412,13 +412,14 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	Status       string           `json:"status,omitempty"`
-	Summary      string           `json:"summary,omitempty"`
-	ParseStatus  string           `json:"parseStatus,omitempty"`
-	ChangedFiles []string         `json:"changedFiles,omitempty"`
-	Commits      []string         `json:"commits,omitempty"`
-	Lifecycle    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	Stdout       string           `json:"stdout,omitempty"`
+	Status        string           `json:"status,omitempty"`
+	Summary       string           `json:"summary,omitempty"`
+	ParseStatus   string           `json:"parseStatus,omitempty"`
+	ChangedFiles  []string         `json:"changedFiles,omitempty"`
+	Commits       []string         `json:"commits,omitempty"`
+	Lifecycle     *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	Stdout        string           `json:"stdout,omitempty"`
+	GitReconciled bool             `json:"gitReconciled,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -917,13 +918,16 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 
 func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	if checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" {
+	executionCompleted := checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
+	if executionCompleted {
 		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
 			return checkpoint, err
 		}
-		return checkpoint, nil
+		if checkpoint.Execution.GitReconciled {
+			return checkpoint, nil
+		}
 	}
-	if !r.allowAutoCommit {
+	if !executionCompleted && !r.allowAutoCommit {
 		checkpoint.SkipReason = fmt.Sprintf("Auto commit disabled; manual execution required for worker %s", input.Loop.ID)
 		checkpoint.ResumePolicy = "manual_intervention"
 		return checkpoint, nil
@@ -936,40 +940,45 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
-	prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath))
-	if err != nil {
-		return checkpoint, err
-	}
-	executionID := eventlog.NewEventID("agent")
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
-	if err != nil {
-		return checkpoint, err
-	}
-	if r.onAgentExecutionStarted != nil {
-		_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
-	}
-	result, err := execution.Wait(ctx)
-	if err != nil {
-		return checkpoint, err
-	}
-	if result.Status != "completed" {
-		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
-		kind := FailureRetryableTransient
-		if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
+	if !executionCompleted {
+		prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath))
+		if err != nil {
+			return checkpoint, err
 		}
-		return checkpoint, &loopError{message: message, kind: kind}
+		executionID := eventlog.NewEventID("agent")
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		if err != nil {
+			return checkpoint, err
+		}
+		if r.onAgentExecutionStarted != nil {
+			_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
+		}
+		result, err := execution.Wait(ctx)
+		if err != nil {
+			return checkpoint, err
+		}
+		if result.Status != "completed" {
+			message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
+			kind := FailureRetryableTransient
+			if agent.IsAgentSetupFailureMessage(message) {
+				kind = FailureManualIntervention
+			}
+			return checkpoint, &loopError{message: message, kind: kind}
+		}
+		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout}
+		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
+		if result.Lifecycle != nil {
+			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
+		} else if len(result.Commits) > 0 {
+			checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, result.Commits...)
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+		}
 	}
-	if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
-		return checkpoint, err
-	}
-	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout}
-	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
-	if result.Lifecycle != nil {
-		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
-	} else if len(result.Commits) > 0 {
-		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, result.Commits...)
-		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if r.git != nil {
 		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
@@ -992,6 +1001,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 		}
 	}
+	checkpoint.Execution.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }

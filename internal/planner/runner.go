@@ -311,11 +311,12 @@ type checkpointWorktree struct {
 }
 
 type checkpointWriteSpec struct {
-	Status    string           `json:"status,omitempty"`
-	Summary   string           `json:"summary,omitempty"`
-	Stdout    string           `json:"stdout,omitempty"`
-	Commits   []string         `json:"commits,omitempty"`
-	Lifecycle *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	Status        string           `json:"status,omitempty"`
+	Summary       string           `json:"summary,omitempty"`
+	Stdout        string           `json:"stdout,omitempty"`
+	Commits       []string         `json:"commits,omitempty"`
+	Lifecycle     *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	GitReconciled bool             `json:"gitReconciled,omitempty"`
 }
 
 type checkpointPullRequest struct {
@@ -768,7 +769,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed") {
+	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
+	if writeSpecCompleted && checkpoint.WriteSpec.GitReconciled {
 		return checkpoint, nil
 	}
 	issue, err := requireIssue(checkpoint)
@@ -779,36 +781,41 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if err != nil {
 		return checkpoint, err
 	}
-	executionID := eventlog.NewEventID("agent")
-	prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
-	if err != nil {
-		return checkpoint, err
-	}
-	if r.onAgentExecutionStarted != nil {
-		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", issue.Repo, issue.IssueNumber), Body: fmt.Sprintf("Planner started for %s", issue.Title), DedupeKey: "runtime.agent.started:planner:" + input.Run.ID}); err != nil && r.logger != nil {
-			r.logger.Warn("planner agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
+	if !writeSpecCompleted {
+		executionID := eventlog.NewEventID("agent")
+		prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush)
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		if err != nil {
+			return checkpoint, err
+		}
+		if r.onAgentExecutionStarted != nil {
+			if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", issue.Repo, issue.IssueNumber), Body: fmt.Sprintf("Planner started for %s", issue.Title), DedupeKey: "runtime.agent.started:planner:" + input.Run.ID}); err != nil && r.logger != nil {
+				r.logger.Warn("planner agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
+			}
+		}
+		result, err := execution.Wait(ctx)
+		if err != nil {
+			return checkpoint, err
+		}
+		if !strings.EqualFold(result.Status, "completed") {
+			message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
+			kind := FailureRetryableTransient
+			if agent.IsAgentSetupFailureMessage(message) {
+				kind = FailureManualIntervention
+			}
+			return checkpoint, &loopError{message: message, kind: kind}
+		}
+		checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle}
+		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+		if result.Lifecycle != nil {
+			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
+		} else if len(result.Commits) > 0 {
+			checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, result.Commits...)
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
 		}
 	}
-	result, err := execution.Wait(ctx)
-	if err != nil {
-		return checkpoint, err
-	}
-	if !strings.EqualFold(result.Status, "completed") {
-		message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
-		kind := FailureRetryableTransient
-		if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
-		}
-		return checkpoint, &loopError{message: message, kind: kind}
-	}
-	checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle}
-	checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
-	if result.Lifecycle != nil {
-		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
-	} else if len(result.Commits) > 0 {
-		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, result.Commits...)
-		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
+		return checkpoint, wrapRetryableAfterResume(err)
 	}
 	if r.git != nil {
 		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
@@ -831,6 +838,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 		}
 	}
+	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }

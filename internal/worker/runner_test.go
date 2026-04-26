@@ -1522,6 +1522,55 @@ func TestRunValidationReturnsCommandFailureOutput(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemExecuteResumeDoesNotRerunAgentAfterTransientInspectFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"},
+		inspectErrors: []error{fmt.Errorf("temporary inspect failure")},
+	}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	first, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable_after_resume failure", first)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts after first attempt = %d, want 1", len(agent.starts))
+	}
+
+	fixture.advance(5 * time.Second)
+	retryClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || retryClaim == nil {
+		t.Fatalf("ClaimNextOfType(retry) = (%#v, %v), want claimed item", retryClaim, err)
+	}
+	second, err := runner.ProcessClaimedItem(context.Background(), *retryClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(second) error = %v", err)
+	}
+	if second.Status != "success" {
+		t.Fatalf("second = %#v, want success", second)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want 1", len(git.pushCalls))
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 1", len(github.createPRCalls))
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
@@ -1668,6 +1717,8 @@ type fakeGitGateway struct {
 	createResult  CreateWorktreeResult
 	prepareResult PrepareWorktreeResult
 	inspectResult InspectHeadResult
+	inspectErrors []error
+	inspectIndex  int
 	commitResult  CommitResult
 	createCalls   []CreateWorktreeInput
 	pushCalls     []PushInput
@@ -1693,6 +1744,12 @@ func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktre
 
 func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) (InspectHeadResult, error) {
 	f.inspectCalls = append(f.inspectCalls, input)
+	if f.inspectIndex < len(f.inspectErrors) && f.inspectErrors[f.inspectIndex] != nil {
+		err := f.inspectErrors[f.inspectIndex]
+		f.inspectIndex++
+		return InspectHeadResult{}, err
+	}
+	f.inspectIndex++
 	return f.inspectResult, nil
 }
 
