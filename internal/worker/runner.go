@@ -1897,14 +1897,17 @@ func buildWorkerFallbackCommitMessage(work workerInput) string {
 }
 
 func (r *Runner) renamePlannerSpecPullRequestAfterTakeover(ctx context.Context, work workerInput, cwd string) error {
-	if r.github == nil || work.ExecutionMode != "push-existing" || work.PRNumber <= 0 || !isPlannerSpecPullRequestTitle(work.PRTitle) {
+	if r.github == nil || work.ExecutionMode != "push-existing" || work.PRNumber <= 0 {
 		return nil
 	}
 	current, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
-	if !isPlannerSpecPullRequestTitle(current.Title) || strings.TrimSpace(current.Title) != strings.TrimSpace(work.PRTitle) {
+	if !isPlannerSpecPullRequestTitle(current.Title) {
+		return nil
+	}
+	if work.PRTitle != "" && strings.TrimSpace(current.Title) != strings.TrimSpace(work.PRTitle) {
 		return nil
 	}
 	work.PRTitle = current.Title

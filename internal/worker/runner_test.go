@@ -1431,6 +1431,26 @@ func TestProcessClaimedItemRenamesPlannerSpecPRAfterPushExistingTakeover(t *test
 	}
 }
 
+func TestRenamePlannerSpecPullRequestAfterTakeoverBackfillsMissingCheckpointTitle(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Title: "Spec: Add login flow", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{GitHub: github})
+	work := workerInput{Title: "Implement login flow", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "push-existing", PRNumber: 42}
+
+	if err := runner.renamePlannerSpecPullRequestAfterTakeover(context.Background(), work, ""); err != nil {
+		t.Fatalf("renamePlannerSpecPullRequestAfterTakeover() error = %v", err)
+	}
+	if len(github.viewPRCalls) != 1 {
+		t.Fatalf("len(github.viewPRCalls) = %d, want 1", len(github.viewPRCalls))
+	}
+	if len(github.updatePRTitleCalls) != 1 {
+		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 1", len(github.updatePRTitleCalls))
+	}
+	if got := github.updatePRTitleCalls[0].Title; got != "Implement login flow" {
+		t.Fatalf("updated title = %q, want worker title", got)
+	}
+}
+
 func TestProcessClaimedItemPreservesHumanEditedPRAfterPushExistingTakeover(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
