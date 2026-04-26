@@ -107,11 +107,6 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact-name: looper-darwin-arm64
-          - target: darwin-x64
-            runner: macos-13
-            goos: darwin
-            goarch: amd64
-            artifact-name: looper-darwin-x64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -179,11 +174,6 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact-name: looperd-darwin-arm64
-          - target: darwin-x64
-            runner: macos-13
-            goos: darwin
-            goarch: amd64
-            artifact-name: looperd-darwin-x64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -261,12 +251,8 @@ jobs:
         run: |
           test -f release-assets/looper-darwin-arm64
           test -f release-assets/looper-darwin-arm64.sha256
-          test -f release-assets/looper-darwin-x64
-          test -f release-assets/looper-darwin-x64.sha256
           test -f release-assets/looperd-darwin-arm64
           test -f release-assets/looperd-darwin-arm64.sha256
-          test -f release-assets/looperd-darwin-x64
-          test -f release-assets/looperd-darwin-x64.sha256
 
       - name: Verify Linux artifacts are not published in Phase 1
         run: |
@@ -286,7 +272,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64,looper-darwin-x64,looperd-darwin-arm64,looperd-darwin-x64" \
+            -required-assets "looper-darwin-arm64,looperd-darwin-arm64" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -314,9 +300,7 @@ jobs:
           assert m["minDaemonForCli"], "minDaemonForCli missing"
           required = {
               "looper-darwin-arm64",
-              "looper-darwin-x64",
               "looperd-darwin-arm64",
-              "looperd-darwin-x64",
           }
           assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
           for name in required:
@@ -337,10 +321,6 @@ jobs:
           files: |
             release-assets/looper-darwin-arm64
             release-assets/looper-darwin-arm64.sha256
-            release-assets/looper-darwin-x64
-            release-assets/looper-darwin-x64.sha256
             release-assets/looperd-darwin-arm64
             release-assets/looperd-darwin-arm64.sha256
-            release-assets/looperd-darwin-x64
-            release-assets/looperd-darwin-x64.sha256
             release-assets/manifest.json
