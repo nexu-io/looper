@@ -1060,9 +1060,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if err := r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
+		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
 			_ = r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: work.Repo, PRNumber: work.PRNumber, Reviewers: append([]string(nil), work.Reviewers...), CWD: input.Project.RepoPath})
 		}
@@ -1906,7 +1904,7 @@ func (r *Runner) renamePlannerSpecPullRequestAfterTakeover(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if !isPlannerSpecPullRequestTitle(current.Title) {
+	if !isPlannerSpecPullRequestTitle(current.Title) || strings.TrimSpace(current.Title) != strings.TrimSpace(work.PRTitle) {
 		return nil
 	}
 	work.PRTitle = current.Title
