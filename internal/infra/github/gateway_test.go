@@ -59,6 +59,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "pr create --repo acme/looper --head feature --base main --title Add support --body Body":
 			return shell.Result{Stdout: "https://example.test/pull/88\n"}, nil
+		case args == "pr edit 42 --repo acme/looper --title Implement support":
+			return shell.Result{Stdout: ""}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -119,6 +121,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	created, err := gateway.CreatePullRequest(context.Background(), CreatePullRequestInput{Repo: "acme/looper", HeadBranch: "feature", BaseBranch: "main", Title: "Add support", Body: "Body"})
 	if err != nil {
 		t.Fatalf("CreatePullRequest() error = %v", err)
+	}
+	if err := gateway.UpdatePullRequestTitle(context.Background(), UpdatePullRequestTitleInput{Repo: "acme/looper", PRNumber: 42, Title: "Implement support"}); err != nil {
+		t.Fatalf("UpdatePullRequestTitle() error = %v", err)
 	}
 	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
 	if err != nil {

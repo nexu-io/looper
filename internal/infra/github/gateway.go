@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -162,6 +163,13 @@ type CreatePullRequestInput struct {
 type CreatePullRequestResult struct {
 	Number int64
 	URL    string
+}
+
+type UpdatePullRequestTitleInput struct {
+	Repo     string
+	PRNumber int64
+	Title    string
+	CWD      string
 }
 
 type ListOpenPullRequestsInput struct {
@@ -558,6 +566,11 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 		return CreatePullRequestResult{}, &shell.CommandExecutionError{Message: "gh pr create returned an empty URL", Result: result}
 	}
 	return CreatePullRequestResult{Number: parsePRNumberFromURL(prURL), URL: prURL}, nil
+}
+
+func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
+	return err
 }
 
 func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bool, error) {

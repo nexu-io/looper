@@ -1394,6 +1394,151 @@ func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemRenamesPlannerSpecPRAfterPushExistingTakeover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_pr"
+	payload := `{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-42", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Title: "Spec: Add login flow", Body: "## Summary\n\nSpec: specs/login/spec.md", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	claim, _ = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-2", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 42 {
+		t.Fatalf("result = %#v, want success with PR 42", result)
+	}
+	if len(github.updatePRTitleCalls) != 1 {
+		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 1", len(github.updatePRTitleCalls))
+	}
+	if got := github.updatePRTitleCalls[0].Title; got != "Implement login flow" {
+		t.Fatalf("updated title = %q, want worker title", got)
+	}
+}
+
+func TestProcessClaimedItemPreservesHumanEditedPRAfterPushExistingTakeover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_pr"
+	payload := `{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-42", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Title: "Human-written implementation title", Body: "## Summary\n\nSpec: specs/login/spec.md", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	claim, _ = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-2", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 42 {
+		t.Fatalf("result = %#v, want success with PR 42", result)
+	}
+	if len(github.updatePRTitleCalls) != 0 {
+		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 0", len(github.updatePRTitleCalls))
+	}
+}
+
+func TestProcessClaimedItemPreservesPRTitleEditedDuringTakeover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_pr"
+	payload := `{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-42", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetailResponses: []PullRequestDetail{
+		{Number: 42, Title: "Spec: Add login flow", Body: "## Summary\n\nSpec: specs/login/spec.md", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"},
+		{Number: 42, Title: "Human edit while worker runs", Body: "## Summary\n\nSpec: specs/login/spec.md", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	claim, _ = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-2", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 42 {
+		t.Fatalf("result = %#v, want success with PR 42", result)
+	}
+	if len(github.viewPRCalls) != 2 {
+		t.Fatalf("len(github.viewPRCalls) = %d, want re-fetch before rename", len(github.viewPRCalls))
+	}
+	if len(github.updatePRTitleCalls) != 0 {
+		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 0", len(github.updatePRTitleCalls))
+	}
+}
+
+func TestProcessClaimedItemDoesNotRenamePlannerSpecPRWhenPushFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_pr"
+	payload := `{"title":"Implement login flow","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-42", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}, pushErrors: []error{errors.New("push failed")}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Title: "Spec: Add login flow", Body: "## Summary\n\nSpec: specs/login/spec.md", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	claim, _ = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-2", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("result = %#v, want retryable failure", result)
+	}
+	if len(github.updatePRTitleCalls) != 0 {
+		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 0", len(github.updatePRTitleCalls))
+	}
+}
+
 func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1625,7 +1770,10 @@ type fakeGitHubGateway struct {
 	openPRResponses         [][]PullRequestSummary
 	openPRIndex             int
 	prDetail                PullRequestDetail
+	prDetailResponses       []PullRequestDetail
+	viewPRIndex             int
 	issueDetail             IssueDetail
+	viewPRCalls             []ViewPullRequestInput
 	viewIssueCalls          []ViewIssueInput
 	createIssueCommentCalls []IssueCommentInput
 	updateIssueCommentCalls []UpdateIssueCommentInput
@@ -1633,6 +1781,7 @@ type fakeGitHubGateway struct {
 	createPRResult          CreatePullRequestResult
 	createPRErrors          []error
 	createPRCalls           []CreatePullRequestInput
+	updatePRTitleCalls      []UpdatePullRequestTitleInput
 	removeLabels            []PullRequestLabelsInput
 	reviewerCalls           []PullRequestReviewersInput
 	createPRIndex           int
@@ -1648,7 +1797,12 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRe
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	f.viewPRCalls = append(f.viewPRCalls, input)
 	detail := f.prDetail
+	if f.viewPRIndex < len(f.prDetailResponses) {
+		detail = f.prDetailResponses[f.viewPRIndex]
+	}
+	f.viewPRIndex++
 	if detail.Number == 0 {
 		detail.Number = input.PRNumber
 	}
@@ -1701,6 +1855,11 @@ func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePul
 	}
 	f.createPRIndex++
 	return f.createPRResult, nil
+}
+
+func (f *fakeGitHubGateway) UpdatePullRequestTitle(_ context.Context, input UpdatePullRequestTitleInput) error {
+	f.updatePRTitleCalls = append(f.updatePRTitleCalls, input)
+	return nil
 }
 
 func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {

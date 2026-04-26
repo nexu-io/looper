@@ -124,6 +124,13 @@ type CreatePullRequestResult struct {
 	URL    string
 }
 
+type UpdatePullRequestTitleInput struct {
+	Repo     string
+	PRNumber int64
+	Title    string
+	CWD      string
+}
+
 type PullRequestLabelsInput struct {
 	Repo     string
 	PRNumber int64
@@ -164,6 +171,7 @@ type GitHubGateway interface {
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
+	UpdatePullRequestTitle(context.Context, UpdatePullRequestTitleInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
 }
@@ -371,6 +379,7 @@ type workerInput struct {
 	IssueNumber   int64    `json:"issueNumber,omitempty"`
 	IssueURL      string   `json:"issueUrl,omitempty"`
 	PRNumber      int64    `json:"prNumber,omitempty"`
+	PRTitle       string   `json:"prTitle,omitempty"`
 	Branch        string   `json:"branch,omitempty"`
 	HeadSHA       string   `json:"headSha,omitempty"`
 	Reviewers     []string `json:"reviewers,omitempty"`
@@ -1051,6 +1060,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
+		if err := r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
 			_ = r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: work.Repo, PRNumber: work.PRNumber, Reviewers: append([]string(nil), work.Reviewers...), CWD: input.Project.RepoPath})
 		}
@@ -1185,7 +1197,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		if err != nil {
 			return workerInput{}, err
 		}
-		work.Title = firstNonEmpty(detail.Title, work.Title)
+		work.PRTitle = detail.Title
 		work.Repo = repo
 		work.PRNumber = prNumber
 		work.BaseBranch = firstNonEmpty(detail.BaseRefName, work.BaseBranch)
@@ -1886,6 +1898,47 @@ func buildWorkerFallbackCommitMessage(work workerInput) string {
 	return fmt.Sprintf("worker: %s", title)
 }
 
+func (r *Runner) renamePlannerSpecPullRequestAfterTakeover(ctx context.Context, work workerInput, cwd string) error {
+	if r.github == nil || work.ExecutionMode != "push-existing" || work.PRNumber <= 0 || !isPlannerSpecPullRequestTitle(work.PRTitle) {
+		return nil
+	}
+	current, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
+	if err != nil {
+		return err
+	}
+	if !isPlannerSpecPullRequestTitle(current.Title) {
+		return nil
+	}
+	work.PRTitle = current.Title
+	title := implementationPullRequestTitle(work)
+	if title == "" || title == strings.TrimSpace(current.Title) {
+		return nil
+	}
+	return r.github.UpdatePullRequestTitle(ctx, UpdatePullRequestTitleInput{Repo: work.Repo, PRNumber: work.PRNumber, Title: title, CWD: cwd})
+}
+
+func isPlannerSpecPullRequestTitle(title string) bool {
+	title = strings.TrimSpace(title)
+	return strings.HasPrefix(strings.ToLower(title), "spec:")
+}
+
+func implementationPullRequestTitle(work workerInput) string {
+	title := strings.TrimSpace(work.Title)
+	if title != "" && !isPlannerSpecPullRequestTitle(title) && title != "Worker run" {
+		return title
+	}
+	prTitle := strings.TrimSpace(work.PRTitle)
+	if len(prTitle) >= len("Spec:") && strings.EqualFold(prTitle[:len("Spec:")], "Spec:") {
+		if stripped := strings.TrimSpace(prTitle[len("Spec:"):]); stripped != "" {
+			return stripped
+		}
+	}
+	if stripped := strings.TrimSpace(strings.TrimPrefix(prTitle, "Spec:")); stripped != "" {
+		return stripped
+	}
+	return title
+}
+
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool) (string, error) {
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
@@ -1939,6 +1992,9 @@ func buildAgentPullRequestInstruction(work workerInput) string {
 	}
 	if work.IssueNumber > 0 {
 		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
+	}
+	if work.ExecutionMode == "push-existing" {
+		parts = append(parts, "If the existing PR title still has the planner/spec-generated `Spec: ...` format after implementation is pushed, rename it to an implementation-oriented title; preserve human-edited titles.")
 	}
 	return strings.Join(parts, "\n")
 }
