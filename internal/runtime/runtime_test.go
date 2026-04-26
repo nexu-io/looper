@@ -355,6 +355,39 @@ func TestBuildRecoveryQueueItemRecordUsesIssueLockForWorkerTargets(t *testing.T)
 	}
 }
 
+func TestBuildRecoveryQueueItemPreservesManualPlannerPayload(t *testing.T) {
+	t.Parallel()
+
+	loop := storage.LoopRecord{
+		ID:           "loop_planner_manual",
+		ProjectID:    "project_1",
+		Type:         "planner",
+		TargetType:   "issue",
+		TargetID:     stringPtr("issue:acme/looper:82"),
+		Repo:         stringPtr("acme/looper"),
+		Status:       "queued",
+		MetadataJSON: stringPtr(`{"issueNumber":82,"manual":true}`),
+	}
+
+	record, ok, err := buildRecoveryQueueItem(loop, "2026-04-17T12:34:56.000Z", 3)
+	if err != nil {
+		t.Fatalf("buildRecoveryQueueItem() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("buildRecoveryQueueItem() ok = false, want true")
+	}
+	if record.PayloadJSON == nil {
+		t.Fatal("record.PayloadJSON = nil, want manual planner payload")
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal([]byte(*record.PayloadJSON), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(payload) error = %v", err)
+	}
+	if payload["manual"] != true || payload["issueNumber"] != float64(82) {
+		t.Fatalf("payload = %#v, want manual planner issue payload", payload)
+	}
+}
+
 func TestRuntimeStartConfiguresDefaultSchedulerTickAtStartup(t *testing.T) {
 	t.Parallel()
 

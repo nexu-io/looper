@@ -916,7 +916,11 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			return storage.QueueItemRecord{}, false, err
 		}
 		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
-		payloadJSON := fmt.Sprintf(`{"issueNumber":%d}`, issueNumber)
+		payload := map[string]any{"issueNumber": issueNumber}
+		if recoveryLoopHasManualPlannerMetadata(loop.MetadataJSON) {
+			payload["manual"] = true
+		}
+		payloadJSON := mustMarshalJSON(payload)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
 		queueRecord.TargetID = lockKey
 		queueRecord.Repo = &repo
@@ -993,6 +997,18 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 	}
 
 	return queueRecord, true, nil
+}
+
+func recoveryLoopHasManualPlannerMetadata(metadataJSON *string) bool {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return false
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return false
+	}
+	manual, ok := metadata["manual"].(bool)
+	return ok && manual
 }
 
 func buildRecoveryWorkerPayloadJSON(metadataJSON *string) *string {

@@ -542,7 +542,7 @@
           "prNumber": null,
           "status": "running",
           "configJson": null,
-          "metadataJson": "{\"issueNumber\":77}",
+          "metadataJson": "{\"issueNumber\":77,\"manual\":true}",
           "lastRunAt": null,
           "nextRunAt": "<generated-timestamp>",
           "createdAt": "<generated-timestamp>",

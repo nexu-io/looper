@@ -2360,6 +2360,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if domain.LoopType(loopType) == domain.LoopTypePlanner {
+		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 
 	now := h.now().UTC()
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
@@ -2731,7 +2737,11 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
-	metadataJSON := fmt.Sprintf(`{"issueNumber":%d}`, *issueNumber)
+	metadataJSONPtr, err := manualPlannerMetadataJSON(nil, *issueNumber)
+	if err != nil {
+		return plannerCreateResponse{}, err
+	}
+	metadataJSON := derefString(metadataJSONPtr)
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -2769,7 +2779,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, upsertErr
 		}
 
-		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, nil, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 		if queueErr != nil {
 			return storage.LoopRecord{}, queueErr
 		}
@@ -3317,6 +3327,23 @@ func normalizeMetadataJSON(raw json.RawMessage) (*string, error) {
 	return &text, nil
 }
 
+func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, error) {
+	metadata := map[string]any{}
+	if existing != nil && strings.TrimSpace(*existing) != "" {
+		if err := json.Unmarshal([]byte(*existing), &metadata); err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "metadata must be a JSON object"}
+		}
+	}
+	metadata["issueNumber"] = issueNumber
+	metadata["manual"] = true
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	text := string(encoded)
+	return &text, nil
+}
+
 func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.LoopTarget, nowISO string, metadataJSON *string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {
 	queueType := domain.LoopType(record.Type)
 	if queueType != domain.LoopTypeReviewer && queueType != domain.LoopTypeFixer && queueType != domain.LoopTypeWorker && queueType != domain.LoopTypePlanner {
@@ -3350,7 +3377,21 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
 		}
 		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
-		payloadJSON := fmt.Sprintf(`{"issueNumber":%d}`, issueNumber)
+		manual := false
+		if metadata := parseJSONObject(metadataJSON); metadata["manual"] == true {
+			if boolValue, ok := metadata["manual"].(bool); ok {
+				manual = boolValue
+			}
+		}
+		payload := map[string]any{"issueNumber": issueNumber}
+		if manual {
+			payload["manual"] = true
+		}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return storage.QueueItemRecord{}, false, err
+		}
+		payloadJSON := string(payloadBytes)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
 		queueRecord.TargetID = lockKey
 		queueRecord.Repo = &repo

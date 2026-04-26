@@ -2055,6 +2055,9 @@ func TestHandlerCreateLoopPlannerEnqueuesSchedulableLoop(t *testing.T) {
 	data := resp["data"].(map[string]any)
 	loopID := data["id"].(string)
 	assertEqual(t, data["status"], "running")
+	metadata := parseJSONMap(t, []byte(data["metadataJson"].(string)))
+	assertEqual(t, metadata["manual"], true)
+	assertEqual(t, metadata["issueNumber"], float64(123))
 
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
@@ -2075,6 +2078,9 @@ func TestHandlerCreateLoopPlannerEnqueuesSchedulableLoop(t *testing.T) {
 	assertEqual(t, queue.TargetType, "issue")
 	assertEqual(t, queue.TargetID, "issue:acme/looper:123")
 	assertEqual(t, queue.DedupeKey, "planner:project_1:"+loopID+":acme/looper:123")
+	payload := parseJSONMap(t, []byte(*queue.PayloadJSON))
+	assertEqual(t, payload["manual"], true)
+	assertEqual(t, payload["issueNumber"], float64(123))
 	assertEqual(t, triggered, 1)
 }
 
