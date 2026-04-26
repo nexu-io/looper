@@ -13,6 +13,7 @@ import (
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -60,6 +61,7 @@ type Result struct {
 	Artifacts        []string
 	ChangedFiles     []string
 	Commits          []string
+	Lifecycle        *lifecycle.State
 	HeartbeatCount   int64
 	PID              int
 }
@@ -71,6 +73,7 @@ type completionParse struct {
 	Artifacts        []string
 	ChangedFiles     []string
 	Commits          []string
+	Lifecycle        *lifecycle.State
 }
 
 type Execution interface {
@@ -329,6 +332,7 @@ func (x *execution) run(ctx context.Context) {
 		Artifacts:        append([]string(nil), completion.Artifacts...),
 		ChangedFiles:     append([]string(nil), completion.ChangedFiles...),
 		Commits:          append([]string(nil), completion.Commits...),
+		Lifecycle:        completion.Lifecycle,
 		HeartbeatCount:   x.heartbeatCountValue(),
 		PID:              pidOrZero(x.process.Process),
 	}
@@ -428,7 +432,7 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	}
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	metadata := mustJSON(map[string]any{"idempotencyKey": emptyToNil(x.input.IdempotencyKey), "metadata": x.input.Metadata})
-	outputJSON := mustJSON(map[string]string{"stdout": result.Stdout, "stderr": result.Stderr})
+	outputJSON := mustJSON(map[string]any{"stdout": result.Stdout, "stderr": result.Stderr, "gitPrLifecycle": result.Lifecycle})
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
@@ -684,6 +688,11 @@ func parseCompletion(stdout, stderr string) completionParse {
 				Artifacts:        asStringSlice(parsed["artifacts"]),
 				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
 				Commits:          asStringSlice(parsed["commits"]),
+			}
+			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
+				result.Lifecycle = state
+			} else {
+				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 			}
 			if summary, ok := parsed["summary"].(string); ok {
 				result.Summary = summary

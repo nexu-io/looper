@@ -89,7 +89,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"]}\n'`}}},
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/powerformer/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
 		Repos:  repos,
 		Now: func() time.Time {
 			now = now.Add(10 * time.Millisecond)
@@ -114,6 +114,9 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	}
 	if len(result.Artifacts) != 1 || result.Artifacts[0] != "spec.md" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "main.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
 		t.Fatalf("result parsed fields = %#v, want artifacts/changedFiles/commits", result)
+	}
+	if result.Lifecycle == nil || result.Lifecycle.Branch != "looper/test" || result.Lifecycle.PRNumber != 84 || result.Lifecycle.Actions.Commit != "agent" {
+		t.Fatalf("result lifecycle = %#v, want parsed git_pr_lifecycle", result.Lifecycle)
 	}
 
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_1")

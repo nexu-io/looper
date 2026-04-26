@@ -1395,6 +1395,22 @@ func (g smokeGitGateway) PrepareWorktree(ctx context.Context, input worker.Prepa
 	return worker.PrepareWorktreeResult{HeadSHA: prepared.HeadSHA, Clean: prepared.Clean}, nil
 }
 
+func (g smokeGitGateway) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
+	result, err := g.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	if err != nil {
+		return worker.InspectHeadResult{}, err
+	}
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+}
+
+func (g smokeGitGateway) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
+	result, err := g.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	if err != nil {
+		return worker.CommitResult{}, err
+	}
+	return worker.CommitResult{CommitSHA: result.CommitSHA}, nil
+}
+
 func (g smokeGitGateway) Push(ctx context.Context, input worker.PushInput) error {
 	return g.gateway.Push(ctx, gitinfra.PushInput{
 		WorktreePath:      input.WorktreePath,

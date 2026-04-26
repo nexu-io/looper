@@ -21,6 +21,7 @@ import (
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -205,9 +206,30 @@ type PushInput struct {
 	ProtectedBranches []string
 }
 
+type InspectHeadInput struct {
+	WorktreePath string
+	BaseRef      string
+}
+
+type InspectHeadResult struct {
+	HeadSHA               string
+	NewCommitSHAs         []string
+	HasUncommittedChanges bool
+	ChangedFiles          []string
+}
+
+type CommitInput struct {
+	WorktreePath string
+	Message      string
+}
+
+type CommitResult struct{ CommitSHA string }
+
 type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
 	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
+	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
+	Commit(context.Context, CommitInput) (CommitResult, error)
 	Push(context.Context, PushInput) error
 }
 
@@ -231,6 +253,7 @@ type AgentResult struct {
 	ParseStatus  string
 	ChangedFiles []string
 	Commits      []string
+	Lifecycle    *lifecycle.State
 }
 
 type AgentExecution interface {
@@ -361,6 +384,7 @@ type workerCheckpoint struct {
 	Worktree       *checkpointWorktree   `json:"worktree,omitempty"`
 	Plan           *checkpointPlan       `json:"plan,omitempty"`
 	Execution      *checkpointExecution  `json:"execution,omitempty"`
+	Lifecycle      *lifecycle.State      `json:"gitPrLifecycle,omitempty"`
 	Validation     *ValidationResult     `json:"validation,omitempty"`
 	PullRequest    *checkpointPullPR     `json:"pullRequest,omitempty"`
 	SkipReason     string                `json:"skipReason,omitempty"`
@@ -388,12 +412,13 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	Status       string   `json:"status,omitempty"`
-	Summary      string   `json:"summary,omitempty"`
-	ParseStatus  string   `json:"parseStatus,omitempty"`
-	ChangedFiles []string `json:"changedFiles,omitempty"`
-	Commits      []string `json:"commits,omitempty"`
-	Stdout       string   `json:"stdout,omitempty"`
+	Status       string           `json:"status,omitempty"`
+	Summary      string           `json:"summary,omitempty"`
+	ParseStatus  string           `json:"parseStatus,omitempty"`
+	ChangedFiles []string         `json:"changedFiles,omitempty"`
+	Commits      []string         `json:"commits,omitempty"`
+	Lifecycle    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	Stdout       string           `json:"stdout,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -864,6 +889,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
 	}
 	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA}
+	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", work.ExecutionMode == "create-pr"), created.Branch, baseBranch)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -937,7 +963,35 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
 	}
-	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
+	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout}
+	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
+	if result.Lifecycle != nil {
+		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
+	} else if len(result.Commits) > 0 {
+		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, result.Commits...)
+		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+	}
+	if r.git != nil {
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if inspect.HasUncommittedChanges {
+			committed, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work)})
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if committed.CommitSHA != "" {
+				checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, committed.CommitSHA)
+			}
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
+		} else if len(inspect.NewCommitSHAs) > 0 {
+			checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+			if checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+				checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+			}
+		}
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -991,6 +1045,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
 		checkpoint.PullRequest = &checkpointPullPR{Number: work.PRNumber, URL: prURL}
+		checkpoint.markLifecyclePushAndPR(firstNonEmpty(work.Branch, worktree.Branch), work.BaseBranch, work.PRNumber, prURL, true, false)
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -1020,6 +1075,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, err
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
+		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -1033,6 +1089,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, err
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
+		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -1050,6 +1107,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, err
 	}
 	checkpoint.PullRequest = &pr
+	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
@@ -1175,7 +1233,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed {
 		if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
@@ -1770,8 +1828,51 @@ func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
 	return *checkpoint.Worktree, nil
 }
 
+func (c *workerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, expectPR bool) {
+	if c.Lifecycle == nil {
+		c.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy(runner, expectPR), branch, baseBranch)
+		return
+	}
+	c.Lifecycle.Normalize()
+	if c.Lifecycle.Branch == "" {
+		c.Lifecycle.Branch = strings.TrimSpace(branch)
+	}
+	if c.Lifecycle.BaseBranch == "" {
+		c.Lifecycle.BaseBranch = strings.TrimSpace(baseBranch)
+	}
+}
+
+func (c *workerCheckpoint) markLifecyclePushAndPR(branch, baseBranch string, prNumber int64, prURL string, pushed, adopted bool) {
+	c.ensureLifecycle("worker", branch, baseBranch, true)
+	c.Lifecycle.Pushed = c.Lifecycle.Pushed || pushed
+	if pushed {
+		c.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
+	}
+	if prNumber > 0 {
+		c.Lifecycle.PRNumber = prNumber
+	}
+	if prURL != "" {
+		c.Lifecycle.PRURL = prURL
+	}
+	if adopted {
+		c.Lifecycle.PRAdopted = true
+	}
+	if prNumber > 0 || prURL != "" {
+		c.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
+	}
+	c.Lifecycle.Normalize()
+}
+
 func buildIssueLockKey(repo string, issueNumber int64) string {
 	return fmt.Sprintf("issue:%s:%d", strings.TrimSpace(repo), issueNumber)
+}
+
+func buildWorkerFallbackCommitMessage(work workerInput) string {
+	title := strings.TrimSpace(work.Title)
+	if title == "" {
+		title = "worker run"
+	}
+	return fmt.Sprintf("worker: %s", title)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool) (string, error) {
@@ -1804,6 +1905,7 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 	} else {
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 	}
+	parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, allowAgentPRCreation, allowAgentPRCreation))
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), nil
 }
 
@@ -2066,6 +2168,22 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return result
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	seen := map[string]bool{}
+	for _, value := range dst {
+		seen[value] = true
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		dst = append(dst, value)
+	}
+	return dst
 }
 
 func stringSliceFromAny(value any) []string {

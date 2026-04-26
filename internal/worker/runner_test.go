@@ -1640,9 +1640,13 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 type fakeGitGateway struct {
 	createResult  CreateWorktreeResult
 	prepareResult PrepareWorktreeResult
+	inspectResult InspectHeadResult
+	commitResult  CommitResult
 	createCalls   []CreateWorktreeInput
 	pushCalls     []PushInput
 	prepareCalls  []PrepareWorktreeInput
+	inspectCalls  []InspectHeadInput
+	commitCalls   []CommitInput
 	pushErrors    []error
 	pushIndex     int
 }
@@ -1658,6 +1662,19 @@ func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktre
 		return PrepareWorktreeResult{HeadSHA: "abc123", Clean: true}, nil
 	}
 	return f.prepareResult, nil
+}
+
+func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) (InspectHeadResult, error) {
+	f.inspectCalls = append(f.inspectCalls, input)
+	return f.inspectResult, nil
+}
+
+func (f *fakeGitGateway) Commit(_ context.Context, input CommitInput) (CommitResult, error) {
+	f.commitCalls = append(f.commitCalls, input)
+	if f.commitResult.CommitSHA == "" {
+		return CommitResult{CommitSHA: "fallback123"}, nil
+	}
+	return f.commitResult, nil
 }
 
 func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {

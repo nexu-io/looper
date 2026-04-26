@@ -650,9 +650,13 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 }
 
 type fakeGitGateway struct {
-	createResult CreateWorktreeResult
-	createCalls  []CreateWorktreeInput
-	pushCalls    []PushInput
+	createResult  CreateWorktreeResult
+	inspectResult InspectHeadResult
+	commitResult  CommitResult
+	createCalls   []CreateWorktreeInput
+	inspectCalls  []InspectHeadInput
+	commitCalls   []CommitInput
+	pushCalls     []PushInput
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -673,6 +677,19 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 	f.pushCalls = append(f.pushCalls, input)
 	return nil
+}
+
+func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) (InspectHeadResult, error) {
+	f.inspectCalls = append(f.inspectCalls, input)
+	return f.inspectResult, nil
+}
+
+func (f *fakeGitGateway) Commit(_ context.Context, input CommitInput) (CommitResult, error) {
+	f.commitCalls = append(f.commitCalls, input)
+	if f.commitResult.CommitSHA == "" {
+		return CommitResult{CommitSHA: "fallback123"}, nil
+	}
+	return f.commitResult, nil
 }
 
 type fakeAgentExecutor struct {

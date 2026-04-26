@@ -151,6 +151,22 @@ func (a plannerGitAdapter) CreateWorktree(ctx context.Context, input planner.Cre
 	return planner.CreateWorktreeResult{ID: worktree.ID, WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, BaseBranch: derefString(worktree.BaseBranch)}, nil
 }
 
+func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.InspectHeadInput) (planner.InspectHeadResult, error) {
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	if err != nil {
+		return planner.InspectHeadResult{}, err
+	}
+	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+}
+
+func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	if err != nil {
+		return planner.CommitResult{}, err
+	}
+	return planner.CommitResult{CommitSHA: result.CommitSHA}, nil
+}
+
 func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) error {
 	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
@@ -171,7 +187,7 @@ func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentRe
 	if err != nil {
 		return planner.AgentResult{}, err
 	}
-	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits}, nil
+	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle}, nil
 }
 
 type reviewerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -365,7 +381,7 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 	if err != nil {
 		return fixer.AgentResult{}, err
 	}
-	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus}, nil
+	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle}, nil
 }
 
 type workerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -444,6 +460,22 @@ func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.Prep
 	return worker.PrepareWorktreeResult{HeadSHA: result.HeadSHA, Clean: result.Clean}, nil
 }
 
+func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	if err != nil {
+		return worker.InspectHeadResult{}, err
+	}
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+}
+
+func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	if err != nil {
+		return worker.CommitResult{}, err
+	}
+	return worker.CommitResult{CommitSHA: result.CommitSHA}, nil
+}
+
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
 	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
@@ -464,7 +496,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle}, nil
 }
 
 func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {

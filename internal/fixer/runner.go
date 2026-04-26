@@ -18,6 +18,7 @@ import (
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -218,6 +219,7 @@ type AgentResult struct {
 	Stdout      string
 	Stderr      string
 	ParseStatus string
+	Lifecycle   *lifecycle.State
 }
 
 type AgentExecution interface {
@@ -324,6 +326,7 @@ type fixerCheckpoint struct {
 	FixItemsHash     string                      `json:"fixItemsHash,omitempty"`
 	Worktree         *checkpointWorktree         `json:"worktree,omitempty"`
 	Repair           *checkpointRepair           `json:"repair,omitempty"`
+	Lifecycle        *lifecycle.State            `json:"gitPrLifecycle,omitempty"`
 	ReconcileCommits *checkpointReconcileCommits `json:"reconcileCommits,omitempty"`
 	Validation       *ValidationResult           `json:"validation,omitempty"`
 	Push             *checkpointPush             `json:"push,omitempty"`
@@ -357,11 +360,12 @@ type checkpointWorktree struct {
 }
 
 type checkpointRepair struct {
-	AgentExecutionID string `json:"agentExecutionId,omitempty"`
-	Summary          string `json:"summary,omitempty"`
-	HeadSHA          string `json:"headSha,omitempty"`
-	ParseStatus      string `json:"parseStatus,omitempty"`
-	CompletedAt      string `json:"completedAt,omitempty"`
+	AgentExecutionID string           `json:"agentExecutionId,omitempty"`
+	Summary          string           `json:"summary,omitempty"`
+	HeadSHA          string           `json:"headSha,omitempty"`
+	ParseStatus      string           `json:"parseStatus,omitempty"`
+	Lifecycle        *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	CompletedAt      string           `json:"completedAt,omitempty"`
 }
 
 type checkpointReconcileCommits struct {
@@ -922,6 +926,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	}
 	preparedAt := r.nowISO()
 	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, HeadSHA: prepared.HeadSHA, BaseHeadSHA: prepared.HeadSHA, PreparedAt: preparedAt}
+	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("fixer", false), branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"))
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": created.WorktreePath, "headSha": nilIfEmpty(prepared.HeadSHA), "preparedAt": preparedAt}})
 	return checkpoint, nil
@@ -979,7 +984,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
 	}
-	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, CompletedAt: r.nowISO()}
+	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: r.nowISO()}
+	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
+	if result.Lifecycle != nil {
+		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1111,6 +1120,12 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	pushedAt := r.nowISO()
 	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(detailHeadSHA(checkpoint.Detail))}})
 	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", PushedAt: pushedAt}
+	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
+	checkpoint.Lifecycle.Pushed = true
+	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
+	checkpoint.Lifecycle.PRNumber = input.PRNumber
+	checkpoint.Lifecycle.PRAdopted = true
+	checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1494,6 +1509,15 @@ func (r *Runner) reconcileCommits(ctx context.Context, checkpoint fixerCheckpoin
 		return checkpoint, err
 	}
 	checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA, FinalHeadSHA: final.HeadSHA, NewCommitSHAs: append([]string(nil), final.NewCommitSHAs...), CommittedByAgent: len(initial.NewCommitSHAs) > 0, CommittedByLoop: committedByLoop, WorkingTreeClean: !final.HasUncommittedChanges, ChangedFiles: append([]string(nil), final.ChangedFiles...), CompletedAt: r.nowISO()}
+	checkpoint.ensureLifecycle("fixer", worktree.Branch, "", false)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, final.NewCommitSHAs...)
+	if len(final.NewCommitSHAs) > 0 {
+		if committedByLoop {
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
+		} else if checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+		}
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1815,7 +1839,8 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 	parts = append(parts,
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
-		"Avoid pushing branches or changing remote review state; Looper will handle follow-up repository actions after your edits.",
+		"Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.",
+		lifecycle.PromptInstruction("fixer", "", "", true, false),
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
@@ -1829,6 +1854,20 @@ func requireWorktree(checkpoint fixerCheckpoint) (*checkpointWorktree, error) {
 		return nil, &loopError{message: "Missing worktree checkpoint for fixer step", kind: FailureRetryableAfterResume}
 	}
 	return checkpoint.Worktree, nil
+}
+
+func (c *fixerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, expectPR bool) {
+	if c.Lifecycle == nil {
+		c.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy(runner, expectPR), branch, baseBranch)
+		return
+	}
+	c.Lifecycle.Normalize()
+	if c.Lifecycle.Branch == "" {
+		c.Lifecycle.Branch = strings.TrimSpace(branch)
+	}
+	if c.Lifecycle.BaseBranch == "" {
+		c.Lifecycle.BaseBranch = strings.TrimSpace(baseBranch)
+	}
 }
 
 func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fixerCheckpoint) bool {
@@ -1989,21 +2028,21 @@ func cloneObjectSlice(values []map[string]any) []map[string]any {
 	if values == nil {
 		return nil
 	}
-	result := make([]map[string]any, 0, len(values))
+	cloned := make([]map[string]any, 0, len(values))
 	for _, value := range values {
-		clone := make(map[string]any, len(value))
-		for k, v := range value {
-			clone[k] = v
+		item := make(map[string]any, len(value))
+		for key, element := range value {
+			item[key] = element
 		}
-		result = append(result, clone)
+		cloned = append(cloned, item)
 	}
-	return result
+	return cloned
 }
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
-			return value
+			return strings.TrimSpace(value)
 		}
 	}
 	return ""
@@ -2015,6 +2054,22 @@ func mustMarshalJSON(value any) string {
 		return "{}"
 	}
 	return string(encoded)
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	seen := map[string]bool{}
+	for _, value := range dst {
+		seen[value] = true
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		dst = append(dst, value)
+	}
+	return dst
 }
 
 func stringFromAny(value any) (string, bool) {
