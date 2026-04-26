@@ -1200,7 +1200,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 		}
 	}
 
-	identifier, err := decodeProjectIdentifier(path)
+	identifier, err := decodeProjectIdentifier(normalizePath(r.URL.EscapedPath()))
 	if err != nil {
 		return nil, err
 	}

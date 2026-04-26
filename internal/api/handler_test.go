@@ -692,6 +692,34 @@ func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsRemoveRouteDeletesProjectWithEscapedSlashInName(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper/Core", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/Looper%2FCore", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_1")
+	assertEqual(t, data["name"], "Looper/Core")
+	project, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project != nil {
+		t.Fatalf("project after delete = %#v, want nil", project)
+	}
+}
+
 func TestHandlerProjectsRemoveRouteReturnsNotFound(t *testing.T) {
 	fixture := newTestFixture(t)
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/missing", nil)
