@@ -478,6 +478,32 @@ func TestProjectRemoveMissingProjectReturnsClearError(t *testing.T) {
 	}
 }
 
+func TestProjectRemoveResolveIDDoesNotFallBackToName(t *testing.T) {
+	t.Parallel()
+
+	projects := []projectOutput{{ID: "project_1", Name: "missing"}}
+	_, err := resolveProjectByIdentifier(projects, projectRemoveIdentifierValue{value: "missing", source: projectIdentifierSourceID})
+	if err == nil {
+		t.Fatal("resolveProjectByIdentifier(--id missing) error = nil, want project not found")
+	}
+	if !strings.Contains(err.Error(), "project not found: missing") {
+		t.Fatalf("resolveProjectByIdentifier(--id missing) error = %q, want not found", err.Error())
+	}
+}
+
+func TestProjectRemoveResolveNameDoesNotMatchIDFirst(t *testing.T) {
+	t.Parallel()
+
+	projects := []projectOutput{{ID: "Looper", Name: "Other"}, {ID: "project_1", Name: "Looper"}}
+	project, err := resolveProjectByIdentifier(projects, projectRemoveIdentifierValue{value: "Looper", source: projectIdentifierSourceName})
+	if err != nil {
+		t.Fatalf("resolveProjectByIdentifier(--name Looper) error = %v, want nil", err)
+	}
+	if got, want := project.ID, "project_1"; got != want {
+		t.Fatalf("resolveProjectByIdentifier(--name Looper) ID = %q, want %q", got, want)
+	}
+}
+
 func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {
 	t.Parallel()
 

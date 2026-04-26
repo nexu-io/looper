@@ -679,7 +679,20 @@ func setString(target map[string]any, key, value string) {
 	}
 }
 
-func projectRemoveIdentifier(cmd *cobra.Command, args []string) (string, error) {
+type projectIdentifierSource string
+
+const (
+	projectIdentifierSourceAny  projectIdentifierSource = "any"
+	projectIdentifierSourceID   projectIdentifierSource = "id"
+	projectIdentifierSourceName projectIdentifierSource = "name"
+)
+
+type projectRemoveIdentifierValue struct {
+	value  string
+	source projectIdentifierSource
+}
+
+func projectRemoveIdentifier(cmd *cobra.Command, args []string) (projectRemoveIdentifierValue, error) {
 	identifier := ""
 	if len(args) > 0 {
 		identifier = strings.TrimSpace(args[0])
@@ -693,39 +706,46 @@ func projectRemoveIdentifier(cmd *cobra.Command, args []string) (string, error) 
 		}
 	}
 	if provided == 0 {
-		return "", fmt.Errorf("Usage: looper project remove <id-or-name> [--force]")
+		return projectRemoveIdentifierValue{}, fmt.Errorf("Usage: looper project remove <id-or-name> [--force]")
 	}
 	if provided > 1 {
-		return "", fmt.Errorf("provide only one project identifier using an argument, --id, or --name")
+		return projectRemoveIdentifierValue{}, fmt.Errorf("provide only one project identifier using an argument, --id, or --name")
 	}
 	if id != "" {
-		return id, nil
+		return projectRemoveIdentifierValue{value: id, source: projectIdentifierSourceID}, nil
 	}
 	if name != "" {
-		return name, nil
+		return projectRemoveIdentifierValue{value: name, source: projectIdentifierSourceName}, nil
 	}
-	return identifier, nil
+	return projectRemoveIdentifierValue{value: identifier, source: projectIdentifierSourceAny}, nil
 }
 
-func resolveProjectByIdentifier(projects []projectOutput, identifier string) (projectOutput, error) {
-	trimmed := strings.TrimSpace(identifier)
+func resolveProjectByIdentifier(projects []projectOutput, identifier projectRemoveIdentifierValue) (projectOutput, error) {
+	trimmed := strings.TrimSpace(identifier.value)
 	if trimmed == "" {
 		return projectOutput{}, fmt.Errorf("project identifier is required")
 	}
 
-	for _, project := range projects {
-		if project.ID == trimmed {
-			return project, nil
+	if identifier.source == projectIdentifierSourceAny || identifier.source == projectIdentifierSourceID {
+		for _, project := range projects {
+			if project.ID == trimmed {
+				return project, nil
+			}
 		}
+	}
+	if identifier.source == projectIdentifierSourceID {
+		return projectOutput{}, fmt.Errorf("project not found: %s", trimmed)
 	}
 
 	var matched *projectOutput
-	for index := range projects {
-		if strings.EqualFold(strings.TrimSpace(projects[index].Name), trimmed) {
-			if matched != nil {
-				return projectOutput{}, fmt.Errorf("project identifier matches multiple projects: %s", trimmed)
+	if identifier.source == projectIdentifierSourceAny || identifier.source == projectIdentifierSourceName {
+		for index := range projects {
+			if strings.EqualFold(strings.TrimSpace(projects[index].Name), trimmed) {
+				if matched != nil {
+					return projectOutput{}, fmt.Errorf("project identifier matches multiple projects: %s", trimmed)
+				}
+				matched = &projects[index]
 			}
-			matched = &projects[index]
 		}
 	}
 	if matched != nil {
