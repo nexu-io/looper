@@ -165,6 +165,46 @@ func TestProcessClaimedItemPlannerSkipsWhenNotManualAndIneligible(t *testing.T) 
 	}
 }
 
+func TestProcessClaimedItemDiscoveryQueueIgnoresManualLoopMetadata(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	loop.MetadataJSON = stringPtr(`{"manual":true,"issueNumber":42}`)
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queueItem, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number}})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"someone"}, Labels: []string{"not-looper:plan"}, Body: "details", URL: "https://example/issues/42"}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claimed, err)
+	}
+	if claimed.ID != queueItem.ID {
+		t.Fatalf("claimed.ID = %q, want %q", claimed.ID, queueItem.ID)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want 0", len(agent.starts))
+	}
+}
+
 func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

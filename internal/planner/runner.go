@@ -674,7 +674,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	manual := isManualPlannerQueue(payload, input.Loop.MetadataJSON)
+	manual := isManualPlannerQueue(payload)
 	if !manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
 		return checkpoint, nil
@@ -1272,13 +1272,8 @@ func includesLogin(values []string, target string) bool {
 	return false
 }
 
-func isManualPlannerQueue(payload map[string]any, loopMetadataJSON *string) bool {
+func isManualPlannerQueue(payload map[string]any) bool {
 	manual, ok := payload["manual"].(bool)
-	if ok && manual {
-		return true
-	}
-	metadata := parseJSONObject(loopMetadataJSON)
-	manual, ok = metadata["manual"].(bool)
 	return ok && manual
 }
 
