@@ -257,6 +257,42 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemAdoptsOpenBranchPRWhenLifecycleLacksPRNumber(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	branch := "looper/planner/42-plan-this"
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}, openPullRequests: []PullRequestSummary{{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec", Lifecycle: &lifecycle.State{Branch: branch, BaseBranch: "main", PRURL: "https://example/pr/202", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 202 {
+		t.Fatalf("result = %#v, want success with adopted PR 202", result)
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("createPRCalls = %#v, want no fallback CreatePullRequest", github.createPRCalls)
+	}
+	if len(github.listOpenPRCalls) != 1 {
+		t.Fatalf("listOpenPRCalls = %d, want 1", len(github.listOpenPRCalls))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.PRNumber == nil || *loop.PRNumber != 202 || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"prNumber":202`) {
+		t.Fatalf("loop = %#v, want adopted PR persisted", loop)
+	}
+}
+
 func TestProcessClaimedItemWriteSpecResumeDoesNotRerunAgentAfterTransientInspectFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -666,11 +702,13 @@ func (f *runnerFixture) nowISO() string {
 type fakeGitHubGateway struct {
 	issues           []IssueSummary
 	issueDetail      IssueDetail
+	openPullRequests []PullRequestSummary
 	prDetail         PullRequestDetail
 	viewPRErr        error
 	createPRResult   CreatePullRequestResult
 	createPRErrors   []error
 	createPRIndex    int
+	listOpenPRCalls  []ListOpenPullRequestsInput
 	createPRCalls    []CreatePullRequestInput
 	addLabelCalls    []PullRequestLabelsInput
 	addReviewerCalls []PullRequestReviewersInput
@@ -693,6 +731,11 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 
 func (*fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
 	return "octocat", nil
+}
+
+func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	f.listOpenPRCalls = append(f.listOpenPRCalls, input)
+	return append([]PullRequestSummary(nil), f.openPullRequests...), nil
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {

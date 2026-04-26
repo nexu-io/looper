@@ -28,7 +28,8 @@ const (
 	stepPublish         PlannerStep = "publish"
 	stepNotify          PlannerStep = "notify"
 
-	discoveryLabel = "looper:plan"
+	discoveryLabel             = "looper:plan"
+	plannerPRDedupeLookupLimit = 1000
 
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 10 * time.Minute
@@ -65,6 +66,20 @@ type IssueDetail struct {
 	URL       string
 	Assignees []string
 	Labels    []string
+}
+
+type PullRequestSummary struct {
+	Number      int64
+	URL         string
+	State       string
+	HeadRefName string
+	BaseRefName string
+}
+
+type ListOpenPullRequestsInput struct {
+	Repo  string
+	CWD   string
+	Limit int
 }
 
 type ListOpenIssuesInput struct {
@@ -127,6 +142,7 @@ type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -909,6 +925,26 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 	}
 	if checkpoint.Publish.PullRequest == nil {
+		adopted, err := r.findOpenPullRequestForBranch(ctx, issue.Repo, worktree.Branch, worktree.BaseBranch, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if adopted != nil {
+			checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: adopted.Number, URL: adopted.URL, Body: ""}
+			checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+			checkpoint.Lifecycle.PRNumber = adopted.Number
+			checkpoint.Lifecycle.PRURL = adopted.URL
+			checkpoint.Lifecycle.PRAdopted = true
+			checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceAgent
+			if err := r.persistPlannerPullRequestReference(ctx, input, *issue, *worktree, *checkpoint.Publish.PullRequest); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
+		}
+	}
+	if checkpoint.Publish.PullRequest == nil {
 		body := buildPullRequestBody(*issue, *worktree, checkpoint.WriteSpec)
 		pr, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: issue.Repo, HeadBranch: worktree.Branch, BaseBranch: worktree.BaseBranch, Title: "Spec: " + issue.Title, Body: body, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -959,6 +995,34 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) findOpenPullRequestForBranch(ctx context.Context, repo, branch, baseBranch, cwd string) (*PullRequestSummary, error) {
+	if r.github == nil || strings.TrimSpace(branch) == "" {
+		return nil, nil
+	}
+	pullRequests, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: plannerPRDedupeLookupLimit})
+	if err != nil {
+		return nil, err
+	}
+	for _, pr := range pullRequests {
+		state := strings.TrimSpace(pr.State)
+		if state != "" && !strings.EqualFold(state, "open") {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(pr.HeadRefName), strings.TrimSpace(branch)) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(pr.BaseRefName), strings.TrimSpace(baseBranch)) {
+			continue
+		}
+		if pr.Number <= 0 {
+			continue
+		}
+		candidate := pr
+		return &candidate, nil
+	}
+	return nil, nil
 }
 
 func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, state *lifecycle.State) (*checkpointPullRequest, error) {
