@@ -271,6 +271,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(path, apiBasePath+"/projects/") {
+		payload, err := h.buildProjectRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
 	if strings.HasPrefix(path, apiBasePath+"/events/") {
 		payload, err := h.buildEntityEventsRouteResponse(r, path)
 		if err != nil {
@@ -1127,6 +1142,7 @@ type stopLoopResponse struct {
 type projectService interface {
 	List(context.Context) ([]storage.ProjectRecord, error)
 	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
+	RemoveProject(context.Context, string) (storage.ProjectRecord, error)
 }
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
@@ -1166,6 +1182,50 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 			message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/projects"),
 		}
 	}
+}
+
+func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, error) {
+	service := h.context.ProjectsService
+	if service == nil {
+		runtimeProjects := h.context.Runtime.Services().Projects
+		if runtimeProjects != nil {
+			service = runtimeProjects
+		}
+	}
+	if service == nil {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeProjectsUnavailable,
+			status:  http.StatusInternalServerError,
+			message: "Project management is not available in this runtime",
+		}
+	}
+
+	identifier, err := decodeProjectIdentifier(path)
+	if err != nil {
+		return nil, err
+	}
+	if r.Method != http.MethodDelete {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+	}
+
+	removed, err := service.RemoveProject(r.Context(), identifier)
+	if err != nil {
+		var notFound projects.ProjectNotFoundError
+		var ambiguous projects.AmbiguousProjectIdentifierError
+		var validation projects.ProjectValidationError
+		switch {
+		case errors.As(err, &notFound):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", notFound.Identifier)}
+		case errors.As(err, &ambiguous):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: err.Error()}
+		case errors.As(err, &validation):
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		default:
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	}
+
+	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
@@ -1616,6 +1676,18 @@ func decodePathSegment(parts []string, index int) (string, error) {
 		return "", fmt.Errorf("missing path segment")
 	}
 	return decoded, nil
+}
+
+func decodeProjectIdentifier(path string) (string, error) {
+	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/projects/"), "/")
+	if len(parts) != 1 {
+		return "", apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+	identifier, err := decodePathSegment(parts, 0)
+	if err != nil {
+		return "", apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "project identifier is required"}
+	}
+	return identifier, nil
 }
 
 func (h *Handler) buildActiveRunsResponse(r *http.Request) (activeRunsListResponse, error) {

@@ -80,6 +80,10 @@ func (c *DaemonAPIClient) Post(ctx context.Context, path string, body any, out a
 	return c.request(ctx, http.MethodPost, path, body, out)
 }
 
+func (c *DaemonAPIClient) Delete(ctx context.Context, path string, out any) error {
+	return c.request(ctx, http.MethodDelete, path, nil, out)
+}
+
 func (c *DaemonAPIClient) request(ctx context.Context, method, path string, body any, out any) error {
 	request, err := c.buildRequest(ctx, method, path, body)
 	if err != nil {

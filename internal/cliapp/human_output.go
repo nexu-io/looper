@@ -214,6 +214,16 @@ func writeHumanProjectAdd(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func writeHumanProjectRemove(w io.Writer, payload json.RawMessage) error {
+	var data projectOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode project response: %w", err)
+	}
+
+	printSection(w, "Project removed", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}})
+	return nil
+}
+
 func writeHumanLoopList(w io.Writer, payload json.RawMessage) error {
 	var data loopsListOutput
 	if err := json.Unmarshal(payload, &data); err != nil {

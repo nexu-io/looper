@@ -119,7 +119,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
-				helpSubcommands: []helpSubcommand{{name: "list", description: "List projects"}, {name: "add", description: "Add a project"}},
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List projects"}, {name: "add", description: "Add a project"}, {name: "remove", description: "Remove a project"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("repo-path", "path", "Repository path"),
@@ -132,10 +132,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				exampleLines: []string{
 					"$ looper project list",
 					"$ looper project add /path/to/repo",
+					"$ looper project remove project_1 --force",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List projects", runE: runtime.projectList}),
 					newCommand(commandSpec{use: "add", short: "Add a project", args: cobra.MaximumNArgs(1), runE: runtime.projectAdd}),
+					newCommand(commandSpec{use: "remove", short: "Remove a project", args: cobra.MaximumNArgs(1), runE: runtime.projectRemove, localFlags: []flagSpec{boolFlag("force", "Remove without prompting for confirmation")}}),
 				},
 			}),
 			newCommand(commandSpec{

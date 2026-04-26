@@ -1,6 +1,7 @@
 package cliapp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -71,6 +72,32 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
 	}, writeHumanProjectAdd)
+}
+
+func (r *commandRuntime) projectRemove(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		identifier, err := projectRemoveIdentifier(cmd, args)
+		if err != nil {
+			return nil, err
+		}
+
+		projects, err := r.listProjects(ctx)
+		if err != nil {
+			return nil, err
+		}
+		project, err := resolveProjectByIdentifier(projects, identifier)
+		if err != nil {
+			return nil, err
+		}
+
+		if !getBoolFlag(cmd, "force") {
+			if err := confirmProjectRemoval(cmd, project); err != nil {
+				return nil, err
+			}
+		}
+
+		return r.deleteJSON(ctx, "/api/v1/projects/"+url.PathEscape(project.ID))
+	}, writeHumanProjectRemove)
 }
 
 func (r *commandRuntime) loopList(cmd *cobra.Command, args []string) error {
@@ -400,6 +427,20 @@ func (r *commandRuntime) postJSON(ctx context.Context, path string, body any) (j
 	return payload, nil
 }
 
+func (r *commandRuntime) deleteJSON(ctx context.Context, path string) (json.RawMessage, error) {
+	client, err := r.apiClient()
+	if err != nil {
+		return nil, err
+	}
+
+	var payload json.RawMessage
+	if err := client.Delete(ctx, path, &payload); err != nil {
+		return nil, err
+	}
+
+	return payload, nil
+}
+
 func (r *commandRuntime) resolveLoopStartProjectID(ctx context.Context, repo string, explicitProjectID string) (string, error) {
 	projects, err := r.listProjects(ctx)
 	if err != nil {
@@ -636,6 +677,77 @@ func setString(target map[string]any, key, value string) {
 	if trimmed := strings.TrimSpace(value); trimmed != "" {
 		target[key] = trimmed
 	}
+}
+
+func projectRemoveIdentifier(cmd *cobra.Command, args []string) (string, error) {
+	identifier := ""
+	if len(args) > 0 {
+		identifier = strings.TrimSpace(args[0])
+	}
+	id := strings.TrimSpace(getStringFlag(cmd, "id"))
+	name := strings.TrimSpace(getStringFlag(cmd, "name"))
+	provided := 0
+	for _, value := range []string{identifier, id, name} {
+		if value != "" {
+			provided++
+		}
+	}
+	if provided == 0 {
+		return "", fmt.Errorf("Usage: looper project remove <id-or-name> [--force]")
+	}
+	if provided > 1 {
+		return "", fmt.Errorf("provide only one project identifier using an argument, --id, or --name")
+	}
+	if id != "" {
+		return id, nil
+	}
+	if name != "" {
+		return name, nil
+	}
+	return identifier, nil
+}
+
+func resolveProjectByIdentifier(projects []projectOutput, identifier string) (projectOutput, error) {
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return projectOutput{}, fmt.Errorf("project identifier is required")
+	}
+
+	for _, project := range projects {
+		if project.ID == trimmed {
+			return project, nil
+		}
+	}
+
+	var matched *projectOutput
+	for index := range projects {
+		if strings.EqualFold(strings.TrimSpace(projects[index].Name), trimmed) {
+			if matched != nil {
+				return projectOutput{}, fmt.Errorf("project identifier matches multiple projects: %s", trimmed)
+			}
+			matched = &projects[index]
+		}
+	}
+	if matched != nil {
+		return *matched, nil
+	}
+
+	return projectOutput{}, fmt.Errorf("project not found: %s", trimmed)
+}
+
+func confirmProjectRemoval(cmd *cobra.Command, project projectOutput) error {
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Remove project %s (%s) and associated runtime records? Type %q to confirm: ", project.ID, project.Name, project.ID)
+	scanner := bufio.NewScanner(cmd.InOrStdin())
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("read confirmation: %w", err)
+		}
+		return fmt.Errorf("project removal cancelled")
+	}
+	if strings.TrimSpace(scanner.Text()) != project.ID {
+		return fmt.Errorf("project removal cancelled")
+	}
+	return nil
 }
 
 func addQueryString(query url.Values, key, value string) {

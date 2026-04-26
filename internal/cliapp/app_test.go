@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,7 +49,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		args        []string
 		subcommands []string
 	}{
-		{args: []string{"project", "--help"}, subcommands: []string{"list  List projects", "add   Add a project"}},
+		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
 		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
@@ -387,6 +388,94 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 		t.Fatalf("Run([project add ... --json]) stderr = %q, want empty string", stderr)
 	}
 	assertJSONContains(t, stdout, "id", "project_1")
+}
+
+func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
+	t.Parallel()
+
+	var seenList atomic.Bool
+	var seenDelete atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects":
+			seenList.Store(true)
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/projects/project_1":
+			seenDelete.Store(true)
+			writeEnvelope(t, w, pkgapi.Success("req_project_remove", map[string]any{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "project", "remove", "Looper", "--force", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project remove ... --force --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project remove ... --force --json]) stderr = %q, want empty string", stderr)
+	}
+	if !seenList.Load() || !seenDelete.Load() {
+		t.Fatalf("requests seen list=%v delete=%v, want both", seenList.Load(), seenDelete.Load())
+	}
+	assertJSONContains(t, stdout, "id", "project_1")
+}
+
+func TestProjectRemovePromptsForConfirmation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/projects/project_1":
+			writeEnvelope(t, w, pkgapi.Success("req_project_remove", map[string]any{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdin: strings.NewReader("project_1\n"), Stdout: stdout, Stderr: stderr})
+	exitCode := app.Run(context.Background(), []string{"project", "remove", "project_1", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([project remove ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Type \"project_1\" to confirm") {
+		t.Fatalf("stderr = %q, want confirmation prompt", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Project removed") {
+		t.Fatalf("stdout = %q, want removal summary", stdout.String())
+	}
+}
+
+func TestProjectRemoveMissingProjectReturnsClearError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodGet; got != want {
+			t.Fatalf("request method = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "project", "remove", "missing", "--force", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([project remove missing --force]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "project not found: missing") {
+		t.Fatalf("stderr = %q, want not found error", stderr)
+	}
 }
 
 func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {

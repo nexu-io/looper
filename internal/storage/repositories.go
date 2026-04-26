@@ -393,6 +393,20 @@ func (r *ProjectsRepository) List(ctx context.Context) ([]ProjectRecord, error) 
 	return scanProjects(rows)
 }
 
+func (r *ProjectsRepository) Delete(ctx context.Context, id string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete project: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete project rows affected: %w", err)
+	}
+
+	return rowsAffected > 0, nil
+}
+
 type LoopsRepository struct{ q sqliteQuerier }
 
 func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {

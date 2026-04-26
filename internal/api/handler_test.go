@@ -664,6 +664,50 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_1")
+	assertEqual(t, data["name"], "Looper")
+	project, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project != nil {
+		t.Fatalf("project after delete = %#v, want nil", project)
+	}
+}
+
+func TestHandlerProjectsRemoveRouteReturnsNotFound(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/missing", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
+	assertEqual(t, errorMap["message"], "Project not found: missing")
+}
+
 func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
 
@@ -4267,8 +4311,9 @@ func seedConflictProject(t *testing.T, service *projects.Service) {
 }
 
 type fakeProjectService struct {
-	list       func(context.Context) ([]storage.ProjectRecord, error)
-	addProject func(context.Context, projects.AddInput) (projects.AddResult, error)
+	list          func(context.Context) ([]storage.ProjectRecord, error)
+	addProject    func(context.Context, projects.AddInput) (projects.AddResult, error)
+	removeProject func(context.Context, string) (storage.ProjectRecord, error)
 }
 
 func (f fakeProjectService) List(ctx context.Context) ([]storage.ProjectRecord, error) {
@@ -4283,6 +4328,13 @@ func (f fakeProjectService) AddProject(ctx context.Context, input projects.AddIn
 		return f.addProject(ctx, input)
 	}
 	return projects.AddResult{}, nil
+}
+
+func (f fakeProjectService) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
+	if f.removeProject != nil {
+		return f.removeProject(ctx, identifier)
+	}
+	return storage.ProjectRecord{}, nil
 }
 
 type errorArtifactCase struct {
