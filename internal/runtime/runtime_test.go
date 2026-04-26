@@ -1115,7 +1115,8 @@ func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
 	cfg.Storage.DBPath = workingDir + "/runtime.sqlite"
 	cfg.Daemon.ShutdownTimeoutMS = 25
 	blockCh := make(chan struct{})
-	defer close(blockCh)
+	unblock := sync.OnceFunc(func() { close(blockCh) })
+	defer unblock()
 	logger := &testLogger{}
 	rt := New(Options{
 		Config: cfg,
@@ -1129,15 +1130,30 @@ func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 
+	rt.mu.RLock()
+	doneCh := rt.schedulerDone
+	rt.mu.RUnlock()
+	if doneCh == nil {
+		t.Fatal("schedulerDone = nil, want running scheduler loop")
+	}
+
 	started := time.Now()
-	rt.Stop("SIGTERM")
+	rt.stopSchedulerLoop()
 	elapsed := time.Since(started)
 	if elapsed > 250*time.Millisecond {
-		t.Fatalf("Stop() elapsed = %v, want timeout-bounded shutdown", elapsed)
+		t.Fatalf("stopSchedulerLoop() elapsed = %v, want timeout-bounded shutdown", elapsed)
 	}
 	if !logger.containsMessage("looperd stop timed out waiting for scheduler loop") {
 		t.Fatalf("logger entries = %#v, want scheduler timeout warning", logger.messages())
 	}
+
+	unblock()
+	select {
+	case <-doneCh:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("scheduler loop did not exit after unblocking")
+	}
+	rt.Stop("SIGTERM")
 }
 
 func TestRuntimeStopSchedulerLoopKeepsTaskTrackerUntilLoopStops(t *testing.T) {
