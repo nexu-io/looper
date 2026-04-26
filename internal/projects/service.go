@@ -570,6 +570,9 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return 0, err
 			}
+			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
+				return 0, ctxErr
+			}
 			message := err.Error()
 			if s.Logger != nil {
 				s.Logger.Warn("failed to snapshot pull request for project", map[string]any{"projectId": project.ID, "repo": *repo, "pullRequestNumber": pullRequest.Number, "message": message})

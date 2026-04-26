@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -235,6 +236,33 @@ func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T
 		},
 		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 			return storage.PullRequestSnapshotRecord{}, context.Canceled
+		},
+	}
+	repo := "powerformer/looper"
+
+	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			cancel()
+			return storage.PullRequestSnapshotRecord{}, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1}}
 		},
 	}
 	repo := "powerformer/looper"
