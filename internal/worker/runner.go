@@ -977,6 +977,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
 		}
 	}
+	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}

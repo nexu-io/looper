@@ -830,6 +830,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
 		}
 	}
+	checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
 		return checkpoint, wrapRetryableAfterResume(err)
 	}
