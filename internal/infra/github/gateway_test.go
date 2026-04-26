@@ -21,8 +21,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
 		case strings.HasPrefix(args, "issue list"):
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
-		case strings.HasPrefix(args, "issue view"):
-			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+		case args == "api repos/acme/looper/issues/8":
+			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","user":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -144,6 +144,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if issueDetail.Number != 8 {
 		t.Fatalf("issueDetail.Number = %d, want 8", issueDetail.Number)
 	}
+	if issueDetail.State != "open" || issueDetail.IsPullRequest {
+		t.Fatalf("issueDetail = %#v, want open issue not pull request", issueDetail)
+	}
 	if comment.ID != 91 || comment.URL != "https://example.test/issues/8#issuecomment-91" {
 		t.Fatalf("comment = %#v, want parsed issue comment metadata", comment)
 	}
@@ -178,7 +181,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json",
 		"pr list --repo acme/looper --state open --limit 30 --label phase-1",
 		"issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label phase-1",
-		"issue view 8 --repo acme/looper",
+		"api repos/acme/looper/issues/8",
 		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
 		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
 		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper --force",

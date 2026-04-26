@@ -395,7 +395,7 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 	if err != nil {
 		return worker.IssueDetail{}, err
 	}
-	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL}, nil
+	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, State: issue.State, IsPullRequest: issue.IsPullRequest}, nil
 }
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {

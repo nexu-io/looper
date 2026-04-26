@@ -71,14 +71,15 @@ type PullRequestDetail struct {
 }
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	State     string
-	Author    string
-	Assignees []string
-	Labels    []string
+	Number        int64
+	Title         string
+	Body          string
+	URL           string
+	State         string
+	Author        string
+	Assignees     []string
+	Labels        []string
+	IsPullRequest bool
 }
 
 type IssueDetail = IssueSummary
@@ -304,7 +305,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "issue", "view", fmt.Sprintf("%d", input.IssueNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d", input.Repo, input.IssueNumber))
 	if err != nil {
 		return IssueDetail{}, err
 	}
@@ -313,14 +314,15 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		return IssueDetail{}, err
 	}
 	return IssueDetail{
-		Number:    asInt64(row["number"]),
-		Title:     asString(row["title"]),
-		Body:      asString(row["body"]),
-		URL:       asString(row["url"]),
-		State:     asString(row["state"]),
-		Author:    extractAuthor(row["author"]),
-		Assignees: extractActorLogins(row["assignees"]),
-		Labels:    extractLabelNames(row["labels"]),
+		Number:        asInt64(row["number"]),
+		Title:         asString(row["title"]),
+		Body:          asString(row["body"]),
+		URL:           firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
+		State:         asString(row["state"]),
+		Author:        extractAuthor(firstNonNil(row["user"], row["author"])),
+		Assignees:     extractActorLogins(row["assignees"]),
+		Labels:        extractLabelNames(row["labels"]),
+		IsPullRequest: row["pull_request"] != nil,
 	}, nil
 }
 
@@ -955,6 +957,24 @@ func extractLabelNames(value any) []string {
 		}
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func parsePRNumberFromURL(value string) int64 {

@@ -535,6 +535,78 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	}
 }
 
+func TestResolveWorkerInputRejectsClosedIssueTargetEvenWithSpecPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Closed issue", State: "CLOSED"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"specPath":"specs/planner.md","baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"specPath":"specs/planner.md","baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	_, err = runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err == nil {
+		t.Fatal("resolveWorkerInput() error = nil, want closed issue validation error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureNonRetryable {
+		t.Fatalf("error = %T %[1]v, want non-retryable loopError", err)
+	}
+	if !strings.Contains(err.Error(), "acme/looper#27 is closed") || !strings.Contains(err.Error(), "open GitHub issue") {
+		t.Fatalf("error = %q, want clear closed issue message", err.Error())
+	}
+}
+
+func TestResolveWorkerInputRejectsPullRequestIssueTarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "PR", State: "OPEN", IsPullRequest: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	_, err = runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err == nil {
+		t.Fatal("resolveWorkerInput() error = nil, want PR validation error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureNonRetryable {
+		t.Fatalf("error = %T %[1]v, want non-retryable loopError", err)
+	}
+	if !strings.Contains(err.Error(), "acme/looper#27 is a pull request") || !strings.Contains(err.Error(), "open GitHub issue") {
+		t.Fatalf("error = %q, want clear pull request message", err.Error())
+	}
+}
+
 func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

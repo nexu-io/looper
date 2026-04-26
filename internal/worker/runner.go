@@ -82,10 +82,12 @@ type PullRequestDetail struct {
 }
 
 type IssueDetail struct {
-	Number int64
-	Title  string
-	Body   string
-	URL    string
+	Number        int64
+	Title         string
+	Body          string
+	URL           string
+	State         string
+	IsPullRequest bool
 }
 
 type IssueCommentInput struct {
@@ -1091,12 +1093,18 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	if work.ExecutionMode == "create-pr" && work.Prompt == "" && work.SpecPath == "" && work.IssueNumber == 0 {
 		return workerInput{}, &loopError{message: "worker.prompt or worker.specPath is required", kind: FailureNonRetryable}
 	}
-	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && work.Prompt == "" && work.SpecPath == "" && r.github != nil {
-		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(work), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
+	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && r.github != nil {
+		lookupRepo := issueLookupRepo(work)
+		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: lookupRepo, IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
-		work = hydrateWorkerInputFromIssue(work, issue)
+		if err := validateWorkerIssueTarget(lookupRepo, work.IssueNumber, issue); err != nil {
+			return workerInput{}, err
+		}
+		if work.Prompt == "" && work.SpecPath == "" {
+			work = hydrateWorkerInputFromIssue(work, issue)
+		}
 	}
 	if loop.TargetType == "pull_request" {
 		repo := firstNonEmpty(derefString(loop.Repo), work.Repo)
@@ -1912,6 +1920,17 @@ func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInpu
 	work.Prompt = buildIssuePrompt(work.IssueRepo, issue)
 	work.IssueURL = firstNonEmpty(issue.URL, work.IssueURL)
 	return work
+}
+
+func validateWorkerIssueTarget(repo string, issueNumber int64, issue IssueDetail) error {
+	reference := formatIssueReference(repo, issueNumber)
+	if issue.IsPullRequest {
+		return &loopError{message: fmt.Sprintf("%s is a pull request, not an issue; worker issue targets must reference an open GitHub issue", reference), kind: FailureNonRetryable}
+	}
+	if issue.State != "" && !strings.EqualFold(issue.State, "OPEN") {
+		return &loopError{message: fmt.Sprintf("%s is %s; worker issue targets must reference an open GitHub issue", reference, strings.ToLower(issue.State)), kind: FailureNonRetryable}
+	}
+	return nil
 }
 
 func buildIssuePrompt(repo string, issue IssueDetail) string {
