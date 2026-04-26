@@ -713,17 +713,41 @@ func IsAgentSetupFailureMessage(message string) bool {
 	if normalized == "" {
 		return false
 	}
-	patterns := []string{
-		"requires a newer version",
-		"please upgrade to the latest app or cli",
+	for _, line := range strings.Split(normalized, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if isCodexVersionSetupFailure(line) || isAgentModelSetupFailure(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexVersionSetupFailure(line string) bool {
+	return strings.Contains(line, " model requires a newer version of codex") &&
+		strings.Contains(line, "please upgrade to the latest app or cli")
+}
+
+func isAgentModelSetupFailure(line string) bool {
+	modelFailurePhrases := []string{
 		"unsupported model",
 		"unknown model",
 		"invalid model",
 		"model is not supported",
 		"unrecognized model",
 	}
+	if !containsAny(line, modelFailurePhrases) {
+		return false
+	}
+	return containsAny(line, []string{"agent setup", "agent configuration", "configured model", "model configuration", "--model", "model:"}) &&
+		containsAny(line, []string{"codex", "claude", "opencode", "cursor"})
+}
+
+func containsAny(value string, patterns []string) bool {
 	for _, pattern := range patterns {
-		if strings.Contains(normalized, pattern) {
+		if strings.Contains(value, pattern) {
 			return true
 		}
 	}

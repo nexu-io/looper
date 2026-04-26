@@ -212,6 +212,21 @@ func TestIsAgentSetupFailureMessageDetectsCodexModelCompatibility(t *testing.T) 
 	}
 }
 
+func TestIsAgentSetupFailureMessageIgnoresIncidentalModelText(t *testing.T) {
+	t.Parallel()
+
+	messages := []string{
+		"custom tool failed: invalid model response from downstream service",
+		"retryable operation returned unknown model while parsing payload",
+		"unsupported model value in project data; try again later",
+	}
+	for _, message := range messages {
+		if IsAgentSetupFailureMessage(message) {
+			t.Fatalf("IsAgentSetupFailureMessage(%q) = true, want false", message)
+		}
+	}
+}
+
 func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	t.Parallel()
 
