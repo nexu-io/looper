@@ -149,12 +149,29 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, canceledErr
 	}
 	if result.ExitCode != 0 {
-		return result, &CommandExecutionError{Message: fmt.Sprintf("Command exited with code %d", result.ExitCode), Result: result}
+		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
 	}
 	if waitErr != nil {
 		return result, waitErr
 	}
 	return result, nil
+}
+
+func commandFailureMessage(result Result) string {
+	message := fmt.Sprintf("Command exited with code %d", result.ExitCode)
+	stderr := strings.TrimSpace(result.Stderr)
+	stdout := strings.TrimSpace(result.Stdout)
+	if stderr != "" {
+		message += ": " + stderr
+	}
+	if stdout != "" {
+		if stderr != "" {
+			message += "\nstdout: " + stdout
+		} else {
+			message += ": " + stdout
+		}
+	}
+	return message
 }
 
 func envSlice(env map[string]string) []string {

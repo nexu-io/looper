@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -566,7 +567,15 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 			CapturedAt: currentISO(s.Now),
 		})
 		if err != nil {
-			return 0, err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return 0, err
+			}
+			message := err.Error()
+			if s.Logger != nil {
+				s.Logger.Warn("failed to snapshot pull request for project", map[string]any{"projectId": project.ID, "repo": *repo, "pullRequestNumber": pullRequest.Number, "message": message})
+			}
+			*warnings = append(*warnings, fmt.Sprintf("Could not snapshot pull request #%d: %s", pullRequest.Number, message))
+			continue
 		}
 		if err := s.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
 			return 0, err

@@ -47,6 +47,24 @@ func TestRunReturnsCommandExecutionErrorOnNonZeroExit(t *testing.T) {
 	if commandErr.Result.Stderr != "bad" {
 		t.Fatalf("Stderr = %q, want bad", commandErr.Result.Stderr)
 	}
+	if !strings.Contains(commandErr.Error(), "bad") {
+		t.Fatalf("error = %q, want stderr detail", commandErr.Error())
+	}
+}
+
+func TestRunIncludesStdoutWhenNonZeroExitHasNoStderr(t *testing.T) {
+	t.Parallel()
+	_, err := Run(context.Background(), Options{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf 'useful output'; exit 2`},
+	})
+	var commandErr *CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("error = %v, want CommandExecutionError", err)
+	}
+	if !strings.Contains(commandErr.Error(), "Command exited with code 2: useful output") {
+		t.Fatalf("error = %q, want stdout detail", commandErr.Error())
+	}
 }
 
 func TestRunTimesOutAndPreservesCapturedOutput(t *testing.T) {
