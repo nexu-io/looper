@@ -173,6 +173,23 @@ func TestExecutorInvalidJSONCompletionPreservesSignalAndFallsBackToLogs(t *testi
 	}
 }
 
+func TestExecutorMalformedLifecycleDoesNotInvalidateCompletion(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","pr_number":"84"}}\n'`}}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_bad_lifecycle", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.ParseStatus != "parsed" || result.Summary != "done" || len(result.Commits) != 1 || result.Commits[0] != "abc123" || result.Lifecycle != nil {
+		t.Fatalf("result = %#v, want parsed completion with lifecycle unavailable", result)
+	}
+}
+
 func TestExecutorFailedCommandIgnoresEchoedTemplateCompletion(t *testing.T) {
 	t.Parallel()
 

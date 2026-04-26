@@ -691,8 +691,6 @@ func parseCompletion(stdout, stderr string) completionParse {
 			}
 			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
 				result.Lifecycle = state
-			} else {
-				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 			}
 			if summary, ok := parsed["summary"].(string); ok {
 				result.Summary = summary

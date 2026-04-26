@@ -10,6 +10,7 @@ import (
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/infra/specpr"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -287,6 +288,20 @@ func TestPublishResumeDoesNotRerunPriorSteps(t *testing.T) {
 	}
 	if len(git.pushCalls) != 1 {
 		t.Fatalf("len(git.pushCalls) = %d, want 1 (push not rerun)", len(git.pushCalls))
+	}
+}
+
+func TestValidatedLifecyclePullRequestTreatsLookupErrorAsNonAdoptable(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{GitHub: &fakeGitHubGateway{viewPRErr: fmt.Errorf("not found")}})
+	state := &lifecycle.State{PRNumber: 84, PRURL: "https://example/pr/84"}
+	adopted, err := runner.validatedLifecyclePullRequest(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}}, checkpointIssue{Repo: "acme/looper"}, checkpointWorktree{Branch: "looper/test", BaseBranch: "main"}, state)
+	if err != nil {
+		t.Fatalf("validatedLifecyclePullRequest() error = %v", err)
+	}
+	if adopted != nil {
+		t.Fatalf("validatedLifecyclePullRequest() = %#v, want nil", adopted)
 	}
 }
 
@@ -602,6 +617,7 @@ type fakeGitHubGateway struct {
 	issues           []IssueSummary
 	issueDetail      IssueDetail
 	prDetail         PullRequestDetail
+	viewPRErr        error
 	createPRResult   CreatePullRequestResult
 	createPRErrors   []error
 	createPRIndex    int
@@ -630,6 +646,9 @@ func (*fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, 
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if f.viewPRErr != nil {
+		return PullRequestDetail{}, f.viewPRErr
+	}
 	detail := f.prDetail
 	if detail.Number == 0 {
 		detail.Number = input.PRNumber
