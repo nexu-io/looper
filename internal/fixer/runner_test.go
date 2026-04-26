@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -214,6 +215,32 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 }
 
+func TestRunPrepareWorktreeStepPreservesExistingLifecycle(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	baseBranch := "main"
+	checkpoint := fixerCheckpoint{
+		Detail:    &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+		Lifecycle: &lifecycle.State{Branch: "feature/fix-42", BaseBranch: "main", CommitSHAs: []string{"commit-1"}, Pushed: true, PRNumber: 42, PRURL: "https://example/pr/42", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceFallback}},
+	}
+
+	prepared, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), BaseBranch: &baseBranch},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if prepared.Lifecycle == nil || len(prepared.Lifecycle.CommitSHAs) != 1 || prepared.Lifecycle.CommitSHAs[0] != "commit-1" || !prepared.Lifecycle.Pushed || prepared.Lifecycle.PRNumber != 42 || prepared.Lifecycle.PRURL == "" || prepared.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
+		t.Fatalf("Lifecycle = %#v, want existing lifecycle metadata preserved", prepared.Lifecycle)
+	}
+}
+
 func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -372,6 +399,7 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 		ClaimedLockKey: "pr:acme/looper:42",
 		FixItems:       []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}},
 		Worktree:       &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "base-1", PreparedAt: nowISO},
+		Lifecycle:      &lifecycle.State{Branch: "feature/fix-42", BaseBranch: "main", CommitSHAs: []string{"commit-1"}, Pushed: true, PRNumber: 42, PRURL: "https://example/pr/42", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceFallback}},
 		Repair:         &checkpointRepair{Summary: "upstream server_error", ParseStatus: "", CompletedAt: nowISO},
 		Validation:     &ValidationResult{Passed: true, Summary: "stale"},
 		Push:           &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", PushedAt: nowISO},
@@ -416,6 +444,9 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 	}
 	if resumed.Checkpoint.Worktree == nil || resumed.Checkpoint.Worktree.PreparedAt != "" {
 		t.Fatalf("Worktree = %#v, want worktree retained but marked for reprepare", resumed.Checkpoint.Worktree)
+	}
+	if resumed.Checkpoint.Lifecycle == nil || len(resumed.Checkpoint.Lifecycle.CommitSHAs) != 1 || !resumed.Checkpoint.Lifecycle.Pushed || resumed.Checkpoint.Lifecycle.PRNumber != 42 || resumed.Checkpoint.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
+		t.Fatalf("Lifecycle = %#v, want lifecycle metadata preserved across prepare rewind", resumed.Checkpoint.Lifecycle)
 	}
 	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepCollectFixes) {
 		t.Fatalf("run.LastCompletedStep = %#v, want collect-fixes", resumed.Run.LastCompletedStep)

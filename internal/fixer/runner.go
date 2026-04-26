@@ -926,7 +926,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	}
 	preparedAt := r.nowISO()
 	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, HeadSHA: prepared.HeadSHA, BaseHeadSHA: prepared.HeadSHA, PreparedAt: preparedAt}
-	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("fixer", false), branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"))
+	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": created.WorktreePath, "headSha": nilIfEmpty(prepared.HeadSHA), "preparedAt": preparedAt}})
 	return checkpoint, nil

@@ -126,6 +126,33 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *testing.T) {
+	t.Parallel()
+
+	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, false)
+	if err != nil {
+		t.Fatalf("buildWorkerPrompt() error = %v", err)
+	}
+	for _, unwanted := range []string{
+		"adopt the existing pull request",
+		"reuse it and preserve human-edited title/body",
+		"adding only missing labels, reviewers, or closing references",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt contains remote PR instruction %q:\n%s", unwanted, prompt)
+		}
+	}
+	for _, want := range []string{
+		"remote actions disabled by Looper configuration",
+		"do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state",
+		`expectPush=false expectPR=false`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
