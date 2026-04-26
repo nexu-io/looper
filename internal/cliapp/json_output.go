@@ -336,8 +336,24 @@ func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
 			return nil, err
 		}
 
+		resolvedProjectID := strings.TrimSpace(getStringFlag(cmd, "project"))
 		body := map[string]any{"issueNumber": issueNumber}
-		setString(body, "projectId", getStringFlag(cmd, "project"))
+
+		if resolvedProjectID == "" {
+			projects, err := r.listProjects(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			project, err := r.resolveExplicitOrCurrentProject(projects, resolvedProjectID)
+			if err != nil {
+				return nil, err
+			}
+
+			resolvedProjectID = project.ID
+		}
+
+		setString(body, "projectId", resolvedProjectID)
 
 		return r.postJSON(ctx, "/api/v1/planners", body)
 	}, writeHumanPlannerCreate)
