@@ -355,7 +355,7 @@ func TestBuildRecoveryQueueItemRecordUsesIssueLockForWorkerTargets(t *testing.T)
 	}
 }
 
-func TestBuildRecoveryQueueItemPreservesManualPlannerPayload(t *testing.T) {
+func TestBuildRecoveryQueueItemDoesNotRestoreManualPlannerPayloadFromLoopMetadata(t *testing.T) {
 	t.Parallel()
 
 	loop := storage.LoopRecord{
@@ -377,14 +377,17 @@ func TestBuildRecoveryQueueItemPreservesManualPlannerPayload(t *testing.T) {
 		t.Fatal("buildRecoveryQueueItem() ok = false, want true")
 	}
 	if record.PayloadJSON == nil {
-		t.Fatal("record.PayloadJSON = nil, want manual planner payload")
+		t.Fatal("record.PayloadJSON = nil, want planner issue payload")
 	}
 	payload := map[string]any{}
 	if err := json.Unmarshal([]byte(*record.PayloadJSON), &payload); err != nil {
 		t.Fatalf("json.Unmarshal(payload) error = %v", err)
 	}
-	if payload["manual"] != true || payload["issueNumber"] != float64(82) {
-		t.Fatalf("payload = %#v, want manual planner issue payload", payload)
+	if _, ok := payload["manual"]; ok {
+		t.Fatalf("payload = %#v, want recovery payload without manual bypass", payload)
+	}
+	if payload["issueNumber"] != float64(82) {
+		t.Fatalf("payload = %#v, want planner issue payload", payload)
 	}
 }
 
