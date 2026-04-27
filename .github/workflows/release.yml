@@ -31,12 +31,17 @@ jobs:
       release-channel: ${{ steps.release-version.outputs.channel }}
       release-prerelease: ${{ steps.release-version.outputs.prerelease }}
       release-timestamp: ${{ steps.release-version.outputs.released }}
+      release-commit: ${{ steps.release-commit.outputs.sha }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+
+      - name: Pin release commit
+        id: release-commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -123,7 +128,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
+          ref: ${{ needs.prepare-go-release.outputs.release-commit }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -192,7 +197,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
+          ref: ${{ needs.prepare-go-release.outputs.release-commit }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -249,7 +254,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
+          ref: ${{ needs.prepare-go-release.outputs.release-commit }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
