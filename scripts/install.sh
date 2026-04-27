@@ -27,8 +27,7 @@ detect_target() {
 
   case "$arch" in
     arm64|aarch64) printf 'darwin-arm64\n' ;;
-    x86_64|amd64) printf 'darwin-x64\n' ;;
-    *) fail "unsupported architecture: $arch (supported: arm64, x86_64)" ;;
+    *) fail "unsupported architecture: $arch (supported: arm64)" ;;
   esac
 }
 

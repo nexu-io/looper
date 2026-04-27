@@ -74,7 +74,6 @@
 2. 如果继续走 npm 包，用户仍需在机器上安装 Bun 才能运行 daemon。
 3. 如果想在 npm 包中直接塞 compiled daemon，就会变成 per-platform 包管理问题：
    - `darwin-arm64`
-   - `darwin-x64`
 4. 这会显著增加 npm publish 与安装逻辑复杂度。
 
 所以：
@@ -237,12 +236,10 @@ bun build --compile src/index.ts --outfile looperd
 需要按 macOS 架构分别构建：
 
 - `darwin-arm64`
-- `darwin-x64`
 
 当前一期仅覆盖：
 
 - `darwin-arm64`
-- `darwin-x64`
 
 Linux 不进入当前实施范围。
 
@@ -695,7 +692,6 @@ release workflow 至少需要承担下面职责：
    - 例如 `v0.2.0`
 2. **matrix 构建 `looperd`**
    - 至少支持 `darwin-arm64`
-   - 至少支持 `darwin-x64`
 3. **上传 release artifacts**
    - 产物名必须稳定、可预测
 4. **生成并上传 checksum**
@@ -711,9 +707,7 @@ release workflow 至少需要承担下面职责：
 建议明确稳定命名规则，例如：
 
 - `looperd-darwin-arm64`
-- `looperd-darwin-x64`
 - `looperd-darwin-arm64.sha256`
-- `looperd-darwin-x64.sha256`
 
 如后续需要带版本号，也应保证规则稳定，例如：
 
@@ -734,7 +728,7 @@ Phase 1 可以直接依赖：
 
 当前 release workflow 已显式验证：
 
-1. Release assets 名称固定为 `looperd-darwin-{arm64,x64}` 与对应 `.sha256`
+1. Release assets 名称固定为 `looperd-darwin-arm64` 与对应 `.sha256`
 2. Phase 1 不发布 Linux artifacts
 3. tag / checksum / `--version` 均在 workflow 内校验
 
@@ -916,11 +910,10 @@ looper daemon status
 当前实测（本仓库 `apps/looperd/scripts/compile.ts` 默认产物）：
 
 - `looperd-darwin-arm64`：约 **58.9 MiB**
-- `looperd-darwin-x64`：约 **64.1 MiB**
 
 因此当前 phase 可接受的预期范围可先定为：
 
-- **darwin-arm64 / darwin-x64 单个 artifact 预期约 59–64 MiB**
+- **darwin-arm64 artifact 预期约 59 MiB**
 - **只要单个 release binary 未明显超过 70 MiB，就仍视为可接受**
 
 这会影响：

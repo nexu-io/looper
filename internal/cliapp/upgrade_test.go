@@ -16,6 +16,25 @@ import (
 	"time"
 )
 
+func TestResolveLooperTarget(t *testing.T) {
+	t.Parallel()
+
+	target, err := resolveLooperTarget("darwin", "arm64")
+	if err != nil {
+		t.Fatalf("resolveLooperTarget(darwin, arm64) error = %v", err)
+	}
+	if target != "darwin-arm64" {
+		t.Fatalf("resolveLooperTarget(darwin, arm64) = %q, want %q", target, "darwin-arm64")
+	}
+
+	for _, arch := range []string{"amd64", "x64"} {
+		_, err = resolveLooperTarget("darwin", arch)
+		if err == nil {
+			t.Fatalf("resolveLooperTarget(darwin, %s) error = nil, want unsupported", arch)
+		}
+	}
+}
+
 func TestUpgradeCheckPrintsSummary(t *testing.T) {
 	t.Parallel()
 

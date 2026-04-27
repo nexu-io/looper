@@ -28,10 +28,9 @@
 - [x] 在 `apps/looperd/package.json` 增加 `compile` 脚本
 - [x] 增加按平台 target 的 compile 脚本
 - [x] 第一批支持 `darwin-arm64`
-- [x] 第一批支持 `darwin-x64`
 - [x] 明确 Linux 不进入当前范围
 - [x] 验证 compile 产物至少可执行 `--version`（完整运行依赖 Phase 3）
-- [x] 验证 compiled binary 体积是否在可接受范围，并记录预期大小（当前实测：darwin-arm64 ≈ 58.9 MiB，darwin-x64 ≈ 64.1 MiB；Phase 1 先以单产物 < 70 MiB 为可接受范围）
+- [x] 验证 compiled binary 体积是否在可接受范围，并记录预期大小（当前实测：darwin-arm64 ≈ 58.9 MiB；Phase 1 先以单产物 < 70 MiB 为可接受范围）
 
 ## Phase 3 - SQLite migrations 内嵌化
 
@@ -60,9 +59,8 @@
 > release workflow 是 compile 可用性的权威验证点；本地 compile 失败不能单独作为否定该分发模型的依据。
 
 - [x] 增加 tag 驱动的 release workflow
-- [x] matrix 构建 macOS 双架构 `looperd` binary
+- [x] matrix 构建 macOS `looperd` binary
 - [x] 第一批 workflow 至少覆盖 `darwin-arm64`
-- [x] 第一批 workflow 至少覆盖 `darwin-x64`
 - [x] macOS targets 使用 macOS runners 构建
 - [x] 明确当前 workflow 不发布 Linux artifacts
 - [x] 上传 GitHub Release artifacts
@@ -150,7 +148,7 @@
 - `bun test apps/looperd/src/storage/sqlite/migrate.test.ts apps/cli/src/index.test.ts` 通过，补齐 Phase 11 缺失单测
 - `bun run typecheck` 与 `bun run build` 通过
 - 本地 tarball 全局安装 smoke：`npm install -g --prefix <tmp> apps/cli/powerformer-looper-0.2.1.tgz` 后 `looper --help` 正常
-- 手动安装 compiled `looperd-darwin-x64` 到 `~/.looper/bin/looperd` 后，`looper daemon start`、`looper daemon status --json`、`looper status --json` 均正常
+- 手动安装 compiled `looperd-darwin-arm64` 到 `~/.looper/bin/looperd` 后，`looper daemon start`、`looper daemon status --json`、`looper status --json` 均正常
 - GitHub Release download 逻辑由 `apps/cli/src/daemon-release.test.ts` 与 `apps/cli/src/daemon-install.test.ts` 覆盖；仓库当前尚无公开 release 可做真实 smoke
 
 ## Out of scope for this spec

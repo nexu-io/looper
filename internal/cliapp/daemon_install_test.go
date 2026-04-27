@@ -24,17 +24,16 @@ func TestResolveLooperdTarget(t *testing.T) {
 		t.Fatalf("resolveLooperdTarget(darwin, arm64) = %q, want %q", target, "darwin-arm64")
 	}
 
-	target, err = resolveLooperdTarget("darwin", "amd64")
-	if err != nil {
-		t.Fatalf("resolveLooperdTarget(darwin, amd64) error = %v", err)
-	}
-	if target != "darwin-x64" {
-		t.Fatalf("resolveLooperdTarget(darwin, amd64) = %q, want %q", target, "darwin-x64")
+	_, err = resolveLooperdTarget("linux", "amd64")
+	if err == nil || err.Error() != "Unsupported platform/arch for looperd install: linux-amd64. Supported targets: darwin-arm64" {
+		t.Fatalf("resolveLooperdTarget(linux, amd64) error = %v", err)
 	}
 
-	_, err = resolveLooperdTarget("linux", "amd64")
-	if err == nil || err.Error() != "Unsupported platform/arch for looperd install: linux-amd64. Supported targets: darwin-arm64, darwin-x64" {
-		t.Fatalf("resolveLooperdTarget(linux, amd64) error = %v", err)
+	for _, arch := range []string{"amd64", "x64"} {
+		_, err = resolveLooperdTarget("darwin", arch)
+		if err == nil {
+			t.Fatalf("resolveLooperdTarget(darwin, %s) error = nil, want unsupported", arch)
+		}
 	}
 }
 
@@ -116,7 +115,7 @@ func TestInstallManagedDaemonSkipsExistingBinary(t *testing.T) {
 		}),
 		HomeDir:  homeDir,
 		Platform: "darwin",
-		Arch:     "amd64",
+		Arch:     "arm64",
 	})
 
 	runtime := newCommandRuntime(app, nil)
@@ -130,8 +129,8 @@ func TestInstallManagedDaemonSkipsExistingBinary(t *testing.T) {
 	if result.DownloadedFrom != nil {
 		t.Fatalf("result.DownloadedFrom = %#v, want nil", result.DownloadedFrom)
 	}
-	if result.Target != "darwin-x64" {
-		t.Fatalf("result.Target = %q, want %q", result.Target, "darwin-x64")
+	if result.Target != "darwin-arm64" {
+		t.Fatalf("result.Target = %q, want %q", result.Target, "darwin-arm64")
 	}
 }
 

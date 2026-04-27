@@ -5,7 +5,7 @@
 - [ ] 明确 Looper 的用户安装入口是 `looper`，不是分别安装 CLI / daemon
 - [ ] 明确 release 渠道只面向用户直接分发 `looper`
 - [ ] 明确 `looperd` 继续由 CLI 负责安装与升级编排
-- [ ] 明确当前主支持矩阵仍是 macOS `darwin-arm64` / `darwin-x64`
+- [ ] 明确当前主支持矩阵仍是 macOS `darwin-arm64`
 - [ ] 明确 `go install` 仅为开发者路径，不作为普通用户推荐安装方式
 - [ ] 明确 `foreground` 仍是当前受支持默认 daemon 模式
 - [ ] 明确 `launchd` 作为下一阶段正式托管模式演进方向

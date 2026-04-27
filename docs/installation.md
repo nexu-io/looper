@@ -6,7 +6,7 @@ This document contains the detailed install, upgrade, uninstall, and source-buil
 
 For the default supported install path:
 
-- macOS (`darwin-arm64` or `darwin-x64`)
+- macOS (`darwin-arm64`)
 - `git`
 - `gh`
 
@@ -38,7 +38,7 @@ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 2. Rename it to `looper` if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `darwin-x64`.
+GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64`.
 
 Linux is not currently supported for the managed daemon flow.
 

@@ -56,7 +56,7 @@
 
 本 spec 当前仅覆盖：
 
-- macOS 13+（arm64 / x64）为正式支持范围
+- macOS 13+（arm64）为正式支持范围
 - macOS 12 为 best-effort
 
 以下平台不在本 spec 的执行范围内：
@@ -133,12 +133,8 @@ looper upgrade --channel beta
 
 - `looper-darwin-arm64`
 - `looper-darwin-arm64.sha256`
-- `looper-darwin-x64`
-- `looper-darwin-x64.sha256`
 - `looperd-darwin-arm64`
 - `looperd-darwin-arm64.sha256`
-- `looperd-darwin-x64`
-- `looperd-darwin-x64.sha256`
 
 ### B. 安装脚本（默认推荐）
 

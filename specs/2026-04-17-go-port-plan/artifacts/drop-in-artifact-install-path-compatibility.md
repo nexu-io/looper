@@ -8,9 +8,7 @@ This artifact closes the Ralph task to preserve drop-in artifact naming, install
 
 - GitHub release assets keep the predictable binary names consumed by existing install/upgrade flows:
   - `looper-darwin-arm64`
-  - `looper-darwin-x64`
   - `looperd-darwin-arm64`
-  - `looperd-darwin-x64`
 - Checksum sidecars keep the existing `<asset>.sha256` naming.
 - The managed daemon install target remains `~/.looper/bin/looperd`.
 - CLI daemon lookup order remains `~/.looper/bin/looperd`, then `$PATH`.

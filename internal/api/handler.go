@@ -702,7 +702,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				InstallDir:       installDir,
 				CurrentTarget:    currentTarget,
 				ArtifactName:     artifactName,
-				SupportedTargets: []string{"darwin-arm64", "darwin-x64"},
+				SupportedTargets: []string{"darwin-arm64"},
 			},
 		},
 		Storage: statusStorage{
@@ -864,15 +864,7 @@ func homeDirOrEmpty() string {
 }
 
 func currentLooperdTarget() string {
-	arch := runtime.GOARCH
-	switch arch {
-	case "amd64":
-		arch = "x64"
-	case "arm64":
-		arch = "arm64"
-	}
-
-	return fmt.Sprintf("%s-%s", runtime.GOOS, arch)
+	return fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
 }
 
 func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string]any {
@@ -3966,7 +3958,6 @@ func deriveProjectIDFromRepoPath(repoPath string) string {
 func looperdArtifactName(target string) *string {
 	supported := map[string]struct{}{
 		"darwin-arm64": {},
-		"darwin-x64":   {},
 	}
 
 	if _, ok := supported[target]; !ok {

@@ -71,7 +71,7 @@
               "installDir": "<home>/.looper/bin",
               "currentTarget": "<current-target>",
               "artifactName": "<artifact-name>",
-              "supportedTargets": ["darwin-arm64", "darwin-x64"]
+              "supportedTargets": ["darwin-arm64"]
             }
           },
           "storage": {
