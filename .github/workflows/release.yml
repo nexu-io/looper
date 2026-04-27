@@ -4,9 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, for example v1.2.3"
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
 permissions:
   contents: write
@@ -20,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
+      release-tag: ${{ steps.release-version.outputs.tag }}
       release-version: ${{ steps.release-version.outputs.value }}
       release-channel: ${{ steps.release-version.outputs.channel }}
       release-prerelease: ${{ steps.release-version.outputs.prerelease }}
@@ -28,6 +35,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -51,7 +60,7 @@ jobs:
       - name: Read release version and channel from tag
         id: release-version
         run: |
-          tag_name="${{ github.ref_name }}"
+          tag_name="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           if [[ ! "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: ${tag_name}" >&2
             exit 1
@@ -64,6 +73,7 @@ jobs:
             prerelease="true"
           fi
           released="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "tag=${tag_name}" >> "$GITHUB_OUTPUT"
           echo "value=${release_version}" >> "$GITHUB_OUTPUT"
           echo "channel=${channel}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
@@ -71,12 +81,12 @@ jobs:
 
       - name: Build
         env:
-          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
           LOOPER_BUILD_VERSION: ${{ steps.release-version.outputs.value }}
-          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ github.ref_name }}
+          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ steps.release-version.outputs.tag }}
           LOOPER_BUILD_CHANNEL: ${{ steps.release-version.outputs.channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
+          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
 
@@ -88,8 +98,8 @@ jobs:
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Looper ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare-go-release.outputs.release-tag }}
+          name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
           draft: true
           prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
           generate_release_notes: true
@@ -112,6 +122,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -122,12 +134,12 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
           LOOPER_BUILD_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
-          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ github.ref_name }}
+          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
+          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looper
@@ -179,6 +191,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -189,12 +203,12 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
           LOOPER_BUILD_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
-          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ github.ref_name }}
+          LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
+          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looperd
@@ -234,6 +248,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-go-release.outputs.release-tag }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -264,7 +280,7 @@ jobs:
       - name: Generate release manifest
         run: |
           go run ./tools/release-manifest \
-            -tag "${{ github.ref_name }}" \
+            -tag "${{ needs.prepare-go-release.outputs.release-tag }}" \
             -version "${{ needs.prepare-go-release.outputs.release-version }}" \
             -released "${{ needs.prepare-go-release.outputs.release-timestamp }}" \
             -channel "${{ needs.prepare-go-release.outputs.release-channel }}" \
@@ -277,7 +293,7 @@ jobs:
 
       - name: Validate release manifest fields
         env:
-          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
           EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
           EXPECTED_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
         run: |
@@ -313,8 +329,8 @@ jobs:
       - name: Publish GitHub release with assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Looper ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare-go-release.outputs.release-tag }}
+          name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
           draft: false
           prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
           generate_release_notes: true
