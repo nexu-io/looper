@@ -4,7 +4,7 @@
 
 - Supported implementation is Go-first. Root commands are the source of truth:
   - `go run ./cmd/looperd`
-  - `go run ./cmd/looper -- <args>`
+  - `go run ./cmd/looper <args>`
   - `go build ./...`
   - `go vet ./...`
   - `go test ./...`

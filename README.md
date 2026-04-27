@@ -66,7 +66,7 @@ Useful pointers:
 From the repo root:
 
 - `go run ./cmd/looperd`
-- `go run ./cmd/looper -- <args>`
+- `go run ./cmd/looper <args>`
 - `go build ./...`
 - `go vet ./...`
 - `go test ./...`

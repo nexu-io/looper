@@ -136,5 +136,5 @@ go run ./cmd/looperd
 In another shell, run the CLI from source:
 
 ```bash
-go run ./cmd/looper -- status
+go run ./cmd/looper status
 ```
