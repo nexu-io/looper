@@ -334,6 +334,7 @@ type checkpointDetail struct {
 	HeadRefName    string   `json:"headRefName,omitempty"`
 	BaseRefName    string   `json:"baseRefName,omitempty"`
 	Author         string   `json:"author,omitempty"`
+	ReviewRequests []string `json:"reviewRequests,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -500,7 +501,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return enqueue(pr, nil)
 	}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || currentLogin == "" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -509,7 +510,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	for _, pr := range specPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" {
+		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -536,6 +537,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			continue
 		}
 		if detail.IsDraft || normalizePRState(detail.State) != "open" {
+			result.Skipped++
+			continue
+		}
+		if !isManualReviewerLoop(loop) && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -783,7 +788,7 @@ func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepI
 	case stepDiscover:
 		return r.runDiscoverStep(ctx, input)
 	case stepFilter:
-		return r.runFilterStep(input)
+		return r.runFilterStep(ctx, input)
 	case stepClaim:
 		return r.runClaimStep(ctx, input)
 	case stepSnapshot:
@@ -805,12 +810,12 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
 
-func (r *Runner) runFilterStep(input stepInput) (reviewerCheckpoint, error) {
+func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for filter step", kind: FailureRetryableTransient}
@@ -822,6 +827,13 @@ func (r *Runner) runFilterStep(input stepInput) (reviewerCheckpoint, error) {
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped non-open pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) {
+		currentLogin, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+			return checkpoint, nil
+		}
 	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
@@ -1336,6 +1348,12 @@ func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) 
 	return result, nil
 }
 
+func isManualReviewerLoop(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	manual, _ := meta["manual"].(bool)
+	return manual
+}
+
 type enqueueInput struct {
 	ProjectID string
 	LoopID    string
@@ -1541,6 +1559,10 @@ func normalizeLogin(login string) string {
 }
 
 func isCurrentUserRequested(requested []string, currentLogin string) bool {
+	currentLogin = normalizeLogin(currentLogin)
+	if currentLogin == "" {
+		return false
+	}
 	for _, login := range requested {
 		if normalizeLogin(login) == currentLogin {
 			return true

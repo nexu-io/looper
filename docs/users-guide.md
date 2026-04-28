@@ -125,9 +125,9 @@ Use this when new commits are expected to keep landing on the PR.
 Reviewer mainly watches two kinds of PRs:
 
 - open PRs where the current GitHub user was requested as a reviewer
-- open PRs labeled `looper:spec-reviewing`
+- manually-started reviewer loops from this machine, including `looper review owner/repo#42 --loop`
 
-So for a spec PR, reviewer can find it even if no explicit review request was added, as long as the PR has `looper:spec-reviewing`.
+For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
 ### What happens after reviewer finishes
 
@@ -233,8 +233,9 @@ So:
 Reviewer automatically pays attention to:
 
 - PRs where the current GitHub user has a review request
+- manual reviewer loops created on this machine
 
-Also, any PR labeled `looper:spec-reviewing` can be discovered by reviewer.
+The `looper:spec-reviewing` label is a phase marker; automatic review still requires a review request unless the loop was explicitly started locally.
 
 ## 11. Common GitHub / PR commands
 
