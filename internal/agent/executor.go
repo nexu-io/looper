@@ -252,16 +252,20 @@ func (x *execution) run(ctx context.Context) {
 		graceKillTimer  <-chan time.Time
 		timeoutTimer    <-chan time.Time
 		inactivityTimer *time.Ticker
+		termDelivered   bool
 		terminateOnce   sync.Once
 		terminateSignal = func() {
 			terminateOnce.Do(func() {
 				if x.process.Process == nil {
 					return
 				}
-				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil && err != os.ErrProcessDone {
-					_ = x.killProcessGroup()
+				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+					if err != os.ErrProcessDone {
+						_ = x.killProcessGroup()
+					}
 					return
 				}
+				termDelivered = true
 				grace := x.gracefulShutdown
 				if grace <= 0 {
 					grace = 5 * time.Second
@@ -332,7 +336,7 @@ func (x *execution) run(ctx context.Context) {
 			_ = x.killProcessGroup()
 		}
 	}
-	if killed || timedOut {
+	if termDelivered && (killed || timedOut) {
 		_ = x.killProcessGroup()
 	}
 
