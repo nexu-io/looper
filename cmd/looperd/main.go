@@ -233,15 +233,22 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 }
 
 func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {
+	termSignaled := false
 	if err := signalProcess(-pid, syscall.SIGTERM); err != nil {
 		if !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
-		if err := signalProcess(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := signalProcess(pid, syscall.SIGTERM); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
 			return err
 		}
+		termSignaled = true
+	} else {
+		termSignaled = true
 	}
-	if grace > 0 {
+	if grace > 0 && termSignaled {
 		go func() {
 			timer := time.NewTimer(grace)
 			defer timer.Stop()

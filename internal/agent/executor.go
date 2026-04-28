@@ -300,6 +300,12 @@ func (x *execution) run(ctx context.Context) {
 			if timedOut || killed {
 				continue
 			}
+			select {
+			case waitErr = <-waitCh:
+				waiting = false
+				continue
+			default:
+			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
 				continue
 			}

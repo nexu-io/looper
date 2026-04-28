@@ -279,6 +279,32 @@ func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 	}
 }
 
+func TestSignalAgentProcessGroupDoesNotEscalateAfterESRCH(t *testing.T) {
+	pid := 4321
+	grace := 10 * time.Millisecond
+	killCalled := make(chan struct{}, 1)
+
+	err := signalAgentProcessGroup(pid, func(gotPID int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			killCalled <- struct{}{}
+			return nil
+		}
+		if sig != syscall.SIGTERM {
+			t.Fatalf("signal = %v, want SIGTERM", sig)
+		}
+		return syscall.ESRCH
+	}, grace)
+	if err != nil {
+		t.Fatalf("signalAgentProcessGroup() error = %v", err)
+	}
+
+	select {
+	case <-killCalled:
+		t.Fatal("SIGKILL escalation was armed after SIGTERM returned ESRCH")
+	case <-time.After(3 * grace):
+	}
+}
+
 func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})

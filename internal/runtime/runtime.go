@@ -563,18 +563,24 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				continue
 			}
 			if running {
-				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-					if r.logger != nil {
-						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
+					if errors.Is(err, syscall.ESRCH) {
+						running = false
+					} else {
+						if r.logger != nil {
+							r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+						}
+						continue
 					}
-					continue
 				}
-				go func(pid int) {
-					timer := time.NewTimer(5 * time.Second)
-					defer timer.Stop()
-					<-timer.C
-					_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
-				}(pid)
+				if running {
+					go func(pid int) {
+						timer := time.NewTimer(5 * time.Second)
+						defer timer.Stop()
+						<-timer.C
+						_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
+					}(pid)
+				}
 			}
 
 			cleaned := execution
