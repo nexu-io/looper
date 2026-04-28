@@ -477,6 +477,52 @@ func TestProcessClaimedItemRetriesPublishFromCheckpointWithoutRerunningReview(t 
 	}
 }
 
+func TestProcessClaimedItemSkipsPublishWhenReviewRequestRemovedBeforeRetry(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{submitFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	firstClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || firstClaim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", firstClaim, err)
+	}
+	firstResult, err := runner.ProcessClaimedItem(context.Background(), *firstClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first result = %#v, want retryable_after_resume failure", firstResult)
+	}
+	if len(agent.starts) != 1 || len(github.submitCalls) != 1 {
+		t.Fatalf("agent starts=%d submit calls=%d, want initial review and publish attempt", len(agent.starts), len(github.submitCalls))
+	}
+
+	github.reviewRequests = []string{}
+	fixture.advance(5 * time.Second)
+	retryClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || retryClaim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", retryClaim, err)
+	}
+	retryResult, err := runner.ProcessClaimedItem(context.Background(), *retryClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(retry) error = %v", err)
+	}
+	if retryResult.Status != "skipped" || !contains(retryResult.Summary, "current user is not requested for review") {
+		t.Fatalf("retry result = %#v, want skipped missing review request", retryResult)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after retry = %d, want no rerun", len(agent.starts))
+	}
+	if len(github.submitCalls) != 1 {
+		t.Fatalf("len(github.submitCalls) after retry = %d, want no second publish", len(github.submitCalls))
+	}
+}
+
 func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

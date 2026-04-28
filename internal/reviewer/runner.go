@@ -1037,6 +1037,16 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	if !isManualReviewerLoop(input.Loop) {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
+			return checkpoint, nil
+		}
+	}
 	phase := resolvePullRequestPhase(detail.Labels)
 	checkpointPhase := resolvePullRequestPhase(detailLabels(input.Checkpoint.Detail))
 	if detail.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
