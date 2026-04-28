@@ -1037,6 +1037,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	phase := resolvePullRequestPhase(detail.Labels)
+	checkpointPhase := resolvePullRequestPhase(detailLabels(input.Checkpoint.Detail))
 	if !isManualReviewerLoop(input.Loop) {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
@@ -1044,6 +1046,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			if pending.PublishState.ReviewSubmitted {
+				if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
+					return checkpoint, err
+				}
 				if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
 					return checkpoint, err
 				}
@@ -1052,8 +1057,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, nil
 		}
 	}
-	phase := resolvePullRequestPhase(detail.Labels)
-	checkpointPhase := resolvePullRequestPhase(detailLabels(input.Checkpoint.Detail))
 	if detail.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
 	}
@@ -1118,29 +1121,37 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		_ = r.tryRemoveReaction(ctx, input, "+1")
 	}
 	_ = r.tryRemoveReaction(ctx, input, "eyes")
-	postSubmitDetail := detail
-	if reviewEvent == ReviewEventApprove && (phase == "spec" || checkpointPhase == "spec") {
-		postSubmitDetail, err = r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: input.Project.RepoPath})
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-	}
-	if reviewEvent == ReviewEventApprove && (phase == "spec" || checkpointPhase == "spec") && isSpecReviewClean(postSubmitDetail) {
-		if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, err
-			}
-		}
-		if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, err
-			}
-		}
+	if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
+		return checkpoint, err
 	}
 	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) transitionSpecReviewLabels(ctx context.Context, input stepInput, detail PullRequestDetail, phase string, checkpointPhase string, reviewEvent ReviewEvent) error {
+	if reviewEvent != ReviewEventApprove || (phase != "spec" && checkpointPhase != "spec") {
+		return nil
+	}
+	postSubmitDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if !isSpecReviewClean(postSubmitDetail) {
+		return nil
+	}
+	if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
+		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return err
+		}
+	}
+	if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {

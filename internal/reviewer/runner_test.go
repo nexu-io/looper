@@ -662,6 +662,64 @@ func TestProcessClaimedItemRecordsPublishedHeadWhenReviewRequestRemovedAfterSubm
 	}
 }
 
+func TestRunPublishStepTransitionsSpecLabelsWhenReviewRequestRemovedAfterSubmit(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_spec_publish", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_spec_publish"},
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{Labels: []string{specpr.ReviewingLabel}},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: (&pendingReviewCheckpoint{
+				HeadSHA: "abc123",
+				Event:   ReviewEventApprove,
+				Summary: "Looks good",
+				Clean:   true,
+				PublishState: &publishState{
+					ReviewSubmitted: true,
+				},
+			}).clone(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if checkpoint.SkipReason == "" || !contains(checkpoint.SkipReason, "current user is not requested for review") {
+		t.Fatalf("SkipReason = %q, want missing review request skip", checkpoint.SkipReason)
+	}
+	if specpr.HasLabel(github.labels, specpr.ReviewingLabel) || !specpr.HasLabel(github.labels, specpr.ReadyLabel) {
+		t.Fatalf("labels after skipped publish = %#v, want reviewing removed and ready added", github.labels)
+	}
+	if len(github.removedLabels) != 1 || len(github.addedLabels) != 1 {
+		t.Fatalf("removedLabels=%#v addedLabels=%#v, want one transition", github.removedLabels, github.addedLabels)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.MetadataJSON == nil || !contains(*updated.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop after skipped publish = %#v, want lastPublishedHeadSha recorded", updated)
+	}
+}
+
 func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
