@@ -192,7 +192,7 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
-	if latestExecution.Status != "running" {
+	if !isStoppableExecutionStatus(latestExecution.Status) {
 		return result, nil
 	}
 	if services.ActiveExecutions != nil {
@@ -233,6 +233,10 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	return result, nil
+}
+
+func isStoppableExecutionStatus(status string) bool {
+	return status == "running" || status == "cancelling"
 }
 
 func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {

@@ -377,6 +377,134 @@ func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	}
 }
 
+func TestStopLoopRetriesActiveInMemoryExecutionAlreadyCancelling(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 30, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	agentExecution := storage.AgentExecutionRecord{ID: "agentexec_1", ProjectID: &project.ID, LoopID: &loop.ID, RunID: &run.ID, Vendor: "codex", Status: "cancelling", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.AgentExecutions.Upsert(ctx, agentExecution); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	active := &fakeActiveExecution{}
+	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	defer unregister()
+	services := looperdruntime.Services{
+		Coordinator:      coordinator,
+		Repositories:     repos,
+		Loops:            &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
+		ActiveExecutions: registry,
+	}
+
+	signaled := false
+	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, func(int, syscall.Signal) error {
+		signaled = true
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("stopLoop() error = %v", err)
+	}
+	result, ok := gotResult.(stopLoopResult)
+	if !ok {
+		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
+	}
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 {
+		t.Fatalf("stopLoop() result = %#v", result)
+	}
+	if !active.killed {
+		t.Fatal("active execution Kill was not invoked")
+	}
+	if active.reason != "Stopped by test" {
+		t.Fatalf("Kill reason = %q, want stop reason", active.reason)
+	}
+	if signaled {
+		t.Fatal("signal invoked, want active execution kill path")
+	}
+}
+
+func TestStopLoopSignalsExecutionAlreadyCancelling(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 30, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	pid := int64(4321)
+	agentExecution := storage.AgentExecutionRecord{ID: "agentexec_1", ProjectID: &project.ID, LoopID: &loop.ID, RunID: &run.ID, Vendor: "codex", Status: "cancelling", PID: &pid, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.AgentExecutions.Upsert(ctx, agentExecution); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	services := looperdruntime.Services{
+		Coordinator:  coordinator,
+		Repositories: repos,
+		Loops:        &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
+	}
+
+	var signalCalls []int
+	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, func(gotPID int, _ syscall.Signal) error {
+		signalCalls = append(signalCalls, gotPID)
+		return syscall.ESRCH
+	}, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
+		return true, true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopLoop() error = %v", err)
+	}
+	result, ok := gotResult.(stopLoopResult)
+	if !ok {
+		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
+	}
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid {
+		t.Fatalf("stopLoop() result = %#v", result)
+	}
+	if len(signalCalls) != 2 || signalCalls[0] != -int(pid) || signalCalls[1] != int(pid) {
+		t.Fatalf("signal calls = %#v, want process group then process", signalCalls)
+	}
+}
+
 func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
