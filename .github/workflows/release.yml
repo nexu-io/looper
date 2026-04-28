@@ -100,7 +100,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check for existing GitHub release
+        id: existing-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create draft GitHub release
+        if: steps.existing-release.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-go-release.outputs.release-tag }}
@@ -338,7 +352,6 @@ jobs:
           name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
           draft: false
           prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
-          generate_release_notes: true
           files: |
             release-assets/looper-darwin-arm64
             release-assets/looper-darwin-arm64.sha256
