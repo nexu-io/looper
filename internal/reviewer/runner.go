@@ -829,7 +829,10 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) {
-		currentLogin, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
 		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			return checkpoint, nil
@@ -1172,6 +1175,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			}
 		}
 	}
+	if startStep != stepDiscover && !isManualReviewerLoop(loop) && needsReviewerEligibilityRediscovery(checkpoint) {
+		startStep = stepDiscover
+		restartFromDiscover = true
+	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscover
 	initialCheckpoint := reviewerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
@@ -1352,6 +1359,10 @@ func isManualReviewerLoop(loop storage.LoopRecord) bool {
 	meta := parseJSONObject(loop.MetadataJSON)
 	manual, _ := meta["manual"].(bool)
 	return manual
+}
+
+func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint) bool {
+	return checkpoint.Detail == nil || checkpoint.Detail.ReviewRequests == nil
 }
 
 type enqueueInput struct {
