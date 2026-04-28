@@ -533,7 +533,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[key] = struct{}{}
 		detail, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
 		if viewErr != nil {
 			result.Skipped++
@@ -547,6 +546,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		seen[key] = struct{}{}
 		if err := enqueue(summaryFromDetail(detail), &loop); err != nil {
 			return DiscoveryResult{}, err
 		}
