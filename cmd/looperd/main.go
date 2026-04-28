@@ -192,6 +192,9 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
+	if latestExecution.Status != "running" {
+		return result, nil
+	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
 		if err != nil {
@@ -265,7 +268,14 @@ func markExecutionCancelling(ctx context.Context, services looperdruntime.Servic
 	if services.Repositories == nil || services.Repositories.AgentExecutions == nil {
 		return nil
 	}
-	updated := execution
+	current, err := services.Repositories.AgentExecutions.GetByID(ctx, execution.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.Status != "running" {
+		return nil
+	}
+	updated := *current
 	updated.Status = "cancelling"
 	updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now().UTC())
 	if updated.ErrorMessage == nil {
