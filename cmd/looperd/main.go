@@ -192,6 +192,18 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
+	if services.ActiveExecutions != nil {
+		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
+		if err != nil {
+			return nil, err
+		}
+		if killed {
+			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+	}
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
 		return result, nil
 	}
@@ -208,22 +220,51 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 	result.PID = *latestExecution.PID
 	if signal != nil {
-		if err := signal(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
 			return nil, err
 		}
 	}
 
-	updated := *latestExecution
-	updated.Status = "cancelling"
-	updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now().UTC())
-	if updated.ErrorMessage == nil {
-		updated.ErrorMessage = &reasonCopy
-	}
-	if err := services.Repositories.AgentExecutions.Upsert(ctx, updated); err != nil {
+	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 		return nil, err
 	}
 
 	return result, nil
+}
+
+func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {
+	if err := signalProcess(-pid, syscall.SIGTERM); err != nil {
+		if !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		if err := signalProcess(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+	}
+	if grace > 0 {
+		go func() {
+			timer := time.NewTimer(grace)
+			defer timer.Stop()
+			<-timer.C
+			if err := signalProcess(-pid, syscall.SIGKILL); errors.Is(err, syscall.ESRCH) {
+				_ = signalProcess(pid, syscall.SIGKILL)
+			}
+		}()
+	}
+	return nil
+}
+
+func markExecutionCancelling(ctx context.Context, services looperdruntime.Services, execution storage.AgentExecutionRecord, reason string, now func() time.Time) error {
+	if services.Repositories == nil || services.Repositories.AgentExecutions == nil {
+		return nil
+	}
+	updated := execution
+	updated.Status = "cancelling"
+	updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now().UTC())
+	if updated.ErrorMessage == nil {
+		updated.ErrorMessage = &reason
+	}
+	return services.Repositories.AgentExecutions.Upsert(ctx, updated)
 }
 
 func hasVersionArg(args []string) bool {

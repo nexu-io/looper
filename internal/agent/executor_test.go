@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -343,6 +346,37 @@ func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 	}
 }
 
+func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
+	workDir := t.TempDir()
+	childPIDPath := filepath.Join(workDir, "child.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `(trap '' TERM; while true; do sleep 1; done) & echo $! > "$CHILD_PID_FILE"; wait`}}}})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill_group", WorkingDirectory: workDir, Prompt: "ignored", Timeout: 5 * time.Second, GracefulShutdown: 20 * time.Millisecond, Env: map[string]string{"CHILD_PID_FILE": childPIDPath}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	childPID := waitForPIDFile(t, childPIDPath)
+	if err := execHandle.Kill("stopped by test"); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "killed" {
+		t.Fatalf("result.Status = %q, want killed", result.Status)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child process %d is still running after execution Kill", childPID)
+}
+
 func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -437,4 +471,21 @@ func containsEvent(events []storage.EventLogRecord, eventType string) bool {
 
 func containsText(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for pid file %s", path)
+	return 0
 }

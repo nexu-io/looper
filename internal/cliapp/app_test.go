@@ -1576,6 +1576,10 @@ func (e smokeAgentExecution) Wait(ctx context.Context) (worker.AgentResult, erro
 	}, nil
 }
 
+func (e smokeAgentExecution) Kill(reason string) error {
+	return e.execution.Kill(reason)
+}
+
 func derefString(value *string) string {
 	if value == nil {
 		return ""

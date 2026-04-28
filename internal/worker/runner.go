@@ -266,6 +266,7 @@ type AgentResult struct {
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
+	Kill(string) error
 }
 
 type AgentExecutor interface {

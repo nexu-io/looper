@@ -504,14 +504,27 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
-type workerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type workerAgentExecutionAdapter struct{ execution agent.Execution }
+type workerAgentExecutorAdapter struct {
+	executor *agent.ConfiguredExecutor
+	registry *ActiveExecutionRegistry
+}
+type workerAgentExecutionAdapter struct {
+	execution agent.Execution
+}
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		return nil, err
 	}
+	unregister := func() {}
+	if a.registry != nil {
+		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
+	}
+	go func() {
+		_, _ = execution.Wait(context.Background())
+		unregister()
+	}()
 	return workerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -523,7 +536,11 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle}, nil
 }
 
-func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
+func (a workerAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
+}
+
+func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
 	if now == nil {
 		now = time.Now
 	}
@@ -670,7 +687,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
 		Git:              workerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:           logger,
 		Now:              now,
 		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,

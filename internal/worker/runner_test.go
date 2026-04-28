@@ -2170,6 +2170,8 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 	return f.result, nil
 }
 
+func (f fakeAgentExecution) Kill(string) error { return nil }
+
 type testLogger struct{}
 
 func (*testLogger) Debug(string, map[string]any) {}

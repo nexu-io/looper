@@ -806,8 +806,11 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 			return "codex exec fix failing tests", nil
 		},
 		SignalProcess: func(gotPID int, signal syscall.Signal) error {
-			if gotPID != int(pid) || signal != syscall.SIGTERM {
-				t.Fatalf("SignalProcess(%d, %v), want (%d, SIGTERM)", gotPID, signal, pid)
+			if signal == syscall.SIGKILL {
+				return nil
+			}
+			if gotPID != -int(pid) || signal != syscall.SIGTERM {
+				t.Fatalf("SignalProcess(%d, %v), want (%d, SIGTERM)", gotPID, signal, -pid)
 			}
 			return nil
 		},

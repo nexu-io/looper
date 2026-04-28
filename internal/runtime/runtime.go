@@ -64,11 +64,12 @@ type Options struct {
 }
 
 type Services struct {
-	Coordinator  *storage.SQLiteCoordinator
-	Repositories *storage.Repositories
-	Projects     *projects.Service
-	Loops        *loops.Service
-	Runs         *runs.Service
+	Coordinator      *storage.SQLiteCoordinator
+	Repositories     *storage.Repositories
+	Projects         *projects.Service
+	Loops            *loops.Service
+	Runs             *runs.Service
+	ActiveExecutions *ActiveExecutionRegistry
 }
 
 type Runtime struct {
@@ -85,20 +86,21 @@ type Runtime struct {
 	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
 
-	mu              sync.RWMutex
-	startedAt       *time.Time
-	recovery        RecoverySummary
-	stopped         bool
-	services        Services
-	startErr        error
-	startOnce       sync.Once
-	shutdownOnce    sync.Once
-	shutdownCh      chan struct{}
-	schedulerStop   chan struct{}
-	schedulerDone   chan struct{}
-	schedulerWake   chan struct{}
-	schedulerCancel context.CancelFunc
-	schedulerTasks  *schedulerTaskTracker
+	mu               sync.RWMutex
+	startedAt        *time.Time
+	recovery         RecoverySummary
+	stopped          bool
+	services         Services
+	startErr         error
+	startOnce        sync.Once
+	shutdownOnce     sync.Once
+	shutdownCh       chan struct{}
+	schedulerStop    chan struct{}
+	schedulerDone    chan struct{}
+	schedulerWake    chan struct{}
+	schedulerCancel  context.CancelFunc
+	schedulerTasks   *schedulerTaskTracker
+	activeExecutions *ActiveExecutionRegistry
 }
 
 func New(options Options) *Runtime {
@@ -151,6 +153,7 @@ func New(options Options) *Runtime {
 		shutdownTimeout:        shutdownTimeout,
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
+		activeExecutions:       NewActiveExecutionRegistry(),
 	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
@@ -352,15 +355,16 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.startedAt = &startedAt
 	r.recovery = recoverySummary
 	r.services = Services{
-		Coordinator:  coordinator,
-		Repositories: repositories,
-		Projects:     projectService,
-		Loops:        loopService,
-		Runs:         runService,
+		Coordinator:      coordinator,
+		Repositories:     repositories,
+		Projects:         projectService,
+		Loops:            loopService,
+		Runs:             runService,
+		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, func() schedulerAsyncRunner {
+		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -559,12 +563,18 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				continue
 			}
 			if running {
-				if err := r.signalProcess(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 					if r.logger != nil {
 						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
 					}
 					continue
 				}
+				go func(pid int) {
+					timer := time.NewTimer(5 * time.Second)
+					defer timer.Stop()
+					<-timer.C
+					_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
+				}(pid)
 			}
 
 			cleaned := execution
@@ -1165,6 +1175,19 @@ func defaultReadProcessCommand(ctx context.Context, pid int) (string, error) {
 
 func defaultSignalProcess(pid int, signal syscall.Signal) error {
 	return syscall.Kill(pid, signal)
+}
+
+func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error {
+	if r.signalProcess == nil {
+		return nil
+	}
+	if err := r.signalProcess(-pid, signal); err != nil {
+		if !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return r.signalProcess(pid, signal)
+	}
+	return nil
 }
 
 func createEmptyRecoverySummary() RecoverySummary {
