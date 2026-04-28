@@ -380,6 +380,64 @@ func TestProcessClaimedItemRestartsAutomaticResumeFromDiscoverForFreshReviewRequ
 	}
 }
 
+func TestProcessClaimedItemPreservesLegacyPublishCheckpointOnAutomaticResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_legacy_publish_resume", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	legacyCheckpoint := reviewerCheckpoint{
+		Detail: &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123"},
+		PendingReview: &pendingReviewCheckpoint{
+			HeadSHA: "abc123",
+			Event:   ReviewEventComment,
+			Body:    "Actionable review",
+			Summary: "Actionable review",
+			Comments: []reviewFeedbackComment{
+				{Body: "Follow-up comment"},
+			},
+			PublishState: &publishState{ReviewSubmitted: true},
+		},
+		ResumePolicy: "advance_from_checkpoint",
+	}
+	legacyRun := storage.RunRecord{ID: "run_legacy_publish", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)), CheckpointJSON: stringPtr(mustMarshalJSON(legacyCheckpoint)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), legacyRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success after publish resume", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts=%d, want no duplicate review", len(agent.starts))
+	}
+	if len(github.submitCalls) != 0 {
+		t.Fatalf("submit calls=%d, want no duplicate review submission", len(github.submitCalls))
+	}
+	if len(github.prComments) != 1 {
+		t.Fatalf("pr comments=%d, want remaining top-level comment", len(github.prComments))
+	}
+}
+
 func TestEnqueueScopesReviewerDedupeKeyToLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

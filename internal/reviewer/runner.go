@@ -1200,7 +1200,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			}
 		}
 	}
-	if startStep != stepDiscover && !isManualReviewerLoop(loop) && needsReviewerEligibilityRediscovery(checkpoint) {
+	if startStep != stepDiscover && !isManualReviewerLoop(loop) && needsReviewerEligibilityRediscovery(checkpoint, startStep) {
 		startStep = stepDiscover
 		restartFromDiscover = true
 	}
@@ -1386,7 +1386,10 @@ func isManualReviewerLoop(loop storage.LoopRecord) bool {
 	return manual
 }
 
-func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint) bool {
+func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {
+	if checkpoint.PendingReview != nil && (startStep == stepReview || startStep == stepPublish) {
+		return false
+	}
 	return checkpoint.Detail == nil || checkpoint.Detail.ReviewRequests == nil
 }
 
