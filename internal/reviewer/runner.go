@@ -459,7 +459,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	currentLogin, _ := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	currentLogin = normalizeLogin(currentLogin)
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
