@@ -1043,6 +1043,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			if pending.PublishState.ReviewSubmitted {
+				if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
+					return checkpoint, err
+				}
+			}
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
@@ -1132,15 +1137,22 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 		}
 	}
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, nil
+}
+
+func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
 	if err != nil {
-		return checkpoint, err
+		return err
 	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
-		return checkpoint, err
+		return err
 	}
-	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", repo, prNumber), payload: map[string]any{"repo": repo, "prNumber": prNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
-	return checkpoint, nil
+	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
+	return nil
 }
 
 type eventInput struct {

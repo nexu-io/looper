@@ -523,6 +523,56 @@ func TestProcessClaimedItemSkipsPublishWhenReviewRequestRemovedBeforeRetry(t *te
 	}
 }
 
+func TestProcessClaimedItemRecordsPublishedHeadWhenReviewRequestRemovedAfterSubmit(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prCommentFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	firstClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || firstClaim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", firstClaim, err)
+	}
+	firstResult, err := runner.ProcessClaimedItem(context.Background(), *firstClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first result = %#v, want retryable_after_resume failure", firstResult)
+	}
+	if len(agent.starts) != 1 || len(github.submitCalls) != 1 || len(github.prComments) != 1 {
+		t.Fatalf("agent starts=%d submit calls=%d comments=%d, want submitted review then failed top-level comment", len(agent.starts), len(github.submitCalls), len(github.prComments))
+	}
+
+	github.reviewRequests = []string{}
+	fixture.advance(5 * time.Second)
+	retryClaim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || retryClaim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", retryClaim, err)
+	}
+	retryResult, err := runner.ProcessClaimedItem(context.Background(), *retryClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(retry) error = %v", err)
+	}
+	if retryResult.Status != "skipped" || !contains(retryResult.Summary, "current user is not requested for review") {
+		t.Fatalf("retry result = %#v, want skipped missing review request", retryResult)
+	}
+	if len(agent.starts) != 1 || len(github.submitCalls) != 1 || len(github.prComments) != 1 {
+		t.Fatalf("agent starts=%d submit calls=%d comments=%d after retry, want no duplicate publish", len(agent.starts), len(github.submitCalls), len(github.prComments))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), retryResult.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil || !contains(*loop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop after skipped retry = %#v, want lastPublishedHeadSha recorded", loop)
+	}
+}
+
 func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1182,19 +1232,20 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	submitFailuresRemaining int
-	changeHeadOnSecondView  bool
-	viewCalls               int
-	submitCalls             []SubmitReviewInput
-	addedLabels             []PullRequestLabelsInput
-	removedLabels           []PullRequestLabelsInput
-	prComments              []PullRequestCommentInput
-	addedReactions          []PullRequestReactionInput
-	removedReactions        []PullRequestReactionInput
-	labels                  []string
-	reviewRequests          []string
-	currentLogin            string
-	currentLoginErr         error
+	submitFailuresRemaining    int
+	prCommentFailuresRemaining int
+	changeHeadOnSecondView     bool
+	viewCalls                  int
+	submitCalls                []SubmitReviewInput
+	addedLabels                []PullRequestLabelsInput
+	removedLabels              []PullRequestLabelsInput
+	prComments                 []PullRequestCommentInput
+	addedReactions             []PullRequestReactionInput
+	removedReactions           []PullRequestReactionInput
+	labels                     []string
+	reviewRequests             []string
+	currentLogin               string
+	currentLoginErr            error
 }
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1247,6 +1298,10 @@ func (g *fakeGitHubGateway) SubmitReview(_ context.Context, input SubmitReviewIn
 
 func (g *fakeGitHubGateway) AddPullRequestComment(_ context.Context, input PullRequestCommentInput) error {
 	g.prComments = append(g.prComments, input)
+	if g.prCommentFailuresRemaining > 0 {
+		g.prCommentFailuresRemaining--
+		return fmt.Errorf("temporary GitHub comment failure")
+	}
 	return nil
 }
 
