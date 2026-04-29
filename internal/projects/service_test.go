@@ -166,6 +166,54 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 	}
 }
 
+func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	repo := "powerformer/looper"
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			capturedAt := now.UTC().Format(time.RFC3339Nano)
+			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: repo, PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
+		},
+		AsyncSnapshotQueueEnabled: func() bool { return false },
+	}
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeAsync})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.DiscoveredPullRequests != 1 || result.PendingSnapshots != 0 || result.CapturedSnapshots != 1 {
+		t.Fatalf("AddProject() counts = discovered %d pending %d captured %d, want 1/0/1", result.DiscoveredPullRequests, result.PendingSnapshots, result.CapturedSnapshots)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "Async snapshot mode requires the scheduler; capturing snapshots synchronously instead." {
+		t.Fatalf("AddProject().Warnings = %#v, want async fallback warning", result.Warnings)
+	}
+	items, err := repos.Queue.List(ctx)
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue items = %#v, want none", items)
+	}
+	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, repo, 1)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.GetLatest() error = %v", err)
+	}
+	if snapshot == nil {
+		t.Fatal("snapshot = nil, want captured snapshot")
+	}
+}
+
 func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T) {
 	t.Parallel()
 

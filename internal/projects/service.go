@@ -79,6 +79,7 @@ type Service struct {
 	ListWorktrees              ListWorktreesFunc
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
+	AsyncSnapshotQueueEnabled  func() bool
 }
 
 type AddInput struct {
@@ -620,6 +621,10 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 	if mode == SnapshotModeOff || repo == nil || strings.TrimSpace(*repo) == "" || s.ListOpenPullRequests == nil {
 		return 0, 0, 0, nil
 	}
+	if mode == SnapshotModeAsync && !s.asyncSnapshotQueueEnabled() {
+		mode = SnapshotModeFull
+		*warnings = append(*warnings, "Async snapshot mode requires the scheduler; capturing snapshots synchronously instead.")
+	}
 
 	listCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -683,6 +688,13 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 	}
 
 	return discovered, pending, captured, nil
+}
+
+func (s *Service) asyncSnapshotQueueEnabled() bool {
+	if s.AsyncSnapshotQueueEnabled == nil {
+		return true
+	}
+	return s.AsyncSnapshotQueueEnabled()
 }
 
 func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (bool, error) {
