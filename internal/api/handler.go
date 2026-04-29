@@ -52,6 +52,7 @@ type Context struct {
 	Now                  func() time.Time
 	RecoverySummary      func() any
 	StopLoop             func(context.Context, string, string) (any, error)
+	StopAll              func(context.Context, string) (any, error)
 	TriggerSchedulerTick func()
 }
 
@@ -1719,14 +1720,26 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	loop, err := h.resolveLoop(r.Context(), selector)
-	if err != nil {
-		return nil, err
+	if selector == "stop-all" {
+		if len(parts) != 1 {
+			return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+		}
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		if h.context.StopAll == nil {
+			return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+		}
+		return h.context.StopAll(r.Context(), "Stopped by user via selector all")
 	}
 
 	if len(parts) == 1 || strings.TrimSpace(parts[1]) == "" {
 		if r.Method != http.MethodGet {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		loop, err := h.resolveLoop(r.Context(), selector)
+		if err != nil {
+			return nil, err
 		}
 		return h.buildActiveRunDetailResponse(r.Context(), loop.ID)
 	}
@@ -1738,6 +1751,10 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		}
 		if h.context.StopLoop == nil {
 			return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+		}
+		loop, err := h.resolveLoop(r.Context(), selector)
+		if err != nil {
+			return nil, err
 		}
 		return h.context.StopLoop(r.Context(), loop.ID, fmt.Sprintf("Stopped by user via selector %s", selector))
 	default:

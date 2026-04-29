@@ -2895,6 +2895,38 @@ func TestHandlerRunRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	}
 }
 
+func TestHandlerActiveRunsStopAllUsesContextStopAll(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	called := 0
+	var gotReason string
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/active/stop-all", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		StopAll: func(_ context.Context, reason string) (any, error) {
+			called++
+			gotReason = reason
+			return map[string]any{"summary": map[string]any{"total": 0, "stopped": 0, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{}}, nil
+		},
+		StopLoop: func(context.Context, string, string) (any, error) {
+			t.Fatal("StopLoop should not be called for stop-all route")
+			return nil, nil
+		},
+	}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	assertEqual(t, called, 1)
+	assertEqual(t, gotReason, "Stopped by user via selector all")
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+}
+
 func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedRunRouteData(t, fixture.runtime)

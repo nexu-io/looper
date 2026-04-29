@@ -115,6 +115,28 @@ type activeRunsOutput struct {
 	Items []activeRunOutput `json:"items"`
 }
 
+type stopAllOutput struct {
+	Summary struct {
+		Total           int `json:"total"`
+		Stopped         int `json:"stopped"`
+		AlreadyFinished int `json:"alreadyFinished"`
+		AlreadyStopping int `json:"alreadyStopping"`
+		Failed          int `json:"failed"`
+	} `json:"summary"`
+	Items []struct {
+		LoopID                  string `json:"loopId"`
+		Seq                     int64  `json:"seq"`
+		Type                    string `json:"type"`
+		RunID                   string `json:"runId"`
+		ExecutionID             string `json:"executionId"`
+		PreviousLoopStatus      string `json:"previousLoopStatus"`
+		PreviousRunStatus       string `json:"previousRunStatus"`
+		PreviousExecutionStatus string `json:"previousExecutionStatus"`
+		Result                  string `json:"result"`
+		Error                   string `json:"error"`
+	} `json:"items"`
+}
+
 type activeRunOutput struct {
 	Seq         int64   `json:"seq"`
 	Type        string  `json:"type"`
@@ -460,6 +482,33 @@ func writeHumanStopLoop(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Loop stopped", [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"stopped", data.Stopped}})
 	if !data.Stopped {
 		return fmt.Errorf("Loop %s could not be stopped", data.LoopID)
+	}
+	return nil
+}
+
+func writeHumanStopAll(w io.Writer, payload json.RawMessage) error {
+	var data stopAllOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode stop-all response: %w", err)
+	}
+	if data.Summary.Total == 0 {
+		_, err := fmt.Fprintln(w, "No running tasks to stop.")
+		return err
+	}
+	printSection(w, "Stopped running tasks", [][2]any{
+		{"total", data.Summary.Total},
+		{"stopped", data.Summary.Stopped},
+		{"alreadyFinished", data.Summary.AlreadyFinished},
+		{"alreadyStopping", data.Summary.AlreadyStopping},
+		{"failed", data.Summary.Failed},
+	})
+	rows := make([]tableRow, 0, len(data.Items))
+	for _, item := range data.Items {
+		rows = append(rows, tableRow{"seq": item.Seq, "type": item.Type, "loopId": item.LoopID, "runId": item.RunID, "executionId": item.ExecutionID, "result": item.Result, "error": item.Error})
+	}
+	printTable(w, []string{"seq", "type", "loopId", "runId", "executionId", "result", "error"}, rows)
+	if data.Summary.Failed > 0 {
+		return fmt.Errorf("failed to stop %d running task(s)", data.Summary.Failed)
 	}
 	return nil
 }

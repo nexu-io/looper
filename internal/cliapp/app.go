@@ -326,7 +326,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper logs 12 --follow",
 				},
 			}),
-			newCommand(commandSpec{use: "stop <id>", short: "Stop an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12"}}),
+			newCommand(commandSpec{use: "stop <id|all>", short: "Stop an active loop or all active loops", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12", "$ looper stop all"}}),
 			newCommand(commandSpec{
 				use:             "run",
 				short:           "Run commands",

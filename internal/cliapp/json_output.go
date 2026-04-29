@@ -284,10 +284,41 @@ func (r *commandRuntime) loopLogs(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) stopLoop(cmd *cobra.Command, args []string) error {
+	selector := strings.TrimSpace(args[0])
+	if selector == "all" {
+		payload, err := r.postJSON(cmd.Context(), "/api/v1/runs/active/stop-all", nil)
+		if err != nil {
+			return err
+		}
+		if getBoolFlag(cmd, "json") {
+			if err := writeJSON(cmd.OutOrStdout(), payload); err != nil {
+				return err
+			}
+		} else if err := writeHumanStopAll(cmd.OutOrStdout(), payload); err != nil {
+			return err
+		}
+		if failed, err := stopAllFailedCount(payload); err != nil {
+			return err
+		} else if failed > 0 {
+			return fmt.Errorf("failed to stop %d running task(s)", failed)
+		}
+		return nil
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
-		selector := strings.TrimSpace(args[0])
 		return r.postJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(selector)+"/stop", nil)
 	}, writeHumanStopLoop)
+}
+
+func stopAllFailedCount(payload json.RawMessage) (int, error) {
+	var data struct {
+		Summary struct {
+			Failed int `json:"failed"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return 0, fmt.Errorf("decode stop-all response: %w", err)
+	}
+	return data.Summary.Failed, nil
 }
 
 func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {

@@ -646,6 +646,77 @@ func TestPSWithoutJSONShowsRunningLoopWithoutRunRow(t *testing.T) {
 	}
 }
 
+func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/runs/active/stop-all"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all", map[string]any{"summary": map[string]any{"total": 1, "stopped": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{{"seq": 12, "type": "worker", "loopId": "loop_12", "runId": "run_12", "executionId": "exec_12", "result": "stopped"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop all]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop all]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Stopped running tasks", "loop_12", "worker", "stopped"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop all]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_empty", map[string]any{"summary": map[string]any{"total": 0, "stopped": 0, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop all]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop all]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "No running tasks to stop.\n"; got != want {
+		t.Fatalf("Run([stop all]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_partial", map[string]any{"summary": map[string]any{"total": 2, "stopped": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 1}, "items": []map[string]any{{"seq": 1, "type": "planner", "loopId": "loop_1", "runId": "run_1", "executionId": "exec_1", "result": "stopped"}, {"seq": 2, "type": "reviewer", "loopId": "loop_2", "runId": "run_2", "executionId": "exec_2", "result": "failed", "error": "signal failed"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatal("Run([stop all]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stdout, "Stopped running tasks") || !strings.Contains(stdout, "signal failed") {
+		t.Fatalf("Run([stop all]) stdout = %q, want summary and failure row", stdout)
+	}
+	if !strings.Contains(stderr, "failed to stop 1 running task(s)") {
+		t.Fatalf("Run([stop all]) stderr = %q, want partial failure message", stderr)
+	}
+}
+
 func TestLogsWithoutJSONPrintsHeaderAndTail(t *testing.T) {
 	t.Parallel()
 
