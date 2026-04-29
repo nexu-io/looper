@@ -236,6 +236,49 @@ func TestRunScheduledQueueItemsErrorsWhenRunnerMissing(t *testing.T) {
 	}
 }
 
+func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-retry.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "powerformer/looper"
+	prNumber := int64(109)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{err: errors.New("gh timeout")},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with one attempt and no finished_at", updated)
+	}
+	if updated.LastError == nil || *updated.LastError != "gh timeout" || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
+		t.Fatalf("queue item error = (%v, %v), want retryable gh timeout", updated.LastError, updated.LastErrorKind)
+	}
+}
+
 func TestSchedulerAvailableSlotsAccountsForRunningQueueItems(t *testing.T) {
 	t.Parallel()
 
@@ -595,6 +638,14 @@ func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*wor
 
 func (s *blockingWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
 	return s.ProcessNext(ctx, "")
+}
+
+type stubSnapshotScheduler struct {
+	err error
+}
+
+func (s stubSnapshotScheduler) CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	return storage.PullRequestSnapshotRecord{}, s.err
 }
 
 func waitForSchedulerCondition(t *testing.T, condition func() bool) {
