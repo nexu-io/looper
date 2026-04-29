@@ -987,7 +987,7 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	}
 	project, err := input.Repos.Projects.GetByID(ctx, *item.ProjectID)
 	if err != nil {
-		return err
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
 	if project == nil {
 		return failSnapshotQueueItem(ctx, item, input, "project not found", "non_retryable")
