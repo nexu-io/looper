@@ -554,7 +554,7 @@ func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerI
 	if strings.TrimSpace(input.Marker) == "" {
 		return false, nil
 	}
-	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
 	if err != nil {
 		return false, err
 	}
@@ -564,7 +564,13 @@ func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerI
 func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
-		return len(allowedReviewEvents) == 0 && strings.Contains(raw, marker)
+		var pages [][]map[string]any
+		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
+			return len(allowedReviewEvents) == 0 && strings.Contains(raw, marker)
+		}
+		for _, page := range pages {
+			rows = append(rows, page...)
+		}
 	}
 	for _, row := range rows {
 		body, ok := row["body"].(string)

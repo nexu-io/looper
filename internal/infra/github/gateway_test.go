@@ -232,9 +232,9 @@ func TestGatewayHasReviewMarkerIgnoresIssueComments(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch args {
-		case "api --paginate repos/acme/looper/pulls/42/reviews":
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews":
 			return shell.Result{Stdout: `[{"body":"review without marker"}]`}, nil
-		case "api --paginate repos/acme/looper/issues/42/comments":
+		case "api --paginate --slurp repos/acme/looper/issues/42/comments":
 			t.Fatalf("HasReviewMarker must not accept markers from issue comments")
 		}
 		t.Fatalf("unexpected gh args: %q", args)
@@ -255,7 +255,7 @@ func TestGatewayHasReviewMarkerRequiresAllowedReviewEvent(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if strings.Join(options.Args, " ") == "api --paginate repos/acme/looper/pulls/42/reviews" {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
 			return shell.Result{Stdout: `[{"state":"APPROVED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]`}, nil
 		}
 		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
@@ -276,6 +276,27 @@ func TestGatewayHasReviewMarkerRequiresAllowedReviewEvent(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("HasReviewMarker() = false, want true when approval is allowed")
+	}
+}
+
+func TestGatewayHasReviewMarkerReadsSlurpedPaginatedReviews(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[[{"state":"COMMENTED","body":"review without marker"}],[{"state":"APPROVED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"APPROVE"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true for marker in slurped paginated reviews")
 	}
 }
 
