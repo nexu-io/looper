@@ -1010,7 +1010,7 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
 	if err := input.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
-		return err
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
 	return input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
 }
