@@ -707,10 +707,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+			if checkpoint.ResumePolicy == "restart_from_discover" {
+				latest.ResumePolicy = checkpoint.ResumePolicy
+			}
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
+				if resumePolicy != "restart_from_discover" {
+					resumePolicy = "advance_from_checkpoint"
+				}
 			case FailureManualIntervention:
 				resumePolicy = "manual_intervention"
 			default:
@@ -1002,6 +1007,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	if result.Status != "completed" {
+		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
 		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Reviewer agent %s", result.Status))
 		kind := FailureRetryableTransient
 		if agent.IsAgentSetupFailureMessage(message) {
@@ -1230,7 +1239,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	restartFromDiscover := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
+		restartFromDiscover = checkpoint.ResumePolicy == "restart_from_discover" || shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
 	}
 	startStep := stepDiscover
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
@@ -1564,6 +1573,30 @@ func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSu
 	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish")
 }
 
+func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {
+	if checkpoint.Snapshot == nil {
+		return "", false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", false
+	}
+	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	}
+	if isManualReviewerLoop(input.Loop) {
+		return "", false
+	}
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return "", false
+	}
+	if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		return "review request removed before publish", true
+	}
+	return "", false
+}
+
 func stepsFrom(start ReviewerStep) []ReviewerStep {
 	startIndex := 0
 	for i, step := range reviewerStepSequence {
@@ -1705,7 +1738,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	}
 	parts = append(parts,
-		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews and PR conversation comments for this PR. If any existing body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome`: outcome=clean means ensure +1 reaction and spec-ready label transition when applicable; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
+		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome`: outcome=clean means ensure +1 reaction and spec-ready label transition when applicable; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
 		fmt.Sprintf("GitHub operation contract: use `gh` to submit exactly one PR review for this run. Prefer `gh api repos/%s/pulls/%d/reviews --method POST --input -`, with `commit_id` set to the expected head SHA and `event` set to COMMENT or APPROVE as appropriate.", repo, prNumber),
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
 		reviewRequestInstruction,

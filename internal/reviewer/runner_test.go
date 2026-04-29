@@ -1378,6 +1378,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"gh api repos/acme/looper/pulls/42/reviews",
 		"looper:review id=reviewer:loop:abc123 head=abc123 outcome=clean|actionable",
 		"before posting anything",
+		"existing PR reviews",
 		"ensure +1 reaction and spec-ready label transition",
 		"review request removed before publish",
 		"PR head changed before publish",
@@ -1391,6 +1392,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	if strings.Contains(prompt, "<!-- looper:review id=reviewer:loop:abc123 head=abc123 run=") {
 		t.Fatalf("prompt includes run-scoped idempotency marker:\n%s", prompt)
 	}
+	if strings.Contains(prompt, "PR conversation comments") {
+		t.Fatalf("prompt idempotency source diverges from review marker verification:\n%s", prompt)
+	}
 }
 
 func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) {
@@ -1403,6 +1407,79 @@ func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) 
 		if !shouldRestartFromDiscover("failed", stepReview, summary) {
 			t.Fatalf("shouldRestartFromDiscover(review, %q) = false, want true", summary)
 		}
+	}
+}
+
+func TestProcessClaimedItemRestartsFromDiscoverOnHeadChangeSignal(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{changeHeadOnSecondView: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent reported a generic shell failure"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed before publish") {
+		t.Fatalf("result = %#v, want structured head-change retry", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepDiscover {
+		t.Fatalf("StartStep = %q, want discover", resumed.StartStep)
+	}
+}
+
+func TestProcessClaimedItemRestartsFromDiscoverOnReviewRequestSignal(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{removeReviewRequestOnSecondView: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent reported a generic shell failure"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "review request removed before publish") {
+		t.Fatalf("result = %#v, want structured review-request retry", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
 	}
 }
 
@@ -1704,22 +1781,23 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	submitFailuresRemaining    int
-	prCommentFailuresRemaining int
-	changeHeadOnSecondView     bool
-	viewCalls                  int
-	submitCalls                []SubmitReviewInput
-	addedLabels                []PullRequestLabelsInput
-	removedLabels              []PullRequestLabelsInput
-	prComments                 []PullRequestCommentInput
-	addedReactions             []PullRequestReactionInput
-	removedReactions           []PullRequestReactionInput
-	labels                     []string
-	reviewRequests             []string
-	currentLogin               string
-	currentLoginErr            error
-	reviewMarkerMissing        bool
-	reviewMarkerErr            error
+	submitFailuresRemaining         int
+	prCommentFailuresRemaining      int
+	changeHeadOnSecondView          bool
+	removeReviewRequestOnSecondView bool
+	viewCalls                       int
+	submitCalls                     []SubmitReviewInput
+	addedLabels                     []PullRequestLabelsInput
+	removedLabels                   []PullRequestLabelsInput
+	prComments                      []PullRequestCommentInput
+	addedReactions                  []PullRequestReactionInput
+	removedReactions                []PullRequestReactionInput
+	labels                          []string
+	reviewRequests                  []string
+	currentLogin                    string
+	currentLoginErr                 error
+	reviewMarkerMissing             bool
+	reviewMarkerErr                 error
 }
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1743,7 +1821,11 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: g.effectiveReviewRequests(), ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts"}, nil
+	reviewRequests := g.effectiveReviewRequests()
+	if g.removeReviewRequestOnSecondView && g.viewCalls >= 2 {
+		reviewRequests = nil
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts"}, nil
 }
 
 func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
