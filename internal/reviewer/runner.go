@@ -202,10 +202,11 @@ type PullRequestLabelsInput struct {
 }
 
 type VerifyReviewMarkerInput struct {
-	Repo     string
-	PRNumber int64
-	Marker   string
-	CWD      string
+	Repo                string
+	PRNumber            int64
+	Marker              string
+	AllowedReviewEvents []ReviewEvent
+	CWD                 string
 }
 
 type GitHubGateway interface {
@@ -1041,8 +1042,24 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, nil
 	}
 	if pending.AgentNative {
+		repo := input.Repo
+		prNumber := input.PRNumber
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if !isManualReviewerLoop(input.Loop) {
+			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
+				return checkpoint, nil
+			}
+		}
 		marker := agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA)
-		found, err := r.github.HasReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, CWD: input.Project.RepoPath})
+		found, err := r.github.HasReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -1168,6 +1185,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
+	if r.allowAutoApprove {
+		return []ReviewEvent{ReviewEventComment, ReviewEventApprove}
+	}
+	return []ReviewEvent{ReviewEventComment}
 }
 
 func (r *Runner) transitionSpecReviewLabels(ctx context.Context, input stepInput, detail PullRequestDetail, phase string, checkpointPhase string, reviewEvent ReviewEvent) error {

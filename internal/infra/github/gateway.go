@@ -132,10 +132,11 @@ type ReviewComment struct {
 }
 
 type VerifyReviewMarkerInput struct {
-	Repo     string
-	PRNumber int64
-	Marker   string
-	CWD      string
+	Repo                string
+	PRNumber            int64
+	Marker              string
+	AllowedReviewEvents []string
+	CWD                 string
 }
 
 type PullRequestReactionInput struct {
@@ -557,20 +558,49 @@ func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerI
 	if err != nil {
 		return false, err
 	}
-	return jsonBodiesContainMarker(reviewsResult.Stdout, input.Marker), nil
+	return jsonBodiesContainAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents), nil
 }
 
-func jsonBodiesContainMarker(raw string, marker string) bool {
+func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
-		return strings.Contains(raw, marker)
+		return len(allowedReviewEvents) == 0 && strings.Contains(raw, marker)
 	}
 	for _, row := range rows {
-		if body, ok := row["body"].(string); ok && strings.Contains(body, marker) {
+		body, ok := row["body"].(string)
+		if !ok || !strings.Contains(body, marker) {
+			continue
+		}
+		if len(allowedReviewEvents) == 0 || reviewStateAllowed(row["state"], allowedReviewEvents) {
 			return true
 		}
 	}
 	return false
+}
+
+func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
+	state, _ := raw.(string)
+	event := reviewEventFromState(state)
+	if event == "" {
+		return false
+	}
+	for _, allowed := range allowedReviewEvents {
+		if strings.EqualFold(event, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewEventFromState(state string) string {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return "APPROVE"
+	case "COMMENTED":
+		return "COMMENT"
+	default:
+		return ""
+	}
 }
 
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {

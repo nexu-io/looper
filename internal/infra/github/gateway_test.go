@@ -251,6 +251,34 @@ func TestGatewayHasReviewMarkerIgnoresIssueComments(t *testing.T) {
 	}
 }
 
+func TestGatewayHasReviewMarkerRequiresAllowedReviewEvent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"APPROVED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if found {
+		t.Fatal("HasReviewMarker() = true, want false for disallowed approval marker")
+	}
+	found, err = gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"COMMENT", "APPROVE"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true when approval is allowed")
+	}
+}
+
 func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

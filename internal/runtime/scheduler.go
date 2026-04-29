@@ -293,7 +293,11 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 }
 
 func (a reviewerGitHubAdapter) HasReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (bool, error) {
-	return a.gateway.HasReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, CWD: input.CWD})
+	allowedReviewEvents := make([]string, 0, len(input.AllowedReviewEvents))
+	for _, event := range input.AllowedReviewEvents {
+		allowedReviewEvents = append(allowedReviewEvents, string(event))
+	}
+	return a.gateway.HasReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, AllowedReviewEvents: allowedReviewEvents, CWD: input.CWD})
 }
 
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
