@@ -131,6 +131,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.openPrStrategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", OpenPRStrategyAllDone, OpenPRStrategyFirstCommit, OpenPRStrategyManual)})
 	}
 
+	if !isValidAddSnapshotMode(config.Defaults.AddSnapshotMode) {
+		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
+	}
+
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	for index, project := range config.Projects {
 		prefix := fmt.Sprintf("projects[%d]", index)
@@ -306,6 +310,15 @@ func isValidNotificationSoundLevel(level NotificationSoundLevel) bool {
 func isValidOpenPRStrategy(strategy OpenPRStrategy) bool {
 	switch strategy {
 	case OpenPRStrategyAllDone, OpenPRStrategyFirstCommit, OpenPRStrategyManual:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
+	switch mode {
+	case AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff:
 		return true
 	default:
 		return false

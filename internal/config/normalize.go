@@ -256,6 +256,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 	if partial.OpenPRStrategy != nil {
 		config.OpenPRStrategy = *partial.OpenPRStrategy
 	}
+
+	if partial.AddSnapshotMode != nil {
+		config.AddSnapshotMode = *partial.AddSnapshotMode
+	}
 }
 
 func mergeAnyMap(base map[string]any, override map[string]any) map[string]any {

@@ -40,6 +40,14 @@ const (
 	OpenPRStrategyManual      OpenPRStrategy = "manual"
 )
 
+type AddSnapshotMode string
+
+const (
+	AddSnapshotModeAsync AddSnapshotMode = "async"
+	AddSnapshotModeFull  AddSnapshotMode = "full"
+	AddSnapshotModeOff   AddSnapshotMode = "off"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -122,14 +130,15 @@ type PackageConfig struct {
 }
 
 type DefaultsConfig struct {
-	BaseBranch         string         `json:"baseBranch"`
-	AllowAutoCommit    bool           `json:"allowAutoCommit"`
-	AllowAutoPush      bool           `json:"allowAutoPush"`
-	AllowAutoApprove   bool           `json:"allowAutoApprove"`
-	AllowAutoMerge     bool           `json:"allowAutoMerge"`
-	AllowRiskyFixes    bool           `json:"allowRiskyFixes"`
-	FixAllPullRequests bool           `json:"fixAllPullRequests"`
-	OpenPRStrategy     OpenPRStrategy `json:"openPrStrategy"`
+	BaseBranch         string          `json:"baseBranch"`
+	AllowAutoCommit    bool            `json:"allowAutoCommit"`
+	AllowAutoPush      bool            `json:"allowAutoPush"`
+	AllowAutoApprove   bool            `json:"allowAutoApprove"`
+	AllowAutoMerge     bool            `json:"allowAutoMerge"`
+	AllowRiskyFixes    bool            `json:"allowRiskyFixes"`
+	FixAllPullRequests bool            `json:"fixAllPullRequests"`
+	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
+	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
 }
 
 type ProjectRefConfig struct {
@@ -221,14 +230,15 @@ type PartialPackageConfig struct {
 }
 
 type PartialDefaultsConfig struct {
-	BaseBranch         *string         `json:"baseBranch,omitempty"`
-	AllowAutoCommit    *bool           `json:"allowAutoCommit,omitempty"`
-	AllowAutoPush      *bool           `json:"allowAutoPush,omitempty"`
-	AllowAutoApprove   *bool           `json:"allowAutoApprove,omitempty"`
-	AllowAutoMerge     *bool           `json:"allowAutoMerge,omitempty"`
-	AllowRiskyFixes    *bool           `json:"allowRiskyFixes,omitempty"`
-	FixAllPullRequests *bool           `json:"fixAllPullRequests,omitempty"`
-	OpenPRStrategy     *OpenPRStrategy `json:"openPrStrategy,omitempty"`
+	BaseBranch         *string          `json:"baseBranch,omitempty"`
+	AllowAutoCommit    *bool            `json:"allowAutoCommit,omitempty"`
+	AllowAutoPush      *bool            `json:"allowAutoPush,omitempty"`
+	AllowAutoApprove   *bool            `json:"allowAutoApprove,omitempty"`
+	AllowAutoMerge     *bool            `json:"allowAutoMerge,omitempty"`
+	AllowRiskyFixes    *bool            `json:"allowRiskyFixes,omitempty"`
+	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
+	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
+	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
 }
 
 type PartialConfig struct {

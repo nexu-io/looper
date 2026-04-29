@@ -2,8 +2,10 @@ package github
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/powerformer/looper/internal/infra/shell"
 )
@@ -329,6 +331,65 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:spec-ready"}}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v, want nil", err)
+	}
+}
+
+func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view"):
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
+		case strings.Contains(args, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
+		case strings.HasPrefix(args, "pr diff"):
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"}
+			return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+
+	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+	}
+	if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
+		t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+	}
+}
+
+func TestGatewayDiffGenericFailureStillFails(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		result := shell.Result{ExitCode: 1, Stderr: "network failed"}
+		return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	_, err := gateway.GetPullRequestDiff(context.Background(), GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || errors.Is(err, ErrDiffTooLarge) {
+		t.Fatalf("GetPullRequestDiff() error = %v, want generic failure", err)
+	}
+}
+
+func TestGatewayRunGhPassesTimeouts(t *testing.T) {
+	t.Parallel()
+	var timeouts []time.Duration
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		timeouts = append(timeouts, options.Timeout)
+		return shell.Result{Stdout: "[]"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	_, _ = gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper", Timeout: prListGhCommandTimeout})
+	_, _ = gateway.GetPullRequestDiff(context.Background(), GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
+	if len(timeouts) != 2 || timeouts[0] != prListGhCommandTimeout || timeouts[1] != prDiffGhCommandTimeout {
+		t.Fatalf("timeouts = %#v, want list/diff timeouts", timeouts)
 	}
 }
 

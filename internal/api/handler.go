@@ -1048,6 +1048,8 @@ type createProjectResponse struct {
 	projectResponse
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
 	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
+	PendingSnapshots       int      `json:"pendingSnapshots"`
+	CapturedSnapshots      int      `json:"capturedSnapshots"`
 	Warnings               []string `json:"warnings"`
 }
 
@@ -3787,6 +3789,7 @@ type createProjectRequest struct {
 	BaseBranch   *string `json:"baseBranch"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	Repo         *string `json:"repo"`
+	SnapshotMode *string `json:"snapshotMode"`
 }
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
@@ -3818,6 +3821,13 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	if baseBranch == "" {
 		baseBranch = h.context.Config.Defaults.BaseBranch
 	}
+	snapshotMode := projects.SnapshotMode(strings.TrimSpace(derefString(body.SnapshotMode)))
+	if snapshotMode == "" {
+		snapshotMode = projects.SnapshotMode(h.context.Config.Defaults.AddSnapshotMode)
+	}
+	if snapshotMode != "" && snapshotMode != projects.SnapshotModeAsync && snapshotMode != projects.SnapshotModeFull && snapshotMode != projects.SnapshotModeOff {
+		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "snapshotMode must be one of: async, full, off"}
+	}
 
 	result, err := service.AddProject(r.Context(), projects.AddInput{
 		ID:           projectID,
@@ -3827,6 +3837,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
+		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
 		var collision projects.ProjectIDCollisionError
@@ -3845,6 +3856,8 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
 		DiscoveredPullRequests: result.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.DiscoveredWorktrees,
+		PendingSnapshots:       result.PendingSnapshots,
+		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
 }

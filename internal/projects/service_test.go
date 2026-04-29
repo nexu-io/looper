@@ -93,7 +93,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		},
 	}
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"})
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", SnapshotMode: SnapshotModeFull})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
@@ -126,6 +126,68 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	captured := false
+	repo := "powerformer/looper"
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC) },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}, {Number: 2, State: "OPEN", IsDraft: true}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			captured = true
+			return storage.PullRequestSnapshotRecord{}, nil
+		},
+	}
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if captured {
+		t.Fatal("CapturePullRequestSnapshot called in default async mode")
+	}
+	if result.DiscoveredPullRequests != 1 || result.PendingSnapshots != 1 || result.CapturedSnapshots != 0 {
+		t.Fatalf("AddProject() counts = discovered %d pending %d captured %d, want 1/1/0", result.DiscoveredPullRequests, result.PendingSnapshots, result.CapturedSnapshots)
+	}
+	items, err := repos.Queue.List(ctx)
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 || items[0].Type != "snapshot" || items[0].PRNumber == nil || *items[0].PRNumber != 1 {
+		t.Fatalf("queue items = %#v, want one snapshot for PR 1", items)
+	}
+}
+
+func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	listed := false
+	repo := "powerformer/looper"
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: time.Now, ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+		listed = true
+		return nil, nil
+	}}
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeOff})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if listed || result.DiscoveredPullRequests != 0 || result.PendingSnapshots != 0 {
+		t.Fatalf("off mode listed=%v counts=%#v, want no discovery", listed, result)
+	}
+}
+
 func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +211,7 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 	}
 	repo := "powerformer/looper"
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
@@ -190,12 +252,12 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 	}
 	repo := "powerformer/looper"
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.DiscoveredPullRequests != 0 {
-		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 0", result.DiscoveredPullRequests)
+	if result.DiscoveredPullRequests != 1 {
+		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 1", result.DiscoveredPullRequests)
 	}
 	if len(result.Warnings) != 1 {
 		t.Fatalf("len(AddProject().Warnings) = %d, want 1", len(result.Warnings))
@@ -240,7 +302,7 @@ func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T
 	}
 	repo := "powerformer/looper"
 
-	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
 	}
@@ -267,7 +329,7 @@ func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.
 	}
 	repo := "powerformer/looper"
 
-	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
 	}

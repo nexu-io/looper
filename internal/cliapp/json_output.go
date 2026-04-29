@@ -69,6 +69,7 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
 		setString(body, "worktreeRoot", getStringFlag(cmd, "worktree-root"))
 		setString(body, "repo", getStringFlag(cmd, "repo"))
+		setString(body, "snapshotMode", getStringFlag(cmd, "snapshot-mode"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
 	}, writeHumanProjectAdd)

@@ -126,7 +126,8 @@ Example minimal `~/.looper/config.json`:
     "allowAutoApprove": false,
     "allowAutoMerge": false,
     "allowRiskyFixes": false,
-    "openPrStrategy": "all_done"
+    "openPrStrategy": "all_done",
+    "addSnapshotMode": "async"
   },
   "projects": [
     {
@@ -238,6 +239,7 @@ Defaults:
 - `allowAutoMerge`
 - `allowRiskyFixes`
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
+- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request
 
 Default values:
 
@@ -248,6 +250,7 @@ Default values:
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
 - `openPrStrategy`: `all_done`
+- `addSnapshotMode`: `async`
 
 ### `projects`
 

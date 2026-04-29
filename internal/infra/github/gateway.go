@@ -19,7 +19,15 @@ import (
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 
+const (
+	defaultGhCommandTimeout = 60 * time.Second
+	prListGhCommandTimeout  = 15 * time.Second
+	prDiffGhCommandTimeout  = 180 * time.Second
+)
+
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
+
+var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
 	GHPath string
@@ -173,11 +181,12 @@ type UpdatePullRequestTitleInput struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo   string
-	CWD    string
-	Limit  int
-	Label  string
-	Author string
+	Repo    string
+	CWD     string
+	Limit   int
+	Label   string
+	Author  string
+	Timeout time.Duration
 }
 
 type ListOpenIssuesInput struct {
@@ -254,7 +263,11 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests"}, ","))
 
-	result, err := g.runGh(ctx, input.CWD, "", args...)
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", timeout, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -437,8 +450,11 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 }
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
 	if err != nil {
+		if isDiffTooLargeError(err) {
+			return "", ErrDiffTooLarge
+		}
 		return "", err
 	}
 	return result.Stdout, nil
@@ -620,13 +636,20 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}
 	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return storage.PullRequestSnapshotRecord{}, err
+		if !errors.Is(err, ErrDiffTooLarge) {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
 	}
 	capturedAt := strings.TrimSpace(input.CapturedAt)
 	if capturedAt == "" {
 		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
 	}
-	payload, err := json.Marshal(map[string]any{"detail": detail, "diff": diff})
+	payloadMap := map[string]any{"detail": detail, "diff": diff}
+	if errors.Is(err, ErrDiffTooLarge) {
+		payloadMap["diffTruncated"] = true
+		payloadMap["diffTruncationReason"] = "github_too_large"
+	}
+	payload, err := json.Marshal(payloadMap)
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
 	}
@@ -748,7 +771,19 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []s
 }
 
 func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) (shell.Result, error) {
-	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
+	return g.runGhWithTimeout(ctx, cwd, stdin, defaultGhCommandTimeout, args...)
+}
+
+func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+}
+
+func isDiffTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "http 406") || strings.Contains(message, "too_large") || strings.Contains(message, "diff exceeded maximum number of lines")
 }
 
 func defaultLimit(limit int) int {

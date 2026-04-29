@@ -46,6 +46,10 @@ type workerScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
 }
 
+type snapshotScheduler interface {
+	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
+}
+
 type schedulerAsyncRunner interface {
 	Go(func())
 }
@@ -60,6 +64,7 @@ type defaultSchedulerTickInput struct {
 	Reviewer          reviewerScheduler
 	Fixer             fixerScheduler
 	Worker            workerScheduler
+	Snapshotter       snapshotScheduler
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -724,6 +729,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Reviewer:          reviewerRunner,
 			Fixer:             fixerRunner,
 			Worker:            workerRunner,
+			Snapshotter:       githubGateway,
 		})
 	}
 }
@@ -939,9 +945,59 @@ func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedule
 			_, err := input.Worker.ProcessClaimedQueueItem(ctx, item)
 			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
+	case "snapshot":
+		if input.Snapshotter == nil || input.Repos == nil || input.Repos.Queue == nil || input.Repos.PullRequestSnapshots == nil {
+			return nil, fmt.Errorf("snapshot runner is not configured")
+		}
+		return func(ctx context.Context) error {
+			return processSnapshotQueueItem(ctx, item, input)
+		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported queue item type %q", item.Type)
 	}
+}
+
+func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) error {
+	if item.ProjectID == nil || strings.TrimSpace(*item.ProjectID) == "" || item.Repo == nil || strings.TrimSpace(*item.Repo) == "" || item.PRNumber == nil {
+		return failSnapshotQueueItem(ctx, item, input, "invalid snapshot queue item", "non_retryable")
+	}
+	project, err := input.Repos.Projects.GetByID(ctx, *item.ProjectID)
+	if err != nil {
+		return err
+	}
+	if project == nil {
+		return failSnapshotQueueItem(ctx, item, input, "project not found", "non_retryable")
+	}
+	cwd := project.RepoPath
+	if item.PayloadJSON != nil && strings.TrimSpace(*item.PayloadJSON) != "" {
+		payload := map[string]any{}
+		if err := json.Unmarshal([]byte(*item.PayloadJSON), &payload); err == nil {
+			if payloadCWD, _ := payload["cwd"].(string); strings.TrimSpace(payloadCWD) != "" {
+				cwd = strings.TrimSpace(payloadCWD)
+			}
+		}
+	}
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
+	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
+	if err != nil {
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	if err := input.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+		return err
+	}
+	return input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+}
+
+func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, message, kind string) error {
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 }
 
 func repoFromProjectMetadata(metadataJSON *string) string {

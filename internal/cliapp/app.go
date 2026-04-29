@@ -128,6 +128,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("base-branch", "branch", "Base branch"),
 					stringFlag("worktree-root", "path", "Worktree root"),
 					stringFlag("repo", "repo", "Repository slug"),
+					stringFlag("snapshot-mode", "mode", "Snapshot mode for project add: async, full, or off"),
 				},
 				exampleLines: []string{
 					"$ looper project list",

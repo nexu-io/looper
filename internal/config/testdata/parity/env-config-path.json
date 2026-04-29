@@ -72,7 +72,8 @@
           "allowAutoApprove": true,
           "allowAutoMerge": true,
           "allowRiskyFixes": true,
-          "openPrStrategy": "first_commit"
+          "openPrStrategy": "first_commit",
+          "addSnapshotMode": "async"
         },
         "projects": [
           {
@@ -156,7 +157,8 @@
         "allowAutoMerge": true,
         "allowRiskyFixes": true,
         "fixAllPullRequests": false,
-        "openPrStrategy": "first_commit"
+        "openPrStrategy": "first_commit",
+        "addSnapshotMode": "async"
       },
       "projects": [
         {
