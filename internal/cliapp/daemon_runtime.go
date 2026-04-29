@@ -108,10 +108,12 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	_ = args
 
 	ctx := cmd.Context()
-	binary, err := r.resolveDaemonBinary(ctx)
+	loaded, err := r.loadConfig()
 	if err != nil {
 		return err
 	}
+	client := r.apiClientFromLoaded(loaded)
+	apiURL := client.baseURL
 
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
 	if err != nil {
@@ -125,17 +127,31 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			if isLooperd {
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running (pid %d)\n", existingPID); err != nil {
+				probe, err := r.probeDaemonStatus(ctx, client)
+				if err != nil {
+					return err
+				}
+				if !probe.isLooperd {
+					return fmt.Errorf("Daemon pid %d appears to be looperd, but %s did not confirm a running looperd", existingPID, apiURL)
+				}
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running at %s (pid %d)\n", apiURL, existingPID); err != nil {
 					return err
 				}
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal: use `looper daemon restart` or stop the process manually if needed.")
 				return err
 			}
 
-			r.removePIDFile(pidFilePath)
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Daemon pid %d does not appear to be looperd; treating pid file as stale.\n", existingPID); err != nil {
+			probe, err := r.probeDaemonStatus(ctx, client)
+			if err != nil {
 				return err
 			}
+			if probe.isLooperd {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running at %s (pid file points to non-looperd pid %d)\n", apiURL, existingPID); err != nil {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("Daemon pid file points to alive non-looperd process %d; refusing to overwrite it", existingPID)
 		} else {
 			r.removePIDFile(pidFilePath)
 			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Removed stale daemon pid file for pid %d\n", existingPID); err != nil {
@@ -144,11 +160,34 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if !r.skipAPIStartProbe {
+		probe, err := r.probeDaemonStatus(ctx, client)
+		if err != nil {
+			return err
+		}
+		if probe.isLooperd {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running at %s (pid file missing)\n", apiURL); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
+	binary, err := r.resolveDaemonBinary(ctx)
+	if err != nil {
+		return err
+	}
+
 	cwd, err := r.getwd()
 	if err != nil {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
+	startupLogPath, err := r.createStartupLogPath(loaded)
+	if err != nil {
+		return err
+	}
 
+	r.startupOutputPath = startupLogPath
 	pid, err := r.spawnDetached(binary.Path, ExtractConfigArgs(r.argv), cwd, os.Environ())
 	if err != nil {
 		return fmt.Errorf("Failed to start looperd: %w", err)
@@ -157,19 +196,10 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Failed to start looperd: process did not report a pid")
 	}
 
-	r.sleep(100 * time.Millisecond)
-	if !r.isProcessAlive(pid) {
-		r.removePIDFile(pidFilePath)
-		return fmt.Errorf("Failed to start looperd: process %d exited during startup", pid)
-	}
-
-	isLooperd, err := r.isLooperdProcess(ctx, pid)
+	err = r.waitForDaemonReady(ctx, client, pid, startupLogPath, apiURL, 5*time.Second, 100*time.Millisecond)
 	if err != nil {
-		return err
-	}
-	if !isLooperd {
 		r.removePIDFile(pidFilePath)
-		return fmt.Errorf("Failed to start looperd: process %d exited during startup", pid)
+		return err
 	}
 
 	if err := r.mkdirAll(filepath.Dir(pidFilePath), 0o755); err != nil {
@@ -185,6 +215,9 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "PID file: %s\n", pidFilePath); err != nil {
 		return err
 	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Startup log: %s\n", startupLogPath); err != nil {
+		return err
+	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal and does not provide full background supervision.")
 	return err
 }
@@ -192,10 +225,12 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
 	_ = args
 
-	if _, err := r.stopDaemonProcess(cmd.Context(), cmd.OutOrStdout(), true); err != nil {
+	stopped, err := r.stopDaemonProcess(cmd.Context(), cmd.OutOrStdout(), true)
+	if err != nil {
 		return err
 	}
 
+	r.skipAPIStartProbe = stopped
 	return r.daemonStart(cmd, nil)
 }
 
@@ -367,6 +402,7 @@ func (r *commandRuntime) detectDaemonVersionState(ctx context.Context, statusPay
 }
 
 type daemonServiceBinary struct {
+	Name    string
 	Version string
 	Path    string
 }
@@ -380,6 +416,7 @@ func extractDaemonServiceBinary(payload json.RawMessage) daemonServiceBinary {
 		Service struct {
 			Version string `json:"version"`
 			Binary  struct {
+				Name string `json:"name"`
 				Path string `json:"path"`
 			} `json:"binary"`
 		} `json:"service"`
@@ -389,9 +426,96 @@ func extractDaemonServiceBinary(payload json.RawMessage) daemonServiceBinary {
 	}
 
 	return daemonServiceBinary{
+		Name:    strings.TrimSpace(decoded.Service.Binary.Name),
 		Version: strings.TrimSpace(decoded.Service.Version),
 		Path:    strings.TrimSpace(decoded.Service.Binary.Path),
 	}
+}
+
+type daemonStatusProbe struct {
+	reachable bool
+	isLooperd bool
+	payload   json.RawMessage
+}
+
+func (r *commandRuntime) probeDaemonStatus(ctx context.Context, client *DaemonAPIClient) (daemonStatusProbe, error) {
+	payload, err := r.getJSONWithClient(ctx, client, "/api/v1/status")
+	if err != nil {
+		var apiErr *DaemonAPIError
+		if errors.As(err, &apiErr) && apiErr.Status > 0 {
+			return daemonStatusProbe{reachable: true}, fmt.Errorf("configured API endpoint %s responded but did not return looperd status: %w", client.baseURL, err)
+		}
+		return daemonStatusProbe{}, nil
+	}
+
+	if !isLooperdStatusPayload(payload) {
+		return daemonStatusProbe{reachable: true, payload: payload}, fmt.Errorf("configured API endpoint %s is occupied by another service: /api/v1/status did not identify looperd", client.baseURL)
+	}
+	return daemonStatusProbe{reachable: true, isLooperd: true, payload: payload}, nil
+}
+
+func isLooperdStatusPayload(payload json.RawMessage) bool {
+	binary := extractDaemonServiceBinary(payload)
+	if binary.Name == looperdBinaryName {
+		return true
+	}
+	return binary.Version != "" && filepath.Base(binary.Path) == looperdBinaryName
+}
+
+func (r *commandRuntime) createStartupLogPath(loaded config.LoadedFileConfig) (string, error) {
+	startupLogDir := filepath.Join(loaded.Config.Daemon.LogDir, "startup")
+	if err := r.mkdirAll(startupLogDir, 0o700); err != nil {
+		return "", fmt.Errorf("create daemon startup log directory: %w", err)
+	}
+	return filepath.Join(startupLogDir, fmt.Sprintf("looperd-%s.log", time.Now().UTC().Format("20060102T150405.000000000Z"))), nil
+}
+
+func (r *commandRuntime) waitForDaemonReady(ctx context.Context, client *DaemonAPIClient, pid int, startupLogPath string, apiURL string, timeout time.Duration, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastProbeErr error
+	for time.Now().Before(deadline) {
+		if !r.isProcessAlive(pid) {
+			return r.daemonStartupFailureError(fmt.Sprintf("Failed to start looperd: process %d exited during startup", pid), startupLogPath, lastProbeErr)
+		}
+		payload, err := r.getJSONWithClient(ctx, client, "/api/v1/status")
+		if err != nil {
+			lastProbeErr = err
+		} else if isLooperdStatusPayload(payload) {
+			if !r.isProcessAlive(pid) {
+				return r.daemonStartupFailureError(fmt.Sprintf("Failed to start looperd: process %d exited during startup", pid), startupLogPath, lastProbeErr)
+			}
+			return nil
+		} else {
+			lastProbeErr = fmt.Errorf("/api/v1/status at %s did not identify looperd", apiURL)
+		}
+		r.sleep(interval)
+	}
+
+	message := fmt.Sprintf("Timed out waiting for looperd pid %d to become ready at %s", pid, apiURL)
+	return r.daemonStartupFailureError(message, startupLogPath, lastProbeErr)
+}
+
+func (r *commandRuntime) daemonStartupFailureError(message string, startupLogPath string, cause error) error {
+	var builder strings.Builder
+	builder.WriteString(message)
+	builder.WriteString(fmt.Sprintf("; startup log: %s", startupLogPath))
+	if cause != nil {
+		builder.WriteString(fmt.Sprintf("; last readiness error: %v", cause))
+	}
+	if tail := r.readStartupLogTail(startupLogPath, 20); tail != "" {
+		builder.WriteString("; startup log tail:\n")
+		builder.WriteString(tail)
+	}
+	return errors.New(builder.String())
+}
+
+func (r *commandRuntime) readStartupLogTail(path string, lineCount int) string {
+	raw, err := r.readFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := tailLines(strings.TrimRight(string(raw), "\n"), lineCount)
+	return strings.Join(lines, "\n")
 }
 
 func extractDaemonVersion(payload json.RawMessage) string {
@@ -646,12 +770,18 @@ func (r *commandRuntime) spawnDetached(command string, args []string, cwd string
 	}
 	defer devNull.Close()
 
+	startupLog, err := os.OpenFile(r.startupOutputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer startupLog.Close()
+
 	cmd := exec.Command(command, args...)
 	cmd.Dir = cwd
 	cmd.Env = env
 	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
+	cmd.Stdout = startupLog
+	cmd.Stderr = startupLog
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return 0, err

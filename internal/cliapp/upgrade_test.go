@@ -717,7 +717,7 @@ func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 				if runningPID == 0 {
 					return nil, fmt.Errorf("daemon offline")
 				}
-				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":%q}}}`, runningVersion)), nil
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":%q,"binary":{"name":"looperd"}}}}`, runningVersion)), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
 				return nil, nil

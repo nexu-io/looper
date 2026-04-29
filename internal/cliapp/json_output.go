@@ -17,8 +17,10 @@ import (
 )
 
 type commandRuntime struct {
-	app  *App
-	argv []string
+	app               *App
+	argv              []string
+	startupOutputPath string
+	skipAPIStartProbe bool
 }
 
 func newCommandRuntime(app *App, argv []string) *commandRuntime {

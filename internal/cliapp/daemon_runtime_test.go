@@ -122,7 +122,8 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
-	configPath := filepath.Join(t.TempDir(), "config.json")
+	configPath := writeDaemonCLIConfig(t, "http://daemon.test")
+	statusRequests := 0
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	spawned := struct {
@@ -142,6 +143,13 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			statusRequests++
+			if statusRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
+		})},
 		Getwd: func() (string, error) {
 			return "/tmp/workspace", nil
 		},
@@ -189,7 +197,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath, "--port", "9999", "--db-path", "/tmp/looper.sqlite"})
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath, "--db-path", "/tmp/looper.sqlite"})
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
@@ -199,8 +207,8 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if spawned.command != managedPath {
 		t.Fatalf("spawned.command = %q, want %q", spawned.command, managedPath)
 	}
-	if got, want := strings.Join(spawned.args, "\n"), strings.Join([]string{"--config", configPath, "--port", "9999", "--db-path", "/tmp/looper.sqlite"}, "\n"); got != want {
-		t.Fatalf("spawned.args = %#v, want %#v", spawned.args, []string{"--config", configPath, "--port", "9999", "--db-path", "/tmp/looper.sqlite"})
+	if got, want := strings.Join(spawned.args, "\n"), strings.Join([]string{"--config", configPath, "--db-path", "/tmp/looper.sqlite"}, "\n"); got != want {
+		t.Fatalf("spawned.args = %#v, want %#v", spawned.args, []string{"--config", configPath, "--db-path", "/tmp/looper.sqlite"})
 	}
 	if spawned.cwd != "/tmp/workspace" {
 		t.Fatalf("spawned.cwd = %q, want %q", spawned.cwd, "/tmp/workspace")
@@ -214,11 +222,252 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if wroteBody != "4321\n" {
 		t.Fatalf("wroteBody = %q, want %q", wroteBody, "4321\n")
 	}
-	if len(killCalls) != 1 || killCalls[0].pid != 4321 || killCalls[0].signal != 0 {
-		t.Fatalf("killCalls = %#v, want only signal 0 probe for pid 4321", killCalls)
+	if len(killCalls) != 2 || killCalls[0].pid != 4321 || killCalls[0].signal != 0 || killCalls[1].pid != 4321 || killCalls[1].signal != 0 {
+		t.Fatalf("killCalls = %#v, want readiness liveness probes for pid 4321", killCalls)
 	}
 	if !strings.Contains(stdout.String(), "Started looperd") {
 		t.Fatalf("stdout = %q, want start confirmation", stdout.String())
+	}
+}
+
+func TestDaemonStartMissingPIDFileUsesReachableLooperdAPI(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer server.Close()
+
+	configPath := writeDaemonCLIConfig(t, server.URL)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(t.TempDir()),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			t.Fatal("SpawnDetached() called, want existing API reused")
+			return 0, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "pid file missing") || !strings.Contains(stdout.String(), server.URL) {
+		t.Fatalf("stdout = %q, want already running message with URL and missing pid", stdout.String())
+	}
+	if requests == 0 {
+		t.Fatal("status endpoint was not probed")
+	}
+}
+
+func TestDaemonStartStalePIDFileUsesReachableLooperdAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer server.Close()
+
+	homeDir := t.TempDir()
+	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	configPath := writeDaemonCLIConfig(t, server.URL)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	removed := false
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			if path == pidFilePath {
+				return []byte("9876\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(filepath.Join(homeDir, ".looper", "bin", "looperd")),
+		KillProcess: func(pid int, signal int) error {
+			if pid == 9876 && signal == 0 {
+				return os.ErrProcessDone
+			}
+			return nil
+		},
+		RemoveFile: func(path string) error {
+			if path == pidFilePath {
+				removed = true
+			}
+			return nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			t.Fatal("SpawnDetached() called, want existing API reused")
+			return 0, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !removed {
+		t.Fatal("stale pid file was not removed")
+	}
+	if !strings.Contains(stdout.String(), "Removed stale daemon pid file") || !strings.Contains(stdout.String(), "pid file missing") {
+		t.Fatalf("stdout = %q, want stale removal and API success messages", stdout.String())
+	}
+}
+
+func TestDaemonStartNonLooperdAPIServiceFailsBeforeSpawn(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{
+			"service": map[string]any{"binary": map[string]any{"name": "not-looperd"}},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeDaemonCLIConfig(t, server.URL)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(t.TempDir()),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			t.Fatal("SpawnDetached() called, want port occupation failure")
+			return 0, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatal("Run([daemon start]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr.String(), "occupied by another service") {
+		t.Fatalf("stderr = %q, want occupied-by-another-service diagnostic", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestDaemonStartExitedProcessIncludesStartupLogTail(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		ReadFile: func(path string) ([]byte, error) {
+			if strings.Contains(path, filepath.Join("startup", "looperd-")) {
+				return []byte("line one\nconfig validation failed: missing storage.dbPath\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(t.TempDir()),
+		Getwd: func() (string, error) {
+			return "/tmp/workspace", nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid == 4321 && signal == 0 {
+				return os.ErrProcessDone
+			}
+			return nil
+		},
+		MkdirAll: func(path string, perm os.FileMode) error {
+			return nil
+		},
+		RemoveFile: func(path string) error {
+			return nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatal("Run([daemon start]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr.String(), "startup log:") || !strings.Contains(stderr.String(), "config validation failed") {
+		t.Fatalf("stderr = %q, want startup log path and tail", stderr.String())
+	}
+}
+
+func TestDaemonStartReadinessLoopWaitsForStatus(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeEnvelope(t, w, map[string]any{"ok": false, "requestId": "req_not_ready", "error": map[string]any{"message": "not ready"}})
+			return
+		}
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer server.Close()
+
+	configPath := writeDaemonCLIConfig(t, server.URL)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	clientRequests := 0
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			clientRequests++
+			if clientRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		})},
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.7.0\n", ExitCode: 0}, nil
+			}
+			if command == "ps" && len(args) >= 2 && args[1] == "4321" {
+				return commandExecutionResult{Stdout: filepath.Join(t.TempDir(), "looperd") + "\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1}, nil
+		},
+		Getwd: func() (string, error) { return "/tmp/workspace", nil },
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error { return nil },
+		MkdirAll:    func(path string, perm os.FileMode) error { return nil },
+		WriteFile:   func(path string, data []byte, perm os.FileMode) error { return nil },
+		Sleep:       func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if requests < 3 {
+		t.Fatalf("status requests = %d, want readiness loop to retry until ready", requests)
 	}
 }
 
@@ -608,4 +857,28 @@ func writeDaemonCLIConfig(t *testing.T, baseURL string) string {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}
 	return configPath
+}
+
+func writeLooperdStatusEnvelope(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{
+		"service": map[string]any{
+			"version": "0.7.0",
+			"binary": map[string]any{
+				"name": "looperd",
+			},
+		},
+	}))
+}
+
+func daemonVersionCommand(managedPath string) runCommandFunc {
+	return func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		_ = managedPath
+		if strings.Join(args, " ") == "--version" {
+			return commandExecutionResult{Stdout: "0.7.0\n", ExitCode: 0}, nil
+		}
+		return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+	}
 }
