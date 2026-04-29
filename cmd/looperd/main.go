@@ -509,13 +509,31 @@ func refreshStopAllCandidate(ctx context.Context, repos *storage.Repositories, l
 }
 
 func classifyStopAllResult(candidate stopAllCandidate) stopAllResult {
-	if candidate.Execution != nil && candidate.Execution.Status == "cancelling" {
+	hasRunningExecution := false
+	hasCancellingExecution := false
+	for _, execution := range candidate.Executions {
+		switch execution.Status {
+		case "running":
+			hasRunningExecution = true
+		case "cancelling":
+			hasCancellingExecution = true
+		}
+	}
+	if candidate.Execution != nil {
+		switch candidate.Execution.Status {
+		case "running":
+			hasRunningExecution = true
+		case "cancelling":
+			hasCancellingExecution = true
+		}
+	}
+	if hasRunningExecution {
+		return stopAllResultStopped
+	}
+	if hasCancellingExecution {
 		if candidate.Loop.Status != "queued" && candidate.Loop.Status != "running" && !candidate.ActiveQueue {
 			return stopAllResultAlreadyStopping
 		}
-	}
-	if candidate.Execution != nil && candidate.Execution.Status == "running" {
-		return stopAllResultStopped
 	}
 	if candidate.Run != nil && candidate.Run.Status != "" && candidate.Run.Status != "running" && candidate.Loop.Status != "queued" && candidate.Loop.Status != "running" && !candidate.ActiveQueue {
 		return stopAllResultAlreadyFinished

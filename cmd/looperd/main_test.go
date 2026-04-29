@@ -782,6 +782,25 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	assertStopAllItemResult(t, repeated.Items, "loop_future", string(stopAllResultAlreadyStopping))
 }
 
+func TestClassifyStopAllResultChecksAllActiveExecutionsBeforeAlreadyStopping(t *testing.T) {
+	runID := "run_mixed"
+	cancelling := storage.AgentExecutionRecord{ID: "exec_cancelling", RunID: &runID, Status: "cancelling"}
+	running := storage.AgentExecutionRecord{ID: "exec_running", RunID: &runID, Status: "running"}
+	candidate := stopAllCandidate{
+		Loop:      storage.LoopRecord{ID: "loop_mixed", Status: "paused"},
+		Run:       &storage.RunRecord{ID: runID, Status: "running"},
+		Execution: &cancelling,
+		Executions: []storage.AgentExecutionRecord{
+			cancelling,
+			running,
+		},
+	}
+
+	if got := classifyStopAllResult(candidate); got != stopAllResultStopped {
+		t.Fatalf("classifyStopAllResult() = %q, want %q while any active execution is still running", got, stopAllResultStopped)
+	}
+}
+
 type fakeActiveExecution struct {
 	killed bool
 	reason string
