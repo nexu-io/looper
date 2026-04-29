@@ -96,6 +96,51 @@ func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want worker loop")
+	}
+	loopMetadata := `{"worker":{"title":"Old title","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/acme/looper/issues/27","baseBranch":"develop","prompt":"Keep this prompt","specPath":"specs/worker.md","reviewers":["alice","bob"]}}`
+	loop.MetadataJSON = &loopMetadata
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 27, Title: "Updated worker-ready title", URL: "https://github.com/acme/looper/issues/27", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	loop, err = fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() after rediscovery error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil {
+		t.Fatalf("loop = %#v, want loop with metadata", loop)
+	}
+	for _, want := range []string{
+		`"title":"Updated worker-ready title"`,
+		`"repo":"acme/looper"`,
+		`"issueNumber":27`,
+		`"issueUrl":"https://github.com/acme/looper/issues/27"`,
+		`"baseBranch":"main"`,
+		`"prompt":"Keep this prompt"`,
+		`"specPath":"specs/worker.md"`,
+		`"reviewers":["alice","bob"]`,
+	} {
+		if !strings.Contains(*loop.MetadataJSON, want) {
+			t.Fatalf("MetadataJSON = %s, want substring %s", *loop.MetadataJSON, want)
+		}
+	}
+}
+
 func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

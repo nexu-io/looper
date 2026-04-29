@@ -1619,7 +1619,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
 	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL}
-	workerMeta := map[string]any{"worker": work}
+	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
@@ -1633,7 +1633,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
-			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, workerMeta)
+			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)})
 			if err == nil {
 				updated.MetadataJSON = &metadataJSON
 			}
@@ -2446,6 +2446,20 @@ func parseJSONObject(raw *string) map[string]any {
 		return map[string]any{}
 	}
 	return decoded
+}
+
+func mergeWorkerMetadata(metadata map[string]any, work workerInput) map[string]any {
+	workerMeta := map[string]any{}
+	if existing, ok := metadata["worker"].(map[string]any); ok {
+		for key, value := range existing {
+			workerMeta[key] = value
+		}
+	}
+	workJSON := parseJSONObject(stringPtr(mustMarshalJSON(work)))
+	for key, value := range workJSON {
+		workerMeta[key] = value
+	}
+	return workerMeta
 }
 
 func mustMarshalJSON(value any) string {
