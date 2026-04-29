@@ -495,15 +495,40 @@ func refreshStopAllCandidate(ctx context.Context, repos *storage.Repositories, l
 	} else if queueItem != nil {
 		candidate.ActiveQueue = true
 	}
+	runsList, err := repos.Runs.List(ctx)
+	if err != nil {
+		return stopAllCandidate{}, err
+	}
+	runByID := make(map[string]storage.RunRecord, len(runsList))
+	for _, run := range runsList {
+		runByID[run.ID] = run
+	}
 	if run, err := repos.Runs.GetLatestByLoopID(ctx, loopID); err != nil {
 		return stopAllCandidate{}, err
 	} else if run != nil {
 		candidate.Run = run
-		if execution, err := repos.AgentExecutions.GetLatestByRunID(ctx, run.ID); err != nil {
-			return stopAllCandidate{}, err
-		} else if execution != nil {
-			candidate.Execution = execution
+	}
+	executions, err := repos.AgentExecutions.ListActive(ctx)
+	if err != nil {
+		return stopAllCandidate{}, err
+	}
+	for _, execution := range executions {
+		executionLoopID := ""
+		if execution.LoopID != nil {
+			executionLoopID = *execution.LoopID
 		}
+		if executionLoopID == "" && execution.RunID != nil {
+			if run, ok := runByID[*execution.RunID]; ok {
+				executionLoopID = run.LoopID
+			}
+		}
+		if executionLoopID != loopID {
+			continue
+		}
+		candidate.Executions = append(candidate.Executions, execution)
+	}
+	if len(candidate.Executions) > 0 {
+		candidate.Execution = &candidate.Executions[0]
 	}
 	return candidate, nil
 }

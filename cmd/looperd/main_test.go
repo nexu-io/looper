@@ -801,6 +801,35 @@ func TestClassifyStopAllResultChecksAllActiveExecutionsBeforeAlreadyStopping(t *
 	}
 }
 
+func TestRefreshStopAllCandidateKeepsOtherActiveExecutionsForClassification(t *testing.T) {
+	services, repos, now := newStopAllTestServices(t)
+	ctx := context.Background()
+
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_mixed", seq: 1, loopType: "worker", loopStatus: "paused", runID: "run_newest", runStatus: "finished", executionID: "exec_newest", executionStatus: "cancelling"})
+	otherRunID := "run_other"
+	olderISO := now.Add(-time.Minute).Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: otherRunID, LoopID: "loop_mixed", Status: "running", StartedAt: olderISO, LastHeartbeatAt: &olderISO, CreatedAt: olderISO, UpdatedAt: olderISO}); err != nil {
+		t.Fatalf("Runs.Upsert(%s) error = %v", otherRunID, err)
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "exec_other", ProjectID: stringPtr("project_1"), RunID: &otherRunID, Vendor: "codex", Status: "running", StartedAt: olderISO, CreatedAt: olderISO, UpdatedAt: olderISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(exec_other) error = %v", err)
+	}
+
+	refreshed, err := refreshStopAllCandidate(ctx, services.Repositories, "loop_mixed")
+	if err != nil {
+		t.Fatalf("refreshStopAllCandidate() error = %v", err)
+	}
+	if len(refreshed.Executions) != 2 {
+		t.Fatalf("len(refreshed.Executions) = %d, want 2", len(refreshed.Executions))
+	}
+	if refreshed.Execution == nil || refreshed.Execution.ID != "exec_newest" {
+		t.Fatalf("refreshed.Execution = %#v, want newest cancelling execution", refreshed.Execution)
+	}
+	if got := classifyStopAllResult(refreshed); got != stopAllResultStopped {
+		t.Fatalf("classifyStopAllResult(refresh) = %q, want %q while another execution is still running", got, stopAllResultStopped)
+	}
+}
+
 type fakeActiveExecution struct {
 	killed bool
 	reason string
