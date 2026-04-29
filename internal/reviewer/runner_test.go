@@ -1432,6 +1432,36 @@ func TestParseStructuredReviewOutputDropsDuplicateTopLevelComments(t *testing.T)
 	}
 }
 
+func TestParseStructuredReviewOutputKeepsDetailedCommentMatchingBodyHeadline(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":"Please add tests","why":"The retry path can regress without coverage.","evidence":"retry.go has no failure-path test.","suggested_change":"Add a regression test for retry failure handling."}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 1 {
+		t.Fatalf("comments = %#v, want detailed comment preserved", parsed.Comments)
+	}
+	if !strings.Contains(parsed.Comments[0].Body, "**Why it matters:** The retry path can regress without coverage.") {
+		t.Fatalf("comment body = %q, want detailed sections preserved", parsed.Comments[0].Body)
+	}
+}
+
+func TestParseStructuredReviewOutputDedupesTopLevelCommentsByCanonicalHeadline(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","body":"Add an integration test"},{"body":"Add an integration test"}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 1 {
+		t.Fatalf("comments = %#v, want duplicate top-level comments deduped", parsed.Comments)
+	}
+	if parsed.Comments[0].Body != "**[major/tests]** Add an integration test" {
+		t.Fatalf("comment body = %q, want first canonical duplicate preserved", parsed.Comments[0].Body)
+	}
+}
+
 func TestParseStructuredReviewOutputDoesNotDedupeIntoCleanReview(t *testing.T) {
 	t.Parallel()
 

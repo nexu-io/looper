@@ -1837,7 +1837,7 @@ func dedupeReviewFeedbackComments(comments []reviewFeedbackComment, body string)
 			result = append(result, comment)
 			continue
 		}
-		key := normalizedReviewFeedbackText(comment.Body)
+		key := reviewFeedbackTopLevelDedupeKey(comment)
 		if key == "" || isDuplicateTopLevelReviewComment(comment, body) {
 			continue
 		}
@@ -1964,13 +1964,31 @@ func isDuplicateTopLevelReviewComment(comment reviewFeedbackComment, body string
 		return false
 	}
 	bodyKey := normalizedReviewFeedbackText(body)
-	for _, value := range []string{comment.Body, comment.rawBody, reviewFeedbackCommentUnlabeledHeadline(comment.Body)} {
+	for _, value := range []string{comment.Body, reviewFeedbackCommentUnlabeledBody(comment.Body)} {
 		key := normalizedReviewFeedbackText(value)
 		if key != "" && key == bodyKey {
 			return true
 		}
 	}
 	return false
+}
+
+func reviewFeedbackTopLevelDedupeKey(comment reviewFeedbackComment) string {
+	if key := normalizedReviewFeedbackText(comment.rawBody); key != "" {
+		return key
+	}
+	return normalizedReviewFeedbackText(reviewFeedbackCommentUnlabeledHeadline(comment.Body))
+}
+
+func reviewFeedbackCommentUnlabeledBody(body string) string {
+	body = strings.TrimSpace(body)
+	if !strings.HasPrefix(body, "**[") {
+		return body
+	}
+	if labelEnd := strings.Index(body, "]** "); labelEnd >= 0 {
+		return strings.TrimSpace(body[labelEnd+4:])
+	}
+	return body
 }
 
 func reviewFeedbackCommentUnlabeledHeadline(body string) string {
