@@ -146,6 +146,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			if probe.isLooperd {
+				r.removePIDFile(pidFilePath)
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running at %s (pid file points to non-looperd pid %d)\n", apiURL, existingPID); err != nil {
 					return err
 				}

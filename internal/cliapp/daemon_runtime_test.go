@@ -330,6 +330,71 @@ func TestDaemonStartStalePIDFileUsesReachableLooperdAPI(t *testing.T) {
 	}
 }
 
+func TestDaemonStartAliveNonLooperdPIDFileUsesReachableLooperdAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer server.Close()
+
+	homeDir := t.TempDir()
+	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	removed := false
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			if path == pidFilePath {
+				return []byte("9876\n"), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "ps" && len(args) >= 2 && args[1] == "9876" {
+				return commandExecutionResult{Stdout: "/usr/bin/sleep\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid != 9876 || signal != 0 {
+				t.Fatalf("KillProcess(%d, %d), want liveness probe for pid 9876", pid, signal)
+			}
+			return nil
+		},
+		RemoveFile: func(path string) error {
+			if path == pidFilePath {
+				removed = true
+			}
+			return nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			t.Fatal("SpawnDetached() called, want existing API reused")
+			return 0, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !removed {
+		t.Fatal("stale pid file pointing at alive non-looperd process was not removed")
+	}
+	if !strings.Contains(stdout.String(), "pid file points to non-looperd pid 9876") || !strings.Contains(stdout.String(), server.URL) {
+		t.Fatalf("stdout = %q, want already running message with URL and non-looperd pid", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestDaemonStartNonLooperdAPIServiceFailsBeforeSpawn(t *testing.T) {
 	t.Parallel()
 
