@@ -1,5 +1,9 @@
 # Looper
 
+[![CI](https://github.com/powerformer/looper/actions/workflows/ci.yml/badge.svg)](https://github.com/powerformer/looper/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
+
 **Run an autonomous AI dev team across all your GitHub repos — plan, review, fix, and ship, on a loop.**
 
 Register every repo you own. Looper watches them all, picks up labeled issues, and runs specialized AI agents — **planner → reviewer ↔ fixer → worker** — until the work is shipped. You stay in GitHub; Looper handles the spec, review cycle, and implementation in isolated worktrees.
