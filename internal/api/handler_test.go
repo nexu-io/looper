@@ -3704,6 +3704,176 @@ func TestActiveRunsIncludesPausedLoopWithRunningRun(t *testing.T) {
 	assertEqual(t, item["status"], "running")
 }
 
+func TestActiveRunsStatusAndTypeFiltersIncludeInactiveCompletedWorkerLoops(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	for _, loop := range []storage.LoopRecord{
+		{
+			ID:         "loop_worker_completed",
+			Seq:        12,
+			ProjectID:  "project_1",
+			Type:       "worker",
+			TargetType: "issue",
+			TargetID:   stringPtr("issue:acme/looper:42"),
+			Repo:       stringPtr("acme/looper"),
+			Status:     "completed",
+			LastRunAt:  stringPtr(completedAt),
+			CreatedAt:  nowISO,
+			UpdatedAt:  completedAt,
+		},
+		{
+			ID:         "loop_worker_running",
+			Seq:        13,
+			ProjectID:  "project_1",
+			Type:       "worker",
+			TargetType: "issue",
+			TargetID:   stringPtr("issue:acme/looper:43"),
+			Repo:       stringPtr("acme/looper"),
+			Status:     "running",
+			LastRunAt:  stringPtr(nowISO),
+			CreatedAt:  nowISO,
+			UpdatedAt:  nowISO,
+		},
+		{
+			ID:         "loop_reviewer_completed",
+			Seq:        14,
+			ProjectID:  "project_1",
+			Type:       "reviewer",
+			TargetType: "pull_request",
+			TargetID:   stringPtr("pr:acme/looper:44"),
+			Repo:       stringPtr("acme/looper"),
+			PRNumber:   int64Ptr(44),
+			Status:     "completed",
+			LastRunAt:  stringPtr(completedAt),
+			CreatedAt:  nowISO,
+			UpdatedAt:  completedAt,
+		},
+	} {
+		if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+
+	defaultReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	defaultRecorder := httptest.NewRecorder()
+	h.ServeHTTP(defaultRecorder, defaultReq)
+	if defaultRecorder.Code != http.StatusOK {
+		t.Fatalf("default status = %d, want 200", defaultRecorder.Code)
+	}
+	defaultBody := parseJSONMap(t, defaultRecorder.Body.Bytes())
+	defaultItems := defaultBody["data"].(map[string]any)["items"].([]any)
+	if len(defaultItems) != 1 {
+		t.Fatalf("len(default items) = %d, want 1", len(defaultItems))
+	}
+	defaultItem := defaultItems[0].(map[string]any)
+	assertEqual(t, defaultItem["loopId"], "loop_worker_running")
+
+	filteredReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active?status=completed&type=worker", nil)
+	filteredRecorder := httptest.NewRecorder()
+	h.ServeHTTP(filteredRecorder, filteredReq)
+	if filteredRecorder.Code != http.StatusOK {
+		t.Fatalf("filtered status = %d, want 200", filteredRecorder.Code)
+	}
+	filteredBody := parseJSONMap(t, filteredRecorder.Body.Bytes())
+	filteredItems := filteredBody["data"].(map[string]any)["items"].([]any)
+	if len(filteredItems) != 1 {
+		t.Fatalf("len(filtered items) = %d, want 1", len(filteredItems))
+	}
+	filteredItem := filteredItems[0].(map[string]any)
+	assertEqual(t, filteredItem["loopId"], "loop_worker_completed")
+	assertEqual(t, filteredItem["type"], "worker")
+	assertEqual(t, filteredItem["status"], "completed")
+	assertEqual(t, filteredItem["runId"], nil)
+	assertEqual(t, filteredItem["agent"], nil)
+}
+
+func TestActiveRunsAllIncludesInactiveCompletedLoopWithLatestRunFields(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	startedAt := fixture.now.Add(-2 * time.Minute).UTC().Format(javaScriptISOString)
+	completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        "project_1",
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_worker_completed",
+		Seq:          15,
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     stringPtr("issue:acme/looper:15"),
+		Repo:         stringPtr("acme/looper"),
+		Status:       "completed",
+		LastRunAt:    stringPtr(completedAt),
+		MetadataJSON: stringPtr(`{"worktreePath":"/tmp/worktrees/loop-15","branch":"feature/loop-15"}`),
+		CreatedAt:    nowISO,
+		UpdatedAt:    completedAt,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_15",
+		LoopID:         "loop_worker_completed",
+		Status:         "completed",
+		StartedAt:      startedAt,
+		EndedAt:        stringPtr(completedAt),
+		CheckpointJSON: stringPtr(`{"worktree":{"path":"/tmp/worktrees/loop-15","branch":"feature/loop-15"}}`),
+		CreatedAt:      startedAt,
+		UpdatedAt:      completedAt,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active?all=true", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], "loop_worker_completed")
+	assertEqual(t, item["runId"], "run_15")
+	assertEqual(t, item["type"], "worker")
+	assertEqual(t, item["status"], "completed")
+	assertEqual(t, item["startedAt"], startedAt)
+	assertEqual(t, item["endedAt"], completedAt)
+	worktree := item["worktree"].(map[string]any)
+	assertEqual(t, worktree["path"], "/tmp/worktrees/loop-15")
+	assertEqual(t, worktree["branch"], "feature/loop-15")
+	assertEqual(t, item["agent"], nil)
+}
+
 func TestActiveRunDetailIncludesPausedLoopWithRunningRun(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

@@ -319,11 +319,15 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				short: "Show running loops",
 				runE:  runtime.activeRuns,
 				localFlags: []flagSpec{
+					boolFlag("all", "Show recent loops in any status"),
+					stringFlag("status", "status", "Filter by loop or run status"),
 					stringFlag("type", "type", "Filter by loop type"),
 					stringFlag("project", "projectId", "Filter by project id"),
 				},
 				exampleLines: []string{
 					"$ looper ps",
+					"$ looper ps --status completed --type worker",
+					"$ looper ps --all",
 					"$ looper ps --type reviewer --project project_1",
 				},
 			}),

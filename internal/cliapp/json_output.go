@@ -262,6 +262,10 @@ func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		query := url.Values{}
+		if getBoolFlag(cmd, "all") {
+			query.Set("all", "true")
+		}
+		addQueryString(query, "status", getStringFlag(cmd, "status"))
 		addQueryString(query, "type", getStringFlag(cmd, "type"))
 		addQueryString(query, "projectId", getStringFlag(cmd, "project"))
 

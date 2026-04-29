@@ -145,6 +145,7 @@ type activeRunOutput struct {
 	Status      string  `json:"status"`
 	CurrentStep *string `json:"currentStep"`
 	StartedAt   *string `json:"startedAt"`
+	EndedAt     *string `json:"endedAt"`
 	Target      struct {
 		Label string `json:"label"`
 	} `json:"target"`
@@ -329,7 +330,7 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(item.StartedAt)})
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
 	}
 	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
 	return nil
@@ -718,6 +719,16 @@ func formatRelativeAge(startedAt *string) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return fmt.Sprintf("%dd%dh", days, remainingHours)
+}
+
+func firstNonEmptyCLIString(values ...*string) *string {
+	for _, value := range values {
+		if value != nil && strings.TrimSpace(*value) != "" {
+			trimmed := strings.TrimSpace(*value)
+			return &trimmed
+		}
+	}
+	return nil
 }
 
 func parseOptionalPositiveInt(value string, flag string) (*int64, error) {

@@ -1079,6 +1079,8 @@ type activeRunsListResponse struct {
 }
 
 type activeRunsQuery struct {
+	All       bool
+	Status    string
 	Type      string
 	ProjectID string
 	Repo      string
@@ -1094,6 +1096,7 @@ type activeRunView struct {
 	Status      string             `json:"status"`
 	CurrentStep *string            `json:"currentStep"`
 	StartedAt   *string            `json:"startedAt"`
+	EndedAt     *string            `json:"endedAt,omitempty"`
 	Target      activeRunTarget    `json:"target"`
 	Agent       *activeRunAgent    `json:"agent"`
 	Worktree    *activeRunWorktree `json:"worktree"`
@@ -1697,7 +1700,7 @@ func (h *Handler) buildActiveRunsResponse(r *http.Request) (activeRunsListRespon
 		return activeRunsListResponse{}, err
 	}
 
-	items, err := h.buildActiveRunViews(r.Context(), true)
+	items, err := h.buildActiveRunViews(r.Context(), true, query.All || query.Status != "")
 	if err != nil {
 		return activeRunsListResponse{}, err
 	}
@@ -1765,7 +1768,7 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 }
 
 func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID string) (activeRunView, error) {
-	items, err := h.buildActiveRunViews(ctx, true)
+	items, err := h.buildActiveRunViews(ctx, true, false)
 	if err != nil {
 		return activeRunView{}, err
 	}
@@ -1777,7 +1780,7 @@ func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID strin
 	return activeRunView{}, apiError{code: pkgapi.ErrorCodeActiveRunNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Active run not found for loop: %s", loopID)}
 }
 
-func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWithoutRuns bool) ([]activeRunView, error) {
+func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWithoutRuns bool, includeInactiveLoops bool) ([]activeRunView, error) {
 	services := h.context.Runtime.Services()
 	if services.Repositories == nil || services.Repositories.Runs == nil || services.Repositories.Loops == nil || services.Repositories.Queue == nil || services.Repositories.AgentExecutions == nil || services.Repositories.Projects == nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
@@ -1919,8 +1922,67 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		})
 	}
 
+	includedLoopIDs := make(map[string]struct{}, len(runningViews)+len(runningLoopViews)+len(queuedViews))
+	for _, item := range runningViews {
+		includedLoopIDs[item.LoopID] = struct{}{}
+	}
+	for _, item := range runningLoopViews {
+		includedLoopIDs[item.LoopID] = struct{}{}
+	}
+	for _, item := range queuedViews {
+		includedLoopIDs[item.LoopID] = struct{}{}
+	}
+
+	inactiveLoopViews := make([]activeRunView, 0)
+	if includeInactiveLoops {
+		for _, loop := range loopsList {
+			if _, ok := includedLoopIDs[loop.ID]; ok {
+				continue
+			}
+			target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			var (
+				latestRun *storage.RunRecord
+				runID     *string
+				worktree  *activeRunWorktree
+			)
+			latestRun, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+			if err != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+			}
+			startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+			var endedAt *string
+			if latestRun != nil {
+				runID = &latestRun.ID
+				startedAt = stringPtrOrNil(latestRun.StartedAt)
+				endedAt = latestRun.EndedAt
+				worktree = buildWorktreeSummary(loop, *latestRun)
+			}
+			inactiveLoopViews = append(inactiveLoopViews, activeRunView{
+				Seq:         loop.Seq,
+				RunID:       runID,
+				LoopID:      loop.ID,
+				ProjectID:   loop.ProjectID,
+				Type:        loop.Type,
+				Status:      loop.Status,
+				CurrentStep: nil,
+				StartedAt:   startedAt,
+				EndedAt:     endedAt,
+				Target:      target,
+				Agent:       nil,
+				Worktree:    worktree,
+			})
+		}
+	}
+
 	items := append(runningViews, runningLoopViews...)
 	items = append(items, queuedViews...)
+	items = append(items, inactiveLoopViews...)
 	sort.Slice(items, func(i, j int) bool {
 		return compareActiveRunViews(items[i], items[j]) < 0
 	})
@@ -2006,6 +2068,8 @@ func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.Loop
 
 func readActiveRunsQuery(values url.Values) (activeRunsQuery, error) {
 	query := activeRunsQuery{
+		All:       strings.EqualFold(strings.TrimSpace(values.Get("all")), "true"),
+		Status:    strings.TrimSpace(values.Get("status")),
 		Type:      strings.TrimSpace(values.Get("type")),
 		ProjectID: strings.TrimSpace(values.Get("projectId")),
 		Repo:      strings.TrimSpace(values.Get("repo")),
@@ -2032,6 +2096,9 @@ func parsePositiveInt64(value, fieldName string) (int64, error) {
 }
 
 func matchesActiveRunQuery(item activeRunView, query activeRunsQuery) bool {
+	if query.Status != "" && item.Status != query.Status {
+		return false
+	}
 	if query.Type != "" && item.Type != query.Type {
 		return false
 	}
@@ -2074,10 +2141,10 @@ func compareActiveRunViews(left, right activeRunView) int {
 		return rightAgent - leftAgent
 	}
 
-	leftStarted := derefString(left.StartedAt)
-	rightStarted := derefString(right.StartedAt)
+	leftStarted := derefString(firstNonEmptyString(left.EndedAt, left.StartedAt))
+	rightStarted := derefString(firstNonEmptyString(right.EndedAt, right.StartedAt))
 	if leftStarted != rightStarted {
-		if leftStarted < rightStarted {
+		if leftStarted > rightStarted {
 			return -1
 		}
 		return 1
