@@ -198,6 +198,9 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 
 	err = r.waitForDaemonReady(ctx, client, pid, startupLogPath, apiURL, 5*time.Second, 100*time.Millisecond)
 	if err != nil {
+		if r.isProcessAlive(pid) {
+			_ = r.killProcess(pid, int(syscall.SIGTERM))
+		}
 		r.removePIDFile(pidFilePath)
 		return err
 	}

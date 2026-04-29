@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -468,6 +469,81 @@ func TestDaemonStartReadinessLoopWaitsForStatus(t *testing.T) {
 	}
 	if requests < 3 {
 		t.Fatalf("status requests = %d, want readiness loop to retry until ready", requests)
+	}
+}
+
+func TestDaemonStartReadinessTimeoutTerminatesSpawnedProcessAndRemovesPIDFile(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	removeCalls := make([]string, 0, 1)
+	killCalls := make([]struct {
+		pid    int
+		signal int
+	}, 0, 8)
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(filepath.Join(homeDir, ".looper", "bin", "looperd")),
+		Getwd: func() (string, error) {
+			return "/tmp/workspace", nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			killCalls = append(killCalls, struct {
+				pid    int
+				signal int
+			}{pid: pid, signal: signal})
+			return nil
+		},
+		MkdirAll: func(path string, perm os.FileMode) error {
+			return nil
+		},
+		RemoveFile: func(path string) error {
+			removeCalls = append(removeCalls, path)
+			return nil
+		},
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			t.Fatalf("WriteFile(%q) called, want readiness failure before pid file write", path)
+			return nil
+		},
+		Sleep: func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatal("Run([daemon start]) exit code = 0, want non-zero")
+	}
+	if got := len(removeCalls); got != 1 || removeCalls[0] != pidFilePath {
+		t.Fatalf("removeCalls = %#v, want [%q]", removeCalls, pidFilePath)
+	}
+	if got := len(killCalls); got < 3 {
+		t.Fatalf("killCalls = %#v, want readiness liveness probes plus SIGTERM cleanup", killCalls)
+	}
+	lastKill := killCalls[len(killCalls)-1]
+	if lastKill.pid != 4321 || lastKill.signal != int(syscall.SIGTERM) {
+		t.Fatalf("last kill call = %#v, want pid 4321 SIGTERM", lastKill)
+	}
+	for i, call := range killCalls[:len(killCalls)-1] {
+		if call.pid != 4321 || call.signal != 0 {
+			t.Fatalf("killCalls[%d] = %#v, want pid 4321 signal 0 readiness probe", i, call)
+		}
+	}
+	if !strings.Contains(stderr.String(), "Timed out waiting for looperd pid 4321 to become ready") {
+		t.Fatalf("stderr = %q, want readiness timeout", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "last readiness error") {
+		t.Fatalf("stderr = %q, want last readiness error details", stderr.String())
 	}
 }
 
