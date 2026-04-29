@@ -47,6 +47,7 @@ const (
 	workerBranchSlugMaxWords  = 5
 	workerBranchHashLength    = 16
 	workerPRDedupeLookupLimit = 1000
+	issueDiscoveryLabel       = "looper:worker-ready"
 )
 
 var workerStepSequence = []WorkerStep{
@@ -68,6 +69,15 @@ type PullRequestSummary struct {
 	State       string
 	HeadRefName string
 	BaseRefName string
+}
+
+type IssueSummary struct {
+	Number    int64
+	Title     string
+	Body      string
+	URL       string
+	Assignees []string
+	Labels    []string
 }
 
 type PullRequestDetail struct {
@@ -164,10 +174,20 @@ type ListOpenPullRequestsInput struct {
 	Label string
 }
 
+type ListOpenIssuesInput struct {
+	Repo     string
+	CWD      string
+	Limit    int
+	Assignee string
+	Label    string
+}
+
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
+	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
+	GetCurrentUserLogin(context.Context, string) (string, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
@@ -368,6 +388,18 @@ type ProcessResult struct {
 	PullRequestNumber int64
 }
 
+type DiscoveryInput struct {
+	ProjectID string
+	Repo      string
+	Limit     int
+}
+
+type DiscoveryResult struct {
+	CreatedLoopIDs []string
+	QueueItems     []storage.QueueItemRecord
+	Skipped        int
+}
+
 type workerInput struct {
 	Title    string `json:"title,omitempty"`
 	Prompt   string `json:"prompt,omitempty"`
@@ -457,6 +489,11 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+type loopUpsertResult struct {
+	record  storage.LoopRecord
+	created bool
+}
+
 func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error {
 	if execution == nil || execution.Status != "completed" {
 		return nil
@@ -523,6 +560,58 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onRunCompleted:          options.OnRunCompleted,
 	}
+}
+
+func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.github == nil {
+		return DiscoveryResult{}, fmt.Errorf("worker discovery is not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	if project.Archived {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	login = normalizeLogin(login)
+	if login == "" {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: login, Label: issueDiscoveryLabel})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result := DiscoveryResult{}
+	for _, issue := range issues {
+		if !shouldClaimWorkerIssue(issue, login) {
+			result.Skipped++
+			continue
+		}
+		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		if loopResult.created {
+			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+		}
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" {
+			result.Skipped++
+			continue
+		}
+		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		result.QueueItems = append(result.QueueItems, queueItem)
+	}
+	return result, nil
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -1525,6 +1614,71 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	})
 }
 
+func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary) (loopUpsertResult, error) {
+	nowISO := r.nowISO()
+	targetID := buildIssueTargetID(repo, issue.Number)
+	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL}
+	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	for _, existing := range loops {
+		if existing.Type == "worker" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			updated := existing
+			updated.Repo = &repo
+			if !pausedOrCompleted && updated.Status != "running" {
+				updated.Status = "queued"
+				updated.NextRunAt = &nowISO
+			}
+			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)})
+			if err == nil {
+				updated.MetadataJSON = &metadataJSON
+			}
+			updated.UpdatedAt = nowISO
+			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+				return loopUpsertResult{}, err
+			}
+			return loopUpsertResult{record: updated}, nil
+		}
+	}
+	seq, err := r.repos.Loops.AllocateSeq(ctx)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	metadataJSON := mustMarshalJSON(workerMeta)
+	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
+		return loopUpsertResult{}, err
+	}
+	return loopUpsertResult{record: loop, created: true}, nil
+}
+
+func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary) (storage.QueueItemRecord, error) {
+	dedupeKey := buildWorkerIssueDedupeKey(project.ID, repo, issue.Number)
+	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		return storage.QueueItemRecord{}, err
+	}
+	if existing != nil {
+		return *existing, nil
+	}
+	nowISO := r.nowISO()
+	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
+	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL})
+	targetID := buildIssueTargetID(repo, issue.Number)
+	lockKey := targetID
+	projectID := project.ID
+	loopID := loop.ID
+	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+		return storage.QueueItemRecord{}, err
+	}
+	return queueItem, nil
+}
+
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
@@ -2238,6 +2392,39 @@ func buildDefaultIssueWorkerTitle(repo string, issueNumber int64) string {
 	return fmt.Sprintf("Implement %s#%d", repo, issueNumber)
 }
 
+func buildIssueTargetID(repo string, issueNumber int64) string {
+	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+}
+
+func buildWorkerIssueDedupeKey(projectID, repo string, issueNumber int64) string {
+	return fmt.Sprintf("worker:%s:%s:%d", projectID, repo, issueNumber)
+}
+
+func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }
+
+func includesLogin(values []string, target string) bool {
+	target = normalizeLogin(target)
+	for _, value := range values {
+		if normalizeLogin(value) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldClaimWorkerIssue(issue IssueSummary, login string) bool {
+	return includesLogin(issue.Assignees, login) && hasLabel(issue.Labels, issueDiscoveryLabel)
+}
+
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
 	metadata := parseJSONObject(current)
 	for key, value := range updates {
@@ -2259,6 +2446,20 @@ func parseJSONObject(raw *string) map[string]any {
 		return map[string]any{}
 	}
 	return decoded
+}
+
+func mergeWorkerMetadata(metadata map[string]any, work workerInput) map[string]any {
+	workerMeta := map[string]any{}
+	if existing, ok := metadata["worker"].(map[string]any); ok {
+		for key, value := range existing {
+			workerMeta[key] = value
+		}
+	}
+	workJSON := parseJSONObject(stringPtr(mustMarshalJSON(work)))
+	for key, value := range workJSON {
+		workerMeta[key] = value
+	}
+	return workerMeta
 }
 
 func mustMarshalJSON(value any) string {

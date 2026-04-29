@@ -52,6 +52,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
 		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
+		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},
@@ -77,6 +78,161 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 				if !strings.Contains(stdout, subcommand) {
 					t.Fatalf("Run(%v) stdout = %q, want to contain %q", testCase.args, stdout, subcommand)
 				}
+			}
+		})
+	}
+}
+
+func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var calls []string
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			calls = append(calls, command+" "+strings.Join(args, " "))
+			switch strings.Join(args, " ") {
+			case "auth status --hostname github.com":
+				return commandExecutionResult{}, nil
+			case "label list --repo acme/looper --limit 1000 --json name,color,description":
+				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			default:
+				t.Fatalf("unexpected command: %s %s", command, strings.Join(args, " "))
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--dry-run", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(labels init --dry-run) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
+	}
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=3 updated=0 skipped=1 failed=0"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
+		}
+	}
+	for _, call := range calls {
+		if strings.Contains(call, "label create") || strings.Contains(call, "label edit") {
+			t.Fatalf("dry run executed mutation command: %s", call)
+		}
+	}
+}
+
+func TestLabelsInitRequiresAuthenticatedGH(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			if strings.Join(args, " ") != "auth status --hostname github.com" {
+				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not logged in"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(labels init unauthenticated) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("Run(labels init unauthenticated) stdout = %q, want empty string", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "gh is not authenticated; run `gh auth login` and retry") {
+		t.Fatalf("stderr = %q, want actionable auth error", stderr.String())
+	}
+}
+
+func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			switch strings.Join(args, " ") {
+			case "auth status --hostname github.com":
+				return commandExecutionResult{}, nil
+			case "label list --repo acme/looper --limit 1000 --json name,color,description":
+				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+				return commandExecutionResult{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by integration"}, nil
+			case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			default:
+				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(labels init) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
+		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+		t.Fatalf("stdout = %q, want failed summary", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
+		t.Fatalf("stderr = %q, want command failure", stderr.String())
+	}
+}
+
+func TestLabelsAuthHostname(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "empty", repo: "", want: "github.com"},
+		{name: "owner name", repo: "acme/looper", want: "github.com"},
+		{name: "host owner name", repo: "github.example.com/acme/looper", want: "github.example.com"},
+		{name: "trim host", repo: " github.example.com/acme/looper ", want: "github.example.com"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := labelsAuthHostname(tc.repo); got != tc.want {
+				t.Fatalf("labelsAuthHostname(%q) = %q, want %q", tc.repo, got, tc.want)
 			}
 		})
 	}

@@ -89,6 +89,9 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	if len(fixerRunner.discoverCalls) != 1 || fixerRunner.discoverCalls[0].Repo != "powerformer/looper" {
 		t.Fatalf("fixer discover calls = %#v, want stored project repo", fixerRunner.discoverCalls)
 	}
+	if len(workerRunner.discoverCalls) != 1 || workerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+		t.Fatalf("worker discover calls = %#v, want stored project repo", workerRunner.discoverCalls)
+	}
 	waitForSchedulerCondition(t, func() bool {
 		return workerRunner.processItemCount() == 1
 	})
@@ -512,9 +515,18 @@ func (s *stubFixerScheduler) processItemCount() int {
 
 type stubWorkerScheduler struct {
 	mu             sync.Mutex
+	discoverCalls  []worker.DiscoveryInput
+	discoverErr    error
 	processClaims  []string
 	processedItems []string
 	processErr     error
+}
+
+func (s *stubWorkerScheduler) DiscoverIssues(_ context.Context, input worker.DiscoveryInput) (worker.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
+	return worker.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (*worker.ProcessResult, error) {
