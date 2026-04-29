@@ -261,7 +261,7 @@ func (r *commandRuntime) upgradeDaemonWithOutput(cmd *cobra.Command, emitOutput 
 		return output, nil
 	}
 
-	result, err := r.installManagedDaemon(ctx, true, latestRelease.Tag)
+	result, err := r.installManagedDaemon(ctx, true, latestRelease.Tag, cmd.ErrOrStderr())
 	if err != nil {
 		return daemonUpgradeOutput{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
 	}
@@ -484,7 +484,7 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	if err != nil {
 		return cliUpgradeOutput{}, err
 	}
-	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL)
+	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL, binaryAsset.Name, cmd.ErrOrStderr())
 	if err != nil {
 		return cliUpgradeOutput{}, fmt.Errorf("failed to download looper binary: %w", err)
 	}

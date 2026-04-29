@@ -65,7 +65,7 @@ func TestInstallManagedDaemonInstallsBinary(t *testing.T) {
 	})
 
 	runtime := newCommandRuntime(app, nil)
-	result, err := runtime.installManagedDaemon(context.Background(), false, "")
+	result, err := runtime.installManagedDaemon(context.Background(), false, "", nil)
 	if err != nil {
 		t.Fatalf("installManagedDaemon() error = %v", err)
 	}
@@ -119,7 +119,7 @@ func TestInstallManagedDaemonSkipsExistingBinary(t *testing.T) {
 	})
 
 	runtime := newCommandRuntime(app, nil)
-	result, err := runtime.installManagedDaemon(context.Background(), false, "")
+	result, err := runtime.installManagedDaemon(context.Background(), false, "", nil)
 	if err != nil {
 		t.Fatalf("installManagedDaemon() error = %v", err)
 	}
@@ -168,14 +168,46 @@ func TestDaemonInstallCommandPrintsHumanOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon install]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("Run([daemon install]) stderr = %q, want empty string", stderr.String())
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 3 B / 3 B (100%)") {
+		t.Fatalf("Run([daemon install]) stderr = %q, want download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Installed looperd (darwin-arm64) to ") {
 		t.Fatalf("Run([daemon install]) stdout = %q, want install confirmation", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "Downloaded from https://example.invalid/looperd-darwin-arm64") {
 		t.Fatalf("Run([daemon install]) stdout = %q, want download URL", stdout.String())
+	}
+}
+
+func TestDownloadBinaryProgressFallsBackWhenLengthUnknown(t *testing.T) {
+	t.Parallel()
+
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() != "https://example.invalid/looperd-darwin-arm64" {
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+			}
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Status:        http.StatusText(http.StatusOK),
+				Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+				Body:          io.NopCloser(strings.NewReader("abcd")),
+				ContentLength: -1,
+			}, nil
+		}),
+	})
+	runtime := newCommandRuntime(app, nil)
+
+	data, err := runtime.downloadBinary(context.Background(), "https://example.invalid/looperd-darwin-arm64", "looperd-darwin-arm64", stderr)
+	if err != nil {
+		t.Fatalf("downloadBinary() error = %v", err)
+	}
+	if string(data) != "abcd" {
+		t.Fatalf("downloadBinary() data = %q, want abcd", string(data))
+	}
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 4 B downloaded") {
+		t.Fatalf("progress = %q, want unknown-size fallback", stderr.String())
 	}
 }
 
@@ -212,9 +244,10 @@ func textResponse(t *testing.T, status int, body string) *http.Response {
 func binaryResponse(t *testing.T, status int, body []byte) *http.Response {
 	t.Helper()
 	return &http.Response{
-		StatusCode: status,
-		Status:     http.StatusText(status),
-		Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
-		Body:       io.NopCloser(bytes.NewReader(body)),
+		StatusCode:    status,
+		Status:        http.StatusText(status),
+		Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
 	}
 }
