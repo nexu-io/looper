@@ -94,7 +94,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -189,6 +189,27 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper upgrade --check",
 					"$ looper upgrade --cli",
 					"$ looper upgrade --daemon",
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "labels",
+				short:           "GitHub label commands",
+				helpSubcommands: []helpSubcommand{{name: "init", description: "Initialize standard Looper GitHub labels"}},
+				helpWhenNoArgs:  true,
+				exampleLines: []string{
+					"$ looper labels init",
+					"$ looper labels init --repo acme/looper --dry-run",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{
+						use:   "init",
+						short: "Initialize standard Looper GitHub labels",
+						runE:  runtime.labelsInit,
+						localFlags: []flagSpec{
+							stringFlag("repo", "owner/name", "GitHub repository slug"),
+							boolFlag("dry-run", "Preview label changes without applying them"),
+						},
+					}),
 				},
 			}),
 			newCommand(commandSpec{

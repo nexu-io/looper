@@ -220,6 +220,40 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
+type InitializeLabelsInput struct {
+	Repo   string
+	CWD    string
+	DryRun bool
+}
+
+type LabelDefinition struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+type LabelInitResult struct {
+	Repo    string           `json:"repo"`
+	DryRun  bool             `json:"dryRun"`
+	Labels  []LabelInitItem  `json:"labels"`
+	Summary LabelInitSummary `json:"summary"`
+}
+
+type LabelInitItem struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+	Error       string `json:"error,omitempty"`
+}
+
+type LabelInitSummary struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
+}
+
 type ReviewThreadNotFoundError struct {
 	ThreadID string
 }
@@ -613,6 +647,60 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 	return strings.TrimSpace(result.Stdout), nil
 }
 
+func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+	if err != nil {
+		return "", err
+	}
+	repo := strings.TrimSpace(result.Stdout)
+	if _, _, err := parseRepo(repo); err != nil {
+		return "", err
+	}
+	return repo, nil
+}
+
+func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsInput) (LabelInitResult, error) {
+	repo := strings.TrimSpace(input.Repo)
+	if _, _, err := parseRepo(repo); err != nil {
+		return LabelInitResult{}, err
+	}
+
+	existing, err := g.listRepositoryLabels(ctx, repo, input.CWD)
+	if err != nil {
+		return LabelInitResult{}, err
+	}
+
+	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(StandardLooperLabels()))}
+	for _, definition := range StandardLooperLabels() {
+		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
+		current, ok := existing[strings.ToLower(definition.Name)]
+		switch {
+		case !ok:
+			item.Status = "created"
+			if !input.DryRun {
+				_, err = g.runGh(ctx, input.CWD, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
+			}
+		case normalizeLabelColor(current.Color) == normalizeLabelColor(definition.Color) && strings.TrimSpace(current.Description) == definition.Description:
+			item.Status = "skipped"
+		default:
+			item.Status = "updated"
+			if !input.DryRun {
+				_, err = g.runGh(ctx, input.CWD, "", "label", "edit", current.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
+			}
+		}
+
+		if err != nil {
+			item.Status = "failed"
+			item.Error = err.Error()
+			err = nil
+		}
+		result.Labels = append(result.Labels, item)
+		incrementLabelSummary(&result.Summary, item.Status)
+	}
+
+	return result, nil
+}
+
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 	detail, err := g.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
@@ -747,6 +835,26 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []s
 	return nil
 }
 
+func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]LabelDefinition, error) {
+	result, err := g.runGh(ctx, cwd, "", "label", "list", "--repo", repo, "--limit", "1000", "--json", "name,color,description")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]LabelDefinition, len(rows))
+	for _, row := range rows {
+		name := strings.TrimSpace(asString(row["name"]))
+		if name == "" {
+			continue
+		}
+		out[strings.ToLower(name)] = LabelDefinition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
+	}
+	return out, nil
+}
+
 func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) (shell.Result, error) {
 	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
 }
@@ -873,6 +981,32 @@ func resolveLabelDescription(label string) string {
 		return "Looper requires manual intervention"
 	default:
 		return "Managed by looper"
+	}
+}
+
+func StandardLooperLabels() []LabelDefinition {
+	return []LabelDefinition{
+		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
+		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
+		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
+		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
+	}
+}
+
+func normalizeLabelColor(value string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
+}
+
+func incrementLabelSummary(summary *LabelInitSummary, status string) {
+	switch status {
+	case "created":
+		summary.Created++
+	case "updated":
+		summary.Updated++
+	case "skipped":
+		summary.Skipped++
+	case "failed":
+		summary.Failed++
 	}
 }
 

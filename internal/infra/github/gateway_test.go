@@ -332,6 +332,90 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 	}
 }
 
+func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"},{"name":"looper:spec-reviewing","color":"000000","description":"Old description"}]`}, nil
+		case "label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("InitializeLabels() error = %v", err)
+	}
+	if result.Summary.Created != 2 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=2 updated=1 skipped=1 failed=0", result.Summary)
+	}
+
+	log := strings.Join(runner.calls, "\n")
+	for _, needle := range []string{
+		"label list --repo acme/looper --limit 1000 --json name,color,description",
+		"label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review",
+		"label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation",
+		"label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention",
+	} {
+		if !strings.Contains(log, needle) {
+			t.Fatalf("gh log missing %q\n%s", needle, log)
+		}
+	}
+}
+
+func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args == "label list --repo acme/looper --limit 1000 --json name,color,description" {
+			return shell.Result{Stdout: `[]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper", DryRun: true})
+	if err != nil {
+		t.Fatalf("InitializeLabels(dry run) error = %v", err)
+	}
+	if result.Summary.Created != 4 || len(runner.calls) != 1 {
+		t.Fatalf("dry run result = %#v, calls = %#v; want four planned creates and only label list", result.Summary, runner.calls)
+	}
+}
+
+func TestGatewayDetectsCurrentRepository(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "repo view --json nameWithOwner --jq .nameWithOwner" {
+			t.Fatalf("gh args = %q, want repo view", args)
+		}
+		return shell.Result{Stdout: "acme/looper\n"}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	repo, err := gateway.DetectCurrentRepository(context.Background(), "")
+	if err != nil {
+		t.Fatalf("DetectCurrentRepository() error = %v", err)
+	}
+	if repo != "acme/looper" {
+		t.Fatalf("DetectCurrentRepository() = %q, want acme/looper", repo)
+	}
+}
+
 type fakeGHRunner struct {
 	t       *testing.T
 	calls   []string

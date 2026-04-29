@@ -12,6 +12,7 @@ Subcommands:
   config     Config commands
   daemon     Daemon commands
   upgrade    Check or upgrade Looper installations
+  labels     GitHub label commands
   loop       Loop commands
   work       Create a worker run
   plan       Create a planner run
