@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -244,7 +247,7 @@ func TestDaemonStartMissingPIDFileUsesReachableLooperdAPI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	configPath := writeDaemonCLIConfig(t, server.URL)
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
@@ -282,7 +285,7 @@ func TestDaemonStartStalePIDFileUsesReachableLooperdAPI(t *testing.T) {
 
 	homeDir := t.TempDir()
 	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
-	configPath := writeDaemonCLIConfig(t, server.URL)
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	removed := false
@@ -337,7 +340,7 @@ func TestDaemonStartNonLooperdAPIServiceFailsBeforeSpawn(t *testing.T) {
 	}))
 	defer server.Close()
 
-	configPath := writeDaemonCLIConfig(t, server.URL)
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
@@ -368,7 +371,7 @@ func TestDaemonStartNonLooperdAPIServiceFailsBeforeSpawn(t *testing.T) {
 func TestDaemonStartExitedProcessIncludesStartupLogTail(t *testing.T) {
 	t.Parallel()
 
-	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, "http://127.0.0.1:1", nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
@@ -425,7 +428,7 @@ func TestDaemonStartReadinessLoopWaitsForStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	configPath := writeDaemonCLIConfig(t, server.URL)
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	clientRequests := 0
@@ -472,12 +475,77 @@ func TestDaemonStartReadinessLoopWaitsForStatus(t *testing.T) {
 	}
 }
 
+func TestDaemonStartIgnoresRemoteBaseURLForLocalReadiness(t *testing.T) {
+	t.Parallel()
+
+	remoteRequests := 0
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteRequests++
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer remoteServer.Close()
+
+	localRequests := 0
+	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localRequests++
+		writeLooperdStatusEnvelope(t, w)
+	}))
+	defer localServer.Close()
+
+	homeDir := t.TempDir()
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, localServer.URL, &remoteServer.URL)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	spawned := false
+	clientRequests := 0
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			clientRequests++
+			if clientRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		})},
+		ReadFile:   func(path string) ([]byte, error) { return nil, os.ErrNotExist },
+		RunCommand: daemonVersionCommand(filepath.Join(homeDir, ".looper", "bin", "looperd")),
+		Getwd:      func() (string, error) { return "/tmp/workspace", nil },
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			spawned = true
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error { return nil },
+		MkdirAll:    func(path string, perm os.FileMode) error { return nil },
+		WriteFile:   func(path string, data []byte, perm os.FileMode) error { return nil },
+		Sleep:       func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !spawned {
+		t.Fatal("SpawnDetached() was not called; remote baseUrl appears to have short-circuited startup")
+	}
+	if remoteRequests != 0 {
+		t.Fatalf("remote baseUrl requests = %d, want 0", remoteRequests)
+	}
+	if localRequests == 0 {
+		t.Fatalf("local bind endpoint requests = %d, want readiness poll", localRequests)
+	}
+	if !strings.Contains(stdout.String(), "Started looperd") || !strings.Contains(stdout.String(), "pid 4321") {
+		t.Fatalf("stdout = %q, want start confirmation", stdout.String())
+	}
+}
+
 func TestDaemonStartReadinessTimeoutTerminatesSpawnedProcessAndRemovesPIDFile(t *testing.T) {
 	t.Parallel()
 
 	homeDir := t.TempDir()
 	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
-	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, "http://127.0.0.1:1", nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	removeCalls := make([]string, 0, 1)
@@ -932,6 +1000,65 @@ func writeDaemonCLIConfig(t *testing.T, baseURL string) string {
 	if err != nil {
 		t.Fatalf("Marshal(config) error = %v", err)
 	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+	return configPath
+}
+
+func writeDaemonCLIConfigForBindEndpoint(t *testing.T, bindURL string, baseURL *string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(bindURL)
+	if err != nil {
+		t.Fatalf("Parse(bindURL) error = %v", err)
+	}
+	host, portText, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q) error = %v", parsed.Host, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("Atoi(%q) error = %v", portText, err)
+	}
+
+	root := t.TempDir()
+	logDir := filepath.Join(root, "logs")
+	workingDir := filepath.Join(root, "working")
+	storageDir := filepath.Join(root, "storage")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(logDir) error = %v", err)
+	}
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workingDir) error = %v", err)
+	}
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(storageDir) error = %v", err)
+	}
+
+	serverConfig := map[string]any{
+		"host":     host,
+		"port":     port,
+		"authMode": "none",
+	}
+	if baseURL != nil {
+		serverConfig["baseUrl"] = *baseURL
+	}
+	payload := map[string]any{
+		"server": serverConfig,
+		"daemon": map[string]any{
+			"logDir":           logDir,
+			"workingDirectory": workingDir,
+		},
+		"storage": map[string]any{
+			"dbPath": filepath.Join(storageDir, "looper.sqlite"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	configPath := filepath.Join(root, "config.json")
 	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}

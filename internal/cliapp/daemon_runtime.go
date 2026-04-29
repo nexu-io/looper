@@ -112,7 +112,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client := r.apiClientFromLoaded(loaded)
+	client := r.localAPIClientFromLoaded(loaded)
 	apiURL := client.baseURL
 
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
@@ -375,6 +375,15 @@ func (r *commandRuntime) apiClientFromLoaded(loaded config.LoadedFileConfig) *Da
 		baseURL = fmt.Sprintf("http://%s:%d", loaded.Config.Server.Host, loaded.Config.Server.Port)
 	}
 
+	return r.newAPIClientForLoaded(loaded, baseURL)
+}
+
+func (r *commandRuntime) localAPIClientFromLoaded(loaded config.LoadedFileConfig) *DaemonAPIClient {
+	baseURL := fmt.Sprintf("http://%s:%d", loaded.Config.Server.Host, loaded.Config.Server.Port)
+	return r.newAPIClientForLoaded(loaded, baseURL)
+}
+
+func (r *commandRuntime) newAPIClientForLoaded(loaded config.LoadedFileConfig, baseURL string) *DaemonAPIClient {
 	token := ""
 	if loaded.Config.Server.AuthMode == config.AuthModeLocalToken && loaded.Config.Server.LocalToken != nil {
 		token = strings.TrimSpace(*loaded.Config.Server.LocalToken)
