@@ -1435,7 +1435,7 @@ func TestParseStructuredReviewOutputDropsDuplicateTopLevelComments(t *testing.T)
 func TestParseStructuredReviewOutputKeepsDetailedCommentMatchingBodyHeadline(t *testing.T) {
 	t.Parallel()
 
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":"Please add tests","why":"The retry path can regress without coverage.","evidence":"retry.go has no failure-path test.","suggested_change":"Add a regression test for retry failure handling."}]}`)
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":"Please add tests","why":"The retry path can regress without coverage.","evidence":"retry.go has no failure-path test.","suggestedChange":"Add a regression test for retry failure handling."}]}`)
 	if !ok {
 		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
 	}
@@ -1465,7 +1465,7 @@ func TestParseStructuredReviewOutputDedupesTopLevelCommentsByCanonicalHeadline(t
 func TestParseStructuredReviewOutputKeepsTopLevelCommentsWithSameHeadlineDifferentDetails(t *testing.T) {
 	t.Parallel()
 
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The retry path can publish duplicate comments.","evidence":"runner.go retries after partial publish.","suggested_change":"Add a retry regression test."},{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The parser can drop distinct feedback with matching headlines.","evidence":"runner.go dedupes top-level comments.","suggested_change":"Deduplicate using the full rendered body."}]}`)
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The retry path can publish duplicate comments.","evidence":"runner.go retries after partial publish.","suggestedChange":"Add a retry regression test."},{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The parser can drop distinct feedback with matching headlines.","evidence":"runner.go dedupes top-level comments.","suggestedChange":"Deduplicate using the full rendered body."}]}`)
 	if !ok {
 		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
 	}
