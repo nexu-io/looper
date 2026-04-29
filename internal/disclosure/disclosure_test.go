@@ -76,6 +76,46 @@ func TestDisclosureIncludesAgentVendorAndModelSeparately(t *testing.T) {
 	}
 }
 
+func TestDisclosureSanitizesModelAttribute(t *testing.T) {
+	vendor := config.AgentVendorOpenCode
+	model := " openai/gpt-5.5\nGenerated-By: looper injected, model)</sub> "
+	s := FromConfig(config.Config{
+		Agent: config.AgentConfig{
+			Vendor: &vendor,
+			Model:  &model,
+		},
+		Disclosure: config.DisclosureConfig{
+			Enabled:      true,
+			IncludeAgent: true,
+			Channels: config.DisclosureChannelsConfig{
+				GitCommit:    true,
+				PullRequest:  true,
+				IssueComment: true,
+			},
+		},
+	})
+	s.Version = "1.2.3"
+
+	commit := s.CommitMessage("fix: disclose model", "worker")
+	if strings.Count(commit, "Generated-By: looper") != 1 {
+		t.Fatalf("model injected an extra trailer: %q", commit)
+	}
+	if strings.Contains(commit, "\nGenerated-By: looper injected") {
+		t.Fatalf("model included a raw newline trailer: %q", commit)
+	}
+	if !strings.Contains(commit, "model=openai/gpt-5.5%20Generated-By:%20looper%20injected%2C%20model%29%3C/sub%3E") {
+		t.Fatalf("commit trailer missing sanitized model: %q", commit)
+	}
+
+	footer := s.Markdown("Body", "worker", ChannelPullRequest)
+	if strings.Count(footer, "<sub>") != 1 || strings.Count(footer, "</sub>") != 1 {
+		t.Fatalf("model broke footer markup: %q", footer)
+	}
+	if strings.Contains(footer, "\nGenerated-By: looper injected") || strings.Contains(footer, "model)</sub>") {
+		t.Fatalf("footer included unsanitized model: %q", footer)
+	}
+}
+
 func TestReviewCommentDefaultsToHiddenMarker(t *testing.T) {
 	s := testStamper()
 	got := s.ReviewComment("Inline note", "reviewer")
