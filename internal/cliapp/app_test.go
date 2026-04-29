@@ -559,7 +559,22 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 
 func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
 	root := t.TempDir()
-	t.Chdir(root)
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get current working directory: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("change working directory to temp root: %v", err)
+	}
+	root, err = os.Getwd()
+	if err != nil {
+		t.Fatalf("get temp working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalCWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
 
 	wantRepoPath := filepath.Join(root, "repo")
 	wantWorktreeRoot := filepath.Join(root, "worktrees")
