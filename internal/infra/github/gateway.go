@@ -131,6 +131,13 @@ type ReviewComment struct {
 	StartSide string
 }
 
+type VerifyReviewMarkerInput struct {
+	Repo     string
+	PRNumber int64
+	Marker   string
+	CWD      string
+}
+
 type PullRequestReactionInput struct {
 	Repo     string
 	PRNumber int64
@@ -540,6 +547,37 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "comment", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--body", input.Body)
 	return err
+}
+
+func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerInput) (bool, error) {
+	if strings.TrimSpace(input.Marker) == "" {
+		return false, nil
+	}
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	if err != nil {
+		return false, err
+	}
+	if jsonBodiesContainMarker(reviewsResult.Stdout, input.Marker) {
+		return true, nil
+	}
+	commentsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.PRNumber))
+	if err != nil {
+		return false, err
+	}
+	return jsonBodiesContainMarker(commentsResult.Stdout, input.Marker), nil
+}
+
+func jsonBodiesContainMarker(raw string, marker string) bool {
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		return strings.Contains(raw, marker)
+	}
+	for _, row := range rows {
+		if body, ok := row["body"].(string); ok && strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {

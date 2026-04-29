@@ -292,6 +292,10 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
+func (a reviewerGitHubAdapter) HasReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (bool, error) {
+	return a.gateway.HasReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, CWD: input.CWD})
+}
+
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
