@@ -1462,6 +1462,24 @@ func TestParseStructuredReviewOutputDedupesTopLevelCommentsByCanonicalHeadline(t
 	}
 }
 
+func TestParseStructuredReviewOutputKeepsTopLevelCommentsWithSameHeadlineDifferentDetails(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The retry path can publish duplicate comments.","evidence":"runner.go retries after partial publish.","suggested_change":"Add a retry regression test."},{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The parser can drop distinct feedback with matching headlines.","evidence":"runner.go dedupes top-level comments.","suggested_change":"Deduplicate using the full rendered body."}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 2 {
+		t.Fatalf("comments = %#v, want both detailed top-level comments preserved", parsed.Comments)
+	}
+	if !strings.Contains(parsed.Comments[0].Body, "**Why it matters:** The retry path can publish duplicate comments.") {
+		t.Fatalf("first comment body = %q, want first detailed comment preserved", parsed.Comments[0].Body)
+	}
+	if !strings.Contains(parsed.Comments[1].Body, "**Why it matters:** The parser can drop distinct feedback with matching headlines.") {
+		t.Fatalf("second comment body = %q, want second detailed comment preserved", parsed.Comments[1].Body)
+	}
+}
+
 func TestParseStructuredReviewOutputDoesNotDedupeIntoCleanReview(t *testing.T) {
 	t.Parallel()
 

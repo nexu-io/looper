@@ -1974,10 +1974,10 @@ func isDuplicateTopLevelReviewComment(comment reviewFeedbackComment, body string
 }
 
 func reviewFeedbackTopLevelDedupeKey(comment reviewFeedbackComment) string {
-	if key := normalizedReviewFeedbackText(comment.rawBody); key != "" {
+	if key := normalizedReviewFeedbackText(reviewFeedbackCommentUnlabeledBody(comment.Body)); key != "" {
 		return key
 	}
-	return normalizedReviewFeedbackText(reviewFeedbackCommentUnlabeledHeadline(comment.Body))
+	return normalizedReviewFeedbackText(comment.rawBody)
 }
 
 func reviewFeedbackCommentUnlabeledBody(body string) string {
