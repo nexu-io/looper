@@ -41,6 +41,61 @@ func TestProcessNextIgnoresOtherQueueTypes(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
+		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
+		{Number: 47, Title: "No label", Assignees: []string{"octocat"}},
+		{Number: 48, Title: "Wrong assignee", Assignees: []string{"someone"}, Labels: []string{"looper:worker-ready"}},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 || result.Skipped != 2 {
+		t.Fatalf("result = %#v, want one worker queue item, one loop, two skipped", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItems[0].ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Type != "worker" || queue.TargetType != "issue" || queue.TargetID != "issue:acme/looper:46" || queue.DedupeKey != "worker:project_1:acme/looper:46" {
+		t.Fatalf("queue = %#v, want worker issue queue for issue 46", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.CreatedLoopIDs[0])
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Type != "worker" || loop.TargetType != "issue" || loop.TargetID == nil || *loop.TargetID != "issue:acme/looper:46" {
+		t.Fatalf("loop = %#v, want worker issue loop for issue 46", loop)
+	}
+}
+
+func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	first, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverIssues() error = %v", err)
+	}
+	second, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverIssues() error = %v", err)
+	}
+	if len(first.QueueItems) != 1 || len(second.QueueItems) != 1 || first.QueueItems[0].ID != second.QueueItems[0].ID {
+		t.Fatalf("first=%#v second=%#v, want reused active queue item", first.QueueItems, second.QueueItems)
+	}
+	if len(second.CreatedLoopIDs) != 0 {
+		t.Fatalf("second.CreatedLoopIDs = %#v, want no duplicate loop", second.CreatedLoopIDs)
+	}
+}
+
 func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1953,6 +2008,9 @@ func (f *runnerFixture) nowISO() string {
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 type fakeGitHubGateway struct {
+	currentLogin            string
+	issues                  []IssueSummary
+	listIssueCalls          []ListOpenIssuesInput
 	openPRs                 []PullRequestSummary
 	openPRResponses         [][]PullRequestSummary
 	openPRIndex             int
@@ -1974,6 +2032,18 @@ type fakeGitHubGateway struct {
 	removeLabels            []PullRequestLabelsInput
 	reviewerCalls           []PullRequestReviewersInput
 	createPRIndex           int
+}
+
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	if f.currentLogin == "" {
+		return "octocat", nil
+	}
+	return f.currentLogin, nil
+}
+
+func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	f.listIssueCalls = append(f.listIssueCalls, input)
+	return append([]IssueSummary(nil), f.issues...), nil
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {

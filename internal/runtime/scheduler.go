@@ -46,6 +46,10 @@ type workerScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
 }
 
+type workerIssueDiscoveryScheduler interface {
+	DiscoverIssues(context.Context, worker.DiscoveryInput) (worker.DiscoveryResult, error)
+}
+
 type schedulerAsyncRunner interface {
 	Go(func())
 }
@@ -426,6 +430,22 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 	return result, nil
 }
 
+func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
+	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]worker.IssueSummary, 0, len(issues))
+	for _, issue := range issues {
+		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+	}
+	return result, nil
+}
+
+func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
 func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
 	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
@@ -801,6 +821,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if input.Fixer != nil {
 			_, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
 			appendErr(wrapSchedulerError("fixer discovery", project.ID, repo, err))
+		}
+		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok {
+			_, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
 		}
 	}
 
