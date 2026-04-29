@@ -77,7 +77,7 @@
         "allowRiskyFixes": false,
         "fixAllPullRequests": false,
         "openPrStrategy": "all_done",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "full"
       },
       "projects": []
     },

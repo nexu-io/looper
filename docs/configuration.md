@@ -127,7 +127,7 @@ Example minimal `~/.looper/config.json`:
     "allowAutoMerge": false,
     "allowRiskyFixes": false,
     "openPrStrategy": "all_done",
-    "addSnapshotMode": "async"
+    "addSnapshotMode": "full"
   },
   "projects": [
     {
@@ -250,7 +250,7 @@ Default values:
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
 - `openPrStrategy`: `all_done`
-- `addSnapshotMode`: `async`
+- `addSnapshotMode`: `full`
 
 ### `projects`
 
