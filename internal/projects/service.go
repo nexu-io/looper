@@ -723,7 +723,7 @@ func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storag
 		Repo:        &repo,
 		PRNumber:    &prNumber,
 		DedupeKey:   dedupeKey,
-		Priority:    1,
+		Priority:    storage.QueuePrioritySnapshot,
 		Status:      "queued",
 		AvailableAt: nowISO,
 		MaxAttempts: 3,
