@@ -8,12 +8,16 @@
 
 Register every repo you own. Looper watches them all, picks up labeled issues, and runs specialized AI agents — **planner → reviewer ↔ fixer → worker** — until the work is shipped. You stay in GitHub; Looper handles the spec, review cycle, and implementation in isolated worktrees.
 
-- **Ship from an issue, not a prompt.** Label `looper:plan`, assign it, and a spec PR shows up. Approve it, and implementation begins.
-- **Every repo, one daemon.** Register all your projects once — Looper watches them together and runs loops across repos in parallel.
-- **Review loops that converge.** Reviewer and fixer ping-pong on a PR until threads are resolved and the review is clean — no babysitting.
-- **Parallel-safe by design.** Every loop runs in its own git worktree, so agents can work across issues and repos without stepping on each other.
-- **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
-- **Local, inspectable, killable.** A Go daemon (`looperd`) on your machine, a thin CLI (`looper`) to drive it. `looper ps`, `looper logs`, `looper stop` — it's just processes.
+![Looper technical architecture](assets/looper-technical-architecture.png)
+
+# Features
+
+- 🚢 **Ship from an issue, not a prompt.** Label `looper:plan`, assign it, and a spec PR shows up. Approve it, and implementation begins.
+- 🛰️ **Every repo, one daemon.** Register all your projects once — Looper watches them together and runs loops across repos in parallel.
+- 🔁 **Review loops that converge.** Reviewer and fixer ping-pong on a PR until threads are resolved and the review is clean — no babysitting.
+- 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents can work across issues and repos without stepping on each other.
+- 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
+- 🧰 **Local, inspectable, killable.** A Go daemon (`looperd`) on your machine, a thin CLI (`looper`) to drive it. `looper ps`, `looper logs`, `looper stop` — it's just processes.
 
 This repo ships two binaries:
 
