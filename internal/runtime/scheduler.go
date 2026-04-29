@@ -1012,7 +1012,10 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if err := input.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
-	return input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+	if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	return nil
 }
 
 func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, message, kind string) error {
