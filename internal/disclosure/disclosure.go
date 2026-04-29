@@ -28,6 +28,7 @@ type Stamper struct {
 	Config  config.DisclosureConfig
 	Version string
 	Agent   string
+	Model   string
 }
 
 func FromConfig(cfg config.Config) Stamper {
@@ -35,7 +36,11 @@ func FromConfig(cfg config.Config) Stamper {
 	if cfg.Agent.Vendor != nil {
 		agent = string(*cfg.Agent.Vendor)
 	}
-	return Stamper{Config: cfg.Disclosure, Version: version.Current().Version, Agent: agent}
+	model := ""
+	if cfg.Agent.Model != nil {
+		model = *cfg.Agent.Model
+	}
+	return Stamper{Config: cfg.Disclosure, Version: version.Current().Version, Agent: agent, Model: model}
 }
 
 func (s Stamper) CommitMessage(message, runner string) string {
@@ -119,6 +124,9 @@ func (s Stamper) attributes(runner string) []string {
 	if s.Config.IncludeAgent {
 		if agent := strings.TrimSpace(s.Agent); agent != "" {
 			attrs = append(attrs, "agent="+agent)
+		}
+		if model := strings.TrimSpace(s.Model); model != "" {
+			attrs = append(attrs, "model="+model)
 		}
 	}
 	if s.Config.IncludeOS {
