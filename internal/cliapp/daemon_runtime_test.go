@@ -247,6 +247,11 @@ func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
 			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
 		}
 	}
+	for _, file := range []string{"git", "gh", "osascript"} {
+		if err := os.WriteFile(filepath.Join(callerDir, file), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", file, err)
+		}
+	}
 
 	previousWD, err := os.Getwd()
 	if err != nil {
@@ -326,14 +331,14 @@ func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
 		Sleep: func(duration time.Duration) {},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", "./looper.json", "--db-path=./looper.sqlite", "--log-dir", "./logs", "--host", "127.0.0.1"})
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", "./looper.json", "--db-path=./looper.sqlite", "--log-dir", "./logs", "--git-path", "./git", "--gh-path=./gh", "--osascript-path", "./osascript", "--host", "127.0.0.1"})
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
 	if spawnedCWD != daemonWorkingDir {
 		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, daemonWorkingDir)
 	}
-	want := []string{"--config", filepath.Join(callerDir, "looper.json"), "--db-path=" + filepath.Join(callerDir, "looper.sqlite"), "--log-dir", filepath.Join(callerDir, "logs"), "--host", "127.0.0.1"}
+	want := []string{"--config", filepath.Join(callerDir, "looper.json"), "--db-path=" + filepath.Join(callerDir, "looper.sqlite"), "--log-dir", filepath.Join(callerDir, "logs"), "--git-path", filepath.Join(callerDir, "git"), "--gh-path=" + filepath.Join(callerDir, "gh"), "--osascript-path", filepath.Join(callerDir, "osascript"), "--host", "127.0.0.1"}
 	if got := strings.Join(spawnedArgs, "\n"); got != strings.Join(want, "\n") {
 		t.Fatalf("spawned.args = %#v, want %#v", spawnedArgs, want)
 	}
@@ -348,9 +353,14 @@ func TestDaemonStartNormalizesRelativeConfigEnvForSpawn(t *testing.T) {
 	}
 	logDir := filepath.Join(callerDir, "logs")
 	storageDir := filepath.Join(callerDir, "storage")
-	for _, dir := range []string{logDir, storageDir} {
+	for _, dir := range []string{logDir, storageDir, filepath.Join(callerDir, "env-logs"), filepath.Join(callerDir, "env-working")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+	}
+	for _, file := range []string{"env-git", "env-gh", "env-osascript"} {
+		if err := os.WriteFile(filepath.Join(callerDir, file), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", file, err)
 		}
 	}
 
@@ -371,6 +381,12 @@ func TestDaemonStartNormalizesRelativeConfigEnvForSpawn(t *testing.T) {
 		}
 	})
 	t.Setenv("LOOPER_CONFIG", "./looper.json")
+	t.Setenv("LOOPER_DB_PATH", "./env-looper.sqlite")
+	t.Setenv("LOOPER_LOG_DIR", "./env-logs")
+	t.Setenv("LOOPER_WORKING_DIRECTORY", "./env-working")
+	t.Setenv("LOOPER_GIT_PATH", "./env-git")
+	t.Setenv("LOOPER_GH_PATH", "./env-gh")
+	t.Setenv("LOOPER_OSASCRIPT_PATH", "./env-osascript")
 
 	configPath := filepath.Join(callerDir, "looper.json")
 	payload := map[string]any{
@@ -432,11 +448,24 @@ func TestDaemonStartNormalizesRelativeConfigEnvForSpawn(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if spawnedCWD != daemonWorkingDir {
-		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, daemonWorkingDir)
+	if spawnedCWD != filepath.Join(resolvedCallerDir, "env-working") {
+		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, filepath.Join(resolvedCallerDir, "env-working"))
 	}
 	if got, want := envValue(spawnedEnv, "LOOPER_CONFIG"), filepath.Join(resolvedCallerDir, "looper.json"); got != want {
 		t.Fatalf("spawned LOOPER_CONFIG = %q, want %q; env=%#v", got, want, spawnedEnv)
+	}
+	wantEnv := map[string]string{
+		"LOOPER_DB_PATH":           filepath.Join(resolvedCallerDir, "env-looper.sqlite"),
+		"LOOPER_LOG_DIR":           filepath.Join(resolvedCallerDir, "env-logs"),
+		"LOOPER_WORKING_DIRECTORY": filepath.Join(resolvedCallerDir, "env-working"),
+		"LOOPER_GIT_PATH":          filepath.Join(resolvedCallerDir, "env-git"),
+		"LOOPER_GH_PATH":           filepath.Join(resolvedCallerDir, "env-gh"),
+		"LOOPER_OSASCRIPT_PATH":    filepath.Join(resolvedCallerDir, "env-osascript"),
+	}
+	for name, want := range wantEnv {
+		if got := envValue(spawnedEnv, name); got != want {
+			t.Fatalf("spawned %s = %q, want %q; env=%#v", name, got, want, spawnedEnv)
+		}
 	}
 }
 

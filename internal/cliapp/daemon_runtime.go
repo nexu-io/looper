@@ -184,13 +184,19 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	forwardedArgs, err := r.forwardedDaemonConfigArgs()
+	env := os.Environ()
+	extractedArgs := ExtractConfigArgs(r.argv)
+	callerCWD, err := r.daemonSpawnCallerCWD(extractedArgs, env)
 	if err != nil {
 		return err
 	}
+	forwardedArgs := normalizeForwardedConfigPathArgs(extractedArgs, callerCWD)
+	if strings.TrimSpace(callerCWD) != "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+		cwd = filepath.Join(callerCWD, cwd)
+	}
 
 	r.startupOutputPath = startupLogPath
-	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, daemonSpawnEnv(os.Environ(), loaded.Metadata.ConfigPath))
+	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD))
 	if err != nil {
 		return fmt.Errorf("Failed to start looperd: %w", err)
 	}
@@ -227,27 +233,36 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	return err
 }
 
-func (r *commandRuntime) forwardedDaemonConfigArgs() ([]string, error) {
-	args := ExtractConfigArgs(r.argv)
-	if !forwardedConfigArgsNeedCWD(args) {
-		return args, nil
+func (r *commandRuntime) daemonSpawnCallerCWD(args []string, env []string) (string, error) {
+	if !forwardedConfigArgsNeedCWD(args) && !daemonSpawnEnvNeedsCWD(env) {
+		return "", nil
 	}
-
 	cwd, err := r.getwd()
 	if err != nil {
-		return nil, fmt.Errorf("resolve current working directory for daemon config paths: %w", err)
+		return "", fmt.Errorf("resolve current working directory for daemon config paths: %w", err)
 	}
 	if strings.TrimSpace(cwd) == "" {
-		return nil, fmt.Errorf("resolve current working directory for daemon config paths: current working directory is empty")
+		return "", fmt.Errorf("resolve current working directory for daemon config paths: current working directory is empty")
 	}
-
-	return normalizeForwardedConfigPathArgs(args, cwd), nil
+	return cwd, nil
 }
 
 var forwardedConfigPathFlagNames = map[string]struct{}{
-	"config":  {},
-	"db-path": {},
-	"log-dir": {},
+	"config":         {},
+	"db-path":        {},
+	"log-dir":        {},
+	"git-path":       {},
+	"gh-path":        {},
+	"osascript-path": {},
+}
+
+var daemonSpawnPathEnvNames = map[string]struct{}{
+	"LOOPER_DB_PATH":           {},
+	"LOOPER_LOG_DIR":           {},
+	"LOOPER_WORKING_DIRECTORY": {},
+	"LOOPER_GIT_PATH":          {},
+	"LOOPER_GH_PATH":           {},
+	"LOOPER_OSASCRIPT_PATH":    {},
 }
 
 func forwardedConfigArgsNeedCWD(args []string) bool {
@@ -273,6 +288,9 @@ func forwardedConfigArgsNeedCWD(args []string) bool {
 
 func normalizeForwardedConfigPathArgs(args []string, cwd string) []string {
 	normalized := append([]string{}, args...)
+	if strings.TrimSpace(cwd) == "" {
+		return normalized
+	}
 	for index := 0; index < len(normalized); index++ {
 		arg := normalized[index]
 		name, value, hasValue := splitLongFlag(arg)
@@ -306,20 +324,42 @@ func splitLongFlag(arg string) (name string, value string, hasValue bool) {
 	return trimmed, "", false
 }
 
-func daemonSpawnEnv(env []string, configPath string) []string {
+func daemonSpawnEnv(env []string, configPath string, cwd string) []string {
 	spawnEnv := append([]string{}, env...)
+	if strings.TrimSpace(cwd) != "" {
+		for index, entry := range spawnEnv {
+			name, value, ok := strings.Cut(entry, "=")
+			if !ok {
+				continue
+			}
+			if _, pathEnv := daemonSpawnPathEnvNames[name]; pathEnv && value != "" && !filepath.IsAbs(value) {
+				spawnEnv[index] = name + "=" + filepath.Join(cwd, value)
+			}
+		}
+	}
 	if strings.TrimSpace(configPath) == "" {
 		return spawnEnv
 	}
-
-	configEnv := "LOOPER_CONFIG=" + configPath
 	for index, entry := range spawnEnv {
 		if strings.HasPrefix(entry, "LOOPER_CONFIG=") {
-			spawnEnv[index] = configEnv
+			spawnEnv[index] = "LOOPER_CONFIG=" + configPath
 			return spawnEnv
 		}
 	}
-	return append(spawnEnv, configEnv)
+	return append(spawnEnv, "LOOPER_CONFIG="+configPath)
+}
+
+func daemonSpawnEnvNeedsCWD(env []string) bool {
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, pathEnv := daemonSpawnPathEnvNames[name]; pathEnv && value != "" && !filepath.IsAbs(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
