@@ -371,6 +371,7 @@ type reviewFeedbackComment struct {
 	Why             string `json:"why,omitempty"`
 	Evidence        string `json:"evidence,omitempty"`
 	SuggestedChange string `json:"suggestedChange,omitempty"`
+	rawBody         string
 }
 
 type publishState struct {
@@ -1753,18 +1754,19 @@ func normalizeReviewFeedbackComment(comment reviewFeedbackComment) reviewFeedbac
 	comment.Why = strings.TrimSpace(comment.Why)
 	comment.Evidence = strings.TrimSpace(comment.Evidence)
 	comment.SuggestedChange = strings.TrimSpace(comment.SuggestedChange)
+	comment.rawBody = strings.TrimSpace(firstNonEmpty(comment.Body, comment.Problem))
 	comment.Body = renderReviewFeedbackCommentBody(comment)
 	if comment.Body == "" {
 		return reviewFeedbackComment{}
 	}
 	if (comment.Path != "" && (comment.Line <= 0 || (comment.Side != "LEFT" && comment.Side != "RIGHT"))) || (comment.Path == "" && (comment.Line > 0 || comment.Side != "" || comment.StartLine > 0 || comment.StartSide != "")) {
-		return reviewFeedbackComment{Body: comment.Body}
+		return reviewFeedbackComment{Body: comment.Body, rawBody: comment.rawBody}
 	}
 	if (comment.StartLine > 0 || comment.StartSide != "") && (comment.StartLine <= 0 || (comment.StartSide != "LEFT" && comment.StartSide != "RIGHT")) {
-		return reviewFeedbackComment{Body: comment.Body}
+		return reviewFeedbackComment{Body: comment.Body, rawBody: comment.rawBody}
 	}
 	if comment.StartLine > 0 && comment.Line > 0 && comment.StartLine >= comment.Line {
-		return reviewFeedbackComment{Body: comment.Body}
+		return reviewFeedbackComment{Body: comment.Body, rawBody: comment.rawBody}
 	}
 	return comment
 }
@@ -1836,7 +1838,7 @@ func dedupeReviewFeedbackComments(comments []reviewFeedbackComment, body string)
 			continue
 		}
 		key := normalizedReviewFeedbackText(comment.Body)
-		if key == "" || key == normalizedReviewFeedbackText(body) {
+		if key == "" || isDuplicateTopLevelReviewComment(comment, body) {
 			continue
 		}
 		if _, ok := seenTopLevel[key]; ok {
@@ -1961,8 +1963,25 @@ func isDuplicateTopLevelReviewComment(comment reviewFeedbackComment, body string
 	if isInlineReviewFeedbackComment(comment) {
 		return false
 	}
-	key := normalizedReviewFeedbackText(comment.Body)
-	return key != "" && key == normalizedReviewFeedbackText(body)
+	bodyKey := normalizedReviewFeedbackText(body)
+	for _, value := range []string{comment.Body, comment.rawBody, reviewFeedbackCommentUnlabeledHeadline(comment.Body)} {
+		key := normalizedReviewFeedbackText(value)
+		if key != "" && key == bodyKey {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewFeedbackCommentUnlabeledHeadline(body string) string {
+	headline, _, _ := strings.Cut(strings.TrimSpace(body), "\n")
+	if !strings.HasPrefix(headline, "**[") {
+		return headline
+	}
+	if labelEnd := strings.Index(headline, "]** "); labelEnd >= 0 {
+		return strings.TrimSpace(headline[labelEnd+4:])
+	}
+	return headline
 }
 
 func normalizedReviewFeedbackText(value string) string {

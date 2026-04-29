@@ -1417,7 +1417,7 @@ func TestParseStructuredReviewOutputUsesProblemAsBodyWhenBodyEmpty(t *testing.T)
 func TestParseStructuredReviewOutputDropsDuplicateTopLevelComments(t *testing.T) {
 	t.Parallel()
 
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"body":" Please   add tests "},{"body":"Add an integration test"},{"body":"Add an integration test"},{"body":"Please add tests","path":"a.go","line":12,"side":"RIGHT"}]}`)
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":" Please   add tests "},{"body":"Add an integration test"},{"body":"Add an integration test"},{"body":"Please add tests","path":"a.go","line":12,"side":"RIGHT"}]}`)
 	if !ok {
 		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
 	}
