@@ -1035,8 +1035,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		reviewEvent = ReviewEventComment
 	}
 	reviewBody := pending.Body
-	if pending.Clean && reviewEvent == ReviewEventComment {
-		reviewBody = firstNonEmpty(strings.TrimSpace(reviewBody), strings.TrimSpace(pending.Summary))
+	if pending.Clean {
+		reviewBody = cleanReviewBody(reviewBody)
 	}
 	repo := input.Repo
 	prNumber := input.PRNumber
@@ -1687,7 +1687,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
 		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
 		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
-		"Do not approve. If the review is clean, return verdict=clean with comments=[].",
+		"Do not approve. If the review is clean, return verdict=clean with comments=[] and write a warm, specific LGTM body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
@@ -2049,6 +2049,13 @@ func ternaryReviewEvent(clean bool) ReviewEvent {
 		return ReviewEventApprove
 	}
 	return ReviewEventComment
+}
+
+func cleanReviewBody(body string) string {
+	if body = strings.TrimSpace(body); body != "" {
+		return body
+	}
+	return "LGTM 👍\n\nNice work—this is clear, focused, and easy to review. Thanks for keeping the change polished."
 }
 
 func cloneStrings(values []string) []string {

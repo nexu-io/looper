@@ -720,6 +720,57 @@ func TestRunPublishStepTransitionsSpecLabelsWhenReviewRequestRemovedAfterSubmit(
 	}
 }
 
+func TestRunPublishStepAddsDefaultCleanReviewBodyAndThumbsUp(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_clean_review_body", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_clean_review_body"},
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: (&pendingReviewCheckpoint{
+				HeadSHA: "abc123",
+				Event:   ReviewEventApprove,
+				Summary: "Looks good",
+				Clean:   true,
+			}).clone(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if len(github.submitCalls) != 1 {
+		t.Fatalf("submitCalls = %#v, want one clean review", github.submitCalls)
+	}
+	if github.submitCalls[0].Event != ReviewEventApprove {
+		t.Fatalf("event = %q, want approve", github.submitCalls[0].Event)
+	}
+	if !strings.Contains(github.submitCalls[0].Body, "LGTM 👍") || !strings.Contains(github.submitCalls[0].Body, "Nice work") {
+		t.Fatalf("review body = %q, want default LGTM praise", github.submitCalls[0].Body)
+	}
+	if len(github.addedReactions) != 1 || github.addedReactions[0].Content != "+1" {
+		t.Fatalf("addedReactions = %#v, want +1 reaction", github.addedReactions)
+	}
+}
+
 func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1352,10 +1403,26 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Good spec/docs comment example",
 		"Spec/docs review rubric",
 		"suggestedChange",
+		"warm, specific LGTM body",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestParseStructuredReviewOutputPreservesAgentGeneratedCleanBody(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"clean","body":"LGTM 👍 The spec is crisp, scoped, and gives implementers a clear validation path.","comments":[]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if !parsed.Clean {
+		t.Fatalf("parsed = %#v, want clean review", parsed)
+	}
+	if parsed.Body != "LGTM 👍 The spec is crisp, scoped, and gives implementers a clear validation path." {
+		t.Fatalf("body = %q, want agent-generated clean body preserved", parsed.Body)
 	}
 }
 
