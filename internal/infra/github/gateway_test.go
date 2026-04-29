@@ -374,6 +374,38 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 	}
 }
 
+func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "label list --repo github.example.com/acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[]`}, nil
+		case "label create looper:plan --repo github.example.com/acme/looper --color 5319e7 --description Picked up automatically by planner":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:spec-reviewing --repo github.example.com/acme/looper --color 1d76db --description Spec PR is under review":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:spec-ready --repo github.example.com/acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:needs-human --repo github.example.com/acme/looper --color d93f0b --description Looper requires manual intervention":
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "github.example.com/acme/looper"})
+	if err != nil {
+		t.Fatalf("InitializeLabels() error = %v", err)
+	}
+	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 4 {
+		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=4", result)
+	}
+}
+
 func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -434,10 +466,10 @@ func TestGatewayDetectsCurrentRepository(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if args := strings.Join(options.Args, " "); args != "repo view --json nameWithOwner --jq .nameWithOwner" {
+		if args := strings.Join(options.Args, " "); args != "repo view --json nameWithOwner,url" {
 			t.Fatalf("gh args = %q, want repo view", args)
 		}
-		return shell.Result{Stdout: "acme/looper\n"}, nil
+		return shell.Result{Stdout: `{"nameWithOwner":"acme/looper","url":"https://github.com/acme/looper"}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -447,6 +479,26 @@ func TestGatewayDetectsCurrentRepository(t *testing.T) {
 	}
 	if repo != "acme/looper" {
 		t.Fatalf("DetectCurrentRepository() = %q, want acme/looper", repo)
+	}
+}
+
+func TestGatewayDetectsCurrentEnterpriseRepository(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "repo view --json nameWithOwner,url" {
+			t.Fatalf("gh args = %q, want repo view", args)
+		}
+		return shell.Result{Stdout: `{"nameWithOwner":"acme/looper","url":"https://github.example.com/acme/looper"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	repo, err := gateway.DetectCurrentRepository(context.Background(), "")
+	if err != nil {
+		t.Fatalf("DetectCurrentRepository() error = %v", err)
+	}
+	if repo != "github.example.com/acme/looper" {
+		t.Fatalf("DetectCurrentRepository() = %q, want github.example.com/acme/looper", repo)
 	}
 }
 

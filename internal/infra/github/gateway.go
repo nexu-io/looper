@@ -648,12 +648,16 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 }
 
 func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (string, error) {
-	result, err := g.runGh(ctx, cwd, "", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+	result, err := g.runGh(ctx, cwd, "", "repo", "view", "--json", "nameWithOwner,url")
 	if err != nil {
 		return "", err
 	}
-	repo := strings.TrimSpace(result.Stdout)
-	if _, _, err := parseRepo(repo); err != nil {
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	repo := hostQualifiedRepo(asString(row["nameWithOwner"]), asString(row["url"]))
+	if err := validateGitHubRepoSlug(repo); err != nil {
 		return "", err
 	}
 	return repo, nil
@@ -661,7 +665,7 @@ func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (stri
 
 func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsInput) (LabelInitResult, error) {
 	repo := strings.TrimSpace(input.Repo)
-	if _, _, err := parseRepo(repo); err != nil {
+	if err := validateGitHubRepoSlug(repo); err != nil {
 		return LabelInitResult{}, err
 	}
 
@@ -875,6 +879,26 @@ func parseRepo(repo string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid GitHub repo: %s", repo)
 	}
 	return parts[0], parts[1], nil
+}
+
+func validateGitHubRepoSlug(repo string) error {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if (len(parts) != 2 && len(parts) != 3) || strings.TrimSpace(parts[len(parts)-2]) == "" || strings.TrimSpace(parts[len(parts)-1]) == "" {
+		return fmt.Errorf("invalid GitHub repo: %s", repo)
+	}
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) == "" {
+		return fmt.Errorf("invalid GitHub repo: %s", repo)
+	}
+	return nil
+}
+
+func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
+	repo := strings.TrimSpace(nameWithOwner)
+	parsed, err := url.Parse(strings.TrimSpace(repoURL))
+	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" {
+		return repo
+	}
+	return parsed.Hostname() + "/" + repo
 }
 
 func summarizeChecks(checks []map[string]any) string {
