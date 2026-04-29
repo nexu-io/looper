@@ -1697,11 +1697,7 @@ func parseReviewFeedback(result AgentResult) parsedReviewFeedback {
 	if structured, ok := parseStructuredReviewOutput(output); ok {
 		return structured
 	}
-	fallback := strings.TrimSpace(firstNonEmpty(result.Summary, summarizeLogs(result.Stdout)))
-	if fallback == "" {
-		return parsedReviewFeedback{}
-	}
-	return parsedReviewFeedback{Body: fallback, Comments: []reviewFeedbackComment{}, Clean: false}
+	return parsedReviewFeedback{}
 }
 
 func extractReviewOutput(stdout string) string {

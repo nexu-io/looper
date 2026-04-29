@@ -1393,6 +1393,32 @@ func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
 	}
 }
 
+func TestParseReviewFeedbackDoesNotPublishToolOutputFallback(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseReviewFeedback(AgentResult{
+		Status:  "completed",
+		Summary: "\x1b[0m→ \x1b[0mRead internal/reviewer/runner.go\x1b[90m [offset=1060, limit=70]\x1b[0m",
+		Stdout:  "\x1b[0m→ \x1b[0mRead internal/reviewer/runner.go\x1b[90m [offset=1060, limit=70]\x1b[0m",
+	})
+	if parsed.Body != "" || len(parsed.Comments) != 0 || parsed.Clean {
+		t.Fatalf("parsed = %#v, want no review feedback from tool output fallback", parsed)
+	}
+}
+
+func TestParseReviewFeedbackDoesNotFallbackWhenStructuredJSONInvalid(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseReviewFeedback(AgentResult{
+		Status:  "completed",
+		Summary: "Looks good",
+		Stdout:  `{"verdict":"clean","body":"LGTM","comments":[`,
+	})
+	if parsed.Body != "" || len(parsed.Comments) != 0 || parsed.Clean {
+		t.Fatalf("parsed = %#v, want invalid structured JSON to produce no fallback feedback", parsed)
+	}
+}
+
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
