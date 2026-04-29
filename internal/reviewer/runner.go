@@ -996,13 +996,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	feedback := parseReviewFeedback(result)
-	if !feedback.Clean && len(feedback.Comments) == 0 {
+	if !feedback.Clean && len(feedback.Comments) == 0 && strings.TrimSpace(feedback.Body) == "" {
 		_ = r.tryRemoveReaction(ctx, input, "eyes")
 		kind := FailureRetryableTransient
 		if result.ParseStatus == "invalid_json" {
 			kind = FailureNonRetryable
 		}
-		return checkpoint, &loopError{message: "Reviewer agent produced no actionable review comments", kind: kind}
+		return checkpoint, &loopError{message: "Reviewer agent produced no actionable review feedback", kind: kind}
 	}
 	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: ternaryReviewEvent(feedback.Clean), Body: feedback.Body, Summary: result.Summary, Comments: feedback.Comments, Clean: feedback.Clean}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1105,6 +1105,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		topLevel := topLevelComments(pending.Comments)
 		for pending.PublishState.TopLevelCommentsPosted < len(topLevel) {
 			comment := topLevel[pending.PublishState.TopLevelCommentsPosted]
+			if isDuplicateTopLevelReviewComment(comment, pending.Body) {
+				pending.PublishState.TopLevelCommentsPosted++
+				checkpoint.PendingReview = pending.clone()
+				if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
+					return checkpoint, err
+				}
+				continue
+			}
 			if err := r.github.AddPullRequestComment(ctx, PullRequestCommentInput{Repo: repo, PRNumber: prNumber, Body: comment.Body, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1662,6 +1670,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Use verdict=actionable whenever there is any actionable advice.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
 		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"For multiline inline comments, startLine/startSide must identify the first line and line/side the last line; omit startLine/startSide for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"Do not approve. If the review is clean, return verdict=clean with comments=[].",
@@ -1678,7 +1687,7 @@ func parseReviewFeedback(result AgentResult) parsedReviewFeedback {
 	if fallback == "" {
 		return parsedReviewFeedback{}
 	}
-	return parsedReviewFeedback{Body: fallback, Comments: []reviewFeedbackComment{{Body: fallback}}, Clean: false}
+	return parsedReviewFeedback{Body: fallback, Comments: []reviewFeedbackComment{}, Clean: false}
 }
 
 func extractReviewOutput(stdout string) string {
@@ -1704,6 +1713,7 @@ func parseStructuredReviewOutput(output string) (parsedReviewFeedback, bool) {
 	if err := json.Unmarshal([]byte(output), &payload); err != nil {
 		return parsedReviewFeedback{}, false
 	}
+	body := strings.TrimSpace(payload.Body)
 	comments := make([]reviewFeedbackComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		normalized := normalizeReviewFeedbackComment(comment)
@@ -1712,10 +1722,11 @@ func parseStructuredReviewOutput(output string) (parsedReviewFeedback, bool) {
 		}
 	}
 	clean := strings.EqualFold(payload.Verdict, "clean") && len(comments) == 0
-	if !clean && len(comments) == 0 {
+	comments = dedupeReviewFeedbackComments(comments, body)
+	if !clean && len(comments) == 0 && body == "" {
 		return parsedReviewFeedback{}, false
 	}
-	return parsedReviewFeedback{Body: strings.TrimSpace(payload.Body), Comments: comments, Clean: clean}, true
+	return parsedReviewFeedback{Body: body, Comments: comments, Clean: clean}, true
 }
 
 func normalizeReviewFeedbackComment(comment reviewFeedbackComment) reviewFeedbackComment {
@@ -1745,7 +1756,37 @@ func normalizePendingReviewCheckpoint(pending pendingReviewCheckpoint) pendingRe
 	if pending.Comments == nil {
 		pending.Comments = []reviewFeedbackComment{}
 	}
+	if pending.PublishState.TopLevelCommentsPosted == 0 {
+		pending.Comments = dedupeReviewFeedbackComments(pending.Comments, pending.Body)
+	}
 	return pending
+}
+
+func dedupeReviewFeedbackComments(comments []reviewFeedbackComment, body string) []reviewFeedbackComment {
+	if len(comments) == 0 {
+		return []reviewFeedbackComment{}
+	}
+	result := make([]reviewFeedbackComment, 0, len(comments))
+	seenTopLevel := map[string]struct{}{}
+	for _, comment := range comments {
+		if comment.Body == "" {
+			continue
+		}
+		if isInlineReviewFeedbackComment(comment) {
+			result = append(result, comment)
+			continue
+		}
+		key := normalizedReviewFeedbackText(comment.Body)
+		if key == "" || key == normalizedReviewFeedbackText(body) {
+			continue
+		}
+		if _, ok := seenTopLevel[key]; ok {
+			continue
+		}
+		seenTopLevel[key] = struct{}{}
+		result = append(result, comment)
+	}
+	return result
 }
 
 func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {
@@ -1826,7 +1867,7 @@ func summarizeLogs(stdout string) string {
 
 func hasInlineComments(comments []reviewFeedbackComment) bool {
 	for _, comment := range comments {
-		if comment.Path != "" && comment.Line > 0 && comment.Side != "" {
+		if isInlineReviewFeedbackComment(comment) {
 			return true
 		}
 	}
@@ -1836,7 +1877,7 @@ func hasInlineComments(comments []reviewFeedbackComment) bool {
 func inlineComments(comments []reviewFeedbackComment) []reviewFeedbackComment {
 	result := make([]reviewFeedbackComment, 0)
 	for _, comment := range comments {
-		if comment.Path != "" && comment.Line > 0 && comment.Side != "" {
+		if isInlineReviewFeedbackComment(comment) {
 			result = append(result, comment)
 		}
 	}
@@ -1851,6 +1892,22 @@ func topLevelComments(comments []reviewFeedbackComment) []reviewFeedbackComment 
 		}
 	}
 	return result
+}
+
+func isInlineReviewFeedbackComment(comment reviewFeedbackComment) bool {
+	return comment.Path != "" && comment.Line > 0 && comment.Side != ""
+}
+
+func isDuplicateTopLevelReviewComment(comment reviewFeedbackComment, body string) bool {
+	if isInlineReviewFeedbackComment(comment) {
+		return false
+	}
+	key := normalizedReviewFeedbackText(comment.Body)
+	return key != "" && key == normalizedReviewFeedbackText(body)
+}
+
+func normalizedReviewFeedbackText(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
 func toGitHubReviewComments(comments []reviewFeedbackComment) []ReviewComment {

@@ -494,7 +494,7 @@ func TestProcessClaimedItemRetriesPublishFromCheckpointWithoutRerunningReview(t 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Add an integration test for the retry path"}]}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -570,7 +570,7 @@ func TestProcessClaimedItemSkipsPublishWhenReviewRequestRemovedBeforeRetry(t *te
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{submitFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Add an integration test for the retry path"}]}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -616,7 +616,7 @@ func TestProcessClaimedItemRecordsPublishedHeadWhenReviewRequestRemovedAfterSubm
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{prCommentFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Please add tests"}]}`}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `{"verdict":"actionable","body":"Please add tests","comments":[{"body":"Add an integration test for the retry path"}]}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -1339,6 +1339,149 @@ func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
 	parsed, ok := parseStructuredReviewOutput(output)
 	if !ok || !parsed.Clean {
 		t.Fatalf("parsed = %#v, %v, want clean structured review", parsed, ok)
+	}
+}
+
+func TestParseStructuredReviewOutputAcceptsBodyOnlyActionableReview(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Cross-cutting feedback","comments":[]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if parsed.Clean || parsed.Body != "Cross-cutting feedback" || len(parsed.Comments) != 0 {
+		t.Fatalf("parsed = %#v, want actionable body-only feedback", parsed)
+	}
+}
+
+func TestParseStructuredReviewOutputDropsDuplicateTopLevelComments(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"body":" Please   add tests "},{"body":"Add an integration test"},{"body":"Add an integration test"},{"body":"Please add tests","path":"a.go","line":12,"side":"RIGHT"}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 2 {
+		t.Fatalf("comments = %#v, want distinct top-level plus inline duplicate preserved", parsed.Comments)
+	}
+	if parsed.Comments[0].Body != "Add an integration test" {
+		t.Fatalf("first comment = %#v, want distinct top-level comment", parsed.Comments[0])
+	}
+	if parsed.Comments[1].Path != "a.go" || parsed.Comments[1].Line != 12 || parsed.Comments[1].Side != "RIGHT" {
+		t.Fatalf("second comment = %#v, want inline comment preserved", parsed.Comments[1])
+	}
+}
+
+func TestParseStructuredReviewOutputDoesNotDedupeIntoCleanReview(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"clean","body":"Please add tests","comments":[{"body":"Please add tests"}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if parsed.Clean {
+		t.Fatalf("parsed = %#v, want duplicate comment not to convert response into clean review", parsed)
+	}
+	if parsed.Body != "Please add tests" || len(parsed.Comments) != 0 {
+		t.Fatalf("parsed = %#v, want actionable body-only feedback after duplicate cleanup", parsed)
+	}
+}
+
+func TestRunPublishStepSkipsDuplicateTopLevelReviewBodyComment(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_duplicate_top_level", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_duplicate_top_level"},
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: (&pendingReviewCheckpoint{
+				HeadSHA: "abc123",
+				Event:   ReviewEventComment,
+				Body:    "Please add tests",
+				Summary: "Please add tests",
+				Comments: []reviewFeedbackComment{
+					{Body: "Please add tests"},
+				},
+			}).clone(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if len(github.submitCalls) != 1 {
+		t.Fatalf("submitCalls = %d, want 1", len(github.submitCalls))
+	}
+	if len(github.prComments) != 0 {
+		t.Fatalf("prComments = %#v, want duplicate top-level comment skipped", github.prComments)
+	}
+	if checkpoint.PendingReview == nil || checkpoint.PendingReview.PublishState == nil || checkpoint.PendingReview.PublishState.TopLevelCommentsPosted != 0 {
+		t.Fatalf("checkpoint pending review = %#v, want duplicate removed before publish", checkpoint.PendingReview)
+	}
+}
+
+func TestRunPublishStepKeepsTopLevelCommentMatchingUnpublishedSummary(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_summary_top_level", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_summary_top_level"},
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: (&pendingReviewCheckpoint{
+				HeadSHA: "abc123",
+				Event:   ReviewEventComment,
+				Summary: "Please add tests",
+				Comments: []reviewFeedbackComment{
+					{Body: "Please add tests"},
+				},
+			}).clone(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if len(github.submitCalls) != 0 {
+		t.Fatalf("submitCalls = %d, want no body-only review submission", len(github.submitCalls))
+	}
+	if len(github.prComments) != 1 || github.prComments[0].Body != "Please add tests" {
+		t.Fatalf("prComments = %#v, want top-level comment matching unpublished summary", github.prComments)
 	}
 }
 
