@@ -339,6 +339,117 @@ func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
 	}
 }
 
+func TestDaemonStartNormalizesRelativeConfigEnvForSpawn(t *testing.T) {
+	homeDir := t.TempDir()
+	callerDir := t.TempDir()
+	daemonWorkingDir := filepath.Join(t.TempDir(), "daemon-working")
+	if err := os.MkdirAll(daemonWorkingDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(daemonWorkingDir) error = %v", err)
+	}
+	logDir := filepath.Join(callerDir, "logs")
+	storageDir := filepath.Join(callerDir, "storage")
+	for _, dir := range []string{logDir, storageDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+	}
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(callerDir); err != nil {
+		t.Fatalf("Chdir(callerDir) error = %v", err)
+	}
+	resolvedCallerDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd(callerDir) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory error = %v", err)
+		}
+	})
+	t.Setenv("LOOPER_CONFIG", "./looper.json")
+
+	configPath := filepath.Join(callerDir, "looper.json")
+	payload := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  "http://daemon.test",
+			"authMode": "none",
+		},
+		"daemon": map[string]any{
+			"logDir":           logDir,
+			"workingDirectory": daemonWorkingDir,
+		},
+		"storage": map[string]any{
+			"dbPath": filepath.Join(storageDir, "looper.sqlite"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	statusRequests := 0
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var spawnedCWD string
+	var spawnedEnv []string
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			statusRequests++
+			if statusRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
+		})},
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(managedPath),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			spawnedCWD = cwd
+			spawnedEnv = append([]string{}, env...)
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error { return nil },
+		MkdirAll:    func(path string, perm os.FileMode) error { return nil },
+		WriteFile:   func(path string, data []byte, perm os.FileMode) error { return nil },
+		Sleep:       func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if spawnedCWD != daemonWorkingDir {
+		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, daemonWorkingDir)
+	}
+	if got, want := envValue(spawnedEnv, "LOOPER_CONFIG"), filepath.Join(resolvedCallerDir, "looper.json"); got != want {
+		t.Fatalf("spawned LOOPER_CONFIG = %q, want %q; env=%#v", got, want, spawnedEnv)
+	}
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
 func TestDaemonStartMissingPIDFileUsesReachableLooperdAPI(t *testing.T) {
 	t.Parallel()
 

@@ -190,7 +190,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	}
 
 	r.startupOutputPath = startupLogPath
-	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, os.Environ())
+	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, daemonSpawnEnv(os.Environ(), loaded.Metadata.ConfigPath))
 	if err != nil {
 		return fmt.Errorf("Failed to start looperd: %w", err)
 	}
@@ -304,6 +304,22 @@ func splitLongFlag(arg string) (name string, value string, hasValue bool) {
 		return trimmed[:equals], trimmed[equals+1:], true
 	}
 	return trimmed, "", false
+}
+
+func daemonSpawnEnv(env []string, configPath string) []string {
+	spawnEnv := append([]string{}, env...)
+	if strings.TrimSpace(configPath) == "" {
+		return spawnEnv
+	}
+
+	configEnv := "LOOPER_CONFIG=" + configPath
+	for index, entry := range spawnEnv {
+		if strings.HasPrefix(entry, "LOOPER_CONFIG=") {
+			spawnEnv[index] = configEnv
+			return spawnEnv
+		}
+	}
+	return append(spawnEnv, configEnv)
 }
 
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
