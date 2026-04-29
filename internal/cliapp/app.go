@@ -143,11 +143,22 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "config",
 				short:           "Config commands",
-				helpSubcommands: []helpSubcommand{{name: "show", description: "Show active config"}},
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config file value"}, {name: "set", description: "Set a config file value"}, {name: "unset", description: "Unset a config file value"}, {name: "validate", description: "Validate the config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the config file"}},
 				helpWhenNoArgs:  true,
-				exampleLines:    []string{"$ looper config show --json"},
+				exampleLines: []string{
+					"$ looper config get defaults.allowRiskyFixes",
+					"$ looper config set defaults.allowRiskyFixes true",
+					"$ looper config unset defaults.allowRiskyFixes",
+					"$ looper config validate",
+					"$ looper config show --source",
+				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow}),
+					newCommand(commandSpec{use: "get <key>", short: "Get a config file value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
+					newCommand(commandSpec{use: "set <key> <value>", short: "Set a config file value", args: cobra.ExactArgs(2), runE: runtime.configSet}),
+					newCommand(commandSpec{use: "unset <key>", short: "Unset a config file value", args: cobra.ExactArgs(1), runE: runtime.configUnset}),
+					newCommand(commandSpec{use: "validate", short: "Validate the config file", runE: runtime.configValidate}),
+					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
+					newCommand(commandSpec{use: "edit", short: "Edit the config file", runE: runtime.configEdit}),
 				},
 			}),
 			newCommand(commandSpec{

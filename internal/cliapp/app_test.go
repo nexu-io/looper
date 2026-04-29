@@ -50,7 +50,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config file value", "set       Set a config file value", "unset     Unset a config file value", "validate  Validate the config file", "show      Show active config", "edit      Edit the config file"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
@@ -559,6 +559,112 @@ func TestConfigShowWithoutJSONPrintsJSON(t *testing.T) {
 		t.Fatalf("Run([config show]) stderr = %q, want empty string", stderr)
 	}
 	assertJSONContains(t, stdout, "server", map[string]any{"authMode": "none"})
+}
+
+func TestConfigSetGetUnsetAllowRiskyFixes(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, stdout, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Set defaults.allowRiskyFixes") {
+		t.Fatalf("stdout = %q, want set confirmation", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "get", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config get ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.TrimSpace(stdout) != "true" {
+		t.Fatalf("stdout = %q, want true", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "unset", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config unset ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Unset defaults.allowRiskyFixes") {
+		t.Fatalf("stdout = %q, want unset confirmation", stdout)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "allowRiskyFixes") {
+		t.Fatalf("config = %s, want allowRiskyFixes removed", raw)
+	}
+}
+
+func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.missing", "true", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid key]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "unsupported config key") {
+		t.Fatalf("stderr = %q, want unsupported key", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "defaults.allowRiskyFixes", "maybe", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid value]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "not a boolean") {
+		t.Fatalf("stderr = %q, want boolean error", stderr)
+	}
+}
+
+func TestConfigValidateAndShowSource(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, stdout, stderr := runApp(t, "config", "validate", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid") {
+		t.Fatalf("stdout = %q, want validation confirmation", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	allowRisky, ok := fields["defaults.allowRiskyFixes"].(map[string]any)
+	if !ok {
+		t.Fatalf("defaults.allowRiskyFixes = %#v, want object", fields["defaults.allowRiskyFixes"])
+	}
+	if got, want := allowRisky["source"], "config-file"; got != want {
+		t.Fatalf("source = %#v, want %#v", got, want)
+	}
+	if got, want := allowRisky["value"], false; got != want {
+		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+}
+
+func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.fixAllPullRequests", "false", "--fix-all-pull-requests", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set with override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --fix-all-pull-requests is set") {
+		t.Fatalf("stderr = %q, want override warning", stderr)
+	}
 }
 
 func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
@@ -1613,6 +1719,28 @@ func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
 		t.Fatalf("write config: %v", err)
 	}
 
+	return configPath
+}
+
+func writeEditableCLIConfig(t *testing.T) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	configPayload := map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes": false,
+		},
+	}
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 	return configPath
 }
 

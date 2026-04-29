@@ -32,6 +32,9 @@ func (r *commandRuntime) status(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) configShow(cmd *cobra.Command, args []string) error {
+	if getBoolFlag(cmd, "source") {
+		return r.configShowSource(cmd)
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/config")
 	}, func(w io.Writer, payload json.RawMessage) error {
