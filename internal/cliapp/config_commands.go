@@ -25,7 +25,7 @@ type configField struct {
 }
 
 var configFieldRegistry = map[string]configField{
-	"defaults.baseBranch":         stringField("defaults.baseBranch", "LOOPER_BASE_BRANCH", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
+	"defaults.baseBranch":         stringField("defaults.baseBranch", "", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
 	"defaults.allowAutoCommit":    boolField("defaults.allowAutoCommit", "LOOPER_ALLOW_AUTO_COMMIT", "", func(c config.Config) any { return c.Defaults.AllowAutoCommit }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoCommit }),
 	"defaults.allowAutoPush":      boolField("defaults.allowAutoPush", "LOOPER_ALLOW_AUTO_PUSH", "", func(c config.Config) any { return c.Defaults.AllowAutoPush }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoPush }),
 	"defaults.allowAutoApprove":   boolField("defaults.allowAutoApprove", "LOOPER_ALLOW_AUTO_APPROVE", "", func(c config.Config) any { return c.Defaults.AllowAutoApprove }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoApprove }),
