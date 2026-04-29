@@ -101,7 +101,7 @@ func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 			_ = timeout
 			calls = append(calls, command+" "+strings.Join(args, " "))
 			switch strings.Join(args, " ") {
-			case "auth status":
+			case "auth status --hostname github.com":
 				return commandExecutionResult{}, nil
 			case "label list --repo acme/looper --limit 1000 --json name,color,description":
 				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
@@ -147,7 +147,7 @@ func TestLabelsInitRequiresAuthenticatedGH(t *testing.T) {
 			_ = ctx
 			_ = command
 			_ = timeout
-			if strings.Join(args, " ") != "auth status" {
+			if strings.Join(args, " ") != "auth status --hostname github.com" {
 				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
 			}
 			return commandExecutionResult{ExitCode: 1, Stderr: "not logged in"}, nil
@@ -183,7 +183,7 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 			_ = command
 			_ = timeout
 			switch strings.Join(args, " ") {
-			case "auth status":
+			case "auth status --hostname github.com":
 				return commandExecutionResult{}, nil
 			case "label list --repo acme/looper --limit 1000 --json name,color,description":
 				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
@@ -212,6 +212,29 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
 		t.Fatalf("stderr = %q, want command failure", stderr.String())
+	}
+}
+
+func TestLabelsAuthHostname(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "empty", repo: "", want: "github.com"},
+		{name: "owner name", repo: "acme/looper", want: "github.com"},
+		{name: "host owner name", repo: "github.example.com/acme/looper", want: "github.example.com"},
+		{name: "trim host", repo: " github.example.com/acme/looper ", want: "github.example.com"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := labelsAuthHostname(tc.repo); got != tc.want {
+				t.Fatalf("labelsAuthHostname(%q) = %q, want %q", tc.repo, got, tc.want)
+			}
+		})
 	}
 }
 

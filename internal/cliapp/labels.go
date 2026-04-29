@@ -29,20 +29,19 @@ func (r *commandRuntime) labelsInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
 
-	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: r.runGHCommand})
-	if authenticated, err := gh.IsAuthenticated(cmd.Context(), cwd, ""); err != nil {
-		return fmt.Errorf("check gh authentication: %w", err)
-	} else if !authenticated {
-		return fmt.Errorf("gh is not authenticated; run `gh auth login` and retry")
-	}
-
 	repo := strings.TrimSpace(getStringFlag(cmd, "repo"))
+	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: r.runGHCommand})
 	if repo == "" {
 		detected, err := gh.DetectCurrentRepository(cmd.Context(), cwd)
 		if err != nil {
 			return fmt.Errorf("detect GitHub repository from current directory: run from a GitHub-backed repository or pass --repo owner/name: %w", err)
 		}
 		repo = detected
+	}
+	if authenticated, err := gh.IsAuthenticated(cmd.Context(), cwd, labelsAuthHostname(repo)); err != nil {
+		return fmt.Errorf("check gh authentication: %w", err)
+	} else if !authenticated {
+		return fmt.Errorf("gh is not authenticated; run `gh auth login` and retry")
 	}
 
 	result, err := gh.InitializeLabels(cmd.Context(), githubinfra.InitializeLabelsInput{Repo: repo, CWD: cwd, DryRun: getBoolFlag(cmd, "dry-run")})
@@ -60,6 +59,19 @@ func (r *commandRuntime) labelsInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("initialize labels for %s: %w", repo, err)
 	}
 	return nil
+}
+
+func labelsAuthHostname(repo string) string {
+	const defaultHost = "github.com"
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultHost
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0])
+	}
+	return defaultHost
 }
 
 func (r *commandRuntime) runGHCommand(ctx context.Context, options shell.Options) (shell.Result, error) {
