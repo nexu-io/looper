@@ -40,7 +40,7 @@ func (r *commandRuntime) configGet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	loaded, err := r.loadConfigForEdit()
+	loaded, err := r.loadRawConfigForEdit()
 	if err != nil {
 		return err
 	}

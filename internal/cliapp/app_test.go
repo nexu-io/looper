@@ -600,6 +600,19 @@ func TestConfigSetGetUnsetAllowRiskyFixes(t *testing.T) {
 	}
 }
 
+func TestConfigGetReadsConfigFileLayer(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+	t.Setenv("LOOPER_FIX_ALL_PULL_REQUESTS", "true")
+
+	exitCode, stdout, stderr := runApp(t, "config", "get", "defaults.fixAllPullRequests", "--fix-all-pull-requests", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config get ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.TrimSpace(stdout) != "false" {
+		t.Fatalf("stdout = %q, want config file value false", stdout)
+	}
+}
+
 func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	configPath := writeEditableCLIConfig(t)
 
@@ -1731,7 +1744,8 @@ func writeEditableCLIConfig(t *testing.T) string {
 			"osascript": map[string]any{"enabled": false},
 		},
 		"defaults": map[string]any{
-			"allowRiskyFixes": false,
+			"allowRiskyFixes":    false,
+			"fixAllPullRequests": false,
 		},
 	}
 	raw, err := json.Marshal(configPayload)
