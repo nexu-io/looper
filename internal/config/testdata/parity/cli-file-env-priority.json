@@ -114,6 +114,18 @@
           "throttleWindowSeconds": 60
         }
       },
+      "disclosure": {
+        "enabled": true,
+        "includeAgent": true,
+        "includeOS": false,
+        "channels": {
+          "gitCommit": true,
+          "pullRequest": true,
+          "issueComment": true,
+          "reviewComment": true,
+          "inlineCommentVisible": false
+        }
+      },
       "tools": {
         "gitPath": "/cli/git",
         "ghPath": "/env/gh",

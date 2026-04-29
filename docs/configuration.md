@@ -101,6 +101,18 @@ Example minimal `~/.looper/config.json`:
       "throttleWindowSeconds": 60
     }
   },
+  "disclosure": {
+    "enabled": true,
+    "includeAgent": true,
+    "includeOS": false,
+    "channels": {
+      "gitCommit": true,
+      "pullRequest": true,
+      "issueComment": true,
+      "reviewComment": true,
+      "inlineCommentVisible": false
+    }
+  },
   "tools": {
     "gitPath": "/usr/bin/git",
     "ghPath": "/opt/homebrew/bin/gh",
@@ -197,6 +209,21 @@ Default behavior:
 - on non-macOS platforms, it defaults to `false`
 
 If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resolve.
+
+### `disclosure`
+
+`looperd` adds local text attribution to externally visible content it generates so collaborators can distinguish agent-assisted actions from human-authored actions. This is only a footer or Git trailer written into GitHub text / commit messages; it is not telemetry and does not send additional machine data anywhere.
+
+- `enabled`: enables disclosure stamps, default `true`
+- `includeAgent`: includes the configured agent vendor, default `true`
+- `includeOS`: includes only the OS family (`macOS`, `Linux`, or `Windows`), default `false`
+- `channels.gitCommit`: add a `Generated-By:` trailer to generated commit bodies without changing commit subjects
+- `channels.pullRequest`: add a Markdown footer to generated PR bodies
+- `channels.issueComment`: add a Markdown footer to generated issue / PR comments
+- `channels.reviewComment`: disclose generated review summaries and inline review comments
+- `channels.inlineCommentVisible`: when `false`, inline review comments receive only the hidden marker; when `true`, they receive the visible Markdown footer
+
+Disclosure stamps use an explicit allowlist: product (`looper`), version, runner role, configured agent vendor, and optionally OS family. They do not include hostnames, usernames, local paths, IP or MAC addresses, detailed kernel versions, environment variables, tokens, endpoints, or machine identifiers.
 
 ### `tools`
 

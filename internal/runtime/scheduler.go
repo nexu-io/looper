@@ -13,6 +13,7 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/fixer"
 	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
@@ -99,7 +100,10 @@ type workerRunCompletedNotificationInput struct {
 	PullRequestURL    string
 }
 
-type plannerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+type plannerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
 	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label})
@@ -146,7 +150,8 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 }
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
-	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
 	if err != nil {
 		return planner.CreatePullRequestResult{}, err
 	}
@@ -161,7 +166,10 @@ func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
-type plannerGitAdapter struct{ gateway *gitinfra.Gateway }
+type plannerGitAdapter struct {
+	gateway *gitinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a plannerGitAdapter) CreateWorktree(ctx context.Context, input planner.CreateWorktreeInput) (planner.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, ProtectedBranches: input.ProtectedBranches})
@@ -180,7 +188,8 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 }
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	message := a.stamper.CommitMessage(input.Message, "planner")
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return planner.CommitResult{}, err
 	}
@@ -210,7 +219,10 @@ func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentRe
 	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle}, nil
 }
 
-type reviewerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+type reviewerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
@@ -243,13 +255,16 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input reviewer.SubmitReviewInput) error {
 	comments := make([]githubinfra.ReviewComment, 0, len(input.Comments))
 	for _, comment := range input.Comments {
-		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+		body := a.stamper.ReviewComment(comment.Body, "reviewer")
+		comments = append(comments, githubinfra.ReviewComment{Body: body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	return a.gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(input.Event), Body: input.Body, CommitID: input.CommitID, Comments: comments, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+	return a.gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(input.Event), Body: body, CommitID: input.CommitID, Comments: comments, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestComment(ctx context.Context, input reviewer.PullRequestCommentInput) error {
-	return a.gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: input.Body, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	return a.gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -351,7 +366,10 @@ func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input f
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
-type fixerGitAdapter struct{ gateway *gitinfra.Gateway }
+type fixerGitAdapter struct {
+	gateway *gitinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a fixerGitAdapter) CreateWorktree(ctx context.Context, input fixer.CreateWorktreeInput) (fixer.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
@@ -378,7 +396,8 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	message := a.stamper.CommitMessage(input.Message, "fixer")
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return fixer.CommitResult{}, err
 	}
@@ -412,7 +431,10 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle}, nil
 }
 
-type workerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+type workerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
@@ -443,7 +465,8 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 }
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
-	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: input.Body, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
 	if err != nil {
 		return worker.IssueCommentResult{}, err
 	}
@@ -451,11 +474,13 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 }
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
-	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: input.Body, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
-	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: input.Body, CWD: input.CWD})
+	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
 	if err != nil {
 		return worker.CreatePullRequestResult{}, err
 	}
@@ -474,7 +499,10 @@ func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input 
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
-type workerGitAdapter struct{ gateway *gitinfra.Gateway }
+type workerGitAdapter struct {
+	gateway *gitinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a workerGitAdapter) CreateWorktree(ctx context.Context, input worker.CreateWorktreeInput) (worker.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
@@ -501,7 +529,8 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 }
 
 func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: input.Message})
+	message := a.stamper.CommitMessage(input.Message, "worker")
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return worker.CommitResult{}, err
 	}
@@ -640,11 +669,12 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:   now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	stamper := disclosure.FromConfig(cfg)
 	plannerRunner = planner.New(planner.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
-		GitHub:           plannerGitHubAdapter{gateway: githubGateway},
-		Git:              plannerGitAdapter{gateway: gitGateway},
+		GitHub:           plannerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		Git:              plannerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:    plannerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
 		Now:              now,
@@ -658,7 +688,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway},
+		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
 		Git:              reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
@@ -674,7 +704,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		DB:                 coordinator.DB(),
 		Repos:              repos,
 		GitHub:             fixerGitHubAdapter{gateway: githubGateway},
-		Git:                fixerGitAdapter{gateway: gitGateway},
+		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
 		Now:                now,
@@ -691,11 +721,11 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	workerRunner = worker.New(worker.Options{
 		DB:     coordinator.DB(),
 		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway},
+		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper},
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
-		Git:              workerGitAdapter{gateway: gitGateway},
+		Git:              workerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:           logger,
 		Now:              now,

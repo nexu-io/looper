@@ -88,6 +88,18 @@ func DefaultConfig(cwd string) (Config, error) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
+		Disclosure: DisclosureConfig{
+			Enabled:      true,
+			IncludeAgent: true,
+			IncludeOS:    false,
+			Channels: DisclosureChannelsConfig{
+				GitCommit:            true,
+				PullRequest:          true,
+				IssueComment:         true,
+				ReviewComment:        true,
+				InlineCommentVisible: false,
+			},
+		},
 		Tools: ToolPathsConfig{},
 		Daemon: DaemonConfig{
 			Mode:              DaemonModeForeground,
