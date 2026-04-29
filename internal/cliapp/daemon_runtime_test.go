@@ -493,6 +493,9 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
+		})},
 		Getwd: func() (string, error) {
 			return "/tmp/workspace", nil
 		},
