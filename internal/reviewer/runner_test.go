@@ -1342,6 +1342,23 @@ func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}})
+	for _, want := range []string{
+		"Every comment MUST include",
+		"Bad comment example",
+		"Good spec/docs comment example",
+		"Spec/docs review rubric",
+		"suggestedChange",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestParseStructuredReviewOutputAcceptsBodyOnlyActionableReview(t *testing.T) {
 	t.Parallel()
 
@@ -1351,6 +1368,49 @@ func TestParseStructuredReviewOutputAcceptsBodyOnlyActionableReview(t *testing.T
 	}
 	if parsed.Clean || parsed.Body != "Cross-cutting feedback" || len(parsed.Comments) != 0 {
 		t.Fatalf("parsed = %#v, want actionable body-only feedback", parsed)
+	}
+}
+
+func TestParseStructuredReviewOutputRendersStructuredFields(t *testing.T) {
+	t.Parallel()
+
+	output := `{"verdict":"actionable","body":"Review found one issue","comments":[{"severity":"major","category":"spec","body":"Define the role trigger schema","problem":"The spec introduces role-specific triggers without defining the allowed fields.","why":"Implementers cannot preserve config compatibility without knowing defaults and validation behavior.","evidence":"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.","suggestedChange":"Add a schema table with role, event, enabled, conditions, defaults, and validation errors.","path":"specs/role-triggers.md","line":42,"side":"RIGHT"}]}`
+	parsed, ok := parseStructuredReviewOutput(output)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 1 {
+		t.Fatalf("comments = %#v, want one rendered comment", parsed.Comments)
+	}
+	comment := parsed.Comments[0]
+	for _, want := range []string{
+		"**[major/spec]** Define the role trigger schema",
+		"**Problem:** The spec introduces role-specific triggers without defining the allowed fields.",
+		"**Why it matters:** Implementers cannot preserve config compatibility without knowing defaults and validation behavior.",
+		"**Evidence:** The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.",
+		"**Suggested change:** Add a schema table with role, event, enabled, conditions, defaults, and validation errors.",
+	} {
+		if !strings.Contains(comment.Body, want) {
+			t.Fatalf("rendered body missing %q:\n%s", want, comment.Body)
+		}
+	}
+	if comment.Path != "specs/role-triggers.md" || comment.Line != 42 || comment.Side != "RIGHT" {
+		t.Fatalf("comment anchor = %#v, want inline anchor preserved", comment)
+	}
+}
+
+func TestParseStructuredReviewOutputUsesProblemAsBodyWhenBodyEmpty(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","comments":[{"severity":"major","category":"tests","problem":"The retry path has no regression coverage.","why":"A future change could reintroduce duplicate publishing without failing tests.","evidence":"runner_test.go covers successful publish but not retry after partial publish.","suggestedChange":"Add a test that fails the top-level comment publish once and verifies the review body is not resubmitted."}]}`)
+	if !ok {
+		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
+	}
+	if len(parsed.Comments) != 1 {
+		t.Fatalf("comments = %#v, want one rendered comment", parsed.Comments)
+	}
+	if !strings.Contains(parsed.Comments[0].Body, "**[major/tests]** The retry path has no regression coverage.") {
+		t.Fatalf("rendered body = %q, want problem promoted to headline", parsed.Comments[0].Body)
 	}
 }
 

@@ -359,12 +359,18 @@ type checkpointSnapshot struct {
 }
 
 type reviewFeedbackComment struct {
-	Body      string `json:"body"`
-	Path      string `json:"path,omitempty"`
-	Line      int64  `json:"line,omitempty"`
-	Side      string `json:"side,omitempty"`
-	StartLine int64  `json:"startLine,omitempty"`
-	StartSide string `json:"startSide,omitempty"`
+	Body            string `json:"body"`
+	Path            string `json:"path,omitempty"`
+	Line            int64  `json:"line,omitempty"`
+	Side            string `json:"side,omitempty"`
+	StartLine       int64  `json:"startLine,omitempty"`
+	StartSide       string `json:"startSide,omitempty"`
+	Severity        string `json:"severity,omitempty"`
+	Category        string `json:"category,omitempty"`
+	Problem         string `json:"problem,omitempty"`
+	Why             string `json:"why,omitempty"`
+	Evidence        string `json:"evidence,omitempty"`
+	SuggestedChange string `json:"suggestedChange,omitempty"`
 }
 
 type publishState struct {
@@ -1666,13 +1672,20 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		}
 	}
 	parts = append(parts,
-		"Return detailed GitHub review feedback as raw JSON with this exact shape:\n{\"verdict\":\"clean\"|\"actionable\",\"body\":\"optional overall summary\",\"comments\":[{\"body\":\"required comment text\",\"path\":\"src/file.ts optional for inline comments\",\"line\":123,\"side\":\"RIGHT\",\"startLine\":120,\"startSide\":\"RIGHT\"}]}",
+		"Return detailed GitHub review feedback as raw JSON with this exact shape:\n{\"verdict\":\"clean\"|\"actionable\",\"body\":\"optional overall summary\",\"comments\":[{\"body\":\"concise comment headline\",\"severity\":\"minor|major|critical optional\",\"category\":\"correctness|tests|docs|spec|security|performance|maintainability|compatibility optional\",\"problem\":\"concrete defect or ambiguity\",\"why\":\"impact or consequence\",\"evidence\":\"quote or summarize relevant diff/spec lines\",\"suggestedChange\":\"specific fix, wording, test, or implementation direction\",\"path\":\"src/file.ts optional for inline comments\",\"line\":123,\"side\":\"RIGHT\",\"startLine\":120,\"startSide\":\"RIGHT\"}]}",
 		"Use verdict=actionable whenever there is any actionable advice.",
+		"Prefer 3 deeply specific comments over 10 shallow comments. If there is no concrete actionable feedback, return verdict=clean with comments=[]. Do not invent feedback.",
+		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
-		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"For multiline inline comments, startLine/startSide must identify the first line and line/side the last line; omit startLine/startSide for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
+		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
+		"Bad comment example: 'Spec review found actionable gaps around role-specific trigger schema, auto-discovery gating boundaries, and exact env/config-source behavior.' This is bad because it has no file, line, section, concrete missing requirement, evidence, or suggested wording.",
+		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
+		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
+		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
 		"Do not approve. If the review is clean, return verdict=clean with comments=[].",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
@@ -1734,6 +1747,13 @@ func normalizeReviewFeedbackComment(comment reviewFeedbackComment) reviewFeedbac
 	comment.Path = strings.TrimSpace(comment.Path)
 	comment.Side = strings.ToUpper(strings.TrimSpace(comment.Side))
 	comment.StartSide = strings.ToUpper(strings.TrimSpace(comment.StartSide))
+	comment.Severity = strings.ToLower(strings.TrimSpace(comment.Severity))
+	comment.Category = strings.ToLower(strings.TrimSpace(comment.Category))
+	comment.Problem = strings.TrimSpace(comment.Problem)
+	comment.Why = strings.TrimSpace(comment.Why)
+	comment.Evidence = strings.TrimSpace(comment.Evidence)
+	comment.SuggestedChange = strings.TrimSpace(comment.SuggestedChange)
+	comment.Body = renderReviewFeedbackCommentBody(comment)
 	if comment.Body == "" {
 		return reviewFeedbackComment{}
 	}
@@ -1747,6 +1767,45 @@ func normalizeReviewFeedbackComment(comment reviewFeedbackComment) reviewFeedbac
 		return reviewFeedbackComment{Body: comment.Body}
 	}
 	return comment
+}
+
+func renderReviewFeedbackCommentBody(comment reviewFeedbackComment) string {
+	body := strings.TrimSpace(firstNonEmpty(comment.Body, comment.Problem))
+	sections := make([]string, 0, 5)
+	if body != "" {
+		label := reviewCommentLabel(comment)
+		if label != "" {
+			body = label + " " + body
+		}
+		sections = append(sections, body)
+	}
+	if comment.Problem != "" && normalizedReviewFeedbackText(comment.Problem) != normalizedReviewFeedbackText(firstNonEmpty(comment.Body, comment.Problem)) {
+		sections = append(sections, "**Problem:** "+comment.Problem)
+	}
+	if comment.Why != "" {
+		sections = append(sections, "**Why it matters:** "+comment.Why)
+	}
+	if comment.Evidence != "" {
+		sections = append(sections, "**Evidence:** "+comment.Evidence)
+	}
+	if comment.SuggestedChange != "" {
+		sections = append(sections, "**Suggested change:** "+comment.SuggestedChange)
+	}
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func reviewCommentLabel(comment reviewFeedbackComment) string {
+	labels := make([]string, 0, 2)
+	if comment.Severity != "" {
+		labels = append(labels, comment.Severity)
+	}
+	if comment.Category != "" {
+		labels = append(labels, comment.Category)
+	}
+	if len(labels) == 0 {
+		return ""
+	}
+	return "**[" + strings.Join(labels, "/") + "]**"
 }
 
 func normalizePendingReviewCheckpoint(pending pendingReviewCheckpoint) pendingReviewCheckpoint {
