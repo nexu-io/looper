@@ -396,6 +396,40 @@ func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	}
 }
 
+func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
+			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
+		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper"})
+	if err == nil {
+		t.Fatalf("InitializeLabels() error = nil, want failure")
+	}
+	if result.Summary.Failed != 1 || result.Summary.Created != 2 || result.Summary.Skipped != 1 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=2 skipped=1 failed=1", result.Summary)
+	}
+	if got := result.Labels[1].Error; !strings.Contains(got, "permission denied") {
+		t.Fatalf("failed label error = %q, want stderr details", got)
+	}
+}
+
 func TestGatewayDetectsCurrentRepository(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

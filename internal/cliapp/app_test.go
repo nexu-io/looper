@@ -166,6 +166,55 @@ func TestLabelsInitRequiresAuthenticatedGH(t *testing.T) {
 	}
 }
 
+func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			switch strings.Join(args, " ") {
+			case "auth status":
+				return commandExecutionResult{}, nil
+			case "label list --repo acme/looper --limit 1000 --json name,color,description":
+				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+				return commandExecutionResult{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by integration"}, nil
+			case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			default:
+				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(labels init) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
+		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+		t.Fatalf("stdout = %q, want failed summary", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
+		t.Fatalf("stderr = %q, want command failure", stderr.String())
+	}
+}
+
 func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	t.Parallel()
 

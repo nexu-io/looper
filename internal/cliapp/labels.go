@@ -46,13 +46,20 @@ func (r *commandRuntime) labelsInit(cmd *cobra.Command, args []string) error {
 	}
 
 	result, err := gh.InitializeLabels(cmd.Context(), githubinfra.InitializeLabelsInput{Repo: repo, CWD: cwd, DryRun: getBoolFlag(cmd, "dry-run")})
-	if err != nil {
+	if err != nil && result.Repo == "" {
 		return fmt.Errorf("initialize labels for %s: %w", repo, err)
 	}
 	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), result)
+		if writeErr := writeJSON(cmd.OutOrStdout(), result); writeErr != nil {
+			return writeErr
+		}
+	} else if writeErr := writeHumanLabelsInit(cmd.OutOrStdout(), result); writeErr != nil {
+		return writeErr
 	}
-	return writeHumanLabelsInit(cmd.OutOrStdout(), result)
+	if err != nil {
+		return fmt.Errorf("initialize labels for %s: %w", repo, err)
+	}
+	return nil
 }
 
 func (r *commandRuntime) runGHCommand(ctx context.Context, options shell.Options) (shell.Result, error) {
@@ -62,7 +69,11 @@ func (r *commandRuntime) runGHCommand(ctx context.Context, options shell.Options
 		return shellResult, err
 	}
 	if result.ExitCode != 0 {
-		return shellResult, &shell.CommandExecutionError{Message: fmt.Sprintf("gh exited with code %d", result.ExitCode), Result: shellResult}
+		message := fmt.Sprintf("gh exited with code %d", result.ExitCode)
+		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+			message += ": " + stderr
+		}
+		return shellResult, &shell.CommandExecutionError{Message: message, Result: shellResult}
 	}
 	return shellResult, nil
 }

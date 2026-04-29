@@ -698,6 +698,9 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 		incrementLabelSummary(&result.Summary, item.Status)
 	}
 
+	if result.Summary.Failed > 0 {
+		return result, fmt.Errorf("%d label mutation(s) failed", result.Summary.Failed)
+	}
 	return result, nil
 }
 
