@@ -42,6 +42,17 @@ func runAppWithContext(t *testing.T, ctx context.Context, args ...string) (int, 
 	return exitCode, stdout.String(), stderr.String()
 }
 
+func runAppWithLookPath(t *testing.T, lookPath config.LookPathFunc, args ...string) (int, string, string) {
+	t.Helper()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, LookPath: lookPath})
+	exitCode := app.Run(context.Background(), args)
+
+	return exitCode, stdout.String(), stderr.String()
+}
+
 func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	t.Parallel()
 
@@ -665,6 +676,132 @@ func TestConfigValidateAndShowSource(t *testing.T) {
 	}
 	if got, want := allowRisky["value"], false; got != want {
 		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+}
+
+func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": true, "throttleWindowSeconds": 60},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes": false,
+		},
+	})
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "validate", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+}
+
+func TestConfigSetRejectsWriteWhenEnabledOsascriptNotificationsLackResolvedPath(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, invalidOsascriptNotificationConfigPayload(false))
+	t.Setenv("LOOPER_CONFIG", writeEditableCLIConfig(t))
+
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config before set: %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after set: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed after failed set\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestConfigUnsetRejectsWriteWhenEnabledOsascriptNotificationsLackResolvedPath(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, invalidOsascriptNotificationConfigPayload(true))
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config before unset: %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "unset", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config unset ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after unset: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed after failed unset\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestConfigEditRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+	editorPath := filepath.Join(t.TempDir(), "editor.sh")
+	editorScript := `#!/bin/sh
+cat > "$1" <<'EOF'
+{"notifications":{"osascript":{"enabled":true,"throttleWindowSeconds":60}},"defaults":{"allowRiskyFixes":false}}
+EOF
+`
+	if err := os.WriteFile(editorPath, []byte(editorScript), 0o755); err != nil {
+		t.Fatalf("write editor script: %v", err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "edit", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config edit]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+}
+
+func invalidOsascriptNotificationConfigPayload(allowRiskyFixes bool) map[string]any {
+	return map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": true, "throttleWindowSeconds": 60},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes": allowRiskyFixes,
+		},
 	}
 }
 
@@ -1738,8 +1875,7 @@ func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
 func writeEditableCLIConfig(t *testing.T) string {
 	t.Helper()
 
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	configPayload := map[string]any{
+	return writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
 			"osascript": map[string]any{"enabled": false},
 		},
@@ -1747,7 +1883,13 @@ func writeEditableCLIConfig(t *testing.T) string {
 			"allowRiskyFixes":    false,
 			"fixAllPullRequests": false,
 		},
-	}
+	})
+}
+
+func writeEditableCLIConfigWithPayload(t *testing.T, configPayload map[string]any) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(configPayload)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)

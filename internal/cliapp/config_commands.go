@@ -68,9 +68,6 @@ func (r *commandRuntime) configSet(cmd *cobra.Command, args []string) error {
 	if err := r.writeConfigFile(loaded.Metadata.ConfigPath, partial); err != nil {
 		return err
 	}
-	if err := validatePartialConfig(partial); err != nil {
-		return err
-	}
 	r.warnConfigOverrides(cmd, field)
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), map[string]any{"key": field.key, "configPath": loaded.Metadata.ConfigPath, "updated": true})
@@ -93,9 +90,6 @@ func (r *commandRuntime) configUnset(cmd *cobra.Command, args []string) error {
 	if err := r.writeConfigFile(loaded.Metadata.ConfigPath, partial); err != nil {
 		return err
 	}
-	if err := validatePartialConfig(partial); err != nil {
-		return err
-	}
 	r.warnConfigOverrides(cmd, field)
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), map[string]any{"key": field.key, "configPath": loaded.Metadata.ConfigPath, "updated": true})
@@ -105,11 +99,8 @@ func (r *commandRuntime) configUnset(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) configValidate(cmd *cobra.Command, args []string) error {
-	loaded, err := r.loadRawConfigForEdit()
+	loaded, err := r.loadConfigForEdit()
 	if err != nil {
-		return err
-	}
-	if err := validatePartialConfig(loaded.Partial); err != nil {
 		return err
 	}
 	if getBoolFlag(cmd, "json") {
@@ -174,7 +165,7 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePartialConfig(loadedAfter.Partial); err != nil {
+	if err := r.validateConfigFile(loadedAfter.Metadata.ConfigPath); err != nil {
 		return err
 	}
 	if getBoolFlag(cmd, "json") {
@@ -185,7 +176,7 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) loadConfigForEdit() (config.LoadedFileConfig, error) {
-	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.app.deps.LookPath})
+	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
 }
 
 func (r *commandRuntime) loadRawConfigForEdit() (config.LoadedFileConfig, error) {
@@ -244,14 +235,11 @@ func resolveConfigPathFromArgs(argv []string, cwd string) (string, error) {
 }
 
 func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConfig) error {
-	if err := validatePartialConfig(partial); err != nil {
+	if err := r.validatePartialConfig(partial); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
-	}
-	if err := backupConfigFile(path); err != nil {
-		return err
 	}
 	raw, err := json.MarshalIndent(partial, "", "  ")
 	if err != nil {
@@ -271,13 +259,24 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temporary config: %w", err)
 	}
+	if err := r.validateConfigFile(tmpPath); err != nil {
+		return err
+	}
+	if err := backupConfigFile(path); err != nil {
+		return err
+	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
 }
 
-func validatePartialConfig(partial config.PartialConfig) error {
+func (r *commandRuntime) validateConfigFile(path string) error {
+	_, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", path}, LookPath: r.lookPath()})
+	return err
+}
+
+func (r *commandRuntime) validatePartialConfig(partial config.PartialConfig) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("determine current working directory: %w", err)
