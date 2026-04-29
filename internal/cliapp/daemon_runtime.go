@@ -184,8 +184,13 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	forwardedArgs, err := r.forwardedDaemonConfigArgs()
+	if err != nil {
+		return err
+	}
+
 	r.startupOutputPath = startupLogPath
-	pid, err := r.spawnDetached(binary.Path, ExtractConfigArgs(r.argv), cwd, os.Environ())
+	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, os.Environ())
 	if err != nil {
 		return fmt.Errorf("Failed to start looperd: %w", err)
 	}
@@ -220,6 +225,85 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal and does not provide full background supervision.")
 	return err
+}
+
+func (r *commandRuntime) forwardedDaemonConfigArgs() ([]string, error) {
+	args := ExtractConfigArgs(r.argv)
+	if !forwardedConfigArgsNeedCWD(args) {
+		return args, nil
+	}
+
+	cwd, err := r.getwd()
+	if err != nil {
+		return nil, fmt.Errorf("resolve current working directory for daemon config paths: %w", err)
+	}
+	if strings.TrimSpace(cwd) == "" {
+		return nil, fmt.Errorf("resolve current working directory for daemon config paths: current working directory is empty")
+	}
+
+	return normalizeForwardedConfigPathArgs(args, cwd), nil
+}
+
+var forwardedConfigPathFlagNames = map[string]struct{}{
+	"config":  {},
+	"db-path": {},
+	"log-dir": {},
+}
+
+func forwardedConfigArgsNeedCWD(args []string) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		name, value, hasValue := splitLongFlag(arg)
+		if _, ok := forwardedConfigPathFlagNames[name]; !ok {
+			continue
+		}
+		if hasValue {
+			if value != "" && !filepath.IsAbs(value) {
+				return true
+			}
+			continue
+		}
+		if index+1 < len(args) && args[index+1] != "" && !filepath.IsAbs(args[index+1]) {
+			return true
+		}
+		index++
+	}
+	return false
+}
+
+func normalizeForwardedConfigPathArgs(args []string, cwd string) []string {
+	normalized := append([]string{}, args...)
+	for index := 0; index < len(normalized); index++ {
+		arg := normalized[index]
+		name, value, hasValue := splitLongFlag(arg)
+		if _, ok := forwardedConfigPathFlagNames[name]; !ok {
+			continue
+		}
+		if hasValue {
+			if value != "" && !filepath.IsAbs(value) {
+				normalized[index] = "--" + name + "=" + filepath.Join(cwd, value)
+			}
+			continue
+		}
+		if index+1 < len(normalized) {
+			if value := normalized[index+1]; value != "" && !filepath.IsAbs(value) {
+				normalized[index+1] = filepath.Join(cwd, value)
+			}
+			index++
+		}
+	}
+	return normalized
+}
+
+func splitLongFlag(arg string) (name string, value string, hasValue bool) {
+	if !strings.HasPrefix(arg, "--") {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(arg, "--")
+	if equals := strings.Index(trimmed, "="); equals >= 0 {
+		return trimmed[:equals], trimmed[equals+1:], true
+	}
+	return trimmed, "", false
 }
 
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
