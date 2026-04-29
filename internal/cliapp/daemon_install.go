@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -43,7 +44,7 @@ type githubReleaseAsset struct {
 func (r *commandRuntime) daemonInstall(cmd *cobra.Command, args []string) error {
 	_ = args
 
-	result, err := r.installManagedDaemon(cmd.Context(), getBoolFlag(cmd, "force"), "")
+	result, err := r.installManagedDaemon(cmd.Context(), getBoolFlag(cmd, "force"), "", cmd.ErrOrStderr())
 	if err != nil {
 		return fmt.Errorf("Failed to install looperd: %w", err)
 	}
@@ -68,7 +69,7 @@ func (r *commandRuntime) daemonInstall(cmd *cobra.Command, args []string) error 
 	return nil
 }
 
-func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, tag string) (daemonInstallResult, error) {
+func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, tag string, progress io.Writer) (daemonInstallResult, error) {
 	homeDir, err := r.homeDir()
 	if err != nil {
 		return daemonInstallResult{}, err
@@ -99,7 +100,7 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 		return daemonInstallResult{}, err
 	}
 
-	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL)
+	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL, binaryAsset.Name, progress)
 	if err != nil {
 		return daemonInstallResult{}, err
 	}
@@ -174,23 +175,15 @@ func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (
 	return payload, nil
 }
 
-func (r *commandRuntime) downloadBinary(ctx context.Context, url string) ([]byte, error) {
-	data, _, err := r.download(ctx, url, "application/octet-stream")
-	if err != nil {
-		return nil, fmt.Errorf("Failed to download looperd binary from %s (%v)", url, err)
-	}
-	return data, nil
-}
-
 func (r *commandRuntime) downloadChecksum(ctx context.Context, url string) (string, error) {
-	data, _, err := r.download(ctx, url, "text/plain")
+	data, _, err := r.download(ctx, url, "text/plain", "", nil)
 	if err != nil {
 		return "", fmt.Errorf("Failed to download looperd checksum from %s (%v)", url, err)
 	}
 	return string(data), nil
 }
 
-func (r *commandRuntime) download(ctx context.Context, url string, accept string) ([]byte, *http.Response, error) {
+func (r *commandRuntime) download(ctx context.Context, url string, accept string, progressName string, progress io.Writer) ([]byte, *http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, nil, err
@@ -208,11 +201,97 @@ func (r *commandRuntime) download(ctx context.Context, url string, accept string
 		return nil, resp, fmt.Errorf("status %s", resp.Status)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	reader := resp.Body
+	if progress != nil && strings.TrimSpace(progressName) != "" {
+		tracker := newDownloadProgress(progress, progressName, resp.ContentLength)
+		defer tracker.finish()
+		reader = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.TeeReader(resp.Body, tracker), Closer: resp.Body}
+	}
+
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, nil, err
 	}
 	return data, resp, nil
+}
+
+func (r *commandRuntime) downloadBinary(ctx context.Context, url string, name string, progress io.Writer) ([]byte, error) {
+	data, _, err := r.download(ctx, url, "application/octet-stream", name, progress)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to download release binary from %s (%v)", url, err)
+	}
+	return data, nil
+}
+
+type downloadProgress struct {
+	w        io.Writer
+	name     string
+	total    int64
+	read     int64
+	last     time.Time
+	finished bool
+}
+
+func newDownloadProgress(w io.Writer, name string, total int64) *downloadProgress {
+	p := &downloadProgress{w: w, name: name, total: total}
+	p.print(true)
+	return p
+}
+
+func (p *downloadProgress) Write(data []byte) (int, error) {
+	p.read += int64(len(data))
+	if time.Since(p.last) >= 200*time.Millisecond {
+		p.print(false)
+	}
+	return len(data), nil
+}
+
+func (p *downloadProgress) finish() {
+	if p.finished {
+		return
+	}
+	p.finished = true
+	p.print(false)
+	_, _ = fmt.Fprintln(p.w)
+}
+
+func (p *downloadProgress) print(initial bool) {
+	p.last = time.Now()
+	var line string
+	if p.total > 0 {
+		percent := 0
+		if p.total > 0 {
+			percent = int((p.read * 100) / p.total)
+		}
+		line = fmt.Sprintf("Downloading %s: %s / %s (%d%%)", p.name, formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
+	} else if p.read > 0 {
+		line = fmt.Sprintf("Downloading %s: %s downloaded", p.name, formatDownloadBytes(p.read))
+	} else {
+		line = fmt.Sprintf("Downloading %s...", p.name)
+	}
+	if initial {
+		_, _ = fmt.Fprint(p.w, line)
+		return
+	}
+	_, _ = fmt.Fprintf(p.w, "\r%s", line)
+}
+
+func formatDownloadBytes(value int64) string {
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	divisor := int64(unit)
+	unitIndex := 0
+	for n := value / unit; n >= unit && unitIndex < 3; n /= unit {
+		divisor *= unit
+		unitIndex++
+	}
+	number := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", float64(value)/float64(divisor)), "0"), ".")
+	return fmt.Sprintf("%s %ciB", number, "KMGT"[unitIndex])
 }
 
 func (r *commandRuntime) httpClient() *http.Client {

@@ -3,6 +3,8 @@ package lifecycle
 import (
 	"strings"
 	"testing"
+
+	"github.com/powerformer/looper/internal/config"
 )
 
 func TestFromMapNormalizesAgentLifecycleState(t *testing.T) {
@@ -46,10 +48,38 @@ func TestMergeAgentPreservesFallbackMetadata(t *testing.T) {
 }
 
 func TestPromptInstructionDocumentsLifecycleContract(t *testing.T) {
-	prompt := PromptInstruction("worker", "looper/test", "main", true, true)
+	prompt := PromptInstruction("worker", "looper/test", "main", true, true, config.DefaultDisclosureConfig())
 	for _, want := range []string{PolicyAgentManagedWithFallback, "git_pr_lifecycle", "commitShas", "actions {commit,push,pr}", "fallbackAllowed=true"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("PromptInstruction missing %q in:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestPromptInstructionRespectsDisabledDisclosure(t *testing.T) {
+	cfg := config.DefaultDisclosureConfig()
+	cfg.Enabled = false
+	prompt := PromptInstruction("fixer", "", "", true, false, cfg)
+	if strings.Contains(prompt, "add a commit body trailer") || strings.Contains(prompt, "add this Markdown footer") {
+		t.Fatalf("PromptInstruction should not request disclosure trailers/footers when disabled:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "disclosure stamping is disabled") || !strings.Contains(prompt, "do not add looper") {
+		t.Fatalf("PromptInstruction missing disabled disclosure guard:\n%s", prompt)
+	}
+}
+
+func TestPromptInstructionRespectsDisclosureChannelOptOuts(t *testing.T) {
+	cfg := config.DefaultDisclosureConfig()
+	cfg.Channels.GitCommit = false
+	cfg.Channels.PullRequest = false
+	cfg.Channels.ReviewComment = false
+	prompt := PromptInstruction("worker", "looper/test", "main", true, true, cfg)
+	for _, want := range []string{"Do not add looper Generated-By trailers", "Do not add looper Markdown disclosure footers to PR bodies", "Do not add looper disclosure footers or hidden looper stamp markers to inline review comments"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("PromptInstruction missing %q in:\n%s", want, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "issue bodies or normal comments") {
+		t.Fatalf("PromptInstruction should still mention enabled issue-comment disclosure:\n%s", prompt)
 	}
 }

@@ -19,7 +19,15 @@ import (
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 
+const (
+	defaultGhCommandTimeout = 60 * time.Second
+	prListGhCommandTimeout  = 15 * time.Second
+	prDiffGhCommandTimeout  = 180 * time.Second
+)
+
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
+
+var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
 	GHPath string
@@ -173,11 +181,12 @@ type UpdatePullRequestTitleInput struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo   string
-	CWD    string
-	Limit  int
-	Label  string
-	Author string
+	Repo    string
+	CWD     string
+	Limit   int
+	Label   string
+	Author  string
+	Timeout time.Duration
 }
 
 type ListOpenIssuesInput struct {
@@ -220,6 +229,40 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
+type InitializeLabelsInput struct {
+	Repo   string
+	CWD    string
+	DryRun bool
+}
+
+type LabelDefinition struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+type LabelInitResult struct {
+	Repo    string           `json:"repo"`
+	DryRun  bool             `json:"dryRun"`
+	Labels  []LabelInitItem  `json:"labels"`
+	Summary LabelInitSummary `json:"summary"`
+}
+
+type LabelInitItem struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+	Error       string `json:"error,omitempty"`
+}
+
+type LabelInitSummary struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
+}
+
 type ReviewThreadNotFoundError struct {
 	ThreadID string
 }
@@ -254,7 +297,11 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests"}, ","))
 
-	result, err := g.runGh(ctx, input.CWD, "", args...)
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", timeout, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -437,8 +484,11 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 }
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
 	if err != nil {
+		if isDiffTooLargeError(err) {
+			return "", ErrDiffTooLarge
+		}
 		return "", err
 	}
 	return result.Stdout, nil
@@ -613,6 +663,67 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 	return strings.TrimSpace(result.Stdout), nil
 }
 
+func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "repo", "view", "--json", "nameWithOwner,url")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	repo := hostQualifiedRepo(asString(row["nameWithOwner"]), asString(row["url"]))
+	if err := validateGitHubRepoSlug(repo); err != nil {
+		return "", err
+	}
+	return repo, nil
+}
+
+func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsInput) (LabelInitResult, error) {
+	repo := strings.TrimSpace(input.Repo)
+	if err := validateGitHubRepoSlug(repo); err != nil {
+		return LabelInitResult{}, err
+	}
+
+	existing, err := g.listRepositoryLabels(ctx, repo, input.CWD)
+	if err != nil {
+		return LabelInitResult{}, err
+	}
+
+	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(StandardLooperLabels()))}
+	for _, definition := range StandardLooperLabels() {
+		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
+		current, ok := existing[strings.ToLower(definition.Name)]
+		switch {
+		case !ok:
+			item.Status = "created"
+			if !input.DryRun {
+				_, err = g.runGh(ctx, input.CWD, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
+			}
+		case normalizeLabelColor(current.Color) == normalizeLabelColor(definition.Color) && strings.TrimSpace(current.Description) == definition.Description:
+			item.Status = "skipped"
+		default:
+			item.Status = "updated"
+			if !input.DryRun {
+				_, err = g.runGh(ctx, input.CWD, "", "label", "edit", current.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
+			}
+		}
+
+		if err != nil {
+			item.Status = "failed"
+			item.Error = err.Error()
+			err = nil
+		}
+		result.Labels = append(result.Labels, item)
+		incrementLabelSummary(&result.Summary, item.Status)
+	}
+
+	if result.Summary.Failed > 0 {
+		return result, fmt.Errorf("%d label mutation(s) failed", result.Summary.Failed)
+	}
+	return result, nil
+}
+
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 	detail, err := g.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
@@ -620,13 +731,20 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}
 	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return storage.PullRequestSnapshotRecord{}, err
+		if !errors.Is(err, ErrDiffTooLarge) {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
 	}
 	capturedAt := strings.TrimSpace(input.CapturedAt)
 	if capturedAt == "" {
 		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
 	}
-	payload, err := json.Marshal(map[string]any{"detail": detail, "diff": diff})
+	payloadMap := map[string]any{"detail": detail, "diff": diff}
+	if errors.Is(err, ErrDiffTooLarge) {
+		payloadMap["diffTruncated"] = true
+		payloadMap["diffTruncationReason"] = "github_too_large"
+	}
+	payload, err := json.Marshal(payloadMap)
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
 	}
@@ -747,8 +865,40 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []s
 	return nil
 }
 
+func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]LabelDefinition, error) {
+	result, err := g.runGh(ctx, cwd, "", "label", "list", "--repo", repo, "--limit", "1000", "--json", "name,color,description")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]LabelDefinition, len(rows))
+	for _, row := range rows {
+		name := strings.TrimSpace(asString(row["name"]))
+		if name == "" {
+			continue
+		}
+		out[strings.ToLower(name)] = LabelDefinition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
+	}
+	return out, nil
+}
+
 func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) (shell.Result, error) {
-	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin})
+	return g.runGhWithTimeout(ctx, cwd, stdin, defaultGhCommandTimeout, args...)
+}
+
+func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	return g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+}
+
+func isDiffTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "http 406") || strings.Contains(message, "too_large") || strings.Contains(message, "diff exceeded maximum number of lines")
 }
 
 func defaultLimit(limit int) int {
@@ -764,6 +914,26 @@ func parseRepo(repo string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid GitHub repo: %s", repo)
 	}
 	return parts[0], parts[1], nil
+}
+
+func validateGitHubRepoSlug(repo string) error {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if (len(parts) != 2 && len(parts) != 3) || strings.TrimSpace(parts[len(parts)-2]) == "" || strings.TrimSpace(parts[len(parts)-1]) == "" {
+		return fmt.Errorf("invalid GitHub repo: %s", repo)
+	}
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) == "" {
+		return fmt.Errorf("invalid GitHub repo: %s", repo)
+	}
+	return nil
+}
+
+func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
+	repo := strings.TrimSpace(nameWithOwner)
+	parsed, err := url.Parse(strings.TrimSpace(repoURL))
+	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" {
+		return repo
+	}
+	return parsed.Hostname() + "/" + repo
 }
 
 func summarizeChecks(checks []map[string]any) string {
@@ -873,6 +1043,32 @@ func resolveLabelDescription(label string) string {
 		return "Looper requires manual intervention"
 	default:
 		return "Managed by looper"
+	}
+}
+
+func StandardLooperLabels() []LabelDefinition {
+	return []LabelDefinition{
+		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
+		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
+		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
+		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
+	}
+}
+
+func normalizeLabelColor(value string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
+}
+
+func incrementLabelSummary(summary *LabelInitSummary, status string) {
+	switch status {
+	case "created":
+		summary.Created++
+	case "updated":
+		summary.Updated++
+	case "skipped":
+		summary.Skipped++
+	case "failed":
+		summary.Failed++
 	}
 }
 

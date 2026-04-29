@@ -52,6 +52,7 @@ type Context struct {
 	Now                  func() time.Time
 	RecoverySummary      func() any
 	StopLoop             func(context.Context, string, string) (any, error)
+	StopAll              func(context.Context, string) (any, error)
 	TriggerSchedulerTick func()
 }
 
@@ -1048,6 +1049,8 @@ type createProjectResponse struct {
 	projectResponse
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
 	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
+	PendingSnapshots       int      `json:"pendingSnapshots"`
+	CapturedSnapshots      int      `json:"capturedSnapshots"`
 	Warnings               []string `json:"warnings"`
 }
 
@@ -1719,14 +1722,26 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	loop, err := h.resolveLoop(r.Context(), selector)
-	if err != nil {
-		return nil, err
+	if selector == "stop-all" {
+		if len(parts) != 1 {
+			return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+		}
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		if h.context.StopAll == nil {
+			return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+		}
+		return h.context.StopAll(r.Context(), "Stopped by user via selector all")
 	}
 
 	if len(parts) == 1 || strings.TrimSpace(parts[1]) == "" {
 		if r.Method != http.MethodGet {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		loop, err := h.resolveLoop(r.Context(), selector)
+		if err != nil {
+			return nil, err
 		}
 		return h.buildActiveRunDetailResponse(r.Context(), loop.ID)
 	}
@@ -1738,6 +1753,10 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		}
 		if h.context.StopLoop == nil {
 			return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+		}
+		loop, err := h.resolveLoop(r.Context(), selector)
+		if err != nil {
+			return nil, err
 		}
 		return h.context.StopLoop(r.Context(), loop.ID, fmt.Sprintf("Stopped by user via selector %s", selector))
 	default:
@@ -3787,6 +3806,7 @@ type createProjectRequest struct {
 	BaseBranch   *string `json:"baseBranch"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	Repo         *string `json:"repo"`
+	SnapshotMode *string `json:"snapshotMode"`
 }
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
@@ -3818,6 +3838,13 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	if baseBranch == "" {
 		baseBranch = h.context.Config.Defaults.BaseBranch
 	}
+	snapshotMode := projects.SnapshotMode(strings.TrimSpace(derefString(body.SnapshotMode)))
+	if snapshotMode == "" {
+		snapshotMode = projects.SnapshotMode(h.context.Config.Defaults.AddSnapshotMode)
+	}
+	if snapshotMode != "" && snapshotMode != projects.SnapshotModeAsync && snapshotMode != projects.SnapshotModeFull && snapshotMode != projects.SnapshotModeOff {
+		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "snapshotMode must be one of: async, full, off"}
+	}
 
 	result, err := service.AddProject(r.Context(), projects.AddInput{
 		ID:           projectID,
@@ -3827,6 +3854,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
+		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
 		var collision projects.ProjectIDCollisionError
@@ -3845,6 +3873,8 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
 		DiscoveredPullRequests: result.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.DiscoveredWorktrees,
+		PendingSnapshots:       result.PendingSnapshots,
+		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
 }

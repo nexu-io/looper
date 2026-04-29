@@ -666,6 +666,10 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Defaults.OpenPRStrategy = %q, want %q", config.Defaults.OpenPRStrategy, OpenPRStrategyAllDone)
 	}
 
+	if config.Defaults.AddSnapshotMode != AddSnapshotModeFull {
+		t.Fatalf("DefaultConfig().Defaults.AddSnapshotMode = %q, want %q", config.Defaults.AddSnapshotMode, AddSnapshotModeFull)
+	}
+
 	if len(config.Agent.Params) != 0 || len(config.Agent.Env) != 0 {
 		t.Fatalf("DefaultConfig().Agent maps = %#v / %#v, want empty maps", config.Agent.Params, config.Agent.Env)
 	}

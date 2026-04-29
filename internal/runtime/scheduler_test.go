@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -88,6 +89,9 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 	if len(fixerRunner.discoverCalls) != 1 || fixerRunner.discoverCalls[0].Repo != "powerformer/looper" {
 		t.Fatalf("fixer discover calls = %#v, want stored project repo", fixerRunner.discoverCalls)
+	}
+	if len(workerRunner.discoverCalls) != 1 || workerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+		t.Fatalf("worker discover calls = %#v, want stored project repo", workerRunner.discoverCalls)
 	}
 	waitForSchedulerCondition(t, func() bool {
 		return workerRunner.processItemCount() == 1
@@ -231,6 +235,178 @@ func TestRunScheduledQueueItemsErrorsWhenRunnerMissing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "worker runner is not configured") {
 		t.Fatalf("runScheduledQueueItems() error = %v, want missing worker runner error", err)
 	}
+}
+
+func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-retry.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "powerformer/looper"
+	prNumber := int64(109)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{err: errors.New("gh timeout")},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with one attempt and no finished_at", updated)
+	}
+	if updated.LastError == nil || *updated.LastError != "gh timeout" || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
+		t.Fatalf("queue item error = (%v, %v), want retryable gh timeout", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestProcessSnapshotQueueItemRetriesTransientPersistenceFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-upsert-retry.sqlite"), backupDir)
+	repos := storage.NewRepositories(&failingSnapshotUpsertQuerier{db: coordinator.DB(), err: errors.New("database is locked")})
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "powerformer/looper"
+	prNumber := int64(109)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_upsert_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with one attempt and no finished_at", updated)
+	}
+	if updated.LastError == nil || !strings.Contains(*updated.LastError, "database is locked") || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
+		t.Fatalf("queue item error = (%v, %v), want retryable database is locked", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestProcessSnapshotQueueItemRetriesTransientProjectLookupFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-project-lookup-retry.sqlite"), backupDir)
+	setupRepos := storage.NewRepositories(coordinator.DB())
+	repos := storage.NewRepositories(&failingProjectLookupQuerier{db: coordinator.DB()})
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "powerformer/looper"
+	prNumber := int64(109)
+	if err := setupRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_project_lookup_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := setupRepos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with one attempt and no finished_at", updated)
+	}
+	if updated.LastError == nil || !strings.Contains(*updated.LastError, "get project by id") || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
+		t.Fatalf("queue item error = (%v, %v), want retryable project lookup failure", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestProcessSnapshotQueueItemRetriesTransientCompletionFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-complete-retry.sqlite"), backupDir)
+	setupRepos := storage.NewRepositories(coordinator.DB())
+	repos := storage.NewRepositories(&failingQueueCompleteQuerier{db: coordinator.DB(), err: errors.New("database is locked")})
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "powerformer/looper"
+	prNumber := int64(109)
+	if err := setupRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_complete_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := setupRepos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with one attempt and no finished_at", updated)
+	}
+	assertQueueRetryError(t, updated, "database is locked")
 }
 
 func TestSchedulerAvailableSlotsAccountsForRunningQueueItems(t *testing.T) {
@@ -512,9 +688,18 @@ func (s *stubFixerScheduler) processItemCount() int {
 
 type stubWorkerScheduler struct {
 	mu             sync.Mutex
+	discoverCalls  []worker.DiscoveryInput
+	discoverErr    error
 	processClaims  []string
 	processedItems []string
 	processErr     error
+}
+
+func (s *stubWorkerScheduler) DiscoverIssues(_ context.Context, input worker.DiscoveryInput) (worker.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
+	return worker.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (*worker.ProcessResult, error) {
@@ -583,6 +768,88 @@ func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*wor
 
 func (s *blockingWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
 	return s.ProcessNext(ctx, "")
+}
+
+type stubSnapshotScheduler struct {
+	err error
+}
+
+func (s stubSnapshotScheduler) CapturePullRequestSnapshot(_ context.Context, input githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: "head", CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, s.err
+}
+
+type failingSnapshotUpsertQuerier struct {
+	db  *sql.DB
+	err error
+}
+
+func (q *failingSnapshotUpsertQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.Contains(query, "INSERT INTO pull_request_snapshots") {
+		return nil, q.err
+	}
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failingSnapshotUpsertQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failingSnapshotUpsertQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+type failingProjectLookupQuerier struct {
+	db *sql.DB
+}
+
+func (q *failingProjectLookupQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failingProjectLookupQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failingProjectLookupQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if strings.Contains(query, "FROM projects WHERE id") {
+		return q.db.QueryRowContext(ctx, `SELECT * FROM missing_projects_table`)
+	}
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+type failingQueueCompleteQuerier struct {
+	db  *sql.DB
+	err error
+}
+
+func (q *failingQueueCompleteQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.Contains(query, "SET status = 'completed'") {
+		return nil, q.err
+	}
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failingQueueCompleteQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failingQueueCompleteQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func assertQueueRetryError(t *testing.T, item *storage.QueueItemRecord, message string) {
+	t.Helper()
+	lastError := "<nil>"
+	if item.LastError != nil {
+		lastError = *item.LastError
+	}
+	lastErrorKind := "<nil>"
+	if item.LastErrorKind != nil {
+		lastErrorKind = *item.LastErrorKind
+	}
+	if item.LastError == nil || !strings.Contains(*item.LastError, message) || item.LastErrorKind == nil || *item.LastErrorKind != "retryable_transient" {
+		t.Fatalf("queue item error = (%s, %s), want retryable %s", lastError, lastErrorKind, message)
+	}
 }
 
 func waitForSchedulerCondition(t *testing.T, condition func() bool) {

@@ -573,7 +573,7 @@ func (r *commandRuntime) ensureBootstrapDaemon(ctx context.Context, force bool) 
 		return "already-installed", false, nil
 	}
 	reinstall := force || installed != nil
-	result, err := r.installManagedDaemon(ctx, reinstall, "")
+	result, err := r.installManagedDaemon(ctx, reinstall, "", r.app.stderr())
 	if err != nil {
 		return "", false, fmt.Errorf("install managed daemon: %w", err)
 	}

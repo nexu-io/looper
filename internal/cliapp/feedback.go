@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/agent"
+	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/spf13/cobra"
 )
 
@@ -44,7 +45,7 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("feedback requires agent.vendor to be configured")
 	}
 
-	prompt := buildFeedbackPrompt(titleHint, message)
+	prompt := buildFeedbackPrompt(titleHint, message, disclosure.FromConfig(loaded.Config))
 	agentCfg := agent.ExecutorConfig{
 		Vendor: *loaded.Config.Agent.Vendor,
 		Model:  loaded.Config.Agent.Model,
@@ -109,11 +110,14 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 	return err
 }
 
-func buildFeedbackPrompt(titleHint, message string) string {
+func buildFeedbackPrompt(titleHint, message string, stamper disclosure.Stamper) string {
 	sections := []string{
 		"Create a new GitHub issue in the repository powerformer/looper for the user feedback below.",
 		"Write the issue title and body in English.",
 		"Use the local GitHub CLI (`gh`) if needed.",
+	}
+	if footer := stamper.Markdown("", "feedback", disclosure.ChannelIssueComment); footer != "" {
+		sections = append(sections, "Before creating the issue, append this exact disclosure footer to the generated issue body and do not include hostname, username, local paths, IP/MAC addresses, env vars, tokens, endpoints, or machine identifiers:\n"+footer)
 	}
 	if titleHint != "" {
 		sections = append(sections, "Preferred title hint: "+titleHint)

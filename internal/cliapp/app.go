@@ -94,7 +94,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -128,6 +128,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("base-branch", "branch", "Base branch"),
 					stringFlag("worktree-root", "path", "Worktree root"),
 					stringFlag("repo", "repo", "Repository slug"),
+					stringFlag("snapshot-mode", "mode", "Snapshot mode for project add: async, full, or off"),
 				},
 				exampleLines: []string{
 					"$ looper project list",
@@ -143,11 +144,22 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "config",
 				short:           "Config commands",
-				helpSubcommands: []helpSubcommand{{name: "show", description: "Show active config"}},
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config file value"}, {name: "set", description: "Set a config file value"}, {name: "unset", description: "Unset a config file value"}, {name: "validate", description: "Validate the config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the config file"}},
 				helpWhenNoArgs:  true,
-				exampleLines:    []string{"$ looper config show --json"},
+				exampleLines: []string{
+					"$ looper config get defaults.allowRiskyFixes",
+					"$ looper config set defaults.allowRiskyFixes true",
+					"$ looper config unset defaults.allowRiskyFixes",
+					"$ looper config validate",
+					"$ looper config show --source",
+				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow}),
+					newCommand(commandSpec{use: "get <key>", short: "Get a config file value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
+					newCommand(commandSpec{use: "set <key> <value>", short: "Set a config file value", args: cobra.ExactArgs(2), runE: runtime.configSet}),
+					newCommand(commandSpec{use: "unset <key>", short: "Unset a config file value", args: cobra.ExactArgs(1), runE: runtime.configUnset}),
+					newCommand(commandSpec{use: "validate", short: "Validate the config file", runE: runtime.configValidate}),
+					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
+					newCommand(commandSpec{use: "edit", short: "Edit the config file", runE: runtime.configEdit}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -189,6 +201,27 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper upgrade --check",
 					"$ looper upgrade --cli",
 					"$ looper upgrade --daemon",
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "labels",
+				short:           "GitHub label commands",
+				helpSubcommands: []helpSubcommand{{name: "init", description: "Initialize standard Looper GitHub labels"}},
+				helpWhenNoArgs:  true,
+				exampleLines: []string{
+					"$ looper labels init",
+					"$ looper labels init --repo acme/looper --dry-run",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{
+						use:   "init",
+						short: "Initialize standard Looper GitHub labels",
+						runE:  runtime.labelsInit,
+						localFlags: []flagSpec{
+							stringFlag("repo", "owner/name", "GitHub repository slug"),
+							boolFlag("dry-run", "Preview label changes without applying them"),
+						},
+					}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -326,7 +359,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper logs 12 --follow",
 				},
 			}),
-			newCommand(commandSpec{use: "stop <id>", short: "Stop an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12"}}),
+			newCommand(commandSpec{use: "stop <id|all>", short: "Stop an active loop or all active loops", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12", "$ looper stop all"}}),
 			newCommand(commandSpec{
 				use:             "run",
 				short:           "Run commands",

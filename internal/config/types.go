@@ -40,6 +40,14 @@ const (
 	OpenPRStrategyManual      OpenPRStrategy = "manual"
 )
 
+type AddSnapshotMode string
+
+const (
+	AddSnapshotModeAsync AddSnapshotMode = "async"
+	AddSnapshotModeFull  AddSnapshotMode = "full"
+	AddSnapshotModeOff   AddSnapshotMode = "off"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -78,6 +86,21 @@ type AgentConfig struct {
 type NotificationConfig struct {
 	InApp     bool                        `json:"inApp"`
 	Osascript OsascriptNotificationConfig `json:"osascript"`
+}
+
+type DisclosureConfig struct {
+	Enabled      bool                     `json:"enabled"`
+	IncludeAgent bool                     `json:"includeAgent"`
+	IncludeOS    bool                     `json:"includeOS"`
+	Channels     DisclosureChannelsConfig `json:"channels"`
+}
+
+type DisclosureChannelsConfig struct {
+	GitCommit            bool `json:"gitCommit"`
+	PullRequest          bool `json:"pullRequest"`
+	IssueComment         bool `json:"issueComment"`
+	ReviewComment        bool `json:"reviewComment"`
+	InlineCommentVisible bool `json:"inlineCommentVisible"`
 }
 
 type OsascriptNotificationConfig struct {
@@ -122,14 +145,15 @@ type PackageConfig struct {
 }
 
 type DefaultsConfig struct {
-	BaseBranch         string         `json:"baseBranch"`
-	AllowAutoCommit    bool           `json:"allowAutoCommit"`
-	AllowAutoPush      bool           `json:"allowAutoPush"`
-	AllowAutoApprove   bool           `json:"allowAutoApprove"`
-	AllowAutoMerge     bool           `json:"allowAutoMerge"`
-	AllowRiskyFixes    bool           `json:"allowRiskyFixes"`
-	FixAllPullRequests bool           `json:"fixAllPullRequests"`
-	OpenPRStrategy     OpenPRStrategy `json:"openPrStrategy"`
+	BaseBranch         string          `json:"baseBranch"`
+	AllowAutoCommit    bool            `json:"allowAutoCommit"`
+	AllowAutoPush      bool            `json:"allowAutoPush"`
+	AllowAutoApprove   bool            `json:"allowAutoApprove"`
+	AllowAutoMerge     bool            `json:"allowAutoMerge"`
+	AllowRiskyFixes    bool            `json:"allowRiskyFixes"`
+	FixAllPullRequests bool            `json:"fixAllPullRequests"`
+	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
+	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
 }
 
 type ProjectRefConfig struct {
@@ -147,6 +171,7 @@ type Config struct {
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
+	Disclosure    DisclosureConfig   `json:"disclosure"`
 	Tools         ToolPathsConfig    `json:"tools"`
 	Daemon        DaemonConfig       `json:"daemon"`
 	Package       PackageConfig      `json:"package"`
@@ -187,6 +212,21 @@ type PartialNotificationConfig struct {
 	Osascript *PartialOsascriptNotificationConfig `json:"osascript,omitempty"`
 }
 
+type PartialDisclosureConfig struct {
+	Enabled      *bool                            `json:"enabled,omitempty"`
+	IncludeAgent *bool                            `json:"includeAgent,omitempty"`
+	IncludeOS    *bool                            `json:"includeOS,omitempty"`
+	Channels     *PartialDisclosureChannelsConfig `json:"channels,omitempty"`
+}
+
+type PartialDisclosureChannelsConfig struct {
+	GitCommit            *bool `json:"gitCommit,omitempty"`
+	PullRequest          *bool `json:"pullRequest,omitempty"`
+	IssueComment         *bool `json:"issueComment,omitempty"`
+	ReviewComment        *bool `json:"reviewComment,omitempty"`
+	InlineCommentVisible *bool `json:"inlineCommentVisible,omitempty"`
+}
+
 type PartialOsascriptNotificationConfig struct {
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	SoundForLevels        *[]NotificationSoundLevel `json:"soundForLevels,omitempty"`
@@ -221,14 +261,15 @@ type PartialPackageConfig struct {
 }
 
 type PartialDefaultsConfig struct {
-	BaseBranch         *string         `json:"baseBranch,omitempty"`
-	AllowAutoCommit    *bool           `json:"allowAutoCommit,omitempty"`
-	AllowAutoPush      *bool           `json:"allowAutoPush,omitempty"`
-	AllowAutoApprove   *bool           `json:"allowAutoApprove,omitempty"`
-	AllowAutoMerge     *bool           `json:"allowAutoMerge,omitempty"`
-	AllowRiskyFixes    *bool           `json:"allowRiskyFixes,omitempty"`
-	FixAllPullRequests *bool           `json:"fixAllPullRequests,omitempty"`
-	OpenPRStrategy     *OpenPRStrategy `json:"openPrStrategy,omitempty"`
+	BaseBranch         *string          `json:"baseBranch,omitempty"`
+	AllowAutoCommit    *bool            `json:"allowAutoCommit,omitempty"`
+	AllowAutoPush      *bool            `json:"allowAutoPush,omitempty"`
+	AllowAutoApprove   *bool            `json:"allowAutoApprove,omitempty"`
+	AllowAutoMerge     *bool            `json:"allowAutoMerge,omitempty"`
+	AllowRiskyFixes    *bool            `json:"allowRiskyFixes,omitempty"`
+	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
+	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
+	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
 }
 
 type PartialConfig struct {
@@ -238,6 +279,7 @@ type PartialConfig struct {
 	Agent         *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging       *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications *PartialNotificationConfig `json:"notifications,omitempty"`
+	Disclosure    *PartialDisclosureConfig   `json:"disclosure,omitempty"`
 	Tools         *PartialToolPathsConfig    `json:"tools,omitempty"`
 	Daemon        *PartialDaemonConfig       `json:"daemon,omitempty"`
 	Package       *PartialPackageConfig      `json:"package,omitempty"`

@@ -33,6 +33,15 @@ type ListOpenPullRequestsFunc func(context.Context, ListOpenPullRequestsInput) (
 
 type CapturePullRequestSnapshotFunc func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 
+type SnapshotMode string
+
+const (
+	SnapshotModeAsync SnapshotMode = "async"
+	SnapshotModeFull  SnapshotMode = "full"
+	SnapshotModeOff   SnapshotMode = "off"
+	queueTypeSnapshot              = "snapshot"
+)
+
 type WorktreeListEntry struct {
 	Path    string
 	Branch  string
@@ -41,9 +50,10 @@ type WorktreeListEntry struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo  string
-	CWD   string
-	Limit int
+	Repo    string
+	CWD     string
+	Limit   int
+	Timeout time.Duration
 }
 
 type PullRequestSummary struct {
@@ -69,6 +79,7 @@ type Service struct {
 	ListWorktrees              ListWorktreesFunc
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
+	AsyncSnapshotQueueEnabled  func() bool
 }
 
 type AddInput struct {
@@ -79,6 +90,7 @@ type AddInput struct {
 	IDSource     string
 	WorktreeRoot *string
 	Repo         *string
+	SnapshotMode SnapshotMode
 }
 
 type AddResult struct {
@@ -86,6 +98,8 @@ type AddResult struct {
 	Repo                   *string
 	DiscoveredPullRequests int
 	DiscoveredWorktrees    int
+	PendingSnapshots       int
+	CapturedSnapshots      int
 	Warnings               []string
 }
 
@@ -216,7 +230,7 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
-	discoveredPullRequests, err := s.discoverPullRequests(ctx, record, repo, &warnings)
+	discoveredPullRequests, pendingSnapshots, capturedSnapshots, err := s.discoverPullRequests(ctx, record, repo, snapshotModeOrDefault(input.SnapshotMode), &warnings)
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -226,6 +240,8 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		Repo:                   repo,
 		DiscoveredPullRequests: discoveredPullRequests,
 		DiscoveredWorktrees:    discoveredWorktrees,
+		PendingSnapshots:       pendingSnapshots,
+		CapturedSnapshots:      capturedSnapshots,
 		Warnings:               warnings,
 	}, nil
 }
@@ -601,24 +617,46 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 	return discovered, nil
 }
 
-func (s *Service) discoverPullRequests(ctx context.Context, project storage.ProjectRecord, repo *string, warnings *[]string) (int, error) {
-	if repo == nil || strings.TrimSpace(*repo) == "" || s.ListOpenPullRequests == nil || s.CapturePullRequestSnapshot == nil || s.Repos == nil || s.Repos.PullRequestSnapshots == nil {
-		return 0, nil
+func (s *Service) discoverPullRequests(ctx context.Context, project storage.ProjectRecord, repo *string, mode SnapshotMode, warnings *[]string) (int, int, int, error) {
+	if mode == SnapshotModeOff || repo == nil || strings.TrimSpace(*repo) == "" || s.ListOpenPullRequests == nil {
+		return 0, 0, 0, nil
+	}
+	if mode == SnapshotModeAsync && !s.asyncSnapshotQueueEnabled() {
+		mode = SnapshotModeFull
+		*warnings = append(*warnings, "Async snapshot mode requires the scheduler; capturing snapshots synchronously instead.")
 	}
 
-	pullRequests, err := s.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: *repo, CWD: project.RepoPath})
+	listCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	pullRequests, err := s.ListOpenPullRequests(listCtx, ListOpenPullRequestsInput{Repo: *repo, CWD: project.RepoPath, Limit: 1000, Timeout: 15 * time.Second})
 	if err != nil {
 		message := err.Error()
 		if s.Logger != nil {
 			s.Logger.Warn("failed to discover pull requests for project", map[string]any{"projectId": project.ID, "repo": *repo, "message": message})
 		}
 		*warnings = append(*warnings, fmt.Sprintf("Could not discover pull requests: %s", message))
-		return 0, nil
+		return 0, 0, 0, nil
 	}
 
 	discovered := 0
+	pending := 0
+	captured := 0
 	for _, pullRequest := range pullRequests {
 		if pullRequest.IsDraft || normalizePRState(pullRequest.State) != "open" {
+			continue
+		}
+		discovered++
+		if mode == SnapshotModeAsync {
+			queued, err := s.enqueuePullRequestSnapshot(ctx, project, *repo, pullRequest.Number)
+			if err != nil {
+				return 0, 0, 0, err
+			}
+			if queued {
+				pending++
+			}
+			continue
+		}
+		if s.CapturePullRequestSnapshot == nil || s.Repos == nil || s.Repos.PullRequestSnapshots == nil {
 			continue
 		}
 
@@ -631,10 +669,10 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return 0, err
+				return 0, 0, 0, err
 			}
 			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
-				return 0, ctxErr
+				return 0, 0, 0, ctxErr
 			}
 			message := err.Error()
 			if s.Logger != nil {
@@ -644,12 +682,65 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 			continue
 		}
 		if err := s.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
-			return 0, err
+			return 0, 0, 0, err
 		}
-		discovered++
+		captured++
 	}
 
-	return discovered, nil
+	return discovered, pending, captured, nil
+}
+
+func (s *Service) asyncSnapshotQueueEnabled() bool {
+	if s.AsyncSnapshotQueueEnabled == nil {
+		return true
+	}
+	return s.AsyncSnapshotQueueEnabled()
+}
+
+func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (bool, error) {
+	if s.Repos == nil || s.Repos.Queue == nil {
+		return false, nil
+	}
+	dedupeKey := fmt.Sprintf("snapshot:%s:%s:%d", project.ID, repo, prNumber)
+	existing, err := s.Repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		return true, nil
+	}
+	nowISO := currentISO(s.Now)
+	payload, err := json.Marshal(map[string]any{"cwd": project.RepoPath})
+	if err != nil {
+		return false, err
+	}
+	record := storage.QueueItemRecord{
+		ID:          fmt.Sprintf("snapshot_%s_%d_%d", project.ID, prNumber, currentTime(s.Now).UnixNano()),
+		ProjectID:   &project.ID,
+		Type:        queueTypeSnapshot,
+		TargetType:  "pull_request_snapshot",
+		TargetID:    fmt.Sprintf("%s#%d", repo, prNumber),
+		Repo:        &repo,
+		PRNumber:    &prNumber,
+		DedupeKey:   dedupeKey,
+		Priority:    storage.QueuePrioritySnapshot,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		MaxAttempts: 3,
+		PayloadJSON: stringPointer(string(payload)),
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}
+	return true, s.Repos.Queue.Upsert(ctx, record)
+}
+
+func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {
+	switch mode {
+	case SnapshotModeFull, SnapshotModeOff:
+		return mode
+	default:
+		return SnapshotModeAsync
+	}
 }
 
 func normalizePRState(state string) string {

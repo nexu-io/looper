@@ -42,6 +42,17 @@ func runAppWithContext(t *testing.T, ctx context.Context, args ...string) (int, 
 	return exitCode, stdout.String(), stderr.String()
 }
 
+func runAppWithLookPath(t *testing.T, lookPath config.LookPathFunc, args ...string) (int, string, string) {
+	t.Helper()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, LookPath: lookPath})
+	exitCode := app.Run(context.Background(), args)
+
+	return exitCode, stdout.String(), stderr.String()
+}
+
 func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	t.Parallel()
 
@@ -50,8 +61,9 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config file value", "set       Set a config file value", "unset     Unset a config file value", "validate  Validate the config file", "show      Show active config", "edit      Edit the config file"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
+		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},
@@ -77,6 +89,161 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 				if !strings.Contains(stdout, subcommand) {
 					t.Fatalf("Run(%v) stdout = %q, want to contain %q", testCase.args, stdout, subcommand)
 				}
+			}
+		})
+	}
+}
+
+func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var calls []string
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			calls = append(calls, command+" "+strings.Join(args, " "))
+			switch strings.Join(args, " ") {
+			case "auth status --hostname github.com":
+				return commandExecutionResult{}, nil
+			case "label list --repo acme/looper --limit 1000 --json name,color,description":
+				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			default:
+				t.Fatalf("unexpected command: %s %s", command, strings.Join(args, " "))
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--dry-run", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(labels init --dry-run) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
+	}
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=3 updated=0 skipped=1 failed=0"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
+		}
+	}
+	for _, call := range calls {
+		if strings.Contains(call, "label create") || strings.Contains(call, "label edit") {
+			t.Fatalf("dry run executed mutation command: %s", call)
+		}
+	}
+}
+
+func TestLabelsInitRequiresAuthenticatedGH(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			if strings.Join(args, " ") != "auth status --hostname github.com" {
+				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not logged in"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(labels init unauthenticated) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("Run(labels init unauthenticated) stdout = %q, want empty string", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "gh is not authenticated; run `gh auth login` and retry") {
+		t.Fatalf("stderr = %q, want actionable auth error", stderr.String())
+	}
+}
+
+func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return t.TempDir(), nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			switch strings.Join(args, " ") {
+			case "auth status --hostname github.com":
+				return commandExecutionResult{}, nil
+			case "label list --repo acme/looper --limit 1000 --json name,color,description":
+				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+				return commandExecutionResult{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by integration"}, nil
+			case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			default:
+				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"labels", "init", "--repo", "acme/looper", "--gh-path", "/fake/gh", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(labels init) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
+		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+		t.Fatalf("stdout = %q, want failed summary", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
+		t.Fatalf("stderr = %q, want command failure", stderr.String())
+	}
+}
+
+func TestLabelsAuthHostname(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "empty", repo: "", want: "github.com"},
+		{name: "owner name", repo: "acme/looper", want: "github.com"},
+		{name: "host owner name", repo: "github.example.com/acme/looper", want: "github.example.com"},
+		{name: "trim host", repo: " github.example.com/acme/looper ", want: "github.example.com"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := labelsAuthHostname(tc.repo); got != tc.want {
+				t.Fatalf("labelsAuthHostname(%q) = %q, want %q", tc.repo, got, tc.want)
 			}
 		})
 	}
@@ -601,6 +768,251 @@ func TestConfigShowWithoutJSONPrintsJSON(t *testing.T) {
 	assertJSONContains(t, stdout, "server", map[string]any{"authMode": "none"})
 }
 
+func TestConfigSetGetUnsetAllowRiskyFixes(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, stdout, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Set defaults.allowRiskyFixes") {
+		t.Fatalf("stdout = %q, want set confirmation", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "get", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config get ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.TrimSpace(stdout) != "true" {
+		t.Fatalf("stdout = %q, want true", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "unset", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config unset ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Unset defaults.allowRiskyFixes") {
+		t.Fatalf("stdout = %q, want unset confirmation", stdout)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "allowRiskyFixes") {
+		t.Fatalf("config = %s, want allowRiskyFixes removed", raw)
+	}
+}
+
+func TestConfigGetReadsConfigFileLayer(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+	t.Setenv("LOOPER_FIX_ALL_PULL_REQUESTS", "true")
+
+	exitCode, stdout, stderr := runApp(t, "config", "get", "defaults.fixAllPullRequests", "--fix-all-pull-requests", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config get ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.TrimSpace(stdout) != "false" {
+		t.Fatalf("stdout = %q, want config file value false", stdout)
+	}
+}
+
+func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.missing", "true", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid key]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "unsupported config key") {
+		t.Fatalf("stderr = %q, want unsupported key", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "defaults.allowRiskyFixes", "maybe", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid value]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "not a boolean") {
+		t.Fatalf("stderr = %q, want boolean error", stderr)
+	}
+}
+
+func TestConfigValidateAndShowSource(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, stdout, stderr := runApp(t, "config", "validate", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid") {
+		t.Fatalf("stdout = %q, want validation confirmation", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	allowRisky, ok := fields["defaults.allowRiskyFixes"].(map[string]any)
+	if !ok {
+		t.Fatalf("defaults.allowRiskyFixes = %#v, want object", fields["defaults.allowRiskyFixes"])
+	}
+	if got, want := allowRisky["source"], "config-file"; got != want {
+		t.Fatalf("source = %#v, want %#v", got, want)
+	}
+	if got, want := allowRisky["value"], false; got != want {
+		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+}
+
+func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": true, "throttleWindowSeconds": 60},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes": false,
+		},
+	})
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "validate", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+}
+
+func TestConfigSetRejectsWriteWhenEnabledOsascriptNotificationsLackResolvedPath(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, invalidOsascriptNotificationConfigPayload(false))
+	t.Setenv("LOOPER_CONFIG", writeEditableCLIConfig(t))
+
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config before set: %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after set: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed after failed set\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestConfigUnsetRejectsWriteWhenEnabledOsascriptNotificationsLackResolvedPath(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, invalidOsascriptNotificationConfigPayload(true))
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config before unset: %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "unset", "defaults.allowRiskyFixes", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config unset ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after unset: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed after failed unset\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestConfigEditRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+	editorPath := filepath.Join(t.TempDir(), "editor.sh")
+	editorScript := `#!/bin/sh
+cat > "$1" <<'EOF'
+{"notifications":{"osascript":{"enabled":true,"throttleWindowSeconds":60}},"defaults":{"allowRiskyFixes":false}}
+EOF
+`
+	if err := os.WriteFile(editorPath, []byte(editorScript), 0o755); err != nil {
+		t.Fatalf("write editor script: %v", err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, func(file string) (string, error) {
+		return "", exec.ErrNotFound
+	}, "config", "edit", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config edit]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "tools.osascriptPath") || !strings.Contains(stderr, "notifications.osascript.enabled is true") {
+		t.Fatalf("stderr = %q, want osascript validation error", stderr)
+	}
+}
+
+func invalidOsascriptNotificationConfigPayload(allowRiskyFixes bool) map[string]any {
+	return map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": true, "throttleWindowSeconds": 60},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes": allowRiskyFixes,
+		},
+	}
+}
+
+func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.fixAllPullRequests", "false", "--fix-all-pull-requests", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set with override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --fix-all-pull-requests is set") {
+		t.Fatalf("stderr = %q, want override warning", stderr)
+	}
+}
+
 func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 	t.Parallel()
 
@@ -683,6 +1095,77 @@ func TestPSWithoutJSONShowsRunningLoopWithoutRunRow(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([ps]) stdout = %q, want to contain %q", stdout, want)
 		}
+	}
+}
+
+func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/runs/active/stop-all"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all", map[string]any{"summary": map[string]any{"total": 1, "stopped": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{{"seq": 12, "type": "worker", "loopId": "loop_12", "runId": "run_12", "executionId": "exec_12", "result": "stopped"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop all]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop all]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Stopped running tasks", "loop_12", "worker", "stopped"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop all]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_empty", map[string]any{"summary": map[string]any{"total": 0, "stopped": 0, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop all]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop all]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "No running tasks to stop.\n"; got != want {
+		t.Fatalf("Run([stop all]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_partial", map[string]any{"summary": map[string]any{"total": 2, "stopped": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 1}, "items": []map[string]any{{"seq": 1, "type": "planner", "loopId": "loop_1", "runId": "run_1", "executionId": "exec_1", "result": "stopped"}, {"seq": 2, "type": "reviewer", "loopId": "loop_2", "runId": "run_2", "executionId": "exec_2", "result": "failed", "error": "signal failed"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatal("Run([stop all]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stdout, "Stopped running tasks") || !strings.Contains(stdout, "signal failed") {
+		t.Fatalf("Run([stop all]) stdout = %q, want summary and failure row", stdout)
+	}
+	if !strings.Contains(stderr, "failed to stop 1 running task(s)") {
+		t.Fatalf("Run([stop all]) stderr = %q, want partial failure message", stderr)
 	}
 }
 
@@ -1653,6 +2136,34 @@ func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
 		t.Fatalf("write config: %v", err)
 	}
 
+	return configPath
+}
+
+func writeEditableCLIConfig(t *testing.T) string {
+	t.Helper()
+
+	return writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes":    false,
+			"fixAllPullRequests": false,
+		},
+	})
+}
+
+func writeEditableCLIConfigWithPayload(t *testing.T, configPayload map[string]any) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 	return configPath
 }
 

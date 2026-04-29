@@ -322,7 +322,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		ListOpenPullRequests: func(ctx context.Context, input projects.ListOpenPullRequestsInput) ([]projects.PullRequestSummary, error) {
-			pullRequests, err := githubGateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
+			pullRequests, err := githubGateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Timeout: input.Timeout})
 			if err != nil {
 				return nil, err
 			}
@@ -334,6 +334,9 @@ func (r *Runtime) start(ctx context.Context) error {
 		},
 		CapturePullRequestSnapshot: func(ctx context.Context, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+		},
+		AsyncSnapshotQueueEnabled: func() bool {
+			return r.customSchedulerTick || r.config.Agent.Vendor != nil
 		},
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}

@@ -198,7 +198,8 @@
             "allowAutoMerge": false,
             "allowRiskyFixes": false,
             "fixAllPullRequests": false,
-            "openPrStrategy": "all_done"
+            "openPrStrategy": "all_done",
+            "addSnapshotMode": "full"
           },
           "projects": []
         },
@@ -594,6 +595,8 @@
           "updatedAt": "2026-04-11T12:00:00.000Z",
           "discoveredPullRequests": 1,
           "discoveredWorktrees": 2,
+          "pendingSnapshots": 0,
+          "capturedSnapshots": 1,
           "warnings": []
         },
         "requestId": "fixture-request-id"

@@ -52,6 +52,18 @@
           "throttleWindowSeconds": 60
         }
       },
+      "disclosure": {
+        "enabled": true,
+        "includeAgent": true,
+        "includeOS": false,
+        "channels": {
+          "gitCommit": true,
+          "pullRequest": true,
+          "issueComment": true,
+          "reviewComment": true,
+          "inlineCommentVisible": false
+        }
+      },
       "tools": {
         "gitPath": "/envonly/git",
         "ghPath": "/envonly/gh",
@@ -76,7 +88,8 @@
         "allowAutoMerge": false,
         "allowRiskyFixes": false,
         "fixAllPullRequests": false,
-        "openPrStrategy": "all_done"
+        "openPrStrategy": "all_done",
+        "addSnapshotMode": "full"
       },
       "projects": []
     },

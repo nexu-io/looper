@@ -38,6 +38,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeNotificationConfig(&config.Notifications, *partial.Notifications)
 	}
 
+	if partial.Disclosure != nil {
+		mergeDisclosureConfig(&config.Disclosure, *partial.Disclosure)
+	}
+
 	if partial.Tools != nil {
 		mergeToolPathsConfig(&config.Tools, *partial.Tools)
 	}
@@ -170,6 +174,42 @@ func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, parti
 	}
 }
 
+func mergeDisclosureConfig(config *DisclosureConfig, partial PartialDisclosureConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+
+	if partial.IncludeAgent != nil {
+		config.IncludeAgent = *partial.IncludeAgent
+	}
+
+	if partial.IncludeOS != nil {
+		config.IncludeOS = *partial.IncludeOS
+	}
+
+	if partial.Channels != nil {
+		mergeDisclosureChannelsConfig(&config.Channels, *partial.Channels)
+	}
+}
+
+func mergeDisclosureChannelsConfig(config *DisclosureChannelsConfig, partial PartialDisclosureChannelsConfig) {
+	if partial.GitCommit != nil {
+		config.GitCommit = *partial.GitCommit
+	}
+	if partial.PullRequest != nil {
+		config.PullRequest = *partial.PullRequest
+	}
+	if partial.IssueComment != nil {
+		config.IssueComment = *partial.IssueComment
+	}
+	if partial.ReviewComment != nil {
+		config.ReviewComment = *partial.ReviewComment
+	}
+	if partial.InlineCommentVisible != nil {
+		config.InlineCommentVisible = *partial.InlineCommentVisible
+	}
+}
+
 func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfig) {
 	if partial.GitPath != nil {
 		config.GitPath = stringPtr(*partial.GitPath)
@@ -255,6 +295,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 
 	if partial.OpenPRStrategy != nil {
 		config.OpenPRStrategy = *partial.OpenPRStrategy
+	}
+
+	if partial.AddSnapshotMode != nil {
+		config.AddSnapshotMode = *partial.AddSnapshotMode
 	}
 }
 

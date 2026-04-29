@@ -5,4 +5,5 @@ const (
 	QueuePriorityReviewer int64 = 2
 	QueuePriorityFixer    int64 = 2
 	QueuePriorityWorker   int64 = 3
+	QueuePrioritySnapshot int64 = 4
 )

@@ -72,7 +72,8 @@
           "allowAutoApprove": true,
           "allowAutoMerge": true,
           "allowRiskyFixes": true,
-          "openPrStrategy": "first_commit"
+          "openPrStrategy": "first_commit",
+          "addSnapshotMode": "async"
         },
         "projects": [
           {
@@ -130,6 +131,18 @@
           "throttleWindowSeconds": 120
         }
       },
+      "disclosure": {
+        "enabled": true,
+        "includeAgent": true,
+        "includeOS": false,
+        "channels": {
+          "gitCommit": true,
+          "pullRequest": true,
+          "issueComment": true,
+          "reviewComment": true,
+          "inlineCommentVisible": false
+        }
+      },
       "tools": {
         "gitPath": "/cfg/git",
         "ghPath": "/cfg/gh",
@@ -156,7 +169,8 @@
         "allowAutoMerge": true,
         "allowRiskyFixes": true,
         "fixAllPullRequests": false,
-        "openPrStrategy": "first_commit"
+        "openPrStrategy": "first_commit",
+        "addSnapshotMode": "async"
       },
       "projects": [
         {

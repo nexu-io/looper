@@ -72,7 +72,7 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 				if !daemonStarted.Load() {
 					return nil, fmt.Errorf("daemon offline")
 				}
-				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
 				return nil, nil
@@ -121,8 +121,8 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([bootstrap --yes]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("Run([bootstrap --yes]) stderr = %q, want empty string", stderr.String())
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 14 B / 14 B (100%)") {
+		t.Fatalf("Run([bootstrap --yes]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if spawnCalls.Load() != 1 {
 		t.Fatalf("spawnDetached calls = %d, want 1", spawnCalls.Load())
@@ -208,7 +208,7 @@ func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 				if !daemonStarted.Load() {
 					return nil, fmt.Errorf("daemon offline")
 				}
-				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
 				return nil, nil
@@ -256,8 +256,8 @@ func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want empty string", stderr.String())
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 14 B / 14 B (100%)") {
+		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	var decoded bootstrapResult
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
@@ -471,7 +471,7 @@ func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.
 				return nil, nil
 			}
 			if req.URL.String() == "http://daemon.test/api/v1/status" {
-				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil
 			}
 			if req.URL.String() == "http://daemon.test/api/v1/healthz" {
 				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
@@ -564,7 +564,7 @@ func TestBootstrapIdempotentSkipsGitHubWhenManagedDaemonInstalled(t *testing.T) 
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "http://daemon.test/api/v1/status":
-				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil
 			case "http://daemon.test/api/v1/healthz":
 				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
 			default:
@@ -643,7 +643,7 @@ func TestBootstrapAddsProjectWithoutPersistingRuntimeOverrides(t *testing.T) {
 			case "https://api.github.com/repos/powerformer/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
 			case "http://daemon.test/api/v1/status":
-				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true}}}`), nil
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil
 			case "http://daemon.test/api/v1/healthz":
 				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}}`), nil
 			default:
