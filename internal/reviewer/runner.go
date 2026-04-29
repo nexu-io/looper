@@ -1038,7 +1038,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if !found {
-			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureNonRetryable}
+			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = pending.clone()
 		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEvent("AGENT_NATIVE")); err != nil {

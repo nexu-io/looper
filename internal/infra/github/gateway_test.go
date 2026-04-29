@@ -226,6 +226,31 @@ func TestGatewayResolveReviewThreadReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestGatewayHasReviewMarkerIgnoresIssueComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api --paginate repos/acme/looper/pulls/42/reviews":
+			return shell.Result{Stdout: `[{"body":"review without marker"}]`}, nil
+		case "api --paginate repos/acme/looper/issues/42/comments":
+			t.Fatalf("HasReviewMarker must not accept markers from issue comments")
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc"})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if found {
+		t.Fatal("HasReviewMarker() = true, want false without marker in PR reviews")
+	}
+}
+
 func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

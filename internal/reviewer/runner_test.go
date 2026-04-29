@@ -589,7 +589,7 @@ func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemFailsWhenAgentReviewMarkerMissing(t *testing.T) {
+func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
@@ -607,8 +607,8 @@ func TestProcessClaimedItemFailsWhenAgentReviewMarkerMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "no matching GitHub review marker") {
-		t.Fatalf("result = %#v, want non-retryable missing marker failure", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+		t.Fatalf("result = %#v, want retryable missing marker failure", result)
 	}
 }
 

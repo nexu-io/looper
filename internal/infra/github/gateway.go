@@ -557,14 +557,7 @@ func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerI
 	if err != nil {
 		return false, err
 	}
-	if jsonBodiesContainMarker(reviewsResult.Stdout, input.Marker) {
-		return true, nil
-	}
-	commentsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.PRNumber))
-	if err != nil {
-		return false, err
-	}
-	return jsonBodiesContainMarker(commentsResult.Stdout, input.Marker), nil
+	return jsonBodiesContainMarker(reviewsResult.Stdout, input.Marker), nil
 }
 
 func jsonBodiesContainMarker(raw string, marker string) bool {
