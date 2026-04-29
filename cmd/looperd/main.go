@@ -320,12 +320,15 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 
 		_, err := stopLoop(ctx, services, candidate.Loop.ID, reason, now, signal, executionMatchesProcess)
 		if err != nil {
+			stopErr := err
 			if candidate.Execution != nil && candidate.Execution.Status == "running" {
-				err = stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess)
+				if fallbackErr := stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess); fallbackErr != nil {
+					err = errors.Join(stopErr, fallbackErr)
+				} else {
+					err = stopErr
+				}
 			}
-			if err == nil {
-				item.Result = string(stopAllResultStopped)
-			} else if refreshed, refreshErr := refreshStopAllCandidate(ctx, services.Repositories, candidate.Loop.ID); refreshErr == nil {
+			if refreshed, refreshErr := refreshStopAllCandidate(ctx, services.Repositories, candidate.Loop.ID); refreshErr == nil {
 				refreshedResult := classifyStopAllResult(refreshed)
 				if refreshedResult == stopAllResultAlreadyFinished || refreshedResult == stopAllResultAlreadyStopping {
 					item.Result = string(refreshedResult)
