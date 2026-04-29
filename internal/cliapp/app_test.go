@@ -390,6 +390,46 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 	assertJSONContains(t, stdout, "id", "project_1")
 }
 
+func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	wantRepoPath := filepath.Join(root, "repo")
+	wantWorktreeRoot := filepath.Join(root, "worktrees")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("request method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got := body["repoPath"]; got != wantRepoPath {
+			t.Fatalf("body.repoPath = %#v, want %#v", got, wantRepoPath)
+		}
+		if got := body["worktreeRoot"]; got != wantWorktreeRoot {
+			t.Fatalf("body.worktreeRoot = %#v, want %#v", got, wantWorktreeRoot)
+		}
+
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "project_1", "repoPath": wantRepoPath}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "project", "add", "repo", "--worktree-root", "worktrees", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project add relative paths --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project add relative paths --json]) stderr = %q, want empty string", stderr)
+	}
+}
+
 func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
 	t.Parallel()
 

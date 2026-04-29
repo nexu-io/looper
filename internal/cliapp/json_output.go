@@ -61,17 +61,34 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		if repoPath == "" && len(args) > 0 {
 			repoPath = strings.TrimSpace(args[0])
 		}
+		repoPath, err := absolutePathIfSet(repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve repo path: %w", err)
+		}
+
+		worktreeRoot, err := absolutePathIfSet(getStringFlag(cmd, "worktree-root"))
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree root: %w", err)
+		}
 
 		body := map[string]any{}
 		setString(body, "repoPath", repoPath)
 		setString(body, "id", getStringFlag(cmd, "id"))
 		setString(body, "name", getStringFlag(cmd, "name"))
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
-		setString(body, "worktreeRoot", getStringFlag(cmd, "worktree-root"))
+		setString(body, "worktreeRoot", worktreeRoot)
 		setString(body, "repo", getStringFlag(cmd, "repo"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
 	}, writeHumanProjectAdd)
+}
+
+func absolutePathIfSet(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", nil
+	}
+	return filepath.Abs(trimmed)
 }
 
 func (r *commandRuntime) projectRemove(cmd *cobra.Command, args []string) error {

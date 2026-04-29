@@ -122,7 +122,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
-	configPath := filepath.Join(t.TempDir(), "config.json")
+	configPath, daemonWorkingDir := writeDaemonStartConfig(t)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	spawned := struct {
@@ -143,7 +143,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 		Stderr:  stderr,
 		HomeDir: homeDir,
 		Getwd: func() (string, error) {
-			return "/tmp/workspace", nil
+			return "/tmp/start-directory", nil
 		},
 		ReadFile: func(path string) ([]byte, error) {
 			return nil, os.ErrNotExist
@@ -202,8 +202,8 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if got, want := strings.Join(spawned.args, "\n"), strings.Join([]string{"--config", configPath, "--port", "9999", "--db-path", "/tmp/looper.sqlite"}, "\n"); got != want {
 		t.Fatalf("spawned.args = %#v, want %#v", spawned.args, []string{"--config", configPath, "--port", "9999", "--db-path", "/tmp/looper.sqlite"})
 	}
-	if spawned.cwd != "/tmp/workspace" {
-		t.Fatalf("spawned.cwd = %q, want %q", spawned.cwd, "/tmp/workspace")
+	if spawned.cwd != daemonWorkingDir {
+		t.Fatalf("spawned.cwd = %q, want %q", spawned.cwd, daemonWorkingDir)
 	}
 	if got, want := mkdirPath, filepath.Join(homeDir, ".looper"); got != want {
 		t.Fatalf("mkdirPath = %q, want %q", got, want)
@@ -220,6 +220,39 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Started looperd") {
 		t.Fatalf("stdout = %q, want start confirmation", stdout.String())
 	}
+}
+
+func writeDaemonStartConfig(t *testing.T) (string, string) {
+	t.Helper()
+
+	root := t.TempDir()
+	logDir := filepath.Join(root, "logs")
+	workingDir := filepath.Join(root, "working")
+	storageDir := filepath.Join(root, "storage")
+	for _, path := range []string{logDir, workingDir, storageDir} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", path, err)
+		}
+	}
+
+	configPath := filepath.Join(root, "config.json")
+	payload := map[string]any{
+		"daemon": map[string]any{
+			"logDir":           logDir,
+			"workingDirectory": workingDir,
+		},
+		"storage": map[string]any{
+			"dbPath": filepath.Join(storageDir, "looper.sqlite"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+	return configPath, workingDir
 }
 
 func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {

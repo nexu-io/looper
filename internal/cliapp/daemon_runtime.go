@@ -108,6 +108,10 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	_ = args
 
 	ctx := cmd.Context()
+	loaded, err := r.loadConfig()
+	if err != nil {
+		return err
+	}
 	binary, err := r.resolveDaemonBinary(ctx)
 	if err != nil {
 		return err
@@ -144,10 +148,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	cwd, err := r.getwd()
-	if err != nil {
-		return fmt.Errorf("determine current working directory: %w", err)
-	}
+	cwd := loaded.Config.Daemon.WorkingDirectory
 
 	pid, err := r.spawnDetached(binary.Path, ExtractConfigArgs(r.argv), cwd, os.Environ())
 	if err != nil {
