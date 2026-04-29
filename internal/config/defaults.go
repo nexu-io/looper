@@ -88,19 +88,8 @@ func DefaultConfig(cwd string) (Config, error) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		Disclosure: DisclosureConfig{
-			Enabled:      true,
-			IncludeAgent: true,
-			IncludeOS:    false,
-			Channels: DisclosureChannelsConfig{
-				GitCommit:            true,
-				PullRequest:          true,
-				IssueComment:         true,
-				ReviewComment:        true,
-				InlineCommentVisible: false,
-			},
-		},
-		Tools: ToolPathsConfig{},
+		Disclosure: DefaultDisclosureConfig(),
+		Tools:      ToolPathsConfig{},
 		Daemon: DaemonConfig{
 			Mode:              DaemonModeForeground,
 			LogDir:            logDir,
@@ -125,6 +114,21 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil
+}
+
+func DefaultDisclosureConfig() DisclosureConfig {
+	return DisclosureConfig{
+		Enabled:      true,
+		IncludeAgent: true,
+		IncludeOS:    false,
+		Channels: DisclosureChannelsConfig{
+			GitCommit:            true,
+			PullRequest:          true,
+			IssueComment:         true,
+			ReviewComment:        true,
+			InlineCommentVisible: false,
+		},
+	}
 }
 
 func stringPtr(value string) *string {
