@@ -1756,6 +1756,25 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailable(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", true, false, config.DefaultDisclosureConfig(), "opencode", "", "")
+
+	if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
+		t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
+	}
+	for _, forbidden := range []string{
+		"When submitting through",
+		"'' review submit",
+		" review submit acme/looper#42",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("prompt contains unavailable submit-path instruction %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
 func TestBuildReviewPromptIncludesAnchorableDiffLocations(t *testing.T) {
 	t.Parallel()
 

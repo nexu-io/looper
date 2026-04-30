@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -63,17 +64,33 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run})
 	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	var anchors *diffanchor.Index
 	if err != nil {
+		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
+			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, event, payload, commitID, cwd)
+		}
 		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
 	}
+	parsedAnchors := diffanchor.Parse(diff)
+	anchors = &parsedAnchors
 
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	anchors := diffanchor.Parse(diff)
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: &anchors, CWD: cwd}); err != nil {
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, CWD: cwd}); err != nil {
 		return fmt.Errorf("submit validated PR review: %w", err)
+	}
+	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
+	return errors.Is(err, githubinfra.ErrDiffTooLarge) && len(comments) == 0
+}
+
+func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string) error {
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, CWD: cwd}); err != nil {
+		return fmt.Errorf("submit PR review without anchor validation: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
 }

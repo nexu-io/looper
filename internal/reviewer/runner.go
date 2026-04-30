@@ -1711,8 +1711,10 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: submit exactly one PR review for this run through the trusted Looper CLI at `%s review submit %s#%d --event COMMENT|APPROVE --commit-id %s`, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), repo, prNumber)
+	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+		submitPayloadInstruction = ""
 	}
 	parts = append(parts,
 		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
@@ -1736,7 +1738,6 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
 		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
-		fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand),
 		"For actionable reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
@@ -1747,6 +1748,9 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
 		"If the review is clean, write a warm, specific LGTM review body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
 	)
+	if submitPayloadInstruction != "" {
+		parts = append(parts, submitPayloadInstruction)
+	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
