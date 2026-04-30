@@ -725,6 +725,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			}
 			return string(*cfg.Agent.Vendor)
 		}(),
+		LooperCLIPath:    derefString(cfg.Tools.LooperPath),
 		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),

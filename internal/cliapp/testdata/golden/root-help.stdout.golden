@@ -35,5 +35,6 @@ Flags:
   --host <host>               Server host
   --json                      Emit JSON output
   --log-dir <path>            Daemon log directory
+  --looper-path <path>        Looper CLI path
   --osascript-path <path>     osascript binary path
   --port <port>               Server port

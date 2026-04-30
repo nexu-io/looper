@@ -106,6 +106,29 @@ func TestParseMarkdownHeadingContext(t *testing.T) {
 	}
 }
 
+func TestFormatPromptSectionTruncatedDiffRemainsAuthoritative(t *testing.T) {
+	t.Parallel()
+	diff := strings.Join([]string{
+		"diff --git a/a.txt b/a.txt",
+		"@@ -1,3 +1,3 @@",
+		"-old a",
+		"+new a",
+		" keep a",
+		"diff --git a/b.txt b/b.txt",
+		"@@ -1,3 +1,3 @@",
+		"-old b",
+		"+new b",
+		" keep b",
+	}, "\n") + "\n"
+	section := Parse(diff).FormatPromptSection(1)
+	if strings.Contains(section, "Use only these path/side/line ranges") {
+		t.Fatalf("truncated prompt section must not claim listed ranges are exclusive:\n%s", section)
+	}
+	if !strings.Contains(section, "the full PR diff remains authoritative for anchor validation") {
+		t.Fatalf("truncated prompt section must identify the full diff as authoritative:\n%s", section)
+	}
+}
+
 func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 	t.Parallel()
 	if got := ValidateTopLevelLocation("This has concerns and should be improved."); !got.QualityFlagged {

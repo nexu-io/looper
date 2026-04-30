@@ -288,17 +288,22 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 			}),
 			newCommand(commandSpec{
-				use:   "review <pr>",
-				short: "Create a reviewer task for a pull request",
-				args:  cobra.ExactArgs(1),
-				runE:  runtime.reviewCreate,
+				use:             "review <pr>",
+				short:           "Create a reviewer task for a pull request",
+				args:            cobra.ExactArgs(1),
+				runE:            runtime.reviewCreate,
+				helpSubcommands: []helpSubcommand{{name: "submit", description: "Submit a validated PR review payload"}},
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
 				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA")}}),
+				},
 				exampleLines: []string{
 					"$ looper review 123",
 					"$ looper review acme/looper#42 --loop",
+					"$ looper review submit acme/looper#42 --event COMMENT --commit-id abc123 < review.json",
 				},
 			}),
 			newCommand(commandSpec{
@@ -540,6 +545,7 @@ func globalFlags() []flagSpec {
 		stringFlag("daemon-mode", "mode", "Daemon mode"),
 		stringFlag("git-path", "path", "Git binary path"),
 		stringFlag("gh-path", "path", "GitHub CLI path"),
+		stringFlag("looper-path", "path", "Looper CLI path"),
 		stringFlag("osascript-path", "path", "osascript binary path"),
 		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
 	}
@@ -596,6 +602,7 @@ var configFlagNames = map[string]struct{}{
 	"daemon-mode":           {},
 	"git-path":              {},
 	"gh-path":               {},
+	"looper-path":           {},
 	"osascript-path":        {},
 	"fix-all-pull-requests": {},
 }

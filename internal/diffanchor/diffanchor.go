@@ -159,7 +159,7 @@ func (idx Index) FormatPromptSection(limit int) string {
 	if limit <= 0 || limit > len(idx.Ranges) {
 		limit = len(idx.Ranges)
 	}
-	lines := []string{"ANCHORABLE DIFF LOCATIONS", "Use only these path/side/line ranges for inline review comments; downgrade anything outside them to a top-level comment with explicit location context."}
+	lines := []string{"ANCHORABLE DIFF LOCATIONS", "Use these path/side/line ranges for inline review comments; downgrade anything outside the full PR diff's anchorable locations to a top-level comment with explicit location context."}
 	for i := 0; i < limit; i++ {
 		r := idx.Ranges[i]
 		lineRange := fmt.Sprintf("%d", r.Start)
@@ -176,7 +176,7 @@ func (idx Index) FormatPromptSection(limit int) string {
 		lines = append(lines, strings.Join(parts, " | "))
 	}
 	if limit < len(idx.Ranges) {
-		lines = append(lines, fmt.Sprintf("- ... %d additional anchorable ranges omitted for brevity", len(idx.Ranges)-limit))
+		lines = append(lines, fmt.Sprintf("- ... %d additional anchorable ranges omitted for brevity; the full PR diff remains authoritative for anchor validation", len(idx.Ranges)-limit))
 	}
 	return strings.Join(lines, "\n")
 }

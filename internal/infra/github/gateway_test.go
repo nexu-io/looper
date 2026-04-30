@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/infra/shell"
 )
 
@@ -207,6 +208,30 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		if !strings.Contains(runner.stdin, needle) {
 			t.Fatalf("review stdin missing %q\n%s", needle, runner.stdin)
 		}
+	}
+}
+
+func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		runner.stdin = options.Stdin
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	anchors := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Valid", Path: " app.go ", Line: 1, Side: " right "}, {Body: "Invalid", Path: "missing.go", Line: 99, Side: "RIGHT"}}, Anchors: &anchors}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if !strings.Contains(runner.stdin, `"path":"app.go"`) || strings.Contains(runner.stdin, `"path":" app.go "`) {
+		t.Fatalf("review payload did not publish trimmed valid path:\n%s", runner.stdin)
+	}
+	if strings.Contains(runner.stdin, `"path":"missing.go"`) || !strings.Contains(runner.stdin, "Invalid") || !strings.Contains(runner.stdin, "Downgraded from inline review comment") {
+		t.Fatalf("review payload did not downgrade invalid anchor into body:\n%s", runner.stdin)
 	}
 }
 

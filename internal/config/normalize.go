@@ -219,6 +219,10 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 		config.GHPath = stringPtr(*partial.GHPath)
 	}
 
+	if partial.LooperPath != nil {
+		config.LooperPath = stringPtr(*partial.LooperPath)
+	}
+
 	if partial.OsascriptPath != nil {
 		config.OsascriptPath = stringPtr(*partial.OsascriptPath)
 	}

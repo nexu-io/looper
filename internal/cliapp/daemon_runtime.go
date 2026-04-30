@@ -253,6 +253,7 @@ var forwardedConfigPathFlagNames = map[string]struct{}{
 	"log-dir":        {},
 	"git-path":       {},
 	"gh-path":        {},
+	"looper-path":    {},
 	"osascript-path": {},
 }
 
@@ -262,6 +263,7 @@ var daemonSpawnPathEnvNames = map[string]struct{}{
 	"LOOPER_WORKING_DIRECTORY": {},
 	"LOOPER_GIT_PATH":          {},
 	"LOOPER_GH_PATH":           {},
+	"LOOPER_LOOPER_PATH":       {},
 	"LOOPER_OSASCRIPT_PATH":    {},
 }
 
