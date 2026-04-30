@@ -43,8 +43,9 @@ type ReviewerStep string
 type ReviewEvent string
 
 const (
-	ReviewEventApprove ReviewEvent = "APPROVE"
-	ReviewEventComment ReviewEvent = "COMMENT"
+	ReviewEventApprove     ReviewEvent = "APPROVE"
+	ReviewEventComment     ReviewEvent = "COMMENT"
+	reviewEventAgentNative ReviewEvent = "AGENT_NATIVE"
 )
 
 type QueueFailureKind string
@@ -944,7 +945,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if result.ParseStatus != "parsed" {
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: ReviewEvent("AGENT_NATIVE"), Summary: result.Summary}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -982,19 +983,28 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, nil
 		}
 	}
-	marker := agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA)
-	found, err := r.github.HasReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
-	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	if !found {
-		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
+	if pending.Event == reviewEventAgentNative {
+		marker := agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA)
+		found, err := r.github.HasReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if !found {
+			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
+		}
 	}
 	checkpoint.PendingReview = pending.clone()
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEvent("AGENT_NATIVE")); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
+	if pending.Event != "" {
+		return pending.Event
+	}
+	return reviewEventAgentNative
 }
 
 func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
