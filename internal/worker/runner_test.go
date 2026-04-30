@@ -230,7 +230,7 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, false, config.DefaultDisclosureConfig())
+	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, false, config.DefaultDisclosureConfig(), "")
 	if err != nil {
 		t.Fatalf("buildWorkerPrompt() error = %v", err)
 	}

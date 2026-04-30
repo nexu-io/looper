@@ -682,6 +682,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:              now,
 		AllowAutoPush:    boolPtr(cfg.Defaults.AllowAutoPush),
 		Disclosure:       &cfg.Disclosure,
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
@@ -716,6 +717,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 		Disclosure:         &cfg.Disclosure,
+		AgentModel:         cfg.Agent.Model,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
@@ -737,6 +739,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
 		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
 		Disclosure:       &cfg.Disclosure,
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {

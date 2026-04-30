@@ -199,7 +199,7 @@
             "allowRiskyFixes": false,
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
-            "addSnapshotMode": "full"
+            "addSnapshotMode": "async"
           },
           "projects": []
         },

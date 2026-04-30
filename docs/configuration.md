@@ -139,7 +139,7 @@ Example minimal `~/.looper/config.json`:
     "allowAutoMerge": false,
     "allowRiskyFixes": false,
     "openPrStrategy": "all_done",
-    "addSnapshotMode": "full"
+    "addSnapshotMode": "async"
   },
   "projects": [
     {
@@ -216,7 +216,7 @@ If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resol
 `looperd` adds local text attribution to externally visible content it generates so collaborators can distinguish agent-assisted actions from human-authored actions. This is only a footer or Git trailer written into GitHub text / commit messages; it is not telemetry and does not send additional machine data anywhere.
 
 - `enabled`: enables disclosure stamps, default `true`
-- `includeAgent`: includes the configured agent vendor, default `true`
+- `includeAgent`: includes the configured agent vendor and configured model, default `true`
 - `includeOS`: includes only the OS family (`macOS`, `Linux`, or `Windows`), default `false`
 - `channels.gitCommit`: add a `Generated-By:` trailer to generated commit bodies without changing commit subjects
 - `channels.pullRequest`: add a Markdown footer to generated PR bodies
@@ -224,7 +224,7 @@ If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resol
 - `channels.reviewComment`: disclose generated review summaries and inline review comments
 - `channels.inlineCommentVisible`: when `false`, inline review comments receive only the hidden marker; when `true`, they receive the visible Markdown footer
 
-Disclosure stamps use an explicit allowlist: product (`looper`), version, runner role, configured agent vendor, and optionally OS family. They do not include hostnames, usernames, local paths, IP or MAC addresses, detailed kernel versions, environment variables, tokens, endpoints, or machine identifiers.
+Disclosure stamps use an explicit allowlist: product (`looper`), version, runner role, configured agent vendor, configured agent model, and optionally OS family. They do not include hostnames, usernames, local paths, IP or MAC addresses, detailed kernel versions, environment variables, tokens, endpoints, or machine identifiers.
 
 ### `tools`
 
@@ -266,7 +266,7 @@ Defaults:
 - `allowAutoMerge`
 - `allowRiskyFixes`
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
-- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request
+- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
 
 Default values:
 
@@ -277,7 +277,23 @@ Default values:
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
 - `openPrStrategy`: `all_done`
-- `addSnapshotMode`: `full`
+- `addSnapshotMode`: `async`
+
+To restore the previous synchronous `project add` behavior for one command:
+
+```bash
+looper project add --snapshot-mode full /absolute/path/to/repo
+```
+
+To restore it by default for all project additions:
+
+```json
+{
+  "defaults": {
+    "addSnapshotMode": "full"
+  }
+}
+```
 
 ### `projects`
 

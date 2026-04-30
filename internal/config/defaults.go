@@ -111,7 +111,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			AllowRiskyFixes:    false,
 			FixAllPullRequests: false,
 			OpenPRStrategy:     OpenPRStrategyAllDone,
-			AddSnapshotMode:    AddSnapshotModeFull,
+			AddSnapshotMode:    AddSnapshotModeAsync,
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

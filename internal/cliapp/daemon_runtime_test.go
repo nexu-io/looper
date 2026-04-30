@@ -127,6 +127,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
 	configPath := writeDaemonCLIConfig(t, "http://daemon.test")
+	daemonWorkingDir := filepath.Join(filepath.Dir(configPath), "working")
 	statusRequests := 0
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
@@ -155,7 +156,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
 		})},
 		Getwd: func() (string, error) {
-			return "/tmp/workspace", nil
+			return "/tmp/start-directory", nil
 		},
 		ReadFile: func(path string) ([]byte, error) {
 			return nil, os.ErrNotExist
@@ -214,8 +215,8 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if got, want := strings.Join(spawned.args, "\n"), strings.Join([]string{"--config", configPath, "--db-path", "/tmp/looper.sqlite"}, "\n"); got != want {
 		t.Fatalf("spawned.args = %#v, want %#v", spawned.args, []string{"--config", configPath, "--db-path", "/tmp/looper.sqlite"})
 	}
-	if spawned.cwd != "/tmp/workspace" {
-		t.Fatalf("spawned.cwd = %q, want %q", spawned.cwd, "/tmp/workspace")
+	if spawned.cwd != daemonWorkingDir {
+		t.Fatalf("spawned.cwd = %q, want %q", spawned.cwd, daemonWorkingDir)
 	}
 	if got, want := mkdirPath, filepath.Join(homeDir, ".looper"); got != want {
 		t.Fatalf("mkdirPath = %q, want %q", got, want)
@@ -232,6 +233,250 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Started looperd") {
 		t.Fatalf("stdout = %q, want start confirmation", stdout.String())
 	}
+}
+
+func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
+	homeDir := t.TempDir()
+	callerDir := t.TempDir()
+	daemonWorkingDir := filepath.Join(t.TempDir(), "daemon-working")
+	if err := os.MkdirAll(daemonWorkingDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(daemonWorkingDir) error = %v", err)
+	}
+	for _, dir := range []string{"logs", "storage"} {
+		if err := os.MkdirAll(filepath.Join(callerDir, dir), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+	}
+	for _, file := range []string{"git", "gh", "osascript"} {
+		if err := os.WriteFile(filepath.Join(callerDir, file), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", file, err)
+		}
+	}
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(callerDir); err != nil {
+		t.Fatalf("Chdir(callerDir) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory error = %v", err)
+		}
+	})
+
+	configPath := filepath.Join(callerDir, "looper.json")
+	payload := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  "http://daemon.test",
+			"authMode": "none",
+		},
+		"daemon": map[string]any{
+			"logDir":           filepath.Join(callerDir, "logs"),
+			"workingDirectory": daemonWorkingDir,
+		},
+		"storage": map[string]any{
+			"dbPath": filepath.Join(callerDir, "storage", "looper.sqlite"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	statusRequests := 0
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var spawnedArgs []string
+	var spawnedCWD string
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			statusRequests++
+			if statusRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
+		})},
+		Getwd: func() (string, error) {
+			return callerDir, nil
+		},
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(managedPath),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = env
+			spawnedArgs = append([]string{}, args...)
+			spawnedCWD = cwd
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			return nil
+		},
+		MkdirAll: func(path string, perm os.FileMode) error {
+			return nil
+		},
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			return nil
+		},
+		Sleep: func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", "./looper.json", "--db-path=./looper.sqlite", "--log-dir", "./logs", "--git-path", "./git", "--gh-path=./gh", "--osascript-path", "./osascript", "--host", "127.0.0.1"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if spawnedCWD != daemonWorkingDir {
+		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, daemonWorkingDir)
+	}
+	want := []string{"--config", filepath.Join(callerDir, "looper.json"), "--db-path=" + filepath.Join(callerDir, "looper.sqlite"), "--log-dir", filepath.Join(callerDir, "logs"), "--git-path", filepath.Join(callerDir, "git"), "--gh-path=" + filepath.Join(callerDir, "gh"), "--osascript-path", filepath.Join(callerDir, "osascript"), "--host", "127.0.0.1"}
+	if got := strings.Join(spawnedArgs, "\n"); got != strings.Join(want, "\n") {
+		t.Fatalf("spawned.args = %#v, want %#v", spawnedArgs, want)
+	}
+}
+
+func TestDaemonStartNormalizesRelativeConfigEnvForSpawn(t *testing.T) {
+	homeDir := t.TempDir()
+	callerDir := t.TempDir()
+	daemonWorkingDir := filepath.Join(t.TempDir(), "daemon-working")
+	if err := os.MkdirAll(daemonWorkingDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(daemonWorkingDir) error = %v", err)
+	}
+	logDir := filepath.Join(callerDir, "logs")
+	storageDir := filepath.Join(callerDir, "storage")
+	for _, dir := range []string{logDir, storageDir, filepath.Join(callerDir, "env-logs"), filepath.Join(callerDir, "env-working")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+	}
+	for _, file := range []string{"env-git", "env-gh", "env-osascript"} {
+		if err := os.WriteFile(filepath.Join(callerDir, file), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", file, err)
+		}
+	}
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(callerDir); err != nil {
+		t.Fatalf("Chdir(callerDir) error = %v", err)
+	}
+	resolvedCallerDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd(callerDir) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory error = %v", err)
+		}
+	})
+	t.Setenv("LOOPER_CONFIG", "./looper.json")
+	t.Setenv("LOOPER_DB_PATH", "./env-looper.sqlite")
+	t.Setenv("LOOPER_LOG_DIR", "./env-logs")
+	t.Setenv("LOOPER_WORKING_DIRECTORY", "./env-working")
+	t.Setenv("LOOPER_GIT_PATH", "./env-git")
+	t.Setenv("LOOPER_GH_PATH", "./env-gh")
+	t.Setenv("LOOPER_OSASCRIPT_PATH", "./env-osascript")
+
+	configPath := filepath.Join(callerDir, "looper.json")
+	payload := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  "http://daemon.test",
+			"authMode": "none",
+		},
+		"daemon": map[string]any{
+			"logDir":           logDir,
+			"workingDirectory": daemonWorkingDir,
+		},
+		"storage": map[string]any{
+			"dbPath": filepath.Join(storageDir, "looper.sqlite"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	statusRequests := 0
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var spawnedCWD string
+	var spawnedEnv []string
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			statusRequests++
+			if statusRequests == 1 {
+				return nil, os.ErrNotExist
+			}
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"binary":{"name":"looperd"}}}}`), nil
+		})},
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		RunCommand: daemonVersionCommand(managedPath),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			spawnedCWD = cwd
+			spawnedEnv = append([]string{}, env...)
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error { return nil },
+		MkdirAll:    func(path string, perm os.FileMode) error { return nil },
+		WriteFile:   func(path string, data []byte, perm os.FileMode) error { return nil },
+		Sleep:       func(duration time.Duration) {},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if spawnedCWD != filepath.Join(resolvedCallerDir, "env-working") {
+		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, filepath.Join(resolvedCallerDir, "env-working"))
+	}
+	if got, want := envValue(spawnedEnv, "LOOPER_CONFIG"), filepath.Join(resolvedCallerDir, "looper.json"); got != want {
+		t.Fatalf("spawned LOOPER_CONFIG = %q, want %q; env=%#v", got, want, spawnedEnv)
+	}
+	wantEnv := map[string]string{
+		"LOOPER_DB_PATH":           filepath.Join(resolvedCallerDir, "env-looper.sqlite"),
+		"LOOPER_LOG_DIR":           filepath.Join(resolvedCallerDir, "env-logs"),
+		"LOOPER_WORKING_DIRECTORY": filepath.Join(resolvedCallerDir, "env-working"),
+		"LOOPER_GIT_PATH":          filepath.Join(resolvedCallerDir, "env-git"),
+		"LOOPER_GH_PATH":           filepath.Join(resolvedCallerDir, "env-gh"),
+		"LOOPER_OSASCRIPT_PATH":    filepath.Join(resolvedCallerDir, "env-osascript"),
+	}
+	for name, want := range wantEnv {
+		if got := envValue(spawnedEnv, name); got != want {
+			t.Fatalf("spawned %s = %q, want %q; env=%#v", name, got, want, spawnedEnv)
+		}
+	}
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
 }
 
 func TestDaemonStartMissingPIDFileUsesReachableLooperdAPI(t *testing.T) {
