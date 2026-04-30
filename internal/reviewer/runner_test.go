@@ -264,8 +264,8 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 	if result.Status != "skipped" || !strings.Contains(result.Summary, "not requested for review") {
 		t.Fatalf("result = %#v, want skipped not requested", result)
 	}
-	if len(agent.starts) != 0 || len(git.createCalls) != 0 || len(github.submitCalls) != 0 {
-		t.Fatalf("agent starts=%d git creates=%d submit calls=%d, want no review work", len(agent.starts), len(git.createCalls), len(github.submitCalls))
+	if len(agent.starts) != 0 || len(git.createCalls) != 0 {
+		t.Fatalf("agent starts=%d git creates=%d, want no review work", len(agent.starts), len(git.createCalls))
 	}
 }
 
@@ -336,8 +336,8 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWithoutReviewRequest(t *testing
 	if result.Status != "success" {
 		t.Fatalf("result = %#v, want success", result)
 	}
-	if len(agent.starts) != 1 || len(github.submitCalls) != 0 {
-		t.Fatalf("agent starts=%d submit calls=%d, want agent-native review to run without Go publishing", len(agent.starts), len(github.submitCalls))
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want agent-native review to run", len(agent.starts))
 	}
 }
 
@@ -377,64 +377,6 @@ func TestProcessClaimedItemRestartsAutomaticResumeFromDiscoverForFreshReviewRequ
 	}
 	if github.viewCalls == 0 || len(agent.starts) != 1 {
 		t.Fatalf("viewCalls=%d agent starts=%d, want fresh discover and review", github.viewCalls, len(agent.starts))
-	}
-}
-
-func TestProcessClaimedItemPreservesLegacyPublishCheckpointOnAutomaticResume(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
-	agent := &fakeAgentExecutor{}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	loop := storage.LoopRecord{ID: "loop_legacy_publish_resume", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	legacyCheckpoint := reviewerCheckpoint{
-		Detail: &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123"},
-		PendingReview: &pendingReviewCheckpoint{
-			HeadSHA: "abc123",
-			Event:   ReviewEventComment,
-			Body:    "Actionable review",
-			Summary: "Actionable review",
-			Comments: []reviewFeedbackComment{
-				{Body: "Follow-up comment"},
-			},
-			PublishState: &publishState{ReviewSubmitted: true},
-		},
-		ResumePolicy: "advance_from_checkpoint",
-	}
-	legacyRun := storage.RunRecord{ID: "run_legacy_publish", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)), CheckpointJSON: stringPtr(mustMarshalJSON(legacyCheckpoint)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Runs.Upsert(context.Background(), legacyRun); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-	queue, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
-	if err != nil {
-		t.Fatalf("enqueue() error = %v", err)
-	}
-	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claimed == nil || claimed.ID != queue.ID {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
-	}
-
-	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success after publish resume", result)
-	}
-	if len(agent.starts) != 0 {
-		t.Fatalf("agent starts=%d, want no duplicate review", len(agent.starts))
-	}
-	if len(github.submitCalls) != 0 {
-		t.Fatalf("submit calls=%d, want no duplicate review submission", len(github.submitCalls))
-	}
-	if len(github.prComments) != 1 {
-		t.Fatalf("pr comments=%d, want remaining top-level comment", len(github.prComments))
 	}
 }
 
@@ -514,9 +456,6 @@ func TestProcessClaimedItemCompletesAgentNativeReviewWithoutGoPublish(t *testing
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
-	if len(github.submitCalls) != 0 {
-		t.Fatalf("len(github.submitCalls) = %d, want Go to leave review publishing to agent", len(github.submitCalls))
-	}
 	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), firstResult.LoopID)
 	if err != nil {
 		t.Fatalf("Runs.ListByLoop() error = %v", err)
@@ -540,10 +479,10 @@ func TestProcessClaimedItemCompletesAgentNativeReviewWithoutGoPublish(t *testing
 	}
 }
 
-func TestProcessClaimedItemAgentNativeReviewIgnoresGoPublishFailures(t *testing.T) {
+func TestProcessClaimedItemAgentNativeReviewCompletesWithoutGoPublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{submitFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -561,8 +500,8 @@ func TestProcessClaimedItemAgentNativeReviewIgnoresGoPublishFailures(t *testing.
 	if firstResult.Status != "success" {
 		t.Fatalf("first result = %#v, want success", firstResult)
 	}
-	if len(agent.starts) != 1 || len(github.submitCalls) != 0 {
-		t.Fatalf("agent starts=%d submit calls=%d, want agent review without Go publish", len(agent.starts), len(github.submitCalls))
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want agent review", len(agent.starts))
 	}
 }
 
@@ -675,7 +614,7 @@ func TestProcessClaimedItemSkipsAgentNativePublishWhenReviewRequestRemoved(t *te
 func TestProcessClaimedItemRecordsPublishedHeadForAgentNativeReview(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{prCommentFailuresRemaining: 1, reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -693,8 +632,8 @@ func TestProcessClaimedItemRecordsPublishedHeadForAgentNativeReview(t *testing.T
 	if firstResult.Status != "success" {
 		t.Fatalf("first result = %#v, want success", firstResult)
 	}
-	if len(agent.starts) != 1 || len(github.submitCalls) != 0 || len(github.prComments) != 0 {
-		t.Fatalf("agent starts=%d submit calls=%d comments=%d, want agent-native review without Go publish", len(agent.starts), len(github.submitCalls), len(github.prComments))
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want agent-native review", len(agent.starts))
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), firstResult.LoopID)
 	if err != nil {
@@ -705,120 +644,11 @@ func TestProcessClaimedItemRecordsPublishedHeadForAgentNativeReview(t *testing.T
 	}
 }
 
-func TestRunPublishStepTransitionsSpecLabelsWhenReviewRequestRemovedAfterSubmit(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
-	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if err != nil || project == nil {
-		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
-	}
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	loop := storage.LoopRecord{ID: "loop_spec_publish", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-
-	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
-		Project:  *project,
-		Loop:     loop,
-		Run:      storage.RunRecord{ID: "run_spec_publish"},
-		Repo:     repo,
-		PRNumber: prNumber,
-		Checkpoint: reviewerCheckpoint{
-			Detail:   &checkpointDetail{Labels: []string{specpr.ReviewingLabel}},
-			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
-			PendingReview: (&pendingReviewCheckpoint{
-				HeadSHA: "abc123",
-				Event:   ReviewEventApprove,
-				Summary: "Looks good",
-				Clean:   true,
-				PublishState: &publishState{
-					ReviewSubmitted: true,
-				},
-			}).clone(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("runPublishStep() error = %v", err)
-	}
-	if checkpoint.SkipReason == "" || !contains(checkpoint.SkipReason, "current user is not requested for review") {
-		t.Fatalf("SkipReason = %q, want missing review request skip", checkpoint.SkipReason)
-	}
-	if specpr.HasLabel(github.labels, specpr.ReviewingLabel) || !specpr.HasLabel(github.labels, specpr.ReadyLabel) {
-		t.Fatalf("labels after skipped publish = %#v, want reviewing removed and ready added", github.labels)
-	}
-	if len(github.removedLabels) != 1 || len(github.addedLabels) != 1 {
-		t.Fatalf("removedLabels=%#v addedLabels=%#v, want one transition", github.removedLabels, github.addedLabels)
-	}
-	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
-	if err != nil {
-		t.Fatalf("Loops.GetByID() error = %v", err)
-	}
-	if updated == nil || updated.MetadataJSON == nil || !contains(*updated.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop after skipped publish = %#v, want lastPublishedHeadSha recorded", updated)
-	}
-}
-
-func TestRunPublishStepAddsDefaultCleanReviewBodyAndThumbsUp(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
-	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if err != nil || project == nil {
-		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
-	}
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	loop := storage.LoopRecord{ID: "loop_clean_review_body", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-
-	_, err = runner.runPublishStep(context.Background(), stepInput{
-		Project:  *project,
-		Loop:     loop,
-		Run:      storage.RunRecord{ID: "run_clean_review_body"},
-		Repo:     repo,
-		PRNumber: prNumber,
-		Checkpoint: reviewerCheckpoint{
-			Detail:   &checkpointDetail{HeadSHA: "abc123"},
-			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
-			PendingReview: (&pendingReviewCheckpoint{
-				HeadSHA: "abc123",
-				Event:   ReviewEventApprove,
-				Summary: "Looks good",
-				Clean:   true,
-			}).clone(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("runPublishStep() error = %v", err)
-	}
-	if len(github.submitCalls) != 1 {
-		t.Fatalf("submitCalls = %#v, want one clean review", github.submitCalls)
-	}
-	if github.submitCalls[0].Event != ReviewEventApprove {
-		t.Fatalf("event = %q, want approve", github.submitCalls[0].Event)
-	}
-	if !strings.Contains(github.submitCalls[0].Body, "LGTM 👍") || !strings.Contains(github.submitCalls[0].Body, "Nice work") {
-		t.Fatalf("review body = %q, want default LGTM praise", github.submitCalls[0].Body)
-	}
-	if len(github.addedReactions) != 1 || github.addedReactions[0].Content != "+1" {
-		t.Fatalf("addedReactions = %#v, want +1 reaction", github.addedReactions)
-	}
-}
-
 func TestProcessClaimedItemAgentNativeReviewCompletesWithoutPublishRetry(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	fixture.repos.Locks.SetNow(fixture.now)
-	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
+	github := &fakeGitHubGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -835,9 +665,6 @@ func TestProcessClaimedItemAgentNativeReviewCompletesWithoutPublishRetry(t *test
 	}
 	if first.Status != "success" {
 		t.Fatalf("first = %#v, want success", first)
-	}
-	if len(github.submitCalls) != 0 {
-		t.Fatalf("len(github.submitCalls) = %d, want Go not to publish review", len(github.submitCalls))
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim1.ID)
 	if err != nil {
@@ -866,11 +693,11 @@ func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *t
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if firstResult.Status != "success" {
-		t.Fatalf("first result = %#v, want agent-native review success", firstResult)
+	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableAfterResume || !contains(firstResult.Summary, "PR head changed before publish") {
+		t.Fatalf("first result = %#v, want retryable head-change failure", firstResult)
 	}
-	if len(agent.starts) != 1 || len(github.submitCalls) != 0 {
-		t.Fatalf("agent starts=%d submit calls=%d, want 1 and 0", len(agent.starts), len(github.submitCalls))
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want 1", len(agent.starts))
 	}
 }
 
@@ -1250,7 +1077,7 @@ func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 func TestProcessClaimedItemReturnsWhenCompleteRunFails(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{submitFailuresRemaining: 1}
+	github := &fakeGitHubGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -1378,49 +1205,6 @@ func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *te
 	}
 	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want paused loop with nil next run", loop)
-	}
-}
-
-func TestExtractReviewOutputStripsCompletionMarkerLine(t *testing.T) {
-	t.Parallel()
-
-	stdout := strings.Join([]string{
-		`{"verdict":"clean","body":"","comments":[]}`,
-		`__LOOPER_RESULT__={"summary":"ok"}`,
-	}, "\n")
-	output := extractReviewOutput(stdout)
-	if strings.Contains(output, "__LOOPER_RESULT__") {
-		t.Fatalf("output = %q, want marker stripped", output)
-	}
-	parsed, ok := parseStructuredReviewOutput(output)
-	if !ok || !parsed.Clean {
-		t.Fatalf("parsed = %#v, %v, want clean structured review", parsed, ok)
-	}
-}
-
-func TestParseReviewFeedbackDoesNotPublishToolOutputFallback(t *testing.T) {
-	t.Parallel()
-
-	parsed := parseReviewFeedback(AgentResult{
-		Status:  "completed",
-		Summary: "\x1b[0m→ \x1b[0mRead internal/reviewer/runner.go\x1b[90m [offset=1060, limit=70]\x1b[0m",
-		Stdout:  "\x1b[0m→ \x1b[0mRead internal/reviewer/runner.go\x1b[90m [offset=1060, limit=70]\x1b[0m",
-	})
-	if parsed.Body != "" || len(parsed.Comments) != 0 || parsed.Clean {
-		t.Fatalf("parsed = %#v, want no review feedback from tool output fallback", parsed)
-	}
-}
-
-func TestParseReviewFeedbackDoesNotFallbackWhenStructuredJSONInvalid(t *testing.T) {
-	t.Parallel()
-
-	parsed := parseReviewFeedback(AgentResult{
-		Status:  "completed",
-		Summary: "Looks good",
-		Stdout:  `{"verdict":"clean","body":"LGTM","comments":[`,
-	})
-	if parsed.Body != "" || len(parsed.Comments) != 0 || parsed.Clean {
-		t.Fatalf("parsed = %#v, want invalid structured JSON to produce no fallback feedback", parsed)
 	}
 }
 
@@ -1555,255 +1339,6 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 	}
 }
 
-func TestParseStructuredReviewOutputPreservesAgentGeneratedCleanBody(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"clean","body":"LGTM 👍 The spec is crisp, scoped, and gives implementers a clear validation path.","comments":[]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if !parsed.Clean {
-		t.Fatalf("parsed = %#v, want clean review", parsed)
-	}
-	if parsed.Body != "LGTM 👍 The spec is crisp, scoped, and gives implementers a clear validation path." {
-		t.Fatalf("body = %q, want agent-generated clean body preserved", parsed.Body)
-	}
-}
-
-func TestParseStructuredReviewOutputAcceptsBodyOnlyActionableReview(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Cross-cutting feedback","comments":[]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if parsed.Clean || parsed.Body != "Cross-cutting feedback" || len(parsed.Comments) != 0 {
-		t.Fatalf("parsed = %#v, want actionable body-only feedback", parsed)
-	}
-}
-
-func TestParseStructuredReviewOutputRendersStructuredFields(t *testing.T) {
-	t.Parallel()
-
-	output := `{"verdict":"actionable","body":"Review found one issue","comments":[{"severity":"major","category":"spec","body":"Define the role trigger schema","problem":"The spec introduces role-specific triggers without defining the allowed fields.","why":"Implementers cannot preserve config compatibility without knowing defaults and validation behavior.","evidence":"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.","suggestedChange":"Add a schema table with role, event, enabled, conditions, defaults, and validation errors.","path":"specs/role-triggers.md","line":42,"side":"RIGHT"}]}`
-	parsed, ok := parseStructuredReviewOutput(output)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 1 {
-		t.Fatalf("comments = %#v, want one rendered comment", parsed.Comments)
-	}
-	comment := parsed.Comments[0]
-	for _, want := range []string{
-		"**[major/spec]** Define the role trigger schema",
-		"**Problem:** The spec introduces role-specific triggers without defining the allowed fields.",
-		"**Why it matters:** Implementers cannot preserve config compatibility without knowing defaults and validation behavior.",
-		"**Evidence:** The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.",
-		"**Suggested change:** Add a schema table with role, event, enabled, conditions, defaults, and validation errors.",
-	} {
-		if !strings.Contains(comment.Body, want) {
-			t.Fatalf("rendered body missing %q:\n%s", want, comment.Body)
-		}
-	}
-	if comment.Path != "specs/role-triggers.md" || comment.Line != 42 || comment.Side != "RIGHT" {
-		t.Fatalf("comment anchor = %#v, want inline anchor preserved", comment)
-	}
-}
-
-func TestParseStructuredReviewOutputUsesProblemAsBodyWhenBodyEmpty(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","comments":[{"severity":"major","category":"tests","problem":"The retry path has no regression coverage.","why":"A future change could reintroduce duplicate publishing without failing tests.","evidence":"runner_test.go covers successful publish but not retry after partial publish.","suggestedChange":"Add a test that fails the top-level comment publish once and verifies the review body is not resubmitted."}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 1 {
-		t.Fatalf("comments = %#v, want one rendered comment", parsed.Comments)
-	}
-	if !strings.Contains(parsed.Comments[0].Body, "**[major/tests]** The retry path has no regression coverage.") {
-		t.Fatalf("rendered body = %q, want problem promoted to headline", parsed.Comments[0].Body)
-	}
-}
-
-func TestParseStructuredReviewOutputDropsDuplicateTopLevelComments(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":" Please   add tests "},{"body":"Add an integration test"},{"body":"Add an integration test"},{"body":"Please add tests","path":"a.go","line":12,"side":"RIGHT"}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 2 {
-		t.Fatalf("comments = %#v, want distinct top-level plus inline duplicate preserved", parsed.Comments)
-	}
-	if parsed.Comments[0].Body != "Add an integration test" {
-		t.Fatalf("first comment = %#v, want distinct top-level comment", parsed.Comments[0])
-	}
-	if parsed.Comments[1].Path != "a.go" || parsed.Comments[1].Line != 12 || parsed.Comments[1].Side != "RIGHT" {
-		t.Fatalf("second comment = %#v, want inline comment preserved", parsed.Comments[1])
-	}
-}
-
-func TestParseStructuredReviewOutputKeepsDetailedCommentMatchingBodyHeadline(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Please add tests","comments":[{"severity":"major","category":"tests","body":"Please add tests","why":"The retry path can regress without coverage.","evidence":"retry.go has no failure-path test.","suggestedChange":"Add a regression test for retry failure handling."}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 1 {
-		t.Fatalf("comments = %#v, want detailed comment preserved", parsed.Comments)
-	}
-	if !strings.Contains(parsed.Comments[0].Body, "**Why it matters:** The retry path can regress without coverage.") {
-		t.Fatalf("comment body = %q, want detailed sections preserved", parsed.Comments[0].Body)
-	}
-}
-
-func TestParseStructuredReviewOutputDedupesTopLevelCommentsByCanonicalHeadline(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","body":"Add an integration test"},{"body":"Add an integration test"}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 1 {
-		t.Fatalf("comments = %#v, want duplicate top-level comments deduped", parsed.Comments)
-	}
-	if parsed.Comments[0].Body != "**[major/tests]** Add an integration test" {
-		t.Fatalf("comment body = %q, want first canonical duplicate preserved", parsed.Comments[0].Body)
-	}
-}
-
-func TestParseStructuredReviewOutputKeepsTopLevelCommentsWithSameHeadlineDifferentDetails(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"actionable","body":"Overall summary","comments":[{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The retry path can publish duplicate comments.","evidence":"runner.go retries after partial publish.","suggestedChange":"Add a retry regression test."},{"severity":"major","category":"tests","problem":"Add regression coverage","why":"The parser can drop distinct feedback with matching headlines.","evidence":"runner.go dedupes top-level comments.","suggestedChange":"Deduplicate using the full rendered body."}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if len(parsed.Comments) != 2 {
-		t.Fatalf("comments = %#v, want both detailed top-level comments preserved", parsed.Comments)
-	}
-	if !strings.Contains(parsed.Comments[0].Body, "**Why it matters:** The retry path can publish duplicate comments.") {
-		t.Fatalf("first comment body = %q, want first detailed comment preserved", parsed.Comments[0].Body)
-	}
-	if !strings.Contains(parsed.Comments[1].Body, "**Why it matters:** The parser can drop distinct feedback with matching headlines.") {
-		t.Fatalf("second comment body = %q, want second detailed comment preserved", parsed.Comments[1].Body)
-	}
-}
-
-func TestParseStructuredReviewOutputDoesNotDedupeIntoCleanReview(t *testing.T) {
-	t.Parallel()
-
-	parsed, ok := parseStructuredReviewOutput(`{"verdict":"clean","body":"Please add tests","comments":[{"body":"Please add tests"}]}`)
-	if !ok {
-		t.Fatalf("parseStructuredReviewOutput() ok = false, want true")
-	}
-	if parsed.Clean {
-		t.Fatalf("parsed = %#v, want duplicate comment not to convert response into clean review", parsed)
-	}
-	if parsed.Body != "Please add tests" || len(parsed.Comments) != 0 {
-		t.Fatalf("parsed = %#v, want actionable body-only feedback after duplicate cleanup", parsed)
-	}
-}
-
-func TestRunPublishStepSkipsDuplicateTopLevelReviewBodyComment(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
-	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if err != nil || project == nil {
-		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
-	}
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	loop := storage.LoopRecord{ID: "loop_duplicate_top_level", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-
-	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
-		Project:  *project,
-		Loop:     loop,
-		Run:      storage.RunRecord{ID: "run_duplicate_top_level"},
-		Repo:     repo,
-		PRNumber: prNumber,
-		Checkpoint: reviewerCheckpoint{
-			Detail:   &checkpointDetail{HeadSHA: "abc123"},
-			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
-			PendingReview: (&pendingReviewCheckpoint{
-				HeadSHA: "abc123",
-				Event:   ReviewEventComment,
-				Body:    "Please add tests",
-				Summary: "Please add tests",
-				Comments: []reviewFeedbackComment{
-					{Body: "Please add tests"},
-				},
-			}).clone(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("runPublishStep() error = %v", err)
-	}
-	if len(github.submitCalls) != 1 {
-		t.Fatalf("submitCalls = %d, want 1", len(github.submitCalls))
-	}
-	if len(github.prComments) != 0 {
-		t.Fatalf("prComments = %#v, want duplicate top-level comment skipped", github.prComments)
-	}
-	if checkpoint.PendingReview == nil || checkpoint.PendingReview.PublishState == nil || checkpoint.PendingReview.PublishState.TopLevelCommentsPosted != 0 {
-		t.Fatalf("checkpoint pending review = %#v, want duplicate removed before publish", checkpoint.PendingReview)
-	}
-}
-
-func TestRunPublishStepKeepsTopLevelCommentMatchingUnpublishedSummary(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
-	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if err != nil || project == nil {
-		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
-	}
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	loop := storage.LoopRecord{ID: "loop_summary_top_level", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-
-	_, err = runner.runPublishStep(context.Background(), stepInput{
-		Project:  *project,
-		Loop:     loop,
-		Run:      storage.RunRecord{ID: "run_summary_top_level"},
-		Repo:     repo,
-		PRNumber: prNumber,
-		Checkpoint: reviewerCheckpoint{
-			Detail:   &checkpointDetail{HeadSHA: "abc123"},
-			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
-			PendingReview: (&pendingReviewCheckpoint{
-				HeadSHA: "abc123",
-				Event:   ReviewEventComment,
-				Summary: "Please add tests",
-				Comments: []reviewFeedbackComment{
-					{Body: "Please add tests"},
-				},
-			}).clone(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("runPublishStep() error = %v", err)
-	}
-	if len(github.submitCalls) != 0 {
-		t.Fatalf("submitCalls = %d, want no body-only review submission", len(github.submitCalls))
-	}
-	if len(github.prComments) != 1 || github.prComments[0].Body != "Please add tests" {
-		t.Fatalf("prComments = %#v, want top-level comment matching unpublished summary", github.prComments)
-	}
-}
-
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
@@ -1841,17 +1376,9 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	submitFailuresRemaining         int
-	prCommentFailuresRemaining      int
 	changeHeadOnSecondView          bool
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
-	submitCalls                     []SubmitReviewInput
-	addedLabels                     []PullRequestLabelsInput
-	removedLabels                   []PullRequestLabelsInput
-	prComments                      []PullRequestCommentInput
-	addedReactions                  []PullRequestReactionInput
-	removedReactions                []PullRequestReactionInput
 	labels                          []string
 	reviewRequests                  []string
 	currentLogin                    string
@@ -1904,24 +1431,6 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr("base123"), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr("octocat"), ChecksSummary: stringPtr("SUCCESS"), PayloadJSON: stringPtr(`{"diff":"diff --git a/a.ts b/a.ts"}`), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
 }
 
-func (g *fakeGitHubGateway) SubmitReview(_ context.Context, input SubmitReviewInput) error {
-	g.submitCalls = append(g.submitCalls, input)
-	if g.submitFailuresRemaining > 0 {
-		g.submitFailuresRemaining--
-		return fmt.Errorf("temporary GitHub failure")
-	}
-	return nil
-}
-
-func (g *fakeGitHubGateway) AddPullRequestComment(_ context.Context, input PullRequestCommentInput) error {
-	g.prComments = append(g.prComments, input)
-	if g.prCommentFailuresRemaining > 0 {
-		g.prCommentFailuresRemaining--
-		return fmt.Errorf("temporary GitHub comment failure")
-	}
-	return nil
-}
-
 func (g *fakeGitHubGateway) HasReviewMarker(_ context.Context, input VerifyReviewMarkerInput) (bool, error) {
 	if g.reviewMarkerErr != nil {
 		return false, g.reviewMarkerErr
@@ -1939,41 +1448,6 @@ func reviewEventIn(events []ReviewEvent, want ReviewEvent) bool {
 		}
 	}
 	return false
-}
-
-func (g *fakeGitHubGateway) AddPullRequestReaction(_ context.Context, input PullRequestReactionInput) error {
-	g.addedReactions = append(g.addedReactions, input)
-	return nil
-}
-
-func (g *fakeGitHubGateway) RemovePullRequestReaction(_ context.Context, input PullRequestReactionInput) error {
-	g.removedReactions = append(g.removedReactions, input)
-	return nil
-}
-
-func (g *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
-	g.addedLabels = append(g.addedLabels, input)
-	g.labels = append(g.labels, input.Labels...)
-	return nil
-}
-
-func (g *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
-	g.removedLabels = append(g.removedLabels, input)
-	remaining := make([]string, 0, len(g.labels))
-	for _, candidate := range g.labels {
-		remove := false
-		for _, label := range input.Labels {
-			if strings.EqualFold(candidate, label) {
-				remove = true
-				break
-			}
-		}
-		if !remove {
-			remaining = append(remaining, candidate)
-		}
-	}
-	g.labels = remaining
-	return nil
 }
 
 type fakeGitGateway struct {
