@@ -27,7 +27,8 @@ These defaults are useful but hard to adapt. Teams may use different labels, wan
 
 ## Non-goals
 
-- Do not change default labels, reviewer/fixer algorithms, queue semantics, or run processing behavior beyond configurable discovery eligibility.
+- Do not change default labels, reviewer/fixer algorithms, queue semantics, or run processing behavior beyond the explicit reviewer/fixer PR eligibility gates controlled by the new policy fields.
+- `includeDrafts` and reviewer `requireReviewRequest` are PR eligibility policy fields, not scheduler-only hints: scheduler discovery and any reviewer/fixer processing-time eligibility checks for queued PR work must honor the same effective values so discovered work is not later skipped by stale hardcoded gates. `autoDiscovery=false` remains scheduler-only and must not block processing of already queued work.
 - Do not remove or rename `defaults.fixAllPullRequests` in this change.
 - Do not introduce per-project role overrides unless they already fall out naturally from existing config layering; this spec targets global role defaults.
 - Do not change manual role commands or direct `ProcessNext`/`ProcessClaimedQueueItem` behavior.
@@ -196,20 +197,23 @@ Replace hardcoded label/assignee checks with policy-based matching:
 
 #### Reviewer PR discovery
 
-Replace hardcoded draft and review-request checks with policy fields:
+Replace hardcoded draft and review-request checks with policy fields in both scheduler-driven discovery and processing-time reviewer PR eligibility checks:
 
 - `includeDrafts=false` preserves current draft skipping.
 - `requireReviewRequest=true` preserves current requirement that the current user is requested.
+- If `includeDrafts=true`, reviewer processing must not reject an otherwise eligible queued PR only because it is a draft.
+- If `requireReviewRequest=false`, reviewer processing must not reject an otherwise eligible queued PR only because the current user is not requested for review.
 - `includeSpecReviewingLabel=true` with the default label preserves the existing spec-reviewing scan/follow-up path.
 - If `includeSpecReviewingLabel=false`, skip the additional spec-reviewing-label discovery path while leaving normal review-request discovery intact.
 
 #### Fixer PR discovery
 
-Replace `FixAllPullRequests` plumbing in the fixer runner with the new policy:
+Replace `FixAllPullRequests` plumbing in the fixer runner with the new policy in both scheduler-driven discovery and processing-time fixer PR eligibility checks:
 
 - `authorFilter=current_user` preserves the current default.
 - `authorFilter=any` preserves the legacy behavior of `defaults.fixAllPullRequests=true`.
 - `includeDrafts=false` preserves current draft skipping.
+- If `includeDrafts=true`, fixer processing must not reject an otherwise eligible queued PR only because it is a draft.
 - Actionable review item detection, PR lock checks, and non-open PR skipping should remain unchanged.
 
 ### 7. Add CLI/env support for common fields
@@ -230,7 +234,26 @@ Update `internal/cliapp/config_commands.go` so `looper config get/set/unset/show
 - `roles.fixer.triggers.includeDrafts`
 - `roles.fixer.authorFilter`
 
-If environment variables are supported only for a curated set of fields, add predictable names for the common booleans/enums, such as `LOOPER_ROLES_FIXER_AUTHOR_FILTER` and `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`, while preserving the existing `LOOPER_FIX_ALL_PULL_REQUESTS`/CLI legacy behavior.
+Environment variables must use the exact names below for the supported role fields. Precedence remains `defaults -> config file -> env -> CLI`, including the legacy `LOOPER_FIX_ALL_PULL_REQUESTS`/CLI behavior. CLI `looper config set` values and environment variable values should parse identically.
+
+| Role field / config command path | Environment variable | Accepted value format | Parse behavior |
+| --- | --- | --- | --- |
+| `roles.planner.autoDiscovery` | `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.planner.triggers.labels` | `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS` | comma-separated string list, for example `looper:plan,team:alpha`; empty string means an empty list | Split on commas, trim ASCII whitespace from each item, reject empty items after trimming unless the whole value is empty, then apply normal duplicate-label validation. |
+| `roles.planner.triggers.labelMode` | `LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE` | enum: `all` or `any` | Trim ASCII whitespace; parse case-sensitively as the documented enum; reject any other value. |
+| `roles.planner.triggers.requireAssigneeCurrentUser` | `LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.worker.autoDiscovery` | `LOOPER_ROLES_WORKER_AUTO_DISCOVERY` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.worker.triggers.labels` | `LOOPER_ROLES_WORKER_TRIGGERS_LABELS` | comma-separated string list, for example `looper:worker-ready,team:alpha`; empty string means an empty list | Split on commas, trim ASCII whitespace from each item, reject empty items after trimming unless the whole value is empty, then apply normal duplicate-label validation. |
+| `roles.worker.triggers.labelMode` | `LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE` | enum: `all` or `any` | Trim ASCII whitespace; parse case-sensitively as the documented enum; reject any other value. |
+| `roles.worker.triggers.requireAssigneeCurrentUser` | `LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.reviewer.autoDiscovery` | `LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.reviewer.triggers.includeDrafts` | `LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.reviewer.triggers.requireReviewRequest` | `LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.reviewer.includeSpecReviewingLabel` | `LOOPER_ROLES_REVIEWER_INCLUDE_SPEC_REVIEWING_LABEL` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.reviewer.specReviewingLabel` | `LOOPER_ROLES_REVIEWER_SPEC_REVIEWING_LABEL` | non-empty string | Trim ASCII whitespace; reject empty values when `includeSpecReviewingLabel=true`. |
+| `roles.fixer.autoDiscovery` | `LOOPER_ROLES_FIXER_AUTO_DISCOVERY` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.fixer.triggers.includeDrafts` | `LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS` | boolean: `true` or `false` | Trim ASCII whitespace; parse case-insensitively; reject any other value. |
+| `roles.fixer.authorFilter` | `LOOPER_ROLES_FIXER_AUTHOR_FILTER` | enum: `current_user` or `any` | Trim ASCII whitespace; parse case-sensitively as the documented enum; reject any other value. |
 
 ### 8. Update documentation and examples
 
@@ -280,8 +303,8 @@ Automated tests should cover:
 - explicit `roles.fixer.authorFilter=current_user` wins over legacy `defaults.fixAllPullRequests=true`;
 - `autoDiscovery=false` prevents scheduler discovery calls for each role while queued item processing still runs;
 - planner and worker issue matching for all labels, any labels, no assignee requirement, and default behavior;
-- reviewer draft inclusion, review-request requirement, and spec-reviewing-label inclusion/exclusion;
-- fixer draft inclusion and both author filters while preserving actionable-item and lock checks;
+- reviewer draft inclusion, review-request requirement, and spec-reviewing-label inclusion/exclusion in both discovery and processing-time PR eligibility gates;
+- fixer draft inclusion in both discovery and processing-time PR eligibility gates, plus both author filters while preserving actionable-item and lock checks;
 - CLI config get/set/unset behavior for newly registered role fields.
 
 Repository-level verification should use the standard Go-first command set:
@@ -303,7 +326,10 @@ go build ./...
 - [ ] Add scheduler `autoDiscovery` gates for each role.
 - [ ] Replace hardcoded planner/worker issue label and assignee checks with policy matching.
 - [ ] Replace hardcoded reviewer draft/review-request/spec-label checks with policy matching.
+- [ ] Ensure reviewer processing-time PR eligibility gates honor `includeDrafts` and `requireReviewRequest`.
 - [ ] Replace fixer `FixAllPullRequests` discovery filtering with `authorFilter` policy.
+- [ ] Ensure fixer processing-time PR eligibility gates honor `includeDrafts`.
 - [ ] Register common role config fields in CLI/env handling.
+- [ ] Register documented role environment variables with deterministic parsing for booleans, enums, and label lists.
 - [ ] Update docs with defaults, examples, and migration notes.
 - [ ] Add unit tests and run `go test ./...`, `go vet ./...`, and `go build ./...`.
