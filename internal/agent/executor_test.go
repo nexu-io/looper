@@ -227,6 +227,34 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	}
 }
 
+func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
+	t.Parallel()
+
+	logPath := filepath.Join(t.TempDir(), "stdout.log")
+	completionLine := CompletionMarkerPrefix + `{"summary":"done from tail"}` + "\n"
+	headSize := maxPersistedLogReadBytes - len(completionLine) + 1023
+	fullLog := strings.Repeat("x", headSize) + "\n" + completionLine
+	if err := os.WriteFile(logPath, []byte(fullLog), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	persisted, ok := readPersistedExecutionLog(logPath)
+	if !ok {
+		t.Fatal("readPersistedExecutionLog() = ok false, want true")
+	}
+	if len(persisted) != maxPersistedLogReadBytes {
+		t.Fatalf("len(persisted) = %d, want %d", len(persisted), maxPersistedLogReadBytes)
+	}
+	if !strings.HasSuffix(persisted, completionLine) {
+		t.Fatalf("persisted log missing completion tail suffix")
+	}
+
+	parsed := parseCompletion(persisted, "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "done from tail" || parsed.CompletionSignal != CompletionMarkerPrefix {
+		t.Fatalf("parseCompletion() = %#v, want parsed tail completion marker", parsed)
+	}
+}
+
 func TestIsAgentSetupFailureMessageDetectsCodexModelCompatibility(t *testing.T) {
 	t.Parallel()
 

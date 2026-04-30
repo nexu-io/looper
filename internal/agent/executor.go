@@ -804,12 +804,18 @@ func readPersistedExecutionLog(path string) (string, bool) {
 		return "", false
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedLogReadBytes+1))
+	info, err := file.Stat()
 	if err != nil {
 		return "", false
 	}
-	if len(raw) > maxPersistedLogReadBytes {
-		raw = raw[:maxPersistedLogReadBytes]
+	if info.Size() > maxPersistedLogReadBytes {
+		if _, err := file.Seek(info.Size()-maxPersistedLogReadBytes, io.SeekStart); err != nil {
+			return "", false
+		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedLogReadBytes))
+	if err != nil {
+		return "", false
 	}
 	return string(raw), true
 }
