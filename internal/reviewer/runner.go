@@ -997,6 +997,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			checkpoint.ResumePolicy = "rerun_review"
 			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 		}
+	} else {
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
 	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
@@ -1071,6 +1075,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	startStep := stepDiscover
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
 		if restartFromDiscover {
+			startStep = stepDiscover
+		} else if rerunReview && !isManualReviewerLoop(loop) {
 			startStep = stepDiscover
 		} else if rerunReview {
 			startStep = stepReview

@@ -570,7 +570,47 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemPublishesLegacyPendingReviewWithoutMarker(t *testing.T) {
+func TestProcessClaimedItemSkipsRerunReviewWhenRequestRemovedAfterMarkerMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+		t.Fatalf("result = %#v, want retryable missing marker failure", result)
+	}
+	github.reviewMarkerMissing = false
+	github.reviewRequests = []string{"someoneelse"}
+	fixture.advance(time.Hour)
+	claim, err = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "current user is not requested for review") {
+		t.Fatalf("retry result = %#v, want eligibility skip", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after retry = %d, want no second review", len(agent.starts))
+	}
+}
+
+func TestProcessClaimedItemRejectsUnverifiableLegacyPendingReview(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
@@ -609,21 +649,21 @@ func TestProcessClaimedItemPublishesLegacyPendingReviewWithoutMarker(t *testing.
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "Legacy pending review checkpoint cannot be verified") {
+		t.Fatalf("result = %#v, want retryable legacy verification failure", result)
 	}
 	if len(agent.starts) != 0 {
-		t.Fatalf("len(agent.starts) = %d, want no rerun for legacy pending review", len(agent.starts))
+		t.Fatalf("len(agent.starts) = %d, want no review rerun in failed publish attempt", len(agent.starts))
 	}
 	if github.reviewMarkerCalls != 0 {
-		t.Fatalf("reviewMarkerCalls = %d, want marker lookup skipped for legacy pending review", github.reviewMarkerCalls)
+		t.Fatalf("reviewMarkerCalls = %d, want agent-native marker lookup skipped for legacy pending review", github.reviewMarkerCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || updatedLoop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
 	}
-	if updatedLoop.MetadataJSON == nil || !contains(*updatedLoop.MetadataJSON, `"lastReviewEvent":"COMMENT"`) || !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %v, want legacy publish progress", updatedLoop.MetadataJSON)
+	if updatedLoop.MetadataJSON != nil && contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %v, want no legacy publish progress", updatedLoop.MetadataJSON)
 	}
 }
 
