@@ -263,6 +263,12 @@ func gitDiffPath(line string) string {
 	if rest == line {
 		return ""
 	}
+	if strings.HasPrefix(rest, "\"") {
+		parts := gitPathTokens(rest)
+		if len(parts) >= 2 {
+			return strings.TrimPrefix(parts[1], "b/")
+		}
+	}
 	for searchFrom := 0; ; {
 		idx := strings.Index(rest[searchFrom:], " b/")
 		if idx < 0 {
@@ -272,22 +278,66 @@ func gitDiffPath(line string) string {
 		left := strings.TrimPrefix(rest[:idx], "a/")
 		right := rest[idx+3:]
 		if left == right {
-			return right
+			return unquoteGitPath(right)
 		}
 		searchFrom = idx + len(" b/")
 	}
 	if idx := strings.Index(rest, " b/"); idx >= 0 {
-		return rest[idx+3:]
+		return unquoteGitPath(rest[idx+3:])
 	}
 	return ""
 }
 
 func fileHeaderPath(path string) string {
-	path = strings.TrimSpace(path)
+	path = unquoteGitPath(strings.TrimSpace(path))
 	if path == "/dev/null" {
 		return ""
 	}
 	return strings.TrimPrefix(path, "b/")
+}
+
+func gitPathTokens(s string) []string {
+	var tokens []string
+	for s = strings.TrimSpace(s); s != ""; s = strings.TrimSpace(s) {
+		if s[0] != '"' {
+			idx := strings.IndexByte(s, ' ')
+			if idx < 0 {
+				tokens = append(tokens, s)
+				break
+			}
+			tokens = append(tokens, s[:idx])
+			s = s[idx+1:]
+			continue
+		}
+		end := 1
+		escaped := false
+		for end < len(s) {
+			c := s[end]
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				end++
+				break
+			}
+			end++
+		}
+		tokens = append(tokens, unquoteGitPath(s[:end]))
+		s = s[end:]
+	}
+	return tokens
+}
+
+func unquoteGitPath(path string) string {
+	if len(path) < 2 || path[0] != '"' || path[len(path)-1] != '"' {
+		return path
+	}
+	unquoted, err := strconv.Unquote(path)
+	if err != nil {
+		return path
+	}
+	return unquoted
 }
 
 func parseInt64(value string) int64 {

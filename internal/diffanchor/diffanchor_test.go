@@ -63,6 +63,23 @@ func TestParseDeletedFilePathContainingBSlash(t *testing.T) {
 	}
 }
 
+func TestParseQuotedGitPathsUnescapesHeaders(t *testing.T) {
+	t.Parallel()
+	path := "a\tb.txt"
+	diff := "diff --git \"a/a\\tb.txt\" \"b/a\\tb.txt\"\n--- \"a/a\\tb.txt\"\n+++ \"b/a\\tb.txt\"\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+	idx := Parse(diff)
+
+	if !idx.Validate(Anchor{Path: path, Line: 1, Side: SideRight}).Valid {
+		t.Fatalf("RIGHT anchor on quoted path should be valid: %#v", idx.Ranges)
+	}
+	if !idx.Validate(Anchor{Path: path, Line: 1, Side: SideLeft}).Valid {
+		t.Fatalf("LEFT anchor on quoted path should be valid: %#v", idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: `"b/a\tb.txt"`, Line: 1, Side: SideRight}); got.Valid {
+		t.Fatalf("still-quoted path anchor should be invalid: %#v", got)
+	}
+}
+
 func TestValidateMultilineMarkdownAnchorAcrossHeadingChange(t *testing.T) {
 	t.Parallel()
 	diff := "diff --git a/docs/spec.md b/docs/spec.md\n@@ -1,4 +1,4 @@\n # Old heading\n-content\n+# New heading\n+content\n tail\n"
