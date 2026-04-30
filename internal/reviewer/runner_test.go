@@ -565,8 +565,64 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	if result.Status != "success" {
 		t.Fatalf("retry result = %#v, want success", result)
 	}
-	if len(agent.starts) != 2 {
-		t.Fatalf("len(agent.starts) after retry = %d, want review rerun", len(agent.starts))
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after retry = %d, want marker recheck without review rerun", len(agent.starts))
+	}
+	if github.reviewMarkerCalls != 2 {
+		t.Fatalf("review marker calls = %d, want initial lookup plus retry", github.reviewMarkerCalls)
+	}
+}
+
+func TestProcessClaimedItemRerunsReviewAfterRepeatedAgentReviewMarkerMisses(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}, {Status: "completed", Summary: "posted again", Stdout: `__LOOPER_RESULT__={"summary":"posted review again"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "retrying marker verification") {
+		t.Fatalf("result = %#v, want retryable marker recheck failure", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after first attempt = %d, want 1", len(agent.starts))
+	}
+
+	fixture.advance(time.Hour)
+	claim, err = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+		t.Fatalf("retry result = %#v, want retryable missing marker failure", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after marker retry = %d, want no review rerun yet", len(agent.starts))
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("GetLatestByLoopID() error = %v", err)
+	}
+	if latestRun == nil {
+		t.Fatal("latest run = nil, want failed run")
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "rerun_review" || checkpoint.PendingReview != nil {
+		t.Fatalf("checkpoint = %#v, want cleared pending review with rerun_review after repeated marker misses", checkpoint)
 	}
 }
 

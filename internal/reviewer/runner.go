@@ -323,9 +323,10 @@ type checkpointSnapshot struct {
 }
 
 type pendingReviewCheckpoint struct {
-	HeadSHA string      `json:"headSha,omitempty"`
-	Event   ReviewEvent `json:"event,omitempty"`
-	Summary string      `json:"summary,omitempty"`
+	HeadSHA                  string      `json:"headSha,omitempty"`
+	Event                    ReviewEvent `json:"event,omitempty"`
+	Summary                  string      `json:"summary,omitempty"`
+	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
 }
 
 type resumedRunContext struct {
@@ -631,7 +632,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			if checkpoint.ResumePolicy == "rerun_review" {
+			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
 				latest = checkpoint
 			}
 			if checkpoint.ResumePolicy == "restart_from_discover" {
@@ -993,6 +994,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if !found {
+			if pending.MarkerVerificationMisses == 0 {
+				pending.MarkerVerificationMisses = 1
+				checkpoint.PendingReview = pending.clone()
+				checkpoint.ResumePolicy = "advance_from_checkpoint"
+				return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
+			}
 			checkpoint.PendingReview = nil
 			checkpoint.ResumePolicy = "rerun_review"
 			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
@@ -1014,6 +1021,10 @@ func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
 		return pending.Event
 	}
 	return reviewEventAgentNative
+}
+
+func hasPendingReviewMarkerMiss(checkpoint reviewerCheckpoint) bool {
+	return checkpoint.PendingReview != nil && checkpoint.PendingReview.MarkerVerificationMisses > 0
 }
 
 func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
