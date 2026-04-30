@@ -37,6 +37,19 @@ func TestParseMultiHunkDiffSeparatesRanges(t *testing.T) {
 	}
 }
 
+func TestParseDeletedFileWithSpacesUsesDiffGitPath(t *testing.T) {
+	t.Parallel()
+	diff := "diff --git a/a b.txt b/a b.txt\ndeleted file mode 100644\n--- a/a b.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-line\n"
+	idx := Parse(diff)
+
+	if !idx.Validate(Anchor{Path: "a b.txt", Line: 1, Side: SideLeft}).Valid {
+		t.Fatalf("LEFT anchor on deleted file with spaces should be valid: %#v", idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "b.txt", Line: 1, Side: SideLeft}); got.Valid {
+		t.Fatalf("truncated path anchor should be invalid: %#v", got)
+	}
+}
+
 func TestParseMarkdownHeadingContext(t *testing.T) {
 	t.Parallel()
 	diff := "diff --git a/docs/spec.md b/docs/spec.md\n@@ -4,3 +4,4 @@\n # Reviewer anchors\n existing\n+new requirement\n tail\n"

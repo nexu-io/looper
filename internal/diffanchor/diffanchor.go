@@ -259,9 +259,12 @@ func fallbackLocation(anchor Anchor) string {
 }
 
 func gitDiffPath(line string) string {
-	fields := strings.Fields(line)
-	if len(fields) >= 4 {
-		return strings.TrimPrefix(fields[3], "b/")
+	rest := strings.TrimPrefix(line, "diff --git ")
+	if rest == line {
+		return ""
+	}
+	if idx := strings.LastIndex(rest, " b/"); idx >= 0 {
+		return rest[idx+3:]
 	}
 	return ""
 }
