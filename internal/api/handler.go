@@ -3363,7 +3363,7 @@ func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRe
 			return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
 		}
 		if latestAgent != nil {
-			stdout, stderr := parseAgentOutput(latestAgent.OutputJSON)
+			stdout, stderr := parseAgentOutput(h.context.Config.Daemon.LogDir, latestAgent.OutputJSON)
 			agentPayload = &loopLogsAgentPayload{
 				ExecutionID:     latestAgent.ID,
 				Vendor:          latestAgent.Vendor,
@@ -3772,18 +3772,68 @@ func mapLoopCreateError(err error) error {
 	}
 }
 
-func parseAgentOutput(outputJSON *string) (string, string) {
+const maxPersistedAgentLogReadBytes = 16 * 1024 * 1024
+
+func parseAgentOutput(logDir string, outputJSON *string) (string, string) {
 	if outputJSON == nil || strings.TrimSpace(*outputJSON) == "" {
 		return "", ""
 	}
 	var payload struct {
-		Stdout string `json:"stdout"`
-		Stderr string `json:"stderr"`
+		Stdout        string `json:"stdout"`
+		Stderr        string `json:"stderr"`
+		StdoutLogPath string `json:"stdoutLogPath"`
+		StderrLogPath string `json:"stderrLogPath"`
 	}
 	if err := json.Unmarshal([]byte(*outputJSON), &payload); err != nil {
 		return "", ""
 	}
+	if content, ok := readAgentOutputLog(logDir, payload.StdoutLogPath); ok {
+		payload.Stdout = content
+	}
+	if content, ok := readAgentOutputLog(logDir, payload.StderrLogPath); ok {
+		payload.Stderr = content
+	}
 	return payload.Stdout, payload.Stderr
+}
+
+func readAgentOutputLog(logDir string, path string) (string, bool) {
+	if strings.TrimSpace(path) == "" {
+		return "", false
+	}
+	if !isPathWithinDirectory(path, logDir) {
+		return "", false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedAgentLogReadBytes+1))
+	if err != nil {
+		return "", false
+	}
+	if len(raw) > maxPersistedAgentLogReadBytes {
+		raw = raw[:maxPersistedAgentLogReadBytes]
+	}
+	return string(raw), true
+}
+
+func isPathWithinDirectory(path string, directory string) bool {
+	if strings.TrimSpace(directory) == "" {
+		return false
+	}
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(filepath.Clean(directory))
+	if err != nil {
+		return false
+	}
+	if absPath == absDir {
+		return false
+	}
+	return strings.HasPrefix(absPath, absDir+string(os.PathSeparator))
 }
 
 func parseJSONObject(raw *string) map[string]any {

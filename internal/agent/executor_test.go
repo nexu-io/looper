@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -322,6 +323,78 @@ func TestExecutorBoundsCapturedOutputToTail(t *testing.T) {
 	}
 	if result.Stderr != "5678" {
 		t.Fatalf("stderr = %q, want 5678", result.Stderr)
+	}
+}
+
+func TestExecutorPersistsHistoricalLogsBeyondMaxOutputBytes(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	logDir := t.TempDir()
+	fullStdout := strings.Repeat("out-", 16)
+	fullStderr := strings.Repeat("err-", 16)
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf "$FULL_STDOUT"; printf "$FULL_STDERR" >&2`}}},
+		Repos:  repos,
+		LogDir: logDir,
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_persisted_logs", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, MaxOutputBytes: 8, Env: map[string]string{"FULL_STDOUT": fullStdout, "FULL_STDERR": fullStderr}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Stdout != fullStdout {
+		t.Fatalf("result.Stdout = %q, want full persisted stdout %q", result.Stdout, fullStdout)
+	}
+	if result.Stderr != fullStderr {
+		t.Fatalf("result.Stderr = %q, want full persisted stderr %q", result.Stderr, fullStderr)
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_persisted_logs")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.OutputJSON == nil {
+		t.Fatalf("agent execution record = %#v, want output_json", record)
+	}
+
+	var output struct {
+		Stdout        string `json:"stdout"`
+		Stderr        string `json:"stderr"`
+		StdoutLogPath string `json:"stdoutLogPath"`
+		StderrLogPath string `json:"stderrLogPath"`
+	}
+	if err := json.Unmarshal([]byte(*record.OutputJSON), &output); err != nil {
+		t.Fatalf("json.Unmarshal(output_json) error = %v", err)
+	}
+	if output.Stdout != fullStdout[len(fullStdout)-8:] {
+		t.Fatalf("output stdout = %q, want truncated tail %q", output.Stdout, fullStdout[len(fullStdout)-8:])
+	}
+	if output.Stderr != fullStderr[len(fullStderr)-8:] {
+		t.Fatalf("output stderr = %q, want truncated tail %q", output.Stderr, fullStderr[len(fullStderr)-8:])
+	}
+	if output.StdoutLogPath == "" || output.StderrLogPath == "" {
+		t.Fatalf("output log paths = %#v, want stdout/stderr log paths", output)
+	}
+	stdoutLog, err := os.ReadFile(output.StdoutLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stdout log) error = %v", err)
+	}
+	stderrLog, err := os.ReadFile(output.StderrLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stderr log) error = %v", err)
+	}
+	if string(stdoutLog) != fullStdout {
+		t.Fatalf("stdout log = %q, want %q", string(stdoutLog), fullStdout)
+	}
+	if string(stderrLog) != fullStderr {
+		t.Fatalf("stderr log = %q, want %q", string(stderrLog), fullStderr)
 	}
 }
 

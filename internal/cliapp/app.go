@@ -169,6 +169,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
+					boolFlag("full", "Show all retained daemon log lines, including rotated log files"),
 					boolFlag("force", "Overwrite existing installed daemon binary"),
 				},
 				exampleLines: []string{
@@ -178,6 +179,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper daemon restart",
 					"$ looper daemon status",
 					"$ looper daemon logs --lines 50",
+					"$ looper daemon logs --full",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),

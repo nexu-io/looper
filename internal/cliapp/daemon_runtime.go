@@ -55,8 +55,10 @@ type daemonStatusOutput struct {
 }
 
 type daemonLogsOutput struct {
-	LogPath string   `json:"logPath"`
-	Lines   []string `json:"lines"`
+	LogPath  string   `json:"logPath"`
+	LogPaths []string `json:"logPaths"`
+	Full     bool     `json:"full"`
+	Lines    []string `json:"lines"`
 }
 
 func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
@@ -452,9 +454,13 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	full := getBoolFlag(cmd, "full")
 	lineCountValue := strings.TrimSpace(getStringFlag(cmd, "lines"))
 	lineCount := int64(50)
 	if lineCountValue != "" {
+		if full {
+			return fmt.Errorf("--full cannot be combined with --lines")
+		}
 		lineCount, err = parsePositiveInt(lineCountValue, "--lines")
 		if err != nil {
 			return err
@@ -462,18 +468,21 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	logPath := filepath.Join(loaded.Config.Daemon.LogDir, "looperd.log")
-	raw, err := r.readFile(logPath)
+	content, logPaths, err := r.readRetainedDaemonLogs(logPath, loaded.Config.Logging.MaxFiles)
 	if err != nil {
 		return err
 	}
 
-	lines := tailLines(strings.TrimRight(string(raw), "\n"), int(lineCount))
-	output := daemonLogsOutput{LogPath: logPath, Lines: lines}
+	lines := splitLogLines(content)
+	if !full {
+		lines = tailLines(strings.Join(lines, "\n"), int(lineCount))
+	}
+	output := daemonLogsOutput{LogPath: logPath, LogPaths: logPaths, Full: full, Lines: lines}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), output)
 	}
 
-	if _, err := fmt.Fprintln(cmd.OutOrStdout(), logPath); err != nil {
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s (retained files: %d; default tail: %d lines; use --full to show all retained logs)\n", logPath, len(logPaths), lineCount); err != nil {
 		return err
 	}
 	for _, line := range lines {
@@ -482,6 +491,55 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+func (r *commandRuntime) readRetainedDaemonLogs(logPath string, maxFiles int) (string, []string, error) {
+	paths := retainedDaemonLogPaths(logPath, maxFiles)
+	var builder strings.Builder
+	readPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		raw, err := r.readFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", nil, err
+		}
+		if len(raw) == 0 {
+			readPaths = append(readPaths, path)
+			continue
+		}
+		if builder.Len() > 0 && !strings.HasSuffix(builder.String(), "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(strings.TrimRight(string(raw), "\n"))
+		builder.WriteString("\n")
+		readPaths = append(readPaths, path)
+	}
+	if len(readPaths) == 0 {
+		return "", nil, os.ErrNotExist
+	}
+	return strings.TrimRight(builder.String(), "\n"), readPaths, nil
+}
+
+func retainedDaemonLogPaths(logPath string, maxFiles int) []string {
+	if maxFiles < 1 {
+		maxFiles = 1
+	}
+	paths := make([]string, 0, maxFiles)
+	for index := maxFiles - 1; index >= 1; index-- {
+		paths = append(paths, fmt.Sprintf("%s.%d", logPath, index))
+	}
+	paths = append(paths, logPath)
+	return paths
+}
+
+func splitLogLines(content string) []string {
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return []string{}
+	}
+	return strings.Split(content, "\n")
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {

@@ -11,6 +11,7 @@ Subcommands:
 
 Flags:
   --force                     Overwrite existing installed daemon binary
+  --full                      Show all retained daemon log lines, including rotated log files
   --lines <count>             Line count
 
 Global Flags:
@@ -33,3 +34,4 @@ $ looper daemon stop
 $ looper daemon restart
 $ looper daemon status
 $ looper daemon logs --lines 50
+$ looper daemon logs --full

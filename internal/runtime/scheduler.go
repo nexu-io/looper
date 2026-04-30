@@ -687,8 +687,9 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Params: cfg.Agent.Params,
 			Env:    cfg.Agent.Env,
 		},
-		Repos: repos,
-		Now:   now,
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
