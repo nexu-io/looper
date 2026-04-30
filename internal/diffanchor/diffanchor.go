@@ -1,0 +1,308 @@
+package diffanchor
+
+import (
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const (
+	SideRight = "RIGHT"
+	SideLeft  = "LEFT"
+)
+
+type Anchor struct {
+	Path      string
+	Line      int64
+	Side      string
+	StartLine int64
+	StartSide string
+}
+
+type Range struct {
+	Path    string
+	Side    string
+	Start   int64
+	End     int64
+	Excerpt string
+	Heading string
+}
+
+type Index struct {
+	Ranges []Range
+}
+
+type ValidationResult struct {
+	Valid          bool
+	Reason         string
+	LocationText   string
+	QualityFlagged bool
+}
+
+var hunkRE = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+
+func Parse(diff string) Index {
+	var idx Index
+	var path string
+	var oldLine, newLine int64
+	var rightHeading, leftHeading string
+	var openRight, openLeft *Range
+	flush := func() {
+		if openRight != nil {
+			idx.Ranges = append(idx.Ranges, *openRight)
+			openRight = nil
+		}
+		if openLeft != nil {
+			idx.Ranges = append(idx.Ranges, *openLeft)
+			openLeft = nil
+		}
+	}
+	add := func(side string, line int64, text string, heading string) {
+		if path == "" || line <= 0 {
+			return
+		}
+		text = strings.TrimSpace(text)
+		if len(text) > 96 {
+			text = text[:93] + "..."
+		}
+		if side == SideRight {
+			if openRight == nil || openRight.Path != path || openRight.Side != side || openRight.End+1 != line || openRight.Heading != heading {
+				if openRight != nil {
+					idx.Ranges = append(idx.Ranges, *openRight)
+				}
+				openRight = &Range{Path: path, Side: side, Start: line, Heading: heading}
+			}
+			openRight.End = line
+			if openRight.Excerpt == "" && text != "" {
+				openRight.Excerpt = text
+			}
+			return
+		}
+		if openLeft == nil || openLeft.Path != path || openLeft.Side != side || openLeft.End+1 != line || openLeft.Heading != heading {
+			if openLeft != nil {
+				idx.Ranges = append(idx.Ranges, *openLeft)
+			}
+			openLeft = &Range{Path: path, Side: side, Start: line, Heading: heading}
+		}
+		openLeft.End = line
+		if openLeft.Excerpt == "" && text != "" {
+			openLeft.Excerpt = text
+		}
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
+			path = gitDiffPath(line)
+			rightHeading, leftHeading = "", ""
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			if parsed := fileHeaderPath(line[4:]); parsed != "" {
+				path = parsed
+			}
+			continue
+		}
+		if m := hunkRE.FindStringSubmatch(line); m != nil {
+			flush()
+			oldLine = parseInt64(m[1])
+			newLine = parseInt64(m[3])
+			continue
+		}
+		if path == "" || line == "" || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "new file mode") || strings.HasPrefix(line, "deleted file mode") {
+			continue
+		}
+		switch line[0] {
+		case ' ':
+			content := line[1:]
+			if h := headingFor(path, content); h != "" {
+				rightHeading, leftHeading = h, h
+			}
+			add(SideRight, newLine, content, rightHeading)
+			add(SideLeft, oldLine, content, leftHeading)
+			oldLine++
+			newLine++
+		case '+':
+			content := line[1:]
+			if h := headingFor(path, content); h != "" {
+				rightHeading = h
+			}
+			add(SideRight, newLine, content, rightHeading)
+			newLine++
+		case '-':
+			content := line[1:]
+			if h := headingFor(path, content); h != "" {
+				leftHeading = h
+			}
+			add(SideLeft, oldLine, content, leftHeading)
+			oldLine++
+		}
+	}
+	flush()
+	sort.SliceStable(idx.Ranges, func(i, j int) bool {
+		if idx.Ranges[i].Path != idx.Ranges[j].Path {
+			return idx.Ranges[i].Path < idx.Ranges[j].Path
+		}
+		if idx.Ranges[i].Side != idx.Ranges[j].Side {
+			return idx.Ranges[i].Side < idx.Ranges[j].Side
+		}
+		return idx.Ranges[i].Start < idx.Ranges[j].Start
+	})
+	return idx
+}
+
+func (idx Index) FormatPromptSection(limit int) string {
+	if len(idx.Ranges) == 0 {
+		return "ANCHORABLE DIFF LOCATIONS\nNo anchorable diff locations were parsed from the PR diff."
+	}
+	if limit <= 0 || limit > len(idx.Ranges) {
+		limit = len(idx.Ranges)
+	}
+	lines := []string{"ANCHORABLE DIFF LOCATIONS", "Use only these path/side/line ranges for inline review comments; downgrade anything outside them to a top-level comment with explicit location context."}
+	for i := 0; i < limit; i++ {
+		r := idx.Ranges[i]
+		lineRange := fmt.Sprintf("%d", r.Start)
+		if r.End != r.Start {
+			lineRange = fmt.Sprintf("%d-%d", r.Start, r.End)
+		}
+		parts := []string{fmt.Sprintf("- %s %s lines %s", r.Path, r.Side, lineRange)}
+		if r.Heading != "" {
+			parts = append(parts, "heading: "+r.Heading)
+		}
+		if r.Excerpt != "" {
+			parts = append(parts, "excerpt: "+r.Excerpt)
+		}
+		lines = append(lines, strings.Join(parts, " | "))
+	}
+	if limit < len(idx.Ranges) {
+		lines = append(lines, fmt.Sprintf("- ... %d additional anchorable ranges omitted for brevity", len(idx.Ranges)-limit))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (idx Index) Validate(anchor Anchor) ValidationResult {
+	anchor.Path = strings.TrimSpace(anchor.Path)
+	anchor.Side = normalizeSide(anchor.Side)
+	anchor.StartSide = normalizeSide(anchor.StartSide)
+	if anchor.Path == "" || anchor.Line <= 0 || anchor.Side == "" {
+		return ValidationResult{Valid: false, Reason: "inline anchor is missing path, line, or side", LocationText: fallbackLocation(anchor), QualityFlagged: anchor.Path == "" && anchor.Line <= 0}
+	}
+	startLine := anchor.StartLine
+	startSide := anchor.StartSide
+	if startLine == 0 {
+		startLine = anchor.Line
+		startSide = anchor.Side
+	}
+	if startSide == "" {
+		startSide = anchor.Side
+	}
+	if startSide != anchor.Side {
+		return ValidationResult{Valid: false, Reason: "multiline anchors spanning LEFT and RIGHT sides are not supported", LocationText: fallbackLocation(anchor)}
+	}
+	if startLine > anchor.Line {
+		return ValidationResult{Valid: false, Reason: "start_line must be less than or equal to line", LocationText: fallbackLocation(anchor)}
+	}
+	if idx.contains(anchor.Path, anchor.Side, startLine, anchor.Line) {
+		return ValidationResult{Valid: true}
+	}
+	return ValidationResult{Valid: false, Reason: "inline anchor is outside the PR diff anchorable ranges", LocationText: fallbackLocation(anchor)}
+}
+
+func (idx Index) contains(path, side string, start, end int64) bool {
+	for _, r := range idx.Ranges {
+		if r.Path == path && r.Side == side && r.Start <= start && r.End >= end {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateTopLevelLocation(body string) ValidationResult {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || !regexp.MustCompile(`(?m)([\w./-]+\.[A-Za-z0-9]+|\b(line|lines|section|symbol|function|method|type|struct|package)\b|^#+\s+)`).MatchString(trimmed) {
+		return ValidationResult{Valid: false, Reason: "top-level comment lacks exact file, section, symbol, or behavior location context", QualityFlagged: true}
+	}
+	return ValidationResult{Valid: true}
+}
+
+func DowngradeBody(body string, anchor Anchor, reason string) string {
+	location := fallbackLocation(anchor)
+	if location == "" {
+		location = "Location: unavailable; follow-up quality gate required."
+	}
+	parts := []string{location}
+	if trimmed := strings.TrimSpace(body); trimmed != "" {
+		parts = append(parts, trimmed)
+	}
+	parts = append(parts, "Downgraded from inline review comment: "+reason)
+	return strings.Join(parts, "\n\n")
+}
+
+func fallbackLocation(anchor Anchor) string {
+	parts := []string{}
+	if anchor.Path != "" {
+		parts = append(parts, anchor.Path)
+	}
+	if anchor.Side != "" && anchor.Line > 0 {
+		if anchor.StartLine > 0 && anchor.StartLine != anchor.Line {
+			parts = append(parts, fmt.Sprintf("%s lines %d-%d", normalizeSide(anchor.Side), anchor.StartLine, anchor.Line))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s line %d", normalizeSide(anchor.Side), anchor.Line))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Location: " + strings.Join(parts, " ")
+}
+
+func gitDiffPath(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) >= 4 {
+		return strings.TrimPrefix(fields[3], "b/")
+	}
+	return ""
+}
+
+func fileHeaderPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "/dev/null" {
+		return ""
+	}
+	return strings.TrimPrefix(path, "b/")
+}
+
+func parseInt64(value string) int64 {
+	n, _ := strconv.ParseInt(value, 10, 64)
+	return n
+}
+
+func headingFor(path, line string) string {
+	if !isMarkdownLike(path) {
+		return ""
+	}
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") {
+		return trimmed
+	}
+	return ""
+}
+
+func isMarkdownLike(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".md" || ext == ".mdx" || ext == ".markdown" {
+		return true
+	}
+	path = strings.ToLower(path)
+	return strings.Contains(path, "/docs/") || strings.Contains(path, "/spec") || strings.HasPrefix(path, "docs/") || strings.HasPrefix(path, "spec")
+}
+
+func normalizeSide(side string) string {
+	side = strings.ToUpper(strings.TrimSpace(side))
+	if side == SideLeft || side == SideRight {
+		return side
+	}
+	return ""
+}

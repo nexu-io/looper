@@ -13,6 +13,7 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
@@ -1685,6 +1686,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		}
 		payload := parseJSONObject(optionalString(checkpoint.Snapshot.PayloadJSON))
 		if diff, ok := stringFromAny(payload["diff"]); ok && diff != "" {
+			parts = append(parts, diffanchor.Parse(diff).FormatPromptSection(80))
 			parts = append(parts, "Diff:\n"+diff)
 		}
 	}
@@ -1711,7 +1713,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
-		"If your inline review API call is rejected because of an invalid anchor, retry once with corrected inline anchors. If code-anchored actionable findings still cannot be submitted as resolvable inline review comments, exit non-zero instead of moving them into the review body or creating separate duplicate PR comments.",
+		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against ANCHORABLE DIFF LOCATIONS. Preserve exact anchors that fit those ranges. If an otherwise useful comment is outside those ranges, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
@@ -1720,6 +1722,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
 		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
+		"Flag any top-level actionable comment that lacks exact file, section, symbol, or behavior context as a follow-up quality-gating failure; do not publish vague unlocated feedback.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
 		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",

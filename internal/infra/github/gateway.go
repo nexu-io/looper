@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -119,6 +120,7 @@ type SubmitReviewInput struct {
 	Body     string
 	CommitID string
 	Comments []ReviewComment
+	Anchors  *diffanchor.Index
 	CWD      string
 }
 
@@ -511,6 +513,7 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 }
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
+	input.Body, input.Comments, _ = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
 	if len(input.Comments) > 0 {
 		payload := map[string]any{
 			"event":     input.Event,
