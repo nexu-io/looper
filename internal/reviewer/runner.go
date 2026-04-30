@@ -631,13 +631,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+			if checkpoint.ResumePolicy == "rerun_review" {
+				latest = checkpoint
+			}
 			if checkpoint.ResumePolicy == "restart_from_discover" {
 				latest.ResumePolicy = checkpoint.ResumePolicy
 			}
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				if resumePolicy != "restart_from_discover" {
+				if resumePolicy != "restart_from_discover" && resumePolicy != "rerun_review" {
 					resumePolicy = "advance_from_checkpoint"
 				}
 			case FailureManualIntervention:
@@ -990,6 +993,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if !found {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "rerun_review"
 			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 		}
 	}
@@ -1057,14 +1062,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		failedStep = asReviewerStep(derefString(latestRun.CurrentStep))
 	}
 	restartFromDiscover := false
+	rerunReview := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 		restartFromDiscover = checkpoint.ResumePolicy == "restart_from_discover" || shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
+		rerunReview = checkpoint.ResumePolicy == "rerun_review"
 	}
 	startStep := stepDiscover
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
 		if restartFromDiscover {
 			startStep = stepDiscover
+		} else if rerunReview {
+			startStep = stepReview
 		} else if lastCompleted != "" {
 			if next := nextReviewerStep(lastCompleted); next != "" {
 				startStep = next
@@ -1537,12 +1546,17 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		approveInstruction = "If the review is clean, submit an APPROVE review."
 		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the review is posted. Do not change labels for actionable reviews."
 	}
+	existingMarkerEventInstruction := "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review. Ignore matching markers on APPROVED reviews and post a new COMMENT review instead."
+	if allowApprove {
+		existingMarkerEventInstruction = "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED or APPROVED PR review."
+	}
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	}
 	parts = append(parts,
 		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome`: outcome=clean means ensure +1 reaction and spec-ready label transition when applicable; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
+		existingMarkerEventInstruction,
 		fmt.Sprintf("GitHub operation contract: use `gh` to submit exactly one PR review for this run. Prefer `gh api repos/%s/pulls/%d/reviews --method POST --input -`, with `commit_id` set to the expected head SHA and `event` set to COMMENT or APPROVE as appropriate.", repo, prNumber),
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
 		reviewRequestInstruction,

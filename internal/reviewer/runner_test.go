@@ -532,7 +532,7 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}, {Status: "completed", Summary: "posted again", Stdout: `__LOOPER_RESULT__={"summary":"posted review again"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -548,6 +548,25 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	}
 	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable missing marker failure", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after first attempt = %d, want 1", len(agent.starts))
+	}
+	github.reviewMarkerMissing = false
+	fixture.advance(time.Hour)
+	claim, err = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("retry result = %#v, want success", result)
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("len(agent.starts) after retry = %d, want review rerun", len(agent.starts))
 	}
 }
 
@@ -1280,6 +1299,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"looper:review id=reviewer:loop:abc123 head=abc123 outcome=clean|actionable",
 		"before posting anything",
 		"existing PR reviews",
+		"COMMENTED or APPROVED PR review",
 		"ensure +1 reaction and spec-ready label transition",
 		"review request removed before publish",
 		"PR head changed before publish",
@@ -1295,6 +1315,20 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	}
 	if strings.Contains(prompt, "PR conversation comments") {
 		t.Fatalf("prompt idempotency source diverges from review marker verification:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false)
+	for _, want := range []string{
+		"Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review",
+		"Ignore matching markers on APPROVED reviews and post a new COMMENT review instead",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
 
