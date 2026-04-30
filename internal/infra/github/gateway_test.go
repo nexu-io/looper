@@ -317,8 +317,8 @@ func TestGatewayFindReviewMarkerExtractsOutcomeFromMatchedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindReviewMarker() error = %v", err)
 	}
-	if !marker.Found || marker.Outcome != "actionable" {
-		t.Fatalf("FindReviewMarker() = %#v, want actionable outcome from matched marker", marker)
+	if !marker.Found || marker.Outcome != "actionable" || marker.Event != "COMMENT" {
+		t.Fatalf("FindReviewMarker() = %#v, want actionable COMMENT marker from matched marker", marker)
 	}
 }
 

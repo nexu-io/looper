@@ -142,6 +142,7 @@ type VerifyReviewMarkerInput struct {
 type ReviewMarkerResult struct {
 	Found   bool
 	Outcome string
+	Event   string
 }
 
 type PullRequestReactionInput struct {
@@ -597,8 +598,9 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		if !ok || !strings.Contains(body, marker) {
 			continue
 		}
-		if len(allowedReviewEvents) == 0 || reviewStateAllowed(row["state"], allowedReviewEvents) {
-			return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker)}
+		event := reviewEventFromStateString(row["state"])
+		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
+			return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event}
 		}
 	}
 	return ReviewMarkerResult{}
@@ -621,8 +623,16 @@ func reviewMarkerOutcome(body string, marker string) string {
 }
 
 func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
+	event := reviewEventFromStateString(raw)
+	return reviewEventAllowed(event, allowedReviewEvents)
+}
+
+func reviewEventFromStateString(raw any) string {
 	state, _ := raw.(string)
-	event := reviewEventFromState(state)
+	return reviewEventFromState(state)
+}
+
+func reviewEventAllowed(event string, allowedReviewEvents []string) bool {
 	if event == "" {
 		return false
 	}
