@@ -167,13 +167,15 @@ type VerifyReviewMarkerInput struct {
 	PRNumber            int64
 	Marker              string
 	AllowedReviewEvents []ReviewEvent
+	AuthorLogin         string
 	CWD                 string
 }
 
 type ReviewMarkerResult struct {
-	Found   bool
-	Outcome string
-	Event   ReviewEvent
+	Found       bool
+	Outcome     string
+	Event       ReviewEvent
+	AuthorLogin string
 }
 
 type PullRequestReactionInput struct {
@@ -1052,8 +1054,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 }
 
 func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string) (ReviewMarkerResult, error) {
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return ReviewMarkerResult{}, err
+	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA)
-	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
+	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
 }
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
@@ -1068,7 +1074,18 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
-		if r.allowAutoApprove && marker.Event == ReviewEventApprove && specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+			if err != nil {
+				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
+			}
+			if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
+				return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
+			}
+			detail = freshDetail
+			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
+				return nil
+			}
 			if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
 				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}

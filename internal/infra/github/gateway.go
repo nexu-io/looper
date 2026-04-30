@@ -136,13 +136,15 @@ type VerifyReviewMarkerInput struct {
 	PRNumber            int64
 	Marker              string
 	AllowedReviewEvents []string
+	AuthorLogin         string
 	CWD                 string
 }
 
 type ReviewMarkerResult struct {
-	Found   bool
-	Outcome string
-	Event   string
+	Found       bool
+	Outcome     string
+	Event       string
+	AuthorLogin string
 }
 
 type PullRequestReactionInput struct {
@@ -572,19 +574,20 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	return findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents), nil
+	return findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin), nil
 }
 
 func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
-	return findAllowedReviewMarker(raw, marker, allowedReviewEvents).Found
+	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "").Found
 }
 
-func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) ReviewMarkerResult {
+func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string) ReviewMarkerResult {
+	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
 		var pages [][]map[string]any
 		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
-			if len(allowedReviewEvents) == 0 && strings.Contains(raw, marker) {
+			if expectedAuthorLogin == "" && len(allowedReviewEvents) == 0 && strings.Contains(raw, marker) {
 				return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(raw, marker)}
 			}
 			return ReviewMarkerResult{}
@@ -599,12 +602,26 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		if !ok || !strings.Contains(body, marker) {
 			continue
 		}
+		author := reviewAuthorLogin(row)
+		if expectedAuthorLogin != "" && normalizeReviewMarkerLogin(author) != expectedAuthorLogin {
+			continue
+		}
 		event := reviewEventFromStateString(row["state"])
 		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
-			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event}
+			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event, AuthorLogin: author}
 		}
 	}
 	return newest
+}
+
+func reviewAuthorLogin(row map[string]any) string {
+	user, _ := row["user"].(map[string]any)
+	login, _ := user["login"].(string)
+	return login
+}
+
+func normalizeReviewMarkerLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
 }
 
 func reviewMarkerOutcome(body string, marker string) string {

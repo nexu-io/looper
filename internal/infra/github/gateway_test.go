@@ -347,6 +347,30 @@ func TestGatewayFindReviewMarkerReturnsNewestMatchingMarker(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerRequiresAuthorLogin(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"COMMENTED","user":{"login":"other-bot"},"body":"<!-- looper:review id=abc head=def outcome=clean -->"},
+				{"state":"COMMENTED","user":{"login":"reviewer-bot"},"body":"<!-- looper:review id=abc head=def outcome=actionable -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}, AuthorLogin: "Reviewer-Bot"})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "actionable" || marker.AuthorLogin != "reviewer-bot" {
+		t.Fatalf("FindReviewMarker() = %#v, want marker authored by reviewer-bot", marker)
+	}
+}
+
 func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
