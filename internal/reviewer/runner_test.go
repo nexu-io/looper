@@ -629,6 +629,52 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanCommentReview(t *t
 	}
 }
 
+func TestProcessClaimedItemDoesNotTransitionSpecLabelsWhenPRReviewStateIsNotClean(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		reviewDecision string
+		comments       []map[string]any
+	}{
+		{name: "changes requested", reviewDecision: "CHANGES_REQUESTED"},
+		{name: "unresolved thread", comments: []map[string]any{{"state": "UNRESOLVED"}}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewDecision: tt.reviewDecision, comments: tt.comments, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+
+			if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+			}
+			result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if result.Status != "success" {
+				t.Fatalf("result = %#v, want success", result)
+			}
+			if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
+				t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
+			}
+			if len(github.removeLabelCalls) != 0 {
+				t.Fatalf("removeLabelCalls = %#v, want no spec-reviewing removal for unclean PR", github.removeLabelCalls)
+			}
+			if len(github.addLabelCalls) != 0 {
+				t.Fatalf("addLabelCalls = %#v, want no spec-ready add for unclean PR", github.addLabelCalls)
+			}
+		})
+	}
+}
+
 func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1698,6 +1744,8 @@ type fakeGitHubGateway struct {
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
 	labels                          []string
+	reviewDecision                  string
+	comments                        []map[string]any
 	reviewRequests                  []string
 	currentLogin                    string
 	currentLoginErr                 error
@@ -1718,7 +1766,7 @@ type fakeGitHubGateway struct {
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	reviewRequests := g.effectiveReviewRequests()
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: "abc123", ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: reviewRequests}}, nil
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: "abc123", ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
@@ -1741,7 +1789,22 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if g.removeReviewRequestOnSecondView && g.viewCalls >= 2 {
 		reviewRequests = nil
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts"}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(g.comments)}, nil
+}
+
+func cloneCommentMaps(comments []map[string]any) []map[string]any {
+	if comments == nil {
+		return nil
+	}
+	cloned := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		clonedComment := make(map[string]any, len(comment))
+		for key, value := range comment {
+			clonedComment[key] = value
+		}
+		cloned = append(cloned, clonedComment)
+	}
+	return cloned
 }
 
 func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
