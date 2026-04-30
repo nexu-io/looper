@@ -668,6 +668,8 @@ func reviewEventFromState(state string) string {
 		return "APPROVE"
 	case "COMMENTED":
 		return "COMMENT"
+	case "CHANGES_REQUESTED":
+		return "REQUEST_CHANGES"
 	default:
 		return ""
 	}
