@@ -175,6 +175,9 @@ func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 	}
 	for _, body := range []string{
 		"docs/spec.md section Reviewer anchors needs a validation example.",
+		"Makefile should keep the release target in dependency order.",
+		"Dockerfile:12 should avoid reinstalling unchanged dependencies.",
+		"build/package should preserve executable permissions.",
 		"function ValidateTopLevelLocation should reject vague line references.",
 		"lines 12-14 should use the parsed anchor range.",
 		"section Reviewer anchors needs a validation example.",

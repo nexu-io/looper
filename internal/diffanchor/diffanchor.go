@@ -15,7 +15,7 @@ const (
 )
 
 var (
-	topLevelFileLocationRe    = regexp.MustCompile(`(?m)(^|[\s(])([\w./-]+\.[A-Za-z0-9]+)(?::\d+(?:-\d+)?)?\b`)
+	topLevelFileLocationRe    = regexp.MustCompile(`(?m)(^|[\s(])((?:[\w.-]+/)+[\w.-]+|[\w./-]+\.[A-Za-z0-9]+|(?:Dockerfile|Makefile|Containerfile|Jenkinsfile|Procfile|Rakefile|Gemfile|Vagrantfile|Brewfile|Justfile|Taskfile|Tiltfile|Earthfile|BUILD|WORKSPACE|LICENSE|NOTICE|README|CHANGELOG|AUTHORS|CODEOWNERS))(?::\d+(?:-\d+)?)?\b`)
 	topLevelHeadingLocationRe = regexp.MustCompile(`(?m)^#{1,6}\s+\S+`)
 	topLevelLineLocationRe    = regexp.MustCompile(`(?i)\b(?:lines?\s+\d+(?:\s*[-–]\s*\d+)?|L\d+(?:\s*[-–]\s*L?\d+)?)\b`)
 	topLevelNamedLocationRe   = regexp.MustCompile(`(?i)\b(?:section|symbol|function|method|type|struct|package)\s+([` + "`" + `"']?[\w./:#-]+)`)
