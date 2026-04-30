@@ -182,7 +182,6 @@ func (idx Index) FormatPromptSection(limit int) string {
 }
 
 func (idx Index) Validate(anchor Anchor) ValidationResult {
-	anchor.Path = strings.TrimSpace(anchor.Path)
 	anchor.Side = normalizeSide(anchor.Side)
 	anchor.StartSide = normalizeSide(anchor.StartSide)
 	if anchor.Path == "" || anchor.Line <= 0 || anchor.Side == "" {
@@ -288,7 +287,17 @@ func gitDiffPath(line string) string {
 }
 
 func fileHeaderPath(path string) string {
-	path = unquoteGitPath(strings.TrimSpace(path))
+	path = strings.TrimSuffix(path, "\r")
+	if strings.HasPrefix(path, "\"") {
+		parts := gitPathTokens(path)
+		if len(parts) > 0 {
+			path = parts[0]
+		}
+	} else if idx := strings.IndexByte(path, '\t'); idx >= 0 {
+		path = path[:idx]
+	} else {
+		path = unquoteGitPath(path)
+	}
 	if path == "/dev/null" {
 		return ""
 	}

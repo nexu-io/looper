@@ -298,11 +298,11 @@ func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	}
 	anchors := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Valid", Path: " app.go ", Line: 1, Side: " right "}, {Body: "Invalid", Path: "missing.go", Line: 99, Side: "RIGHT"}}, Anchors: &anchors}); err != nil {
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Valid", Path: "app.go", Line: 1, Side: " right "}, {Body: "Invalid", Path: "missing.go", Line: 99, Side: "RIGHT"}}, Anchors: &anchors}); err != nil {
 		t.Fatalf("SubmitReview() error = %v", err)
 	}
-	if !strings.Contains(runner.stdin, `"path":"app.go"`) || strings.Contains(runner.stdin, `"path":" app.go "`) {
-		t.Fatalf("review payload did not publish trimmed valid path:\n%s", runner.stdin)
+	if !strings.Contains(runner.stdin, `"path":"app.go"`) {
+		t.Fatalf("review payload did not publish valid path:\n%s", runner.stdin)
 	}
 	if strings.Contains(runner.stdin, `"path":"missing.go"`) || !strings.Contains(runner.stdin, "Invalid") || !strings.Contains(runner.stdin, "Downgraded from inline review comment") {
 		t.Fatalf("review payload did not downgrade invalid anchor into body:\n%s", runner.stdin)

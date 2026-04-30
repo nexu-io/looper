@@ -86,6 +86,39 @@ func TestParseQuotedGitPathsUnescapesHeaders(t *testing.T) {
 	}
 }
 
+func TestValidatePreservesLeadingAndTrailingPathSpaces(t *testing.T) {
+	t.Parallel()
+	diff := "diff --git a/ leading.txt b/ leading.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n" +
+		"diff --git \"a/trailing.txt \" \"b/trailing.txt \"\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+	idx := Parse(diff)
+
+	if got := idx.Validate(Anchor{Path: " leading.txt", Line: 1, Side: SideRight}); !got.Valid {
+		t.Fatalf("RIGHT anchor with leading-space path should be valid: %#v ranges=%#v", got, idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "leading.txt", Line: 1, Side: SideRight}); got.Valid {
+		t.Fatalf("trimmed leading-space path should be invalid: %#v", got)
+	}
+	if got := idx.Validate(Anchor{Path: "trailing.txt ", Line: 1, Side: SideRight}); !got.Valid {
+		t.Fatalf("RIGHT anchor with trailing-space path should be valid: %#v ranges=%#v", got, idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "trailing.txt", Line: 1, Side: SideRight}); got.Valid {
+		t.Fatalf("trimmed trailing-space path should be invalid: %#v", got)
+	}
+}
+
+func TestParseFileHeaderPreservesTrailingSpaceBeforeTabSeparator(t *testing.T) {
+	t.Parallel()
+	diff := "diff --git \"a/trailing.txt \" \"b/trailing.txt \"\n--- \"a/trailing.txt \"\n+++ b/trailing.txt \tmetadata\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+	idx := Parse(diff)
+
+	if got := idx.Validate(Anchor{Path: "trailing.txt ", Line: 1, Side: SideRight}); !got.Valid {
+		t.Fatalf("RIGHT anchor on trailing-space path should be valid: %#v ranges=%#v", got, idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "trailing.txt", Line: 1, Side: SideRight}); got.Valid {
+		t.Fatalf("trimmed trailing-space path should be invalid: %#v", got)
+	}
+}
+
 func TestValidateMultilineMarkdownAnchorAcrossHeadingChange(t *testing.T) {
 	t.Parallel()
 	diff := "diff --git a/docs/spec.md b/docs/spec.md\n@@ -1,4 +1,4 @@\n # Old heading\n-content\n+# New heading\n+content\n tail\n"

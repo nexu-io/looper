@@ -79,7 +79,6 @@ func reviewQualityGateApplies(event string, body string) bool {
 }
 
 func normalizeReviewCommentAnchor(comment ReviewComment) ReviewComment {
-	comment.Path = strings.TrimSpace(comment.Path)
 	comment.Side = normalizeReviewCommentSide(comment.Side)
 	if comment.StartLine <= 0 {
 		comment.StartLine = 0

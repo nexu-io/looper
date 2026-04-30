@@ -47,18 +47,18 @@ func TestNormalizeReviewAnchorsCanonicalizesValidSides(t *testing.T) {
 	}
 }
 
-func TestNormalizeReviewAnchorsTrimsValidPath(t *testing.T) {
+func TestNormalizeReviewAnchorsPreservesValidPathSpaces(t *testing.T) {
 	t.Parallel()
-	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
+	idx := diffanchor.Parse("diff --git a/ leading.go b/ leading.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
 	_, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
-		{Body: "Valid inline", Path: " app.go \t", Line: 1, Side: "RIGHT"},
+		{Body: "Valid inline", Path: " leading.go", Line: 1, Side: "RIGHT"},
 	}, &idx)
 
 	if len(comments) != 1 {
 		t.Fatalf("comments = %#v, want one preserved valid comment", comments)
 	}
-	if comments[0].Path != "app.go" {
-		t.Fatalf("comment path = %q, want trimmed app.go", comments[0].Path)
+	if comments[0].Path != " leading.go" {
+		t.Fatalf("comment path = %q, want preserved leading-space path", comments[0].Path)
 	}
 	if len(flags) != 0 {
 		t.Fatalf("unexpected quality flags: %#v", flags)
