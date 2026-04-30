@@ -255,6 +255,49 @@ func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing
 	}
 }
 
+func TestExecutionResolveOutputLogsSkipsPersistedReplacementAfterWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	logPath := filepath.Join(t.TempDir(), "stdout.log")
+	fullPersisted := strings.Repeat("persisted-", 4)
+	if err := os.WriteFile(logPath, []byte(fullPersisted), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	x := &execution{
+		stdout:                  []byte("tail-only"),
+		stdoutLogPath:           logPath,
+		persistedLogWriteFailed: true,
+	}
+
+	stdout, stderr := x.resolveOutputLogs()
+	if stdout != "tail-only" {
+		t.Fatalf("stdout = %q, want in-memory tail when persisted write failed", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty stderr", stderr)
+	}
+}
+
+func TestAppendPersistedLogMarksWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	dirPath := filepath.Join(t.TempDir(), "logs")
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	x := &execution{}
+	if !x.appendPersistedLog(dirPath, []byte("chunk")) {
+		t.Fatal("appendPersistedLog() = false, want true for unwritable path")
+	}
+	x.markPersistedLogWriteFailed()
+
+	if !x.hasPersistedLogWriteFailure() {
+		t.Fatal("hasPersistedLogWriteFailure() = false, want true")
+	}
+}
+
 func TestIsAgentSetupFailureMessageDetectsCodexModelCompatibility(t *testing.T) {
 	t.Parallel()
 

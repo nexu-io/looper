@@ -189,13 +189,14 @@ type execution struct {
 	lastHeartbeatAtISO string
 	lastOutputAt       time.Time
 
-	mu             sync.Mutex
-	status         string
-	stdout         []byte
-	stderr         []byte
-	stdoutLogPath  string
-	stderrLogPath  string
-	heartbeatCount int64
+	mu                      sync.Mutex
+	status                  string
+	stdout                  []byte
+	stderr                  []byte
+	stdoutLogPath           string
+	stderrLogPath           string
+	persistedLogWriteFailed bool
+	heartbeatCount          int64
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -349,18 +350,13 @@ func (x *execution) run(ctx context.Context) {
 		_ = x.killProcessGroup()
 	}
 
-	stdout := x.stdoutString()
-	stderr := x.stderrString()
-	if persisted, ok := readPersistedExecutionLog(x.stdoutLogPath); ok {
-		stdout = persisted
-	}
-	if persisted, ok := readPersistedExecutionLog(x.stderrLogPath); ok {
-		stderr = persisted
-	}
+	stdout, stderr := x.resolveOutputLogs()
 	status := x.finalStatus(timedOut, killed)
 	if waitErr != nil && status == "failed" && strings.TrimSpace(stderr) == "" {
 		stderr = waitErr.Error()
-		x.appendPersistedLog(x.stderrLogPath, []byte(stderr))
+		if x.appendPersistedLog(x.stderrLogPath, []byte(stderr)) {
+			x.markPersistedLogWriteFailed()
+		}
 	}
 	errorMessage := ""
 	if status == "failed" || status == "timeout" || status == "killed" {
@@ -420,10 +416,14 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	if stream == "stdout" {
-		x.appendPersistedLog(x.stdoutLogPath, chunk)
+		if x.appendPersistedLog(x.stdoutLogPath, chunk) {
+			x.persistedLogWriteFailed = true
+		}
 		x.stdout = appendTailBounded(x.stdout, chunk, x.maxOutputBytes)
 	} else {
-		x.appendPersistedLog(x.stderrLogPath, chunk)
+		if x.appendPersistedLog(x.stderrLogPath, chunk) {
+			x.persistedLogWriteFailed = true
+		}
 		x.stderr = appendTailBounded(x.stderr, chunk, x.maxOutputBytes)
 	}
 	heartbeatCount := x.heartbeatCount
@@ -576,6 +576,33 @@ func (x *execution) heartbeatCountValue() int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.heartbeatCount
+}
+
+func (x *execution) resolveOutputLogs() (string, string) {
+	stdout := x.stdoutString()
+	stderr := x.stderrString()
+	if x.hasPersistedLogWriteFailure() {
+		return stdout, stderr
+	}
+	if persisted, ok := readPersistedExecutionLog(x.stdoutLogPath); ok {
+		stdout = persisted
+	}
+	if persisted, ok := readPersistedExecutionLog(x.stderrLogPath); ok {
+		stderr = persisted
+	}
+	return stdout, stderr
+}
+
+func (x *execution) hasPersistedLogWriteFailure() bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.persistedLogWriteFailed
+}
+
+func (x *execution) markPersistedLogWriteFailed() {
+	x.mu.Lock()
+	x.persistedLogWriteFailed = true
+	x.mu.Unlock()
 }
 
 func (x *execution) timeSinceLastOutput() time.Duration {
@@ -764,19 +791,23 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func (x *execution) appendPersistedLog(path string, chunk []byte) {
+func (x *execution) appendPersistedLog(path string, chunk []byte) bool {
 	if path == "" || len(chunk) == 0 {
-		return
+		return false
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return true
 	}
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return
+		return true
 	}
-	defer file.Close()
-	_, _ = file.Write(chunk)
+	n, err := file.Write(chunk)
+	writeFailed := err != nil || n != len(chunk)
+	if err := file.Close(); err != nil {
+		writeFailed = true
+	}
+	return writeFailed
 }
 
 func (x *execution) initializePersistedLogs() {

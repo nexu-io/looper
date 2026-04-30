@@ -3808,12 +3808,18 @@ func readAgentOutputLog(logDir string, path string) (string, bool) {
 		return "", false
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedAgentLogReadBytes+1))
+	info, err := file.Stat()
 	if err != nil {
 		return "", false
 	}
-	if len(raw) > maxPersistedAgentLogReadBytes {
-		raw = raw[:maxPersistedAgentLogReadBytes]
+	if info.Size() > maxPersistedAgentLogReadBytes {
+		if _, err := file.Seek(info.Size()-maxPersistedAgentLogReadBytes, io.SeekStart); err != nil {
+			return "", false
+		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedAgentLogReadBytes))
+	if err != nil {
+		return "", false
 	}
 	return string(raw), true
 }

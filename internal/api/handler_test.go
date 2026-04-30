@@ -285,6 +285,30 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 	assertEqual(t, errMap["message"], "list loops: database is locked")
 }
 
+func TestReadAgentOutputLogReadsTailToPreserveCompletionMarker(t *testing.T) {
+	t.Parallel()
+
+	logDir := t.TempDir()
+	logPath := filepath.Join(logDir, "stdout.log")
+	completionLine := "__LOOPER_RESULT__={\"summary\":\"done from tail\"}\n"
+	headSize := maxPersistedAgentLogReadBytes - len(completionLine) + 1023
+	fullLog := strings.Repeat("x", headSize) + "\n" + completionLine
+	if err := os.WriteFile(logPath, []byte(fullLog), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	persisted, ok := readAgentOutputLog(logDir, logPath)
+	if !ok {
+		t.Fatal("readAgentOutputLog() = ok false, want true")
+	}
+	if len(persisted) != maxPersistedAgentLogReadBytes {
+		t.Fatalf("len(persisted) = %d, want %d", len(persisted), maxPersistedAgentLogReadBytes)
+	}
+	if !strings.HasSuffix(persisted, completionLine) {
+		t.Fatal("persisted log missing completion tail suffix")
+	}
+}
+
 func TestHandlerPullRequestStatusReturnsInternalErrorWhenRunLookupFails(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)
