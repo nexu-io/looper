@@ -971,6 +971,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if result.ParseStatus != "parsed" {
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		} else if found.Found {
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
 	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
@@ -1001,39 +1008,38 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
 	}
+	markerResult := ReviewMarkerResult{}
+	if pending.Event == reviewEventAgentNative {
+		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		markerResult = found
+	} else {
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
+	}
 	if !isManualReviewerLoop(input.Loop) {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) && !markerResult.Found {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
 	}
-	markerResult := ReviewMarkerResult{}
-	if pending.Event == reviewEventAgentNative {
-		marker := agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA)
-		found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	if !markerResult.Found {
+		if pending.MarkerVerificationMisses == 0 {
+			pending.MarkerVerificationMisses = 1
+			checkpoint.PendingReview = pending.clone()
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
 		}
-		markerResult = found
-		if !markerResult.Found {
-			if pending.MarkerVerificationMisses == 0 {
-				pending.MarkerVerificationMisses = 1
-				checkpoint.PendingReview = pending.clone()
-				checkpoint.ResumePolicy = "advance_from_checkpoint"
-				return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
-			}
-			checkpoint.PendingReview = nil
-			checkpoint.ResumePolicy = "rerun_review"
-			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
-		}
-	} else {
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "rerun_review"
-		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
@@ -1043,6 +1049,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string) (ReviewMarkerResult, error) {
+	marker := agentNativeReviewMarker(input.Loop.ID, headSHA)
+	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
 }
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
@@ -1643,7 +1654,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
 		"Every review body must use the same disclosure style as looper's Go-side stamping: include the hidden stamp marker `<!-- looper:stamp v=1 -->` immediately followed by the visible Markdown footer `<sub>Generated by looper 0.0.0-dev · runner=reviewer · agent=opencode</sub>`. Do not write the footer as plain paragraph text.",
-		"If your inline review API call is rejected because of an invalid anchor, retry once by moving the same actionable feedback into the review body rather than creating separate duplicate PR comments.",
+		"If your inline review API call is rejected because of an invalid anchor, retry once with corrected inline anchors. If code-anchored actionable findings still cannot be submitted as resolvable inline review comments, exit non-zero instead of moving them into the review body or creating separate duplicate PR comments.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,

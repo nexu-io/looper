@@ -678,7 +678,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsWhenPRReviewStateIsNotClea
 func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted maybe", Stdout: "posted maybe"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -695,6 +695,39 @@ func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	}
 	if result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "valid completion marker") {
 		t.Fatalf("result = %#v, want non-retryable completion marker failure", result)
+	}
+}
+
+func TestProcessClaimedItemRecoversMissingCompletionMarkerWhenReviewMarkerExists(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "actionable"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted maybe", Stdout: "posted maybe"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success after marker recovery", result)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil || !contains(*loop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop after recovered publish = %#v, want lastPublishedHeadSha recorded", loop)
+	}
+	if github.reviewMarkerCalls != 2 {
+		t.Fatalf("review marker calls = %d, want parse recovery lookup plus publish verification", github.reviewMarkerCalls)
 	}
 }
 
@@ -796,7 +829,7 @@ func TestProcessClaimedItemRerunsReviewAfterRepeatedAgentReviewMarkerMisses(t *t
 	}
 }
 
-func TestProcessClaimedItemSkipsRerunReviewWhenRequestRemovedAfterMarkerMissing(t *testing.T) {
+func TestProcessClaimedItemRecordsReviewWhenRequestRemovedAfterMarkerAppears(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
@@ -828,8 +861,54 @@ func TestProcessClaimedItemSkipsRerunReviewWhenRequestRemovedAfterMarkerMissing(
 	if err != nil {
 		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
 	}
+	if result.Status != "success" {
+		t.Fatalf("retry result = %#v, want publish success after marker appears", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) after retry = %d, want no second review", len(agent.starts))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil || !contains(*loop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop after marker recovery = %#v, want lastPublishedHeadSha recorded", loop)
+	}
+}
+
+func TestProcessClaimedItemSkipsRerunReviewWhenRequestRemovedAndMarkerMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+		t.Fatalf("result = %#v, want retryable missing marker failure", result)
+	}
+	github.reviewRequests = []string{"someoneelse"}
+	fixture.advance(time.Hour)
+	claim, err = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("retry ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
+	}
 	if result.Status != "skipped" || !contains(result.Summary, "current user is not requested for review") {
-		t.Fatalf("retry result = %#v, want eligibility skip", result)
+		t.Fatalf("retry result = %#v, want eligibility skip when marker is still missing", result)
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) after retry = %d, want no second review", len(agent.starts))
@@ -923,7 +1002,7 @@ func TestProcessClaimedItemRetriesWhenAgentNativeReviewApprovesWithoutPermission
 	}
 }
 
-func TestProcessClaimedItemSkipsAgentNativePublishWhenReviewRequestRemoved(t *testing.T) {
+func TestProcessClaimedItemRecordsAgentNativePublishWhenReviewRequestRemovedAfterPosting(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, removeReviewRequestOnSecondView: true}
@@ -941,15 +1020,15 @@ func TestProcessClaimedItemSkipsAgentNativePublishWhenReviewRequestRemoved(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" || !contains(result.Summary, "current user is not requested for review") {
-		t.Fatalf("result = %#v, want missing review request skip", result)
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want publish success after marker verification", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || (loop.MetadataJSON != nil && contains(*loop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`)) {
-		t.Fatalf("loop after skipped publish = %#v, want no lastPublishedHeadSha", loop)
+	if loop == nil || loop.MetadataJSON == nil || !contains(*loop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop after verified publish = %#v, want lastPublishedHeadSha recorded", loop)
 	}
 }
 
@@ -1578,6 +1657,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"<!-- looper:stamp v=1 -->",
 		"<sub>Generated by looper 0.0.0-dev · runner=reviewer · agent=opencode</sub>",
 		"Do not write the footer as plain paragraph text",
+		"retry once with corrected inline anchors",
+		"exit non-zero instead of moving them into the review body",
 		"Resolvable inline review comments are required",
 		"PR review `comments` array",
 		"not as a separate issue/PR conversation comment",
@@ -1595,6 +1676,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	}
 	if strings.Contains(prompt, "PR conversation comments") {
 		t.Fatalf("prompt idempotency source diverges from review marker verification:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "moving the same actionable feedback into the review body") {
+		t.Fatalf("prompt allows weakening resolvable inline comment contract:\n%s", prompt)
 	}
 }
 
