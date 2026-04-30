@@ -467,6 +467,18 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	}, nil
 }
 
+func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return asString(row["headRefOid"]), nil
+}
+
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
 	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD)
 	if err != nil {
@@ -513,34 +525,40 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 }
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
-	input.Body, input.Comments, _ = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
-	if len(input.Comments) > 0 {
+	var flags []reviewQualityFlag
+	input.Body, input.Comments, flags = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	if reviewQualityGateApplies(input.Event, input.Body) && len(flags) > 0 {
+		return fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
+	}
+	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
 		payload := map[string]any{
 			"event":     input.Event,
 			"body":      emptyToNil(input.Body),
 			"commit_id": emptyToNil(input.CommitID),
 		}
-		comments := make([]map[string]any, 0, len(input.Comments))
-		for _, comment := range input.Comments {
-			row := map[string]any{"body": comment.Body}
-			if comment.Path != "" {
-				row["path"] = comment.Path
+		if len(input.Comments) > 0 {
+			comments := make([]map[string]any, 0, len(input.Comments))
+			for _, comment := range input.Comments {
+				row := map[string]any{"body": comment.Body}
+				if comment.Path != "" {
+					row["path"] = comment.Path
+				}
+				if comment.Line > 0 {
+					row["line"] = comment.Line
+				}
+				if comment.Side != "" {
+					row["side"] = comment.Side
+				}
+				if comment.StartLine > 0 {
+					row["start_line"] = comment.StartLine
+				}
+				if comment.StartSide != "" {
+					row["start_side"] = comment.StartSide
+				}
+				comments = append(comments, row)
 			}
-			if comment.Line > 0 {
-				row["line"] = comment.Line
-			}
-			if comment.Side != "" {
-				row["side"] = comment.Side
-			}
-			if comment.StartLine > 0 {
-				row["start_line"] = comment.StartLine
-			}
-			if comment.StartSide != "" {
-				row["start_side"] = comment.StartSide
-			}
-			comments = append(comments, row)
+			payload["comments"] = comments
 		}
-		payload["comments"] = comments
 		body, err := json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("marshal gh review payload: %w", err)

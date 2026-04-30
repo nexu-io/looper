@@ -50,7 +50,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
-		case args == "pr review 42 --repo acme/looper --comment --body Looks good":
+		case args == "pr review 42 --repo acme/looper --comment --body app.go: Looks good":
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "pr comment 42 --repo acme/looper --body High-level follow-up":
 			return shell.Result{Stdout: "{}"}, nil
@@ -94,7 +94,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
 	}
-	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Looks good"}); err != nil {
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "app.go: Looks good"}); err != nil {
 		t.Fatalf("SubmitReview(comment only) error = %v", err)
 	}
 	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please handle the null case.", Path: "src/a.ts", Line: 12, Side: "RIGHT"}}}); err != nil {
@@ -182,7 +182,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 
 	log := strings.Join(runner.calls, "\n")
 	for _, needle := range []string{
-		"pr review 42 --repo acme/looper --comment --body Looks good",
+		"pr review 42 --repo acme/looper --comment --body app.go: Looks good",
 		"api repos/acme/looper/pulls/42/reviews --method POST --input -",
 		"pr comment 42 --repo acme/looper --body High-level follow-up",
 		"api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes",
@@ -208,6 +208,80 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		if !strings.Contains(runner.stdin, needle) {
 			t.Fatalf("review stdin missing %q\n%s", needle, runner.stdin)
 		}
+	}
+}
+
+func TestGetPullRequestHeadSHA(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr view 42 --repo acme/looper --json headRefOid" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"headRefOid":"abc123"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	headSHA, err := gateway.GetPullRequestHeadSHA(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("GetPullRequestHeadSHA() error = %v", err)
+	}
+	if headSHA != "abc123" {
+		t.Fatalf("GetPullRequestHeadSHA() = %q, want abc123", headSHA)
+	}
+}
+
+func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "This needs work."})
+	if err == nil || !strings.Contains(err.Error(), "review quality gate failed") || !strings.Contains(err.Error(), "top-level-location-missing") {
+		t.Fatalf("SubmitReview() error = %v, want quality gate failure", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after quality failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewAllowsCleanOutcomeWithoutLocation(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "pr review 42 --repo acme/looper --comment --body LGTM\n<!-- looper:review id=reviewer:1 head=abc outcome=clean -->" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	body := "LGTM\n<!-- looper:review id=reviewer:1 head=abc outcome=clean -->"
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: body}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+}
+
+func TestSubmitReviewUsesAPIForTopLevelReviewWithCommitID(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		runner.stdin = options.Stdin
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "app.go: Looks good", CommitID: "abc123"}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if !strings.Contains(runner.stdin, `"commit_id":"abc123"`) || strings.Contains(runner.stdin, `"comments"`) {
+		t.Fatalf("review stdin = %s, want commit_id without comments", runner.stdin)
 	}
 }
 

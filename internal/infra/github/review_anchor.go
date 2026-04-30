@@ -14,7 +14,7 @@ type reviewQualityFlag struct {
 func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diffanchor.Index) (string, []ReviewComment, []reviewQualityFlag) {
 	flags := []reviewQualityFlag{}
 	if anchors == nil {
-		if len(comments) == 0 {
+		if len(comments) == 0 && strings.TrimSpace(body) != "" {
 			if result := diffanchor.ValidateTopLevelLocation(body); result.QualityFlagged {
 				flags = append(flags, reviewQualityFlag{Kind: "top-level-location-missing", Detail: result.Reason})
 			}
@@ -42,12 +42,40 @@ func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diff
 		parts = append(parts, downgraded...)
 		body = strings.Join(parts, "\n\n")
 	}
-	if len(kept) == 0 {
+	if len(kept) == 0 && strings.TrimSpace(body) != "" {
 		if result := diffanchor.ValidateTopLevelLocation(body); result.QualityFlagged {
 			flags = append(flags, reviewQualityFlag{Kind: "top-level-location-missing", Detail: result.Reason})
 		}
 	}
 	return body, kept, flags
+}
+
+func formatReviewQualityFlags(flags []reviewQualityFlag) string {
+	parts := make([]string, 0, len(flags))
+	for _, flag := range flags {
+		part := strings.TrimSpace(flag.Kind)
+		if detail := strings.TrimSpace(flag.Detail); detail != "" {
+			part += " (" + detail + ")"
+		}
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func reviewQualityGateApplies(event string, body string) bool {
+	if strings.EqualFold(strings.TrimSpace(event), "REQUEST_CHANGES") {
+		return true
+	}
+	body = strings.ToLower(body)
+	if strings.Contains(body, "outcome=actionable") {
+		return true
+	}
+	if strings.Contains(body, "outcome=clean") || strings.EqualFold(strings.TrimSpace(event), "APPROVE") {
+		return false
+	}
+	return true
 }
 
 func normalizeReviewCommentAnchor(comment ReviewComment) ReviewComment {

@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
@@ -18,5 +19,19 @@ func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *t
 	}
 	if canSubmitWithoutAnchorValidation(errors.New("network failed"), nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false for generic diff errors")
+	}
+}
+
+func TestValidateExpectedHeadCommit(t *testing.T) {
+	t.Parallel()
+
+	if err := validateExpectedHeadCommit("abc123", "ABC123"); err != nil {
+		t.Fatalf("validateExpectedHeadCommit() error = %v", err)
+	}
+	if err := validateExpectedHeadCommit("", "abc123"); err == nil || !strings.Contains(err.Error(), "requires --commit-id") {
+		t.Fatalf("validateExpectedHeadCommit(empty) error = %v, want commit-id requirement", err)
+	}
+	if err := validateExpectedHeadCommit("abc123", "def456"); err == nil || !strings.Contains(err.Error(), "expected head commit abc123 but PR head is def456") {
+		t.Fatalf("validateExpectedHeadCommit(stale) error = %v, want stale head failure", err)
 	}
 }

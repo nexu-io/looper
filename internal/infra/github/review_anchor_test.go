@@ -72,3 +72,11 @@ func TestNormalizeReviewAnchorsFlagsUnlocatedTopLevelComment(t *testing.T) {
 		t.Fatalf("flags = %#v, want top-level-location-missing", flags)
 	}
 }
+
+func TestNormalizeReviewAnchorsDoesNotFlagEmptyTopLevelBody(t *testing.T) {
+	t.Parallel()
+	_, _, flags := normalizeReviewAnchors("", nil, nil)
+	if len(flags) != 0 {
+		t.Fatalf("flags = %#v, want none for empty top-level body", flags)
+	}
+}

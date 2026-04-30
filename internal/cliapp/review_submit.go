@@ -40,6 +40,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unsupported review event %q", event)
 	}
 	commitID := strings.TrimSpace(getStringFlag(cmd, "commit-id"))
+	if commitID == "" {
+		return fmt.Errorf("review submit requires --commit-id expected PR head SHA")
+	}
 
 	raw, err := io.ReadAll(cmd.InOrStdin())
 	if err != nil {
@@ -63,6 +66,13 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run})
+	headSHA, err := gh.GetPullRequestHeadSHA(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return fmt.Errorf("validate expected PR head commit: %w", err)
+	}
+	if err := validateExpectedHeadCommit(commitID, headSHA); err != nil {
+		return err
+	}
 	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	var anchors *diffanchor.Index
 	if err != nil {
@@ -82,6 +92,21 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("submit validated PR review: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+func validateExpectedHeadCommit(expected string, actual string) error {
+	expected = strings.TrimSpace(expected)
+	actual = strings.TrimSpace(actual)
+	if expected == "" {
+		return fmt.Errorf("review submit requires --commit-id expected PR head SHA")
+	}
+	if actual == "" {
+		return fmt.Errorf("validate expected PR head commit: PR head SHA is empty")
+	}
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("review submit expected head commit %s but PR head is %s; refresh the review before submitting", expected, actual)
+	}
+	return nil
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
