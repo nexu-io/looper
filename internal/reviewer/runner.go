@@ -170,12 +170,35 @@ type VerifyReviewMarkerInput struct {
 	CWD                 string
 }
 
+type ReviewMarkerResult struct {
+	Found   bool
+	Outcome string
+}
+
+type PullRequestReactionInput struct {
+	Repo     string
+	PRNumber int64
+	Content  string
+	CWD      string
+}
+
+type PullRequestLabelsInput struct {
+	Repo     string
+	PRNumber int64
+	Labels   []string
+	CWD      string
+}
+
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
-	HasReviewMarker(context.Context, VerifyReviewMarkerInput) (bool, error)
+	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
+	AddPullRequestReaction(context.Context, PullRequestReactionInput) error
+	RemovePullRequestReaction(context.Context, PullRequestReactionInput) error
+	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
+	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 }
 
 type GitGateway interface {
@@ -987,13 +1010,15 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, nil
 		}
 	}
+	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
 		marker := agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA)
-		found, err := r.github.HasReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
+		found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: repo, PRNumber: prNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !found {
+		markerResult = found
+		if !markerResult.Found {
 			if pending.MarkerVerificationMisses == 0 {
 				pending.MarkerVerificationMisses = 1
 				checkpoint.PendingReview = pending.clone()
@@ -1010,10 +1035,47 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
+	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
+		return checkpoint, err
+	}
 	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
+	if !marker.Found {
+		return &loopError{message: "Cannot apply review side effects without a verified review marker", kind: FailureRetryableAfterResume}
+	}
+	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
+	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
+	switch outcome {
+	case "clean":
+		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
+		if r.allowAutoApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+			if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
+				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+				}
+			}
+			if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
+				if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+				}
+			}
+		}
+	case "actionable":
+		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+	default:
+		return &loopError{message: "Verified review marker is missing outcome=clean|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
+	}
+	return nil
 }
 
 func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
