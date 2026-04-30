@@ -13,8 +13,14 @@ func TestParseSingleFileDiffAndValidateAnchors(t *testing.T) {
 	if !idx.Validate(Anchor{Path: "app.go", Line: 12, Side: SideRight}).Valid {
 		t.Fatalf("RIGHT anchor on added line should be valid: %#v", idx.Ranges)
 	}
+	if !idx.Validate(Anchor{Path: "app.go", Line: 10, Side: SideRight}).Valid {
+		t.Fatalf("RIGHT anchor on unchanged context line should be valid: %#v", idx.Ranges)
+	}
 	if !idx.Validate(Anchor{Path: "app.go", Line: 11, Side: SideLeft}).Valid {
 		t.Fatalf("LEFT anchor on removed line should be valid: %#v", idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "app.go", Line: 10, Side: SideLeft}); got.Valid {
+		t.Fatalf("LEFT anchor on unchanged context line should be invalid: %#v ranges=%#v", got, idx.Ranges)
 	}
 	if got := idx.Validate(Anchor{Path: "app.go", Line: 99, Side: SideRight}); got.Valid || !strings.Contains(got.LocationText, "app.go RIGHT line 99") {
 		t.Fatalf("out-of-range validation = %#v, want invalid with fallback location", got)

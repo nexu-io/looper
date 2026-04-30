@@ -121,7 +121,6 @@ func Parse(diff string) Index {
 				rightHeading, leftHeading = h, h
 			}
 			add(SideRight, newLine, content, rightHeading)
-			add(SideLeft, oldLine, content, leftHeading)
 			oldLine++
 			newLine++
 		case '+':
