@@ -718,6 +718,14 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+		Disclosure:       &cfg.Disclosure,
+		AgentRuntime: func() string {
+			if cfg.Agent.Vendor == nil {
+				return ""
+			}
+			return string(*cfg.Agent.Vendor)
+		}(),
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {

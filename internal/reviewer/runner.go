@@ -13,9 +13,11 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/version"
 )
 
 const (
@@ -261,6 +263,9 @@ type Options struct {
 	AgentTimeout            time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
+	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
+	AgentModel              *string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
@@ -277,6 +282,9 @@ type Runner struct {
 	agentTimeout            time.Duration
 	claimTTL                time.Duration
 	allowAutoApprove        bool
+	disclosure              config.DisclosureConfig
+	agentRuntime            string
+	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -390,6 +398,10 @@ func New(options Options) *Runner {
 	if retryMax <= 0 {
 		retryMax = defaultRetryMax
 	}
+	disclosureCfg := config.DefaultDisclosureConfig()
+	if options.Disclosure != nil {
+		disclosureCfg = *options.Disclosure
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -401,6 +413,9 @@ func New(options Options) *Runner {
 		agentTimeout:            agentTimeout,
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
+		disclosure:              disclosureCfg,
+		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
+		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
@@ -947,7 +962,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop)), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -961,6 +976,17 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	if result.Status != "completed" {
+		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		} else if found.Found {
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
 			checkpoint.ResumePolicy = "restart_from_discover"
 			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
@@ -1518,6 +1544,20 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	return "", false
 }
 
+func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {
+	if checkpoint.Snapshot == nil {
+		return "", false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", false
+	}
+	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	}
+	return "", false
+}
+
 func stepsFrom(start ReviewerStep) []ReviewerStep {
 	startIndex := 0
 	for i, step := range reviewerStepSequence {
@@ -1616,7 +1656,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
 }
 
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool) string {
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
 	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 	if phase == "spec" {
@@ -1670,7 +1710,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
-		"Every review body must use the same disclosure style as looper's Go-side stamping: include the hidden stamp marker `<!-- looper:stamp v=1 -->` immediately followed by the visible Markdown footer `<sub>Generated by looper 0.0.0-dev · runner=reviewer · agent=opencode</sub>`. Do not write the footer as plain paragraph text.",
+		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
 		"If your inline review API call is rejected because of an invalid anchor, retry once with corrected inline anchors. If code-anchored actionable findings still cannot be submitted as resolvable inline review comments, exit non-zero instead of moving them into the review body or creating separate duplicate PR comments.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
@@ -1695,6 +1735,21 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"If the review is clean, write a warm, specific LGTM review body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+}
+
+func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+	if !disclosureCfg.Enabled {
+		return "Looper disclosure stamping is disabled by configuration; do not add looper Markdown disclosure footers or hidden looper stamp markers to GitHub review bodies or inline review comments."
+	}
+	if !disclosureCfg.Channels.ReviewComment {
+		return "Looper review disclosure stamping is disabled by configuration; do not add looper Markdown disclosure footers or hidden looper stamp markers to GitHub review bodies or inline review comments."
+	}
+	stamper := disclosure.Stamper{Config: disclosureCfg, Version: version.Current().Version, Agent: agentRuntime, Model: agentModel}
+	reviewBodyInstruction := "Every GitHub review body you post must use looper's configured disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
+	if disclosureCfg.Channels.InlineCommentVisible {
+		return reviewBodyInstruction + " Every inline review comment must include the hidden stamp marker immediately followed by the same visible Markdown footer."
+	}
+	return reviewBodyInstruction + " Inline review comments must use only the hidden `" + disclosure.Marker + "` marker, without a visible disclosure footer."
 }
 
 func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
