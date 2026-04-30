@@ -322,6 +322,31 @@ func TestGatewayFindReviewMarkerExtractsOutcomeFromMatchedMarker(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerReturnsNewestMatchingMarker(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=actionable -->"},
+				{"state":"APPROVED","body":"<!-- looper:review id=abc head=def outcome=clean -->"},
+				{"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=clean -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "clean" || marker.Event != "COMMENT" {
+		t.Fatalf("FindReviewMarker() = %#v, want newest matching COMMENT marker", marker)
+	}
+}
+
 func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

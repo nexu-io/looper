@@ -593,6 +593,7 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 			rows = append(rows, page...)
 		}
 	}
+	var newest ReviewMarkerResult
 	for _, row := range rows {
 		body, ok := row["body"].(string)
 		if !ok || !strings.Contains(body, marker) {
@@ -600,10 +601,10 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		}
 		event := reviewEventFromStateString(row["state"])
 		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
-			return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event}
+			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event}
 		}
 	}
-	return ReviewMarkerResult{}
+	return newest
 }
 
 func reviewMarkerOutcome(body string, marker string) string {
