@@ -196,10 +196,10 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 			return PauseResult{}, fmt.Errorf("loop not found: %s", loopID)
 		}
 		currentStatus := domain.LoopStatus(loop.Status)
-		switch currentStatus {
-		case domain.LoopStatusPaused, domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning:
-		default:
-			return PauseResult{}, fmt.Errorf("invalid loop status transition: %s -> %s", currentStatus, domain.LoopStatusPaused)
+		if currentStatus != domain.LoopStatusPaused {
+			if err := domain.AssertLoopStatusTransition(currentStatus, domain.LoopStatusPaused); err != nil {
+				return PauseResult{}, err
+			}
 		}
 		updated := *loop
 		updated.Status = string(domain.LoopStatusPaused)

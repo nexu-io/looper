@@ -15,6 +15,7 @@ import (
 	looperdapi "github.com/powerformer/looper/internal/api"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/domain"
 	"github.com/powerformer/looper/internal/eventlog"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/storage"
@@ -358,7 +359,7 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 		} else if refreshed, refreshErr := refreshStopAllCandidate(ctx, services.Repositories, candidate.Loop.ID); refreshErr != nil {
 			item.Result = string(stopAllResultFailed)
 			item.Error = refreshErr.Error()
-		} else if classifyStopAllResult(refreshed) == stopAllResultAlreadyFinished {
+		} else if candidate.Loop.Status != string(domain.LoopStatusWaiting) && classifyStopAllResult(refreshed) == stopAllResultAlreadyFinished {
 			item.Result = string(stopAllResultAlreadyFinished)
 		}
 		response.Items = append(response.Items, item)
@@ -436,7 +437,7 @@ func collectStopAllCandidates(ctx context.Context, repos *storage.Repositories) 
 		}
 	}
 	for _, loop := range loopsList {
-		if loop.Status == "queued" || loop.Status == "running" {
+		if isStopAllLoopStatus(loop.Status) {
 			activeLoopIDs[loop.ID] = struct{}{}
 		}
 	}
@@ -479,6 +480,15 @@ func collectStopAllCandidates(ctx context.Context, repos *storage.Repositories) 
 		return candidates[i].Loop.ID < candidates[j].Loop.ID
 	})
 	return candidates, nil
+}
+
+func isStopAllLoopStatus(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusQueued, domain.LoopStatusRunning, domain.LoopStatusWaiting:
+		return true
+	default:
+		return false
+	}
 }
 
 func refreshStopAllCandidate(ctx context.Context, repos *storage.Repositories, loopID string) (stopAllCandidate, error) {
@@ -556,11 +566,11 @@ func classifyStopAllResult(candidate stopAllCandidate) stopAllResult {
 		return stopAllResultStopped
 	}
 	if hasCancellingExecution {
-		if candidate.Loop.Status != "queued" && candidate.Loop.Status != "running" && !candidate.ActiveQueue {
+		if !isStopAllLoopStatus(candidate.Loop.Status) && !candidate.ActiveQueue {
 			return stopAllResultAlreadyStopping
 		}
 	}
-	if candidate.Run != nil && candidate.Run.Status != "" && candidate.Run.Status != "running" && candidate.Loop.Status != "queued" && candidate.Loop.Status != "running" && !candidate.ActiveQueue {
+	if candidate.Run != nil && candidate.Run.Status != "" && candidate.Run.Status != "running" && !isStopAllLoopStatus(candidate.Loop.Status) && !candidate.ActiveQueue {
 		return stopAllResultAlreadyFinished
 	}
 	return stopAllResultStopped

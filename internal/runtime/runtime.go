@@ -1216,7 +1216,7 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bo
 	if loop.Status == "paused" {
 		return false
 	}
-	if loop.Status == "completed" || loop.Status == "failed" {
+	if loop.Status == "completed" || loop.Status == "failed" || loop.Status == "terminated" || loop.Status == "stopped" {
 		return false
 	}
 	if latestRun == nil {

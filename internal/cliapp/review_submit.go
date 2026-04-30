@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/powerformer/looper/internal/diffanchor"
@@ -54,6 +55,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateReviewSubmitEventAllowed(event, loaded.Config.Defaults.AllowAutoApprove); err != nil {
+		return err
+	}
+	if err := validateReviewSubmitBody(payload.Body, commitID, event); err != nil {
+		return err
+	}
 	if loaded.Config.Tools.GHPath == nil || strings.TrimSpace(*loaded.Config.Tools.GHPath) == "" {
 		return fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
@@ -100,6 +107,45 @@ func validateReviewSubmitEvent(raw string) (string, error) {
 		return "", fmt.Errorf("unsupported review event %q", event)
 	}
 	return event, nil
+}
+
+func validateReviewSubmitEventAllowed(event string, allowAutoApprove bool) error {
+	if strings.EqualFold(strings.TrimSpace(event), "APPROVE") && !allowAutoApprove {
+		return fmt.Errorf("review submit --event APPROVE requires defaults.allowAutoApprove=true")
+	}
+	return nil
+}
+
+var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+
+func validateReviewSubmitBody(body string, commitID string, event string) error {
+	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
+	if len(matches) != 1 {
+		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
+	}
+	fields := parseReviewSubmitMarkerFields(matches[0][1])
+	if fields["id"] == "" || fields["head"] == "" || (fields["outcome"] != "clean" && fields["outcome"] != "actionable") {
+		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
+	}
+	if !strings.EqualFold(fields["head"], strings.TrimSpace(commitID)) {
+		return fmt.Errorf("review marker head=%s does not match --commit-id %s", fields["head"], strings.TrimSpace(commitID))
+	}
+	if event == "APPROVE" && fields["outcome"] != "clean" {
+		return fmt.Errorf("review marker outcome=%s does not match APPROVE event", fields["outcome"])
+	}
+	return nil
+}
+
+func parseReviewSubmitMarkerFields(segment string) map[string]string {
+	fields := map[string]string{}
+	for _, field := range strings.Fields(segment) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+	return fields
 }
 
 func validateExpectedHeadCommit(expected string, actual string) error {

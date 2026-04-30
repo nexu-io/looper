@@ -512,6 +512,36 @@ func TestGatewayFindReviewMarkerRequiresAuthorLogin(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerFetchesMatchedReviewComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews":
+			return shell.Result{Stdout: `[
+				{"id":101,"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=clean -->"},
+				{"id":202,"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=actionable -->"}
+			]`}, nil
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews/202/comments":
+			return shell.Result{Stdout: `[[{"body":"first inline finding"}],[{"body":"second inline finding"}]]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.ReviewID != "202" || marker.Outcome != "actionable" {
+		t.Fatalf("FindReviewMarker() = %#v, want newest matching review 202", marker)
+	}
+	if got, want := strings.Join(marker.InlineCommentBodies, "\n"), "first inline finding\nsecond inline finding"; got != want {
+		t.Fatalf("InlineCommentBodies = %q, want %q", got, want)
+	}
+}
+
 func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -889,4 +919,18 @@ func (f *fakeGHRunner) run(_ context.Context, options shell.Options) (shell.Resu
 		f.t.Fatalf("fakeGHRunner missing responder for args: %q", args)
 	}
 	return f.respond(options)
+}
+
+func TestSubmitReviewRejectsCleanMarkerWithComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "LGTM\n<!-- looper:review id=abc head=def outcome=clean -->", Comments: []ReviewComment{{Body: "But fix this", Path: "app.go", Line: 1, Side: "RIGHT"}}})
+	if err == nil || !strings.Contains(err.Error(), "clean review marker cannot be submitted with review comments") {
+		t.Fatalf("SubmitReview() error = %v, want clean-with-comments rejection", err)
+	}
 }

@@ -143,10 +143,13 @@ type VerifyReviewMarkerInput struct {
 }
 
 type ReviewMarkerResult struct {
-	Found       bool
-	Outcome     string
-	Event       string
-	AuthorLogin string
+	Found               bool
+	Outcome             string
+	Event               string
+	AuthorLogin         string
+	Body                string
+	ReviewID            string
+	InlineCommentBodies []string
 }
 
 type PullRequestReactionInput struct {
@@ -525,6 +528,9 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 }
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
+	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
+		return fmt.Errorf("clean review marker cannot be submitted with review comments")
+	}
 	var flags []reviewQualityFlag
 	input.Body, input.Comments, flags = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
 	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
@@ -599,7 +605,33 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	return findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin), nil
+	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin)
+	if marker.Found && marker.ReviewID != "" {
+		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
+		if err != nil {
+			return ReviewMarkerResult{}, err
+		}
+		marker.InlineCommentBodies = comments
+	}
+	return marker, nil
+}
+
+func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prNumber int64, reviewID string, cwd string) ([]string, error) {
+	result, err := g.runGh(ctx, cwd, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repo, prNumber, reviewID))
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	bodies := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if body := asString(row["body"]); strings.TrimSpace(body) != "" {
+			bodies = append(bodies, body)
+		}
+	}
+	return bodies, nil
 }
 
 func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
@@ -613,7 +645,7 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		var pages [][]map[string]any
 		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
 			if parsedMarker, ok := findReviewIdempotencyMarker(raw, marker); expectedAuthorLogin == "" && len(allowedReviewEvents) == 0 && ok {
-				return ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome}
+				return ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Body: raw}
 			}
 			return ReviewMarkerResult{}
 		}
@@ -637,10 +669,20 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		}
 		event := reviewEventFromStateString(row["state"])
 		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
-			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author}
+			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author, Body: body, ReviewID: reviewIDString(row)}
 		}
 	}
 	return newest
+}
+
+func reviewIDString(row map[string]any) string {
+	if id := asString(row["id"]); id != "" {
+		return id
+	}
+	if id := asInt64(row["id"]); id != 0 {
+		return fmt.Sprintf("%d", id)
+	}
+	return ""
 }
 
 func reviewAuthorLogin(row map[string]any) string {

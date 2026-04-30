@@ -270,7 +270,7 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 	if err != nil {
 		return reviewer.ReviewMarkerResult{}, err
 	}
-	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin}, nil
+	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -687,8 +687,9 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Params: cfg.Agent.Params,
 			Env:    cfg.Agent.Env,
 		},
-		Repos: repos,
-		Now:   now,
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
@@ -710,15 +711,18 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
-		Disclosure:       &cfg.Disclosure,
+		DB:                      coordinator.DB(),
+		Repos:                   repos,
+		GitHub:                  reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		Git:                     reviewerGitAdapter{gateway: gitGateway},
+		AgentExecutor:           reviewerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:                  logger,
+		Now:                     now,
+		AllowAutoApprove:        cfg.Defaults.AllowAutoApprove,
+		LoopConfig:              cfg.Reviewer.Loop,
+		Scope:                   cfg.Reviewer.Scope,
+		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
+		Disclosure:              &cfg.Disclosure,
 		AgentRuntime: func() string {
 			if cfg.Agent.Vendor == nil {
 				return ""

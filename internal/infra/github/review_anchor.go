@@ -72,7 +72,7 @@ func reviewQualityGateApplies(event string, body string) (bool, error) {
 	if len(markerComments) == 0 {
 		return true, nil
 	}
-	if len(markers) != 1 {
+	if len(markerComments) != 1 || len(markers) != 1 {
 		return true, fmt.Errorf("review body must contain exactly one well-formed looper review marker")
 	}
 	marker := markers[0]
@@ -91,7 +91,7 @@ func reviewQualityGateApplies(event string, body string) (bool, error) {
 
 func normalizeReviewCommentAnchor(comment ReviewComment) ReviewComment {
 	comment.Side = normalizeReviewCommentSide(comment.Side)
-	if comment.StartLine <= 0 {
+	if comment.StartLine <= 0 || comment.StartLine == comment.Line {
 		comment.StartLine = 0
 		comment.StartSide = ""
 		return comment

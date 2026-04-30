@@ -282,6 +282,50 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--reviewer-loop-enabled"):
+			value, nextIndex, err := takeValue(index, "--reviewer-loop-enabled")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--reviewer-quiet-period-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-quiet-period-seconds: %q is not an integer", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-max-iterations-per-pr"):
+			value, nextIndex, err := takeValue(index, "--reviewer-max-iterations-per-pr")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-max-iterations-per-pr: %q is not an integer", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).MaxIterationsPerPR = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-max-iterations-per-head"):
+			value, nextIndex, err := takeValue(index, "--reviewer-max-iterations-per-head")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-max-iterations-per-head: %q is not an integer", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).MaxIterationsPerHead = parsedValue
+			index = nextIndex
 		case matchesFlag(arg, "--osascript-path"):
 			value, nextIndex, err := takeValue(index, "--osascript-path")
 			if err != nil {
@@ -395,6 +439,34 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureDefaultsConfig(&overrides).FixAllPullRequests = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_LOOP_ENABLED"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_LOOP_ENABLED: %q is not a boolean", value)
+		}
+		ensureReviewerLoopConfig(&overrides).EnabledByDefault = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_QUIET_PERIOD_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+		}
+		ensureReviewerLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR: %q is not an integer", value)
+		}
+		ensureReviewerLoopConfig(&overrides).MaxIterationsPerPR = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD: %q is not an integer", value)
+		}
+		ensureReviewerLoopConfig(&overrides).MaxIterationsPerHead = parsed
+	}
 	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)
 	}
@@ -466,4 +538,19 @@ func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 	}
 
 	return partial.Defaults
+}
+
+func ensureReviewerConfig(partial *PartialConfig) *PartialReviewerConfig {
+	if partial.Reviewer == nil {
+		partial.Reviewer = &PartialReviewerConfig{}
+	}
+	return partial.Reviewer
+}
+
+func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig {
+	reviewer := ensureReviewerConfig(partial)
+	if reviewer.Loop == nil {
+		reviewer.Loop = &PartialReviewerLoopConfig{}
+	}
+	return reviewer.Loop
 }

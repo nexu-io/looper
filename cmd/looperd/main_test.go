@@ -733,6 +733,7 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_fixer", seq: 4, loopType: "fixer", loopStatus: "running", runID: "run_fixer", runStatus: "running", executionID: "exec_fixer", executionStatus: "cancelling", pid: 4104})
 	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_future", seq: 5, loopType: "auditor", loopStatus: "running", runID: "run_future", runStatus: "running", executionID: "exec_future", executionStatus: "running", pid: 4105})
 	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_queued", seq: 6, loopType: "worker", loopStatus: "queued", queueStatus: "running"})
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_waiting", seq: 7, loopType: "reviewer", loopStatus: "waiting", runID: "run_waiting", runStatus: "success"})
 
 	var signalPIDs []int
 	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
@@ -751,16 +752,17 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 		t.Fatalf("stopAllLoops() error = %v", err)
 	}
 
-	if got, want := response.Summary, (stopAllSummary{Total: 6, Stopped: 5, Failed: 1}); got != want {
+	if got, want := response.Summary, (stopAllSummary{Total: 7, Stopped: 6, Failed: 1}); got != want {
 		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
 	}
-	if got := stopAllItemTypes(response.Items); !slices.Equal(got, []string{"planner", "reviewer", "worker", "fixer", "auditor", "worker"}) {
+	if got := stopAllItemTypes(response.Items); !slices.Equal(got, []string{"planner", "reviewer", "worker", "fixer", "auditor", "worker", "reviewer"}) {
 		t.Fatalf("item types = %#v, want mixed known and future types", got)
 	}
 	assertStopAllItemResult(t, response.Items, "loop_reviewer", string(stopAllResultFailed))
 	assertStopAllItemResult(t, response.Items, "loop_fixer", string(stopAllResultStopped))
 	assertStopAllItemResult(t, response.Items, "loop_future", string(stopAllResultStopped))
 	assertStopAllItemResult(t, response.Items, "loop_queued", string(stopAllResultStopped))
+	assertStopAllItemResult(t, response.Items, "loop_waiting", string(stopAllResultStopped))
 	if !slices.Contains(signalPIDs, -4101) || !slices.Contains(signalPIDs, -4103) || !slices.Contains(signalPIDs, -4105) {
 		t.Fatalf("signal pids = %#v, want other loops processed after failure", signalPIDs)
 	}

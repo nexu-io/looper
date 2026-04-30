@@ -127,3 +127,28 @@ func TestReviewQualityGateUsesMarkerOutcome(t *testing.T) {
 		t.Fatalf("reviewQualityGateApplies(actionable COMMENT) = %v, %v; want true, nil", applies, err)
 	}
 }
+
+func TestReviewQualityGateRejectsExtraMalformedMarker(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=clean -->\n<!-- looper:review id=abc head=def -->"
+	if _, err := reviewQualityGateApplies("APPROVE", body); err == nil {
+		t.Fatalf("reviewQualityGateApplies() error = nil, want extra malformed marker rejected")
+	}
+}
+
+func TestNormalizeReviewAnchorsClearsSingleLineStartRange(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
+	_, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Valid inline", Path: "app.go", StartLine: 1, StartSide: "RIGHT", Line: 1, Side: "RIGHT"},
+	}, &idx)
+	if len(flags) != 0 {
+		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("comments = %#v, want one preserved valid comment", comments)
+	}
+	if comments[0].StartLine != 0 || comments[0].StartSide != "" {
+		t.Fatalf("single-line range = start_line %d start_side %q, want cleared", comments[0].StartLine, comments[0].StartSide)
+	}
+}

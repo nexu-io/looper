@@ -648,6 +648,81 @@ func TestRuntimeRecoveryRebuildsMissingQueueItemForRequeuedLoop(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecoveryDoesNotRequeueTerminalReviewerLoopWithInterruptedRun(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "main"
+	projectID := "project_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch,
+		Archived: false, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	prNumber := int64(137)
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_terminal_reviewer", Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request",
+		TargetID: stringPtr("pr:acme/looper:137"), Repo: stringPtr("acme/looper"), PRNumber: &prNumber,
+		Status: "terminated", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_terminal_reviewer) error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_terminal_reviewer", LoopID: "loop_terminal_reviewer", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_terminal_reviewer) error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return startedAt }})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	assertLoopStatus(t, services.Repositories, "loop_terminal_reviewer", "terminated")
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), "loop_terminal_reviewer")
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want interrupted run", latestRun, err)
+	}
+	if latestRun.Status != "interrupted" {
+		t.Fatalf("latestRun.Status = %q, want interrupted", latestRun.Status)
+	}
+	queueItems, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == "loop_terminal_reviewer" {
+			t.Fatalf("unexpected queue item for terminal reviewer loop: %#v", item)
+		}
+	}
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", "loop_terminal_reviewer")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(loop_terminal_reviewer) error = %v", err)
+	}
+	if containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want no loop_requeued event", events)
+	}
+}
+
 func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
 	t.Parallel()
 

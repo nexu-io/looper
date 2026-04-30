@@ -2,12 +2,15 @@ package reviewer
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -41,6 +44,8 @@ var reviewerStepSequence = []ReviewerStep{
 	stepReview,
 	stepPublish,
 }
+
+var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
 
 type ReviewerStep string
 
@@ -176,10 +181,12 @@ type VerifyReviewMarkerInput struct {
 }
 
 type ReviewMarkerResult struct {
-	Found       bool
-	Outcome     string
-	Event       ReviewEvent
-	AuthorLogin string
+	Found               bool
+	Outcome             string
+	Event               ReviewEvent
+	AuthorLogin         string
+	Body                string
+	InlineCommentBodies []string
 }
 
 type PullRequestReactionInput struct {
@@ -265,6 +272,9 @@ type Options struct {
 	AgentTimeout            time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
+	LoopConfig              config.ReviewerLoopConfig
+	Scope                   config.ReviewerScope
+	DetectDuplicateFindings bool
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
 	AgentModel              *string
@@ -285,6 +295,9 @@ type Runner struct {
 	agentTimeout            time.Duration
 	claimTTL                time.Duration
 	allowAutoApprove        bool
+	loopConfig              config.ReviewerLoopConfig
+	scope                   config.ReviewerScope
+	detectDuplicateFindings bool
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	agentModel              string
@@ -362,8 +375,10 @@ type checkpointSnapshot struct {
 
 type pendingReviewCheckpoint struct {
 	HeadSHA                  string      `json:"headSha,omitempty"`
+	IdempotencyKey           string      `json:"idempotencyKey,omitempty"`
 	Event                    ReviewEvent `json:"event,omitempty"`
 	Summary                  string      `json:"summary,omitempty"`
+	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
 }
 
@@ -406,6 +421,14 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
+	loopConfig := options.LoopConfig
+	if loopConfig.MaxIterationsPerPR == 0 {
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+	}
+	scope := options.Scope
+	if scope == "" {
+		scope = config.ReviewerScopeChangedRanges
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -417,6 +440,9 @@ func New(options Options) *Runner {
 		agentTimeout:            agentTimeout,
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
+		loopConfig:              loopConfig,
+		scope:                   scope,
+		detectDuplicateFindings: options.DetectDuplicateFindings,
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentModel:              derefString(options.AgentModel),
@@ -458,7 +484,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if loopErr != nil {
 			return loopErr
 		}
-		if loopResult.record.Status == "paused" {
+		if terminalReviewerLoopReason(loopResult.record) != "" {
 			result.Skipped++
 			return nil
 		}
@@ -466,18 +492,32 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
 		meta := parseJSONObject(loopResult.record.MetadataJSON)
+		_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
+		if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
+			result.Skipped++
+			return nil
+		}
 		if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
 			result.Skipped++
 			return nil
 		}
+		availableAt := r.now()
+		if _, reviewed := stringFromAny(meta["lastPublishedHeadSha"]); reviewed && r.loopConfig.QuietPeriodSeconds > 0 {
+			availableAt = availableAt.Add(time.Duration(r.loopConfig.QuietPeriodSeconds) * time.Second)
+		}
 		queueItem, queueErr := r.enqueue(ctx, enqueueInput{
-			ProjectID: project.ID,
-			LoopID:    loopResult.record.ID,
-			Repo:      input.Repo,
-			PRNumber:  pr.Number,
+			ProjectID:   project.ID,
+			LoopID:      loopResult.record.ID,
+			Repo:        input.Repo,
+			PRNumber:    pr.Number,
+			HeadSHA:     pr.HeadSHA,
+			AvailableAt: availableAt,
 		})
 		if queueErr != nil {
 			return queueErr
+		}
+		if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+			return err
 		}
 		result.QueueItems = append(result.QueueItems, queueItem)
 		return nil
@@ -525,7 +565,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if detail.IsDraft || normalizePRState(detail.State) != "open" {
+		if detail.IsDraft {
+			result.Skipped++
+			continue
+		}
+		if normalizePRState(detail.State) != "open" {
+			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+				return DiscoveryResult{}, err
+			}
 			result.Skipped++
 			continue
 		}
@@ -615,6 +662,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
+	if reason := terminalReviewerLoopReason(*loop); reason != "" {
+		cancelReason := "loop_" + reason
+		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &cancelReason); err != nil {
+			return ProcessResult{}, err
+		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
@@ -662,6 +717,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
+		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON)
+		if metaErr == nil {
+			updated.MetadataJSON = &metadataJSON
+		}
 	}); err != nil {
 		return ProcessResult{}, err
 	}
@@ -708,9 +767,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
 			}
+			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
-				if updated.Status == "paused" {
+				metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.message)
+				if metaErr == nil {
+					updated.MetadataJSON = &metadataJSON
+				}
+				if terminalReviewerLoopReason(*updated) == "failed" {
+					terminalFailure = true
+					updated.Status = "failed"
+					updated.NextRunAt = nil
+				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
@@ -726,6 +794,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			})
 			if loopErr != nil {
 				return ProcessResult{}, loopErr
+			}
+			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
+					return ProcessResult{}, err
+				}
+				failedQueue.Status = "failed"
 			}
 			if failedQueue == nil || failedQueue.Status != "queued" {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
@@ -756,12 +830,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
 	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
+	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
+		if metaErr == nil {
+			updated.MetadataJSON = &metadataJSON
+		}
+		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
-	}); err != nil {
+	})
+	if err != nil {
 		return ProcessResult{}, err
+	}
+	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
+		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 	status := "success"
@@ -824,7 +908,38 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped non-open pull request %s#%d", input.Repo, input.PRNumber)
+		if err := r.terminateLoop(ctx, input.Loop, "pr_closed_or_merged"); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
+		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
+			return checkpoint, err
+		}
+		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
+		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
+			return checkpoint, err
+		}
+		return checkpoint, nil
+	}
+	meta := parseJSONObject(input.Loop.MetadataJSON)
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
+		return checkpoint, nil
+	}
+	if r.loopEnabled(meta) {
+		if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
+			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
+			if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
 	}
 	if !isManualReviewerLoop(input.Loop) {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -835,11 +950,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			return checkpoint, nil
 		}
-	}
-	meta := parseJSONObject(input.Loop.MetadataJSON)
-	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
-		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
-		return checkpoint, nil
 	}
 	return checkpoint, nil
 }
@@ -967,9 +1077,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
+	}
+	if err := r.recordAgentExecutionStarted(ctx, input.Loop.ID); err != nil {
+		r.logWarn("reviewer agent execution start metadata update failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 	}
 	if r.onAgentExecutionStarted != nil {
 		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Review started", DedupeKey: "runtime.agent.started:reviewer:" + input.Run.ID}); err != nil && r.logger != nil {
@@ -985,10 +1098,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "restart_from_discover"
 			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
 		}
-		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -1004,16 +1117,16 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if result.ParseStatus != "parsed" {
-		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1043,7 +1156,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
-		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA)
+		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -1075,6 +1188,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
+	if checkpoint.PendingReview.ContentFingerprint == "" {
+		if fp := reviewMarkerFingerprint(markerResult); fp != "" {
+			checkpoint.PendingReview.ContentFingerprint = fp
+		}
+	}
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
@@ -1084,12 +1202,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	return checkpoint, nil
 }
 
-func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string) (ReviewMarkerResult, error) {
+func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string, idempotencyKey string) (ReviewMarkerResult, error) {
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	marker := agentNativeReviewMarker(input.Loop.ID, headSHA)
+	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
 	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
 }
 
@@ -1157,11 +1275,12 @@ func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-	if err != nil {
-		return err
-	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
+		if err == nil {
+			updated.MetadataJSON = stringPtr(metadataJSON)
+		}
+	}); err != nil {
 		return err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
@@ -1339,16 +1458,26 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
-		if existing.Status == "paused" {
+		if terminalReviewerLoopReason(*existing) != "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
 		updated := *existing
-		if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
-			updated.Status = "running"
-		} else {
-			updated.Status = "queued"
+		metadataJSONSource := updated.MetadataJSON
+		meta := parseJSONObject(updated.MetadataJSON)
+		if loopEnabledMetadataMissing(meta) {
+			meta["followUpdates"] = false
+			encoded, err := json.Marshal(meta)
+			if err != nil {
+				return loopUpsertResult{}, err
+			}
+			text := string(encoded)
+			metadataJSONSource = &text
 		}
-		updated.NextRunAt = &nowISO
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, repo, prNumber)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		updated.MetadataJSON = &metadataJSON
 		updated.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 			return loopUpsertResult{}, err
@@ -1360,12 +1489,32 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	metadataJSON, err := r.ensureLoopMetadataJSON(nil, repo, prNumber)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &metadataJSON}
 	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
 		return loopUpsertResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "reviewer", "repo": repo, "prNumber": prNumber}})
 	return loopUpsertResult{record: loop, created: true}, nil
+}
+
+func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {
+	if terminalReviewerLoopReason(loop) != "" {
+		return nil
+	}
+	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
+			updated.Status = "running"
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
+		updated.NextRunAt = stringPtr(availableAt)
+	})
+	return err
 }
 
 func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
@@ -1388,11 +1537,11 @@ func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) 
 	}
 	result := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
-		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "paused" {
+		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "paused" || loop.Status == "failed" || terminalReviewerLoopReason(loop) != "" {
 			continue
 		}
 		meta := parseJSONObject(loop.MetadataJSON)
-		if follow, ok := meta["followUpdates"].(bool); ok && follow {
+		if r.loopEnabled(meta) {
 			result = append(result, loop)
 		}
 	}
@@ -1413,10 +1562,12 @@ func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startSte
 }
 
 type enqueueInput struct {
-	ProjectID string
-	LoopID    string
-	Repo      string
-	PRNumber  int64
+	ProjectID   string
+	LoopID      string
+	Repo        string
+	PRNumber    int64
+	HeadSHA     string
+	AvailableAt time.Time
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
@@ -1425,7 +1576,33 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
+	availableAt := r.nowISO()
+	if !input.AvailableAt.IsZero() {
+		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
+	}
+	payloadJSON := ""
+	if strings.TrimSpace(input.HeadSHA) != "" {
+		payload, err := json.Marshal(map[string]any{"headSha": input.HeadSHA})
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		payloadJSON = string(payload)
+	}
 	if existing != nil {
+		if existing.Status == "queued" && strings.TrimSpace(input.HeadSHA) != "" {
+			existingPayload := parseJSONObject(existing.PayloadJSON)
+			existingHeadSHA, _ := stringFromAny(existingPayload["headSha"])
+			if existingHeadSHA != input.HeadSHA && isoTimeAfter(availableAt, existing.AvailableAt) {
+				updated := *existing
+				updated.AvailableAt = availableAt
+				updated.UpdatedAt = r.nowISO()
+				updated.PayloadJSON = &payloadJSON
+				if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+					return storage.QueueItemRecord{}, err
+				}
+				return updated, nil
+			}
+		}
 		return *existing, nil
 	}
 	nowISO := r.nowISO()
@@ -1433,11 +1610,23 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
-	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if payloadJSON != "" {
+		queueItem.PayloadJSON = &payloadJSON
+	}
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
 	return queueItem, nil
+}
+
+func isoTimeAfter(candidate, current string) bool {
+	candidateTime, candidateErr := time.Parse(time.RFC3339Nano, candidate)
+	currentTime, currentErr := time.Parse(time.RFC3339Nano, current)
+	if candidateErr == nil && currentErr == nil {
+		return candidateTime.After(currentTime)
+	}
+	return candidate > current
 }
 
 func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) string {
@@ -1626,6 +1815,316 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
+func (r *Runner) loopEnabled(meta map[string]any) bool {
+	if enabled, ok := meta["followUpdates"].(bool); ok {
+		return enabled
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			return enabled
+		}
+	}
+	return false
+}
+
+func loopEnabledMetadataMissing(meta map[string]any) bool {
+	if _, ok := meta["followUpdates"].(bool); ok {
+		return false
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if _, ok := loopMeta["enabled"].(bool); ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber int64) (string, error) {
+	meta := parseJSONObject(current)
+	loopMeta, _ := meta["loop"].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	if _, ok := meta["followUpdates"].(bool); !ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			meta["followUpdates"] = enabled
+		} else {
+			meta["followUpdates"] = r.loopConfig.EnabledByDefault
+		}
+	}
+	if _, ok := loopMeta["enabled"].(bool); !ok {
+		loopMeta["enabled"] = r.loopEnabled(meta)
+	}
+	if _, ok := loopMeta["status"].(string); !ok {
+		loopMeta["status"] = "active"
+	}
+	if _, ok := loopMeta["startTime"].(string); !ok {
+		loopMeta["startTime"] = r.nowISO()
+	}
+	loopMeta["repo"] = repo
+	loopMeta["prNumber"] = prNumber
+	loopMeta["scope"] = string(r.scope)
+	loopMeta["quietPeriodSeconds"] = r.loopConfig.QuietPeriodSeconds
+	loopMeta["maxIterationsPerPR"] = r.loopConfig.MaxIterationsPerPR
+	loopMeta["maxIterationsPerHead"] = r.loopConfig.MaxIterationsPerHead
+	loopMeta["maxWallClockSeconds"] = r.loopConfig.MaxWallClockSeconds
+	loopMeta["maxConsecutiveFailures"] = r.loopConfig.MaxConsecutiveFailures
+	loopMeta["maxAgentExecutionsPerPR"] = r.loopConfig.MaxAgentExecutionsPerPR
+	meta["loop"] = loopMeta
+	encoded, err := json.Marshal(meta)
+	return string(encoded), err
+}
+
+func (r *Runner) recordLoopRunStartMetadata(current *string) (string, error) {
+	meta := parseJSONObject(current)
+	loopMeta := reviewerLoopMetadata(meta)
+	loopMeta["status"] = "active"
+	loopMeta["lastStatus"] = "running"
+	meta["loop"] = loopMeta
+	encoded, err := json.Marshal(meta)
+	return string(encoded), err
+}
+
+func (r *Runner) recordAgentExecutionStarted(ctx context.Context, loopID string) error {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || current == nil {
+		return err
+	}
+	_, err = r.updateLoop(ctx, storage.LoopRecord{ID: loopID}, func(updated *storage.LoopRecord) {
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta := reviewerLoopMetadata(meta)
+		loopMeta["agentExecutionCount"] = intFromAny(loopMeta["agentExecutionCount"]) + 1
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	return err
+}
+
+func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, skipReason string) string {
+	meta := parseJSONObject(metadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
+		return status
+	}
+	if isTerminalReviewerLoopStatus(currentStatus) {
+		return currentStatus
+	}
+	if r.loopEnabled(meta) && skipReason == "" {
+		return "waiting"
+	}
+	return "completed"
+}
+
+func isTerminalReviewerLoopStatus(status string) bool {
+	switch status {
+	case "terminated", "failed", "paused", "stopped":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalReviewerLoopReason(loop storage.LoopRecord) string {
+	if isTerminalReviewerLoopStatus(loop.Status) {
+		return loop.Status
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
+		return status
+	}
+	return ""
+}
+
+func (r *Runner) recordLoopFailureMetadata(current *string, message string) (string, error) {
+	meta := parseJSONObject(current)
+	loopMeta := reviewerLoopMetadata(meta)
+	failures := intFromAny(loopMeta["failureCount"])
+	consecutive := intFromAny(loopMeta["consecutiveFailures"])
+	loopMeta["failureCount"] = failures + 1
+	loopMeta["consecutiveFailures"] = consecutive + 1
+	loopMeta["lastStatus"] = "failed"
+	loopMeta["lastFailure"] = message
+	if consecutive+1 >= r.loopConfig.MaxConsecutiveFailures {
+		loopMeta["status"] = "failed"
+		loopMeta["terminationReason"] = "max_consecutive_failures"
+	}
+	meta["loop"] = loopMeta
+	encoded, err := json.Marshal(meta)
+	return string(encoded), err
+}
+
+func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerCheckpoint, summary string) (string, error) {
+	meta := parseJSONObject(current)
+	loopMeta := reviewerLoopMetadata(meta)
+	head := ""
+	if checkpoint.Snapshot != nil {
+		head = checkpoint.Snapshot.HeadSHA
+	}
+	iterations := intFromAny(loopMeta["iterationCount"])
+	loopMeta["lastStatus"] = "success"
+	loopMeta["consecutiveFailures"] = 0
+	reviewCompleted := checkpoint.SkipReason == "" && checkpoint.PendingReview != nil
+	if reviewCompleted {
+		loopMeta["iterationCount"] = iterations + 1
+	}
+	if reviewCompleted && head != "" {
+		loopMeta["lastReviewedHeadSha"] = head
+		byHead, _ := loopMeta["iterationsByHead"].(map[string]any)
+		if byHead == nil {
+			byHead = map[string]any{}
+		}
+		byHead[head] = intFromAny(byHead[head]) + 1
+		loopMeta["iterationsByHead"] = byHead
+	}
+	fp := ""
+	if reviewCompleted {
+		fp = loopSuccessOutputFingerprint(checkpoint, summary)
+	}
+	if fp != "" {
+		previous, _ := loopMeta["lastOutputFingerprint"].(string)
+		if previous == fp && r.loopConfig.StopOnIdenticalOutput {
+			loopMeta["identicalOutputCount"] = intFromAny(loopMeta["identicalOutputCount"]) + 1
+			loopMeta["terminationReason"] = "identical_output"
+			loopMeta["status"] = "terminated"
+		} else {
+			loopMeta["identicalOutputCount"] = 1
+		}
+		loopMeta["lastOutputFingerprint"] = fp
+		fingerprints, _ := loopMeta["publishedFindingFingerprints"].([]any)
+		if !containsAnyString(fingerprints, fp) {
+			loopMeta["publishedFindingFingerprints"] = append(fingerprints, fp)
+		} else if r.detectDuplicateFindings {
+			loopMeta["duplicateFindingsDetected"] = intFromAny(loopMeta["duplicateFindingsDetected"]) + 1
+		}
+	}
+	if loopMeta["terminationReason"] == nil {
+		loopMeta["status"] = "waiting"
+	}
+	meta["loop"] = loopMeta
+	encoded, err := json.Marshal(meta)
+	return string(encoded), err
+}
+
+func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string) string {
+	if checkpoint.PendingReview != nil {
+		if fp := strings.TrimSpace(checkpoint.PendingReview.ContentFingerprint); fp != "" {
+			return fp
+		}
+		if fp := normalizedFindingFingerprint(checkpoint.PendingReview.Summary); fp != "" {
+			return fp
+		}
+	}
+	return normalizedFindingFingerprint(summary)
+}
+
+func reviewMarkerFingerprint(found ReviewMarkerResult) string {
+	parts := make([]string, 0, 1+len(found.InlineCommentBodies))
+	if strings.TrimSpace(found.Body) != "" {
+		parts = append(parts, found.Body)
+	}
+	for _, body := range found.InlineCommentBodies {
+		if strings.TrimSpace(body) != "" {
+			parts = append(parts, body)
+		}
+	}
+	return normalizedFindingFingerprint(strings.Join(parts, "\n"))
+}
+
+func (r *Runner) loopBudgetTerminationReason(loop storage.LoopRecord, headSHA string) string {
+	meta := parseJSONObject(loop.MetadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if intFromAny(loopMeta["iterationCount"]) >= r.loopConfig.MaxIterationsPerPR {
+		return "max_iterations_per_pr"
+	}
+	if intFromAny(loopMeta["agentExecutionCount"]) >= r.loopConfig.MaxAgentExecutionsPerPR {
+		return "max_agent_executions_per_pr"
+	}
+	if intFromAny(loopMeta["consecutiveFailures"]) >= r.loopConfig.MaxConsecutiveFailures {
+		return "max_consecutive_failures"
+	}
+	if headSHA != "" {
+		byHead, _ := loopMeta["iterationsByHead"].(map[string]any)
+		if intFromAny(byHead[headSHA]) >= r.loopConfig.MaxIterationsPerHead {
+			return "max_iterations_per_head"
+		}
+	}
+	if start, ok := loopMeta["startTime"].(string); ok && start != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, start); err == nil && r.now().Sub(parsed) >= time.Duration(r.loopConfig.MaxWallClockSeconds)*time.Second {
+			return "max_wall_clock"
+		}
+	}
+	return ""
+}
+
+func (r *Runner) terminateLoop(ctx context.Context, loop storage.LoopRecord, reason string) error {
+	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "terminated"
+		updated.NextRunAt = nil
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta := reviewerLoopMetadata(meta)
+		loopMeta["status"] = "terminated"
+		loopMeta["terminationReason"] = reason
+		loopMeta["lastStatus"] = "terminated"
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	if err != nil {
+		return err
+	}
+	_, err = r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason)
+	return err
+}
+
+func reviewerLoopMetadata(meta map[string]any) map[string]any {
+	loopMeta, _ := meta["loop"].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	return loopMeta
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func normalizedFindingFingerprint(text string) string {
+	text = reviewMarkerCommentPattern.ReplaceAllString(text, "")
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if normalized == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(normalized)))
+	return hex.EncodeToString(sum[:])
+}
+
+func containsAnyString(values []any, target string) bool {
+	for _, value := range values {
+		if text, ok := value.(string); ok && text == target {
+			return true
+		}
+	}
+	return false
+}
+
 func summaryFromDetail(detail PullRequestDetail) PullRequestSummary {
 	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
 }
@@ -1661,7 +2160,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
 }
 
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -1669,7 +2168,11 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, "You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits.", fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
+	publishInstruction := "You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
+	if looperCLIPath == "" {
+		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so do not publish a GitHub review yourself; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+	}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -1775,6 +2278,19 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+func reviewerScopeInstruction(scope config.ReviewerScope) string {
+	switch scope {
+	case config.ReviewerScopeFullPR:
+		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff payload below. You may report actionable issues anywhere in the PR diff when they are supported by the included context."
+	case config.ReviewerScopeChangedFiles:
+		return "Review scope: changed_files. Limit actionable findings to files changed by this PR. Use unchanged hunks only as context for changed files, and do not request changes in unrelated files unless the changed-file behavior cannot be fixed locally."
+	case config.ReviewerScopeChangedRanges:
+		return "Review scope: changed_ranges. Limit actionable findings to changed diff ranges. Use surrounding unchanged lines only to understand the change, and prefer resolvable inline comments anchored to RIGHT/LEFT lines in the diff."
+	default:
+		return reviewerScopeInstruction(config.ReviewerScopeChangedRanges)
+	}
+}
+
 func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	if !disclosureCfg.Enabled {
 		return "Looper disclosure stamping is disabled by configuration; do not add looper Markdown disclosure footers or hidden looper stamp markers to GitHub review bodies or inline review comments."
@@ -1801,8 +2317,11 @@ func agentNativeReviewID(loopID string, headSHA string) string {
 	return fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 }
 
-func agentNativeReviewMarker(loopID string, headSHA string) string {
-	return fmt.Sprintf("looper:review id=%s head=%s", agentNativeReviewID(loopID, headSHA), headSHA)
+func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey string) string {
+	if idempotencyKey == "" {
+		idempotencyKey = fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
+	}
+	return fmt.Sprintf("looper:review id=%s head=%s", idempotencyKey, headSHA)
 }
 
 func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {

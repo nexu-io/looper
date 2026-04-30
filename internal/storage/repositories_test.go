@@ -883,6 +883,34 @@ func TestQueueRecoveryHelpersRequeueAndCancelByLoop(t *testing.T) {
 	}
 }
 
+func TestQueueClaimNextOfTypeSkipsTerminatedAndStoppedLoops(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_queue_terminal"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Queue Terminal", RepoPath: "/tmp/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for index, status := range []string{"terminated", "stopped"} {
+		loopID := "loop_" + status
+		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: int64(index + 1), ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: status, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", status, err)
+		}
+		if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "queue_" + status, ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:" + status, DedupeKey: "d_" + status, Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", status, err)
+		}
+	}
+
+	claimed, err := repos.Queue.ClaimNextOfType(ctx, now, "worker", "reviewer")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextOfType() error = %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("Queue.ClaimNextOfType() = %#v, want nil", claimed)
+	}
+}
+
 func strPtr(value string) *string {
 	return &value
 }

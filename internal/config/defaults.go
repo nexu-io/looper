@@ -115,6 +115,23 @@ func DefaultConfig(cwd string) (Config, error) {
 			OpenPRStrategy:     OpenPRStrategyAllDone,
 			AddSnapshotMode:    AddSnapshotModeAsync,
 		},
+		Reviewer: ReviewerConfig{
+			Loop: ReviewerLoopConfig{
+				EnabledByDefault:        true,
+				QuietPeriodSeconds:      120,
+				MaxIterationsPerPR:      20,
+				MaxIterationsPerHead:    1,
+				MaxWallClockSeconds:     14400,
+				MaxConsecutiveFailures:  3,
+				MaxAgentExecutionsPerPR: 25,
+				StopOnApproved:          true,
+				StopOnReadyLabel:        true,
+				StopOnIdenticalOutput:   true,
+			},
+			Scope:                   ReviewerScopeChangedRanges,
+			PublishMode:             ReviewerPublishModeSingleReview,
+			DetectDuplicateFindings: true,
+		},
 		Projects: []ProjectRefConfig{},
 	}, nil
 }

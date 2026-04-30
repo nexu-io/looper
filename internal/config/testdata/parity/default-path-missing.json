@@ -91,6 +91,23 @@
         "openPrStrategy": "all_done",
         "addSnapshotMode": "async"
       },
+      "reviewer": {
+        "loop": {
+          "enabledByDefault": true,
+          "quietPeriodSeconds": 120,
+          "maxIterationsPerPR": 20,
+          "maxIterationsPerHead": 1,
+          "maxWallClockSeconds": 14400,
+          "maxConsecutiveFailures": 3,
+          "maxAgentExecutionsPerPR": 25,
+          "stopOnApproved": true,
+          "stopOnReadyLabel": true,
+          "stopOnIdenticalOutput": true
+        },
+        "scope": "changed_ranges",
+        "publishMode": "single_review",
+        "detectDuplicateFindings": true
+      },
       "projects": []
     },
     "metadata": {

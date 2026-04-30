@@ -444,6 +444,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 		"--force",
 	})
 
@@ -465,6 +471,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 	}
 
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -493,6 +505,27 @@ func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
 	}
 	assertJSONContains(t, stdout, "healthy", true)
 	assertJSONContains(t, stdout, "version", "1.2.3")
+}
+
+func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "status", "--reviewer-loop-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	}
 }
 
 func TestConfigShowJSONSendsLocalToken(t *testing.T) {
@@ -1607,6 +1640,16 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			}
 			if got, want := body["prNumber"], float64(123); got != want {
 				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			metadata, ok := body["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("body.metadata = %#v, want object", body["metadata"])
+			}
+			if got, want := metadata["manual"], true; got != want {
+				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
+			}
+			if got, want := metadata["followUpdates"], false; got != want {
+				t.Fatalf("body.metadata.followUpdates = %#v, want %#v", got, want)
 			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
 		default:

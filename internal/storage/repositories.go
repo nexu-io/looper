@@ -1273,7 +1273,7 @@ const scheduledQueueBaseQuery = `
 	LEFT JOIN loops l ON l.id = qi.loop_id
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
-		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted')
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (

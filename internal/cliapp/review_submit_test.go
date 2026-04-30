@@ -49,3 +49,53 @@ func TestValidateReviewSubmitEventRejectsRequestChanges(t *testing.T) {
 		t.Fatalf("validateReviewSubmitEvent(REQUEST_CHANGES) error = %v, want unsupported event", err)
 	}
 }
+
+func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
+	t.Parallel()
+	body := "Review body\n<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(body, "def", "COMMENT"); err != nil {
+		t.Fatalf("validateReviewSubmitBody() error = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "missing", body: "Review body", want: "exactly one"},
+		{name: "multiple", body: body + "\n<!-- looper:review id=abc head=def outcome=actionable -->", want: "exactly one"},
+		{name: "malformed", body: "<!-- looper:review id=abc head=def -->", want: "exactly one"},
+		{name: "stale", body: body, want: "does not match --commit-id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			commitID := "def"
+			if tc.name == "stale" {
+				commitID = "new"
+			}
+			err := validateReviewSubmitBody(tc.body, commitID, "COMMENT")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateReviewSubmitBody() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsApproveActionableMismatch(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(body, "def", "APPROVE"); err == nil || !strings.Contains(err.Error(), "does not match APPROVE") {
+		t.Fatalf("validateReviewSubmitBody(APPROVE actionable) error = %v, want mismatch", err)
+	}
+}
+
+func TestValidateReviewSubmitEventAllowedRejectsApproveWhenDisabled(t *testing.T) {
+	t.Parallel()
+	if err := validateReviewSubmitEventAllowed("APPROVE", false); err == nil || !strings.Contains(err.Error(), "allowAutoApprove") {
+		t.Fatalf("validateReviewSubmitEventAllowed(APPROVE,false) error = %v, want allowAutoApprove rejection", err)
+	}
+	if err := validateReviewSubmitEventAllowed("APPROVE", true); err != nil {
+		t.Fatalf("validateReviewSubmitEventAllowed(APPROVE,true) error = %v", err)
+	}
+	if err := validateReviewSubmitEventAllowed("COMMENT", false); err != nil {
+		t.Fatalf("validateReviewSubmitEventAllowed(COMMENT,false) error = %v", err)
+	}
+}

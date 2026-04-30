@@ -1275,6 +1275,67 @@ func TestDaemonLogsJSONReturnsTail(t *testing.T) {
 	assertJSONContains(t, stdout.String(), "lines", []any{"two", "three"})
 }
 
+func TestDaemonLogsFullJSONIncludesRetainedHistoryBeforeActiveLog(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		ReadFile: func(path string) ([]byte, error) {
+			switch {
+			case strings.HasSuffix(path, filepath.Join("logs", "looperd.log.4")):
+				return []byte("oldest"), nil
+			case strings.HasSuffix(path, filepath.Join("logs", "looperd.log.3")):
+				return []byte("older"), nil
+			case strings.HasSuffix(path, filepath.Join("logs", "looperd.log.2")):
+				return []byte("old"), nil
+			case strings.HasSuffix(path, filepath.Join("logs", "looperd.log.1")):
+				return []byte("recent-rotated"), nil
+			case strings.HasSuffix(path, filepath.Join("logs", "looperd.log")):
+				return []byte("current-1\ncurrent-2\n"), nil
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "logs", "--full", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon logs --full --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([daemon logs --full --json]) stderr = %q, want empty string", stderr.String())
+	}
+	assertJSONContains(t, stdout.String(), "full", true)
+	assertJSONContains(t, stdout.String(), "lines", []any{"oldest", "older", "old", "recent-rotated", "current-1", "current-2"})
+}
+
+func TestDaemonLogsRejectsFullWithLines(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://127.0.0.1:1")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "logs", "--full", "--lines", "2", "--config", configPath})
+	if exitCode != 1 {
+		t.Fatalf("Run([daemon logs --full --lines 2]) exit code = %d, want 1", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("Run([daemon logs --full --lines 2]) stdout = %q, want empty string", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--full cannot be combined with --lines") {
+		t.Fatalf("stderr = %q, want full/lines conflict", stderr.String())
+	}
+}
+
 func writeDaemonCLIConfig(t *testing.T, baseURL string) string {
 	t.Helper()
 

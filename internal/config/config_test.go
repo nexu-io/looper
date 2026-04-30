@@ -358,6 +358,34 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
 	})
 }
 
+func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"loop":{"enabledByDefault":false,"quietPeriodSeconds":30,"maxIterationsPerPR":7,"maxIterationsPerHead":2}}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD: cwd,
+		Args: []string{
+			"--config", configPath,
+			"--reviewer-loop-enabled", "true",
+			"--reviewer-max-iterations-per-pr", "11",
+		},
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_REVIEWER_QUIET_PERIOD_SECONDS":    "45",
+			"LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD": "3",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	loop := loaded.Config.Reviewer.Loop
+	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
+		t.Fatalf("reviewer loop config = %#v, want cli/env/file precedence applied", loop)
+	}
+}
+
 func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T) {
 	_, err := LoadFile(LoadFileOptions{Args: []string{"--hostfoo", "127.0.0.99"}, LookupEnv: emptyEnvLookup})
 	if err == nil {
@@ -424,6 +452,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 		"logging": {"level": "verbose", "maxFiles": 0},
 		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
+		"reviewer": {"loop": {"quietPeriodSeconds": -1, "maxIterationsPerPR": 0}, "scope": "wide", "publishMode": "stream"},
 		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
 		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
 	}`
@@ -450,6 +479,10 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
 	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
+	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "reviewer.loop.maxIterationsPerPR", "must be a positive integer")
+	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
+	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
 }
