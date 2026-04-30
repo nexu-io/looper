@@ -164,10 +164,23 @@ func TestFormatPromptSectionTruncatedDiffRemainsAuthoritative(t *testing.T) {
 
 func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 	t.Parallel()
-	if got := ValidateTopLevelLocation("This has concerns and should be improved."); !got.QualityFlagged {
-		t.Fatalf("expected missing location to be quality flagged: %#v", got)
+	for _, body := range []string{
+		"This has concerns and should be improved.",
+		"This needs work on these lines.",
+		"The function needs work.",
+	} {
+		if got := ValidateTopLevelLocation(body); !got.QualityFlagged {
+			t.Fatalf("expected missing location to be quality flagged for %q: %#v", body, got)
+		}
 	}
-	if got := ValidateTopLevelLocation("docs/spec.md section Reviewer anchors needs a validation example."); !got.Valid {
-		t.Fatalf("expected exact location context to pass: %#v", got)
+	for _, body := range []string{
+		"docs/spec.md section Reviewer anchors needs a validation example.",
+		"function ValidateTopLevelLocation should reject vague line references.",
+		"lines 12-14 should use the parsed anchor range.",
+		"section Reviewer anchors needs a validation example.",
+	} {
+		if got := ValidateTopLevelLocation(body); !got.Valid {
+			t.Fatalf("expected exact location context to pass for %q: %#v", body, got)
+		}
 	}
 }

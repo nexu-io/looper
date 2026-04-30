@@ -14,6 +14,13 @@ const (
 	SideLeft  = "LEFT"
 )
 
+var (
+	topLevelFileLocationRe    = regexp.MustCompile(`(?m)(^|[\s(])([\w./-]+\.[A-Za-z0-9]+)(?::\d+(?:-\d+)?)?\b`)
+	topLevelHeadingLocationRe = regexp.MustCompile(`(?m)^#{1,6}\s+\S+`)
+	topLevelLineLocationRe    = regexp.MustCompile(`(?i)\b(?:lines?\s+\d+(?:\s*[-–]\s*\d+)?|L\d+(?:\s*[-–]\s*L?\d+)?)\b`)
+	topLevelNamedLocationRe   = regexp.MustCompile(`(?i)\b(?:section|symbol|function|method|type|struct|package)\s+([` + "`" + `"']?[\w./:#-]+)`)
+)
+
 type Anchor struct {
 	Path      string
 	Line      int64
@@ -219,10 +226,43 @@ func (idx Index) contains(path, side string, start, end int64) bool {
 
 func ValidateTopLevelLocation(body string) ValidationResult {
 	trimmed := strings.TrimSpace(body)
-	if trimmed == "" || !regexp.MustCompile(`(?m)([\w./-]+\.[A-Za-z0-9]+|\b(line|lines|section|symbol|function|method|type|struct|package)\b|^#+\s+)`).MatchString(trimmed) {
+	if trimmed == "" || !hasExactTopLevelLocation(trimmed) {
 		return ValidationResult{Valid: false, Reason: "top-level comment lacks exact file, section, symbol, or behavior location context", QualityFlagged: true}
 	}
 	return ValidationResult{Valid: true}
+}
+
+func hasExactTopLevelLocation(body string) bool {
+	if topLevelFileLocationRe.MatchString(body) || topLevelHeadingLocationRe.MatchString(body) || topLevelLineLocationRe.MatchString(body) {
+		return true
+	}
+	for _, match := range topLevelNamedLocationRe.FindAllStringSubmatch(body, -1) {
+		if len(match) > 1 && isSpecificLocationName(match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSpecificLocationName(name string) bool {
+	name = strings.Trim(strings.TrimSpace(name), "`\"'.,:;()[]{}")
+	if name == "" {
+		return false
+	}
+	lower := strings.ToLower(name)
+	if genericTopLevelLocationName(lower) {
+		return false
+	}
+	return regexp.MustCompile(`[A-Za-z0-9_]`).MatchString(name)
+}
+
+func genericTopLevelLocationName(name string) bool {
+	switch name {
+	case "a", "an", "the", "this", "that", "these", "those", "it", "its", "here", "there", "above", "below", "line", "lines", "section", "symbol", "function", "method", "type", "struct", "package", "code", "area", "part", "spot", "place", "needs", "need", "should", "work", "broken", "is", "are":
+		return true
+	default:
+		return false
+	}
 }
 
 func DowngradeBody(body string, anchor Anchor, reason string) string {
