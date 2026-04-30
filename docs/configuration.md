@@ -63,7 +63,7 @@ Example minimal `~/.looper/config.json`:
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 4310,
+    "port": 17310,
     "authMode": "local-token",
     "localToken": "replace-me"
   },
@@ -158,7 +158,7 @@ Example minimal `~/.looper/config.json`:
 ### `server`
 
 - `host`: bind host, default `127.0.0.1`
-- `port`: bind port, default `4310`
+- `port`: bind port, default `17310`
 - `authMode`: `none` or `local-token`
 - `localToken`: required when `authMode` is `local-token`
 
@@ -338,6 +338,8 @@ LOOPER_PORT=4321 \
 LOOPER_ALLOW_AUTO_PUSH=false \
 looperd
 ```
+
+Migration note: the default looperd port changed from `4310` to `17310` to reduce conflicts with other local services. Existing config files, `LOOPER_PORT`, and `--port` values continue to take precedence, so users with an explicit port setting keep their current port.
 
 Example precedence:
 

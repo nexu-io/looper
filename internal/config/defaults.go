@@ -6,6 +6,8 @@ import (
 	"runtime"
 )
 
+const DefaultServerPort = 17310
+
 func DefaultLooperHome() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -54,7 +56,7 @@ func DefaultConfig(cwd string) (Config, error) {
 	return Config{
 		Server: ServerConfig{
 			Host:     "127.0.0.1",
-			Port:     4310,
+			Port:     DefaultServerPort,
 			AuthMode: AuthModeNone,
 		},
 		Storage: StorageConfig{

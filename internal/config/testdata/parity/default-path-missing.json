@@ -21,7 +21,7 @@
     "config": {
       "server": {
         "host": "127.0.0.9",
-        "port": 4310,
+        "port": 17310,
         "authMode": "none"
       },
       "storage": {

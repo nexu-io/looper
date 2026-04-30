@@ -610,8 +610,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Server.Host = %q, want %q", config.Server.Host, "127.0.0.1")
 	}
 
-	if config.Server.Port != 4310 {
-		t.Fatalf("DefaultConfig().Server.Port = %d, want %d", config.Server.Port, 4310)
+	if config.Server.Port != DefaultServerPort {
+		t.Fatalf("DefaultConfig().Server.Port = %d, want %d", config.Server.Port, DefaultServerPort)
 	}
 
 	if config.Server.AuthMode != AuthModeNone {

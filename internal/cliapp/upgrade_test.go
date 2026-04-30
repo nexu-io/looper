@@ -761,7 +761,7 @@ func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 				return binaryResponse(t, http.StatusOK, newBinary), nil
 			case "https://example.invalid/looperd-darwin-arm64-v0.3.0.sha256":
 				return textResponse(t, http.StatusOK, hex.EncodeToString(newChecksum[:])+"  looperd-darwin-arm64\n"), nil
-			case "http://daemon.test/api/v1/status", "http://127.0.0.1:4310/api/v1/status":
+			case "http://daemon.test/api/v1/status", "http://127.0.0.1:17310/api/v1/status":
 				mu.Lock()
 				defer mu.Unlock()
 				if runningPID == 0 {
