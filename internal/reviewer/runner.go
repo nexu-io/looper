@@ -1698,9 +1698,11 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	}
 	approveInstruction := "Do not approve; submit clean reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels when clean reviews are submitted as COMMENT."
+	reviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint))
 	if allowApprove {
 		approveInstruction = "If the review is clean, submit an APPROVE review."
 		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT or actionable reviews."
+		reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s` for actionable reviews or `%s review submit %s#%d --event APPROVE --commit-id %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint))
 	}
 	existingMarkerEventInstruction := "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review. Ignore matching markers on APPROVED reviews and post a new COMMENT review instead."
 	if allowApprove {
@@ -1710,7 +1712,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	}
-	githubOperationContract := fmt.Sprintf("GitHub operation contract: submit exactly one PR review for this run through the trusted Looper CLI at `%s review submit %s#%d --event COMMENT|APPROVE --commit-id %s`, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), repo, prNumber)
+	githubOperationContract := fmt.Sprintf("GitHub operation contract: submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", reviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."

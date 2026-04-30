@@ -43,6 +43,34 @@ func TestParseMultiHunkDiffSeparatesRanges(t *testing.T) {
 	}
 }
 
+func TestParseDoesNotTreatHunkContentAsFileHeaders(t *testing.T) {
+	t.Parallel()
+	diff := strings.Join([]string{
+		"diff --git a/app.go b/app.go",
+		"--- a/app.go",
+		"+++ b/app.go",
+		"@@ -10,3 +10,3 @@",
+		"-- removed heading",
+		"+new line",
+		" context",
+		"@@ -20,2 +20,3 @@",
+		" context",
+		"+++ added heading",
+		"+tail",
+	}, "\n") + "\n"
+	idx := Parse(diff)
+
+	if got := idx.Validate(Anchor{Path: "app.go", Line: 10, Side: SideLeft}); !got.Valid {
+		t.Fatalf("removed content starting with -- should remain anchorable: %#v ranges=%#v", got, idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "app.go", Line: 21, Side: SideRight}); !got.Valid {
+		t.Fatalf("added content starting with ++ should remain anchorable: %#v ranges=%#v", got, idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "added heading", Line: 22, Side: SideRight}); got.Valid {
+		t.Fatalf("hunk content must not replace the current path: %#v ranges=%#v", got, idx.Ranges)
+	}
+}
+
 func TestParseDeletedFileWithSpacesUsesDiffGitPath(t *testing.T) {
 	t.Parallel()
 	diff := "diff --git a/a b.txt b/a b.txt\ndeleted file mode 100644\n--- a/a b.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-line\n"

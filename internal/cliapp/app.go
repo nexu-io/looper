@@ -298,7 +298,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA")}}),
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT or APPROVE"), stringFlag("commit-id", "sha", "Expected PR head commit SHA")}}),
 				},
 				exampleLines: []string{
 					"$ looper review 123",

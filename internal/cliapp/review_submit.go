@@ -32,12 +32,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	event := strings.ToUpper(strings.TrimSpace(getStringFlag(cmd, "event")))
-	if event == "" {
-		return fmt.Errorf("review submit requires --event COMMENT, APPROVE, or REQUEST_CHANGES")
-	}
-	if event != "COMMENT" && event != "APPROVE" && event != "REQUEST_CHANGES" {
-		return fmt.Errorf("unsupported review event %q", event)
+	event, err := validateReviewSubmitEvent(getStringFlag(cmd, "event"))
+	if err != nil {
+		return err
 	}
 	commitID := strings.TrimSpace(getStringFlag(cmd, "commit-id"))
 	if commitID == "" {
@@ -92,6 +89,17 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("submit validated PR review: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+func validateReviewSubmitEvent(raw string) (string, error) {
+	event := strings.ToUpper(strings.TrimSpace(raw))
+	if event == "" {
+		return "", fmt.Errorf("review submit requires --event COMMENT or APPROVE")
+	}
+	if event != "COMMENT" && event != "APPROVE" {
+		return "", fmt.Errorf("unsupported review event %q", event)
+	}
+	return event, nil
 }
 
 func validateExpectedHeadCommit(expected string, actual string) error {

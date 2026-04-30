@@ -56,6 +56,7 @@ func Parse(diff string) Index {
 	var path string
 	var oldLine, newLine int64
 	var rightHeading, leftHeading string
+	inHunk := false
 	var openRight, openLeft *Range
 	flush := func() {
 		if openRight != nil {
@@ -104,9 +105,10 @@ func Parse(diff string) Index {
 			flush()
 			path = gitDiffPath(line)
 			rightHeading, leftHeading = "", ""
+			inHunk = false
 			continue
 		}
-		if strings.HasPrefix(line, "+++ ") {
+		if !inHunk && strings.HasPrefix(line, "+++ ") {
 			if parsed := fileHeaderPath(line[4:]); parsed != "" {
 				path = parsed
 			}
@@ -116,9 +118,10 @@ func Parse(diff string) Index {
 			flush()
 			oldLine = parseInt64(m[1])
 			newLine = parseInt64(m[3])
+			inHunk = true
 			continue
 		}
-		if path == "" || line == "" || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "new file mode") || strings.HasPrefix(line, "deleted file mode") {
+		if path == "" || line == "" || (!inHunk && strings.HasPrefix(line, "--- ")) || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "new file mode") || strings.HasPrefix(line, "deleted file mode") {
 			continue
 		}
 		switch line[0] {

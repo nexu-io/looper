@@ -1705,7 +1705,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Spec/docs review rubric",
 		"suggestedChange",
 		"warm, specific LGTM review body",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT|APPROVE --commit-id abc123",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123` for actionable reviews",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123` for clean reviews",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
@@ -1805,10 +1806,14 @@ func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *
 	for _, want := range []string{
 		"Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review",
 		"Ignore matching markers on APPROVED reviews and post a new COMMENT review instead",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+	if strings.Contains(prompt, "--event COMMENT|APPROVE") {
+		t.Fatalf("prompt advertises approvals while allowApprove=false:\n%s", prompt)
 	}
 }
 

@@ -1,6 +1,7 @@
 package github
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/powerformer/looper/internal/diffanchor"
@@ -64,18 +65,28 @@ func formatReviewQualityFlags(flags []reviewQualityFlag) string {
 	return strings.Join(parts, "; ")
 }
 
-func reviewQualityGateApplies(event string, body string) bool {
-	if strings.EqualFold(strings.TrimSpace(event), "REQUEST_CHANGES") {
-		return true
+func reviewQualityGateApplies(event string, body string) (bool, error) {
+	event = strings.ToUpper(strings.TrimSpace(event))
+	markers := parseReviewIdempotencyMarkers(body)
+	markerComments := reviewMarkerRE.FindAllStringSubmatch(body, -1)
+	if len(markerComments) == 0 {
+		return true, nil
 	}
-	body = strings.ToLower(body)
-	if strings.Contains(body, "outcome=actionable") {
-		return true
+	if len(markers) != 1 {
+		return true, fmt.Errorf("review body must contain exactly one well-formed looper review marker")
 	}
-	if strings.Contains(body, "outcome=clean") || strings.EqualFold(strings.TrimSpace(event), "APPROVE") {
-		return false
+	marker := markers[0]
+	switch event {
+	case "APPROVE":
+		if marker.Outcome != "clean" {
+			return true, fmt.Errorf("review marker outcome=%s does not match APPROVE event", marker.Outcome)
+		}
+	case "REQUEST_CHANGES":
+		if marker.Outcome != "actionable" {
+			return true, fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", marker.Outcome)
+		}
 	}
-	return true
+	return marker.Outcome != "clean", nil
 }
 
 func normalizeReviewCommentAnchor(comment ReviewComment) ReviewComment {

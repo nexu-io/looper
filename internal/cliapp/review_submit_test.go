@@ -35,3 +35,17 @@ func TestValidateExpectedHeadCommit(t *testing.T) {
 		t.Fatalf("validateExpectedHeadCommit(stale) error = %v, want stale head failure", err)
 	}
 }
+
+func TestValidateReviewSubmitEventRejectsRequestChanges(t *testing.T) {
+	t.Parallel()
+
+	if event, err := validateReviewSubmitEvent("comment"); err != nil || event != "COMMENT" {
+		t.Fatalf("validateReviewSubmitEvent(comment) = %q, %v; want COMMENT, nil", event, err)
+	}
+	if event, err := validateReviewSubmitEvent("APPROVE"); err != nil || event != "APPROVE" {
+		t.Fatalf("validateReviewSubmitEvent(APPROVE) = %q, %v; want APPROVE, nil", event, err)
+	}
+	if _, err := validateReviewSubmitEvent("REQUEST_CHANGES"); err == nil || !strings.Contains(err.Error(), "unsupported review event") {
+		t.Fatalf("validateReviewSubmitEvent(REQUEST_CHANGES) error = %v, want unsupported event", err)
+	}
+}

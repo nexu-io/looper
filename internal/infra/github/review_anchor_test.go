@@ -80,3 +80,50 @@ func TestNormalizeReviewAnchorsDoesNotFlagEmptyTopLevelBody(t *testing.T) {
 		t.Fatalf("flags = %#v, want none for empty top-level body", flags)
 	}
 }
+
+func TestReviewQualityGateRequiresActualCleanMarker(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		"<!-- looper:review id=abc head=def outcome=clean -->\n<!-- looper:review id=abc head=def outcome=clean -->",
+		"<!-- looper:review id=abc head=def -->",
+	} {
+		applies, err := reviewQualityGateApplies("APPROVE", body)
+		if err == nil {
+			t.Fatalf("reviewQualityGateApplies() error = nil for %q, want marker validation error", body)
+		}
+		if !applies {
+			t.Fatalf("reviewQualityGateApplies() = false for %q, want true without exactly one well-formed clean marker", body)
+		}
+	}
+	applies, err := reviewQualityGateApplies("APPROVE", "This prose mentions outcome=clean but has no marker.")
+	if err != nil || !applies {
+		t.Fatalf("reviewQualityGateApplies(prose outcome) = %v, %v; want true, nil", applies, err)
+	}
+}
+
+func TestReviewQualityGateRejectsEventOutcomeMismatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		event string
+		body  string
+	}{
+		{event: "APPROVE", body: "<!-- looper:review id=abc head=def outcome=actionable -->"},
+		{event: "REQUEST_CHANGES", body: "<!-- looper:review id=abc head=def outcome=clean -->"},
+	} {
+		if _, err := reviewQualityGateApplies(tc.event, tc.body); err == nil {
+			t.Fatalf("reviewQualityGateApplies(%q, %q) error = nil, want mismatch error", tc.event, tc.body)
+		}
+	}
+}
+
+func TestReviewQualityGateUsesMarkerOutcome(t *testing.T) {
+	t.Parallel()
+	applies, err := reviewQualityGateApplies("COMMENT", "Top-level clean review.\n<!-- looper:review id=abc head=def outcome=clean -->")
+	if err != nil || applies {
+		t.Fatalf("reviewQualityGateApplies(clean COMMENT) = %v, %v; want false, nil", applies, err)
+	}
+	applies, err = reviewQualityGateApplies("COMMENT", "Top-level actionable review.\n<!-- looper:review id=abc head=def outcome=actionable -->")
+	if err != nil || !applies {
+		t.Fatalf("reviewQualityGateApplies(actionable COMMENT) = %v, %v; want true, nil", applies, err)
+	}
+}
