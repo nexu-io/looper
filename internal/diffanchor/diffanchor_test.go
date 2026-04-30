@@ -50,6 +50,29 @@ func TestParseDeletedFileWithSpacesUsesDiffGitPath(t *testing.T) {
 	}
 }
 
+func TestParseDeletedFilePathContainingBSlash(t *testing.T) {
+	t.Parallel()
+	diff := "diff --git a/foo b/bar.txt b/foo b/bar.txt\ndeleted file mode 100644\n--- a/foo b/bar.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-line\n"
+	idx := Parse(diff)
+
+	if !idx.Validate(Anchor{Path: "foo b/bar.txt", Line: 1, Side: SideLeft}).Valid {
+		t.Fatalf("LEFT anchor on deleted file containing b/ should be valid: %#v", idx.Ranges)
+	}
+	if got := idx.Validate(Anchor{Path: "bar.txt", Line: 1, Side: SideLeft}); got.Valid {
+		t.Fatalf("truncated path anchor should be invalid: %#v", got)
+	}
+}
+
+func TestValidateMultilineMarkdownAnchorAcrossHeadingChange(t *testing.T) {
+	t.Parallel()
+	diff := "diff --git a/docs/spec.md b/docs/spec.md\n@@ -1,4 +1,4 @@\n # Old heading\n-content\n+# New heading\n+content\n tail\n"
+	idx := Parse(diff)
+
+	if got := idx.Validate(Anchor{Path: "docs/spec.md", StartLine: 1, Line: 2, Side: SideRight, StartSide: SideRight}); !got.Valid {
+		t.Fatalf("contiguous RIGHT multiline anchor across heading change should be valid: %#v ranges=%#v", got, idx.Ranges)
+	}
+}
+
 func TestParseMarkdownHeadingContext(t *testing.T) {
 	t.Parallel()
 	diff := "diff --git a/docs/spec.md b/docs/spec.md\n@@ -4,3 +4,4 @@\n # Reviewer anchors\n existing\n+new requirement\n tail\n"

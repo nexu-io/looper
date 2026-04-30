@@ -69,7 +69,7 @@ func Parse(diff string) Index {
 			text = text[:93] + "..."
 		}
 		if side == SideRight {
-			if openRight == nil || openRight.Path != path || openRight.Side != side || openRight.End+1 != line || openRight.Heading != heading {
+			if openRight == nil || openRight.Path != path || openRight.Side != side || openRight.End+1 != line {
 				if openRight != nil {
 					idx.Ranges = append(idx.Ranges, *openRight)
 				}
@@ -81,7 +81,7 @@ func Parse(diff string) Index {
 			}
 			return
 		}
-		if openLeft == nil || openLeft.Path != path || openLeft.Side != side || openLeft.End+1 != line || openLeft.Heading != heading {
+		if openLeft == nil || openLeft.Path != path || openLeft.Side != side || openLeft.End+1 != line {
 			if openLeft != nil {
 				idx.Ranges = append(idx.Ranges, *openLeft)
 			}
@@ -263,7 +263,20 @@ func gitDiffPath(line string) string {
 	if rest == line {
 		return ""
 	}
-	if idx := strings.LastIndex(rest, " b/"); idx >= 0 {
+	for searchFrom := 0; ; {
+		idx := strings.Index(rest[searchFrom:], " b/")
+		if idx < 0 {
+			break
+		}
+		idx += searchFrom
+		left := strings.TrimPrefix(rest[:idx], "a/")
+		right := rest[idx+3:]
+		if left == right {
+			return right
+		}
+		searchFrom = idx + len(" b/")
+	}
+	if idx := strings.Index(rest, " b/"); idx >= 0 {
 		return rest[idx+3:]
 	}
 	return ""
