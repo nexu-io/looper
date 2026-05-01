@@ -35,6 +35,7 @@ const (
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+	defaultIssueLimit   = 30
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
@@ -464,8 +465,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if r.discoveryPolicy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	labelFilter := safeIssueQueryLabel(r.discoveryPolicy.Labels)
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, Label: labelFilter})
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -1596,10 +1596,86 @@ func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) 
 }
 
 func safeIssueQueryLabel(labels []string) string {
-	if len(labels) == 1 {
-		return labels[0]
+	for _, label := range labels {
+		if strings.TrimSpace(label) != "" {
+			return label
+		}
 	}
 	return ""
+}
+
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+	if policy.LabelMode != config.LabelModeAny {
+		input.Label = safeIssueQueryLabel(policy.Labels)
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func mergeIssuePages(pages [][]IssueSummary, limit int) []IssueSummary {
+	seenIssues := map[int64]struct{}{}
+	merged := []IssueSummary{}
+	for index := 0; len(merged) < limit; index++ {
+		anyPageHasIndex := false
+		for _, page := range pages {
+			if index >= len(page) {
+				continue
+			}
+			anyPageHasIndex = true
+			issue := page[index]
+			if _, ok := seenIssues[issue.Number]; ok {
+				continue
+			}
+			seenIssues[issue.Number] = struct{}{}
+			merged = append(merged, issue)
+			if len(merged) >= limit {
+				break
+			}
+		}
+		if !anyPageHasIndex {
+			break
+		}
+	}
+	return merged
+}
+
+func effectiveIssueLimit(limit int) int {
+	if limit <= 0 {
+		return defaultIssueLimit
+	}
+	return limit
+}
+
+func uniqueNonEmptyLabels(labels []string) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {

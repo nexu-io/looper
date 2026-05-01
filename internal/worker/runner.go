@@ -42,6 +42,7 @@ const (
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+	defaultIssueLimit   = 30
 
 	workerBranchSlugMaxLength = 30
 	workerBranchSlugMaxWords  = 5
@@ -427,16 +428,17 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo     string   `json:"issueRepo,omitempty"`
-	BaseBranch    string   `json:"baseBranch,omitempty"`
-	ExecutionMode string   `json:"executionMode,omitempty"`
-	IssueNumber   int64    `json:"issueNumber,omitempty"`
-	IssueURL      string   `json:"issueUrl,omitempty"`
-	PRNumber      int64    `json:"prNumber,omitempty"`
-	PRTitle       string   `json:"prTitle,omitempty"`
-	Branch        string   `json:"branch,omitempty"`
-	HeadSHA       string   `json:"headSha,omitempty"`
-	Reviewers     []string `json:"reviewers,omitempty"`
+	IssueRepo      string   `json:"issueRepo,omitempty"`
+	BaseBranch     string   `json:"baseBranch,omitempty"`
+	ExecutionMode  string   `json:"executionMode,omitempty"`
+	IssueNumber    int64    `json:"issueNumber,omitempty"`
+	IssueURL       string   `json:"issueUrl,omitempty"`
+	PRNumber       int64    `json:"prNumber,omitempty"`
+	PRTitle        string   `json:"prTitle,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	HeadSHA        string   `json:"headSha,omitempty"`
+	AutoDiscovered bool     `json:"autoDiscovered,omitempty"`
+	Reviewers      []string `json:"reviewers,omitempty"`
 }
 
 type workerCheckpoint struct {
@@ -624,7 +626,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if r.discoveryPolicy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, Label: safeIssueQueryLabel(r.discoveryPolicy.Labels)})
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -959,7 +961,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if !acquired {
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
-	if work.IssueNumber > 0 && r.github != nil {
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || r.discoveryPolicy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
@@ -1376,7 +1378,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -1686,7 +1688,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL}
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -1735,7 +1737,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL})
+	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID
@@ -2498,10 +2500,86 @@ func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPo
 }
 
 func safeIssueQueryLabel(labels []string) string {
-	if len(labels) == 1 {
-		return labels[0]
+	for _, label := range labels {
+		if strings.TrimSpace(label) != "" {
+			return label
+		}
 	}
 	return ""
+}
+
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+	if policy.LabelMode != config.LabelModeAny {
+		input.Label = safeIssueQueryLabel(policy.Labels)
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func mergeIssuePages(pages [][]IssueSummary, limit int) []IssueSummary {
+	seenIssues := map[int64]struct{}{}
+	merged := []IssueSummary{}
+	for index := 0; len(merged) < limit; index++ {
+		anyPageHasIndex := false
+		for _, page := range pages {
+			if index >= len(page) {
+				continue
+			}
+			anyPageHasIndex = true
+			issue := page[index]
+			if _, ok := seenIssues[issue.Number]; ok {
+				continue
+			}
+			seenIssues[issue.Number] = struct{}{}
+			merged = append(merged, issue)
+			if len(merged) >= limit {
+				break
+			}
+		}
+		if !anyPageHasIndex {
+			break
+		}
+	}
+	return merged
+}
+
+func effectiveIssueLimit(limit int) int {
+	if limit <= 0 {
+		return defaultIssueLimit
+	}
+	return limit
+}
+
+func uniqueNonEmptyLabels(labels []string) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
@@ -2663,6 +2741,13 @@ func stringFromAnyDefault(value any) string {
 		return text
 	}
 	return ""
+}
+
+func boolFromAny(value any) bool {
+	if flag, ok := value.(bool); ok {
+		return flag
+	}
+	return false
 }
 
 func firstNonEmpty(values ...string) string {

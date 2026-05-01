@@ -87,6 +87,40 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesUsesSingleServerSideLabelFilterWhenConfiguredWithMultipleLabels(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Labels: []string{"team:alpha", "team:beta"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha", "team:beta"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listOpenIssueCalls) != 1 {
+		t.Fatalf("listOpenIssueCalls = %#v, want one call", github.listOpenIssueCalls)
+	}
+	if github.listOpenIssueCalls[0].Label != "team:alpha" {
+		t.Fatalf("ListOpenIssues label = %q, want first configured label", github.listOpenIssueCalls[0].Label)
+	}
+}
+
+func TestDiscoverIssuesQueriesEachServerSideLabelWhenConfiguredWithAnyLabelMode(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 43, Title: "Plan any", Labels: []string{"team:beta"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha", "team:beta"}, LabelMode: config.LabelModeAny, RequireAssigneeCurrentUser: false}})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listOpenIssueCalls) != 2 {
+		t.Fatalf("listOpenIssueCalls = %#v, want two calls", github.listOpenIssueCalls)
+	}
+	if github.listOpenIssueCalls[0].Label != "team:alpha" || github.listOpenIssueCalls[1].Label != "team:beta" {
+		t.Fatalf("ListOpenIssues labels = [%q, %q], want configured labels", github.listOpenIssueCalls[0].Label, github.listOpenIssueCalls[1].Label)
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -793,23 +827,25 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	issues           []IssueSummary
-	issueDetail      IssueDetail
-	openPullRequests []PullRequestSummary
-	prDetail         PullRequestDetail
-	viewPRErr        error
-	createPRResult   CreatePullRequestResult
-	createPRErrors   []error
-	createPRIndex    int
-	listOpenPRCalls  []ListOpenPullRequestsInput
-	createPRCalls    []CreatePullRequestInput
-	addLabelCalls    []PullRequestLabelsInput
-	addReviewerCalls []PullRequestReviewersInput
-	addAssigneeCalls []IssueAssigneesInput
-	addAssigneeErr   error
+	issues             []IssueSummary
+	listOpenIssueCalls []ListOpenIssuesInput
+	issueDetail        IssueDetail
+	openPullRequests   []PullRequestSummary
+	prDetail           PullRequestDetail
+	viewPRErr          error
+	createPRResult     CreatePullRequestResult
+	createPRErrors     []error
+	createPRIndex      int
+	listOpenPRCalls    []ListOpenPullRequestsInput
+	createPRCalls      []CreatePullRequestInput
+	addLabelCalls      []PullRequestLabelsInput
+	addReviewerCalls   []PullRequestReviewersInput
+	addAssigneeCalls   []IssueAssigneesInput
+	addAssigneeErr     error
 }
 
-func (f *fakeGitHubGateway) ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error) {
+func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	f.listOpenIssueCalls = append(f.listOpenIssueCalls, input)
 	return append([]IssueSummary(nil), f.issues...), nil
 }
 
