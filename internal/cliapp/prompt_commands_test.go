@@ -77,6 +77,27 @@ func TestPromptPreviewLifecycleReflectsDisabledRemoteActions(t *testing.T) {
 	}
 }
 
+func TestPromptPreviewFixerLifecycleMatchesRuntimeBranchFields(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, promptPreviewConfigPayload(t.TempDir(), true))
+
+	exitCode, stdout, stderr := runApp(t, "prompt", "preview", "--project", "project_1", "--role", "fixer", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(prompt preview fixer) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{"branch=\"\"", "baseBranch=\"\"", "expectPush=true", "expectPR=false"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
+	for _, notWant := range []string{"branch=\"<branch>\"", "baseBranch=\"main\""} {
+		if strings.Contains(stdout, notWant) {
+			t.Fatalf("fixer prompt preview used lifecycle fields that runtime fixer prompt does not use %q:\n%s", notWant, stdout)
+		}
+	}
+}
+
 func TestPromptPreviewWorkerHonorsManualOpenPRStrategy(t *testing.T) {
 	t.Parallel()
 

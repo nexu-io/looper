@@ -92,6 +92,8 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 		}
 		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	case "fixer":
+		branch = ""
+		baseBranch = ""
 		if !allowRemote {
 			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 		}
