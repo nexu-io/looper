@@ -61,6 +61,9 @@ func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
 	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
 		t.Fatalf("QueueItems = %#v, want only matching PR #42", result.QueueItems)
 	}
+	if len(github.listCalls) != 1 || strings.Join(github.listCalls[0].Labels, ",") != "needs-review,spec" {
+		t.Fatalf("list calls = %#v, want server-side multi-label filter", github.listCalls)
+	}
 }
 
 func TestDiscoverPullRequestsReturnsCurrentUserLookupError(t *testing.T) {
@@ -2905,9 +2908,11 @@ type fakeGitHubGateway struct {
 	removeReactionCalls             []PullRequestReactionInput
 	addLabelCalls                   []PullRequestLabelsInput
 	removeLabelCalls                []PullRequestLabelsInput
+	listCalls                       []ListOpenPullRequestsInput
 }
 
-func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	g.listCalls = append(g.listCalls, input)
 	reviewRequests := g.effectiveReviewRequests()
 	headSHA := g.listHeadSHA
 	if headSHA == "" {

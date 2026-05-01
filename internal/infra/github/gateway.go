@@ -213,6 +213,7 @@ type ListOpenPullRequestsInput struct {
 	CWD     string
 	Limit   int
 	Label   string
+	Labels  []string
 	Author  string
 	Timeout time.Duration
 }
@@ -317,8 +318,9 @@ func New(options Options) *Gateway {
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	labels := prListLabels(input)
+	for _, label := range labels {
+		args = append(args, "--label", label)
 	}
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
@@ -355,6 +357,28 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 		})
 	}
 	return out, nil
+}
+
+func prListLabels(input ListOpenPullRequestsInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func (g *Gateway) GetPullRequestAuthor(ctx context.Context, input ViewPullRequestInput) (string, error) {

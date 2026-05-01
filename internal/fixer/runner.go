@@ -104,6 +104,7 @@ type ListOpenPullRequestsInput struct {
 	Limit  int
 	Author string
 	Label  string
+	Labels []string
 }
 
 type ViewPullRequestInput struct {
@@ -544,7 +545,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Author: currentUser, Label: safePRQueryLabel(r.discoveryPolicy.Labels)})
+	openPRs, err := r.listOpenPullRequestsForDiscovery(ctx, input.Repo, project.RepoPath, input.Limit, currentUser)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -598,6 +599,36 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			return DiscoveryResult{}, err
 		}
 		result.QueueItems = append(result.QueueItems, queueItem)
+	}
+	return result, nil
+}
+
+func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
+	labels := prQueryLabels(r.discoveryPolicy.Labels)
+	if len(labels) == 0 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author})
+	}
+	if len(labels) == 1 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: labels[0]})
+	}
+	if r.discoveryPolicy.LabelMode == config.LabelModeAll {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Labels: labels})
+	}
+
+	result := []PullRequestSummary{}
+	seen := map[int64]struct{}{}
+	for _, label := range labels {
+		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: label})
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range prs {
+			if _, ok := seen[pr.Number]; ok {
+				continue
+			}
+			seen[pr.Number] = struct{}{}
+			result = append(result, pr)
+		}
 	}
 	return result, nil
 }
@@ -2082,11 +2113,22 @@ func sameGitHubLogin(left, right string) bool {
 	return left != "" && right != "" && strings.EqualFold(left, right)
 }
 
-func safePRQueryLabel(labels []string) string {
-	if len(labels) == 1 {
-		return labels[0]
+func prQueryLabels(labels []string) []string {
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
 	}
-	return ""
+	return result
 }
 
 func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
