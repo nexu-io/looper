@@ -606,7 +606,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+		if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 			result.Skipped++
 			continue
 		}

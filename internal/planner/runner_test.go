@@ -315,6 +315,26 @@ func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemExcludesCurrentUserFromRequestedReviewersWhenAssigneePolicyDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no requested reviewers after excluding octocat", github.addReviewerCalls)
+	}
+}
+
 func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
