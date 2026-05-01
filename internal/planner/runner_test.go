@@ -99,8 +99,8 @@ func TestDiscoverIssuesUsesSingleServerSideLabelFilterWhenConfiguredWithMultiple
 	if len(github.listOpenIssueCalls) != 1 {
 		t.Fatalf("listOpenIssueCalls = %#v, want one call", github.listOpenIssueCalls)
 	}
-	if github.listOpenIssueCalls[0].Label != "team:alpha" {
-		t.Fatalf("ListOpenIssues label = %q, want first configured label", github.listOpenIssueCalls[0].Label)
+	if got := github.listOpenIssueCalls[0].Labels; len(got) != 2 || got[0] != "team:alpha" || got[1] != "team:beta" {
+		t.Fatalf("ListOpenIssues labels = %#v, want both configured labels", got)
 	}
 }
 

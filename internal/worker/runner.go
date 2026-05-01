@@ -188,6 +188,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type GitHubGateway interface {
@@ -2510,7 +2511,8 @@ func safeIssueQueryLabel(labels []string) string {
 
 func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
 	if policy.LabelMode != config.LabelModeAny {
-		input.Label = safeIssueQueryLabel(policy.Labels)
+		input.Labels = uniqueNonEmptyLabels(policy.Labels)
+		input.Label = safeIssueQueryLabel(input.Labels)
 		return r.github.ListOpenIssues(ctx, input)
 	}
 	queryLabels := uniqueNonEmptyLabels(policy.Labels)

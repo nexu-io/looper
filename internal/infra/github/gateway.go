@@ -224,6 +224,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type ViewIssueInput struct {
@@ -398,8 +399,8 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	if strings.TrimSpace(input.Assignee) != "" {
 		args = append(args, "--assignee", input.Assignee)
 	}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	for _, label := range issueListLabels(input) {
+		args = append(args, "--label", label)
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
 
@@ -425,6 +426,28 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 		})
 	}
 	return out, nil
+}
+
+func issueListLabels(input ListOpenIssuesInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
