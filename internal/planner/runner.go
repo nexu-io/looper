@@ -261,6 +261,7 @@ type Options struct {
 	ClaimTTL                time.Duration
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
+	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
@@ -287,6 +288,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
+	customInstructions      config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -433,7 +435,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -865,8 +867,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush, r.disclosure, r.agentModel)
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentModel)
+		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
+		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+			metadata[key] = value
+		}
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1497,7 +1503,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -1513,6 +1519,10 @@ func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, w
 	}
 	if agentsBlock := readAgentsBlock(project.RepoPath); agentsBlock != "" {
 		parts = append(parts, agentsBlock)
+	}
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, project.ID, "planner")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
 	}
 	requirements := []string{
 		"Requirements:",
@@ -1531,7 +1541,16 @@ func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, w
 	} else {
 		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {

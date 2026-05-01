@@ -53,7 +53,7 @@ func TestLoadFileMatchesFrozenParityFixtures(t *testing.T) {
 				DefaultConfigPath: resolveParityString(fixture.Input.DefaultConfigPath, rootDir, homeDir),
 				Args:              resolveParityStrings(fixture.Input.Args, rootDir, homeDir),
 				LookupEnv:         mapEnvLookup(resolveParityStringMap(fixture.Input.Env, rootDir, homeDir)),
-				LookPath:          fakeLookPath(map[string]string{}),
+				LookPath:          fakeLookPath(map[string]string{"looper": "/detected/looper"}),
 			})
 			if err != nil {
 				t.Fatalf("LoadFile() error = %v", err)

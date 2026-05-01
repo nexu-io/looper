@@ -139,6 +139,15 @@ type DisclosureChannelsConfig struct {
 	InlineCommentVisible bool `json:"inlineCommentVisible"`
 }
 
+type InstructionsConfig struct {
+	Enabled  bool `json:"enabled"`
+	MaxBytes int  `json:"maxBytes"`
+}
+
+type RoleConfig struct {
+	Instructions string `json:"instructions,omitempty"`
+}
+
 type OsascriptNotificationConfig struct {
 	Enabled               bool                     `json:"enabled"`
 	SoundForLevels        []NotificationSoundLevel `json:"soundForLevels"`
@@ -252,22 +261,26 @@ type FixerRoleTriggersConfig struct {
 type PlannerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
 }
 
 type WorkerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
 }
 
 type ReviewerRoleConfig struct {
 	AutoDiscovery bool                       `json:"autoDiscovery"`
 	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
 	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+	Instructions  string                     `json:"instructions,omitempty"`
 }
 
 type FixerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
 }
 
 type RoleConfigs struct {
@@ -278,11 +291,13 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	RepoPath     string  `json:"repoPath"`
-	BaseBranch   *string `json:"baseBranch,omitempty"`
-	WorktreeRoot *string `json:"worktreeRoot,omitempty"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	RepoPath     string            `json:"repoPath"`
+	Path         string            `json:"path,omitempty"`
+	BaseBranch   *string           `json:"baseBranch,omitempty"`
+	WorktreeRoot *string           `json:"worktreeRoot,omitempty"`
+	Instructions map[string]string `json:"instructions,omitempty"`
 }
 
 type Config struct {
@@ -298,6 +313,7 @@ type Config struct {
 	Package       PackageConfig      `json:"package"`
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Reviewer      ReviewerConfig     `json:"reviewer"`
+	Instructions  InstructionsConfig `json:"instructions"`
 	Roles         RoleConfigs        `json:"roles"`
 	Projects      []ProjectRefConfig `json:"projects"`
 }
@@ -423,6 +439,11 @@ type PartialReviewerReviewEventsConfig struct {
 	Blocking *ReviewerReviewEvent `json:"blocking,omitempty"`
 }
 
+type PartialInstructionsConfig struct {
+	Enabled  *bool `json:"enabled,omitempty"`
+	MaxBytes *int  `json:"maxBytes,omitempty"`
+}
+
 type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
@@ -456,22 +477,26 @@ type PartialFixerRoleTriggersConfig struct {
 type PartialPlannerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
 type PartialReviewerRoleConfig struct {
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	Instructions  *string                            `json:"instructions,omitempty"`
 }
 
 type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
 type PartialRoleConfigs struct {
@@ -494,6 +519,7 @@ type PartialConfig struct {
 	Package       *PartialPackageConfig      `json:"package,omitempty"`
 	Defaults      *PartialDefaultsConfig     `json:"defaults,omitempty"`
 	Reviewer      *PartialReviewerConfig     `json:"reviewer,omitempty"`
+	Instructions  *PartialInstructionsConfig `json:"instructions,omitempty"`
 	Roles         *PartialRoleConfigs        `json:"roles,omitempty"`
 	Projects      *[]ProjectRefConfig        `json:"projects,omitempty"`
 }

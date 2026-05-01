@@ -167,6 +167,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.blocking", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventRequestChanges)})
 	}
 
+	validateInstructions(config, &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
@@ -200,6 +201,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}
+		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
+			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
+		}
+
+		for role, text := range project.Instructions {
+			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
+			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
+			validateAggregateInstructionBytes(path, roleInstructionText(config.Roles, role), text, config.Instructions.MaxBytes, &issues)
+		}
 	}
 
 	if len(issues) > 0 {
@@ -226,6 +236,87 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateInstructions(config Config, issues *[]ValidationIssue) {
+	if config.Instructions.MaxBytes < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "instructions.maxBytes", Message: "must be a positive integer"})
+	}
+	for _, roleInstruction := range roleInstructions(config.Roles) {
+		validateInstructionText("roles."+roleInstruction.role+".instructions", roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, issues)
+		validateAggregateInstructionBytes("roles."+roleInstruction.role+".instructions", roleInstruction.text, "", config.Instructions.MaxBytes, issues)
+	}
+}
+
+type roleInstruction struct {
+	role string
+	text string
+}
+
+func roleInstructions(roles RoleConfigs) []roleInstruction {
+	return []roleInstruction{
+		{role: "planner", text: roles.Planner.Instructions},
+		{role: "worker", text: roles.Worker.Instructions},
+		{role: "reviewer", text: roles.Reviewer.Instructions},
+		{role: "fixer", text: roles.Fixer.Instructions},
+	}
+}
+
+func roleInstructionText(roles RoleConfigs, role string) string {
+	switch role {
+	case "planner":
+		return roles.Planner.Instructions
+	case "worker":
+		return roles.Worker.Instructions
+	case "reviewer":
+		return roles.Reviewer.Instructions
+	case "fixer":
+		return roles.Fixer.Instructions
+	default:
+		return ""
+	}
+}
+
+func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
+	if !isValidInstructionRole(role) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
+	}
+	if maxBytes > 0 && len([]byte(text)) > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
+	}
+	if protected := protectedInstructionPhrase(text); protected != "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must not attempt to override protected Looper contract %q", protected)})
+	}
+}
+
+func validateAggregateInstructionBytes(path, globalText, projectText string, maxBytes int, issues *[]ValidationIssue) {
+	if maxBytes <= 0 {
+		return
+	}
+	bytes := len([]byte(strings.TrimSpace(globalText))) + len([]byte(strings.TrimSpace(projectText)))
+	if bytes > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("combined custom instructions for this role must be at most %d bytes", maxBytes)})
+	}
+}
+
+func isValidInstructionRole(role string) bool {
+	switch role {
+	case "planner", "worker", "reviewer", "fixer":
+		return true
+	default:
+		return false
+	}
+}
+
+func protectedInstructionPhrase(text string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	protected := []string{"systemprompt", "system prompt", "__looper_result__", "completion marker", "git_pr_lifecycle", "summary field", "commits field", "result json", "allowautopush", "allowautoapprove", "allow auto push", "allow auto approve", "auto approve", "auto push", "pr creation policy", "review submission policy", "looper review submit", "review submit wrapper", "gh pr review", "disclosure stamping", "auth requirement", "permission boundary", "state transition", "state machine", "ignore lifecycle", "override lifecycle", "custom completion"}
+	for _, phrase := range protected {
+		if strings.Contains(normalized, phrase) {
+			return phrase
+		}
+	}
+	return ""
 }
 
 type writablePathKind string

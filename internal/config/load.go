@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -134,8 +136,13 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 	}
 
 	var partialConfig PartialConfig
-	if err := json.Unmarshal(raw, &partialConfig); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&partialConfig); err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: trailing JSON value", path)
 	}
 
 	return partialConfig, true, nil
@@ -177,6 +184,21 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			parsed.configPath = value
 			parsed.hasConfigPath = true
 			index = nextIndex
+		case matchesFlag(arg, "--no-custom-instructions"):
+			disable := true
+			if _, value, ok := strings.Cut(arg, "="); ok {
+				parsedValue, err := parseBoolean(value)
+				if err != nil {
+					return parsedCLIArgs{}, fmt.Errorf("invalid value for --no-custom-instructions: %q is not a boolean", value)
+				}
+				disable = *parsedValue
+			} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+				if parsedValue, err := parseBoolean(args[index+1]); err == nil {
+					disable = *parsedValue
+					index++
+				}
+			}
+			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
 		case matchesFlag(arg, "--host"):
 			value, nextIndex, err := takeValue(index, "--host")
 			if err != nil {
@@ -732,6 +754,15 @@ func ensureReviewerReviewEventsConfig(partial *PartialConfig) *PartialReviewerRe
 	}
 	return reviewer.ReviewEvents
 }
+
+func ensureInstructionsConfig(partial *PartialConfig) *PartialInstructionsConfig {
+	if partial.Instructions == nil {
+		partial.Instructions = &PartialInstructionsConfig{}
+	}
+	return partial.Instructions
+}
+
+func boolPtr(value bool) *bool { return &value }
 
 func ensureRoleConfigs(partial *PartialConfig) *PartialRoleConfigs {
 	if partial.Roles == nil {

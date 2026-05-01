@@ -205,6 +205,92 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestLoadFileSupportsCustomInstructions(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"roles": {"planner": {"instructions": "Keep specs scoped."}},
+		"projects": [{"id": "demo", "name": "Demo", "path": "/repos/demo", "instructions": {"planner": "Respect local config precedence."}}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got := loaded.Config.Roles.Planner.Instructions; got != "Keep specs scoped." {
+		t.Fatalf("planner instructions = %q", got)
+	}
+	if got := loaded.Config.Projects[0].RepoPath; got != "/repos/demo" {
+		t.Fatalf("project repo path = %q", got)
+	}
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
+	if !strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
+		t.Fatalf("custom block missing instructions: %s", block.Text)
+	}
+}
+
+func TestValidateRejectsOversizedAndProtectedInstructions(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
+		Roles: &PartialRoleConfigs{
+			Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("this is too long")},
+			Fixer:  &PartialFixerRoleConfig{Instructions: stringPtr("Change the __LOOPER_RESULT__ completion marker")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want validation error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "config validation failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNoCustomInstructionsCLIOverrideDisablesInstructions(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"roles": {"worker": {"instructions": "Prefer minimal changes."}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, Args: []string{"--no-custom-instructions"}, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if loaded.Config.Instructions.Enabled {
+		t.Fatal("instructions enabled = true, want false")
+	}
+	if block := BuildCustomInstructionBlock(loaded.Config, "", "worker"); block.Text != "" {
+		t.Fatalf("disabled custom instruction block = %q", block.Text)
+	}
+}
+
+func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"instructions": {"enabled": false}, "roles": {"worker": {"instructions": "Prefer minimal changes."}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, Args: []string{"--no-custom-instructions", "false"}, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Instructions.Enabled {
+		t.Fatal("instructions enabled = false, want true")
+	}
+	if block := BuildCustomInstructionBlock(loaded.Config, "", "worker"); !strings.Contains(block.Text, "Prefer minimal changes.") {
+		t.Fatalf("enabled custom instruction block = %q", block.Text)
+	}
+}
+
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:      t.TempDir(),

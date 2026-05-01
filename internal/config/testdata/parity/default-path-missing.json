@@ -70,6 +70,7 @@
       "tools": {
         "gitPath": "/envonly/git",
         "ghPath": "/envonly/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/envonly/osascript"
       },
       "daemon": {
@@ -114,6 +115,10 @@
           "blocking": "COMMENT"
         },
         "detectDuplicateFindings": true
+      },
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
       },
       "roles": {
         "planner": {
@@ -167,6 +172,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

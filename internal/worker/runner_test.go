@@ -288,6 +288,44 @@ func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *
 	}
 }
 
+func TestBuildWorkerPromptPlacesCustomInstructionsBeforeLifecycle(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{Instructions: stringPtr("Prefer small commits.")}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	prompt, block, err := buildWorkerPromptWithInstructions("", "demo", cfg, workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, true, config.DefaultDisclosureConfig(), "")
+	if err != nil {
+		t.Fatalf("buildWorkerPromptWithInstructions() error = %v", err)
+	}
+	if len(block.Sources) != 1 {
+		t.Fatalf("instruction sources = %#v", block.Sources)
+	}
+	customIndex := strings.Index(prompt, "Prefer small commits.")
+	lifecycleIndex := strings.Index(prompt, "Agent-managed git/PR lifecycle policy")
+	completionIndex := strings.Index(prompt, "__LOOPER_RESULT__=")
+	if customIndex < 0 || lifecycleIndex < 0 || completionIndex < 0 || !(customIndex < lifecycleIndex && lifecycleIndex < completionIndex) {
+		t.Fatalf("unexpected prompt order custom=%d lifecycle=%d completion=%d\n%s", customIndex, lifecycleIndex, completionIndex, prompt)
+	}
+}
+
+func TestBuildWorkerPromptOmitsDisabledCustomInstructions(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Instructions: &config.PartialInstructionsConfig{Enabled: testBoolPtr(false)}, Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{Instructions: stringPtr("Prefer small commits.")}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	prompt, block, err := buildWorkerPromptWithInstructions("", "demo", cfg, workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, true, config.DefaultDisclosureConfig(), "")
+	if err != nil {
+		t.Fatalf("buildWorkerPromptWithInstructions() error = %v", err)
+	}
+	if block.Text != "" || strings.Contains(prompt, "Prefer small commits.") {
+		t.Fatalf("disabled instructions were included: block=%#v prompt=%s", block, prompt)
+	}
+}
+
+func testBoolPtr(value bool) *bool { return &value }
+
 func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

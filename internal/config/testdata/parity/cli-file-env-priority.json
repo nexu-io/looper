@@ -132,6 +132,7 @@
       "tools": {
         "gitPath": "/cli/git",
         "ghPath": "/env/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/cli/osascript"
       },
       "daemon": {
@@ -229,7 +230,11 @@
           "name": "Demo",
           "repoPath": "__TMP__/repo"
         }
-      ]
+      ],
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
+      }
     },
     "metadata": {
       "configPath": "__TMP__/configs/priority.json",
@@ -237,6 +242,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

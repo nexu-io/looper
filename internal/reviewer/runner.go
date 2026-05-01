@@ -280,6 +280,7 @@ type Options struct {
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
 	Disclosure              *config.DisclosureConfig
+	CustomInstructions      *config.Config
 	AgentRuntime            string
 	AgentModel              *string
 	LooperCLIPath           string
@@ -315,6 +316,7 @@ type Runner struct {
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
 	disclosure              config.DisclosureConfig
+	customInstructions      config.Config
 	agentRuntime            string
 	agentModel              string
 	looperCLIPath           string
@@ -476,6 +478,7 @@ func New(options Options) *Runner {
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
 		disclosure:              disclosureCfg,
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentModel:              derefString(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
@@ -1219,7 +1222,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
+	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+		metadata[key] = value
+	}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -2386,6 +2394,13 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 }
 
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
+	return prompt
+}
+
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -2423,6 +2438,10 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 			parts = append(parts, diffanchor.Parse(diff).FormatPromptSection(80))
 			parts = append(parts, "Diff:\n"+diff)
 		}
+	}
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
 	}
 	approveInstruction := "Submit clean reviews as COMMENT."
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
@@ -2492,7 +2511,16 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	if submitPayloadInstruction != "" {
 		parts = append(parts, submitPayloadInstruction)
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func normalizeLooperCLIPath(path string) string {

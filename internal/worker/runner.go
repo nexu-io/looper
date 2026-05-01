@@ -360,6 +360,7 @@ type Options struct {
 	AllowAutoPush                   bool
 	OpenPRStrategy                  config.OpenPRStrategy
 	Disclosure                      *config.DisclosureConfig
+	CustomInstructions              *config.Config
 	AgentModel                      *string
 	RetryBaseDelay                  time.Duration
 	RetryMaxAttempts                int64
@@ -393,6 +394,7 @@ type Runner struct {
 	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
 	disclosure              config.DisclosureConfig
+	customInstructions      config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -588,6 +590,7 @@ func New(options Options) *Runner {
 		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
 		disclosure:              disclosureCfg,
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
@@ -1111,12 +1114,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, err
 	}
 	if !executionCompleted {
-		prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentModel)
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentModel)
 		if err != nil {
 			return checkpoint, err
 		}
 		executionID := eventlog.NewEventID("agent")
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
+		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+			metadata[key] = value
+		}
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2226,6 +2233,13 @@ func implementationPullRequestTitle(work workerInput) string {
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, error) {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentModel)
+	return prompt, err
+}
+
+func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock, error) {
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -2249,6 +2263,10 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 		}
 		parts = append(parts, strings.Join(lines, "\n"))
 	}
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "worker")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
+	}
 	if allowAgentPRCreation {
 		parts = append(parts, buildAgentPullRequestInstruction(work))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
@@ -2257,7 +2275,16 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), nil
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {

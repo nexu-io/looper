@@ -133,6 +133,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
 			DetectDuplicateFindings: true,
 		},
+		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
