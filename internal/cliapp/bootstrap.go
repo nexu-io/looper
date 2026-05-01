@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -723,7 +725,20 @@ func bootstrapDaemonPayloadMatchesManaged(payload json.RawMessage, expectedVersi
 	if strings.TrimSpace(binary.Path) == "" {
 		return false
 	}
-	return filepath.Clean(binary.Path) == filepath.Clean(managedDaemonPath)
+	return bootstrapDaemonPathMatchesManaged(binary.Path, managedDaemonPath)
+}
+
+func bootstrapDaemonPathMatchesManaged(binaryPath string, managedDaemonPath string) bool {
+	return canonicalBootstrapPath(binaryPath) == canonicalBootstrapPath(managedDaemonPath)
+}
+
+func canonicalBootstrapPath(path string) string {
+	cleanPath := filepath.Clean(path)
+	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return cleanPath
+	}
+	return filepath.Clean(resolvedPath)
 }
 
 func bootstrapDaemonVersionMatchesExpected(daemonVersion string, expectedVersion string) bool {
@@ -761,7 +776,32 @@ func (r *commandRuntime) bootstrapCanRestartReachableDaemon(ctx context.Context,
 }
 
 func normalizeBootstrapBaseURL(baseURL string) string {
-	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return trimmed
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if isBootstrapLoopbackHost(host) {
+		host = "localhost"
+	}
+	if port := parsed.Port(); port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = host
+	parsed.User = nil
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func isBootstrapLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	parsedIP := net.ParseIP(host)
+	return parsedIP != nil && parsedIP.IsLoopback()
 }
 
 func (r *commandRuntime) waitForBootstrapMatchingDaemon(ctx context.Context, client *DaemonAPIClient, expectedVersion string, managedDaemonPath string) (bool, error) {

@@ -829,6 +829,49 @@ func TestBootstrapRestartsReachableStaleDaemonAfterReinstall(t *testing.T) {
 	assertJSONContains(t, stdout.String(), "daemonRunning", true)
 }
 
+func TestNormalizeBootstrapBaseURLTreatsLoopbackHostsAsLocal(t *testing.T) {
+	got := normalizeBootstrapBaseURL("http://localhost:17310/")
+	want := normalizeBootstrapBaseURL("http://127.0.0.1:17310")
+	if got != want {
+		t.Fatalf("normalized localhost URL = %q, normalized 127.0.0.1 URL = %q, want equal", got, want)
+	}
+
+	got = normalizeBootstrapBaseURL("http://[::1]:17310")
+	if got != want {
+		t.Fatalf("normalized ::1 URL = %q, normalized 127.0.0.1 URL = %q, want equal", got, want)
+	}
+
+	remote := normalizeBootstrapBaseURL("http://daemon.test:17310")
+	if remote == want {
+		t.Fatalf("normalized remote URL = %q, normalized local URL = %q, want different", remote, want)
+	}
+}
+
+func TestBootstrapDaemonPayloadMatchesManagedResolvesSymlinkedHome(t *testing.T) {
+	realHome := t.TempDir()
+	linkedParent := filepath.Join(t.TempDir(), "linked-home")
+	if err := os.Symlink(realHome, linkedParent); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+
+	managedPath := filepath.Join(linkedParent, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(managed dir) error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("looperd"), 0o755); err != nil {
+		t.Fatalf("WriteFile(managedPath) error = %v", err)
+	}
+	canonicalPath, err := filepath.EvalSymlinks(managedPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(managedPath) error = %v", err)
+	}
+
+	payload := json.RawMessage(fmt.Sprintf(`{"service":{"healthy":true,"version":"1.2.3","binary":{"name":"looperd","path":%q}}}`, canonicalPath))
+	if !bootstrapDaemonPayloadMatchesManaged(payload, "1.2.3", managedPath) {
+		t.Fatalf("bootstrapDaemonPayloadMatchesManaged() = false, want true for canonical status path and symlinked managed path")
+	}
+}
+
 func TestBootstrapIdempotentSkipsGitHubWhenManagedDaemonInstalled(t *testing.T) {
 	t.Parallel()
 
