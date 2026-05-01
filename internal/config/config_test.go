@@ -19,6 +19,7 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:        cwd,
 		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
 		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
@@ -161,7 +162,7 @@ func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath})
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath, LookupEnv: emptyEnvLookup})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -194,7 +195,7 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
 	if err == nil {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
