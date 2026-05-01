@@ -129,11 +129,41 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 	}
 	client := r.apiClientFromLoaded(loaded)
 
-	apiReachable, err := r.bootstrapAPIReachable(ctx, client)
+	var apiReachable bool
+	if installed {
+		apiReachable, err = r.bootstrapAPIReachableForInstalled(ctx, client)
+	} else {
+		apiReachable, err = r.bootstrapAPIReachable(ctx, client)
+	}
 	if err != nil {
 		return bootstrapResult{}, err
 	}
-	if !apiReachable {
+	if apiReachable && installed {
+		expectedDaemon, err := r.readManagedDaemonVersion(ctx)
+		if err != nil {
+			return bootstrapResult{}, err
+		}
+		expectedVersion := ""
+		if expectedDaemon != nil {
+			expectedVersion = expectedDaemon.Version
+		}
+		matches, err := r.bootstrapReachableDaemonMatches(ctx, client, expectedVersion, managedDaemonPath)
+		if err != nil {
+			return bootstrapResult{}, err
+		}
+		if !matches {
+			if err := r.bootstrapCanRestartReachableDaemon(ctx, client, loaded); err != nil {
+				return bootstrapResult{}, err
+			}
+			if err := r.daemonRestartForBootstrap(cmd); err != nil {
+				return bootstrapResult{}, err
+			}
+			apiReachable, err = r.waitForBootstrapMatchingDaemon(ctx, client, expectedVersion, managedDaemonPath)
+			if err != nil {
+				return bootstrapResult{}, err
+			}
+		}
+	} else if !apiReachable {
 		if err := r.daemonStartForBootstrap(cmd); err != nil {
 			return bootstrapResult{}, err
 		}
@@ -296,6 +326,17 @@ func (r *commandRuntime) daemonStartForBootstrap(cmd *cobra.Command) error {
 	cmd.SetOut(io.Discard)
 	defer cmd.SetOut(originalOut)
 	return r.daemonStart(cmd, nil)
+}
+
+func (r *commandRuntime) daemonRestartForBootstrap(cmd *cobra.Command) error {
+	if !getBoolFlag(cmd, "json") {
+		return r.daemonRestart(cmd, nil)
+	}
+
+	originalOut := cmd.OutOrStdout()
+	cmd.SetOut(io.Discard)
+	defer cmd.SetOut(originalOut)
+	return r.daemonRestart(cmd, nil)
 }
 
 func (r *commandRuntime) bootstrapConfiguredToolPaths(configPath string) (config.ToolPathsConfig, error) {
@@ -636,6 +677,106 @@ func (r *commandRuntime) bootstrapAPIReachable(ctx context.Context, client *Daem
 		return false, healthErr
 	}
 	return false, nil
+}
+
+func (r *commandRuntime) bootstrapAPIReachableForInstalled(ctx context.Context, client *DaemonAPIClient) (bool, error) {
+	_, err := r.getJSONWithClient(ctx, client, "/api/v1/status")
+	if err == nil {
+		return true, nil
+	}
+	if isBootstrapProbeContextError(err) {
+		return false, err
+	}
+	if !isBootstrapProbeReachabilityError(err) {
+		return true, nil
+	}
+
+	_, healthErr := r.getJSONWithClient(ctx, client, "/api/v1/healthz")
+	if healthErr == nil {
+		return true, nil
+	}
+	if isBootstrapProbeContextError(healthErr) {
+		return false, healthErr
+	}
+	if !isBootstrapProbeReachabilityError(healthErr) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *commandRuntime) bootstrapReachableDaemonMatches(ctx context.Context, client *DaemonAPIClient, expectedVersion string, managedDaemonPath string) (bool, error) {
+	payload, err := r.getJSONWithClient(ctx, client, "/api/v1/status")
+	if err != nil {
+		if isBootstrapProbeContextError(err) {
+			return false, err
+		}
+		return false, nil
+	}
+	return bootstrapDaemonPayloadMatchesManaged(payload, expectedVersion, managedDaemonPath), nil
+}
+
+func bootstrapDaemonPayloadMatchesManaged(payload json.RawMessage, expectedVersion string, managedDaemonPath string) bool {
+	binary := extractDaemonServiceBinary(payload)
+	if !bootstrapDaemonVersionMatchesExpected(binary.Version, expectedVersion) {
+		return false
+	}
+	if strings.TrimSpace(binary.Path) == "" {
+		return false
+	}
+	return filepath.Clean(binary.Path) == filepath.Clean(managedDaemonPath)
+}
+
+func bootstrapDaemonVersionMatchesExpected(daemonVersion string, expectedVersion string) bool {
+	if strings.TrimSpace(expectedVersion) == "" {
+		return bootstrapDaemonVersionMatches(daemonVersion)
+	}
+	return strings.TrimPrefix(strings.TrimSpace(daemonVersion), "v") == strings.TrimPrefix(strings.TrimSpace(expectedVersion), "v")
+}
+
+func (r *commandRuntime) bootstrapCanRestartReachableDaemon(ctx context.Context, client *DaemonAPIClient, loaded config.LoadedFileConfig) error {
+	localClient := r.localAPIClientFromLoaded(loaded)
+	if normalizeBootstrapBaseURL(client.baseURL) != normalizeBootstrapBaseURL(localClient.baseURL) {
+		return fmt.Errorf("installed managed looperd, but the configured API endpoint is not the local daemon endpoint; stop the stale looperd process manually and rerun `looper bootstrap`")
+	}
+
+	pidFilePath, err := r.resolveDaemonPIDFilePath()
+	if err != nil {
+		return err
+	}
+	existingPID, ok := r.readPIDFile(pidFilePath)
+	if !ok {
+		return fmt.Errorf("installed managed looperd, but a stale looperd API is already reachable and no daemon pid file was found; stop the stale looperd process manually and rerun `looper bootstrap`")
+	}
+	if !r.isProcessAlive(existingPID) {
+		return fmt.Errorf("installed managed looperd, but a stale looperd API is already reachable and the daemon pid file points to a stopped process; stop the stale looperd process manually and rerun `looper bootstrap`")
+	}
+	isLooperd, err := r.isLooperdProcess(ctx, existingPID)
+	if err != nil {
+		return err
+	}
+	if !isLooperd {
+		return fmt.Errorf("installed managed looperd, but a stale looperd API is already reachable and the daemon pid file does not point to looperd; stop the stale looperd process manually and rerun `looper bootstrap`")
+	}
+	return nil
+}
+
+func normalizeBootstrapBaseURL(baseURL string) string {
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+func (r *commandRuntime) waitForBootstrapMatchingDaemon(ctx context.Context, client *DaemonAPIClient, expectedVersion string, managedDaemonPath string) (bool, error) {
+	deadline := time.Now().Add(bootstrapHealthCheckTimeout)
+	for time.Now().Before(deadline) {
+		matches, err := r.bootstrapReachableDaemonMatches(ctx, client, expectedVersion, managedDaemonPath)
+		if err != nil {
+			return false, err
+		}
+		if matches {
+			return true, nil
+		}
+		r.sleep(250 * time.Millisecond)
+	}
+	return false, fmt.Errorf("looperd is reachable but does not report the managed daemon version/path; stop the stale looperd process manually and rerun `looper bootstrap`")
 }
 
 func isBootstrapProbeContextError(err error) bool {

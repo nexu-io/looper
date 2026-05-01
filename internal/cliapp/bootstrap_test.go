@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -685,6 +686,147 @@ func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.
 	if string(afterRaw) != before {
 		t.Fatalf("config changed unexpectedly\nbefore=%s\nafter=%s", before, string(afterRaw))
 	}
+}
+
+func TestBootstrapRestartsReachableStaleDaemonAfterReinstall(t *testing.T) {
+	homeDir := t.TempDir()
+	cwd := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "bootstrap-stale-daemon.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	pidFilePath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(managed dir) error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("old-looperd"), 0o755); err != nil {
+		t.Fatalf("WriteFile(managedPath) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pidFilePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(pid dir) error = %v", err)
+	}
+	if err := os.WriteFile(pidFilePath, []byte("100\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(pidFilePath) error = %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"server":{"host":"127.0.0.1","port":17310,"authMode":"none"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(configPath) error = %v", err)
+	}
+
+	binary := []byte("new-looperd")
+	checksum := sha256.Sum256(binary)
+	checksumText := hex.EncodeToString(checksum[:]) + "  looperd-darwin-arm64\n"
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runningPID := 100
+	runningVersion := "0.1.0"
+	installedVersion := "0.1.0"
+	var spawnCalls atomic.Int32
+	var termCalls atomic.Int32
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		Getwd: func() (string, error) {
+			return cwd, nil
+		},
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				installedVersion = "1.2.3"
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			case "http://daemon.test/api/v1/status", "http://127.0.0.1:17310/api/v1/status":
+				if runningPID == 0 {
+					return nil, fmt.Errorf("daemon offline")
+				}
+				binaryPath := managedPath
+				if runningVersion == "0.1.0" {
+					binaryPath = filepath.Join(homeDir, ".looper", "bin", "stale-looperd")
+				}
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"version":%q,"binary":{"name":"looperd","path":%q}}}}`, runningVersion, binaryPath)), nil
+			case "http://daemon.test/api/v1/healthz", "http://127.0.0.1:17310/api/v1/healthz":
+				if runningPID == 0 {
+					return nil, fmt.Errorf("daemon offline")
+				}
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_health","data":{"healthy":true}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: installedVersion + "\n"}, nil
+			}
+			if command == "ps" && len(args) == 4 && args[0] == "-p" && args[2] == "-o" && args[3] == "command=" {
+				if runningPID == 0 || args[1] != fmt.Sprintf("%d", runningPID) {
+					return commandExecutionResult{ExitCode: 1}, nil
+				}
+				return commandExecutionResult{ExitCode: 0, Stdout: managedPath + "\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = args
+			_ = cwd
+			_ = env
+			if command != managedPath {
+				return 0, fmt.Errorf("unexpected command %q", command)
+			}
+			spawnCalls.Add(1)
+			runningPID = 4321
+			runningVersion = "1.2.3"
+			return runningPID, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if signal == 0 {
+				if pid == runningPID && runningPID != 0 {
+					return nil
+				}
+				return os.ErrProcessDone
+			}
+			if pid == 100 && signal == int(syscall.SIGTERM) {
+				termCalls.Add(1)
+				runningPID = 0
+				return nil
+			}
+			return fmt.Errorf("unexpected kill(%d, %d)", pid, signal)
+		},
+		Sleep: func(duration time.Duration) {
+			_ = duration
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--force", "--json", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if termCalls.Load() != 1 {
+		t.Fatalf("SIGTERM calls = %d, want 1", termCalls.Load())
+	}
+	if spawnCalls.Load() != 1 {
+		t.Fatalf("spawnDetached calls = %d, want 1", spawnCalls.Load())
+	}
+	assertJSONContains(t, stdout.String(), "daemonInstallState", "reinstalled")
+	assertJSONContains(t, stdout.String(), "daemonInstalled", true)
+	assertJSONContains(t, stdout.String(), "daemonRunning", true)
 }
 
 func TestBootstrapIdempotentSkipsGitHubWhenManagedDaemonInstalled(t *testing.T) {
