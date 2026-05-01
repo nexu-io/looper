@@ -304,7 +304,7 @@ func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	if !strings.Contains(runner.stdin, `"path":"app.go"`) {
 		t.Fatalf("review payload did not publish valid path:\n%s", runner.stdin)
 	}
-	if strings.Contains(runner.stdin, `"path":"missing.go"`) || !strings.Contains(runner.stdin, "Invalid") || !strings.Contains(runner.stdin, "Downgraded from inline review comment") {
+	if strings.Contains(runner.stdin, `"path":"missing.go"`) || !strings.Contains(runner.stdin, "Invalid") || !strings.Contains(runner.stdin, "Inline comment could not be anchored") {
 		t.Fatalf("review payload did not downgrade invalid anchor into body:\n%s", runner.stdin)
 	}
 }
