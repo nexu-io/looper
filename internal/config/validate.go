@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -160,6 +161,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
 
+	validateInstructions(config, &issues)
+
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	for index, project := range config.Projects {
 		prefix := fmt.Sprintf("projects[%d]", index)
@@ -182,6 +185,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
+		}
+		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
+			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
+		}
+
+		for role, text := range project.Instructions {
+			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
+			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
+			validateAggregateInstructionBytes(path, config.Roles[role].Instructions, text, config.Instructions.MaxBytes, &issues)
 		}
 	}
 
@@ -209,6 +221,58 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateInstructions(config Config, issues *[]ValidationIssue) {
+	if config.Instructions.MaxBytes < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "instructions.maxBytes", Message: "must be a positive integer"})
+	}
+	for role, roleConfig := range config.Roles {
+		validateInstructionText("roles."+role+".instructions", role, roleConfig.Instructions, config.Instructions.MaxBytes, issues)
+		validateAggregateInstructionBytes("roles."+role+".instructions", roleConfig.Instructions, "", config.Instructions.MaxBytes, issues)
+	}
+}
+
+func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
+	if !isValidInstructionRole(role) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
+	}
+	if maxBytes > 0 && len([]byte(text)) > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
+	}
+	if protected := protectedInstructionPhrase(text); protected != "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must not attempt to override protected Looper contract %q", protected)})
+	}
+}
+
+func validateAggregateInstructionBytes(path, globalText, projectText string, maxBytes int, issues *[]ValidationIssue) {
+	if maxBytes <= 0 {
+		return
+	}
+	bytes := len([]byte(strings.TrimSpace(globalText))) + len([]byte(strings.TrimSpace(projectText)))
+	if bytes > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("combined custom instructions for this role must be at most %d bytes", maxBytes)})
+	}
+}
+
+func isValidInstructionRole(role string) bool {
+	switch role {
+	case "planner", "worker", "reviewer", "fixer":
+		return true
+	default:
+		return false
+	}
+}
+
+func protectedInstructionPhrase(text string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	protected := []string{"systemprompt", "system prompt", "__looper_result__", "completion marker", "git_pr_lifecycle", "summary field", "commits field", "result json", "allowautopush", "allowautoapprove", "allow auto push", "allow auto approve", "auto approve", "auto push", "pr creation policy", "review submission policy", "looper review submit", "review submit wrapper", "gh pr review", "disclosure stamping", "auth requirement", "permission boundary", "state transition", "state machine", "ignore lifecycle", "override lifecycle", "custom completion"}
+	for _, phrase := range protected {
+		if strings.Contains(normalized, phrase) {
+			return phrase
+		}
+	}
+	return ""
 }
 
 type writablePathKind string

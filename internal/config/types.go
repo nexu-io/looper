@@ -117,6 +117,15 @@ type DisclosureChannelsConfig struct {
 	InlineCommentVisible bool `json:"inlineCommentVisible"`
 }
 
+type InstructionsConfig struct {
+	Enabled  bool `json:"enabled"`
+	MaxBytes int  `json:"maxBytes"`
+}
+
+type RoleConfig struct {
+	Instructions string `json:"instructions,omitempty"`
+}
+
 type OsascriptNotificationConfig struct {
 	Enabled               bool                     `json:"enabled"`
 	SoundForLevels        []NotificationSoundLevel `json:"soundForLevels"`
@@ -192,27 +201,31 @@ type ReviewerConfig struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	RepoPath     string  `json:"repoPath"`
-	BaseBranch   *string `json:"baseBranch,omitempty"`
-	WorktreeRoot *string `json:"worktreeRoot,omitempty"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	RepoPath     string            `json:"repoPath"`
+	Path         string            `json:"path,omitempty"`
+	BaseBranch   *string           `json:"baseBranch,omitempty"`
+	WorktreeRoot *string           `json:"worktreeRoot,omitempty"`
+	Instructions map[string]string `json:"instructions,omitempty"`
 }
 
 type Config struct {
-	Server        ServerConfig       `json:"server"`
-	Storage       StorageConfig      `json:"storage"`
-	Scheduler     SchedulerConfig    `json:"scheduler"`
-	Agent         AgentConfig        `json:"agent"`
-	Logging       LoggingConfig      `json:"logging"`
-	Notifications NotificationConfig `json:"notifications"`
-	Disclosure    DisclosureConfig   `json:"disclosure"`
-	Tools         ToolPathsConfig    `json:"tools"`
-	Daemon        DaemonConfig       `json:"daemon"`
-	Package       PackageConfig      `json:"package"`
-	Defaults      DefaultsConfig     `json:"defaults"`
-	Reviewer      ReviewerConfig     `json:"reviewer"`
-	Projects      []ProjectRefConfig `json:"projects"`
+	Server        ServerConfig          `json:"server"`
+	Storage       StorageConfig         `json:"storage"`
+	Scheduler     SchedulerConfig       `json:"scheduler"`
+	Agent         AgentConfig           `json:"agent"`
+	Logging       LoggingConfig         `json:"logging"`
+	Notifications NotificationConfig    `json:"notifications"`
+	Disclosure    DisclosureConfig      `json:"disclosure"`
+	Tools         ToolPathsConfig       `json:"tools"`
+	Daemon        DaemonConfig          `json:"daemon"`
+	Package       PackageConfig         `json:"package"`
+	Defaults      DefaultsConfig        `json:"defaults"`
+	Reviewer      ReviewerConfig        `json:"reviewer"`
+	Instructions  InstructionsConfig    `json:"instructions"`
+	Roles         map[string]RoleConfig `json:"roles"`
+	Projects      []ProjectRefConfig    `json:"projects"`
 }
 
 type PartialServerConfig struct {
@@ -330,18 +343,29 @@ type PartialReviewerConfig struct {
 	DedupeFindings          *bool                      `json:"dedupeFindings,omitempty"`
 }
 
+type PartialInstructionsConfig struct {
+	Enabled  *bool `json:"enabled,omitempty"`
+	MaxBytes *int  `json:"maxBytes,omitempty"`
+}
+
+type PartialRoleConfig struct {
+	Instructions *string `json:"instructions,omitempty"`
+}
+
 type PartialConfig struct {
-	Server        *PartialServerConfig       `json:"server,omitempty"`
-	Storage       *PartialStorageConfig      `json:"storage,omitempty"`
-	Scheduler     *PartialSchedulerConfig    `json:"scheduler,omitempty"`
-	Agent         *PartialAgentConfig        `json:"agent,omitempty"`
-	Logging       *PartialLoggingConfig      `json:"logging,omitempty"`
-	Notifications *PartialNotificationConfig `json:"notifications,omitempty"`
-	Disclosure    *PartialDisclosureConfig   `json:"disclosure,omitempty"`
-	Tools         *PartialToolPathsConfig    `json:"tools,omitempty"`
-	Daemon        *PartialDaemonConfig       `json:"daemon,omitempty"`
-	Package       *PartialPackageConfig      `json:"package,omitempty"`
-	Defaults      *PartialDefaultsConfig     `json:"defaults,omitempty"`
-	Reviewer      *PartialReviewerConfig     `json:"reviewer,omitempty"`
-	Projects      *[]ProjectRefConfig        `json:"projects,omitempty"`
+	Server        *PartialServerConfig         `json:"server,omitempty"`
+	Storage       *PartialStorageConfig        `json:"storage,omitempty"`
+	Scheduler     *PartialSchedulerConfig      `json:"scheduler,omitempty"`
+	Agent         *PartialAgentConfig          `json:"agent,omitempty"`
+	Logging       *PartialLoggingConfig        `json:"logging,omitempty"`
+	Notifications *PartialNotificationConfig   `json:"notifications,omitempty"`
+	Disclosure    *PartialDisclosureConfig     `json:"disclosure,omitempty"`
+	Tools         *PartialToolPathsConfig      `json:"tools,omitempty"`
+	Daemon        *PartialDaemonConfig         `json:"daemon,omitempty"`
+	Package       *PartialPackageConfig        `json:"package,omitempty"`
+	Defaults      *PartialDefaultsConfig       `json:"defaults,omitempty"`
+	Reviewer      *PartialReviewerConfig       `json:"reviewer,omitempty"`
+	Instructions  *PartialInstructionsConfig   `json:"instructions,omitempty"`
+	Roles         map[string]PartialRoleConfig `json:"roles,omitempty"`
+	Projects      *[]ProjectRefConfig          `json:"projects,omitempty"`
 }

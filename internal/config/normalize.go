@@ -62,6 +62,14 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
 	}
 
+	if partial.Instructions != nil {
+		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
+	}
+
+	if partial.Roles != nil {
+		config.Roles = mergeRoles(config.Roles, partial.Roles)
+	}
+
 	if partial.Projects != nil {
 		config.Projects = cloneProjects(*partial.Projects)
 	}
@@ -360,6 +368,30 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	}
 }
 
+func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstructionsConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MaxBytes != nil {
+		config.MaxBytes = *partial.MaxBytes
+	}
+}
+
+func mergeRoles(base map[string]RoleConfig, override map[string]PartialRoleConfig) map[string]RoleConfig {
+	merged := make(map[string]RoleConfig, len(base)+len(override))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range override {
+		role := merged[key]
+		if value.Instructions != nil {
+			role.Instructions = *value.Instructions
+		}
+		merged[key] = role
+	}
+	return merged
+}
+
 func mergeAnyMap(base map[string]any, override map[string]any) map[string]any {
 	merged := make(map[string]any, len(base)+len(override))
 	for key, value := range base {
@@ -435,9 +467,11 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = ProjectRefConfig{
-			ID:       project.ID,
-			Name:     project.Name,
-			RepoPath: project.RepoPath,
+			ID:           project.ID,
+			Name:         project.Name,
+			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
+			Path:         project.Path,
+			Instructions: cloneStringMap(project.Instructions),
 		}
 
 		if project.BaseBranch != nil {
@@ -450,4 +484,24 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

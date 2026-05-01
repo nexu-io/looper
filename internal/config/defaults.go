@@ -132,7 +132,9 @@ func DefaultConfig(cwd string) (Config, error) {
 			PublishMode:             ReviewerPublishModeSingleReview,
 			DetectDuplicateFindings: true,
 		},
-		Projects: []ProjectRefConfig{},
+		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
+		Roles:        map[string]RoleConfig{},
+		Projects:     []ProjectRefConfig{},
 	}, nil
 }
 

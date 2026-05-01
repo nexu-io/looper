@@ -694,18 +694,19 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
 	plannerRunner = planner.New(planner.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           plannerGitHubAdapter{gateway: githubGateway, stamper: stamper},
-		Git:              plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:    plannerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoPush:    boolPtr(cfg.Defaults.AllowAutoPush),
-		Disclosure:       &cfg.Disclosure,
-		AgentModel:       cfg.Agent.Model,
-		RetryBaseDelay:   retryBaseDelay,
-		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		DB:                 coordinator.DB(),
+		Repos:              repos,
+		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
+		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:             logger,
+		Now:                now,
+		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
+		Disclosure:         &cfg.Disclosure,
+		CustomInstructions: &cfg,
+		AgentModel:         cfg.Agent.Model,
+		RetryBaseDelay:     retryBaseDelay,
+		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
@@ -723,6 +724,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Scope:                   cfg.Reviewer.Scope,
 		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
 		Disclosure:              &cfg.Disclosure,
+		CustomInstructions:      &cfg,
 		AgentRuntime: func() string {
 			if cfg.Agent.Vendor == nil {
 				return ""
@@ -750,6 +752,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 		Disclosure:         &cfg.Disclosure,
+		CustomInstructions: &cfg,
 		AgentModel:         cfg.Agent.Model,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
@@ -764,17 +767,18 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
-		Git:              workerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
-		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
-		Disclosure:       &cfg.Disclosure,
-		AgentModel:       cfg.Agent.Model,
-		RetryBaseDelay:   retryBaseDelay,
-		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		Git:                workerGitAdapter{gateway: gitGateway, stamper: stamper},
+		AgentExecutor:      workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
+		Logger:             logger,
+		Now:                now,
+		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
+		AllowAutoPush:      cfg.Defaults.AllowAutoPush,
+		OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
+		Disclosure:         &cfg.Disclosure,
+		CustomInstructions: &cfg,
+		AgentModel:         cfg.Agent.Model,
+		RetryBaseDelay:     retryBaseDelay,
+		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},

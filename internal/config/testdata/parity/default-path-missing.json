@@ -48,7 +48,10 @@
         "inApp": false,
         "osascript": {
           "enabled": false,
-          "soundForLevels": ["action_required", "failure"],
+          "soundForLevels": [
+            "action_required",
+            "failure"
+          ],
           "throttleWindowSeconds": 60
         }
       },
@@ -67,6 +70,7 @@
       "tools": {
         "gitPath": "/envonly/git",
         "ghPath": "/envonly/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/envonly/osascript"
       },
       "daemon": {
@@ -108,7 +112,12 @@
         "publishMode": "single_review",
         "detectDuplicateFindings": true
       },
-      "projects": []
+      "projects": [],
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
+      },
+      "roles": {}
     },
     "metadata": {
       "configPath": "__TMP__/configs/missing.json",
@@ -116,6 +125,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

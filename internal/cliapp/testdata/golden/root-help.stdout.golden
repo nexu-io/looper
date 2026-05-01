@@ -10,6 +10,7 @@ Subcommands:
   version    Show Looper version
   project    Project commands
   config     Config commands
+  prompt     Prompt inspection commands
   daemon     Daemon commands
   upgrade    Check or upgrade Looper installations
   labels     GitHub label commands
@@ -36,6 +37,7 @@ Flags:
   --json                      Emit JSON output
   --log-dir <path>            Daemon log directory
   --looper-path <path>        Looper CLI path
+  --no-custom-instructions    Disable custom instructions for debugging
   --osascript-path <path>     osascript binary path
   --port <port>               Server port
   --reviewer-loop-enabled <bool> Enable reviewer follow-up loops by default

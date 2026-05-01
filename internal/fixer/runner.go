@@ -277,6 +277,7 @@ type Options struct {
 	AllowRiskyFixes         bool
 	FixAllPullRequests      bool
 	Disclosure              *config.DisclosureConfig
+	CustomInstructions      *config.Config
 	AgentModel              *string
 	Sleep                   func(time.Duration)
 	RetryBaseDelay          time.Duration
@@ -301,6 +302,7 @@ type Runner struct {
 	allowRiskyFixes         bool
 	fixAllPullRequests      bool
 	disclosure              config.DisclosureConfig
+	customInstructions      config.Config
 	agentModel              string
 	sleep                   func(time.Duration)
 	retryBaseDelay          time.Duration
@@ -497,6 +499,7 @@ func New(options Options) *Runner {
 		allowRiskyFixes:         options.AllowRiskyFixes,
 		fixAllPullRequests:      options.FixAllPullRequests,
 		disclosure:              disclosureCfg,
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		sleep:                   sleep,
 		retryBaseDelay:          retryBaseDelay,
@@ -1029,7 +1032,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildFixerPrompt(input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentModel)
+	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
+	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+		metadata[key] = value
+	}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1895,7 +1903,7 @@ func hashFixItems(items []FixItem) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber)}
 	if headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
@@ -1909,6 +1917,10 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
 	)
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "fixer")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
+	}
 	if allowAutoPush {
 		parts = append(parts, "Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.")
 		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentModel))
@@ -1916,7 +1928,16 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {

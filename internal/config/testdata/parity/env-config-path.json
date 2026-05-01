@@ -43,7 +43,9 @@
           "inApp": true,
           "osascript": {
             "enabled": true,
-            "soundForLevels": ["failure"],
+            "soundForLevels": [
+              "failure"
+            ],
             "throttleWindowSeconds": 120
           }
         },
@@ -127,7 +129,9 @@
         "inApp": true,
         "osascript": {
           "enabled": true,
-          "soundForLevels": ["failure"],
+          "soundForLevels": [
+            "failure"
+          ],
           "throttleWindowSeconds": 120
         }
       },
@@ -146,6 +150,7 @@
       "tools": {
         "gitPath": "/cfg/git",
         "ghPath": "/cfg/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/cfg/osascript"
       },
       "daemon": {
@@ -197,7 +202,12 @@
           "baseBranch": "develop",
           "worktreeRoot": "__TMP__/alpha-worktrees"
         }
-      ]
+      ],
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
+      },
+      "roles": {}
     },
     "metadata": {
       "configPath": "__TMP__/configs/env-selected.json",
@@ -205,6 +215,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

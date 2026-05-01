@@ -24,10 +24,8 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 	detection := map[string]ToolDetectionStatus{
 		"gitPath":       toolDetectionStatusFor(paths.GitPath),
 		"ghPath":        toolDetectionStatusFor(paths.GHPath),
+		"looperPath":    toolDetectionStatusFor(paths.LooperPath),
 		"osascriptPath": toolDetectionStatusFor(paths.OsascriptPath),
-	}
-	if paths.LooperPath != nil {
-		detection["looperPath"] = ToolDetectionStatusConfigured
 	}
 
 	candidates := []struct {
