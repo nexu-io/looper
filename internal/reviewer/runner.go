@@ -1294,8 +1294,9 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
-		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+		specReviewingLabel := r.specReviewingLabel()
+		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
+		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
 			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 			if err != nil {
 				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
@@ -1307,8 +1308,8 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
 				return nil
 			}
-			if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
-				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			if specpr.HasLabel(detail.Labels, specReviewingLabel) {
+				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 				}
 			}
@@ -1326,6 +1327,13 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		return &loopError{message: "Verified review marker is missing outcome=clean|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
 	return nil
+}
+
+func (r *Runner) specReviewingLabel() string {
+	if label := strings.TrimSpace(r.discoveryPolicy.SpecReviewingLabel); label != "" {
+		return label
+	}
+	return specpr.ReviewingLabel
 }
 
 func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
