@@ -719,6 +719,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Logger:                  logger,
 		Now:                     now,
 		AllowAutoApprove:        cfg.Defaults.AllowAutoApprove,
+		ReviewEvents:            cfg.Reviewer.ReviewEvents,
 		LoopConfig:              cfg.Reviewer.Loop,
 		Scope:                   cfg.Reviewer.Scope,
 		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,

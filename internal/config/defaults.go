@@ -130,6 +130,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			},
 			Scope:                   ReviewerScopeChangedRanges,
 			PublishMode:             ReviewerPublishModeSingleReview,
+			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
 			DetectDuplicateFindings: true,
 		},
 		Projects: []ProjectRefConfig{},

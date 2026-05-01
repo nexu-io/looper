@@ -19,6 +19,7 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:        cwd,
 		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
 		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
@@ -66,7 +67,7 @@ func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath})
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath, LookupEnv: emptyEnvLookup})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -99,7 +100,7 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
 	if err == nil {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
@@ -383,6 +384,67 @@ func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 	loop := loaded.Config.Reviewer.Loop
 	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
 		t.Fatalf("reviewer loop config = %#v, want cli/env/file precedence applied", loop)
+	}
+}
+
+func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"reviewEvents":{"clean":"COMMENT","blocking":"COMMENT"}}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD: cwd,
+		Args: []string{
+			"--config", configPath,
+			"--reviewer-blocking-review-event", "REQUEST_CHANGES",
+		},
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN": "APPROVE",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got := loaded.Config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := loaded.Config.Reviewer.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+		t.Fatalf("blocking review event = %q, want %q", got, ReviewerReviewEventRequestChanges)
+	}
+}
+
+func TestNormalizeAllowAutoApproveLegacyAliasRespectsExplicitReviewerCleanEvent(t *testing.T) {
+	trueValue := true
+	comment := ReviewerReviewEventComment
+	config, err := Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, Reviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
+	if err != nil {
+		t.Fatalf("Normalize(explicit) error = %v", err)
+	}
+	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("explicit clean review event = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Reviewer.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
+	cfg.Reviewer.ReviewEvents.Blocking = ReviewerReviewEventApprove
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "config validation failed") {
+		t.Fatalf("ValidateWithOptions() error = %v, want validation failure", err)
 	}
 }
 

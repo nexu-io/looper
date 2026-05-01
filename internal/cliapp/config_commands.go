@@ -33,6 +33,12 @@ var configFieldRegistry = map[string]configField{
 	"defaults.allowRiskyFixes":    boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
 	"defaults.fixAllPullRequests": boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
 	"defaults.openPrStrategy":     openPRStrategyField(),
+	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Clean
+	}),
+	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Blocking
+	}),
 }
 
 func (r *commandRuntime) configGet(cmd *cobra.Command, args []string) error {
@@ -384,6 +390,16 @@ func openPRStrategyField() configField {
 	}}
 }
 
+func reviewerReviewEventField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
+	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
+		*target(p) = &value
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*target(p) = nil
+	}}
+}
+
 func parseConfigBool(raw string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "true", "1", "yes", "on":
@@ -402,27 +418,62 @@ func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefault
 	return partial.Defaults
 }
 
-func configFieldSet(partial config.PartialConfig, key string) bool {
-	if partial.Defaults == nil {
-		return false
+func ensurePartialReviewerReviewEvents(partial *config.PartialConfig) *config.PartialReviewerReviewEventsConfig {
+	if partial.Reviewer == nil {
+		partial.Reviewer = &config.PartialReviewerConfig{}
 	}
+	if partial.Reviewer.ReviewEvents == nil {
+		partial.Reviewer.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
+	}
+	return partial.Reviewer.ReviewEvents
+}
+
+func configFieldSet(partial config.PartialConfig, key string) bool {
 	switch key {
 	case "defaults.baseBranch":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.BaseBranch != nil
 	case "defaults.allowAutoCommit":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoCommit != nil
 	case "defaults.allowAutoPush":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoPush != nil
 	case "defaults.allowAutoApprove":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoApprove != nil
 	case "defaults.allowAutoMerge":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoMerge != nil
 	case "defaults.allowRiskyFixes":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowRiskyFixes != nil
 	case "defaults.fixAllPullRequests":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.FixAllPullRequests != nil
 	case "defaults.openPrStrategy":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.OpenPRStrategy != nil
+	case "reviewer.reviewEvents.clean":
+		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil
+	case "reviewer.reviewEvents.blocking":
+		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Blocking != nil
 	default:
 		return false
 	}

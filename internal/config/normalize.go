@@ -6,11 +6,24 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	explicitReviewerCleanReviewEvent := hasExplicitReviewerCleanReviewEvent(partials)
 	for _, partial := range partials {
 		mergeConfig(&config, partial)
 	}
+	if config.Defaults.AllowAutoApprove && !explicitReviewerCleanReviewEvent {
+		config.Reviewer.ReviewEvents.Clean = ReviewerReviewEventApprove
+	}
 
 	return config, nil
+}
+
+func hasExplicitReviewerCleanReviewEvent(partials []PartialConfig) bool {
+	for _, partial := range partials {
+		if partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeConfig(config *Config, partial PartialConfig) {
@@ -320,10 +333,22 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.PublishMode != nil {
 		config.PublishMode = *partial.PublishMode
 	}
+	if partial.ReviewEvents != nil {
+		mergeReviewerReviewEventsConfig(&config.ReviewEvents, *partial.ReviewEvents)
+	}
 	if partial.DetectDuplicateFindings != nil {
 		config.DetectDuplicateFindings = *partial.DetectDuplicateFindings
 	} else if partial.DedupeFindings != nil {
 		config.DetectDuplicateFindings = *partial.DedupeFindings
+	}
+}
+
+func mergeReviewerReviewEventsConfig(config *ReviewerReviewEventsConfig, partial PartialReviewerReviewEventsConfig) {
+	if partial.Clean != nil {
+		config.Clean = *partial.Clean
+	}
+	if partial.Blocking != nil {
+		config.Blocking = *partial.Blocking
 	}
 }
 
