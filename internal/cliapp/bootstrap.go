@@ -566,11 +566,21 @@ func bootstrapLocalToken() string {
 }
 
 func (r *commandRuntime) ensureBootstrapDaemon(ctx context.Context, force bool) (string, bool, error) {
+	matchingTag := bootstrapDaemonReleaseTag()
+	if force {
+		result, err := r.installManagedDaemon(ctx, true, matchingTag, r.app.stderr())
+		if err != nil {
+			return "", false, fmt.Errorf("install managed daemon: %w", err)
+		}
+		if result.Skipped {
+			return "already-installed", false, nil
+		}
+		return "reinstalled", true, nil
+	}
 	installed, err := r.readManagedDaemonVersion(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	matchingTag := bootstrapDaemonReleaseTag()
 	if !force && installed != nil && bootstrapDaemonVersionMatches(installed.Version) {
 		return "already-installed", false, nil
 	}

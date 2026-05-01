@@ -249,6 +249,75 @@ func TestBootstrapReportsInvalidManagedDaemon(t *testing.T) {
 	}
 }
 
+func TestEnsureBootstrapDaemonForceReinstallsBrokenManagedBinary(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("corrupt"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	binary := []byte("replacement-looperd")
+	checksum := sha256.Sum256(binary)
+	checksumText := hex.EncodeToString(checksum[:]) + "  looperd-darwin-arm64\n"
+	stderr := &bytes.Buffer{}
+
+	app := New(Deps{
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "exec format error"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	runtime := newCommandRuntime(app, nil)
+	state, installed, err := runtime.ensureBootstrapDaemon(context.Background(), true)
+	if err != nil {
+		t.Fatalf("ensureBootstrapDaemon(force=true) error = %v", err)
+	}
+	if state != "reinstalled" {
+		t.Fatalf("ensureBootstrapDaemon(force=true) state = %q, want %q", state, "reinstalled")
+	}
+	if !installed {
+		t.Fatal("ensureBootstrapDaemon(force=true) installed = false, want true")
+	}
+
+	got, err := os.ReadFile(managedPath)
+	if err != nil {
+		t.Fatalf("ReadFile(managedPath) error = %v", err)
+	}
+	if !bytes.Equal(got, binary) {
+		t.Fatalf("managed daemon bytes = %q, want %q", got, binary)
+	}
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64") {
+		t.Fatalf("stderr = %q, want download progress", stderr.String())
+	}
+}
+
 func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 	t.Parallel()
 
