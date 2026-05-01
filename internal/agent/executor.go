@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,8 +20,9 @@ import (
 )
 
 const (
-	defaultMaxOutputBytes = 256 * 1024
-	completionMarkerEnv   = "LOOPER_COMPLETION_MARKER"
+	defaultMaxOutputBytes    = 256 * 1024
+	maxPersistedLogReadBytes = 16 * 1024 * 1024
+	completionMarkerEnv      = "LOOPER_COMPLETION_MARKER"
 )
 
 type ExecutorConfig struct {
@@ -32,6 +35,7 @@ type ExecutorConfig struct {
 type ExecutorOptions struct {
 	Config ExecutorConfig
 	Repos  *storage.Repositories
+	LogDir string
 	Now    func() time.Time
 }
 
@@ -84,6 +88,7 @@ type Execution interface {
 type ConfiguredExecutor struct {
 	config ExecutorConfig
 	repos  *storage.Repositories
+	logDir string
 	now    func() time.Time
 }
 
@@ -92,7 +97,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, now: now}
+	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now}
 }
 
 func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Execution, error) {
@@ -149,6 +154,8 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 	}
+	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
+	x.initializePersistedLogs()
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 	if err := cmd.Start(); err != nil {
@@ -182,11 +189,14 @@ type execution struct {
 	lastHeartbeatAtISO string
 	lastOutputAt       time.Time
 
-	mu             sync.Mutex
-	status         string
-	stdout         []byte
-	stderr         []byte
-	heartbeatCount int64
+	mu                      sync.Mutex
+	status                  string
+	stdout                  []byte
+	stderr                  []byte
+	stdoutLogPath           string
+	stderrLogPath           string
+	persistedLogWriteFailed bool
+	heartbeatCount          int64
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -340,11 +350,13 @@ func (x *execution) run(ctx context.Context) {
 		_ = x.killProcessGroup()
 	}
 
-	stdout := x.stdoutString()
-	stderr := x.stderrString()
+	stdout, stderr := x.resolveOutputLogs()
 	status := x.finalStatus(timedOut, killed)
 	if waitErr != nil && status == "failed" && strings.TrimSpace(stderr) == "" {
 		stderr = waitErr.Error()
+		if x.appendPersistedLog(x.stderrLogPath, []byte(stderr)) {
+			x.markPersistedLogWriteFailed()
+		}
 	}
 	errorMessage := ""
 	if status == "failed" || status == "timeout" || status == "killed" {
@@ -404,8 +416,14 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	if stream == "stdout" {
+		if x.appendPersistedLog(x.stdoutLogPath, chunk) {
+			x.persistedLogWriteFailed = true
+		}
 		x.stdout = appendTailBounded(x.stdout, chunk, x.maxOutputBytes)
 	} else {
+		if x.appendPersistedLog(x.stderrLogPath, chunk) {
+			x.persistedLogWriteFailed = true
+		}
 		x.stderr = appendTailBounded(x.stderr, chunk, x.maxOutputBytes)
 	}
 	heartbeatCount := x.heartbeatCount
@@ -413,7 +431,7 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	stderr := string(x.stderr)
 	x.mu.Unlock()
 
-	outputJSON := mustJSON(map[string]string{"stdout": stdout, "stderr": stderr})
+	outputJSON := x.outputJSON(stdout, stderr)
 	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
 	x.bumpRunHeartbeat(nowISO)
 }
@@ -474,7 +492,14 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	}
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	metadata := mustJSON(map[string]any{"idempotencyKey": emptyToNil(x.input.IdempotencyKey), "metadata": x.input.Metadata})
-	outputJSON := mustJSON(map[string]any{"stdout": result.Stdout, "stderr": result.Stderr, "gitPrLifecycle": result.Lifecycle})
+	embeddedStdout := x.stdoutString()
+	embeddedStderr := x.stderrString()
+	if embeddedStderr == "" && result.Stderr != "" {
+		embeddedStderr = result.Stderr
+	}
+	output := x.outputPayload(embeddedStdout, embeddedStderr)
+	output["gitPrLifecycle"] = result.Lifecycle
+	outputJSON := mustJSON(output)
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
@@ -551,6 +576,33 @@ func (x *execution) heartbeatCountValue() int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.heartbeatCount
+}
+
+func (x *execution) resolveOutputLogs() (string, string) {
+	stdout := x.stdoutString()
+	stderr := x.stderrString()
+	if x.hasPersistedLogWriteFailure() {
+		return stdout, stderr
+	}
+	if persisted, ok := readPersistedExecutionLog(x.stdoutLogPath); ok {
+		stdout = persisted
+	}
+	if persisted, ok := readPersistedExecutionLog(x.stderrLogPath); ok {
+		stderr = persisted
+	}
+	return stdout, stderr
+}
+
+func (x *execution) hasPersistedLogWriteFailure() bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.persistedLogWriteFailed
+}
+
+func (x *execution) markPersistedLogWriteFailed() {
+	x.mu.Lock()
+	x.persistedLogWriteFailed = true
+	x.mu.Unlock()
 }
 
 func (x *execution) timeSinceLastOutput() time.Duration {
@@ -696,6 +748,122 @@ func stringArgs(value any) []string {
 		}
 	}
 	return result
+}
+
+func (e *ConfiguredExecutor) executionLogPaths(input RunInput, executionID string) (string, string) {
+	if strings.TrimSpace(e.logDir) == "" {
+		return "", ""
+	}
+	runID := safeLogPathSegment(firstNonEmpty(input.RunID, "runless"))
+	loopID := safeLogPathSegment(firstNonEmpty(input.LoopID, "loopless"))
+	execID := safeLogPathSegment(firstNonEmpty(executionID, "execution"))
+	dir := filepath.Join(e.logDir, "loops", loopID, runID)
+	return filepath.Join(dir, execID+".stdout.log"), filepath.Join(dir, execID+".stderr.log")
+}
+
+func safeLogPathSegment(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "." || trimmed == ".." {
+		return "unknown"
+	}
+	var builder strings.Builder
+	for _, r := range trimmed {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteRune('_')
+		}
+	}
+	segment := builder.String()
+	if segment == "." || segment == ".." {
+		return "unknown"
+	}
+	return segment
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (x *execution) appendPersistedLog(path string, chunk []byte) bool {
+	if path == "" || len(chunk) == 0 {
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return true
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return true
+	}
+	n, err := file.Write(chunk)
+	writeFailed := err != nil || n != len(chunk)
+	if err := file.Close(); err != nil {
+		writeFailed = true
+	}
+	return writeFailed
+}
+
+func (x *execution) initializePersistedLogs() {
+	for _, path := range []string{x.stdoutLogPath, x.stderrLogPath} {
+		if path == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			continue
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			continue
+		}
+		_ = file.Close()
+	}
+}
+
+func readPersistedExecutionLog(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", false
+	}
+	if info.Size() > maxPersistedLogReadBytes {
+		if _, err := file.Seek(info.Size()-maxPersistedLogReadBytes, io.SeekStart); err != nil {
+			return "", false
+		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxPersistedLogReadBytes))
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func (x *execution) outputJSON(stdout, stderr string) string {
+	return mustJSON(x.outputPayload(stdout, stderr))
+}
+
+func (x *execution) outputPayload(stdout, stderr string) map[string]any {
+	payload := map[string]any{"stdout": stdout, "stderr": stderr}
+	if x.stdoutLogPath != "" {
+		payload["stdoutLogPath"] = x.stdoutLogPath
+	}
+	if x.stderrLogPath != "" {
+		payload["stderrLogPath"] = x.stderrLogPath
+	}
+	return payload
 }
 
 func appendTailBounded(existing []byte, chunk []byte, maxBytes int) []byte {

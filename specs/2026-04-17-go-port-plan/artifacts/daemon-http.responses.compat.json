@@ -92,24 +92,40 @@
           },
           "loops": {
             "planner": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "reviewer": {
+              "queued": 0,
               "running": 1,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "worker": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "fixer": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             }
           },
           "safety": {
@@ -141,7 +157,7 @@
         "data": {
           "server": {
             "host": "127.0.0.1",
-            "port": 4310,
+            "port": 17310,
             "authMode": "none",
             "localTokenConfigured": false
           },
@@ -199,7 +215,24 @@
             "allowRiskyFixes": false,
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
-            "addSnapshotMode": "full"
+            "addSnapshotMode": "async"
+          },
+          "reviewer": {
+            "loop": {
+              "enabledByDefault": true,
+              "quietPeriodSeconds": 120,
+              "maxIterationsPerPR": 20,
+              "maxIterationsPerHead": 1,
+              "maxWallClockSeconds": 14400,
+              "maxConsecutiveFailures": 3,
+              "maxAgentExecutionsPerPR": 25,
+              "stopOnApproved": true,
+              "stopOnReadyLabel": true,
+              "stopOnIdenticalOutput": true
+            },
+            "scope": "changed_ranges",
+            "publishMode": "single_review",
+            "detectDuplicateFindings": true
           },
           "projects": []
         },

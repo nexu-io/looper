@@ -169,6 +169,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
+					boolFlag("full", "Show all retained daemon log lines, including rotated log files"),
 					boolFlag("force", "Overwrite existing installed daemon binary"),
 				},
 				exampleLines: []string{
@@ -178,6 +179,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper daemon restart",
 					"$ looper daemon status",
 					"$ looper daemon logs --lines 50",
+					"$ looper daemon logs --full",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),
@@ -288,17 +290,23 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 			}),
 			newCommand(commandSpec{
-				use:   "review <pr>",
-				short: "Create a reviewer task for a pull request",
-				args:  cobra.ExactArgs(1),
-				runE:  runtime.reviewCreate,
+				use:             "review <pr>",
+				short:           "Create a reviewer task for a pull request",
+				args:            cobra.ExactArgs(1),
+				runE:            runtime.reviewCreate,
+				helpSubcommands: []helpSubcommand{{name: "submit", description: "Submit a validated PR review payload"}},
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
+					boolFlag("no-loop", "Run only one review pass"),
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT or APPROVE"), stringFlag("commit-id", "sha", "Expected PR head commit SHA")}}),
 				},
 				exampleLines: []string{
 					"$ looper review 123",
 					"$ looper review acme/looper#42 --loop",
+					"$ looper review submit acme/looper#42 --event COMMENT --commit-id abc123 < review.json",
 				},
 			}),
 			newCommand(commandSpec{
@@ -319,11 +327,15 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				short: "Show running loops",
 				runE:  runtime.activeRuns,
 				localFlags: []flagSpec{
+					boolFlag("all", "Show recent loops in any status"),
+					stringFlag("status", "status", "Filter by loop or run status"),
 					stringFlag("type", "type", "Filter by loop type"),
 					stringFlag("project", "projectId", "Filter by project id"),
 				},
 				exampleLines: []string{
 					"$ looper ps",
+					"$ looper ps --status completed --type worker",
+					"$ looper ps --all",
 					"$ looper ps --type reviewer --project project_1",
 				},
 			}),
@@ -536,8 +548,13 @@ func globalFlags() []flagSpec {
 		stringFlag("daemon-mode", "mode", "Daemon mode"),
 		stringFlag("git-path", "path", "Git binary path"),
 		stringFlag("gh-path", "path", "GitHub CLI path"),
+		stringFlag("looper-path", "path", "Looper CLI path"),
 		stringFlag("osascript-path", "path", "osascript binary path"),
 		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
+		stringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
+		stringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		stringFlag("reviewer-max-iterations-per-pr", "count", "Reviewer loop max iterations per PR"),
+		stringFlag("reviewer-max-iterations-per-head", "count", "Reviewer loop max iterations per head"),
 	}
 }
 
@@ -584,16 +601,21 @@ func (a *App) stderr() io.Writer {
 }
 
 var configFlagNames = map[string]struct{}{
-	"config":                {},
-	"host":                  {},
-	"port":                  {},
-	"db-path":               {},
-	"log-dir":               {},
-	"daemon-mode":           {},
-	"git-path":              {},
-	"gh-path":               {},
-	"osascript-path":        {},
-	"fix-all-pull-requests": {},
+	"config":                           {},
+	"host":                             {},
+	"port":                             {},
+	"db-path":                          {},
+	"log-dir":                          {},
+	"daemon-mode":                      {},
+	"git-path":                         {},
+	"gh-path":                          {},
+	"looper-path":                      {},
+	"osascript-path":                   {},
+	"fix-all-pull-requests":            {},
+	"reviewer-loop-enabled":            {},
+	"reviewer-quiet-period-seconds":    {},
+	"reviewer-max-iterations-per-pr":   {},
+	"reviewer-max-iterations-per-head": {},
 }
 
 func ExtractConfigArgs(argv []string) []string {

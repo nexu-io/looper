@@ -138,6 +138,10 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
+func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
+	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
+}
+
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
@@ -261,19 +265,16 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
-func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input reviewer.SubmitReviewInput) error {
-	comments := make([]githubinfra.ReviewComment, 0, len(input.Comments))
-	for _, comment := range input.Comments {
-		body := a.stamper.ReviewComment(comment.Body, "reviewer")
-		comments = append(comments, githubinfra.ReviewComment{Body: body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
+	allowedReviewEvents := make([]string, 0, len(input.AllowedReviewEvents))
+	for _, event := range input.AllowedReviewEvents {
+		allowedReviewEvents = append(allowedReviewEvents, string(event))
 	}
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
-	return a.gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(input.Event), Body: body, CommitID: input.CommitID, Comments: comments, CWD: input.CWD})
-}
-
-func (a reviewerGitHubAdapter) AddPullRequestComment(ctx context.Context, input reviewer.PullRequestCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	return a.gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
+	marker, err := a.gateway.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, AllowedReviewEvents: allowedReviewEvents, AuthorLogin: input.AuthorLogin, CWD: input.CWD})
+	if err != nil {
+		return reviewer.ReviewMarkerResult{}, err
+	}
+	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -471,6 +472,10 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
+func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
+	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
@@ -690,8 +695,9 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Params: cfg.Agent.Params,
 			Env:    cfg.Agent.Env,
 		},
-		Repos: repos,
-		Now:   now,
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
@@ -705,6 +711,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:              now,
 		AllowAutoPush:    boolPtr(cfg.Defaults.AllowAutoPush),
 		Disclosure:       &cfg.Disclosure,
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
@@ -712,14 +719,26 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+		DB:                      coordinator.DB(),
+		Repos:                   repos,
+		GitHub:                  reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		Git:                     reviewerGitAdapter{gateway: gitGateway},
+		AgentExecutor:           reviewerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:                  logger,
+		Now:                     now,
+		AllowAutoApprove:        cfg.Defaults.AllowAutoApprove,
+		LoopConfig:              cfg.Reviewer.Loop,
+		Scope:                   cfg.Reviewer.Scope,
+		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
+		Disclosure:              &cfg.Disclosure,
+		AgentRuntime: func() string {
+			if cfg.Agent.Vendor == nil {
+				return ""
+			}
+			return string(*cfg.Agent.Vendor)
+		}(),
+		LooperCLIPath:    derefString(cfg.Tools.LooperPath),
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
@@ -739,6 +758,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 		Disclosure:         &cfg.Disclosure,
+		AgentModel:         cfg.Agent.Model,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
@@ -760,6 +780,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
 		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
 		Disclosure:       &cfg.Disclosure,
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {

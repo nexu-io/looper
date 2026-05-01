@@ -58,6 +58,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeDefaultsConfig(&config.Defaults, *partial.Defaults)
 	}
 
+	if partial.Reviewer != nil {
+		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
+	}
+
 	if partial.Projects != nil {
 		config.Projects = cloneProjects(*partial.Projects)
 	}
@@ -219,6 +223,10 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 		config.GHPath = stringPtr(*partial.GHPath)
 	}
 
+	if partial.LooperPath != nil {
+		config.LooperPath = stringPtr(*partial.LooperPath)
+	}
+
 	if partial.OsascriptPath != nil {
 		config.OsascriptPath = stringPtr(*partial.OsascriptPath)
 	}
@@ -299,6 +307,56 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 
 	if partial.AddSnapshotMode != nil {
 		config.AddSnapshotMode = *partial.AddSnapshotMode
+	}
+}
+
+func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) {
+	if partial.Loop != nil {
+		mergeReviewerLoopConfig(&config.Loop, *partial.Loop)
+	}
+	if partial.Scope != nil {
+		config.Scope = *partial.Scope
+	}
+	if partial.PublishMode != nil {
+		config.PublishMode = *partial.PublishMode
+	}
+	if partial.DetectDuplicateFindings != nil {
+		config.DetectDuplicateFindings = *partial.DetectDuplicateFindings
+	} else if partial.DedupeFindings != nil {
+		config.DetectDuplicateFindings = *partial.DedupeFindings
+	}
+}
+
+func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewerLoopConfig) {
+	if partial.EnabledByDefault != nil {
+		config.EnabledByDefault = *partial.EnabledByDefault
+	}
+	if partial.QuietPeriodSeconds != nil {
+		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
+	if partial.MaxIterationsPerPR != nil {
+		config.MaxIterationsPerPR = *partial.MaxIterationsPerPR
+	}
+	if partial.MaxIterationsPerHead != nil {
+		config.MaxIterationsPerHead = *partial.MaxIterationsPerHead
+	}
+	if partial.MaxWallClockSeconds != nil {
+		config.MaxWallClockSeconds = *partial.MaxWallClockSeconds
+	}
+	if partial.MaxConsecutiveFailures != nil {
+		config.MaxConsecutiveFailures = *partial.MaxConsecutiveFailures
+	}
+	if partial.MaxAgentExecutionsPerPR != nil {
+		config.MaxAgentExecutionsPerPR = *partial.MaxAgentExecutionsPerPR
+	}
+	if partial.StopOnApproved != nil {
+		config.StopOnApproved = *partial.StopOnApproved
+	}
+	if partial.StopOnReadyLabel != nil {
+		config.StopOnReadyLabel = *partial.StopOnReadyLabel
+	}
+	if partial.StopOnIdenticalOutput != nil {
+		config.StopOnIdenticalOutput = *partial.StopOnIdenticalOutput
 	}
 }
 

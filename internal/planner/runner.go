@@ -138,10 +138,18 @@ type PullRequestReviewersInput struct {
 	CWD       string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
@@ -251,6 +259,7 @@ type Options struct {
 	ClaimTTL                time.Duration
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
+	AgentModel              *string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
@@ -268,6 +277,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
+	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -408,7 +418,7 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -716,13 +726,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	if err != nil {
 		return input.Checkpoint, err
 	}
-	currentLogin := firstNonEmpty(stringFromAnyDefault(payload["currentUserLogin"]), input.CheckpointIssueLogin())
-	if currentLogin == "" {
-		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err == nil {
-			currentLogin = normalizeLogin(login)
-		}
-	}
+	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), buildIssueLockKey(repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -733,20 +737,42 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	if !acquired {
 		return input.Checkpoint, &loopError{message: fmt.Sprintf("Issue lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+		}
+	}()
+	manual := isManualPlannerQueue(payload)
+	if !manual && !specpr.HasLabel(detail.Labels, discoveryLabel) {
+		checkpoint := input.Checkpoint
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+		checkpoint.ClaimedLockKey = lockKey
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
+		releaseOnError = false
+		return checkpoint, nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
+	}
+	currentLogin = normalizeLogin(login)
+	if currentLogin == "" {
+		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
+	}
+	if currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
+			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
+		}
+		detail.Assignees = appendUniqueStrings(detail.Assignees, currentLogin)
+	}
 	checkpoint := input.Checkpoint
 	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	manual := isManualPlannerQueue(payload)
-	if !manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
-		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
-		return checkpoint, nil
-	}
-	if !manual && !specpr.HasLabel(detail.Labels, discoveryLabel) {
-		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
-		return checkpoint, nil
-	}
 	checkpoint.SkipReason = ""
+	releaseOnError = false
 	return checkpoint, nil
 }
 
@@ -805,7 +831,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush, r.disclosure)
+		prompt := buildPlannerPrompt(input.Project, issue, worktree, r.allowAutoPush, r.disclosure, r.agentModel)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
@@ -1437,7 +1463,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig) string {
+func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) string {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -1467,17 +1493,18 @@ func buildPlannerPrompt(project storage.ProjectRecord, issue *checkpointIssue, w
 	}
 	parts = append(parts, strings.Join(requirements, "\n"))
 	if allowAutoPush {
-		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg))
+		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg, agentModel))
 	} else {
-		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch))
+		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentModel))
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
-func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string) string {
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")

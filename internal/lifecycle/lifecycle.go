@@ -196,7 +196,7 @@ func (s *State) MergeAgent(agent *State, ingestedAt string) {
 	s.Normalize()
 }
 
-func PromptInstruction(runner, branch, baseBranch string, expectPush, expectPR bool, disclosureCfg config.DisclosureConfig) string {
+func PromptInstruction(runner, branch, baseBranch string, expectPush, expectPR bool, disclosureCfg config.DisclosureConfig, agentModel string) string {
 	policy := AgentManagedWithFallbackPolicy(runner, expectPR)
 	prStep := "create or adopt an open pull request for this branch"
 	if !expectPR {
@@ -209,14 +209,18 @@ func PromptInstruction(runner, branch, baseBranch string, expectPush, expectPR b
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: " + policy.Name + ".",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; " + gitStep + "; " + prStep + ".",
-		disclosurePromptInstruction(runner, disclosureCfg),
+		disclosurePromptInstruction(runner, disclosureCfg, agentModel),
 		"If a branch PR already exists, reuse it and preserve human-edited title/body while adding only missing labels, reviewers, or closing references requested by the run.",
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" for actions you completed and \"none\" for actions still missing.",
 		fmt.Sprintf("Expected lifecycle branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", branch, baseBranch, expectPush, policy.ExpectPR, policy.AllowFallback),
 	}, "\n")
 }
 
-func disclosurePromptInstruction(runner string, cfg config.DisclosureConfig) string {
+func DisclosurePromptInstruction(runner string, cfg config.DisclosureConfig, agentModel string) string {
+	return disclosurePromptInstruction(runner, cfg, agentModel)
+}
+
+func disclosurePromptInstruction(runner string, cfg config.DisclosureConfig, agentModel string) string {
 	if !cfg.Enabled {
 		return "Looper disclosure stamping is disabled by configuration; do not add looper Generated-By trailers, Markdown disclosure footers, or hidden looper stamp markers to generated external content."
 	}
@@ -224,6 +228,9 @@ func disclosurePromptInstruction(runner string, cfg config.DisclosureConfig) str
 	attrs := []string{"runner=" + runner}
 	if cfg.IncludeAgent {
 		attrs = append(attrs, "agent=<agent-runtime>")
+		if strings.TrimSpace(agentModel) != "" {
+			attrs = append(attrs, "model=<agent-model>")
+		}
 	}
 	if cfg.IncludeOS {
 		attrs = append(attrs, "os=<os-family>")

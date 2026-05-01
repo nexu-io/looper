@@ -33,6 +33,9 @@ const (
 	LoopStatusQueued      LoopStatus = "queued"
 	LoopStatusRunning     LoopStatus = "running"
 	LoopStatusPaused      LoopStatus = "paused"
+	LoopStatusWaiting     LoopStatus = "waiting"
+	LoopStatusStopped     LoopStatus = "stopped"
+	LoopStatusTerminated  LoopStatus = "terminated"
 	LoopStatusCompleted   LoopStatus = "completed"
 	LoopStatusFailed      LoopStatus = "failed"
 	LoopStatusInterrupted LoopStatus = "interrupted"
@@ -73,6 +76,10 @@ type LoopSummary struct {
 }
 
 var activeLoopStatuses = map[LoopStatus]struct{}{
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {},
+}
+
+var conflictingActiveLoopStatuses = map[LoopStatus]struct{}{
 	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {},
 }
 
@@ -81,10 +88,13 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 }
 
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
-	LoopStatusIdle:        {LoopStatusQueued},
-	LoopStatusQueued:      {LoopStatusRunning},
-	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted},
-	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted},
+	LoopStatusIdle:        {LoopStatusQueued, LoopStatusPaused},
+	LoopStatusQueued:      {LoopStatusRunning, LoopStatusPaused},
+	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusTerminated},
+	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped},
+	LoopStatusWaiting:     {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusStopped:     {},
+	LoopStatusTerminated:  {},
 	LoopStatusCompleted:   {},
 	LoopStatusFailed:      {},
 	LoopStatusInterrupted: {LoopStatusQueued, LoopStatusFailed},
@@ -122,11 +132,16 @@ func AssertKnownLoopStatus(status LoopStatus) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
+	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusWaiting, LoopStatusStopped, LoopStatusTerminated, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
 }
 
 func IsActiveLoopStatus(status LoopStatus) bool {
 	_, ok := activeLoopStatuses[status]
+	return ok
+}
+
+func IsConflictingActiveLoopStatus(status LoopStatus) bool {
+	_, ok := conflictingActiveLoopStatuses[status]
 	return ok
 }
 
@@ -175,12 +190,12 @@ func AssertLoopTypeMatchesTarget(loopType LoopType, target LoopTarget) error {
 }
 
 func AssertUniqueActiveLoop(existing []LoopSummary, candidate LoopSummary) error {
-	if !IsActiveLoopStatus(candidate.Status) {
+	if !IsConflictingActiveLoopStatus(candidate.Status) {
 		return nil
 	}
 
 	for _, loop := range existing {
-		if loop.ID == candidate.ID || !IsActiveLoopStatus(loop.Status) {
+		if loop.ID == candidate.ID || !IsConflictingActiveLoopStatus(loop.Status) {
 			continue
 		}
 

@@ -82,6 +82,65 @@ func TestServiceCreateRejectsConflictingActiveLoop(t *testing.T) {
 	}
 }
 
+func TestServiceCreateAllowsWaitingReviewerLoopRerun(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
+
+	_, err := service.Create(ctx, CreateInput{ProjectID: "project_1", Type: domain.LoopTypeReviewer, Target: target, Status: domain.LoopStatusWaiting})
+	if err != nil {
+		t.Fatalf("waiting Create() error = %v", err)
+	}
+	if _, err := service.Create(ctx, CreateInput{ProjectID: "project_1", Type: domain.LoopTypeReviewer, Target: target, Status: domain.LoopStatusQueued}); err != nil {
+		t.Fatalf("queued Create() with waiting existing loop error = %v, want allowed", err)
+	}
+}
+
+func TestServicePauseWaitingLoopCancelsQueuedWork(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	seedProject(t, repos, now)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop, err := service.Create(ctx, CreateInput{ProjectID: "project_1", Type: domain.LoopTypeReviewer, Target: domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: repo, PRNumber: prNumber}, Status: domain.LoopStatusWaiting})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	projectID := "project_1"
+	queue := storage.QueueItemRecord{ID: "queue_waiting", ProjectID: &projectID, LoopID: &loop.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:waiting", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(ctx, queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	reason := "stop waiting loop"
+	paused, err := service.Pause(ctx, loop.ID, &reason)
+	if err != nil {
+		t.Fatalf("Pause(waiting) error = %v", err)
+	}
+	if paused.Loop.Status != string(domain.LoopStatusPaused) || paused.Loop.NextRunAt != nil {
+		t.Fatalf("Pause(waiting).Loop = %#v, want paused without next run", paused.Loop)
+	}
+	if paused.CancelledQueueItems != 1 {
+		t.Fatalf("CancelledQueueItems = %d, want 1", paused.CancelledQueueItems)
+	}
+	cancelled, err := repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || cancelled == nil || cancelled.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want cancelled", cancelled, err)
+	}
+}
+
 func TestTargetFromRecordNormalizesRepeatedProjectPrefix(t *testing.T) {
 	t.Parallel()
 

@@ -6,6 +6,8 @@ import (
 	"runtime"
 )
 
+const DefaultServerPort = 17310
+
 func DefaultLooperHome() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -54,7 +56,7 @@ func DefaultConfig(cwd string) (Config, error) {
 	return Config{
 		Server: ServerConfig{
 			Host:     "127.0.0.1",
-			Port:     4310,
+			Port:     DefaultServerPort,
 			AuthMode: AuthModeNone,
 		},
 		Storage: StorageConfig{
@@ -111,7 +113,24 @@ func DefaultConfig(cwd string) (Config, error) {
 			AllowRiskyFixes:    false,
 			FixAllPullRequests: false,
 			OpenPRStrategy:     OpenPRStrategyAllDone,
-			AddSnapshotMode:    AddSnapshotModeFull,
+			AddSnapshotMode:    AddSnapshotModeAsync,
+		},
+		Reviewer: ReviewerConfig{
+			Loop: ReviewerLoopConfig{
+				EnabledByDefault:        true,
+				QuietPeriodSeconds:      120,
+				MaxIterationsPerPR:      20,
+				MaxIterationsPerHead:    1,
+				MaxWallClockSeconds:     14400,
+				MaxConsecutiveFailures:  3,
+				MaxAgentExecutionsPerPR: 25,
+				StopOnApproved:          true,
+				StopOnReadyLabel:        true,
+				StopOnIdenticalOutput:   true,
+			},
+			Scope:                   ReviewerScopeChangedRanges,
+			PublishMode:             ReviewerPublishModeSingleReview,
+			DetectDuplicateFindings: true,
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

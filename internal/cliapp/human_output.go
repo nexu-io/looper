@@ -46,9 +46,13 @@ type statusOutput struct {
 }
 
 type statusLoopSummary struct {
-	Running int `json:"running"`
-	Paused  int `json:"paused"`
-	Failed  int `json:"failed"`
+	Queued     int `json:"queued"`
+	Running    int `json:"running"`
+	Waiting    int `json:"waiting"`
+	Paused     int `json:"paused"`
+	Failed     int `json:"failed"`
+	Terminated int `json:"terminated"`
+	Stopped    int `json:"stopped"`
 }
 
 type projectsListOutput struct {
@@ -145,6 +149,7 @@ type activeRunOutput struct {
 	Status      string  `json:"status"`
 	CurrentStep *string `json:"currentStep"`
 	StartedAt   *string `json:"startedAt"`
+	EndedAt     *string `json:"endedAt"`
 	Target      struct {
 		Label string `json:"label"`
 	} `json:"target"`
@@ -198,7 +203,7 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
 	fmt.Fprintln(w)
-	printTable(w, []string{"type", "running", "paused", "failed"}, []tableRow{{"type": "planner", "running": data.Loops.Planner.Running, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed}, {"type": "reviewer", "running": data.Loops.Reviewer.Running, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed}, {"type": "worker", "running": data.Loops.Worker.Running, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed}, {"type": "fixer", "running": data.Loops.Fixer.Running, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed}})
+	printTable(w, []string{"type", "queued", "running", "waiting", "paused", "failed", "terminated", "stopped"}, []tableRow{{"type": "planner", "queued": data.Loops.Planner.Queued, "running": data.Loops.Planner.Running, "waiting": data.Loops.Planner.Waiting, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed, "terminated": data.Loops.Planner.Terminated, "stopped": data.Loops.Planner.Stopped}, {"type": "reviewer", "queued": data.Loops.Reviewer.Queued, "running": data.Loops.Reviewer.Running, "waiting": data.Loops.Reviewer.Waiting, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed, "terminated": data.Loops.Reviewer.Terminated, "stopped": data.Loops.Reviewer.Stopped}, {"type": "worker", "queued": data.Loops.Worker.Queued, "running": data.Loops.Worker.Running, "waiting": data.Loops.Worker.Waiting, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed, "terminated": data.Loops.Worker.Terminated, "stopped": data.Loops.Worker.Stopped}, {"type": "fixer", "queued": data.Loops.Fixer.Queued, "running": data.Loops.Fixer.Running, "waiting": data.Loops.Fixer.Waiting, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed, "terminated": data.Loops.Fixer.Terminated, "stopped": data.Loops.Fixer.Stopped}})
 	fmt.Fprintln(w)
 	printSection(w, "Tools", [][2]any{{"git", data.Tools.Git}, {"gh", data.Tools.GH}, {"osascript", data.Tools.Osascript}})
 	fmt.Fprintln(w)
@@ -226,7 +231,7 @@ func writeHumanProjectAdd(w io.Writer, payload json.RawMessage) error {
 		return fmt.Errorf("decode project response: %w", err)
 	}
 
-	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"scheduledSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
+	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
 	if len(data.Warnings) > 0 {
 		fmt.Fprintln(w)
 		entries := make([][2]any, 0, len(data.Warnings))
@@ -307,12 +312,12 @@ func writeHumanPullRequestStatus(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
-func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopEnabled bool) error {
+func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopSetting string) error {
 	var data loopOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode reviewer response: %w", err)
 	}
-	printSection(w, "Reviewer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}, {"loop", fmt.Sprintf("%t", loopEnabled)}})
+	printSection(w, "Reviewer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}, {"loop", loopSetting}})
 	return nil
 }
 
@@ -329,7 +334,7 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(item.StartedAt)})
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
 	}
 	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
 	return nil
@@ -718,6 +723,16 @@ func formatRelativeAge(startedAt *string) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return fmt.Sprintf("%dd%dh", days, remainingHours)
+}
+
+func firstNonEmptyCLIString(values ...*string) *string {
+	for _, value := range values {
+		if value != nil && strings.TrimSpace(*value) != "" {
+			trimmed := strings.TrimSpace(*value)
+			return &trimmed
+		}
+	}
+	return nil
 }
 
 func parseOptionalPositiveInt(value string, flag string) (*int64, error) {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -100,6 +101,13 @@ type IssueCommentInput struct {
 	CWD         string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -119,6 +127,7 @@ type SubmitReviewInput struct {
 	Body     string
 	CommitID string
 	Comments []ReviewComment
+	Anchors  *diffanchor.Index
 	CWD      string
 }
 
@@ -129,6 +138,25 @@ type ReviewComment struct {
 	Side      string
 	StartLine int64
 	StartSide string
+}
+
+type VerifyReviewMarkerInput struct {
+	Repo                string
+	PRNumber            int64
+	Marker              string
+	AllowedReviewEvents []string
+	AuthorLogin         string
+	CWD                 string
+}
+
+type ReviewMarkerResult struct {
+	Found               bool
+	Outcome             string
+	Event               string
+	AuthorLogin         string
+	Body                string
+	ReviewID            string
+	InlineCommentBodies []string
 }
 
 type PullRequestReactionInput struct {
@@ -414,6 +442,30 @@ func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueComme
 	return err
 }
 
+func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
+	assignees := compactIssueAssignees(input.Assignees)
+	if len(assignees) == 0 {
+		return nil
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", input.Repo, input.IssueNumber), "--method", "POST"}
+	for _, assignee := range assignees {
+		args = append(args, "-f", "assignees[]="+assignee)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+func compactIssueAssignees(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
@@ -447,6 +499,18 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Reviews:        toObjectSlice(row["reviews"]),
 		Checks:         toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return asString(row["headRefOid"]), nil
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
@@ -495,33 +559,47 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 }
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
-	if len(input.Comments) > 0 {
+	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
+		return fmt.Errorf("clean review marker cannot be submitted with review comments")
+	}
+	var flags []reviewQualityFlag
+	input.Body, input.Comments, flags = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
+	if err != nil {
+		return err
+	}
+	if gateApplies && len(flags) > 0 {
+		return fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
+	}
+	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
 		payload := map[string]any{
 			"event":     input.Event,
 			"body":      emptyToNil(input.Body),
 			"commit_id": emptyToNil(input.CommitID),
 		}
-		comments := make([]map[string]any, 0, len(input.Comments))
-		for _, comment := range input.Comments {
-			row := map[string]any{"body": comment.Body}
-			if comment.Path != "" {
-				row["path"] = comment.Path
+		if len(input.Comments) > 0 {
+			comments := make([]map[string]any, 0, len(input.Comments))
+			for _, comment := range input.Comments {
+				row := map[string]any{"body": comment.Body}
+				if comment.Path != "" {
+					row["path"] = comment.Path
+				}
+				if comment.Line > 0 {
+					row["line"] = comment.Line
+				}
+				if comment.Side != "" {
+					row["side"] = comment.Side
+				}
+				if comment.StartLine > 0 {
+					row["start_line"] = comment.StartLine
+				}
+				if comment.StartSide != "" {
+					row["start_side"] = comment.StartSide
+				}
+				comments = append(comments, row)
 			}
-			if comment.Line > 0 {
-				row["line"] = comment.Line
-			}
-			if comment.Side != "" {
-				row["side"] = comment.Side
-			}
-			if comment.StartLine > 0 {
-				row["start_line"] = comment.StartLine
-			}
-			if comment.StartSide != "" {
-				row["start_side"] = comment.StartSide
-			}
-			comments = append(comments, row)
+			payload["comments"] = comments
 		}
-		payload["comments"] = comments
 		body, err := json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("marshal gh review payload: %w", err)
@@ -533,13 +611,222 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	if input.Body != "" {
 		args = append(args, "--body", input.Body)
 	}
-	_, err := g.runGh(ctx, input.CWD, "", args...)
+	_, err = g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "comment", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--body", input.Body)
 	return err
+}
+
+func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerInput) (bool, error) {
+	marker, err := g.FindReviewMarker(ctx, input)
+	if err != nil {
+		return false, err
+	}
+	return marker.Found, nil
+}
+
+func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {
+	if strings.TrimSpace(input.Marker) == "" {
+		return ReviewMarkerResult{}, nil
+	}
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	if err != nil {
+		return ReviewMarkerResult{}, err
+	}
+	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin)
+	if marker.Found && marker.ReviewID != "" {
+		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
+		if err != nil {
+			return ReviewMarkerResult{}, err
+		}
+		marker.InlineCommentBodies = comments
+	}
+	return marker, nil
+}
+
+func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prNumber int64, reviewID string, cwd string) ([]string, error) {
+	result, err := g.runGh(ctx, cwd, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repo, prNumber, reviewID))
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	bodies := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if body := asString(row["body"]); strings.TrimSpace(body) != "" {
+			bodies = append(bodies, body)
+		}
+	}
+	return bodies, nil
+}
+
+func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
+	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "").Found
+}
+
+func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string) ReviewMarkerResult {
+	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		var pages [][]map[string]any
+		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
+			if parsedMarker, ok := findReviewIdempotencyMarker(raw, marker); expectedAuthorLogin == "" && len(allowedReviewEvents) == 0 && ok {
+				return ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Body: raw}
+			}
+			return ReviewMarkerResult{}
+		}
+		for _, page := range pages {
+			rows = append(rows, page...)
+		}
+	}
+	var newest ReviewMarkerResult
+	for _, row := range rows {
+		body, ok := row["body"].(string)
+		if !ok {
+			continue
+		}
+		parsedMarker, ok := findReviewIdempotencyMarker(body, marker)
+		if !ok {
+			continue
+		}
+		author := reviewAuthorLogin(row)
+		if expectedAuthorLogin != "" && normalizeReviewMarkerLogin(author) != expectedAuthorLogin {
+			continue
+		}
+		event := reviewEventFromStateString(row["state"])
+		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
+			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author, Body: body, ReviewID: reviewIDString(row)}
+		}
+	}
+	return newest
+}
+
+func reviewIDString(row map[string]any) string {
+	if id := asString(row["id"]); id != "" {
+		return id
+	}
+	if id := asInt64(row["id"]); id != 0 {
+		return fmt.Sprintf("%d", id)
+	}
+	return ""
+}
+
+func reviewAuthorLogin(row map[string]any) string {
+	user, _ := row["user"].(map[string]any)
+	login, _ := user["login"].(string)
+	return login
+}
+
+func normalizeReviewMarkerLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func reviewMarkerOutcome(body string, marker string) string {
+	if parsedMarker, ok := findReviewIdempotencyMarker(body, marker); ok {
+		return parsedMarker.Outcome
+	}
+	return ""
+}
+
+type reviewIdempotencyMarker struct {
+	ID      string
+	Head    string
+	Outcome string
+}
+
+var reviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+
+func findReviewIdempotencyMarker(body string, marker string) (reviewIdempotencyMarker, bool) {
+	marker = strings.TrimSpace(marker)
+	for _, parsedMarker := range parseReviewIdempotencyMarkers(body) {
+		if marker == "" || parsedMarker.matches(marker) {
+			return parsedMarker, true
+		}
+	}
+	return reviewIdempotencyMarker{}, false
+}
+
+func parseReviewIdempotencyMarkers(body string) []reviewIdempotencyMarker {
+	matches := reviewMarkerRE.FindAllStringSubmatch(body, -1)
+	markers := make([]reviewIdempotencyMarker, 0, len(matches))
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		fields := parseReviewMarkerFields(match[1])
+		parsedMarker := reviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
+		if parsedMarker.ID == "" || parsedMarker.Head == "" || (parsedMarker.Outcome != "clean" && parsedMarker.Outcome != "actionable") {
+			continue
+		}
+		markers = append(markers, parsedMarker)
+	}
+	return markers
+}
+
+func parseReviewMarkerFields(segment string) map[string]string {
+	fields := map[string]string{}
+	for _, field := range strings.Fields(segment) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+func (m reviewIdempotencyMarker) matches(marker string) bool {
+	fields := parseReviewMarkerFields(strings.TrimPrefix(marker, "looper:review"))
+	if id := fields["id"]; id != "" && id != m.ID {
+		return false
+	}
+	if head := fields["head"]; head != "" && head != m.Head {
+		return false
+	}
+	if outcome := fields["outcome"]; outcome != "" && outcome != m.Outcome {
+		return false
+	}
+	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
+}
+
+func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
+	event := reviewEventFromStateString(raw)
+	return reviewEventAllowed(event, allowedReviewEvents)
+}
+
+func reviewEventFromStateString(raw any) string {
+	state, _ := raw.(string)
+	return reviewEventFromState(state)
+}
+
+func reviewEventAllowed(event string, allowedReviewEvents []string) bool {
+	if event == "" {
+		return false
+	}
+	for _, allowed := range allowedReviewEvents {
+		if strings.EqualFold(event, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewEventFromState(state string) string {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return "APPROVE"
+	case "COMMENTED":
+		return "COMMENT"
+	case "CHANGES_REQUESTED":
+		return "REQUEST_CHANGES"
+	default:
+		return ""
+	}
 }
 
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
@@ -555,11 +842,11 @@ func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullReque
 	if currentLogin == "" {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
+	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
 	if err != nil {
 		return err
 	}
-	rows, err := decodeJSONArray(result.Stdout)
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
 	if err != nil {
 		return err
 	}
@@ -1092,6 +1379,24 @@ func decodeJSONArray(value string) ([]map[string]any, error) {
 		return []map[string]any{}, nil
 	}
 	return out, nil
+}
+
+func decodeJSONArrayOrPages(value string) ([]map[string]any, error) {
+	rows, err := decodeJSONArray(value)
+	if err == nil {
+		return rows, nil
+	}
+	var pages [][]map[string]any
+	if pageErr := json.Unmarshal([]byte(value), &pages); pageErr != nil {
+		return nil, err
+	}
+	for _, page := range pages {
+		rows = append(rows, page...)
+	}
+	if rows == nil {
+		return []map[string]any{}, nil
+	}
+	return rows, nil
 }
 
 func invalidJSONError(stdout string, err error) error {

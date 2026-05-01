@@ -43,7 +43,7 @@ Source: `apps/looperd/src/config/load.ts:24-68`, `apps/looperd/src/config/load.t
 
 - `looper` reads `--config`/`LOOPER_CONFIG`/`~/.looper/config.json` to find connection settings
 - `server.host` precedence: CLI flag → `LOOPER_HOST` → config file → `127.0.0.1`
-- `server.port` precedence: CLI flag → `LOOPER_PORT` → config file → `4310`
+- `server.port` precedence: CLI flag → `LOOPER_PORT` → config file → `17310`
 - API token precedence: `LOOPER_TOKEN` only; the CLI does not read `server.localToken` from file, it injects `localToken: options.env.LOOPER_TOKEN`
 - API base URL uses `server.baseUrl` from config file when present, otherwise `http://<host>:<port>`
 
@@ -54,7 +54,7 @@ Source: `apps/cli/src/index.ts:282-294`, `apps/cli/src/index.ts:2473-2516`
 | Field | Type / allowed values | Default / behavior | Validation / notes |
 | --- | --- | --- | --- |
 | `server.host` | string | `127.0.0.1` | required non-empty string |
-| `server.port` | integer | `4310` | `1..65535` |
+| `server.port` | integer | `17310` | `1..65535` |
 | `server.baseUrl` | optional string | none | CLI-only consumption when reading config |
 | `server.authMode` | `none` \| `local-token` | `none` | `local-token` requires `server.localToken` |
 | `server.localToken` | optional string | none | required when `authMode=local-token` |

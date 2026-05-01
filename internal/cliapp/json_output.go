@@ -66,18 +66,35 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		if repoPath == "" && len(args) > 0 {
 			repoPath = strings.TrimSpace(args[0])
 		}
+		repoPath, err := absolutePathIfSet(repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve repo path: %w", err)
+		}
+
+		worktreeRoot, err := absolutePathIfSet(getStringFlag(cmd, "worktree-root"))
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree root: %w", err)
+		}
 
 		body := map[string]any{}
 		setString(body, "repoPath", repoPath)
 		setString(body, "id", getStringFlag(cmd, "id"))
 		setString(body, "name", getStringFlag(cmd, "name"))
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
-		setString(body, "worktreeRoot", getStringFlag(cmd, "worktree-root"))
+		setString(body, "worktreeRoot", worktreeRoot)
 		setString(body, "repo", getStringFlag(cmd, "repo"))
 		setString(body, "snapshotMode", getStringFlag(cmd, "snapshot-mode"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
 	}, writeHumanProjectAdd)
+}
+
+func absolutePathIfSet(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", nil
+	}
+	return filepath.Abs(trimmed)
 }
 
 func (r *commandRuntime) projectRemove(cmd *cobra.Command, args []string) error {
@@ -188,10 +205,29 @@ func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) er
 }
 
 func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
+	loopFlagChanged := cmd.Flags().Changed("loop")
+	noLoop := getBoolFlag(cmd, "no-loop")
+	if loopFlagChanged && noLoop {
+		return fmt.Errorf("--loop and --no-loop are mutually exclusive")
+	}
+	loopEnabled := false
+	loopSetting := "false"
+	if noLoop {
+		loopEnabled = false
+		loopSetting = "false"
+	} else if loopFlagChanged {
+		loopEnabled = getBoolFlag(cmd, "loop")
+		loopSetting = fmt.Sprintf("%t", loopEnabled)
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
 		if err != nil {
 			return nil, err
+		}
+
+		metadata := map[string]any{
+			"manual":        true,
+			"followUpdates": loopEnabled,
 		}
 
 		body := map[string]any{
@@ -201,15 +237,12 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 			"repo":       repo,
 			"prNumber":   prNumber,
 			"status":     "running",
-			"metadata": map[string]any{
-				"followUpdates": getBoolFlag(cmd, "loop"),
-				"manual":        true,
-			},
+			"metadata":   metadata,
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
 	}, func(w io.Writer, payload json.RawMessage) error {
-		return writeHumanReviewCreate(w, payload, getBoolFlag(cmd, "loop"))
+		return writeHumanReviewCreate(w, payload, loopSetting)
 	})
 }
 
@@ -262,6 +295,10 @@ func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		query := url.Values{}
+		if getBoolFlag(cmd, "all") {
+			query.Set("all", "true")
+		}
+		addQueryString(query, "status", getStringFlag(cmd, "status"))
 		addQueryString(query, "type", getStringFlag(cmd, "type"))
 		addQueryString(query, "projectId", getStringFlag(cmd, "project"))
 

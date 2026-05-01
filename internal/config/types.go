@@ -48,6 +48,20 @@ const (
 	AddSnapshotModeOff   AddSnapshotMode = "off"
 )
 
+type ReviewerScope string
+
+const (
+	ReviewerScopeFullPR        ReviewerScope = "full_pr"
+	ReviewerScopeChangedFiles  ReviewerScope = "changed_files"
+	ReviewerScopeChangedRanges ReviewerScope = "changed_ranges"
+)
+
+type ReviewerPublishMode string
+
+const (
+	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -118,6 +132,7 @@ type LoggingConfig struct {
 type ToolPathsConfig struct {
 	GitPath       *string `json:"gitPath,omitempty"`
 	GHPath        *string `json:"ghPath,omitempty"`
+	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 }
 
@@ -156,6 +171,26 @@ type DefaultsConfig struct {
 	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
 }
 
+type ReviewerLoopConfig struct {
+	EnabledByDefault        bool `json:"enabledByDefault"`
+	QuietPeriodSeconds      int  `json:"quietPeriodSeconds"`
+	MaxIterationsPerPR      int  `json:"maxIterationsPerPR"`
+	MaxIterationsPerHead    int  `json:"maxIterationsPerHead"`
+	MaxWallClockSeconds     int  `json:"maxWallClockSeconds"`
+	MaxConsecutiveFailures  int  `json:"maxConsecutiveFailures"`
+	MaxAgentExecutionsPerPR int  `json:"maxAgentExecutionsPerPR"`
+	StopOnApproved          bool `json:"stopOnApproved"`
+	StopOnReadyLabel        bool `json:"stopOnReadyLabel"`
+	StopOnIdenticalOutput   bool `json:"stopOnIdenticalOutput"`
+}
+
+type ReviewerConfig struct {
+	Loop                    ReviewerLoopConfig  `json:"loop"`
+	Scope                   ReviewerScope       `json:"scope"`
+	PublishMode             ReviewerPublishMode `json:"publishMode"`
+	DetectDuplicateFindings bool                `json:"detectDuplicateFindings"`
+}
+
 type ProjectRefConfig struct {
 	ID           string  `json:"id"`
 	Name         string  `json:"name"`
@@ -176,6 +211,7 @@ type Config struct {
 	Daemon        DaemonConfig       `json:"daemon"`
 	Package       PackageConfig      `json:"package"`
 	Defaults      DefaultsConfig     `json:"defaults"`
+	Reviewer      ReviewerConfig     `json:"reviewer"`
 	Projects      []ProjectRefConfig `json:"projects"`
 }
 
@@ -242,6 +278,7 @@ type PartialLoggingConfig struct {
 type PartialToolPathsConfig struct {
 	GitPath       *string `json:"gitPath,omitempty"`
 	GHPath        *string `json:"ghPath,omitempty"`
+	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 }
 
@@ -272,6 +309,27 @@ type PartialDefaultsConfig struct {
 	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
 }
 
+type PartialReviewerLoopConfig struct {
+	EnabledByDefault        *bool `json:"enabledByDefault,omitempty"`
+	QuietPeriodSeconds      *int  `json:"quietPeriodSeconds,omitempty"`
+	MaxIterationsPerPR      *int  `json:"maxIterationsPerPR,omitempty"`
+	MaxIterationsPerHead    *int  `json:"maxIterationsPerHead,omitempty"`
+	MaxWallClockSeconds     *int  `json:"maxWallClockSeconds,omitempty"`
+	MaxConsecutiveFailures  *int  `json:"maxConsecutiveFailures,omitempty"`
+	MaxAgentExecutionsPerPR *int  `json:"maxAgentExecutionsPerPR,omitempty"`
+	StopOnApproved          *bool `json:"stopOnApproved,omitempty"`
+	StopOnReadyLabel        *bool `json:"stopOnReadyLabel,omitempty"`
+	StopOnIdenticalOutput   *bool `json:"stopOnIdenticalOutput,omitempty"`
+}
+
+type PartialReviewerConfig struct {
+	Loop                    *PartialReviewerLoopConfig `json:"loop,omitempty"`
+	Scope                   *ReviewerScope             `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode       `json:"publishMode,omitempty"`
+	DetectDuplicateFindings *bool                      `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                      `json:"dedupeFindings,omitempty"`
+}
+
 type PartialConfig struct {
 	Server        *PartialServerConfig       `json:"server,omitempty"`
 	Storage       *PartialStorageConfig      `json:"storage,omitempty"`
@@ -284,5 +342,6 @@ type PartialConfig struct {
 	Daemon        *PartialDaemonConfig       `json:"daemon,omitempty"`
 	Package       *PartialPackageConfig      `json:"package,omitempty"`
 	Defaults      *PartialDefaultsConfig     `json:"defaults,omitempty"`
+	Reviewer      *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Projects      *[]ProjectRefConfig        `json:"projects,omitempty"`
 }

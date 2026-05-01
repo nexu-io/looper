@@ -15,12 +15,12 @@ Scheduler
   queuedItems  : 2
   runningItems : 1
 
-type      running  paused  failed
---------  -------  ------  ------
-planner   0        1       0     
-reviewer  1        0       0     
-worker    2        0       1     
-fixer     0        0       0     
+type      queued  running  waiting  paused  failed  terminated  stopped
+--------  ------  -------  -------  ------  ------  ----------  -------
+planner   0       0        0        1       0       0           0      
+reviewer  1       1        1        0       0       0           0      
+worker    0       2        0        0       1       1           0      
+fixer     0       0        0        0       0       0           1      
 
 Tools
   git       : yes

@@ -17,6 +17,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 	paths := ToolPathsConfig{
 		GitPath:       cloneStringPtr(configured.GitPath),
 		GHPath:        cloneStringPtr(configured.GHPath),
+		LooperPath:    cloneStringPtr(configured.LooperPath),
 		OsascriptPath: cloneStringPtr(configured.OsascriptPath),
 	}
 
@@ -24,6 +25,9 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		"gitPath":       toolDetectionStatusFor(paths.GitPath),
 		"ghPath":        toolDetectionStatusFor(paths.GHPath),
 		"osascriptPath": toolDetectionStatusFor(paths.OsascriptPath),
+	}
+	if paths.LooperPath != nil {
+		detection["looperPath"] = ToolDetectionStatusConfigured
 	}
 
 	candidates := []struct {
@@ -33,6 +37,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 	}{
 		{key: "gitPath", executable: "git", target: &paths.GitPath},
 		{key: "ghPath", executable: "gh", target: &paths.GHPath},
+		{key: "looperPath", executable: "looper", target: &paths.LooperPath},
 		{key: "osascriptPath", executable: "osascript", target: &paths.OsascriptPath},
 	}
 

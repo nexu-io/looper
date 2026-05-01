@@ -55,8 +55,10 @@ type daemonStatusOutput struct {
 }
 
 type daemonLogsOutput struct {
-	LogPath string   `json:"logPath"`
-	Lines   []string `json:"lines"`
+	LogPath  string   `json:"logPath"`
+	LogPaths []string `json:"logPaths"`
+	Full     bool     `json:"full"`
+	Lines    []string `json:"lines"`
 }
 
 func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
@@ -160,7 +162,6 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
-
 	if !r.skipAPIStartProbe {
 		probe, err := r.probeDaemonStatus(ctx, client)
 		if err != nil {
@@ -179,17 +180,25 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cwd, err := r.getwd()
-	if err != nil {
-		return fmt.Errorf("determine current working directory: %w", err)
-	}
+	cwd := loaded.Config.Daemon.WorkingDirectory
 	startupLogPath, err := r.createStartupLogPath(loaded)
 	if err != nil {
 		return err
 	}
 
+	env := os.Environ()
+	extractedArgs := ExtractConfigArgs(r.argv)
+	callerCWD, err := r.daemonSpawnCallerCWD(extractedArgs, env)
+	if err != nil {
+		return err
+	}
+	forwardedArgs := normalizeForwardedConfigPathArgs(extractedArgs, callerCWD)
+	if strings.TrimSpace(callerCWD) != "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+		cwd = filepath.Join(callerCWD, cwd)
+	}
+
 	r.startupOutputPath = startupLogPath
-	pid, err := r.spawnDetached(binary.Path, ExtractConfigArgs(r.argv), cwd, os.Environ())
+	pid, err := r.spawnDetached(binary.Path, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD))
 	if err != nil {
 		return fmt.Errorf("Failed to start looperd: %w", err)
 	}
@@ -224,6 +233,137 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal and does not provide full background supervision.")
 	return err
+}
+
+func (r *commandRuntime) daemonSpawnCallerCWD(args []string, env []string) (string, error) {
+	if !forwardedConfigArgsNeedCWD(args) && !daemonSpawnEnvNeedsCWD(env) {
+		return "", nil
+	}
+	cwd, err := r.getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve current working directory for daemon config paths: %w", err)
+	}
+	if strings.TrimSpace(cwd) == "" {
+		return "", fmt.Errorf("resolve current working directory for daemon config paths: current working directory is empty")
+	}
+	return cwd, nil
+}
+
+var forwardedConfigPathFlagNames = map[string]struct{}{
+	"config":         {},
+	"db-path":        {},
+	"log-dir":        {},
+	"git-path":       {},
+	"gh-path":        {},
+	"looper-path":    {},
+	"osascript-path": {},
+}
+
+var daemonSpawnPathEnvNames = map[string]struct{}{
+	"LOOPER_DB_PATH":           {},
+	"LOOPER_LOG_DIR":           {},
+	"LOOPER_WORKING_DIRECTORY": {},
+	"LOOPER_GIT_PATH":          {},
+	"LOOPER_GH_PATH":           {},
+	"LOOPER_LOOPER_PATH":       {},
+	"LOOPER_OSASCRIPT_PATH":    {},
+}
+
+func forwardedConfigArgsNeedCWD(args []string) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		name, value, hasValue := splitLongFlag(arg)
+		if _, ok := forwardedConfigPathFlagNames[name]; !ok {
+			continue
+		}
+		if hasValue {
+			if value != "" && !filepath.IsAbs(value) {
+				return true
+			}
+			continue
+		}
+		if index+1 < len(args) && args[index+1] != "" && !filepath.IsAbs(args[index+1]) {
+			return true
+		}
+		index++
+	}
+	return false
+}
+
+func normalizeForwardedConfigPathArgs(args []string, cwd string) []string {
+	normalized := append([]string{}, args...)
+	if strings.TrimSpace(cwd) == "" {
+		return normalized
+	}
+	for index := 0; index < len(normalized); index++ {
+		arg := normalized[index]
+		name, value, hasValue := splitLongFlag(arg)
+		if _, ok := forwardedConfigPathFlagNames[name]; !ok {
+			continue
+		}
+		if hasValue {
+			if value != "" && !filepath.IsAbs(value) {
+				normalized[index] = "--" + name + "=" + filepath.Join(cwd, value)
+			}
+			continue
+		}
+		if index+1 < len(normalized) {
+			if value := normalized[index+1]; value != "" && !filepath.IsAbs(value) {
+				normalized[index+1] = filepath.Join(cwd, value)
+			}
+			index++
+		}
+	}
+	return normalized
+}
+
+func splitLongFlag(arg string) (name string, value string, hasValue bool) {
+	if !strings.HasPrefix(arg, "--") {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(arg, "--")
+	if equals := strings.Index(trimmed, "="); equals >= 0 {
+		return trimmed[:equals], trimmed[equals+1:], true
+	}
+	return trimmed, "", false
+}
+
+func daemonSpawnEnv(env []string, configPath string, cwd string) []string {
+	spawnEnv := append([]string{}, env...)
+	if strings.TrimSpace(cwd) != "" {
+		for index, entry := range spawnEnv {
+			name, value, ok := strings.Cut(entry, "=")
+			if !ok {
+				continue
+			}
+			if _, pathEnv := daemonSpawnPathEnvNames[name]; pathEnv && value != "" && !filepath.IsAbs(value) {
+				spawnEnv[index] = name + "=" + filepath.Join(cwd, value)
+			}
+		}
+	}
+	if strings.TrimSpace(configPath) == "" {
+		return spawnEnv
+	}
+	for index, entry := range spawnEnv {
+		if strings.HasPrefix(entry, "LOOPER_CONFIG=") {
+			spawnEnv[index] = "LOOPER_CONFIG=" + configPath
+			return spawnEnv
+		}
+	}
+	return append(spawnEnv, "LOOPER_CONFIG="+configPath)
+}
+
+func daemonSpawnEnvNeedsCWD(env []string) bool {
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, pathEnv := daemonSpawnPathEnvNames[name]; pathEnv && value != "" && !filepath.IsAbs(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error {
@@ -316,9 +456,13 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	full := getBoolFlag(cmd, "full")
 	lineCountValue := strings.TrimSpace(getStringFlag(cmd, "lines"))
 	lineCount := int64(50)
 	if lineCountValue != "" {
+		if full {
+			return fmt.Errorf("--full cannot be combined with --lines")
+		}
 		lineCount, err = parsePositiveInt(lineCountValue, "--lines")
 		if err != nil {
 			return err
@@ -326,18 +470,21 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	logPath := filepath.Join(loaded.Config.Daemon.LogDir, "looperd.log")
-	raw, err := r.readFile(logPath)
+	content, logPaths, err := r.readRetainedDaemonLogs(logPath, loaded.Config.Logging.MaxFiles)
 	if err != nil {
 		return err
 	}
 
-	lines := tailLines(strings.TrimRight(string(raw), "\n"), int(lineCount))
-	output := daemonLogsOutput{LogPath: logPath, Lines: lines}
+	lines := splitLogLines(content)
+	if !full {
+		lines = tailLines(strings.Join(lines, "\n"), int(lineCount))
+	}
+	output := daemonLogsOutput{LogPath: logPath, LogPaths: logPaths, Full: full, Lines: lines}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), output)
 	}
 
-	if _, err := fmt.Fprintln(cmd.OutOrStdout(), logPath); err != nil {
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s (retained files: %d; default tail: %d lines; use --full to show all retained logs)\n", logPath, len(logPaths), lineCount); err != nil {
 		return err
 	}
 	for _, line := range lines {
@@ -346,6 +493,55 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+func (r *commandRuntime) readRetainedDaemonLogs(logPath string, maxFiles int) (string, []string, error) {
+	paths := retainedDaemonLogPaths(logPath, maxFiles)
+	var builder strings.Builder
+	readPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		raw, err := r.readFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", nil, err
+		}
+		if len(raw) == 0 {
+			readPaths = append(readPaths, path)
+			continue
+		}
+		if builder.Len() > 0 && !strings.HasSuffix(builder.String(), "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(strings.TrimRight(string(raw), "\n"))
+		builder.WriteString("\n")
+		readPaths = append(readPaths, path)
+	}
+	if len(readPaths) == 0 {
+		return "", nil, os.ErrNotExist
+	}
+	return strings.TrimRight(builder.String(), "\n"), readPaths, nil
+}
+
+func retainedDaemonLogPaths(logPath string, maxFiles int) []string {
+	if maxFiles < 1 {
+		maxFiles = 1
+	}
+	paths := make([]string, 0, maxFiles)
+	for index := maxFiles - 1; index >= 1; index-- {
+		paths = append(paths, fmt.Sprintf("%s.%d", logPath, index))
+	}
+	paths = append(paths, logPath)
+	return paths
+}
+
+func splitLogLines(content string) []string {
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return []string{}
+	}
+	return strings.Split(content, "\n")
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
@@ -540,33 +736,75 @@ type resolvedDaemonBinary struct {
 	Source string
 }
 
+type daemonBinaryUsability struct {
+	Path    string
+	Version string
+	Exists  bool
+}
+
 func (r *commandRuntime) resolveDaemonBinary(ctx context.Context) (*resolvedDaemonBinary, error) {
-	managedPath, err := r.managedDaemonBinaryPath()
+	managed, err := r.checkManagedDaemonBinary(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	candidates := []resolvedDaemonBinary{{Path: managedPath, Source: "installed"}, {Path: looperdBinaryName, Source: "path"}}
-	for _, candidate := range candidates {
-		version, err := r.runVersionCommand(ctx, candidate.Path)
-		if err != nil {
-			return nil, err
-		}
-		if version != "" {
-			resolved := candidate
-			return &resolved, nil
-		}
+	if managed.Exists {
+		return &resolvedDaemonBinary{Path: managed.Path, Source: "installed"}, nil
 	}
+
+	version, err := r.runVersionCommandStrict(ctx, looperdBinaryName)
+	if version != "" {
+		return &resolvedDaemonBinary{Path: looperdBinaryName, Source: "path"}, nil
+	}
+	_ = err
 
 	return nil, fmt.Errorf("Cannot find looperd binary. Lookup order: ~/.looper/bin/looperd, then $PATH.")
 }
 
-func (r *commandRuntime) readManagedDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
+func (r *commandRuntime) checkManagedDaemonBinary(ctx context.Context) (daemonBinaryUsability, error) {
 	binaryPath, err := r.managedDaemonBinaryPath()
+	if err != nil {
+		return daemonBinaryUsability{}, err
+	}
+	info, err := os.Stat(binaryPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			version, versionErr := r.runVersionCommandStrict(ctx, binaryPath)
+			if versionErr == nil && strings.TrimSpace(version) != "" {
+				return daemonBinaryUsability{Path: binaryPath, Version: version, Exists: true}, nil
+			}
+			return daemonBinaryUsability{Path: binaryPath}, nil
+		}
+		return daemonBinaryUsability{}, fmt.Errorf("check looperd at %s: %w", binaryPath, err)
+	}
+	if info.IsDir() {
+		return daemonBinaryUsability{}, fmt.Errorf("found looperd at %s, but it is a directory\n\nFix: remove or rename %s\nThen reinstall: looper daemon install --force", binaryPath, binaryPath)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return daemonBinaryUsability{}, fmt.Errorf("found looperd at %s, but it is not executable\n\nFix: chmod +x %s\nOr reinstall: looper daemon install --force", binaryPath, binaryPath)
+	}
+	version, err := r.runVersionCommandStrict(ctx, binaryPath)
+	if err != nil {
+		return daemonBinaryUsability{}, unusableManagedDaemonError(binaryPath, fmt.Sprintf("version check failed: %v", err))
+	}
+	if strings.TrimSpace(version) == "" {
+		return daemonBinaryUsability{}, unusableManagedDaemonError(binaryPath, "it did not report a version")
+	}
+	return daemonBinaryUsability{Path: binaryPath, Version: version, Exists: true}, nil
+}
+
+func unusableManagedDaemonError(path string, reason string) error {
+	return fmt.Errorf("found looperd at %s, but %s\n\nFix: looper daemon install --force", path, reason)
+}
+
+func (r *commandRuntime) readManagedDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
+	state, err := r.checkManagedDaemonBinary(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return r.readDaemonVersion(ctx, binaryPath)
+	if !state.Exists {
+		return nil, nil
+	}
+	return &daemonVersionState{Version: state.Version, Source: "binary", BinaryPath: stringPtr(state.Path)}, nil
 }
 
 func (r *commandRuntime) readPathDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
@@ -585,12 +823,24 @@ func (r *commandRuntime) readDaemonVersion(ctx context.Context, command string) 
 }
 
 func (r *commandRuntime) runVersionCommand(ctx context.Context, command string) (string, error) {
-	result, err := r.runCommand(ctx, command, []string{"--version"}, daemonCommandTimeout)
+	version, err := r.runVersionCommandStrict(ctx, command)
 	if err != nil {
 		return "", nil
 	}
+	return version, nil
+}
+
+func (r *commandRuntime) runVersionCommandStrict(ctx context.Context, command string) (string, error) {
+	result, err := r.runCommand(ctx, command, []string{"--version"}, daemonCommandTimeout)
+	if err != nil {
+		return "", err
+	}
 	if result.ExitCode != 0 {
-		return "", nil
+		message := strings.TrimSpace(result.Stderr)
+		if message == "" {
+			message = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return "", errors.New(message)
 	}
 	return strings.TrimSpace(result.Stdout), nil
 }

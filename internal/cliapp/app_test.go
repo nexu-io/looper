@@ -444,6 +444,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 		"--force",
 	})
 
@@ -465,6 +471,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 	}
 
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -493,6 +505,27 @@ func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
 	}
 	assertJSONContains(t, stdout, "healthy", true)
 	assertJSONContains(t, stdout, "version", "1.2.3")
+}
+
+func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "status", "--reviewer-loop-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	}
 }
 
 func TestConfigShowJSONSendsLocalToken(t *testing.T) {
@@ -555,6 +588,61 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 		t.Fatalf("Run([project add ... --json]) stderr = %q, want empty string", stderr)
 	}
 	assertJSONContains(t, stdout, "id", "project_1")
+}
+
+func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
+	root := t.TempDir()
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get current working directory: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("change working directory to temp root: %v", err)
+	}
+	root, err = os.Getwd()
+	if err != nil {
+		t.Fatalf("get temp working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalCWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+
+	wantRepoPath := filepath.Join(root, "repo")
+	wantWorktreeRoot := filepath.Join(root, "worktrees")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("request method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got := body["repoPath"]; got != wantRepoPath {
+			t.Fatalf("body.repoPath = %#v, want %#v", got, wantRepoPath)
+		}
+		if got := body["worktreeRoot"]; got != wantWorktreeRoot {
+			t.Fatalf("body.worktreeRoot = %#v, want %#v", got, wantWorktreeRoot)
+		}
+
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "project_1", "repoPath": wantRepoPath}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "project", "add", "repo", "--worktree-root", "worktrees", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project add relative paths --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project add relative paths --json]) stderr = %q, want empty string", stderr)
+	}
 }
 
 func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
@@ -1058,6 +1146,85 @@ func TestPSWithoutJSONShowsRunningLoopWithoutRunRow(t *testing.T) {
 	}
 }
 
+func TestPSStatusAndTypeFiltersUseActiveRunsQueryAndShowInactiveCompletedLoop(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Query().Get("status"), "completed"; got != want {
+			t.Fatalf("status query = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Query().Get("type"), "worker"; got != want {
+			t.Fatalf("type query = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("all"); got != "" {
+			t.Fatalf("all query = %q, want empty", got)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{{
+			"seq":    12,
+			"type":   "worker",
+			"status": "completed",
+			"target": map[string]any{"label": "Issue #42"},
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--status", "completed", "--type", "worker", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps --status completed --type worker]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps --status completed --type worker]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"worker", "completed", "Issue #42"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([ps --status completed --type worker]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestPSAllUsesActiveRunsAllQueryAndShowsInactiveCompletedLoop(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Query().Get("all"), "true"; got != want {
+			t.Fatalf("all query = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("status"); got != "" {
+			t.Fatalf("status query = %q, want empty", got)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{{
+			"seq":     15,
+			"runId":   "run_15",
+			"type":    "worker",
+			"status":  "completed",
+			"endedAt": "2026-04-11T12:01:00.000Z",
+			"target":  map[string]any{"label": "Issue #15"},
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--all", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps --all]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps --all]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"worker", "completed", "Issue #15"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([ps --all]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
 	t.Parallel()
 
@@ -1473,6 +1640,16 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			}
 			if got, want := body["prNumber"], float64(123); got != want {
 				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			metadata, ok := body["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("body.metadata = %#v, want object", body["metadata"])
+			}
+			if got, want := metadata["manual"], true; got != want {
+				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
+			}
+			if got, want := metadata["followUpdates"], false; got != want {
+				t.Fatalf("body.metadata.followUpdates = %#v, want %#v", got, want)
 			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
 		default:
