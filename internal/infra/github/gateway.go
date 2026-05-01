@@ -101,6 +101,13 @@ type IssueCommentInput struct {
 	CWD         string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -433,6 +440,30 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
 	return err
+}
+
+func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
+	assignees := compactIssueAssignees(input.Assignees)
+	if len(assignees) == 0 {
+		return nil
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", input.Repo, input.IssueNumber), "--method", "POST"}
+	for _, assignee := range assignees {
+		args = append(args, "-f", "assignees[]="+assignee)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+func compactIssueAssignees(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {

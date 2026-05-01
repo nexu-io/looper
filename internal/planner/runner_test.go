@@ -257,6 +257,57 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want one self-assignment", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.Repo != "acme/looper" || call.IssueNumber != 42 || len(call.Assignees) != 1 || call.Assignees[0] != "octocat" {
+		t.Fatalf("add assignee call = %#v, want octocat on acme/looper#42", call)
+	}
+}
+
+func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, addAssigneeErr: fmt.Errorf("permission denied")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !strings.Contains(result.Summary, "Unable to assign issue acme/looper#42 to octocat") {
+		t.Fatalf("result = %#v, want clear retryable assignment failure", result)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: "issue:acme/looper:42", Owner: "retry", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() = false, want assignment failure to release issue lock")
+	}
+}
+
 func TestProcessClaimedItemAdoptsOpenBranchPRWhenLifecycleLacksPRNumber(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -712,6 +763,8 @@ type fakeGitHubGateway struct {
 	createPRCalls    []CreatePullRequestInput
 	addLabelCalls    []PullRequestLabelsInput
 	addReviewerCalls []PullRequestReviewersInput
+	addAssigneeCalls []IssueAssigneesInput
+	addAssigneeErr   error
 }
 
 func (f *fakeGitHubGateway) ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error) {
@@ -731,6 +784,11 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 
 func (*fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
 	return "octocat", nil
+}
+
+func (f *fakeGitHubGateway) AddIssueAssignees(_ context.Context, input IssueAssigneesInput) error {
+	f.addAssigneeCalls = append(f.addAssigneeCalls, input)
+	return f.addAssigneeErr
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
