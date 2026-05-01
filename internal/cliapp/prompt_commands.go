@@ -33,24 +33,27 @@ func (r *commandRuntime) promptPreview(cmd *cobra.Command, args []string) error 
 		return err
 	}
 	block := config.BuildCustomInstructionBlock(loaded.Config, projectID, role)
+	order := []string{"Looper base role prompt"}
 	sections := []string{
 		"Looper base role prompt\n" + previewBaseRole(role),
 	}
-	if repoContext := previewRepositoryContext(project.RepoPath); repoContext != "" {
+	if repoContext := previewRepositoryContextForRole(role, project.RepoPath); repoContext != "" {
 		sections = append(sections, "Repository context / AGENTS.md\n"+repoContext)
+		order = append(order, "repository context / AGENTS.md")
 	}
 	if block.Text != "" {
 		sections = append(sections, previewInstructionSources(block)+"\n\n"+block.Text)
 	} else {
 		sections = append(sections, "Custom instructions\nSources: none\n(no custom instructions applied)")
 	}
+	order = append(order, "custom instructions", "lifecycle / safety constraints", "completion / output contract")
 	sections = append(sections,
 		"Lifecycle / safety constraints\n"+previewLifecycleSafety(role, project, loaded.Config),
 		"Completion / output contract\n"+agent.AppendCompletionInstruction("<role prompt assembled above>"),
 	)
 	prompt := strings.Join(sections, "\n\n---\n\n")
 	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), map[string]any{"project": projectID, "role": role, "order": []string{"Looper base role prompt", "repository context / AGENTS.md", "custom instructions", "lifecycle / safety constraints", "completion / output contract"}, "customInstructions": block, "prompt": prompt})
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"project": projectID, "role": role, "order": order, "customInstructions": block, "prompt": prompt})
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), prompt)
 	return err
@@ -79,14 +82,31 @@ func previewInstructionSources(block config.CustomInstructionBlock) string {
 func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg config.Config) string {
 	branch := "<branch>"
 	baseBranch := promptBaseBranch(project.BaseBranch, cfg.Defaults.BaseBranch)
+	allowRemote := cfg.Defaults.AllowAutoPush
 	switch role {
 	case "reviewer":
 		return "Use Looper's trusted `looper review submit` wrapper for review submission. Do not bypass approval, publication, or disclosure policy.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	case "fixer":
+		if !allowRemote {
+			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		}
 		return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, false, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	default:
+		if !allowRemote {
+			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		}
 		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	}
+}
+
+func previewNoRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+	return strings.Join([]string{
+		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
+		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
+		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
+	}, "\n")
 }
 
 func configuredProjectByID(projects []config.ProjectRefConfig, id string) (config.ProjectRefConfig, error) {
@@ -122,6 +142,13 @@ func previewRepositoryContext(repoPath string) string {
 		return "Repository path: " + repoPath
 	}
 	return "Repository path: " + repoPath + "\n\nAGENTS.md:\n" + strings.TrimSpace(string(raw))
+}
+
+func previewRepositoryContextForRole(role string, repoPath string) string {
+	if role != "planner" {
+		return ""
+	}
+	return previewRepositoryContext(repoPath)
 }
 
 func promptBaseBranch(projectBase *string, defaultBase string) string {
