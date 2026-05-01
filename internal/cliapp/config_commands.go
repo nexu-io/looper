@@ -25,14 +25,42 @@ type configField struct {
 }
 
 var configFieldRegistry = map[string]configField{
-	"defaults.baseBranch":         stringField("defaults.baseBranch", "", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
-	"defaults.allowAutoCommit":    boolField("defaults.allowAutoCommit", "LOOPER_ALLOW_AUTO_COMMIT", "", func(c config.Config) any { return c.Defaults.AllowAutoCommit }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoCommit }),
-	"defaults.allowAutoPush":      boolField("defaults.allowAutoPush", "LOOPER_ALLOW_AUTO_PUSH", "", func(c config.Config) any { return c.Defaults.AllowAutoPush }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoPush }),
-	"defaults.allowAutoApprove":   boolField("defaults.allowAutoApprove", "LOOPER_ALLOW_AUTO_APPROVE", "", func(c config.Config) any { return c.Defaults.AllowAutoApprove }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoApprove }),
-	"defaults.allowAutoMerge":     boolField("defaults.allowAutoMerge", "", "", func(c config.Config) any { return c.Defaults.AllowAutoMerge }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoMerge }),
-	"defaults.allowRiskyFixes":    boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
-	"defaults.fixAllPullRequests": boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
-	"defaults.openPrStrategy":     openPRStrategyField(),
+	"defaults.baseBranch":              stringField("defaults.baseBranch", "", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
+	"defaults.allowAutoCommit":         boolField("defaults.allowAutoCommit", "LOOPER_ALLOW_AUTO_COMMIT", "", func(c config.Config) any { return c.Defaults.AllowAutoCommit }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoCommit }),
+	"defaults.allowAutoPush":           boolField("defaults.allowAutoPush", "LOOPER_ALLOW_AUTO_PUSH", "", func(c config.Config) any { return c.Defaults.AllowAutoPush }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoPush }),
+	"defaults.allowAutoApprove":        boolField("defaults.allowAutoApprove", "LOOPER_ALLOW_AUTO_APPROVE", "", func(c config.Config) any { return c.Defaults.AllowAutoApprove }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoApprove }),
+	"defaults.allowAutoMerge":          boolField("defaults.allowAutoMerge", "", "", func(c config.Config) any { return c.Defaults.AllowAutoMerge }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoMerge }),
+	"defaults.allowRiskyFixes":         boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
+	"defaults.fixAllPullRequests":      boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
+	"defaults.openPrStrategy":          openPRStrategyField(),
+	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
+	"roles.planner.triggers.labels":    stringListField("roles.planner.triggers.labels", "LOOPER_ROLES_PLANNER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Planner.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialPlannerTriggers(p).Labels }),
+	"roles.planner.triggers.labelMode": labelModeField("roles.planner.triggers.labelMode", "LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Planner.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialPlannerTriggers(p).LabelMode }),
+	"roles.planner.triggers.requireAssigneeCurrentUser": boolField("roles.planner.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Planner.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialPlannerTriggers(p).RequireAssigneeCurrentUser
+	}),
+	"roles.worker.autoDiscovery":      boolField("roles.worker.autoDiscovery", "LOOPER_ROLES_WORKER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Worker.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialWorkerRole(p).AutoDiscovery }),
+	"roles.worker.triggers.labels":    stringListField("roles.worker.triggers.labels", "LOOPER_ROLES_WORKER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Worker.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialWorkerTriggers(p).Labels }),
+	"roles.worker.triggers.labelMode": labelModeField("roles.worker.triggers.labelMode", "LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Worker.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialWorkerTriggers(p).LabelMode }),
+	"roles.worker.triggers.requireAssigneeCurrentUser": boolField("roles.worker.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Worker.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialWorkerTriggers(p).RequireAssigneeCurrentUser
+	}),
+	"roles.reviewer.autoDiscovery":          boolField("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Reviewer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRole(p).AutoDiscovery }),
+	"roles.reviewer.triggers.includeDrafts": boolField("roles.reviewer.triggers.includeDrafts", "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRoleTriggers(p).IncludeDrafts }),
+	"roles.reviewer.triggers.requireReviewRequest": boolField("roles.reviewer.triggers.requireReviewRequest", "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.RequireReviewRequest }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).RequireReviewRequest
+	}),
+	"roles.reviewer.triggers.labels": stringListField("roles.reviewer.triggers.labels", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Reviewer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialReviewerRoleTriggers(p).Labels }),
+	"roles.reviewer.triggers.labelMode": labelModeField("roles.reviewer.triggers.labelMode", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Reviewer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode {
+		return &ensurePartialReviewerRoleTriggers(p).LabelMode
+	}),
+	"roles.reviewer.specReview.includeReviewingLabel": boolField("roles.reviewer.specReview.includeReviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "", func(c config.Config) any { return c.Roles.Reviewer.SpecReview.IncludeReviewingLabel }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerSpecReview(p).IncludeReviewingLabel }),
+	"roles.reviewer.specReview.reviewingLabel":        stringField("roles.reviewer.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "", func(c config.Config) any { return c.Roles.Reviewer.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerSpecReview(p).ReviewingLabel }),
+	"roles.fixer.autoDiscovery":                       boolField("roles.fixer.autoDiscovery", "LOOPER_ROLES_FIXER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Fixer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRole(p).AutoDiscovery }),
+	"roles.fixer.triggers.includeDrafts":              boolField("roles.fixer.triggers.includeDrafts", "LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Fixer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRoleTriggers(p).IncludeDrafts }),
+	"roles.fixer.triggers.labels":                     stringListField("roles.fixer.triggers.labels", "LOOPER_ROLES_FIXER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Fixer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialFixerRoleTriggers(p).Labels }),
+	"roles.fixer.triggers.labelMode":                  labelModeField("roles.fixer.triggers.labelMode", "LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Fixer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialFixerRoleTriggers(p).LabelMode }),
+	"roles.fixer.triggers.authorFilter":               fixerAuthorFilterField(),
 }
 
 func (r *commandRuntime) configGet(cmd *cobra.Command, args []string) error {
@@ -345,9 +373,6 @@ func boolField(key, env, flag string, get func(config.Config) any, target func(*
 		*target(p) = &value
 		return nil
 	}, unset: func(p *config.PartialConfig) {
-		if p.Defaults == nil {
-			return
-		}
 		*target(p) = nil
 	}}
 }
@@ -360,11 +385,45 @@ func stringField(key, env, flag string, get func(config.Config) any, target func
 		*target(p) = &raw
 		return nil
 	}, unset: func(p *config.PartialConfig) {
-		if p.Defaults == nil {
-			return
-		}
 		*target(p) = nil
 	}}
+}
+
+func stringListField(key, env string, get func(config.Config) any, target func(*config.PartialConfig) **[]string) configField {
+	return configField{key: key, valueType: "string-list", env: env, get: get, set: func(p *config.PartialConfig, raw string) error {
+		items, err := parseConfigStringList(raw)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %v", key, err)
+		}
+		*target(p) = &items
+		return nil
+	}, unset: func(p *config.PartialConfig) { *target(p) = nil }}
+}
+
+func labelModeField(key, env string, get func(config.Config) any, target func(*config.PartialConfig) **config.LabelMode) configField {
+	return configField{key: key, valueType: "string", env: env, get: get, set: func(p *config.PartialConfig, raw string) error {
+		mode := config.LabelMode(strings.TrimSpace(raw))
+		switch mode {
+		case config.LabelModeAll, config.LabelModeAny:
+			*target(p) = &mode
+			return nil
+		default:
+			return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.LabelModeAll, config.LabelModeAny)
+		}
+	}, unset: func(p *config.PartialConfig) { *target(p) = nil }}
+}
+
+func fixerAuthorFilterField() configField {
+	return configField{key: "roles.fixer.triggers.authorFilter", valueType: "string", env: "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER", get: func(c config.Config) any { return c.Roles.Fixer.Triggers.AuthorFilter }, set: func(p *config.PartialConfig, raw string) error {
+		filter := config.FixerAuthorFilter(strings.TrimSpace(raw))
+		switch filter {
+		case config.FixerAuthorFilterCurrentUser, config.FixerAuthorFilterAny:
+			ensurePartialFixerRoleTriggers(p).AuthorFilter = &filter
+			return nil
+		default:
+			return fmt.Errorf("invalid value for roles.fixer.triggers.authorFilter: must be one of: %s, %s", config.FixerAuthorFilterCurrentUser, config.FixerAuthorFilterAny)
+		}
+	}, unset: func(p *config.PartialConfig) { ensurePartialFixerRoleTriggers(p).AuthorFilter = nil }}
 }
 
 func openPRStrategyField() configField {
@@ -395,6 +454,23 @@ func parseConfigBool(raw string) (bool, error) {
 	}
 }
 
+func parseConfigStringList(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{}, nil
+	}
+	parts := strings.Split(raw, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			return nil, fmt.Errorf("empty list item")
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefaultsConfig {
 	if partial.Defaults == nil {
 		partial.Defaults = &config.PartialDefaultsConfig{}
@@ -402,27 +478,167 @@ func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefault
 	return partial.Defaults
 }
 
-func configFieldSet(partial config.PartialConfig, key string) bool {
-	if partial.Defaults == nil {
-		return false
+func ensurePartialRoles(partial *config.PartialConfig) *config.PartialRoleConfigs {
+	if partial.Roles == nil {
+		partial.Roles = &config.PartialRoleConfigs{}
 	}
+	return partial.Roles
+}
+
+func ensurePartialPlannerRole(partial *config.PartialConfig) *config.PartialPlannerRoleConfig {
+	roles := ensurePartialRoles(partial)
+	if roles.Planner == nil {
+		roles.Planner = &config.PartialPlannerRoleConfig{}
+	}
+	return roles.Planner
+}
+
+func ensurePartialPlannerTriggers(partial *config.PartialConfig) *config.PartialIssueRoleTriggersConfig {
+	planner := ensurePartialPlannerRole(partial)
+	if planner.Triggers == nil {
+		planner.Triggers = &config.PartialIssueRoleTriggersConfig{}
+	}
+	return planner.Triggers
+}
+
+func ensurePartialWorkerRole(partial *config.PartialConfig) *config.PartialWorkerRoleConfig {
+	roles := ensurePartialRoles(partial)
+	if roles.Worker == nil {
+		roles.Worker = &config.PartialWorkerRoleConfig{}
+	}
+	return roles.Worker
+}
+
+func ensurePartialWorkerTriggers(partial *config.PartialConfig) *config.PartialIssueRoleTriggersConfig {
+	worker := ensurePartialWorkerRole(partial)
+	if worker.Triggers == nil {
+		worker.Triggers = &config.PartialIssueRoleTriggersConfig{}
+	}
+	return worker.Triggers
+}
+
+func ensurePartialReviewerRole(partial *config.PartialConfig) *config.PartialReviewerRoleConfig {
+	roles := ensurePartialRoles(partial)
+	if roles.Reviewer == nil {
+		roles.Reviewer = &config.PartialReviewerRoleConfig{}
+	}
+	return roles.Reviewer
+}
+
+func ensurePartialReviewerRoleTriggers(partial *config.PartialConfig) *config.PartialReviewerRoleTriggersConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Triggers == nil {
+		reviewer.Triggers = &config.PartialReviewerRoleTriggersConfig{}
+	}
+	return reviewer.Triggers
+}
+
+func ensurePartialReviewerSpecReview(partial *config.PartialConfig) *config.PartialReviewerSpecReviewConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.SpecReview == nil {
+		reviewer.SpecReview = &config.PartialReviewerSpecReviewConfig{}
+	}
+	return reviewer.SpecReview
+}
+
+func ensurePartialFixerRole(partial *config.PartialConfig) *config.PartialFixerRoleConfig {
+	roles := ensurePartialRoles(partial)
+	if roles.Fixer == nil {
+		roles.Fixer = &config.PartialFixerRoleConfig{}
+	}
+	return roles.Fixer
+}
+
+func ensurePartialFixerRoleTriggers(partial *config.PartialConfig) *config.PartialFixerRoleTriggersConfig {
+	fixer := ensurePartialFixerRole(partial)
+	if fixer.Triggers == nil {
+		fixer.Triggers = &config.PartialFixerRoleTriggersConfig{}
+	}
+	return fixer.Triggers
+}
+
+func configFieldSet(partial config.PartialConfig, key string) bool {
 	switch key {
 	case "defaults.baseBranch":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.BaseBranch != nil
 	case "defaults.allowAutoCommit":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoCommit != nil
 	case "defaults.allowAutoPush":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoPush != nil
 	case "defaults.allowAutoApprove":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoApprove != nil
 	case "defaults.allowAutoMerge":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowAutoMerge != nil
 	case "defaults.allowRiskyFixes":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.AllowRiskyFixes != nil
 	case "defaults.fixAllPullRequests":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.FixAllPullRequests != nil
 	case "defaults.openPrStrategy":
+		if partial.Defaults == nil {
+			return false
+		}
 		return partial.Defaults.OpenPRStrategy != nil
+	case "roles.planner.autoDiscovery":
+		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
+	case "roles.planner.triggers.labels":
+		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.Triggers != nil && partial.Roles.Planner.Triggers.Labels != nil
+	case "roles.planner.triggers.labelMode":
+		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.Triggers != nil && partial.Roles.Planner.Triggers.LabelMode != nil
+	case "roles.planner.triggers.requireAssigneeCurrentUser":
+		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.Triggers != nil && partial.Roles.Planner.Triggers.RequireAssigneeCurrentUser != nil
+	case "roles.worker.autoDiscovery":
+		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.AutoDiscovery != nil
+	case "roles.worker.triggers.labels":
+		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.Labels != nil
+	case "roles.worker.triggers.labelMode":
+		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.LabelMode != nil
+	case "roles.worker.triggers.requireAssigneeCurrentUser":
+		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.RequireAssigneeCurrentUser != nil
+	case "roles.reviewer.autoDiscovery":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoDiscovery != nil
+	case "roles.reviewer.triggers.includeDrafts":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil
+	case "roles.reviewer.triggers.requireReviewRequest":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.RequireReviewRequest != nil
+	case "roles.reviewer.triggers.labels":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil
+	case "roles.reviewer.triggers.labelMode":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.LabelMode != nil
+	case "roles.reviewer.specReview.includeReviewingLabel":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil
+	case "roles.reviewer.specReview.reviewingLabel":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.ReviewingLabel != nil
+	case "roles.fixer.autoDiscovery":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil
+	case "roles.fixer.triggers.includeDrafts":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.IncludeDrafts != nil
+	case "roles.fixer.triggers.labels":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.Labels != nil
+	case "roles.fixer.triggers.labelMode":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.LabelMode != nil
+	case "roles.fixer.triggers.authorFilter":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.AuthorFilter != nil
 	default:
 		return false
 	}

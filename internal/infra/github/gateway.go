@@ -213,6 +213,7 @@ type ListOpenPullRequestsInput struct {
 	CWD     string
 	Limit   int
 	Label   string
+	Labels  []string
 	Author  string
 	Timeout time.Duration
 }
@@ -223,6 +224,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type ViewIssueInput struct {
@@ -317,8 +319,9 @@ func New(options Options) *Gateway {
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	labels := prListLabels(input)
+	for _, label := range labels {
+		args = append(args, "--label", label)
 	}
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
@@ -357,6 +360,28 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	return out, nil
 }
 
+func prListLabels(input ListOpenPullRequestsInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
 func (g *Gateway) GetPullRequestAuthor(ctx context.Context, input ViewPullRequestInput) (string, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "author")
 	if err != nil {
@@ -374,8 +399,8 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	if strings.TrimSpace(input.Assignee) != "" {
 		args = append(args, "--assignee", input.Assignee)
 	}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	for _, label := range issueListLabels(input) {
+		args = append(args, "--label", label)
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
 
@@ -401,6 +426,28 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 		})
 	}
 	return out, nil
+}
+
+func issueListLabels(input ListOpenIssuesInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {

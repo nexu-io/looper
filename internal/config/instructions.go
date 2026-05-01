@@ -28,8 +28,8 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 		return block
 	}
 	sections := make([]string, 0, 2)
-	if roleConfig, ok := cfg.Roles[role]; ok && strings.TrimSpace(roleConfig.Instructions) != "" {
-		sections = append(sections, fmt.Sprintf("Global %s instructions:\n%s", role, strings.TrimSpace(roleConfig.Instructions)))
+	if globalInstructions := strings.TrimSpace(roleInstructionText(cfg.Roles, role)); globalInstructions != "" {
+		sections = append(sections, fmt.Sprintf("Global %s instructions:\n%s", role, globalInstructions))
 		block.Sources = append(block.Sources, CustomInstructionSource{Kind: "global-role", Path: "roles." + role + ".instructions"})
 	}
 	if project := findConfiguredProject(cfg.Projects, projectID); project != nil {

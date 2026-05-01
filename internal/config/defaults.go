@@ -133,8 +133,47 @@ func DefaultConfig(cwd string) (Config, error) {
 			DetectDuplicateFindings: true,
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
-		Roles:        map[string]RoleConfig{},
-		Projects:     []ProjectRefConfig{},
+		Roles: RoleConfigs{
+			Planner: PlannerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: IssueRoleTriggersConfig{
+					Labels:                     []string{"looper:plan"},
+					LabelMode:                  LabelModeAll,
+					RequireAssigneeCurrentUser: true,
+				},
+			},
+			Reviewer: ReviewerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: ReviewerRoleTriggersConfig{
+					IncludeDrafts:        false,
+					RequireReviewRequest: true,
+					Labels:               []string{},
+					LabelMode:            LabelModeAll,
+				},
+				SpecReview: ReviewerSpecReviewConfig{
+					IncludeReviewingLabel: true,
+					ReviewingLabel:        "looper:spec-reviewing",
+				},
+			},
+			Fixer: FixerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: FixerRoleTriggersConfig{
+					IncludeDrafts: false,
+					AuthorFilter:  FixerAuthorFilterCurrentUser,
+					Labels:        []string{},
+					LabelMode:     LabelModeAll,
+				},
+			},
+			Worker: WorkerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: IssueRoleTriggersConfig{
+					Labels:                     []string{"looper:worker-ready"},
+					LabelMode:                  LabelModeAll,
+					RequireAssigneeCurrentUser: true,
+				},
+			},
+		},
+		Projects: []ProjectRefConfig{},
 	}, nil
 }
 

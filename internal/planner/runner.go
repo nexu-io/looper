@@ -35,6 +35,7 @@ const (
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+	defaultIssueLimit   = 30
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
@@ -88,6 +89,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type ViewIssueInput struct {
@@ -264,6 +266,14 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	DiscoveryPolicy         DiscoveryPolicy
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery              bool
+	Labels                     []string
+	LabelMode                  config.LabelMode
+	RequireAssigneeCurrentUser bool
 }
 
 type Runner struct {
@@ -283,6 +293,7 @@ type Runner struct {
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	discoveryPolicy         DiscoveryPolicy
 }
 
 type DiscoveryInput struct {
@@ -420,7 +431,11 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted}
+	policy := options.DiscoveryPolicy
+	if policy.LabelMode == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+	}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -437,21 +452,29 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	login := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		var err error
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
 	}
-	login = normalizeLogin(login)
-	if login == "" {
+	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: login, Label: discoveryLabel})
+	assigneeFilter := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		assigneeFilter = login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimIssue(issue, login) {
+		if !shouldClaimIssue(issue, login, r.discoveryPolicy) {
 			result.Skipped++
 			continue
 		}
@@ -746,24 +769,35 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 	}()
 	manual := isManualPlannerQueue(payload)
-	if !manual && !specpr.HasLabel(detail.Labels, discoveryLabel) {
+	if currentLogin == "" {
+		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
+		}
+		currentLogin = normalizeLogin(login)
+		if currentLogin == "" {
+			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
+		}
+	}
+	if !manual && !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
-		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer matches planner labels", repo, issueNumber)
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-	if err != nil {
-		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
+	if !manual && r.discoveryPolicy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+		checkpoint := input.Checkpoint
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+		checkpoint.ClaimedLockKey = lockKey
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
+		releaseOnError = false
+		return checkpoint, nil
 	}
-	currentLogin = normalizeLogin(login)
-	if currentLogin == "" {
-		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
-	}
-	if currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
 		}
@@ -1574,8 +1608,115 @@ func isManualPlannerQueue(payload map[string]any) bool {
 	return ok && manual
 }
 
-func shouldClaimIssue(issue IssueSummary, login string) bool {
-	return includesLogin(issue.Assignees, login) && specpr.HasLabel(issue.Labels, discoveryLabel)
+func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
+	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
+		return false
+	}
+	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+func safeIssueQueryLabel(labels []string) string {
+	for _, label := range labels {
+		if strings.TrimSpace(label) != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+	if policy.LabelMode != config.LabelModeAny {
+		input.Labels = uniqueNonEmptyLabels(policy.Labels)
+		input.Label = safeIssueQueryLabel(input.Labels)
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func mergeIssuePages(pages [][]IssueSummary, limit int) []IssueSummary {
+	seenIssues := map[int64]struct{}{}
+	merged := []IssueSummary{}
+	for index := 0; len(merged) < limit; index++ {
+		anyPageHasIndex := false
+		for _, page := range pages {
+			if index >= len(page) {
+				continue
+			}
+			anyPageHasIndex = true
+			issue := page[index]
+			if _, ok := seenIssues[issue.Number]; ok {
+				continue
+			}
+			seenIssues[issue.Number] = struct{}{}
+			merged = append(merged, issue)
+			if len(merged) >= limit {
+				break
+			}
+		}
+		if !anyPageHasIndex {
+			break
+		}
+	}
+	return merged
+}
+
+func effectiveIssueLimit(limit int) int {
+	if limit <= 0 {
+		return defaultIssueLimit
+	}
+	return limit
+}
+
+func uniqueNonEmptyLabels(labels []string) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string, currentLogin string) []string {

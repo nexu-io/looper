@@ -910,6 +910,40 @@ func TestGatewayDetectsCurrentEnterpriseRepository(t *testing.T) {
 	}
 }
 
+func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,author,reviewRequests" {
+			t.Fatalf("gh args = %q, want repeated label filters", args)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper", Labels: []string{"bug", "priority"}}); err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+}
+
+func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label bug --label priority --json number,title,body,url,state,author,assignees,labels" {
+			t.Fatalf("gh args = %q, want repeated label filters", args)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenIssues(context.Background(), ListOpenIssuesInput{Repo: "acme/looper", Assignee: "reviewer", Labels: []string{"bug", "priority"}}); err != nil {
+		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
 type fakeGHRunner struct {
 	t       *testing.T
 	calls   []string

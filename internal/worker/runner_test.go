@@ -96,6 +96,40 @@ func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesUsesSingleServerSideLabelFilterWhenConfiguredWithMultipleLabels(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Labels: []string{"team:alpha", "team:beta"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha", "team:beta"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) != 1 {
+		t.Fatalf("listIssueCalls = %#v, want one call", github.listIssueCalls)
+	}
+	if got := github.listIssueCalls[0].Labels; len(got) != 2 || got[0] != "team:alpha" || got[1] != "team:beta" {
+		t.Fatalf("ListOpenIssues labels = %#v, want both configured labels", got)
+	}
+}
+
+func TestDiscoverIssuesQueriesEachServerSideLabelWhenConfiguredWithAnyLabelMode(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 47, Title: "Implement worker-ready", Labels: []string{"team:beta"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha", "team:beta"}, LabelMode: config.LabelModeAny, RequireAssigneeCurrentUser: false}})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) != 2 {
+		t.Fatalf("listIssueCalls = %#v, want two calls", github.listIssueCalls)
+	}
+	if github.listIssueCalls[0].Label != "team:alpha" || github.listIssueCalls[1].Label != "team:beta" {
+		t.Fatalf("ListOpenIssues labels = [%q, %q], want configured labels", github.listIssueCalls[0].Label, github.listIssueCalls[1].Label)
+	}
+}
+
 func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -256,7 +290,7 @@ func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *
 
 func TestBuildWorkerPromptPlacesCustomInstructionsBeforeLifecycle(t *testing.T) {
 	t.Parallel()
-	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: map[string]config.PartialRoleConfig{"worker": {Instructions: stringPtr("Prefer small commits.")}}})
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{Instructions: stringPtr("Prefer small commits.")}}})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
@@ -277,7 +311,7 @@ func TestBuildWorkerPromptPlacesCustomInstructionsBeforeLifecycle(t *testing.T) 
 
 func TestBuildWorkerPromptOmitsDisabledCustomInstructions(t *testing.T) {
 	t.Parallel()
-	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Instructions: &config.PartialInstructionsConfig{Enabled: testBoolPtr(false)}, Roles: map[string]config.PartialRoleConfig{"worker": {Instructions: stringPtr("Prefer small commits.")}}})
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Instructions: &config.PartialInstructionsConfig{Enabled: testBoolPtr(false)}, Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{Instructions: stringPtr("Prefer small commits.")}}})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
@@ -1213,7 +1247,7 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "worker-login", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}}
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
@@ -1229,6 +1263,33 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	call := github.addAssigneeCalls[0]
 	if call.Repo != "acme/looper" || call.IssueNumber != 27 || len(call.Assignees) != 1 || call.Assignees[0] != "worker-login" {
 		t.Fatalf("add assignee call = %#v, want worker-login on acme/looper#27", call)
+	}
+}
+
+func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"looper:worker-ready"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(context.Background(), *project, "acme/looper", issue)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	queueItem, err := runner.enqueueDiscoveredIssue(context.Background(), *project, loopResult.record, "acme/looper", issue)
+	if err != nil {
+		t.Fatalf("enqueueDiscoveredIssue() error = %v", err)
+	}
+	if _, err := runner.runPrepareWorkStep(context.Background(), stepInput{Project: *project, Loop: loopResult.record, QueueItem: queueItem}); err != nil {
+		t.Fatalf("runPrepareWorkStep() error = %v", err)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment", github.addAssigneeCalls)
 	}
 }
 

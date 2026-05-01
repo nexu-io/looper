@@ -48,6 +48,20 @@ const (
 	AddSnapshotModeOff   AddSnapshotMode = "off"
 )
 
+type LabelMode string
+
+const (
+	LabelModeAll LabelMode = "all"
+	LabelModeAny LabelMode = "any"
+)
+
+type FixerAuthorFilter string
+
+const (
+	FixerAuthorFilterCurrentUser FixerAuthorFilter = "current_user"
+	FixerAuthorFilterAny         FixerAuthorFilter = "any"
+)
+
 type ReviewerScope string
 
 const (
@@ -200,6 +214,68 @@ type ReviewerConfig struct {
 	DetectDuplicateFindings bool                `json:"detectDuplicateFindings"`
 }
 
+type IssueRoleTriggersConfig struct {
+	Labels                     []string  `json:"labels"`
+	LabelMode                  LabelMode `json:"labelMode"`
+	RequireAssigneeCurrentUser bool      `json:"requireAssigneeCurrentUser"`
+}
+
+type PullRequestRoleTriggersConfig struct {
+	IncludeDrafts        bool `json:"includeDrafts"`
+	RequireReviewRequest bool `json:"requireReviewRequest"`
+}
+
+type ReviewerRoleTriggersConfig struct {
+	IncludeDrafts        bool      `json:"includeDrafts"`
+	RequireReviewRequest bool      `json:"requireReviewRequest"`
+	Labels               []string  `json:"labels"`
+	LabelMode            LabelMode `json:"labelMode"`
+}
+
+type ReviewerSpecReviewConfig struct {
+	IncludeReviewingLabel bool   `json:"includeReviewingLabel"`
+	ReviewingLabel        string `json:"reviewingLabel"`
+}
+
+type FixerRoleTriggersConfig struct {
+	IncludeDrafts bool              `json:"includeDrafts"`
+	AuthorFilter  FixerAuthorFilter `json:"authorFilter"`
+	Labels        []string          `json:"labels"`
+	LabelMode     LabelMode         `json:"labelMode"`
+}
+
+type PlannerRoleConfig struct {
+	AutoDiscovery bool                    `json:"autoDiscovery"`
+	Triggers      IssueRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
+}
+
+type WorkerRoleConfig struct {
+	AutoDiscovery bool                    `json:"autoDiscovery"`
+	Triggers      IssueRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
+}
+
+type ReviewerRoleConfig struct {
+	AutoDiscovery bool                       `json:"autoDiscovery"`
+	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
+	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+	Instructions  string                     `json:"instructions,omitempty"`
+}
+
+type FixerRoleConfig struct {
+	AutoDiscovery bool                    `json:"autoDiscovery"`
+	Triggers      FixerRoleTriggersConfig `json:"triggers"`
+	Instructions  string                  `json:"instructions,omitempty"`
+}
+
+type RoleConfigs struct {
+	Planner  PlannerRoleConfig  `json:"planner"`
+	Reviewer ReviewerRoleConfig `json:"reviewer"`
+	Fixer    FixerRoleConfig    `json:"fixer"`
+	Worker   WorkerRoleConfig   `json:"worker"`
+}
+
 type ProjectRefConfig struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
@@ -211,21 +287,21 @@ type ProjectRefConfig struct {
 }
 
 type Config struct {
-	Server        ServerConfig          `json:"server"`
-	Storage       StorageConfig         `json:"storage"`
-	Scheduler     SchedulerConfig       `json:"scheduler"`
-	Agent         AgentConfig           `json:"agent"`
-	Logging       LoggingConfig         `json:"logging"`
-	Notifications NotificationConfig    `json:"notifications"`
-	Disclosure    DisclosureConfig      `json:"disclosure"`
-	Tools         ToolPathsConfig       `json:"tools"`
-	Daemon        DaemonConfig          `json:"daemon"`
-	Package       PackageConfig         `json:"package"`
-	Defaults      DefaultsConfig        `json:"defaults"`
-	Reviewer      ReviewerConfig        `json:"reviewer"`
-	Instructions  InstructionsConfig    `json:"instructions"`
-	Roles         map[string]RoleConfig `json:"roles"`
-	Projects      []ProjectRefConfig    `json:"projects"`
+	Server        ServerConfig       `json:"server"`
+	Storage       StorageConfig      `json:"storage"`
+	Scheduler     SchedulerConfig    `json:"scheduler"`
+	Agent         AgentConfig        `json:"agent"`
+	Logging       LoggingConfig      `json:"logging"`
+	Notifications NotificationConfig `json:"notifications"`
+	Disclosure    DisclosureConfig   `json:"disclosure"`
+	Tools         ToolPathsConfig    `json:"tools"`
+	Daemon        DaemonConfig       `json:"daemon"`
+	Package       PackageConfig      `json:"package"`
+	Defaults      DefaultsConfig     `json:"defaults"`
+	Reviewer      ReviewerConfig     `json:"reviewer"`
+	Instructions  InstructionsConfig `json:"instructions"`
+	Roles         RoleConfigs        `json:"roles"`
+	Projects      []ProjectRefConfig `json:"projects"`
 }
 
 type PartialServerConfig struct {
@@ -348,24 +424,82 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
-type PartialRoleConfig struct {
-	Instructions *string `json:"instructions,omitempty"`
+type PartialIssueRoleTriggersConfig struct {
+	Labels                     *[]string  `json:"labels,omitempty"`
+	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
+	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
+}
+
+type PartialPullRequestRoleTriggersConfig struct {
+	IncludeDrafts        *bool `json:"includeDrafts,omitempty"`
+	RequireReviewRequest *bool `json:"requireReviewRequest,omitempty"`
+}
+
+type PartialReviewerRoleTriggersConfig struct {
+	IncludeDrafts        *bool      `json:"includeDrafts,omitempty"`
+	RequireReviewRequest *bool      `json:"requireReviewRequest,omitempty"`
+	Labels               *[]string  `json:"labels,omitempty"`
+	LabelMode            *LabelMode `json:"labelMode,omitempty"`
+}
+
+type PartialReviewerSpecReviewConfig struct {
+	IncludeReviewingLabel *bool   `json:"includeReviewingLabel,omitempty"`
+	ReviewingLabel        *string `json:"reviewingLabel,omitempty"`
+}
+
+type PartialFixerRoleTriggersConfig struct {
+	IncludeDrafts *bool              `json:"includeDrafts,omitempty"`
+	AuthorFilter  *FixerAuthorFilter `json:"authorFilter,omitempty"`
+	Labels        *[]string          `json:"labels,omitempty"`
+	LabelMode     *LabelMode         `json:"labelMode,omitempty"`
+}
+
+type PartialPlannerRoleConfig struct {
+	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
+	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
+}
+
+type PartialWorkerRoleConfig struct {
+	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
+	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
+}
+
+type PartialReviewerRoleConfig struct {
+	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
+	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
+	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	Instructions  *string                            `json:"instructions,omitempty"`
+}
+
+type PartialFixerRoleConfig struct {
+	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
+	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
+}
+
+type PartialRoleConfigs struct {
+	Planner  *PartialPlannerRoleConfig  `json:"planner,omitempty"`
+	Reviewer *PartialReviewerRoleConfig `json:"reviewer,omitempty"`
+	Fixer    *PartialFixerRoleConfig    `json:"fixer,omitempty"`
+	Worker   *PartialWorkerRoleConfig   `json:"worker,omitempty"`
 }
 
 type PartialConfig struct {
-	Server        *PartialServerConfig         `json:"server,omitempty"`
-	Storage       *PartialStorageConfig        `json:"storage,omitempty"`
-	Scheduler     *PartialSchedulerConfig      `json:"scheduler,omitempty"`
-	Agent         *PartialAgentConfig          `json:"agent,omitempty"`
-	Logging       *PartialLoggingConfig        `json:"logging,omitempty"`
-	Notifications *PartialNotificationConfig   `json:"notifications,omitempty"`
-	Disclosure    *PartialDisclosureConfig     `json:"disclosure,omitempty"`
-	Tools         *PartialToolPathsConfig      `json:"tools,omitempty"`
-	Daemon        *PartialDaemonConfig         `json:"daemon,omitempty"`
-	Package       *PartialPackageConfig        `json:"package,omitempty"`
-	Defaults      *PartialDefaultsConfig       `json:"defaults,omitempty"`
-	Reviewer      *PartialReviewerConfig       `json:"reviewer,omitempty"`
-	Instructions  *PartialInstructionsConfig   `json:"instructions,omitempty"`
-	Roles         map[string]PartialRoleConfig `json:"roles,omitempty"`
-	Projects      *[]ProjectRefConfig          `json:"projects,omitempty"`
+	Server        *PartialServerConfig       `json:"server,omitempty"`
+	Storage       *PartialStorageConfig      `json:"storage,omitempty"`
+	Scheduler     *PartialSchedulerConfig    `json:"scheduler,omitempty"`
+	Agent         *PartialAgentConfig        `json:"agent,omitempty"`
+	Logging       *PartialLoggingConfig      `json:"logging,omitempty"`
+	Notifications *PartialNotificationConfig `json:"notifications,omitempty"`
+	Disclosure    *PartialDisclosureConfig   `json:"disclosure,omitempty"`
+	Tools         *PartialToolPathsConfig    `json:"tools,omitempty"`
+	Daemon        *PartialDaemonConfig       `json:"daemon,omitempty"`
+	Package       *PartialPackageConfig      `json:"package,omitempty"`
+	Defaults      *PartialDefaultsConfig     `json:"defaults,omitempty"`
+	Reviewer      *PartialReviewerConfig     `json:"reviewer,omitempty"`
+	Instructions  *PartialInstructionsConfig `json:"instructions,omitempty"`
+	Roles         *PartialRoleConfigs        `json:"roles,omitempty"`
+	Projects      *[]ProjectRefConfig        `json:"projects,omitempty"`
 }

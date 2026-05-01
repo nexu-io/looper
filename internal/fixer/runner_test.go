@@ -107,6 +107,101 @@ func TestDiscoverPullRequestsFixAllPullRequestsOptIn(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug", "urgent"}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Labels: []string{"bug"}},
+		},
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug", "urgent"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAll}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want only matching PR #42", result.QueueItems)
+	}
+	if len(github.listCalls) != 1 || strings.Join(github.listCalls[0].Labels, ",") != "bug,urgent" {
+		t.Fatalf("list calls = %#v, want server-side multi-label filter", github.listCalls)
+	}
+}
+
+func TestDiscoverPullRequestsQueriesEachAnyModeLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}}},
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAny}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want matching PR #42", result.QueueItems)
+	}
+	if len(github.listCalls) != 2 || github.listCalls[0].Label != "bug" || github.listCalls[1].Label != "urgent" {
+		t.Fatalf("list calls = %#v, want one server-side query per any-mode label", github.listCalls)
+	}
+}
+
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToLimit(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"bug": {
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Labels: []string{"bug"}},
+		},
+		"urgent": {
+			{Number: 44, State: "OPEN", HeadSHA: "head-44", Labels: []string{"urgent"}},
+			{Number: 45, State: "OPEN", HeadSHA: "head-45", Labels: []string{"urgent"}},
+		},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAny, AuthorFilter: config.FixerAuthorFilterAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 2, "looper")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 2 || prs[0].Number != 42 || prs[1].Number != 43 {
+		t.Fatalf("prs = %#v, want first two unique PRs capped to limit", prs)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "bug" {
+		t.Fatalf("list calls = %#v, want discovery to stop after reaching limit", github.listCalls)
+	}
+}
+
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToDefaultLimit(t *testing.T) {
+	t.Parallel()
+	firstPage := make([]PullRequestSummary, 30)
+	for i := range firstPage {
+		firstPage[i] = PullRequestSummary{Number: int64(42 + i), State: "OPEN", HeadSHA: fmt.Sprintf("head-%d", 42+i), Labels: []string{"bug"}}
+	}
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"bug":    firstPage,
+		"urgent": {{Number: 99, State: "OPEN", HeadSHA: "head-99", Labels: []string{"urgent"}}},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAny, AuthorFilter: config.FixerAuthorFilterAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 0, "looper")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 30 {
+		t.Fatalf("len(prs) = %d, want default cap", len(prs))
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "bug" || github.listCalls[0].Limit != 30 {
+		t.Fatalf("list calls = %#v, want discovery to use and stop at default limit", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1015,6 +1110,7 @@ func (f *runnerFixture) nowISO() string {
 type fakeGitHubGateway struct {
 	currentUser      string
 	listOpen         []PullRequestSummary
+	listOpenByLabel  map[string][]PullRequestSummary
 	listCalls        []ListOpenPullRequestsInput
 	viewResponses    []PullRequestDetail
 	viewIndex        int
@@ -1025,6 +1121,9 @@ type fakeGitHubGateway struct {
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	f.listCalls = append(f.listCalls, input)
+	if f.listOpenByLabel != nil {
+		return append([]PullRequestSummary(nil), f.listOpenByLabel[input.Label]...), nil
+	}
 	result := append([]PullRequestSummary(nil), f.listOpen...)
 	for index := range result {
 		if result[index].Author == "" {

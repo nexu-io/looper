@@ -162,6 +162,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	validateInstructions(config, &issues)
+	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
+	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
+	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
+	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	if config.Roles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) == "" {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+	} else if config.Roles.Reviewer.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
+	}
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	for index, project := range config.Projects {
@@ -193,7 +202,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		for role, text := range project.Instructions {
 			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
 			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
-			validateAggregateInstructionBytes(path, config.Roles[role].Instructions, text, config.Instructions.MaxBytes, &issues)
+			validateAggregateInstructionBytes(path, roleInstructionText(config.Roles, role), text, config.Instructions.MaxBytes, &issues)
 		}
 	}
 
@@ -227,9 +236,38 @@ func validateInstructions(config Config, issues *[]ValidationIssue) {
 	if config.Instructions.MaxBytes < 1 {
 		*issues = append(*issues, ValidationIssue{Path: "instructions.maxBytes", Message: "must be a positive integer"})
 	}
-	for role, roleConfig := range config.Roles {
-		validateInstructionText("roles."+role+".instructions", role, roleConfig.Instructions, config.Instructions.MaxBytes, issues)
-		validateAggregateInstructionBytes("roles."+role+".instructions", roleConfig.Instructions, "", config.Instructions.MaxBytes, issues)
+	for _, roleInstruction := range roleInstructions(config.Roles) {
+		validateInstructionText("roles."+roleInstruction.role+".instructions", roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, issues)
+		validateAggregateInstructionBytes("roles."+roleInstruction.role+".instructions", roleInstruction.text, "", config.Instructions.MaxBytes, issues)
+	}
+}
+
+type roleInstruction struct {
+	role string
+	text string
+}
+
+func roleInstructions(roles RoleConfigs) []roleInstruction {
+	return []roleInstruction{
+		{role: "planner", text: roles.Planner.Instructions},
+		{role: "worker", text: roles.Worker.Instructions},
+		{role: "reviewer", text: roles.Reviewer.Instructions},
+		{role: "fixer", text: roles.Fixer.Instructions},
+	}
+}
+
+func roleInstructionText(roles RoleConfigs, role string) string {
+	switch role {
+	case "planner":
+		return roles.Planner.Instructions
+	case "worker":
+		return roles.Worker.Instructions
+	case "reviewer":
+		return roles.Reviewer.Instructions
+	case "fixer":
+		return roles.Fixer.Instructions
+	default:
+		return ""
 	}
 }
 
@@ -411,6 +449,62 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isValidLabelMode(mode LabelMode) bool {
+	switch mode {
+	case LabelModeAll, LabelModeAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
+	switch filter {
+	case FixerAuthorFilterCurrentUser, FixerAuthorFilterAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateReviewerRoleTriggers(triggers ReviewerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateLabelTriggers(labels []string, mode LabelMode, path string, issues *[]ValidationIssue) {
+	if !isValidLabelMode(mode) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".labelMode", Message: fmt.Sprintf("must be one of: %s, %s", LabelModeAll, LabelModeAny)})
+	}
+	seen := map[string]struct{}{}
+	for index, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must be a non-empty string"})
+			continue
+		}
+		if label != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
+			continue
+		}
+		if _, ok := seen[label]; ok {
+			*issues = append(*issues, ValidationIssue{Path: path + ".labels", Message: fmt.Sprintf("contains duplicate label: %s", label)})
+			continue
+		}
+		seen[label] = struct{}{}
 	}
 }
 

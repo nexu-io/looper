@@ -194,6 +194,50 @@
         "publishMode": "single_review",
         "detectDuplicateFindings": true
       },
+      "roles": {
+        "planner": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:plan"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        },
+        "reviewer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "requireReviewRequest": true,
+            "labels": [],
+            "labelMode": "all"
+          },
+          "specReview": {
+            "includeReviewingLabel": true,
+            "reviewingLabel": "looper:spec-reviewing"
+          }
+        },
+        "fixer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "labels": [],
+            "labelMode": "all",
+            "authorFilter": "current_user"
+          }
+        },
+        "worker": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:worker-ready"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        }
+      },
       "projects": [
         {
           "id": "alpha",
@@ -206,8 +250,7 @@
       "instructions": {
         "enabled": true,
         "maxBytes": 8192
-      },
-      "roles": {}
+      }
     },
     "metadata": {
       "configPath": "__TMP__/configs/env-selected.json",
