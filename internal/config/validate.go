@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -158,6 +159,16 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 	if config.Reviewer.PublishMode != ReviewerPublishModeSingleReview {
 		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
+	}
+
+	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
+	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
+	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
+	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	if config.Roles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) == "" {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+	} else if config.Roles.Reviewer.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 	}
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
@@ -347,6 +358,62 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isValidLabelMode(mode LabelMode) bool {
+	switch mode {
+	case LabelModeAll, LabelModeAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
+	switch filter {
+	case FixerAuthorFilterCurrentUser, FixerAuthorFilterAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateReviewerRoleTriggers(triggers ReviewerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateLabelTriggers(labels []string, mode LabelMode, path string, issues *[]ValidationIssue) {
+	if !isValidLabelMode(mode) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".labelMode", Message: fmt.Sprintf("must be one of: %s, %s", LabelModeAll, LabelModeAny)})
+	}
+	seen := map[string]struct{}{}
+	for index, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must be a non-empty string"})
+			continue
+		}
+		if label != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
+			continue
+		}
+		if _, ok := seen[label]; ok {
+			*issues = append(*issues, ValidationIssue{Path: path + ".labels", Message: fmt.Sprintf("contains duplicate label: %s", label)})
+			continue
+		}
+		seen[label] = struct{}{}
 	}
 }
 

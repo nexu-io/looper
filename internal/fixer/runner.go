@@ -77,6 +77,7 @@ type PullRequestSummary struct {
 	Number  int64
 	State   string
 	IsDraft bool
+	Labels  []string
 	HeadSHA string
 	Author  string
 }
@@ -102,6 +103,7 @@ type ListOpenPullRequestsInput struct {
 	CWD    string
 	Limit  int
 	Author string
+	Label  string
 }
 
 type ViewPullRequestInput struct {
@@ -276,12 +278,21 @@ type Options struct {
 	AllowAutoPush           bool
 	AllowRiskyFixes         bool
 	FixAllPullRequests      bool
+	DiscoveryPolicy         DiscoveryPolicy
 	Disclosure              *config.DisclosureConfig
 	AgentModel              *string
 	Sleep                   func(time.Duration)
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery bool
+	IncludeDrafts bool
+	AuthorFilter  config.FixerAuthorFilter
+	Labels        []string
+	LabelMode     config.LabelMode
 }
 
 type Runner struct {
@@ -300,6 +311,7 @@ type Runner struct {
 	allowAutoPush           bool
 	allowRiskyFixes         bool
 	fixAllPullRequests      bool
+	discoveryPolicy         DiscoveryPolicy
 	disclosure              config.DisclosureConfig
 	agentModel              string
 	sleep                   func(time.Duration)
@@ -480,6 +492,13 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
+	policy := options.DiscoveryPolicy
+	if policy.AuthorFilter == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{}, LabelMode: config.LabelModeAll}
+		if options.FixAllPullRequests {
+			policy.AuthorFilter = config.FixerAuthorFilterAny
+		}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -496,6 +515,7 @@ func New(options Options) *Runner {
 		allowAutoPush:           options.AllowAutoPush,
 		allowRiskyFixes:         options.AllowRiskyFixes,
 		fixAllPullRequests:      options.FixAllPullRequests,
+		discoveryPolicy:         policy,
 		disclosure:              disclosureCfg,
 		agentModel:              derefString(options.AgentModel),
 		sleep:                   sleep,
@@ -517,24 +537,28 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	currentUser := ""
-	if !r.fixAllPullRequests {
+	if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Author: currentUser})
+	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Author: currentUser, Label: safePRQueryLabel(r.discoveryPolicy.Labels)})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
+		if (!r.discoveryPolicy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
 			result.Skipped++
 			continue
 		}
-		if !r.fixAllPullRequests && !sameGitHubLogin(pr.Author, currentUser) {
+		if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
+			result.Skipped++
+			continue
+		}
+		if !labelsMatch(pr.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 			result.Skipped++
 			continue
 		}
@@ -896,7 +920,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 }
 
 func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, cwd, repo string, prNumber int64) (string, error) {
-	if r.fixAllPullRequests {
+	if r.discoveryPolicy.AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
 	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
@@ -940,7 +964,7 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
 	}
-	if checkpoint.Detail.IsDraft || normalizePRState(checkpoint.Detail.State) != "open" {
+	if (!r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
@@ -2056,6 +2080,33 @@ func sameGitHubLogin(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)
 	return left != "" && right != "" && strings.EqualFold(left, right)
+}
+
+func safePRQueryLabel(labels []string) string {
+	if len(labels) == 1 {
+		return labels[0]
+	}
+	return ""
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSpecReviewClean(detail PullRequestDetail) bool {

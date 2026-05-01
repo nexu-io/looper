@@ -273,6 +273,7 @@ type Options struct {
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
 	LoopConfig              config.ReviewerLoopConfig
+	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
 	Disclosure              *config.DisclosureConfig
@@ -282,6 +283,16 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery             bool
+	IncludeDrafts             bool
+	RequireReviewRequest      bool
+	Labels                    []string
+	LabelMode                 config.LabelMode
+	IncludeSpecReviewingLabel bool
+	SpecReviewingLabel        string
 }
 
 type Runner struct {
@@ -296,6 +307,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	allowAutoApprove        bool
 	loopConfig              config.ReviewerLoopConfig
+	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
 	disclosure              config.DisclosureConfig
@@ -429,6 +441,10 @@ func New(options Options) *Runner {
 	if scope == "" {
 		scope = config.ReviewerScopeChangedRanges
 	}
+	policy := options.DiscoveryPolicy
+	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -441,6 +457,7 @@ func New(options Options) *Runner {
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
 		loopConfig:              loopConfig,
+		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
 		disclosure:              disclosureCfg,
@@ -464,19 +481,27 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit})
+	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: safePRQueryLabel(r.discoveryPolicy.Labels)})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	specPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: specpr.ReviewingLabel})
-	if err != nil {
-		return DiscoveryResult{}, err
+	specPRs := []PullRequestSummary{}
+	if r.discoveryPolicy.IncludeSpecReviewingLabel {
+		var err error
+		specPRs, err = r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: r.discoveryPolicy.SpecReviewingLabel})
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	currentLogin := ""
+	if r.discoveryPolicy.RequireReviewRequest {
+		var err error
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = normalizeLogin(currentLogin)
 	}
-	currentLogin = normalizeLogin(currentLogin)
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
@@ -531,7 +556,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return enqueue(pr, nil)
 	}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if !r.prEligibleForDiscovery(pr, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -540,7 +565,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	for _, pr := range specPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if !r.prEligibleForDiscovery(pr, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -565,7 +590,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if detail.IsDraft {
+		if !r.discoveryPolicy.IncludeDrafts && detail.IsDraft {
 			result.Skipped++
 			continue
 		}
@@ -576,7 +601,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		if !isManualReviewerLoop(loop) && r.discoveryPolicy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+			result.Skipped++
+			continue
+		}
+		if !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 			result.Skipped++
 			continue
 		}
@@ -586,6 +615,49 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	return result, nil
+}
+
+func (r *Runner) prEligibleForDiscovery(pr PullRequestSummary, currentLogin string) bool {
+	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
+		return false
+	}
+	if normalizePRState(pr.State) != "open" {
+		return false
+	}
+	if r.discoveryPolicy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		return false
+	}
+	if !labelsMatch(pr.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+		return false
+	}
+	return true
+}
+
+func safePRQueryLabel(labels []string) string {
+	if len(labels) == 1 {
+		return labels[0]
+	}
+	return ""
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -902,7 +974,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for filter step", kind: FailureRetryableTransient}
 	}
-	if checkpoint.Detail.IsDraft {
+	if !r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped draft pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
@@ -941,7 +1013,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, nil
 		}
 	}
-	if !isManualReviewerLoop(input.Loop) {
+	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1166,7 +1238,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) {
+	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1725,7 +1797,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
 	}
-	if isManualReviewerLoop(input.Loop) {
+	if isManualReviewerLoop(input.Loop) || !r.discoveryPolicy.RequireReviewRequest {
 		return "", false
 	}
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)

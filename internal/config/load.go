@@ -355,6 +355,7 @@ func parseInteger(value string) (*int, error) {
 }
 
 func parseBoolean(value string) (*bool, error) {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, fmt.Errorf("boolean value cannot be empty")
 	}
@@ -369,6 +370,40 @@ func parseBoolean(value string) (*bool, error) {
 	default:
 		return nil, fmt.Errorf("invalid boolean")
 	}
+}
+
+func parseStringList(value string) (*[]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		parsed := []string{}
+		return &parsed, nil
+	}
+	parts := strings.Split(value, ",")
+	parsed := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			return nil, fmt.Errorf("list contains empty item")
+		}
+		parsed = append(parsed, item)
+	}
+	return &parsed, nil
+}
+
+func parseLabelMode(value string) (*LabelMode, error) {
+	mode := LabelMode(strings.TrimSpace(value))
+	if !isValidLabelMode(mode) {
+		return nil, fmt.Errorf("invalid label mode")
+	}
+	return &mode, nil
+}
+
+func parseFixerAuthorFilter(value string) (*FixerAuthorFilter, error) {
+	filter := FixerAuthorFilter(strings.TrimSpace(value))
+	if !isValidFixerAuthorFilter(filter) {
+		return nil, fmt.Errorf("invalid author filter")
+	}
+	return &filter, nil
 }
 
 func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
@@ -479,8 +514,119 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	if value, ok := lookupEnv("LOOPER_OSASCRIPT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).OsascriptPath = stringPtr(value)
 	}
+	if err := applyRoleEnvOverrides(&overrides, lookupEnv); err != nil {
+		return PartialConfig{}, err
+	}
 
 	return overrides, nil
+}
+
+func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
+	boolEnv := func(name string, set func(*bool)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not a boolean", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+	listEnv := func(name string, set func(*[]string)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseStringList(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not a comma-separated string list", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+	labelModeEnv := func(name string, set func(*LabelMode)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseLabelMode(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: must be one of: %s, %s", name, LabelModeAll, LabelModeAny)
+		}
+		set(parsed)
+		return nil
+	}
+
+	if err := boolEnv("LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", func(v *bool) { ensurePlannerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
+		return err
+	}
+	if err := listEnv("LOOPER_ROLES_PLANNER_TRIGGERS_LABELS", func(v *[]string) { ensurePlannerRoleTriggersConfig(overrides).Labels = v }); err != nil {
+		return err
+	}
+	if err := labelModeEnv("LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensurePlannerRoleTriggersConfig(overrides).LabelMode = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", func(v *bool) { ensurePlannerRoleTriggersConfig(overrides).RequireAssigneeCurrentUser = v }); err != nil {
+		return err
+	}
+
+	if err := boolEnv("LOOPER_ROLES_WORKER_AUTO_DISCOVERY", func(v *bool) { ensureWorkerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
+		return err
+	}
+	if err := listEnv("LOOPER_ROLES_WORKER_TRIGGERS_LABELS", func(v *[]string) { ensureWorkerRoleTriggersConfig(overrides).Labels = v }); err != nil {
+		return err
+	}
+	if err := labelModeEnv("LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensureWorkerRoleTriggersConfig(overrides).LabelMode = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", func(v *bool) { ensureWorkerRoleTriggersConfig(overrides).RequireAssigneeCurrentUser = v }); err != nil {
+		return err
+	}
+
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", func(v *bool) { ensureReviewerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).IncludeDrafts = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).RequireReviewRequest = v }); err != nil {
+		return err
+	}
+	if err := listEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(v *[]string) { ensureReviewerRoleTriggersConfig(overrides).Labels = v }); err != nil {
+		return err
+	}
+	if err := labelModeEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensureReviewerRoleTriggersConfig(overrides).LabelMode = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", func(v *bool) { ensureReviewerSpecReviewConfig(overrides).IncludeReviewingLabel = v }); err != nil {
+		return err
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL"); ok {
+		ensureReviewerSpecReviewConfig(overrides).ReviewingLabel = stringPtr(strings.TrimSpace(value))
+	}
+
+	if err := boolEnv("LOOPER_ROLES_FIXER_AUTO_DISCOVERY", func(v *bool) { ensureFixerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS", func(v *bool) { ensureFixerRoleTriggersConfig(overrides).IncludeDrafts = v }); err != nil {
+		return err
+	}
+	if err := listEnv("LOOPER_ROLES_FIXER_TRIGGERS_LABELS", func(v *[]string) { ensureFixerRoleTriggersConfig(overrides).Labels = v }); err != nil {
+		return err
+	}
+	if err := labelModeEnv("LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensureFixerRoleTriggersConfig(overrides).LabelMode = v }); err != nil {
+		return err
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER"); ok {
+		parsed, err := parseFixerAuthorFilter(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER: must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)
+		}
+		ensureFixerRoleTriggersConfig(overrides).AuthorFilter = parsed
+	}
+	return nil
 }
 
 func ensureServerConfig(partial *PartialConfig) *PartialServerConfig {
@@ -553,4 +699,83 @@ func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig
 		reviewer.Loop = &PartialReviewerLoopConfig{}
 	}
 	return reviewer.Loop
+}
+
+func ensureRoleConfigs(partial *PartialConfig) *PartialRoleConfigs {
+	if partial.Roles == nil {
+		partial.Roles = &PartialRoleConfigs{}
+	}
+	return partial.Roles
+}
+
+func ensurePlannerRoleConfig(partial *PartialConfig) *PartialPlannerRoleConfig {
+	roles := ensureRoleConfigs(partial)
+	if roles.Planner == nil {
+		roles.Planner = &PartialPlannerRoleConfig{}
+	}
+	return roles.Planner
+}
+
+func ensurePlannerRoleTriggersConfig(partial *PartialConfig) *PartialIssueRoleTriggersConfig {
+	planner := ensurePlannerRoleConfig(partial)
+	if planner.Triggers == nil {
+		planner.Triggers = &PartialIssueRoleTriggersConfig{}
+	}
+	return planner.Triggers
+}
+
+func ensureWorkerRoleConfig(partial *PartialConfig) *PartialWorkerRoleConfig {
+	roles := ensureRoleConfigs(partial)
+	if roles.Worker == nil {
+		roles.Worker = &PartialWorkerRoleConfig{}
+	}
+	return roles.Worker
+}
+
+func ensureWorkerRoleTriggersConfig(partial *PartialConfig) *PartialIssueRoleTriggersConfig {
+	worker := ensureWorkerRoleConfig(partial)
+	if worker.Triggers == nil {
+		worker.Triggers = &PartialIssueRoleTriggersConfig{}
+	}
+	return worker.Triggers
+}
+
+func ensureReviewerRoleConfig(partial *PartialConfig) *PartialReviewerRoleConfig {
+	roles := ensureRoleConfigs(partial)
+	if roles.Reviewer == nil {
+		roles.Reviewer = &PartialReviewerRoleConfig{}
+	}
+	return roles.Reviewer
+}
+
+func ensureReviewerRoleTriggersConfig(partial *PartialConfig) *PartialReviewerRoleTriggersConfig {
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.Triggers == nil {
+		reviewer.Triggers = &PartialReviewerRoleTriggersConfig{}
+	}
+	return reviewer.Triggers
+}
+
+func ensureReviewerSpecReviewConfig(partial *PartialConfig) *PartialReviewerSpecReviewConfig {
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.SpecReview == nil {
+		reviewer.SpecReview = &PartialReviewerSpecReviewConfig{}
+	}
+	return reviewer.SpecReview
+}
+
+func ensureFixerRoleConfig(partial *PartialConfig) *PartialFixerRoleConfig {
+	roles := ensureRoleConfigs(partial)
+	if roles.Fixer == nil {
+		roles.Fixer = &PartialFixerRoleConfig{}
+	}
+	return roles.Fixer
+}
+
+func ensureFixerRoleTriggersConfig(partial *PartialConfig) *PartialFixerRoleTriggersConfig {
+	fixer := ensureFixerRoleConfig(partial)
+	if fixer.Triggers == nil {
+		fixer.Triggers = &PartialFixerRoleTriggersConfig{}
+	}
+	return fixer.Triggers
 }

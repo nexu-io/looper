@@ -71,7 +71,9 @@
               "installDir": "<home>/.looper/bin",
               "currentTarget": "<current-target>",
               "artifactName": "<artifact-name>",
-              "supportedTargets": ["darwin-arm64"]
+              "supportedTargets": [
+                "darwin-arm64"
+              ]
             }
           },
           "storage": {
@@ -186,7 +188,10 @@
             "inApp": true,
             "osascript": {
               "enabled": true,
-              "soundForLevels": ["action_required", "failure"],
+              "soundForLevels": [
+                "action_required",
+                "failure"
+              ],
               "throttleWindowSeconds": 60
             }
           },
@@ -233,6 +238,50 @@
             "scope": "changed_ranges",
             "publishMode": "single_review",
             "detectDuplicateFindings": true
+          },
+          "roles": {
+            "planner": {
+              "autoDiscovery": true,
+              "triggers": {
+                "labels": [
+                  "looper:plan"
+                ],
+                "labelMode": "all",
+                "requireAssigneeCurrentUser": true
+              }
+            },
+            "reviewer": {
+              "autoDiscovery": true,
+              "triggers": {
+                "includeDrafts": false,
+                "requireReviewRequest": true,
+                "labels": [],
+                "labelMode": "all"
+              },
+              "specReview": {
+                "includeReviewingLabel": true,
+                "reviewingLabel": "looper:spec-reviewing"
+              }
+            },
+            "fixer": {
+              "autoDiscovery": true,
+              "triggers": {
+                "includeDrafts": false,
+                "labels": [],
+                "labelMode": "all",
+                "authorFilter": "current_user"
+              }
+            },
+            "worker": {
+              "autoDiscovery": true,
+              "triggers": {
+                "labels": [
+                  "looper:worker-ready"
+                ],
+                "labelMode": "all",
+                "requireAssigneeCurrentUser": true
+              }
+            }
           },
           "projects": []
         },
@@ -372,7 +421,9 @@
           "reviewer": "running",
           "fixer": null,
           "loopStatus": {
-            "loops": ["running"],
+            "loops": [
+              "running"
+            ],
             "latestRunStatus": "running",
             "runningRunCount": 1
           }

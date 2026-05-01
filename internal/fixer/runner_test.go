@@ -107,6 +107,30 @@ func TestDiscoverPullRequestsFixAllPullRequestsOptIn(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug", "urgent"}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Labels: []string{"bug"}},
+		},
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug", "urgent"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAll}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want only matching PR #42", result.QueueItems)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "" {
+		t.Fatalf("list calls = %#v, want broad query for multi-label filter", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

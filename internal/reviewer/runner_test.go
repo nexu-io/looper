@@ -48,6 +48,21 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"needs-review", "spec"}, reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{"needs-review", "spec"}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: false}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want only matching PR #42", result.QueueItems)
+	}
+}
+
 func TestDiscoverPullRequestsReturnsCurrentUserLookupError(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -141,6 +141,46 @@ Example minimal `~/.looper/config.json`:
     "openPrStrategy": "all_done",
     "addSnapshotMode": "async"
   },
+  "roles": {
+    "planner": {
+      "autoDiscovery": true,
+      "triggers": {
+        "labels": ["looper:plan"],
+        "labelMode": "all",
+        "requireAssigneeCurrentUser": true
+      }
+    },
+    "reviewer": {
+      "autoDiscovery": true,
+      "triggers": {
+        "includeDrafts": false,
+        "requireReviewRequest": true,
+        "labels": [],
+        "labelMode": "all"
+      },
+      "specReview": {
+        "includeReviewingLabel": true,
+        "reviewingLabel": "looper:spec-reviewing"
+      }
+    },
+    "fixer": {
+      "autoDiscovery": true,
+      "triggers": {
+        "includeDrafts": false,
+        "authorFilter": "current_user",
+        "labels": [],
+        "labelMode": "all"
+      }
+    },
+    "worker": {
+      "autoDiscovery": true,
+      "triggers": {
+        "labels": ["looper:worker-ready"],
+        "labelMode": "all",
+        "requireAssigneeCurrentUser": true
+      }
+    }
+  },
   "projects": [
     {
       "id": "looper",
@@ -276,6 +316,7 @@ Default values:
 - `allowAutoApprove`: `false`
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
+- `fixAllPullRequests`: `false`; legacy fixer discovery switch. Prefer `roles.fixer.triggers.authorFilter` for new config.
 - `openPrStrategy`: `all_done`
 - `addSnapshotMode`: `async`
 
@@ -294,6 +335,59 @@ To restore it by default for all project additions:
   }
 }
 ```
+
+### `roles`
+
+The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
+
+Defaults preserve Looper's historical behavior:
+
+- planner discovers open issues labeled `looper:plan` assigned to the current GitHub user
+- worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
+- reviewer discovers open non-draft PRs where the current user is requested for review, plus the `looper:spec-reviewing` follow-up path
+- fixer discovers open non-draft PRs authored by the current user that have actionable review items
+
+Common fields:
+
+- `roles.<role>.autoDiscovery`: when `false`, the scheduler skips new discovery for that role only
+- issue roles (`planner`, `worker`): `triggers.labels`, `triggers.labelMode` (`all` or `any`), and `triggers.requireAssigneeCurrentUser`
+- reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
+- fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
+
+Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+
+Examples:
+
+```json
+{
+  "roles": {
+    "planner": {
+      "triggers": {
+        "labels": ["team:alpha", "needs-plan"],
+        "labelMode": "any",
+        "requireAssigneeCurrentUser": false
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "roles": {
+    "reviewer": {
+      "autoDiscovery": false
+    },
+    "fixer": {
+      "triggers": {
+        "authorFilter": "any"
+      }
+    }
+  }
+}
+```
+
+`defaults.fixAllPullRequests=true` remains supported and maps to `roles.fixer.triggers.authorFilter=any` when `roles.fixer.triggers.authorFilter` is not explicitly configured. If both are present, `roles.fixer.triggers.authorFilter` wins.
 
 ### `projects`
 
@@ -340,6 +434,27 @@ Supported environment overrides:
 - `LOOPER_ALLOW_AUTO_COMMIT`
 - `LOOPER_ALLOW_AUTO_PUSH`
 - `LOOPER_ALLOW_AUTO_APPROVE`
+- `LOOPER_FIX_ALL_PULL_REQUESTS`
+- `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
+- `LOOPER_ROLES_WORKER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_WORKER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
+- `LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL`
+- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL`
+- `LOOPER_ROLES_FIXER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS`
+- `LOOPER_ROLES_FIXER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER`
 
 Boolean environment variables accept:
 

@@ -263,6 +263,14 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	DiscoveryPolicy         DiscoveryPolicy
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery              bool
+	Labels                     []string
+	LabelMode                  config.LabelMode
+	RequireAssigneeCurrentUser bool
 }
 
 type Runner struct {
@@ -281,6 +289,7 @@ type Runner struct {
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	discoveryPolicy         DiscoveryPolicy
 }
 
 type DiscoveryInput struct {
@@ -418,7 +427,11 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted}
+	policy := options.DiscoveryPolicy
+	if policy.LabelMode == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+	}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -435,21 +448,30 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	login := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		var err error
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
 	}
-	login = normalizeLogin(login)
-	if login == "" {
+	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: login, Label: discoveryLabel})
+	assigneeFilter := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		assigneeFilter = login
+	}
+	labelFilter := safeIssueQueryLabel(r.discoveryPolicy.Labels)
+	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, Label: labelFilter})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimIssue(issue, login) {
+		if !shouldClaimIssue(issue, login, r.discoveryPolicy) {
 			result.Skipped++
 			continue
 		}
@@ -771,6 +793,15 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	manual = isManualPlannerQueue(payload)
+	if !manual && r.discoveryPolicy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
+		return checkpoint, nil
+	}
+	if !manual && !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer matches planner labels", repo, issueNumber)
+		return checkpoint, nil
+	}
 	checkpoint.SkipReason = ""
 	releaseOnError = false
 	return checkpoint, nil
@@ -1555,8 +1586,38 @@ func isManualPlannerQueue(payload map[string]any) bool {
 	return ok && manual
 }
 
-func shouldClaimIssue(issue IssueSummary, login string) bool {
-	return includesLogin(issue.Assignees, login) && specpr.HasLabel(issue.Labels, discoveryLabel)
+func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
+	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
+		return false
+	}
+	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+func safeIssueQueryLabel(labels []string) string {
+	if len(labels) == 1 {
+		return labels[0]
+	}
+	return ""
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string, currentLogin string) []string {

@@ -50,6 +50,101 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
+		t.Fatalf("planner role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Reviewer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || !got.Triggers.RequireReviewRequest || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 || !got.SpecReview.IncludeReviewingLabel || got.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+		t.Fatalf("reviewer role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
+		t.Fatalf("fixer role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
+		t.Fatalf("worker role defaults = %#v", got)
+	}
+}
+
+func TestLegacyFixAllPullRequestsMapsToFixerAuthorFilter(t *testing.T) {
+	trueValue := true
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Defaults: &PartialDefaultsConfig{FixAllPullRequests: &trueValue}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if cfg.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny {
+		t.Fatalf("fixer authorFilter = %q, want %q", cfg.Roles.Fixer.Triggers.AuthorFilter, FixerAuthorFilterAny)
+	}
+
+	currentUser := FixerAuthorFilterCurrentUser
+	cfg, err = Normalize(t.TempDir(), PartialConfig{Defaults: &PartialDefaultsConfig{FixAllPullRequests: &trueValue}, Roles: &PartialRoleConfigs{Fixer: &PartialFixerRoleConfig{Triggers: &PartialFixerRoleTriggersConfig{AuthorFilter: &currentUser}}}})
+	if err != nil {
+		t.Fatalf("Normalize() with explicit role error = %v", err)
+	}
+	if cfg.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser {
+		t.Fatalf("explicit fixer authorFilter = %q, want %q", cfg.Roles.Fixer.Triggers.AuthorFilter, FixerAuthorFilterCurrentUser)
+	}
+}
+
+func TestRoleEnvironmentOverrides(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_OSASCRIPT_ENABLED":                                    "false",
+			"LOOPER_ROLES_PLANNER_AUTO_DISCOVERY":                         "false",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_LABELS":                        "needs-plan,team:alpha",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE":                    "any",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER": "false",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS":               "true",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST":       "false",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS":                       "needs-review,spec",
+			"LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL":   "false",
+			"LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER":                   "any",
+			"LOOPER_ROLES_FIXER_TRIGGERS_LABELS":                          "bugfix",
+		}),
+		LookPath: fakeLookPath(map[string]string{}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if loaded.Config.Roles.Planner.AutoDiscovery {
+		t.Fatal("planner autoDiscovery = true, want false")
+	}
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Planner.Triggers.Labels, []string{"needs-plan", "team:alpha"}) {
+		t.Fatalf("planner labels = %#v", loaded.Config.Roles.Planner.Triggers.Labels)
+	}
+	if loaded.Config.Roles.Planner.Triggers.LabelMode != LabelModeAny || loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("planner triggers = %#v", loaded.Config.Roles.Planner.Triggers)
+	}
+	if !loaded.Config.Roles.Reviewer.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Triggers.RequireReviewRequest {
+		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Triggers)
+	}
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.SpecReview.IncludeReviewingLabel {
+		t.Fatalf("reviewer config = %#v", loaded.Config.Roles.Reviewer)
+	}
+	if loaded.Config.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(loaded.Config.Roles.Fixer.Triggers.Labels, []string{"bugfix"}) {
+		t.Fatalf("fixer config = %#v", loaded.Config.Roles.Fixer)
+	}
+}
+
+func reflectStringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 	cwd := t.TempDir()
 	relativePath := filepath.Join("configs", "looper.json")

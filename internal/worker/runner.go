@@ -363,6 +363,14 @@ type Options struct {
 	RetryMaxAttempts                int64
 	OnAgentExecutionStarted         AgentExecutionStartedFunc
 	OnRunCompleted                  RunCompletedFunc
+	DiscoveryPolicy                 DiscoveryPolicy
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery              bool
+	Labels                     []string
+	LabelMode                  config.LabelMode
+	RequireAssigneeCurrentUser bool
 }
 
 type Runner struct {
@@ -388,6 +396,7 @@ type Runner struct {
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onRunCompleted          RunCompletedFunc
+	discoveryPolicy         DiscoveryPolicy
 }
 
 type ProcessResult struct {
@@ -554,6 +563,10 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
+	policy := options.DiscoveryPolicy
+	if policy.LabelMode == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{issueDiscoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -577,6 +590,7 @@ func New(options Options) *Runner {
 		retryMaxAttempts:        retryMaxAttempts,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onRunCompleted:          options.OnRunCompleted,
+		discoveryPolicy:         policy,
 	}
 }
 
@@ -594,21 +608,29 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	login := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		var err error
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
 	}
-	login = normalizeLogin(login)
-	if login == "" {
+	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: login, Label: issueDiscoveryLabel})
+	assigneeFilter := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		assigneeFilter = login
+	}
+	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, Label: safeIssueQueryLabel(r.discoveryPolicy.Labels)})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimWorkerIssue(issue, login) {
+		if !shouldClaimWorkerIssue(issue, login, r.discoveryPolicy) {
 			result.Skipped++
 			continue
 		}
@@ -2468,8 +2490,38 @@ func hasLabel(labels []string, target string) bool {
 	return false
 }
 
-func shouldClaimWorkerIssue(issue IssueSummary, login string) bool {
-	return includesLogin(issue.Assignees, login) && hasLabel(issue.Labels, issueDiscoveryLabel)
+func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
+	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
+		return false
+	}
+	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+func safeIssueQueryLabel(labels []string) string {
+	if len(labels) == 1 {
+		return labels[0]
+	}
+	return ""
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if hasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !hasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
