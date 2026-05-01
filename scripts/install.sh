@@ -127,6 +127,35 @@ verify_checksum() {
   [ "$actual" = "$expected" ] || fail "checksum mismatch: expected $expected, got $actual"
 }
 
+curl_supports_progress_bar() {
+  curl --help all 2>/dev/null | grep -q -- '--progress-bar'
+}
+
+show_download_progress() {
+  case "${LOOPER_DOWNLOAD_PROGRESS:-auto}" in
+    0|false|False|FALSE|no|No|NO|never|Never|NEVER)
+      return 1
+      ;;
+    1|true|True|TRUE|yes|Yes|YES|always|Always|ALWAYS)
+      curl_supports_progress_bar
+      return
+      ;;
+  esac
+
+  [ -t 2 ] && curl_supports_progress_bar
+}
+
+download_file() {
+  url="$1"
+  output="$2"
+
+  if show_download_progress; then
+    curl -fL --progress-bar "$url" -o "$output"
+  else
+    curl -fsSL "$url" -o "$output"
+  fi
+}
+
 need_cmd curl
 need_cmd grep
 
@@ -155,8 +184,8 @@ tmp_binary="$tmp_dir/looper"
 tmp_checksum="$tmp_dir/$asset.sha256"
 
 log "Downloading $binary_url"
-curl -fsSL "$binary_url" -o "$tmp_binary"
-curl -fsSL "$checksum_url" -o "$tmp_checksum"
+download_file "$binary_url" "$tmp_binary"
+download_file "$checksum_url" "$tmp_checksum"
 
 expected_checksum="$(awk '{print $1}' "$tmp_checksum")"
 [ -n "$expected_checksum" ] || fail "invalid checksum file: $checksum_url"
