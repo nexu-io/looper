@@ -85,7 +85,7 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 	allowRemote := cfg.Defaults.AllowAutoPush
 	switch role {
 	case "reviewer":
-		return "Use Looper's trusted `looper review submit` wrapper for review submission. Do not bypass approval, publication, or disclosure policy.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return previewReviewerLifecycleSafety(cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	case "fixer":
 		if !allowRemote {
 			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
@@ -97,6 +97,17 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 		}
 		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	}
+}
+
+func previewReviewerLifecycleSafety(disclosureCfg config.DisclosureConfig, agentModel string) string {
+	return strings.Join([]string{
+		"Use Looper's trusted `looper review submit` wrapper for review submission. Do not bypass approval, publication, or disclosure policy.",
+		"GitHub operation contract: submit exactly one PR review for the run through the trusted Looper CLI review-submit wrapper, with review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly for review submission.",
+		"Before posting, confirm the PR is still open, the head SHA still matches the expected head SHA, and the current GitHub user is still requested for review unless the run is manual.",
+		"Every review body must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
+		"For clean reviews, submit COMMENT unless reviewer policy allows APPROVE; for actionable reviews, submit COMMENT with resolvable inline comments whenever anchors can be validated.",
+		lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentModel),
+	}, "\n")
 }
 
 func previewNoRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {

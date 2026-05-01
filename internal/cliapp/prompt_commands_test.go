@@ -77,6 +77,31 @@ func TestPromptPreviewLifecycleReflectsDisabledRemoteActions(t *testing.T) {
 	}
 }
 
+func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, promptPreviewConfigPayload(t.TempDir(), true))
+
+	exitCode, stdout, stderr := runApp(t, "prompt", "preview", "--project", "project_1", "--role", "reviewer", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(prompt preview reviewer) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{
+		"trusted `looper review submit` wrapper",
+		"GitHub operation contract: submit exactly one PR review",
+		"looper:review id=... head=... outcome=clean|actionable",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
+	for _, notWant := range []string{"git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request"} {
+		if strings.Contains(stdout, notWant) {
+			t.Fatalf("reviewer prompt preview included generic git/PR lifecycle text %q:\n%s", notWant, stdout)
+		}
+	}
+}
+
 func promptPreviewConfigPayload(repoPath string, allowAutoPush bool) map[string]any {
 	return map[string]any{
 		"notifications": map[string]any{
