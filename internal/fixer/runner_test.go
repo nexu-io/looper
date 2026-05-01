@@ -178,6 +178,30 @@ func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToLimit(t *testing.T) 
 	}
 }
 
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToDefaultLimit(t *testing.T) {
+	t.Parallel()
+	firstPage := make([]PullRequestSummary, 30)
+	for i := range firstPage {
+		firstPage[i] = PullRequestSummary{Number: int64(42 + i), State: "OPEN", HeadSHA: fmt.Sprintf("head-%d", 42+i), Labels: []string{"bug"}}
+	}
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"bug":    firstPage,
+		"urgent": {{Number: 99, State: "OPEN", HeadSHA: "head-99", Labels: []string{"urgent"}}},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAny, AuthorFilter: config.FixerAuthorFilterAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 0, "looper")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 30 {
+		t.Fatalf("len(prs) = %d, want default cap", len(prs))
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "bug" || github.listCalls[0].Limit != 30 {
+		t.Fatalf("list calls = %#v, want discovery to use and stop at default limit", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

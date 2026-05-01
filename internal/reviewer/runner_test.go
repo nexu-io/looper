@@ -92,6 +92,30 @@ func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToLimit(t *testing.T) 
 	}
 }
 
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToDefaultLimit(t *testing.T) {
+	t.Parallel()
+	firstPage := make([]PullRequestSummary, 30)
+	for i := range firstPage {
+		firstPage[i] = PullRequestSummary{Number: int64(42 + i), State: "OPEN", Labels: []string{"needs-review"}}
+	}
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"needs-review": firstPage,
+		"spec":         {{Number: 99, State: "OPEN", Labels: []string{"spec"}}},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"needs-review", "spec"}, LabelMode: config.LabelModeAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 0)
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 30 {
+		t.Fatalf("len(prs) = %d, want default cap", len(prs))
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "needs-review" || github.listCalls[0].Limit != 30 {
+		t.Fatalf("list calls = %#v, want discovery to use and stop at default limit", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsReturnsCurrentUserLookupError(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

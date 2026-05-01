@@ -605,6 +605,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(r.discoveryPolicy.Labels)
+	effectiveLimit := defaultDiscoveryLimit(limit)
 	if len(labels) == 0 {
 		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author})
 	}
@@ -618,10 +619,10 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 	result := []PullRequestSummary{}
 	seen := map[int64]struct{}{}
 	for _, label := range labels {
-		if limit > 0 && len(result) >= limit {
+		if len(result) >= effectiveLimit {
 			break
 		}
-		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: label})
+		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: effectiveLimit, Author: author, Label: label})
 		if err != nil {
 			return nil, err
 		}
@@ -631,12 +632,19 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 			}
 			seen[pr.Number] = struct{}{}
 			result = append(result, pr)
-			if limit > 0 && len(result) >= limit {
+			if len(result) >= effectiveLimit {
 				break
 			}
 		}
 	}
 	return result, nil
+}
+
+func defaultDiscoveryLimit(limit int) int {
+	if limit <= 0 {
+		return 30
+	}
+	return limit
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
