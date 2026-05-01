@@ -654,6 +654,13 @@ func ExtractConfigArgs(argv []string) []string {
 
 		extracted = append(extracted, arg)
 		if _, isBool := configBoolFlagNames[name]; isBool {
+			if !strings.Contains(trimmed, "=") && index+1 < len(argv) {
+				next := argv[index+1]
+				if isConfigBoolLiteral(next) {
+					extracted = append(extracted, next)
+					index++
+				}
+			}
 			continue
 		}
 		if !strings.Contains(trimmed, "=") && index+1 < len(argv) {
@@ -666,4 +673,13 @@ func ExtractConfigArgs(argv []string) []string {
 	}
 
 	return extracted
+}
+
+func isConfigBoolLiteral(value string) bool {
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on", "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
 }

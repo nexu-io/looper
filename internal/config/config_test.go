@@ -177,6 +177,25 @@ func TestNoCustomInstructionsCLIOverrideDisablesInstructions(t *testing.T) {
 	}
 }
 
+func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"instructions": {"enabled": false}, "roles": {"worker": {"instructions": "Prefer minimal changes."}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, Args: []string{"--no-custom-instructions", "false"}, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Instructions.Enabled {
+		t.Fatal("instructions enabled = false, want true")
+	}
+	if block := BuildCustomInstructionBlock(loaded.Config, "", "worker"); !strings.Contains(block.Text, "Prefer minimal changes.") {
+		t.Fatalf("enabled custom instruction block = %q", block.Text)
+	}
+}
+
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:      t.TempDir(),

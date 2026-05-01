@@ -192,6 +192,11 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 					return parsedCLIArgs{}, fmt.Errorf("invalid value for --no-custom-instructions: %q is not a boolean", value)
 				}
 				disable = *parsedValue
+			} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+				if parsedValue, err := parseBoolean(args[index+1]); err == nil {
+					disable = *parsedValue
+					index++
+				}
 			}
 			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
 		case matchesFlag(arg, "--host"):
