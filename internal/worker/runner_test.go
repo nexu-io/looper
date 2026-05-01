@@ -1172,6 +1172,54 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedQueueItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want one self-assignment", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.Repo != "acme/looper" || call.IssueNumber != 27 || len(call.Assignees) != 1 || call.Assignees[0] != "worker-login" {
+		t.Fatalf("add assignee call = %#v, want worker-login on acme/looper#27", call)
+	}
+}
+
+func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}, addAssigneeErr: fmt.Errorf("permission denied")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !strings.Contains(result.Summary, "Unable to assign issue acme/looper#27 to worker-login") {
+		t.Fatalf("result = %#v, want clear retryable assignment failure", result)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: "issue:acme/looper:27", Owner: "retry", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() = false, want assignment failure to release issue lock")
+	}
+}
+
 func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2076,6 +2124,8 @@ type fakeGitHubGateway struct {
 	updatePRTitleIndex      int
 	removeLabels            []PullRequestLabelsInput
 	reviewerCalls           []PullRequestReviewersInput
+	addAssigneeCalls        []IssueAssigneesInput
+	addAssigneeErr          error
 	createPRIndex           int
 }
 
@@ -2084,6 +2134,11 @@ func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 		return "octocat", nil
 	}
 	return f.currentLogin, nil
+}
+
+func (f *fakeGitHubGateway) AddIssueAssignees(_ context.Context, input IssueAssigneesInput) error {
+	f.addAssigneeCalls = append(f.addAssigneeCalls, input)
+	return f.addAssigneeErr
 }
 
 func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {

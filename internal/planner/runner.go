@@ -138,10 +138,18 @@ type PullRequestReviewersInput struct {
 	CWD       string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
@@ -718,13 +726,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	if err != nil {
 		return input.Checkpoint, err
 	}
-	currentLogin := firstNonEmpty(stringFromAnyDefault(payload["currentUserLogin"]), input.CheckpointIssueLogin())
-	if currentLogin == "" {
-		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err == nil {
-			currentLogin = normalizeLogin(login)
-		}
-	}
+	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), buildIssueLockKey(repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -735,20 +737,42 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	if !acquired {
 		return input.Checkpoint, &loopError{message: fmt.Sprintf("Issue lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+		}
+	}()
+	manual := isManualPlannerQueue(payload)
+	if !manual && !specpr.HasLabel(detail.Labels, discoveryLabel) {
+		checkpoint := input.Checkpoint
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+		checkpoint.ClaimedLockKey = lockKey
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
+		releaseOnError = false
+		return checkpoint, nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
+	}
+	currentLogin = normalizeLogin(login)
+	if currentLogin == "" {
+		return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue self-assignment on %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
+	}
+	if currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
+			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
+		}
+		detail.Assignees = appendUniqueStrings(detail.Assignees, currentLogin)
+	}
 	checkpoint := input.Checkpoint
 	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	manual := isManualPlannerQueue(payload)
-	if !manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
-		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
-		return checkpoint, nil
-	}
-	if !manual && !specpr.HasLabel(detail.Labels, discoveryLabel) {
-		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer has %s", repo, issueNumber, discoveryLabel)
-		return checkpoint, nil
-	}
 	checkpoint.SkipReason = ""
+	releaseOnError = false
 	return checkpoint, nil
 }
 

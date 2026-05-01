@@ -30,6 +30,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
 			return shell.Result{Stdout: "{}"}, nil
+		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
+			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr view"):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
@@ -89,6 +91,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	}
 	if err := gateway.UpdateIssueComment(context.Background(), UpdateIssueCommentInput{Repo: "acme/looper", CommentID: 91, Body: "Looper finished"}); err != nil {
 		t.Fatalf("UpdateIssueComment() error = %v", err)
+	}
+	if err := gateway.AddIssueAssignees(context.Background(), IssueAssigneesInput{Repo: "acme/looper", IssueNumber: 8, Assignees: []string{"reviewer"}}); err != nil {
+		t.Fatalf("AddIssueAssignees() error = %v", err)
 	}
 	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
 	if err != nil {
@@ -193,6 +198,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"api repos/acme/looper/issues/8",
 		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
 		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
+		"api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer",
 		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper --force",
 		"label create ready --repo acme/looper --color 5319e7 --description Managed by looper --force",
 		"api repos/acme/looper/issues/42/labels --method POST -f labels[]=phase-1 -f labels[]=ready",

@@ -108,6 +108,13 @@ type IssueCommentInput struct {
 	CWD         string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -188,6 +195,7 @@ type GitHubGateway interface {
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
@@ -929,6 +937,12 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if !acquired {
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
+	if work.IssueNumber > 0 && r.github != nil {
+		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+			return checkpoint, err
+		}
+	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
 		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
 	}
@@ -938,6 +952,28 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	checkpoint.SkipReason = ""
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusRunning, "")
 	return checkpoint, nil
+}
+
+func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd string) error {
+	if r.github == nil || work.IssueNumber <= 0 {
+		return nil
+	}
+	repo := issueLookupRepo(work)
+	if repo == "" {
+		return nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
+	}
+	login = normalizeLogin(login)
+	if login == "" {
+		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
+	}
+	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {
+		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
+	}
+	return nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
