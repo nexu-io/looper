@@ -86,6 +86,11 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 	switch role {
 	case "reviewer":
 		return previewReviewerLifecycleSafety(cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+	case "worker":
+		if !previewWorkerAllowsRemoteLifecycle(cfg) {
+			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		}
+		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	case "fixer":
 		if !allowRemote {
 			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
@@ -97,6 +102,10 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 		}
 		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	}
+}
+
+func previewWorkerAllowsRemoteLifecycle(cfg config.Config) bool {
+	return cfg.Defaults.AllowAutoPush && cfg.Defaults.OpenPRStrategy != config.OpenPRStrategyManual
 }
 
 func previewReviewerLifecycleSafety(disclosureCfg config.DisclosureConfig, agentModel string) string {

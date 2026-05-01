@@ -77,6 +77,27 @@ func TestPromptPreviewLifecycleReflectsDisabledRemoteActions(t *testing.T) {
 	}
 }
 
+func TestPromptPreviewWorkerHonorsManualOpenPRStrategy(t *testing.T) {
+	t.Parallel()
+
+	payload := promptPreviewConfigPayload(t.TempDir(), true)
+	payload["defaults"].(map[string]any)["openPrStrategy"] = "manual"
+	configPath := writeEditableCLIConfigWithPayload(t, payload)
+
+	exitCode, stdout, stderr := runApp(t, "prompt", "preview", "--project", "project_1", "--role", "worker", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(prompt preview worker manual openPrStrategy) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{"remote actions disabled by Looper configuration", "expectPush=false", "expectPR=false"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "expectPush=true") || strings.Contains(stdout, "expectPR=true") {
+		t.Fatalf("worker prompt preview advertised remote actions despite defaults.openPrStrategy=manual:\n%s", stdout)
+	}
+}
+
 func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	t.Parallel()
 
