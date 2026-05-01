@@ -1374,7 +1374,8 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		}
 		specReviewingLabel := r.specReviewingLabel()
 		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
-		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
+		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
 			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 			if err != nil {
 				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
