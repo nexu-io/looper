@@ -85,7 +85,7 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 	allowRemote := cfg.Defaults.AllowAutoPush
 	switch role {
 	case "reviewer":
-		return previewReviewerLifecycleSafety(cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return previewReviewerLifecycleSafety(promptDerefString(cfg.Tools.LooperPath), cfg.Disclosure, promptDerefString(cfg.Agent.Model))
 	case "worker":
 		if !previewWorkerAllowsRemoteLifecycle(cfg) {
 			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
@@ -110,7 +110,13 @@ func previewWorkerAllowsRemoteLifecycle(cfg config.Config) bool {
 	return cfg.Defaults.AllowAutoPush && cfg.Defaults.OpenPRStrategy != config.OpenPRStrategyManual
 }
 
-func previewReviewerLifecycleSafety(disclosureCfg config.DisclosureConfig, agentModel string) string {
+func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+	if strings.TrimSpace(looperCLIPath) == "" {
+		return strings.Join([]string{
+			"GitHub operation contract: a trusted Looper CLI path was not detected for reviewer runs, so agents cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.",
+			lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentModel),
+		}, "\n")
+	}
 	return strings.Join([]string{
 		"Use Looper's trusted `looper review submit` wrapper for review submission. Do not bypass approval, publication, or disclosure policy.",
 		"GitHub operation contract: submit exactly one PR review for the run through the trusted Looper CLI review-submit wrapper, with review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly for review submission.",

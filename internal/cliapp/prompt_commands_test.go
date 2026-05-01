@@ -122,7 +122,9 @@ func TestPromptPreviewWorkerHonorsManualOpenPRStrategy(t *testing.T) {
 func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	t.Parallel()
 
-	configPath := writeEditableCLIConfigWithPayload(t, promptPreviewConfigPayload(t.TempDir(), true))
+	payload := promptPreviewConfigPayload(t.TempDir(), true)
+	payload["tools"] = map[string]any{"looperPath": "/opt/looper/bin/looper"}
+	configPath := writeEditableCLIConfigWithPayload(t, payload)
 
 	exitCode, stdout, stderr := runApp(t, "prompt", "preview", "--project", "project_1", "--role", "reviewer", "--config", configPath)
 	if exitCode != 0 {
@@ -140,6 +142,34 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	for _, notWant := range []string{"git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request"} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("reviewer prompt preview included generic git/PR lifecycle text %q:\n%s", notWant, stdout)
+		}
+	}
+}
+
+func TestPromptPreviewReviewerReflectsMissingTrustedWrapper(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, promptPreviewConfigPayload(t.TempDir(), true))
+	missingLookPath := func(string) (string, error) { return "", os.ErrNotExist }
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, missingLookPath, "prompt", "preview", "--project", "project_1", "--role", "reviewer", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(prompt preview reviewer missing looper) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{
+		"trusted Looper CLI path was not detected",
+		"trusted looper review submit wrapper unavailable",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
+	for _, notWant := range []string{
+		"Use Looper's trusted `looper review submit` wrapper",
+		"submit exactly one PR review for the run through the trusted Looper CLI review-submit wrapper",
+	} {
+		if strings.Contains(stdout, notWant) {
+			t.Fatalf("reviewer prompt preview advertised available submit wrapper %q despite missing looper path:\n%s", notWant, stdout)
 		}
 	}
 }
