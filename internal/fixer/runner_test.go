@@ -152,6 +152,32 @@ func TestDiscoverPullRequestsQueriesEachAnyModeLabel(t *testing.T) {
 	}
 }
 
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToLimit(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"bug": {
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Labels: []string{"bug"}},
+		},
+		"urgent": {
+			{Number: 44, State: "OPEN", HeadSHA: "head-44", Labels: []string{"urgent"}},
+			{Number: 45, State: "OPEN", HeadSHA: "head-45", Labels: []string{"urgent"}},
+		},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"bug", "urgent"}, LabelMode: config.LabelModeAny, AuthorFilter: config.FixerAuthorFilterAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 2, "looper")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 2 || prs[0].Number != 42 || prs[1].Number != 43 {
+		t.Fatalf("prs = %#v, want first two unique PRs capped to limit", prs)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "bug" {
+		t.Fatalf("list calls = %#v, want discovery to stop after reaching limit", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1060,6 +1086,7 @@ func (f *runnerFixture) nowISO() string {
 type fakeGitHubGateway struct {
 	currentUser      string
 	listOpen         []PullRequestSummary
+	listOpenByLabel  map[string][]PullRequestSummary
 	listCalls        []ListOpenPullRequestsInput
 	viewResponses    []PullRequestDetail
 	viewIndex        int
@@ -1070,6 +1097,9 @@ type fakeGitHubGateway struct {
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	f.listCalls = append(f.listCalls, input)
+	if f.listOpenByLabel != nil {
+		return append([]PullRequestSummary(nil), f.listOpenByLabel[input.Label]...), nil
+	}
 	result := append([]PullRequestSummary(nil), f.listOpen...)
 	for index := range result {
 		if result[index].Author == "" {

@@ -66,6 +66,32 @@ func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
 	}
 }
 
+func TestListOpenPullRequestsForDiscoveryCapsAnyModeLabelsToLimit(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{
+		"needs-review": {
+			{Number: 42, State: "OPEN", Labels: []string{"needs-review"}},
+			{Number: 43, State: "OPEN", Labels: []string{"needs-review"}},
+		},
+		"spec": {
+			{Number: 44, State: "OPEN", Labels: []string{"spec"}},
+			{Number: 45, State: "OPEN", Labels: []string{"spec"}},
+		},
+	}}
+	runner := New(Options{GitHub: github, DiscoveryPolicy: DiscoveryPolicy{Labels: []string{"needs-review", "spec"}, LabelMode: config.LabelModeAny}})
+
+	prs, err := runner.listOpenPullRequestsForDiscovery(context.Background(), "acme/looper", "/tmp/repo", 2)
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscovery() error = %v", err)
+	}
+	if len(prs) != 2 || prs[0].Number != 42 || prs[1].Number != 43 {
+		t.Fatalf("prs = %#v, want first two unique PRs capped to limit", prs)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "needs-review" {
+		t.Fatalf("list calls = %#v, want discovery to stop after reaching limit", github.listCalls)
+	}
+}
+
 func TestDiscoverPullRequestsReturnsCurrentUserLookupError(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2932,10 +2958,14 @@ type fakeGitHubGateway struct {
 	addLabelCalls                   []PullRequestLabelsInput
 	removeLabelCalls                []PullRequestLabelsInput
 	listCalls                       []ListOpenPullRequestsInput
+	listOpenByLabel                 map[string][]PullRequestSummary
 }
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	g.listCalls = append(g.listCalls, input)
+	if g.listOpenByLabel != nil {
+		return append([]PullRequestSummary(nil), g.listOpenByLabel[input.Label]...), nil
+	}
 	reviewRequests := g.effectiveReviewRequests()
 	headSHA := g.listHeadSHA
 	if headSHA == "" {

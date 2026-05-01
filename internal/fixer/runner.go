@@ -618,6 +618,9 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 	result := []PullRequestSummary{}
 	seen := map[int64]struct{}{}
 	for _, label := range labels {
+		if limit > 0 && len(result) >= limit {
+			break
+		}
 		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: label})
 		if err != nil {
 			return nil, err
@@ -628,6 +631,9 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 			}
 			seen[pr.Number] = struct{}{}
 			result = append(result, pr)
+			if limit > 0 && len(result) >= limit {
+				break
+			}
 		}
 	}
 	return result, nil
