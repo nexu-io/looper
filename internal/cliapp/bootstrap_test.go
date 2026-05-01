@@ -829,6 +829,98 @@ func TestBootstrapRestartsReachableStaleDaemonAfterReinstall(t *testing.T) {
 	assertJSONContains(t, stdout.String(), "daemonRunning", true)
 }
 
+func TestBootstrapInstalledStatusAPIErrorFailsWithoutSpawnOrRestart(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "bootstrap-status-error.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	binary := []byte("looperd-binary")
+	checksum := sha256.Sum256(binary)
+	checksumText := hex.EncodeToString(checksum[:]) + "  looperd-darwin-arm64\n"
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var spawnCalls atomic.Int32
+	var killCalls atomic.Int32
+
+	app := New(Deps{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		LookPath: func(file string) (string, error) {
+			switch file {
+			case "git", "gh", "osascript":
+				return "/usr/bin/" + file, nil
+			default:
+				return "", fmt.Errorf("not found")
+			}
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/powerformer/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, binary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, checksumText), nil
+			case "http://127.0.0.1:17310/api/v1/status":
+				return jsonResponse(t, http.StatusUnauthorized, `{"ok":false,"error":{"message":"missing token"}}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				if _, err := os.Stat(managedPath); err != nil {
+					return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+				}
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = args
+			_ = cwd
+			_ = env
+			spawnCalls.Add(1)
+			return 0, fmt.Errorf("spawn should not be called")
+		},
+		KillProcess: func(pid int, signal int) error {
+			killCalls.Add(1)
+			return fmt.Errorf("unexpected kill(%d, %d)", pid, signal)
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--force", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([bootstrap --yes --force]) exit code = 0, want error")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("Run([bootstrap --yes --force]) stdout = %q, want empty string", stdout.String())
+	}
+	if spawnCalls.Load() != 0 {
+		t.Fatalf("spawnDetached calls = %d, want 0", spawnCalls.Load())
+	}
+	if killCalls.Load() != 0 {
+		t.Fatalf("KillProcess calls = %d, want 0", killCalls.Load())
+	}
+	for _, want := range []string{"looper:", "missing token"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want to contain %q", stderr.String(), want)
+		}
+	}
+}
+
 func TestNormalizeBootstrapBaseURLTreatsLoopbackHostsAsLocal(t *testing.T) {
 	got := normalizeBootstrapBaseURL("http://localhost:17310/")
 	want := normalizeBootstrapBaseURL("http://127.0.0.1:17310")

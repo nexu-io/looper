@@ -690,7 +690,7 @@ func (r *commandRuntime) bootstrapAPIReachableForInstalled(ctx context.Context, 
 		return false, err
 	}
 	if !isBootstrapProbeReachabilityError(err) {
-		return true, nil
+		return false, err
 	}
 
 	_, healthErr := r.getJSONWithClient(ctx, client, "/api/v1/healthz")
