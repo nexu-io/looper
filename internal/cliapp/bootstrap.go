@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -569,11 +570,12 @@ func (r *commandRuntime) ensureBootstrapDaemon(ctx context.Context, force bool) 
 	if err != nil {
 		return "", false, err
 	}
-	if !force && installed != nil {
+	matchingTag := bootstrapDaemonReleaseTag()
+	if !force && installed != nil && bootstrapDaemonVersionMatches(installed.Version) {
 		return "already-installed", false, nil
 	}
 	reinstall := force || installed != nil
-	result, err := r.installManagedDaemon(ctx, reinstall, "", r.app.stderr())
+	result, err := r.installManagedDaemon(ctx, reinstall, matchingTag, r.app.stderr())
 	if err != nil {
 		return "", false, fmt.Errorf("install managed daemon: %w", err)
 	}
@@ -584,6 +586,25 @@ func (r *commandRuntime) ensureBootstrapDaemon(ctx context.Context, force bool) 
 		return "reinstalled", true, nil
 	}
 	return "installed", true, nil
+}
+
+func bootstrapDaemonVersionMatches(daemonVersion string) bool {
+	cliVersion := strings.TrimSpace(version.Current().Version)
+	if cliVersion == "" || cliVersion == "0.0.0-dev" || strings.Contains(cliVersion, "dev") {
+		return strings.TrimSpace(daemonVersion) != ""
+	}
+	return strings.TrimPrefix(strings.TrimSpace(daemonVersion), "v") == strings.TrimPrefix(cliVersion, "v")
+}
+
+func bootstrapDaemonReleaseTag() string {
+	cliVersion := strings.TrimSpace(version.Current().Version)
+	if cliVersion == "" || cliVersion == "0.0.0-dev" || strings.Contains(cliVersion, "dev") {
+		return ""
+	}
+	if strings.HasPrefix(cliVersion, "v") {
+		return cliVersion
+	}
+	return "v" + cliVersion
 }
 
 func (r *commandRuntime) bootstrapAPIReachable(ctx context.Context, client *DaemonAPIClient) (bool, error) {

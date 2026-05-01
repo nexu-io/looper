@@ -235,6 +235,38 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	}
 }
 
+func TestDaemonStartReportsNonExecutableManagedDaemon(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("looperd"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, os.ErrNotExist
+		})},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", writeDaemonCLIConfig(t, "http://daemon.test")})
+	if exitCode == 0 {
+		t.Fatalf("Run([daemon start]) exit code = 0, want error")
+	}
+	for _, want := range []string{"not executable", "chmod +x " + managedPath, "looper daemon install --force"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want to contain %q", stderr.String(), want)
+		}
+	}
+}
+
 func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
 	homeDir := t.TempDir()
 	callerDir := t.TempDir()

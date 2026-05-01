@@ -177,6 +177,9 @@ if [ "$install_dir" = "$HOME/.local/bin" ] && ! in_path_dir "$install_dir"; then
 fi
 
 log ""
+log "This installer only installs the looper CLI."
+log "looper bootstrap will install/start the matching looperd daemon."
+log ""
 log "Next steps:"
 log "  looper bootstrap"
 log "  looper status"

@@ -162,6 +162,93 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 	}
 }
 
+func TestBootstrapReportsNonExecutableManagedDaemon(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("looperd"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		LookPath: func(file string) (string, error) {
+			return "/usr/bin/" + file, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--config", filepath.Join(t.TempDir(), "config.json")})
+	if exitCode == 0 {
+		t.Fatalf("Run([bootstrap]) exit code = 0, want error")
+	}
+	for _, want := range []string{"not executable", "chmod +x " + managedPath, "looper daemon install --force"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want to contain %q", stderr.String(), want)
+		}
+	}
+}
+
+func TestBootstrapReportsInvalidManagedDaemon(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("corrupt"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stderr:   stderr,
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		LookPath: func(file string) (string, error) {
+			return "/usr/bin/" + file, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "/usr/bin/gh" && strings.Join(args, " ") == "auth status" {
+				return commandExecutionResult{ExitCode: 0}, nil
+			}
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "exec format error"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"bootstrap", "--yes", "--config", filepath.Join(t.TempDir(), "config.json")})
+	if exitCode == 0 {
+		t.Fatalf("Run([bootstrap]) exit code = 0, want error")
+	}
+	for _, want := range []string{"version check failed", "exec format error", "looper daemon install --force"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want to contain %q", stderr.String(), want)
+		}
+	}
+}
+
 func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 	t.Parallel()
 
