@@ -43,4 +43,5 @@ Flags:
   --reviewer-loop-enabled <bool> Enable reviewer follow-up loops by default
   --reviewer-max-iterations-per-head <count> Reviewer loop max iterations per head
   --reviewer-max-iterations-per-pr <count> Reviewer loop max iterations per PR
+  --reviewer-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
   --reviewer-quiet-period-seconds <seconds> Reviewer loop quiet period
