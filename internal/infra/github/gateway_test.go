@@ -316,6 +316,28 @@ func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewStripsDisclosureFromInlineComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		runner.stdin = options.Stdin
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	anchors := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1 +1 @@\n+new\n")
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "<!-- looper:stamp v=1 -->Please fix `value`.", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors})
+	if err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if strings.Contains(runner.stdin, "looper:stamp") || !strings.Contains(runner.stdin, "Please fix `value`.") {
+		t.Fatalf("review payload = %s, want inline disclosure stripped and markdown preserved", runner.stdin)
+	}
+}
+
 func TestGatewayResolveReviewThreadReturnsNotFound(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

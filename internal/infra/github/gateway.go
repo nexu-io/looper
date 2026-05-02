@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/diffanchor"
+	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -732,6 +733,9 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	if gateApplies && len(flags) > 0 {
 		return fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
 	}
+	for i := range input.Comments {
+		input.Comments[i].Body = stripInlineReviewDisclosure(input.Comments[i].Body)
+	}
 	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
 		payload := map[string]any{
 			"event":     input.Event,
@@ -774,6 +778,14 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	}
 	_, err = g.runGh(ctx, input.CWD, "", args...)
 	return err
+}
+
+func stripInlineReviewDisclosure(body string) string {
+	if !strings.Contains(body, disclosure.Marker) {
+		return body
+	}
+	cleaned := strings.TrimSpace(strings.ReplaceAll(body, disclosure.Marker, ""))
+	return cleaned
 }
 
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
