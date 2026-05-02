@@ -1420,7 +1420,8 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, r.allowAutoApprove)
+	shouldTransitionSpecLabels := r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove
+	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
 }
 
 func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, enabled bool) error {
