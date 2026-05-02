@@ -90,7 +90,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	var anchors *diffanchor.Index
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, event, payload, commitID, cwd)
+			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, event, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
 	}
@@ -101,7 +101,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, CWD: cwd}); err != nil {
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return fmt.Errorf("submit validated PR review: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
@@ -237,8 +237,8 @@ func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment)
 	return errors.Is(err, githubinfra.ErrDiffTooLarge) && len(comments) == 0
 }
 
-func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string) error {
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, CWD: cwd}); err != nil {
+func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
 		return fmt.Errorf("submit PR review without anchor validation: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})

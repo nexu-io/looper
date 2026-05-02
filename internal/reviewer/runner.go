@@ -103,9 +103,11 @@ type PullRequestDetail struct {
 	BaseRefName    string
 	Author         string
 	ReviewRequests []string
+	HasConflicts   bool
 	ChecksSummary  string
 	Diff           string
 	Comments       []map[string]any
+	Reviews        []map[string]any
 }
 
 type CreateWorktreeInput struct {
@@ -408,17 +410,19 @@ type reviewerCheckpoint struct {
 }
 
 type checkpointDetail struct {
-	Title          string   `json:"title,omitempty"`
-	State          string   `json:"state,omitempty"`
-	IsDraft        bool     `json:"isDraft,omitempty"`
-	ReviewDecision string   `json:"reviewDecision,omitempty"`
-	Labels         []string `json:"labels,omitempty"`
-	HeadSHA        string   `json:"headSha,omitempty"`
-	BaseSHA        string   `json:"baseSha,omitempty"`
-	HeadRefName    string   `json:"headRefName,omitempty"`
-	BaseRefName    string   `json:"baseRefName,omitempty"`
-	Author         string   `json:"author,omitempty"`
-	ReviewRequests []string `json:"reviewRequests,omitempty"`
+	Title          string           `json:"title,omitempty"`
+	State          string           `json:"state,omitempty"`
+	IsDraft        bool             `json:"isDraft,omitempty"`
+	ReviewDecision string           `json:"reviewDecision,omitempty"`
+	Labels         []string         `json:"labels,omitempty"`
+	HeadSHA        string           `json:"headSha,omitempty"`
+	BaseSHA        string           `json:"baseSha,omitempty"`
+	HeadRefName    string           `json:"headRefName,omitempty"`
+	BaseRefName    string           `json:"baseRefName,omitempty"`
+	Author         string           `json:"author,omitempty"`
+	ReviewRequests []string         `json:"reviewRequests,omitempty"`
+	HasConflicts   bool             `json:"hasConflicts,omitempty"`
+	Reviews        []map[string]any `json:"reviews,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -501,7 +505,7 @@ func New(options Options) *Runner {
 	}
 	loopConfig := options.LoopConfig
 	if loopConfig.MaxIterationsPerPR == 0 {
-		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 900, MinPublishIntervalSeconds: 1800, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 	}
 	scope := options.Scope
 	if scope == "" {
@@ -1101,7 +1105,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Reviews: cloneObjectSlice(detail.Reviews)}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -1135,6 +1139,20 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, err
 		}
 		return checkpoint, nil
+	}
+	if checkpoint.Detail.HasConflicts {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
+		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
+			return checkpoint, nil
+		}
 	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
@@ -1630,7 +1648,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), r.discoveryPolicy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -1681,6 +1699,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
+		}
+		if reason, ok := rediscoverySignalFromAgentResult(result, !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
+		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
 		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
@@ -2434,6 +2460,59 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 	return "", false
 }
 
+func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
+	login = normalizeLogin(login)
+	headSHA = strings.TrimSpace(headSHA)
+	if login == "" || headSHA == "" {
+		return false
+	}
+	for _, review := range reviews {
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if authorLogin, ok := stringFromAny(author["login"]); !ok || normalizeLogin(authorLogin) != login {
+			continue
+		}
+		state, _ := stringFromAny(review["state"])
+		if !isSubmittedReviewState(state) {
+			continue
+		}
+		commit, ok := review["commit"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if oid, ok := stringFromAny(commit["oid"]); ok && strings.TrimSpace(oid) == headSHA {
+			return true
+		}
+	}
+	return false
+}
+
+func isSubmittedReviewState(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED", "CHANGES_REQUESTED", "COMMENTED":
+		return true
+	default:
+		return false
+	}
+}
+
+func rediscoverySignalFromAgentResult(result AgentResult, allowReviewRequestSignal bool) (string, bool) {
+	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
+		for _, line := range strings.Split(candidate, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case line == "PR head changed before publish" || strings.HasPrefix(line, "PR head changed before publish:"):
+				return line, true
+			case allowReviewRequestSignal && line == "review request removed before publish":
+				return line, true
+			}
+		}
+	}
+	return "", false
+}
+
 func stepsFrom(start ReviewerStep) []ReviewerStep {
 	startIndex := 0
 	for i, step := range reviewerStepSequence {
@@ -2898,11 +2977,11 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
 	return prompt
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -2964,6 +3043,8 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
+	} else if !requireReviewRequest {
+		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
@@ -3064,9 +3145,9 @@ func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRun
 	stamper := disclosure.Stamper{Config: disclosureCfg, Version: version.Current().Version, Agent: agentRuntime, Model: agentModel}
 	reviewBodyInstruction := "Every GitHub review body you post must use looper's configured disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
 	if disclosureCfg.Channels.InlineCommentVisible {
-		return reviewBodyInstruction + " Every inline review comment must include the hidden stamp marker immediately followed by the same visible Markdown footer."
+		return reviewBodyInstruction + " Every inline review comment you post must also use looper's configured visible inline disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
 	}
-	return reviewBodyInstruction + " Inline review comments must use only the hidden `" + disclosure.Marker + "` marker, without a visible disclosure footer."
+	return reviewBodyInstruction + " Every inline review comment you post must include only the hidden looper stamp marker `" + disclosure.Marker + "` as its disclosure. Do not add visible looper disclosure footers to inline review comments."
 }
 
 func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
@@ -3165,13 +3246,19 @@ func cloneStrings(values []string) []string {
 	return append([]string(nil), values...)
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
+func cloneObjectSlice(values []map[string]any) []map[string]any {
+	if values == nil {
+		return nil
 	}
-	return ""
+	cloned := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		clonedValue := make(map[string]any, len(value))
+		for key, inner := range value {
+			clonedValue[key] = inner
+		}
+		cloned = append(cloned, clonedValue)
+	}
+	return cloned
 }
 
 func mustMarshalJSON(value any) string {
@@ -3188,6 +3275,15 @@ func stringFromAny(value any) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func optionalString(value string) *string {

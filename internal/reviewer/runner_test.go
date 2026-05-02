@@ -48,6 +48,34 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestReviewDisclosureInstructionPreservesVisibleInlineGuidance(t *testing.T) {
+	t.Parallel()
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Channels.InlineCommentVisible = true
+
+	instruction := reviewDisclosureInstruction(disclosureCfg, "opencode", "")
+	if !strings.Contains(instruction, "Every inline review comment you post must also use looper's configured visible inline disclosure style") {
+		t.Fatalf("instruction = %q, want visible inline disclosure guidance", instruction)
+	}
+	if strings.Contains(instruction, "Do not add looper disclosure footers or hidden looper stamp markers to inline review comments") {
+		t.Fatalf("instruction = %q, should not suppress enabled inline disclosure", instruction)
+	}
+}
+
+func TestReviewDisclosureInstructionUsesHiddenInlineMarkerWhenVisibleDisabled(t *testing.T) {
+	t.Parallel()
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Channels.InlineCommentVisible = false
+
+	instruction := reviewDisclosureInstruction(disclosureCfg, "opencode", "")
+	if !strings.Contains(instruction, "Every inline review comment you post must include only the hidden looper stamp marker") {
+		t.Fatalf("instruction = %q, want hidden inline marker guidance", instruction)
+	}
+	if strings.Contains(instruction, "Do not add looper disclosure footers or hidden looper stamp markers to inline review comments") {
+		t.Fatalf("instruction = %q, should not suppress enabled inline disclosure", instruction)
+	}
+}
+
 func TestDiscoverPullRequestsAppliesLabelFilters(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -566,6 +594,232 @@ func TestRunFilterStepSkipsAlreadyReviewedHeadBeforeBudgetTermination(t *testing
 	}
 	if persisted == nil || persisted.Status != "waiting" {
 		t.Fatalf("loop after filter = %#v, want waiting loop not terminated", persisted)
+	}
+}
+
+func TestRunFilterStepSkipsConflictedPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Skipped conflicted pull request acme/looper#42") {
+		t.Fatalf("SkipReason = %q, want conflicted PR skip", checkpoint.SkipReason)
+	}
+}
+
+func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_approved_conflicted", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED"}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for approved pull request") {
+		t.Fatalf("SkipReason = %q, want approved termination", checkpoint.SkipReason)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status != "terminated" {
+		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepTerminatesReadyBeforeConflictSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_ready_conflicted", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, Labels: []string{specpr.ReadyLabel}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for ready pull request") {
+		t.Fatalf("SkipReason = %q, want ready termination", checkpoint.SkipReason)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status != "terminated" {
+		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "OctoCat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "current user already reviewed head abc123") {
+		t.Fatalf("SkipReason = %q, want already-reviewed-by-current-user skip", checkpoint.SkipReason)
+	}
+}
+
+func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_approved_already_reviewed", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewDecision: "APPROVED", Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for approved pull request") {
+		t.Fatalf("SkipReason = %q, want approved termination", checkpoint.SkipReason)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status != "terminated" {
+		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepTerminatesReadyBeforeAlreadyReviewedSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_ready_already_reviewed", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{specpr.ReadyLabel}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for ready pull request") {
+		t.Fatalf("SkipReason = %q, want ready termination", checkpoint.SkipReason)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status != "terminated" {
+		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepAllowsManualReviewAlreadyReviewedByCurrentUserForHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"manual":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_already_reviewed", ProjectID: "project_1", Type: "reviewer", MetadataJSON: &metadata}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip for manual run", checkpoint.SkipReason)
+	}
+}
+
+func TestRunFilterStepAllowsReviewWhenOnlyCurrentHeadReviewIsUnsubmitted(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []string{"PENDING", "DISMISSED"} {
+		t.Run(state, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLogin: "octocat"}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+			repo := "acme/looper"
+			prNumber := int64(42)
+			reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": state, "commit": map[string]any{"oid": "abc123"}}}
+
+			checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+			if err != nil {
+				t.Fatalf("runFilterStep() error = %v", err)
+			}
+			if checkpoint.SkipReason != "" {
+				t.Fatalf("SkipReason = %q, want no skip for %s review", checkpoint.SkipReason, state)
+			}
+		})
+	}
+}
+
+func TestRunFilterStepAllowsReviewAfterHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "old-head"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "new-head", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip for old-head review", checkpoint.SkipReason)
+	}
+}
+
+func TestRunFilterStepAllowsReviewWhenReviewCommitMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED"}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip without review commit", checkpoint.SkipReason)
 	}
 }
 
@@ -3062,8 +3316,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"do not submit a clean COMMENT or APPROVE review",
 		"never use an LGTM or other clean body as a fallback",
 		"<!-- looper:stamp v=1 -->",
-		"<sub>Generated by [Looper](https://github.com/powerformer/looper) 0.0.0-dev · runner=reviewer · agent=opencode</sub>",
-		"Inline review comments must use only the hidden `<!-- looper:stamp v=1 -->` marker",
+		"<sub>Generated by Looper 0.0.0-dev · runner=reviewer · agent=opencode</sub>",
+		"Every inline review comment you post must include only the hidden looper stamp marker",
 		"Do not write the footer as plain paragraph text",
 		"validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations",
 		"the full PR diff remains authoritative",
@@ -3283,6 +3537,162 @@ func TestProcessClaimedItemRestartsFromDiscoverOnReviewRequestSignal(t *testing.
 	}
 }
 
+func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedReviewRequestGuardrail(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "review request removed before publish"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "review request removed before publish") {
+		t.Fatalf("result = %#v, want structured review-request retry", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunReviewStepIgnoresUnparsedReviewRequestGuardrailWhenPolicyDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "review request removed before publish"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_policy_disabled", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_policy_disabled", LoopID: "loop_policy_disabled"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "valid completion marker") {
+		t.Fatalf("runReviewStep() error = %v, want marker failure", err)
+	}
+	if checkpoint.ResumePolicy == "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want no rediscovery restart", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunReviewStepIgnoresUnparsedReviewRequestGuardrailForManualLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "review request removed before publish"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	metadata := `{"manual":true}`
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_manual_guardrail", ProjectID: project.ID, Type: "reviewer", MetadataJSON: &metadata},
+		Run:      storage.RunRecord{ID: "run_manual_guardrail", LoopID: "loop_manual_guardrail"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "valid completion marker") {
+		t.Fatalf("runReviewStep() error = %v, want marker failure", err)
+	}
+	if checkpoint.ResumePolicy == "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want no rediscovery restart", checkpoint.ResumePolicy)
+	}
+}
+
+func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedHeadChangeGuardrail(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: "PR head changed before publish: expected abc123, got new-head"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed before publish") {
+		t.Fatalf("result = %#v, want structured head-change retry", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunReviewStepIgnoresPromptEchoedRediscoveryGuardrail(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Reviewer prompt said to report `PR head changed before publish` before retrying."}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_prompt_echo", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_prompt_echo", LoopID: "loop_prompt_echo"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "valid completion marker") {
+		t.Fatalf("runReviewStep() error = %v, want marker failure", err)
+	}
+	if checkpoint.ResumePolicy == "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want no rediscovery restart", checkpoint.ResumePolicy)
+	}
+}
+
 func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 	t.Parallel()
 
@@ -3315,6 +3725,19 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 	}
 	if strings.Contains(prompt, "add `looper:spec-ready`") {
 		t.Fatalf("prompt allows spec-ready transition when approve is disabled:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+
+	if strings.Contains(prompt, "review request removed before publish") {
+		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "does not require a current-user review request") {
+		t.Fatalf("prompt missing disabled review-request instruction:\n%s", prompt)
 	}
 }
 
@@ -3457,6 +3880,8 @@ type fakeGitHubGateway struct {
 	labels                          []string
 	reviewDecision                  string
 	comments                        []map[string]any
+	reviews                         []map[string]any
+	hasConflicts                    bool
 	useReviewStateAfterFirstView    bool
 	reviewDecisionAfterFirstView    string
 	commentsAfterFirstView          []map[string]any
@@ -3535,7 +3960,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if state == "" {
 		state = "OPEN"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments)}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments), Reviews: cloneCommentMaps(g.reviews)}, nil
 }
 
 func cloneCommentMaps(comments []map[string]any) []map[string]any {
