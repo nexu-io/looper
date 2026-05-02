@@ -71,7 +71,9 @@
               "installDir": "<home>/.looper/bin",
               "currentTarget": "<current-target>",
               "artifactName": "<artifact-name>",
-              "supportedTargets": ["darwin-arm64"]
+              "supportedTargets": [
+                "darwin-arm64"
+              ]
             }
           },
           "storage": {
@@ -186,7 +188,10 @@
             "inApp": true,
             "osascript": {
               "enabled": true,
-              "soundForLevels": ["action_required", "failure"],
+              "soundForLevels": [
+                "action_required",
+                "failure"
+              ],
               "throttleWindowSeconds": 60
             }
           },
@@ -232,7 +237,17 @@
             },
             "scope": "changed_ranges",
             "publishMode": "single_review",
-            "detectDuplicateFindings": true
+            "detectDuplicateFindings": true,
+            "threadResolution": {
+              "autoResolve": "objective_only",
+              "enabled": false,
+              "maxThreadsPerRun": 10,
+              "mode": "report_only",
+              "requireAuditComment": true,
+              "requireCurrentReviewRequest": true,
+              "requireNewHeadSinceThread": true,
+              "scope": "looper_authored_only"
+            }
           },
           "projects": []
         },
@@ -372,7 +387,9 @@
           "reviewer": "running",
           "fixer": null,
           "loopStatus": {
-            "loops": ["running"],
+            "loops": [
+              "running"
+            ],
             "latestRunStatus": "running",
             "runningRunCount": 1
           }

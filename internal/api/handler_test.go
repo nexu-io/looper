@@ -152,6 +152,9 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["scope"], string(cfg.Reviewer.Scope))
 	assertEqual(t, reviewer["publishMode"], string(cfg.Reviewer.PublishMode))
 	assertEqual(t, reviewer["detectDuplicateFindings"], cfg.Reviewer.DetectDuplicateFindings)
+	threadResolution := reviewer["threadResolution"].(map[string]any)
+	assertEqual(t, threadResolution["enabled"], cfg.Reviewer.ThreadResolution.Enabled)
+	assertEqual(t, threadResolution["mode"], string(cfg.Reviewer.ThreadResolution.Mode))
 	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Reviewer.Loop.EnabledByDefault)
 	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Reviewer.Loop.MaxConsecutiveFailures))
 	if _, ok := daemon["shutdownTimeoutMs"]; ok {

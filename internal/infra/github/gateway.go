@@ -236,6 +236,42 @@ type ResolveReviewThreadInput struct {
 	CWD      string
 }
 
+type ListReviewThreadsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+	Limit    int
+}
+
+type ReviewThread struct {
+	ID         string
+	IsResolved bool
+	Path       string
+	Line       int64
+	URL        string
+	Comments   []ReviewThreadComment
+}
+
+type ReviewThreadComment struct {
+	ID                string
+	Body              string
+	Author            string
+	CreatedAt         string
+	UpdatedAt         string
+	Path              string
+	Line              int64
+	OriginalCommitOID string
+	CommitOID         string
+	URL               string
+}
+
+type AddReviewThreadReplyInput struct {
+	Repo     string
+	ThreadID string
+	Body     string
+	CWD      string
+}
+
 type GetPullRequestDiffInput struct {
 	Repo     string
 	PRNumber int64
@@ -512,6 +548,98 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 	threadRow, _ := resolveRow["thread"].(map[string]any)
 	if threadRow == nil || !asBool(threadRow["isResolved"]) {
 		return fmt.Errorf("failed to resolve review thread %s", input.ThreadID)
+	}
+	return nil
+}
+
+func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	limit := input.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	owner, name, err := parseRepo(input.Repo)
+	if err != nil {
+		return nil, err
+	}
+	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+		"query($owner: String!, $name: String!, $prNumber: Int!, $limit: Int!) {",
+		"  repository(owner: $owner, name: $name) {",
+		"    pullRequest(number: $prNumber) {",
+		"      reviewThreads(first: $limit) {",
+		"        nodes {",
+		"          id isResolved path line",
+		"          comments(first: 50) {",
+		"            nodes {",
+		"              id body createdAt updatedAt path line url",
+		"              author { login }",
+		"              originalCommit { oid }",
+		"              commit { oid }",
+		"            }",
+		"          }",
+		"        }",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("prNumber=%d", input.PRNumber), "-F", fmt.Sprintf("limit=%d", limit))
+	if err != nil {
+		return nil, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	data, _ := row["data"].(map[string]any)
+	repoRow, _ := data["repository"].(map[string]any)
+	prRow, _ := repoRow["pullRequest"].(map[string]any)
+	threadsRow, _ := prRow["reviewThreads"].(map[string]any)
+	nodes, _ := threadsRow["nodes"].([]any)
+	out := make([]ReviewThread, 0, len(nodes))
+	for _, node := range nodes {
+		threadRow, _ := node.(map[string]any)
+		id := asString(threadRow["id"])
+		if id == "" {
+			continue
+		}
+		thread := ReviewThread{ID: id, IsResolved: asBool(threadRow["isResolved"]), Path: asString(threadRow["path"]), Line: asInt64(threadRow["line"])}
+		commentsRow, _ := threadRow["comments"].(map[string]any)
+		commentNodes, _ := commentsRow["nodes"].([]any)
+		for _, commentNode := range commentNodes {
+			commentRow, _ := commentNode.(map[string]any)
+			commentID := asString(commentRow["id"])
+			if commentID == "" {
+				continue
+			}
+			thread.Comments = append(thread.Comments, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
+		}
+		if thread.URL == "" && len(thread.Comments) > 0 {
+			thread.URL = thread.Comments[0].URL
+		}
+		out = append(out, thread)
+	}
+	return out, nil
+}
+
+func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
+	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+		"mutation($threadId: ID!, $body: String!) {",
+		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
+		"    comment { id }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "threadId="+input.ThreadID, "-f", "body="+input.Body)
+	if err != nil {
+		return err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return err
+	}
+	data, _ := row["data"].(map[string]any)
+	replyRow, _ := data["addPullRequestReviewThreadReply"].(map[string]any)
+	commentRow, _ := replyRow["comment"].(map[string]any)
+	if asString(commentRow["id"]) == "" {
+		return fmt.Errorf("failed to add review thread reply %s", input.ThreadID)
 	}
 	return nil
 }
@@ -1395,6 +1523,14 @@ func extractAuthor(value any) string {
 		return login
 	}
 	return asString(row["name"])
+}
+
+func extractOID(value any) string {
+	row, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	return asString(row["oid"])
 }
 
 func extractReviewRequestLogins(value any) []string {

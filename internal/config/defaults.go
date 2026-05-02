@@ -131,6 +131,16 @@ func DefaultConfig(cwd string) (Config, error) {
 			Scope:                   ReviewerScopeChangedRanges,
 			PublishMode:             ReviewerPublishModeSingleReview,
 			DetectDuplicateFindings: true,
+			ThreadResolution: ReviewerThreadResolutionConfig{
+				Enabled:                     false,
+				Mode:                        ReviewerThreadResolutionModeReportOnly,
+				Scope:                       ReviewerThreadResolutionScopeLooperAuthoredOnly,
+				AutoResolve:                 ReviewerThreadResolutionAutoResolveObjectiveOnly,
+				RequireAuditComment:         true,
+				RequireNewHeadSinceThread:   true,
+				RequireCurrentReviewRequest: true,
+				MaxThreadsPerRun:            10,
+			},
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

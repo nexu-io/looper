@@ -159,6 +159,21 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Reviewer.PublishMode != ReviewerPublishModeSingleReview {
 		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
+	if !isValidReviewerThreadResolutionMode(config.Reviewer.ThreadResolution.Mode) {
+		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
+	}
+	if config.Reviewer.ThreadResolution.Scope != ReviewerThreadResolutionScopeLooperAuthoredOnly {
+		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.scope", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionScopeLooperAuthoredOnly)})
+	}
+	if config.Reviewer.ThreadResolution.AutoResolve != ReviewerThreadResolutionAutoResolveObjectiveOnly {
+		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.autoResolve", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionAutoResolveObjectiveOnly)})
+	}
+	if config.Reviewer.ThreadResolution.MaxThreadsPerRun < 1 {
+		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.maxThreadsPerRun", Message: "must be a positive integer"})
+	}
+	if config.Reviewer.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Reviewer.ThreadResolution.RequireAuditComment {
+		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
+	}
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	for index, project := range config.Projects {
@@ -353,6 +368,15 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 func isValidReviewerScope(scope ReviewerScope) bool {
 	switch scope {
 	case ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidReviewerThreadResolutionMode(mode ReviewerThreadResolutionMode) bool {
+	switch mode {
+	case ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective:
 		return true
 	default:
 		return false
