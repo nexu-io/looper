@@ -1130,7 +1130,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	if len(checkpoint.Detail.Reviews) > 0 {
+	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
