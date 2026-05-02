@@ -356,6 +356,36 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	} else if partial.DedupeFindings != nil {
 		config.DetectDuplicateFindings = *partial.DedupeFindings
 	}
+	if partial.ThreadResolution != nil {
+		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+}
+
+func mergeReviewerThreadResolutionConfig(config *ReviewerThreadResolutionConfig, partial PartialReviewerThreadResolutionConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+	if partial.Scope != nil {
+		config.Scope = *partial.Scope
+	}
+	if partial.AutoResolve != nil {
+		config.AutoResolve = *partial.AutoResolve
+	}
+	if partial.RequireAuditComment != nil {
+		config.RequireAuditComment = *partial.RequireAuditComment
+	}
+	if partial.RequireNewHeadSinceThread != nil {
+		config.RequireNewHeadSinceThread = *partial.RequireNewHeadSinceThread
+	}
+	if partial.RequireCurrentReviewRequest != nil {
+		config.RequireCurrentReviewRequest = *partial.RequireCurrentReviewRequest
+	}
+	if partial.MaxThreadsPerRun != nil {
+		config.MaxThreadsPerRun = *partial.MaxThreadsPerRun
+	}
 }
 
 func mergeReviewerReviewEventsConfig(config *ReviewerReviewEventsConfig, partial PartialReviewerReviewEventsConfig) {

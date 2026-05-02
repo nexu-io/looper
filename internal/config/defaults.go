@@ -133,6 +133,16 @@ func DefaultConfig(cwd string) (Config, error) {
 			PublishMode:             ReviewerPublishModeSingleReview,
 			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
 			DetectDuplicateFindings: true,
+			ThreadResolution: ReviewerThreadResolutionConfig{
+				Enabled:                     false,
+				Mode:                        ReviewerThreadResolutionModeReportOnly,
+				Scope:                       ReviewerThreadResolutionScopeLooperAuthoredOnly,
+				AutoResolve:                 ReviewerThreadResolutionAutoResolveObjectiveOnly,
+				RequireAuditComment:         true,
+				RequireNewHeadSinceThread:   true,
+				RequireCurrentReviewRequest: true,
+				MaxThreadsPerRun:            10,
+			},
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{

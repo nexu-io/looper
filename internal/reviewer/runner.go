@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,13 +27,14 @@ import (
 )
 
 const (
-	stepDiscover ReviewerStep = "discover"
-	stepFilter   ReviewerStep = "filter"
-	stepClaim    ReviewerStep = "claim"
-	stepSnapshot ReviewerStep = "snapshot"
-	stepWorktree ReviewerStep = "worktree"
-	stepReview   ReviewerStep = "review"
-	stepPublish  ReviewerStep = "publish"
+	stepDiscover         ReviewerStep = "discover"
+	stepFilter           ReviewerStep = "filter"
+	stepClaim            ReviewerStep = "claim"
+	stepSnapshot         ReviewerStep = "snapshot"
+	stepWorktree         ReviewerStep = "worktree"
+	stepThreadResolution ReviewerStep = "thread_resolution"
+	stepReview           ReviewerStep = "review"
+	stepPublish          ReviewerStep = "publish"
 )
 
 var reviewerStepSequence = []ReviewerStep{
@@ -41,6 +43,7 @@ var reviewerStepSequence = []ReviewerStep{
 	stepClaim,
 	stepSnapshot,
 	stepWorktree,
+	stepThreadResolution,
 	stepReview,
 	stepPublish,
 }
@@ -205,6 +208,48 @@ type PullRequestLabelsInput struct {
 	CWD      string
 }
 
+type ListReviewThreadsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+	Limit    int
+}
+
+type ReviewThread struct {
+	ID         string
+	IsResolved bool
+	Path       string
+	Line       int64
+	URL        string
+	Comments   []ReviewThreadComment
+}
+
+type ReviewThreadComment struct {
+	ID                string
+	Body              string
+	Author            string
+	CreatedAt         string
+	UpdatedAt         string
+	Path              string
+	Line              int64
+	OriginalCommitOID string
+	CommitOID         string
+	URL               string
+}
+
+type AddReviewThreadReplyInput struct {
+	Repo     string
+	ThreadID string
+	Body     string
+	CWD      string
+}
+
+type ResolveReviewThreadInput struct {
+	Repo     string
+	ThreadID string
+	CWD      string
+}
+
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
@@ -215,6 +260,9 @@ type GitHubGateway interface {
 	RemovePullRequestReaction(context.Context, PullRequestReactionInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
+	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
+	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
+	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 }
 
 type GitGateway interface {
@@ -279,6 +327,7 @@ type Options struct {
 	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
+	ThreadResolution        config.ReviewerThreadResolutionConfig
 	Disclosure              *config.DisclosureConfig
 	CustomInstructions      *config.Config
 	AgentRuntime            string
@@ -315,6 +364,7 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
+	threadResolution        config.ReviewerThreadResolutionConfig
 	disclosure              config.DisclosureConfig
 	customInstructions      config.Config
 	agentRuntime            string
@@ -347,13 +397,14 @@ type ProcessResult struct {
 }
 
 type reviewerCheckpoint struct {
-	ResumePolicy   string                   `json:"resumePolicy,omitempty"`
-	Detail         *checkpointDetail        `json:"detail,omitempty"`
-	ClaimedLockKey string                   `json:"claimedLockKey,omitempty"`
-	Snapshot       *checkpointSnapshot      `json:"snapshot,omitempty"`
-	Worktree       *checkpointWorktree      `json:"worktree,omitempty"`
-	PendingReview  *pendingReviewCheckpoint `json:"pendingReview,omitempty"`
-	SkipReason     string                   `json:"skipReason,omitempty"`
+	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
+	Detail           *checkpointDetail           `json:"detail,omitempty"`
+	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
+	Snapshot         *checkpointSnapshot         `json:"snapshot,omitempty"`
+	Worktree         *checkpointWorktree         `json:"worktree,omitempty"`
+	ThreadResolution *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
+	PendingReview    *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
+	SkipReason       string                      `json:"skipReason,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -399,6 +450,14 @@ type pendingReviewCheckpoint struct {
 	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
 	CleanNoop                bool        `json:"cleanNoop,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
+}
+
+type threadResolutionCheckpoint struct {
+	HeadSHA   string `json:"headSha,omitempty"`
+	Processed int    `json:"processed,omitempty"`
+	Commented int    `json:"commented,omitempty"`
+	Resolved  int    `json:"resolved,omitempty"`
+	Reported  int    `json:"reported,omitempty"`
 }
 
 type resumedRunContext struct {
@@ -448,6 +507,10 @@ func New(options Options) *Runner {
 	if scope == "" {
 		scope = config.ReviewerScopeChangedRanges
 	}
+	threadResolution := options.ThreadResolution
+	if threadResolution.Mode == "" {
+		threadResolution = config.ReviewerThreadResolutionConfig{Enabled: false, Mode: config.ReviewerThreadResolutionModeReportOnly, Scope: config.ReviewerThreadResolutionScopeLooperAuthoredOnly, AutoResolve: config.ReviewerThreadResolutionAutoResolveObjectiveOnly, RequireAuditComment: true, RequireNewHeadSinceThread: true, RequireCurrentReviewRequest: true, MaxThreadsPerRun: 10}
+	}
 	reviewEvents := options.ReviewEvents
 	if reviewEvents.Clean == "" {
 		reviewEvents.Clean = config.ReviewerReviewEventComment
@@ -478,6 +541,7 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
+		threadResolution:        threadResolution,
 		disclosure:              disclosureCfg,
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
@@ -1020,6 +1084,8 @@ func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepI
 		return r.runSnapshotStep(ctx, input)
 	case stepWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
+	case stepThreadResolution:
+		return r.runThreadResolutionStep(ctx, input)
 	case stepReview:
 		return r.runReviewStep(ctx, input)
 	case stepPublish:
@@ -1194,6 +1260,350 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	checkpoint.Worktree.PreparedAt = r.nowISO()
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+type threadResolutionAgentDecision struct {
+	ThreadID   string `json:"threadId"`
+	Decision   string `json:"decision"`
+	Evidence   string `json:"evidence"`
+	Confidence string `json:"confidence"`
+}
+
+type threadResolutionAgentOutput struct {
+	Decisions []threadResolutionAgentDecision `json:"decisions"`
+}
+
+func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	policy := r.threadResolution
+	if checkpoint.SkipReason != "" || !policy.Enabled {
+		return checkpoint, nil
+	}
+	if checkpoint.ThreadResolution != nil && checkpoint.Snapshot != nil && checkpoint.ThreadResolution.HeadSHA == checkpoint.Snapshot.HeadSHA {
+		return checkpoint, nil
+	}
+	if checkpoint.Detail == nil || checkpoint.Snapshot == nil {
+		return checkpoint, &loopError{message: "Missing PR detail or snapshot checkpoint for thread resolution step", kind: FailureRetryableTransient}
+	}
+	if normalizePRState(checkpoint.Detail.State) != "open" {
+		return checkpoint, nil
+	}
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	currentLogin = normalizeLogin(currentLogin)
+	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, "skipped", "current_user_not_requested", "", "skipped", "current_user_not_requested")
+		return checkpoint, nil
+	}
+	limit := policy.MaxThreadsPerRun
+	if limit <= 0 {
+		limit = 10
+	}
+	fetchLimit := limit * 5
+	if fetchLimit < 100 {
+		fetchLimit = 100
+	}
+	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: fetchLimit})
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	candidates := make([]ReviewThread, 0, len(threads))
+	for _, thread := range threads {
+		if len(candidates) >= limit {
+			break
+		}
+		if r.threadResolutionCandidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy) {
+			candidates = append(candidates, thread)
+		}
+	}
+	result := &threadResolutionCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Reported: len(candidates)}
+	if len(candidates) == 0 {
+		checkpoint.ThreadResolution = result
+		return checkpoint, nil
+	}
+	decisions, err := r.classifyReviewThreads(ctx, input, checkpoint, candidates)
+	if err != nil {
+		return checkpoint, err
+	}
+	decisionByID := map[string]threadResolutionAgentDecision{}
+	for _, decision := range decisions {
+		decisionByID[decision.ThreadID] = decision
+	}
+	for _, thread := range candidates {
+		decision, ok := decisionByID[thread.ID]
+		if !ok {
+			decision = threadResolutionAgentDecision{ThreadID: thread.ID, Decision: "needs_human", Evidence: "no classifier decision returned", Confidence: "low"}
+		}
+		result.Processed++
+		auditedForHead := hasThreadResolutionAuditForHead(thread, checkpoint.Snapshot.HeadSHA)
+		commented := false
+		resolved := false
+		skippedReason := ""
+		if !auditedForHead && r.threadResolutionShouldComment(policy, decision) {
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
+			if err != nil {
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
+				return checkpoint, err
+			}
+			if latestThread == nil {
+				skippedReason = "candidate_no_longer_eligible"
+				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
+				continue
+			}
+			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
+			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
+			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			result.Commented++
+			commented = true
+		}
+		if r.threadResolutionShouldResolve(policy, decision) {
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
+			if err != nil {
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
+				return checkpoint, err
+			}
+			if latestThread == nil {
+				skippedReason = "candidate_no_longer_eligible"
+				continue
+			}
+			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
+			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
+				skippedReason = "missing_objective_audit_comment"
+				continue
+			}
+			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: thread.ID, CWD: input.Project.RepoPath}); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			result.Resolved++
+			resolved = true
+		}
+		action := "reported"
+		if resolved {
+			action = "resolved"
+		} else if commented {
+			action = "commented"
+		} else if skippedReason != "" {
+			action = "skipped"
+		}
+		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, action, skippedReason)
+	}
+	checkpoint.ThreadResolution = result
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint, err error) reviewerCheckpoint {
+	var typed *loopError
+	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume && strings.Contains(typed.message, "PR changed during thread reconciliation") {
+		checkpoint.ResumePolicy = "restart_from_discover"
+	}
+	return checkpoint
+}
+
+func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig) bool {
+	if thread.IsResolved || thread.ID == "" || len(thread.Comments) == 0 {
+		return false
+	}
+	first := thread.Comments[0]
+	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && normalizeLogin(first.Author) != currentLogin {
+		return false
+	}
+	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && !isLooperAuthoredThread(thread) {
+		return false
+	}
+	if policy.RequireNewHeadSinceThread && headSHA != "" {
+		threadSHA := latestThreadFeedbackCommitOID(thread)
+		if threadSHA == "" || threadSHA == headSHA {
+			return false
+		}
+	}
+	if policy.Mode != config.ReviewerThreadResolutionModeResolveObjective && hasThreadResolutionAuditForHead(thread, headSHA) {
+		return false
+	}
+	return true
+}
+
+func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, limit int) (*ReviewThread, PullRequestDetail, error) {
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, PullRequestDetail{}, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
+		return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
+	}
+	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		return nil, detail, nil
+	}
+	latest, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: limit})
+	if err != nil {
+		return nil, detail, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	for i := range latest {
+		if latest[i].ID == threadID {
+			if !r.threadResolutionCandidate(latest[i], headSHA, currentLogin, policy) {
+				return nil, detail, nil
+			}
+			return &latest[i], detail, nil
+		}
+	}
+	return nil, detail, nil
+}
+
+func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, threads []ReviewThread) ([]threadResolutionAgentDecision, error) {
+	if r.agentExecutor == nil {
+		return nil, &loopError{message: "reviewer agent executor is not configured", kind: FailureRetryableTransient}
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	executionID := eventlog.NewEventID("agent")
+	candidateIDs := make([]string, 0, len(threads))
+	for _, thread := range threads {
+		candidateIDs = append(candidateIDs, thread.ID)
+	}
+	slices.Sort(candidateIDs)
+	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	result, err := execution.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if result.Status != "completed" {
+		return nil, &loopError{message: firstNonEmpty(result.Summary, result.Stderr, "thread resolution classifier failed"), kind: FailureRetryableTransient}
+	}
+	parsed, err := parseThreadResolutionOutput(result.Stdout)
+	if err != nil {
+		return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	return parsed.Decisions, nil
+}
+
+func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread) string {
+	payload, _ := json.MarshalIndent(map[string]any{"repo": repo, "prNumber": prNumber, "headSHA": headSHA, "threads": threads}, "", "  ")
+	return strings.TrimSpace(`You are running Looper's reviewer thread reconciliation phase.
+
+Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify whether each requested change is objectively addressed at the current head.
+
+Safety rules:
+- Return objectively_fixed only for concrete, verifiable code or documentation changes that are present in the worktree.
+- Return needs_human for subjective, product, design, security-sensitive, ambiguous, or partially addressed feedback.
+- Do not treat an author reply like "fixed" as evidence by itself.
+- Do not call GitHub APIs and do not post comments.
+
+Output only valid JSON in this exact shape:
+{"decisions":[{"threadId":"<id>","decision":"objectively_fixed|needs_human|not_fixed","evidence":"brief concrete evidence","confidence":"high|medium|low"}]}
+
+Payload:
+` + string(payload))
+}
+
+func parseThreadResolutionOutput(stdout string) (threadResolutionAgentOutput, error) {
+	trimmed := strings.TrimSpace(stdout)
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
+	if start < 0 || end < start {
+		return threadResolutionAgentOutput{}, fmt.Errorf("thread resolution classifier did not return JSON")
+	}
+	var parsed threadResolutionAgentOutput
+	if err := json.Unmarshal([]byte(trimmed[start:end+1]), &parsed); err != nil {
+		return threadResolutionAgentOutput{}, fmt.Errorf("parse thread resolution classifier output: %w", err)
+	}
+	return parsed, nil
+}
+
+func (r *Runner) threadResolutionShouldComment(policy config.ReviewerThreadResolutionConfig, decision threadResolutionAgentDecision) bool {
+	switch policy.Mode {
+	case config.ReviewerThreadResolutionModeCommentOnly, config.ReviewerThreadResolutionModeSuggestResolution:
+		return true
+	case config.ReviewerThreadResolutionModeResolveObjective:
+		return policy.RequireAuditComment && isObjectiveThreadResolutionDecision(decision)
+	default:
+		return false
+	}
+}
+
+func (r *Runner) threadResolutionShouldResolve(policy config.ReviewerThreadResolutionConfig, decision threadResolutionAgentDecision) bool {
+	return policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && policy.AutoResolve == config.ReviewerThreadResolutionAutoResolveObjectiveOnly && policy.RequireAuditComment && isObjectiveThreadResolutionDecision(decision)
+}
+
+func isObjectiveThreadResolutionDecision(decision threadResolutionAgentDecision) bool {
+	return strings.EqualFold(strings.TrimSpace(decision.Decision), "objectively_fixed") && strings.EqualFold(strings.TrimSpace(decision.Confidence), "high")
+}
+
+func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision threadResolutionAgentDecision, policy config.ReviewerThreadResolutionConfig) string {
+	evidence := strings.TrimSpace(decision.Evidence)
+	if evidence == "" {
+		evidence = "the current head"
+	}
+	decisionValue := strings.ToLower(strings.TrimSpace(decision.Decision))
+	if decisionValue == "" {
+		decisionValue = "needs_human"
+	}
+	marker := fmt.Sprintf("<!-- looper:thread-resolution thread=%s head=%s decision=%s -->", threadID, headSHA, decisionValue)
+	if isObjectiveThreadResolutionDecision(decision) {
+		if policy.Mode == config.ReviewerThreadResolutionModeSuggestResolution {
+			return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s. Please resolve this thread if you agree.\n%s", headSHA, evidence, marker)
+		}
+		if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective {
+			return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s, so I’m resolving this thread. Reopen if this still needs discussion.\n%s", headSHA, evidence, marker)
+		}
+		return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s.\n%s", headSHA, evidence, marker)
+	}
+	return fmt.Sprintf("Looper checked this thread against head `%s`. I could not verify that this thread is objectively resolved: %s.\n%s", headSHA, evidence, marker)
+}
+
+func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
+	needle := "looper:thread-resolution"
+	headNeedle := "head=" + headSHA
+	for _, comment := range thread.Comments {
+		if strings.Contains(comment.Body, needle) && (headSHA == "" || strings.Contains(comment.Body, headNeedle)) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA string) bool {
+	for _, comment := range thread.Comments {
+		body := comment.Body
+		if strings.Contains(body, "looper:thread-resolution") && strings.Contains(body, "thread="+threadID) && strings.Contains(body, "head="+headSHA) && strings.Contains(body, "decision=objectively_fixed") {
+			return true
+		}
+	}
+	return false
+}
+
+func isLooperAuthoredThread(thread ReviewThread) bool {
+	if len(thread.Comments) == 0 {
+		return false
+	}
+	body := thread.Comments[0].Body
+	return strings.Contains(body, "looper:stamp") || strings.Contains(body, "looper:review")
+}
+
+func latestThreadFeedbackCommitOID(thread ReviewThread) string {
+	for i := len(thread.Comments) - 1; i >= 0; i-- {
+		comment := thread.Comments[i]
+		if strings.Contains(comment.Body, "looper:thread-resolution") {
+			continue
+		}
+		if oid := firstNonEmpty(comment.CommitOID, comment.OriginalCommitOID); oid != "" {
+			return oid
+		}
+	}
+	return ""
+}
+
+func (r *Runner) appendThreadResolutionEvent(ctx context.Context, input stepInput, headSHA, decision, evidence, threadID, action, skippedReason string) {
+	r.appendEvent(ctx, eventInput{eventType: "reviewer.thread_resolution", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "threadId": threadID, "headSha": headSHA, "decision": decision, "evidence": evidence, "action": action, "skippedReason": skippedReason}})
 }
 
 func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -1980,10 +2390,10 @@ func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSu
 	if status != "failed" && status != "interrupted" {
 		return false
 	}
-	if failedStep != stepPublish && failedStep != stepReview {
+	if failedStep != stepPublish && failedStep != stepReview && failedStep != stepThreadResolution {
 		return false
 	}
-	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish")
+	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish") || strings.Contains(failureSummary, "PR changed during thread reconciliation")
 }
 
 func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {

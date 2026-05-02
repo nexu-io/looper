@@ -76,6 +76,27 @@ const (
 	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
 )
 
+type ReviewerThreadResolutionMode string
+
+const (
+	ReviewerThreadResolutionModeReportOnly        ReviewerThreadResolutionMode = "report_only"
+	ReviewerThreadResolutionModeCommentOnly       ReviewerThreadResolutionMode = "comment_only"
+	ReviewerThreadResolutionModeSuggestResolution ReviewerThreadResolutionMode = "suggest_resolution"
+	ReviewerThreadResolutionModeResolveObjective  ReviewerThreadResolutionMode = "resolve_objective"
+)
+
+type ReviewerThreadResolutionScope string
+
+const (
+	ReviewerThreadResolutionScopeLooperAuthoredOnly ReviewerThreadResolutionScope = "looper_authored_only"
+)
+
+type ReviewerThreadResolutionAutoResolve string
+
+const (
+	ReviewerThreadResolutionAutoResolveObjectiveOnly ReviewerThreadResolutionAutoResolve = "objective_only"
+)
+
 type ReviewerReviewEvent string
 
 const (
@@ -217,16 +238,28 @@ type ReviewerLoopConfig struct {
 }
 
 type ReviewerConfig struct {
-	Loop                    ReviewerLoopConfig         `json:"loop"`
-	Scope                   ReviewerScope              `json:"scope"`
-	PublishMode             ReviewerPublishMode        `json:"publishMode"`
-	ReviewEvents            ReviewerReviewEventsConfig `json:"reviewEvents"`
-	DetectDuplicateFindings bool                       `json:"detectDuplicateFindings"`
+	Loop                    ReviewerLoopConfig             `json:"loop"`
+	Scope                   ReviewerScope                  `json:"scope"`
+	PublishMode             ReviewerPublishMode            `json:"publishMode"`
+	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
+	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
+	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
 }
 
 type ReviewerReviewEventsConfig struct {
 	Clean    ReviewerReviewEvent `json:"clean"`
 	Blocking ReviewerReviewEvent `json:"blocking"`
+}
+
+type ReviewerThreadResolutionConfig struct {
+	Enabled                     bool                                `json:"enabled"`
+	Mode                        ReviewerThreadResolutionMode        `json:"mode"`
+	Scope                       ReviewerThreadResolutionScope       `json:"scope"`
+	AutoResolve                 ReviewerThreadResolutionAutoResolve `json:"autoResolve"`
+	RequireAuditComment         bool                                `json:"requireAuditComment"`
+	RequireNewHeadSinceThread   bool                                `json:"requireNewHeadSinceThread"`
+	RequireCurrentReviewRequest bool                                `json:"requireCurrentReviewRequest"`
+	MaxThreadsPerRun            int                                 `json:"maxThreadsPerRun"`
 }
 
 type IssueRoleTriggersConfig struct {
@@ -428,17 +461,29 @@ type PartialReviewerLoopConfig struct {
 }
 
 type PartialReviewerConfig struct {
-	Loop                    *PartialReviewerLoopConfig         `json:"loop,omitempty"`
-	Scope                   *ReviewerScope                     `json:"scope,omitempty"`
-	PublishMode             *ReviewerPublishMode               `json:"publishMode,omitempty"`
-	ReviewEvents            *PartialReviewerReviewEventsConfig `json:"reviewEvents,omitempty"`
-	DetectDuplicateFindings *bool                              `json:"detectDuplicateFindings,omitempty"`
-	DedupeFindings          *bool                              `json:"dedupeFindings,omitempty"`
+	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
+	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
+	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
+	DetectDuplicateFindings *bool                                  `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
+	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
 }
 
 type PartialReviewerReviewEventsConfig struct {
 	Clean    *ReviewerReviewEvent `json:"clean,omitempty"`
 	Blocking *ReviewerReviewEvent `json:"blocking,omitempty"`
+}
+
+type PartialReviewerThreadResolutionConfig struct {
+	Enabled                     *bool                                `json:"enabled,omitempty"`
+	Mode                        *ReviewerThreadResolutionMode        `json:"mode,omitempty"`
+	Scope                       *ReviewerThreadResolutionScope       `json:"scope,omitempty"`
+	AutoResolve                 *ReviewerThreadResolutionAutoResolve `json:"autoResolve,omitempty"`
+	RequireAuditComment         *bool                                `json:"requireAuditComment,omitempty"`
+	RequireNewHeadSinceThread   *bool                                `json:"requireNewHeadSinceThread,omitempty"`
+	RequireCurrentReviewRequest *bool                                `json:"requireCurrentReviewRequest,omitempty"`
+	MaxThreadsPerRun            *int                                 `json:"maxThreadsPerRun,omitempty"`
 }
 
 type PartialInstructionsConfig struct {

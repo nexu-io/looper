@@ -566,6 +566,24 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureReviewerLoopConfig(&overrides).MaxIterationsPerHead = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED: %q is not a boolean", value)
+		}
+		ensureReviewerThreadResolutionConfig(&overrides).Enabled = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_MODE"); ok {
+		mode := ReviewerThreadResolutionMode(value)
+		ensureReviewerThreadResolutionConfig(&overrides).Mode = &mode
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN: %q is not an integer", value)
+		}
+		ensureReviewerThreadResolutionConfig(&overrides).MaxThreadsPerRun = parsed
+	}
 	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)
 	}
@@ -763,6 +781,14 @@ func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig
 		reviewer.Loop = &PartialReviewerLoopConfig{}
 	}
 	return reviewer.Loop
+}
+
+func ensureReviewerThreadResolutionConfig(partial *PartialConfig) *PartialReviewerThreadResolutionConfig {
+	reviewer := ensureReviewerConfig(partial)
+	if reviewer.ThreadResolution == nil {
+		reviewer.ThreadResolution = &PartialReviewerThreadResolutionConfig{}
+	}
+	return reviewer.ThreadResolution
 }
 
 func ensureReviewerReviewEventsConfig(partial *PartialConfig) *PartialReviewerReviewEventsConfig {

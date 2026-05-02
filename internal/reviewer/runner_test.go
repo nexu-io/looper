@@ -3202,6 +3202,14 @@ func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) 
 	}
 }
 
+func TestShouldRestartFromDiscoverForThreadResolutionHeadChange(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRestartFromDiscover("failed", stepThreadResolution, "PR changed during thread reconciliation") {
+		t.Fatalf("shouldRestartFromDiscover(thread_resolution head change) = false, want true")
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverOnHeadChangeSignal(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3310,6 +3318,101 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 	}
 }
 
+func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"OBJECTIVELY_FIXED","evidence":"the nil check is now present","confidence":"HIGH"}]}`}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 1 || checkpoint.ThreadResolution.Resolved != 1 {
+		t.Fatalf("ThreadResolution = %#v, want one comment and one resolution", checkpoint.ThreadResolution)
+	}
+	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "decision=objectively_fixed") {
+		t.Fatalf("addThreadReplyCalls = %#v, want objective audit reply", github.addThreadReplyCalls)
+	}
+	if len(github.resolveThreadCalls) != 1 || github.resolveThreadCalls[0].ThreadID != "thread_1" {
+		t.Fatalf("resolveThreadCalls = %#v, want thread_1 resolved", github.resolveThreadCalls)
+	}
+	if len(agent.starts) != 1 || !strings.Contains(agent.starts[0].IdempotencyKey, "thread_1") {
+		t.Fatalf("agent starts = %#v, want thread id in idempotency key", agent.starts)
+	}
+}
+
+func TestRunThreadResolutionStepRequiresLooperAuthoredMarker(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Manual review comment without Looper marker", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Reported != 0 || checkpoint.ThreadResolution.Processed != 0 {
+		t.Fatalf("ThreadResolution = %#v, want no eligible candidates", checkpoint.ThreadResolution)
+	}
+	if len(agent.starts) != 0 || len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("side effects: agent=%d replies=%d resolves=%d, want none", len(agent.starts), len(github.addThreadReplyCalls), len(github.resolveThreadCalls))
+	}
+}
+
+func TestRunThreadResolutionStepRestartsFromDiscoverOnHeadChange(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, viewHeadSHA: "new-head", reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"objectively_fixed","evidence":"the nil check is now present","confidence":"high"}]}`}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err == nil || !strings.Contains(err.Error(), "PR changed during thread reconciliation") {
+		t.Fatalf("runThreadResolutionStep() error = %v, want head-change reconciliation error", err)
+	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+	if len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("side effects: replies=%d resolves=%d, want none", len(github.addThreadReplyCalls), len(github.resolveThreadCalls))
+	}
+}
+
+func defaultThreadResolutionPolicy(t *testing.T) config.ReviewerThreadResolutionConfig {
+	t.Helper()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	return cfg.Reviewer.ThreadResolution
+}
+
+func threadResolutionStepInput() stepInput {
+	repo := "acme/looper"
+	prNumber := int64(42)
+	return stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"},
+		Loop:     storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "reviewer", Repo: &repo, PRNumber: &prNumber},
+		Run:      storage.RunRecord{ID: "run_1", LoopID: "loop_1"},
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"looper-bot"}},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: "/tmp/repo", HeadSHA: "abc123"},
+		},
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
@@ -3374,6 +3477,10 @@ type fakeGitHubGateway struct {
 	removeReactionErr               error
 	addLabelErr                     error
 	removeLabelErr                  error
+	reviewThreads                   []ReviewThread
+	viewHeadSHA                     string
+	addThreadReplyCalls             []AddReviewThreadReplyInput
+	resolveThreadCalls              []ResolveReviewThreadInput
 	addReactionCalls                []PullRequestReactionInput
 	removeReactionCalls             []PullRequestReactionInput
 	addLabelCalls                   []PullRequestLabelsInput
@@ -3408,6 +3515,9 @@ func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error) {
 	g.viewCalls++
 	headSHA := "abc123"
+	if g.viewHeadSHA != "" {
+		headSHA = g.viewHeadSHA
+	}
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
@@ -3498,6 +3608,27 @@ func (g *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRe
 func (g *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
 	g.removeLabelCalls = append(g.removeLabelCalls, input)
 	return g.removeLabelErr
+}
+
+func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error) {
+	out := make([]ReviewThread, len(g.reviewThreads))
+	copy(out, g.reviewThreads)
+	return out, nil
+}
+
+func (g *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
+	g.addThreadReplyCalls = append(g.addThreadReplyCalls, input)
+	return nil
+}
+
+func (g *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input ResolveReviewThreadInput) error {
+	g.resolveThreadCalls = append(g.resolveThreadCalls, input)
+	for i := range g.reviewThreads {
+		if g.reviewThreads[i].ID == input.ThreadID {
+			g.reviewThreads[i].IsResolved = true
+		}
+	}
+	return nil
 }
 
 func reviewEventIn(events []ReviewEvent, want ReviewEvent) bool {

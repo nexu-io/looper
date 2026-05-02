@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -329,6 +330,98 @@ func TestGatewayResolveReviewThreadReturnsNotFound(t *testing.T) {
 	err := gateway.ResolveReviewThread(context.Background(), ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-missing"})
 	if _, ok := err.(*ReviewThreadNotFoundError); !ok {
 		t.Fatalf("ResolveReviewThread() error = %v, want *ReviewThreadNotFoundError", err)
+	}
+}
+
+func TestGatewayListReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "reviewThreads(first: $limit, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
+			if !strings.Contains(args, "limit=1") {
+				t.Fatalf("second review thread page args = %q, want remaining limit=1", args)
+			}
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-101","isResolved":true,"path":"b.go","line":20,"comments":{"nodes":[{"id":"comment-101","body":"last","createdAt":"2024-01-03T00:00:00Z","updatedAt":"2024-01-03T00:00:00Z","path":"b.go","line":20,"url":"https://example.test/comment-101","author":{"login":"carol"},"originalCommit":{"oid":"orig-101"},"commit":{"oid":"head-101"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.Contains(args, "reviewThreads(first: $limit, after: $after)") && !strings.Contains(args, "-F after="):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[` + reviewThreadNodesJSON(1, 100) + `],"pageInfo":{"hasNextPage":true,"endCursor":"thread-cursor-1"}}}}}}`}, nil
+		case strings.Contains(args, "comments(first: 100, after: $after)") && strings.Contains(args, "threadId=thread-1") && strings.Contains(args, "-F after=comment-cursor-1"):
+			return shell.Result{Stdout: `{"data":{"node":{"comments":{"nodes":[{"id":"comment-2","body":"second","createdAt":"2024-01-02T00:00:00Z","updatedAt":"2024-01-02T00:00:00Z","path":"a.go","line":11,"url":"https://example.test/comment-2","author":{"login":"bob"},"originalCommit":{"oid":"orig-2"},"commit":{"oid":"head-2"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	threads, err := gateway.ListReviewThreads(context.Background(), ListReviewThreadsInput{Repo: "acme/looper", PRNumber: 42, Limit: 101})
+	if err != nil {
+		t.Fatalf("ListReviewThreads() error = %v", err)
+	}
+	if len(threads) != 101 {
+		t.Fatalf("len(threads) = %d, want 101", len(threads))
+	}
+	if len(threads[0].Comments) != 2 {
+		t.Fatalf("len(threads[0].Comments) = %d, want 2", len(threads[0].Comments))
+	}
+	if threads[0].Comments[1].ID != "comment-2" || threads[0].Comments[1].Author != "bob" || threads[0].Comments[1].OriginalCommitOID != "orig-2" || threads[0].Comments[1].CommitOID != "head-2" {
+		t.Fatalf("threads[0].Comments[1] = %#v, want paginated comment metadata preserved", threads[0].Comments[1])
+	}
+	if threads[100].ID != "thread-101" || !threads[100].IsResolved {
+		t.Fatalf("threads[100] = %#v, want second paginated thread", threads[100])
+	}
+	log := strings.Join(runner.calls, "\n")
+	for _, needle := range []string{"limit=100", "after=thread-cursor-1", "threadId=thread-1", "after=comment-cursor-1"} {
+		if !strings.Contains(log, needle) {
+			t.Fatalf("gh log missing %q\n%s", needle, log)
+		}
+	}
+}
+
+func reviewThreadNodesJSON(start, count int) string {
+	var b strings.Builder
+	for i := start; i < start+count; i++ {
+		if i > start {
+			b.WriteString(",")
+		}
+		commentPageInfo := `"pageInfo":{"hasNextPage":false,"endCursor":""}`
+		if i == 1 {
+			commentPageInfo = `"pageInfo":{"hasNextPage":true,"endCursor":"comment-cursor-1"}`
+		}
+		b.WriteString(fmt.Sprintf(`{"id":"thread-%d","isResolved":false,"path":"a.go","line":%d,"comments":{"nodes":[{"id":"comment-%d","body":"first","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z","path":"a.go","line":%d,"url":"https://example.test/comment-%d","author":{"login":"alice"},"originalCommit":{"oid":"orig-%d"},"commit":{"oid":"head-%d"}}],%s}}`, i, i, i, i, i, i, i, commentPageInfo))
+	}
+	return b.String()
+}
+
+func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
+		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"first page"}]}}],"pageInfo":{"hasNextPage":true,"endCursor":"thread-cursor-1"}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if len(detail.Comments) != 2 {
+		t.Fatalf("len(detail.Comments) = %d, want 2", len(detail.Comments))
+	}
+	if detail.Comments[1]["threadId"] != "thread-2" || detail.Comments[1]["body"] != "second page" {
+		t.Fatalf("detail.Comments[1] = %#v, want second paginated thread", detail.Comments[1])
 	}
 }
 

@@ -115,7 +115,17 @@
           "clean": "APPROVE",
           "blocking": "COMMENT"
         },
-        "detectDuplicateFindings": true
+        "detectDuplicateFindings": true,
+        "threadResolution": {
+          "autoResolve": "objective_only",
+          "enabled": false,
+          "maxThreadsPerRun": 10,
+          "mode": "report_only",
+          "requireAuditComment": true,
+          "requireCurrentReviewRequest": true,
+          "requireNewHeadSinceThread": true,
+          "scope": "looper_authored_only"
+        }
       },
       "instructions": {
         "enabled": true,

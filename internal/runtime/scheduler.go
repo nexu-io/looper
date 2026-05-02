@@ -297,6 +297,31 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
+func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input reviewer.ListReviewThreadsInput) ([]reviewer.ReviewThread, error) {
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reviewer.ReviewThread, 0, len(threads))
+	for _, thread := range threads {
+		converted := reviewer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Path: thread.Path, Line: thread.Line, URL: thread.URL}
+		for _, comment := range thread.Comments {
+			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
+		}
+		out = append(out, converted)
+	}
+	return out, nil
+}
+
+func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input reviewer.AddReviewThreadReplyInput) error {
+	body := a.stamper.ReviewComment(input.Body, "reviewer")
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+}
+
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
@@ -756,6 +781,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 		Scope:                   cfg.Reviewer.Scope,
 		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
+		ThreadResolution:        cfg.Reviewer.ThreadResolution,
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
 		CustomInstructions:      &cfg,
