@@ -14,6 +14,7 @@ Subcommands:
   daemon     Daemon commands
   upgrade    Check or upgrade Looper installations
   labels     GitHub label commands
+  queue      Queue inspection and maintenance commands
   loop       Loop commands
   work       Create a worker run
   plan       Create a planner run

@@ -921,9 +921,19 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 	}
 
+	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+	if err != nil {
+		appendErr(err)
+		availableSlots = 0
+	}
+	if availableSlots > 0 && input.Repos.Queue != nil {
+		appendErr(claimAndRunScheduledQueueItems(ctx, availableSlots, input))
+	}
+
 	projectsList, err := input.Repos.Projects.List(ctx)
 	if err != nil {
-		return err
+		appendErr(err)
+		return errors.Join(errs...)
 	}
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
@@ -963,18 +973,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
-	}
-
-	if err := ctx.Err(); err != nil {
-		return errors.Join(append(errs, err)...)
-	}
-	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
-	if err != nil {
-		appendErr(err)
-		availableSlots = 0
-	}
-	if availableSlots > 0 && input.Repos.Queue != nil {
-		appendErr(claimAndRunScheduledQueueItems(ctx, availableSlots, input))
 	}
 
 	if len(errs) == 0 {

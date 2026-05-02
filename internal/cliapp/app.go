@@ -94,7 +94,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -234,6 +234,22 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 							boolFlag("dry-run", "Preview label changes without applying them"),
 						},
 					}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "queue",
+				short:           "Queue inspection and maintenance commands",
+				helpSubcommands: []helpSubcommand{{name: "stats", description: "Show queue eligibility stats"}, {name: "list", description: "List queue items"}, {name: "cleanup", description: "Clean stale queue items"}},
+				helpWhenNoArgs:  true,
+				exampleLines: []string{
+					"$ looper queue stats",
+					"$ looper queue list --eligible",
+					"$ looper queue cleanup --stale",
+				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "stats", short: "Show queue eligibility stats", runE: runtime.queueStats}),
+					newCommand(commandSpec{use: "list", short: "List queue items", runE: runtime.queueList, localFlags: []flagSpec{boolFlag("eligible", "Only list currently eligible queued items")}}),
+					newCommand(commandSpec{use: "cleanup", short: "Clean stale queue items", runE: runtime.queueCleanup, localFlags: []flagSpec{boolFlag("stale", "Cancel queued items blocked by terminal loops")}}),
 				},
 			}),
 			newCommand(commandSpec{

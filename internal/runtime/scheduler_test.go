@@ -101,6 +101,46 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
+func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-claim-first.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	projectMetadata := `{"repo":"powerformer/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectID := "looper"
+	loopTarget := "project:looper"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_claim_first", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("powerformer/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	loopID := "loop_worker_claim_first"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_claim_first", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("powerformer/looper"), DedupeKey: "worker:loop_worker_claim_first", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	plannerRunner := &queueStatusCheckingPlannerScheduler{t: t, repos: repos, queueItemID: "queue_worker_claim_first"}
+
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 1,
+		Planner:           plannerRunner,
+		Worker:            &stubWorkerScheduler{},
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if !plannerRunner.checkedClaimedStatus {
+		t.Fatal("planner discovery did not verify claimed queue item status")
+	}
+}
+
 func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	t.Parallel()
 
@@ -567,6 +607,41 @@ type stubPlannerScheduler struct {
 	processedItems []string
 	discoverErr    error
 	processErr     error
+}
+
+type queueStatusCheckingPlannerScheduler struct {
+	t                    *testing.T
+	repos                *storage.Repositories
+	queueItemID          string
+	checkedClaimedStatus bool
+}
+
+func (s *queueStatusCheckingPlannerScheduler) DiscoverIssues(ctx context.Context, _ planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.t.Helper()
+	item, err := s.repos.Queue.GetByID(ctx, s.queueItemID)
+	if err != nil {
+		s.t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if item == nil {
+		s.t.Fatal("Queue.GetByID() = nil, want claimed queue item")
+	}
+	if item.Status != "running" {
+		s.t.Fatalf("queue item status during discovery = %q, want running", item.Status)
+	}
+	if item.ClaimedBy == nil || *item.ClaimedBy != "scheduler" {
+		s.t.Fatalf("queue item claimed_by during discovery = %v, want scheduler", item.ClaimedBy)
+	}
+	s.checkedClaimedStatus = true
+	return planner.DiscoveryResult{}, nil
+}
+
+func (s *queueStatusCheckingPlannerScheduler) ProcessNext(context.Context, string) (*planner.ProcessResult, error) {
+	return nil, nil
+}
+
+func (s *queueStatusCheckingPlannerScheduler) ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error) {
+	return nil, nil
+
 }
 
 func (s *stubPlannerScheduler) DiscoverIssues(_ context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {

@@ -183,6 +183,16 @@ type QueueItemRecord struct {
 	UpdatedAt     string
 }
 
+type QueueStats struct {
+	TotalQueued                      int64
+	EligibleQueued                   int64
+	BlockedByTerminalOrPausedLoop    int64
+	BlockedByLockKey                 int64
+	BlockedByReviewerFixerDependency int64
+	ScheduledForFuture               int64
+	StaleQueued                      int64
+}
+
 type QueueMarkRetryInput struct {
 	ID           string
 	AvailableAt  string
@@ -884,6 +894,26 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	return scanQueueItems(rows)
 }
 
+func (r *QueueRepository) ListQueued(ctx context.Context, limit int64) ([]QueueItemRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT *
+		FROM queue_items
+		WHERE status = 'queued'
+		ORDER BY priority ASC, available_at ASC, created_at ASC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list queued queue items: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
 func (r *QueueRepository) CountByStatus(ctx context.Context, status string) (int64, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE status = ?`, status)
 	var count int64
@@ -941,6 +971,91 @@ func (r *QueueRepository) ListScheduled(ctx context.Context, nowISO string, limi
 	defer rows.Close()
 
 	return scanQueueItems(rows)
+}
+
+func (r *QueueRepository) Stats(ctx context.Context, nowISO string) (QueueStats, error) {
+	stats := QueueStats{}
+	queries := []struct {
+		name string
+		dest *int64
+		sql  string
+		now  bool
+	}{
+		{name: "total queued", dest: &stats.TotalQueued, sql: `SELECT COUNT(*) FROM queue_items WHERE status = 'queued'`},
+		{name: "eligible queued", dest: &stats.EligibleQueued, sql: `SELECT COUNT(*) FROM (` + scheduledQueueBaseQuery + `)`, now: true},
+		{name: "blocked by terminal or paused loop", dest: &stats.BlockedByTerminalOrPausedLoop, sql: `
+			SELECT COUNT(*)
+			FROM queue_items qi
+			JOIN loops l ON l.id = qi.loop_id
+			WHERE qi.status = 'queued'
+				AND l.status IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		`},
+		{name: "blocked by lock key", dest: &stats.BlockedByLockKey, now: true, sql: `
+			SELECT COUNT(*)
+			FROM queue_items qi
+			WHERE qi.status = 'queued'
+				AND qi.available_at <= ?
+				AND qi.lock_key IS NOT NULL
+				AND EXISTS (
+					SELECT 1
+					FROM queue_items lock_blocker
+					WHERE lock_blocker.lock_key = qi.lock_key
+						AND lock_blocker.status = 'running'
+						AND lock_blocker.id != qi.id
+				)
+		`},
+		{name: "blocked by reviewer/fixer dependency", dest: &stats.BlockedByReviewerFixerDependency, now: true, sql: `
+			SELECT COUNT(*)
+			FROM queue_items qi
+			WHERE qi.status = 'queued'
+				AND qi.available_at <= ?
+				AND qi.type = 'fixer'
+				AND qi.repo IS NOT NULL
+				AND qi.pr_number IS NOT NULL
+				AND EXISTS (
+					SELECT 1
+					FROM queue_items blocker
+					WHERE blocker.type = 'reviewer'
+						AND blocker.repo = qi.repo
+						AND blocker.pr_number = qi.pr_number
+						AND blocker.status IN ('queued', 'running')
+						AND blocker.id != qi.id
+				)
+		`},
+		{name: "scheduled for future", dest: &stats.ScheduledForFuture, sql: `SELECT COUNT(*) FROM queue_items WHERE status = 'queued' AND available_at > ?`, now: true},
+		{name: "stale queued", dest: &stats.StaleQueued, sql: staleQueuedCountQuery},
+	}
+
+	for _, query := range queries {
+		args := []any{}
+		if query.now {
+			args = append(args, nowISO)
+		}
+		if err := r.q.QueryRowContext(ctx, query.sql, args...).Scan(query.dest); err != nil {
+			return QueueStats{}, fmt.Errorf("count queue items %s: %w", query.name, err)
+		}
+	}
+	return stats, nil
+}
+
+func (r *QueueRepository) CleanupStaleQueued(ctx context.Context, finishedAt string, reason string) (int64, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'cancelled',
+			finished_at = ?,
+			last_error = ?,
+			last_error_kind = 'non_retryable',
+			updated_at = ?
+		WHERE id IN (`+staleQueuedIDsQuery+`)
+	`, finishedAt, reason, finishedAt)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup stale queued items: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cleanup stale queued items rows affected: %w", err)
+	}
+	return affected, nil
 }
 
 func (r *QueueRepository) ClaimNext(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
@@ -1305,6 +1420,16 @@ const scheduledQueueOrderBy = `
 `
 
 const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
+
+const staleQueuedIDsQuery = `
+	SELECT qi.id
+	FROM queue_items qi
+	JOIN loops l ON l.id = qi.loop_id
+	WHERE qi.status = 'queued'
+		AND l.status IN ('completed', 'failed', 'interrupted', 'terminated', 'stopped')
+`
+
+const staleQueuedCountQuery = `SELECT COUNT(*) FROM (` + staleQueuedIDsQuery + `)`
 
 func scanProjects(rows *sql.Rows) ([]ProjectRecord, error) {
 	records := make([]ProjectRecord, 0)

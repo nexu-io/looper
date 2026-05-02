@@ -19,6 +19,7 @@ import (
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
@@ -2045,6 +2046,9 @@ func (r *Runner) classifyFailure(err error) *loopError {
 		return typed
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if githubinfra.IsTransientError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}

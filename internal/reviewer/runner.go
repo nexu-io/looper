@@ -21,6 +21,7 @@ import (
 	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 	"github.com/powerformer/looper/internal/version"
@@ -2385,6 +2386,9 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	}
 	var transient transientFailure
 	if errors.As(err, &transient) && transient.Temporary() {
+		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if githubinfra.IsTransientError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}

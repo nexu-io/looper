@@ -240,6 +240,35 @@ func TestGetPullRequestHeadSHA(t *testing.T) {
 	}
 }
 
+func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "gateway-wrapped tls handshake timeout", err: &TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "net/http: TLS handshake timeout"}}}},
+		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
+		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if !IsTransientError(tc.err) {
+				t.Fatalf("IsTransientError(%v) = false, want true", tc.err)
+			}
+		})
+	}
+}
+
+func TestIsTransientErrorIgnoresNonGitHubShellFailures(t *testing.T) {
+	t.Parallel()
+
+	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "unexpected EOF while reading local file"}}
+	if IsTransientError(err) {
+		t.Fatal("IsTransientError(non-GitHub shell EOF) = true, want false")
+	}
+}
+
 func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

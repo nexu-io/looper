@@ -16,6 +16,7 @@ import (
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
@@ -1623,6 +1624,9 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	message := err.Error()
 	if strings.Contains(strings.ToLower(message), "remote head changed") {
 		return &loopError{message: message, kind: FailureRetryableAfterResume}
+	}
+	if githubinfra.IsTransientError(err) {
+		return &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	return &loopError{message: message, kind: FailureNonRetryable}
 }

@@ -1,0 +1,86 @@
+package github
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/powerformer/looper/internal/infra/shell"
+)
+
+type TransientError struct {
+	Err error
+}
+
+func (e *TransientError) Error() string {
+	return fmt.Sprintf("transient GitHub error: %v", e.Err)
+}
+
+func (e *TransientError) Unwrap() error {
+	return e.Err
+}
+
+// IsTransientError reports whether a GitHub CLI/API failure is likely caused by
+// network or service flakiness and should be retried instead of treated as a
+// terminal loop failure.
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transientErr *TransientError
+	if errors.As(err, &transientErr) {
+		return true
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		message := strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")
+		return looksLikeGitHubFailure(message) && isTransientGitHubMessage(message)
+	}
+	message := err.Error()
+	if !looksLikeGitHubFailure(message) {
+		return false
+	}
+	return isTransientGitHubMessage(message)
+}
+
+func looksLikeGitHubFailure(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"github",
+		"api.github.com",
+		"graphql",
+		"gh api",
+		"gh pr",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTransientGitHubMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"tls handshake timeout",
+		"unexpected eof",
+		"connection reset by peer",
+		"connection refused",
+		"connection timed out",
+		"i/o timeout",
+		"temporary failure in name resolution",
+		"no such host",
+		"network is unreachable",
+		"stream error",
+		"http2: server sent goaway",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
+		"graphql: something went wrong",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}

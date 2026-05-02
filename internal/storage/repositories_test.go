@@ -911,6 +911,76 @@ func TestQueueClaimNextOfTypeSkipsTerminatedAndStoppedLoops(t *testing.T) {
 	}
 }
 
+func TestQueueStatsAndCleanupStaleQueued(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_queue_stats"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for i, loop := range []LoopRecord{
+		{ID: "loop_eligible", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_future", Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_terminal", Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "completed", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_lock_wait", Seq: 4, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_lock_running", Seq: 5, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_reviewer", Seq: 6, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_fixer", Seq: 7, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_stale", Seq: 8, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "terminated", CreatedAt: now, UpdatedAt: now},
+	} {
+		loop.Seq = int64(i + 1)
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	lockKey := "repo:acme/looper"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	for _, item := range []QueueItemRecord{
+		{ID: "qi_eligible", ProjectID: &projectID, LoopID: strPtr("loop_eligible"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "eligible", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_future", ProjectID: &projectID, LoopID: strPtr("loop_future"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "future", Priority: 1, Status: "queued", AvailableAt: "2026-04-11T12:10:00.000Z", MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_terminal", ProjectID: &projectID, LoopID: strPtr("loop_terminal"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "terminal", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_lock_running", ProjectID: &projectID, LoopID: strPtr("loop_lock_running"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "lock-running", Priority: 1, Status: "running", AvailableAt: now, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_lock_wait", ProjectID: &projectID, LoopID: strPtr("loop_lock_wait"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "lock-wait", Priority: 1, Status: "queued", AvailableAt: now, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_reviewer", ProjectID: &projectID, LoopID: strPtr("loop_reviewer"), Type: "reviewer", TargetType: "pull_request", TargetID: "acme/looper#42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_fixer", ProjectID: &projectID, LoopID: strPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "acme/looper#42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_stale", ProjectID: &projectID, LoopID: strPtr("loop_stale"), Type: "worker", TargetType: "project", TargetID: "project_queue_stats", DedupeKey: "stale", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	stats, err := repos.Queue.Stats(ctx, now)
+	if err != nil {
+		t.Fatalf("Queue.Stats() error = %v", err)
+	}
+	if stats.TotalQueued != 7 || stats.EligibleQueued != 2 || stats.BlockedByTerminalOrPausedLoop != 2 || stats.BlockedByLockKey != 1 || stats.BlockedByReviewerFixerDependency != 1 || stats.ScheduledForFuture != 1 || stats.StaleQueued != 2 {
+		t.Fatalf("Queue.Stats() = %#v, want total=7 eligible=2 terminal=2 lock=1 dependency=1 future=1 stale=2", stats)
+	}
+
+	cleaned, err := repos.Queue.CleanupStaleQueued(ctx, now, "stale queue item attached to terminal loop")
+	if err != nil {
+		t.Fatalf("Queue.CleanupStaleQueued() error = %v", err)
+	}
+	if cleaned != 2 {
+		t.Fatalf("Queue.CleanupStaleQueued() = %d, want 2", cleaned)
+	}
+	for _, id := range []string{"qi_terminal", "qi_stale"} {
+		item, err := repos.Queue.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil || item.Status != "cancelled" || item.LastErrorKind == nil || *item.LastErrorKind != "non_retryable" {
+			t.Fatalf("Queue.GetByID(%s) after cleanup = %#v, want cancelled non_retryable", id, item)
+		}
+	}
+}
+
 func strPtr(value string) *string {
 	return &value
 }
