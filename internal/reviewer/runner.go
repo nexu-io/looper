@@ -1545,7 +1545,7 @@ func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision t
 	if evidence == "" {
 		evidence = "the current head"
 	}
-	decisionValue := strings.TrimSpace(decision.Decision)
+	decisionValue := strings.ToLower(strings.TrimSpace(decision.Decision))
 	if decisionValue == "" {
 		decisionValue = "needs_human"
 	}
