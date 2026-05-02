@@ -2451,7 +2451,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	reviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 		approveInstruction = "If the review is clean, submit an APPROVE review."
-		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT or actionable reviews."
+		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT, non-blocking, or blocking finding reviews."
 		reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for finding reviews or `%s review submit %s#%d --event APPROVE --commit-id %s %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
@@ -2477,7 +2477,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		submitPayloadInstruction = ""
 	}
 	parts = append(parts,
-		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
+		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=non_blocking, outcome=blocking, or legacy outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
 		existingMarkerEventInstruction,
 		githubOperationContract,
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
@@ -2487,7 +2487,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
 		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations. Use ANCHORABLE DIFF LOCATIONS as a summary of known ranges, but if that summary is truncated, the full PR diff remains authoritative. Preserve exact anchors that fit the full diff. If an otherwise useful comment is outside the full diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
-		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
+		"For non-blocking or blocking finding reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
 		approveInstruction,
 		blockingInstruction,
@@ -2499,7 +2499,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
 		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
-		"For actionable reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
+		"For non-blocking or blocking finding reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",

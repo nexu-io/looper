@@ -140,3 +140,34 @@ func TestValidateReviewSubmitPolicyRejectsInvalidOverrides(t *testing.T) {
 		t.Fatalf("validateReviewSubmitPolicy(invalid blocking) error = %v, want blocking rejection", err)
 	}
 }
+
+func TestEffectiveReviewSubmitPolicyRejectsForgedWideningOverrides(t *testing.T) {
+	t.Parallel()
+
+	if _, err := effectiveReviewSubmitPolicy(commentOnlyReviewPolicy, "APPROVE", ""); err == nil || !strings.Contains(err.Error(), "--clean-review-event APPROVE requires reviewer.reviewEvents.clean=APPROVE") {
+		t.Fatalf("effectiveReviewSubmitPolicy(clean widen) error = %v, want clean widening rejection", err)
+	}
+	if _, err := effectiveReviewSubmitPolicy(commentOnlyReviewPolicy, "", "REQUEST_CHANGES"); err == nil || !strings.Contains(err.Error(), "--blocking-review-event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES") {
+		t.Fatalf("effectiveReviewSubmitPolicy(blocking widen) error = %v, want blocking widening rejection", err)
+	}
+}
+
+func TestEffectiveReviewSubmitPolicyAllowsBaseAndNarrowingOverrides(t *testing.T) {
+	t.Parallel()
+
+	policy, err := effectiveReviewSubmitPolicy(decisionReviewPolicy, "COMMENT", "COMMENT")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitPolicy(narrow to comment) error = %v", err)
+	}
+	if policy.Clean != config.ReviewerReviewEventComment || policy.Blocking != config.ReviewerReviewEventComment {
+		t.Fatalf("effectiveReviewSubmitPolicy(narrow to comment) = %+v, want both COMMENT", policy)
+	}
+
+	policy, err = effectiveReviewSubmitPolicy(decisionReviewPolicy, "APPROVE", "REQUEST_CHANGES")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitPolicy(base decisions) error = %v", err)
+	}
+	if policy != decisionReviewPolicy {
+		t.Fatalf("effectiveReviewSubmitPolicy(base decisions) = %+v, want %+v", policy, decisionReviewPolicy)
+	}
+}

@@ -56,14 +56,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	policy := loaded.Config.Reviewer.ReviewEvents
-	if value := strings.TrimSpace(getStringFlag(cmd, "clean-review-event")); value != "" {
-		policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(value))
-	}
-	if value := strings.TrimSpace(getStringFlag(cmd, "blocking-review-event")); value != "" {
-		policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(value))
-	}
-	if err := validateReviewSubmitPolicy(policy); err != nil {
+	policy, err := effectiveReviewSubmitPolicy(
+		loaded.Config.Reviewer.ReviewEvents,
+		getStringFlag(cmd, "clean-review-event"),
+		getStringFlag(cmd, "blocking-review-event"),
+	)
+	if err != nil {
 		return err
 	}
 	if err := validateReviewSubmitEventAllowed(event, policy); err != nil {
@@ -128,6 +126,45 @@ func validateReviewSubmitPolicy(policy config.ReviewerReviewEventsConfig) error 
 		return fmt.Errorf("blocking review event policy must be COMMENT or REQUEST_CHANGES")
 	}
 	return nil
+}
+
+func effectiveReviewSubmitPolicy(base config.ReviewerReviewEventsConfig, cleanOverride string, blockingOverride string) (config.ReviewerReviewEventsConfig, error) {
+	if err := validateReviewSubmitPolicy(base); err != nil {
+		return config.ReviewerReviewEventsConfig{}, err
+	}
+	policy := base
+	if value := strings.TrimSpace(cleanOverride); value != "" {
+		override := config.ReviewerReviewEvent(strings.ToUpper(value))
+		switch override {
+		case config.ReviewerReviewEventComment:
+			policy.Clean = override
+		case config.ReviewerReviewEventApprove:
+			if base.Clean != config.ReviewerReviewEventApprove {
+				return config.ReviewerReviewEventsConfig{}, fmt.Errorf("review submit --clean-review-event APPROVE requires reviewer.reviewEvents.clean=APPROVE")
+			}
+			policy.Clean = override
+		default:
+			policy.Clean = override
+		}
+	}
+	if value := strings.TrimSpace(blockingOverride); value != "" {
+		override := config.ReviewerReviewEvent(strings.ToUpper(value))
+		switch override {
+		case config.ReviewerReviewEventComment:
+			policy.Blocking = override
+		case config.ReviewerReviewEventRequestChanges:
+			if base.Blocking != config.ReviewerReviewEventRequestChanges {
+				return config.ReviewerReviewEventsConfig{}, fmt.Errorf("review submit --blocking-review-event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES")
+			}
+			policy.Blocking = override
+		default:
+			policy.Blocking = override
+		}
+	}
+	if err := validateReviewSubmitPolicy(policy); err != nil {
+		return config.ReviewerReviewEventsConfig{}, err
+	}
+	return policy, nil
 }
 
 func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReviewEventsConfig) error {
