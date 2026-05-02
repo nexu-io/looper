@@ -76,6 +76,12 @@ func (s Stamper) MarkdownStamp(runner string) string {
 	return Marker + "\n" + s.markdownFooter(runner)
 }
 
+func StripMarkdownStamp(body string) string {
+	cleaned := markdownStampPattern.ReplaceAllString(body, "")
+	cleaned = markerOnlyPattern.ReplaceAllString(cleaned, "")
+	return strings.TrimSpace(cleaned)
+}
+
 func (s Stamper) ReviewComment(body, runner string) string {
 	if !s.enabled(ChannelReviewComment) {
 		return body

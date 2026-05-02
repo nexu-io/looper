@@ -1126,10 +1126,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
-	if checkpoint.Detail.HasConflicts {
-		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
-		return checkpoint, nil
-	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
 		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
@@ -1142,6 +1138,10 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
 			return checkpoint, err
 		}
+		return checkpoint, nil
+	}
+	if checkpoint.Detail.HasConflicts {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
