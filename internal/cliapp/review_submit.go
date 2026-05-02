@@ -134,32 +134,10 @@ func effectiveReviewSubmitPolicy(base config.ReviewerReviewEventsConfig, cleanOv
 	}
 	policy := base
 	if value := strings.TrimSpace(cleanOverride); value != "" {
-		override := config.ReviewerReviewEvent(strings.ToUpper(value))
-		switch override {
-		case config.ReviewerReviewEventComment:
-			policy.Clean = override
-		case config.ReviewerReviewEventApprove:
-			if base.Clean != config.ReviewerReviewEventApprove {
-				return config.ReviewerReviewEventsConfig{}, fmt.Errorf("review submit --clean-review-event APPROVE requires reviewer.reviewEvents.clean=APPROVE")
-			}
-			policy.Clean = override
-		default:
-			policy.Clean = override
-		}
+		policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(value))
 	}
 	if value := strings.TrimSpace(blockingOverride); value != "" {
-		override := config.ReviewerReviewEvent(strings.ToUpper(value))
-		switch override {
-		case config.ReviewerReviewEventComment:
-			policy.Blocking = override
-		case config.ReviewerReviewEventRequestChanges:
-			if base.Blocking != config.ReviewerReviewEventRequestChanges {
-				return config.ReviewerReviewEventsConfig{}, fmt.Errorf("review submit --blocking-review-event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES")
-			}
-			policy.Blocking = override
-		default:
-			policy.Blocking = override
-		}
+		policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(value))
 	}
 	if err := validateReviewSubmitPolicy(policy); err != nil {
 		return config.ReviewerReviewEventsConfig{}, err

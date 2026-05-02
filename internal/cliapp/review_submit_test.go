@@ -141,14 +141,15 @@ func TestValidateReviewSubmitPolicyRejectsInvalidOverrides(t *testing.T) {
 	}
 }
 
-func TestEffectiveReviewSubmitPolicyRejectsForgedWideningOverrides(t *testing.T) {
+func TestEffectiveReviewSubmitPolicyHonorsDecisionOverrides(t *testing.T) {
 	t.Parallel()
 
-	if _, err := effectiveReviewSubmitPolicy(commentOnlyReviewPolicy, "APPROVE", ""); err == nil || !strings.Contains(err.Error(), "--clean-review-event APPROVE requires reviewer.reviewEvents.clean=APPROVE") {
-		t.Fatalf("effectiveReviewSubmitPolicy(clean widen) error = %v, want clean widening rejection", err)
+	policy, err := effectiveReviewSubmitPolicy(commentOnlyReviewPolicy, "APPROVE", "REQUEST_CHANGES")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitPolicy(decision overrides) error = %v", err)
 	}
-	if _, err := effectiveReviewSubmitPolicy(commentOnlyReviewPolicy, "", "REQUEST_CHANGES"); err == nil || !strings.Contains(err.Error(), "--blocking-review-event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES") {
-		t.Fatalf("effectiveReviewSubmitPolicy(blocking widen) error = %v, want blocking widening rejection", err)
+	if policy != decisionReviewPolicy {
+		t.Fatalf("effectiveReviewSubmitPolicy(decision overrides) = %+v, want %+v", policy, decisionReviewPolicy)
 	}
 }
 

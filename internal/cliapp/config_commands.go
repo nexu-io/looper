@@ -452,6 +452,18 @@ func openPRStrategyField() configField {
 func reviewerReviewEventField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
 	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
+		switch key {
+		case "reviewer.reviewEvents.clean":
+			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventApprove {
+				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove)
+			}
+		case "reviewer.reviewEvents.blocking":
+			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventRequestChanges {
+				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges)
+			}
+		default:
+			return fmt.Errorf("unsupported review event config key %q", key)
+		}
 		*target(p) = &value
 		return nil
 	}, unset: func(p *config.PartialConfig) {
