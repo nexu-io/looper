@@ -1101,6 +1101,14 @@ func TestDiscoverPullRequestsSuppressesRepeatedAlreadyReviewedSkip(t *testing.T)
 	if err != nil || processed.Status != "skipped" || !strings.Contains(processed.Summary, "already reviewed head abc123") {
 		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want already-reviewed skip", processed, err)
 	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), first.CreatedLoopIDs[0])
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	lastSkip, _ := parseJSONObject(loop.MetadataJSON)["lastFilterSkip"].(map[string]any)
+	if got, _ := stringFromAny(lastSkip["reviewerLogin"]); got != "octocat" {
+		t.Fatalf("lastFilterSkip.reviewerLogin = %q, want octocat", got)
+	}
 
 	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
 	if err != nil {
@@ -1108,6 +1116,16 @@ func TestDiscoverPullRequestsSuppressesRepeatedAlreadyReviewedSkip(t *testing.T)
 	}
 	if len(second.QueueItems) != 0 {
 		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged already-reviewed head", second.QueueItems)
+	}
+
+	github.currentLogin = "looper-bot"
+	github.reviewRequests = []string{"looper-bot"}
+	third, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("third DiscoverPullRequests() error = %v", err)
+	}
+	if len(third.QueueItems) != 1 {
+		t.Fatalf("third QueueItems = %#v, want re-enqueue when reviewer login changes", third.QueueItems)
 	}
 }
 

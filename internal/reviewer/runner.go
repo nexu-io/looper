@@ -401,15 +401,16 @@ type ProcessResult struct {
 }
 
 type reviewerCheckpoint struct {
-	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
-	Detail           *checkpointDetail           `json:"detail,omitempty"`
-	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
-	Snapshot         *checkpointSnapshot         `json:"snapshot,omitempty"`
-	Worktree         *checkpointWorktree         `json:"worktree,omitempty"`
-	ThreadResolution *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
-	PendingReview    *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
-	SkipReason       string                      `json:"skipReason,omitempty"`
-	SkipKind         string                      `json:"skipKind,omitempty"`
+	ResumePolicy      string                      `json:"resumePolicy,omitempty"`
+	Detail            *checkpointDetail           `json:"detail,omitempty"`
+	ClaimedLockKey    string                      `json:"claimedLockKey,omitempty"`
+	Snapshot          *checkpointSnapshot         `json:"snapshot,omitempty"`
+	Worktree          *checkpointWorktree         `json:"worktree,omitempty"`
+	ThreadResolution  *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
+	PendingReview     *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
+	SkipReason        string                      `json:"skipReason,omitempty"`
+	SkipKind          string                      `json:"skipKind,omitempty"`
+	SkipReviewerLogin string                      `json:"skipReviewerLogin,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -612,7 +613,18 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			return nil
 		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr) {
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
+			result.Skipped++
+			return nil
+		}
+		if reviewerLastSkipNeedsCurrentLogin(meta, pr) && currentLogin == "" {
+			lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+			if lookupErr != nil {
+				lookupLogin = ""
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+		}
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
 			result.Skipped++
 			return nil
 		}
@@ -1164,6 +1176,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
 			checkpoint.SkipKind = "already_reviewed_by_current_user"
+			checkpoint.SkipReviewerLogin = normalizeLogin(currentLogin)
 			return checkpoint, nil
 		}
 	}
@@ -2592,7 +2605,7 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
-func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary) bool {
+func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string) bool {
 	raw, _ := meta["lastFilterSkip"].(map[string]any)
 	if raw == nil {
 		return false
@@ -2604,6 +2617,12 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 	headSHA, _ := stringFromAny(raw["headSha"])
 	if headSHA == "" || pr.HeadSHA == "" || headSHA != pr.HeadSHA {
 		return false
+	}
+	if kind == "already_reviewed_by_current_user" {
+		reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
+		if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
+			return false
+		}
 	}
 	if kind == "conflicted" && !pr.HasConflicts {
 		return false
@@ -2618,6 +2637,19 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 		return false
 	}
 	return true
+}
+
+func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummary) bool {
+	raw, _ := meta["lastFilterSkip"].(map[string]any)
+	if raw == nil {
+		return false
+	}
+	kind, _ := stringFromAny(raw["kind"])
+	if kind != "already_reviewed_by_current_user" {
+		return false
+	}
+	headSHA, _ := stringFromAny(raw["headSha"])
+	return headSHA != "" && pr.HeadSHA != "" && headSHA == pr.HeadSHA
 }
 
 func isDiscoverySuppressingSkipKind(kind string) bool {
@@ -2904,6 +2936,9 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 	}
 	if checkpoint.SkipKind == "ready_label" {
 		metadata["requiredLabel"] = specpr.ReadyLabel
+	}
+	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
+		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)
 	}
 	return metadata
 }
