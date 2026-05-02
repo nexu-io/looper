@@ -1008,7 +1008,7 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 func TestDiscoverPullRequestsSuppressesRepeatedConflictSkipUntilHeadChanges(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{hasConflicts: true, reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{hasConflicts: true, reviewDecision: "REVIEW_REQUIRED", reviewRequests: []string{"octocat"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
 	repo := "acme/looper"
 
@@ -1025,12 +1025,13 @@ func TestDiscoverPullRequestsSuppressesRepeatedConflictSkipUntilHeadChanges(t *t
 		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want conflicted skip", processed, err)
 	}
 
+	github.reviewDecision = "APPROVED"
 	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
 	if err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
 	if len(second.QueueItems) != 0 {
-		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged conflicted head", second.QueueItems)
+		t.Fatalf("second QueueItems = %#v, want no re-enqueue while conflict remains after review decision changes", second.QueueItems)
 	}
 	items, err := fixture.repos.Queue.List(context.Background())
 	if err != nil {
@@ -1085,7 +1086,7 @@ func TestDiscoverPullRequestsSuppressesRepeatedAlreadyReviewedSkip(t *testing.T)
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
-	github := &fakeGitHubGateway{currentLogin: "octocat", reviews: reviews, reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", reviewDecision: "REVIEW_REQUIRED", reviews: reviews, reviewRequests: []string{"octocat"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
 	repo := "acme/looper"
 
@@ -1110,12 +1111,13 @@ func TestDiscoverPullRequestsSuppressesRepeatedAlreadyReviewedSkip(t *testing.T)
 		t.Fatalf("lastFilterSkip.reviewerLogin = %q, want octocat", got)
 	}
 
+	github.reviewDecision = "APPROVED"
 	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
 	if err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
 	if len(second.QueueItems) != 0 {
-		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged already-reviewed head", second.QueueItems)
+		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged already-reviewed head after review decision changes", second.QueueItems)
 	}
 
 	github.currentLogin = "looper-bot"

@@ -2624,17 +2624,23 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 			return false
 		}
 	}
-	if kind == "conflicted" && !pr.HasConflicts {
-		return false
-	}
-	if label, ok := stringFromAny(raw["requiredLabel"]); ok && label != "" && !specpr.HasLabel(pr.Labels, label) {
-		return false
-	}
-	if decision, ok := stringFromAny(raw["reviewDecision"]); ok && decision != "" && !strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), decision) {
-		return false
-	}
-	if draft, ok := raw["isDraft"].(bool); ok && draft != pr.IsDraft {
-		return false
+	switch kind {
+	case "conflicted":
+		if !pr.HasConflicts {
+			return false
+		}
+	case "ready_label":
+		if label, ok := stringFromAny(raw["requiredLabel"]); ok && label != "" && !specpr.HasLabel(pr.Labels, label) {
+			return false
+		}
+	case "approved":
+		if decision, ok := stringFromAny(raw["reviewDecision"]); ok && decision != "" && !strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), decision) {
+			return false
+		}
+	case "draft":
+		if draft, ok := raw["isDraft"].(bool); ok && draft != pr.IsDraft {
+			return false
+		}
 	}
 	return true
 }
@@ -2925,13 +2931,13 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 	if checkpoint.Detail.HeadSHA != "" {
 		metadata["headSha"] = checkpoint.Detail.HeadSHA
 	}
-	if checkpoint.Detail.IsDraft {
+	if checkpoint.SkipKind == "draft" && checkpoint.Detail.IsDraft {
 		metadata["isDraft"] = true
 	}
-	if checkpoint.Detail.ReviewDecision != "" {
+	if checkpoint.SkipKind == "approved" && checkpoint.Detail.ReviewDecision != "" {
 		metadata["reviewDecision"] = strings.TrimSpace(checkpoint.Detail.ReviewDecision)
 	}
-	if checkpoint.Detail.HasConflicts {
+	if checkpoint.SkipKind == "conflicted" && checkpoint.Detail.HasConflicts {
 		metadata["hasConflicts"] = true
 	}
 	if checkpoint.SkipKind == "ready_label" {
