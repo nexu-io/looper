@@ -19,6 +19,7 @@ import (
 	"github.com/powerformer/looper/internal/domain"
 	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/loops"
 	"github.com/powerformer/looper/internal/projects"
 	"github.com/powerformer/looper/internal/runs"
@@ -684,6 +685,49 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			eventsWritten += 1
 		}
 
+		latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return RecoverySummary{}, err
+		}
+		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, int64(r.config.Reviewer.Loop.MaxConsecutiveFailures)) {
+			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			if recoveredQueueItems == 0 {
+				active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+				if activeErr != nil {
+					return RecoverySummary{}, activeErr
+				}
+				if active == nil {
+					return RecoverySummary{}, fmt.Errorf("reviewer recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
+				}
+			}
+			requeuedLoop := autoRecoveredReviewerLoop(loop, nowISO)
+			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+				return RecoverySummary{}, err
+			}
+			requeuedLoopIDs[loop.ID] = struct{}{}
+			summary.LoopsRequeued += 1
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "looperd.recovery.reviewer_auto_recovered",
+				LoopID:     stringPtr(loop.ID),
+				EntityType: stringPtr("loop"),
+				EntityID:   stringPtr(loop.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"previousStatus":      loop.Status,
+					"nextRunAt":           nowISO,
+					"recoveredQueueItems": recoveredQueueItems,
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+			continue
+		}
+
 		if shouldRequeueLoop(loop, latestRun) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
@@ -1210,6 +1254,148 @@ func createEmptyRecoverySummary() RecoverySummary {
 		LoopsRequeued:         0,
 		EventsWritten:         0,
 	}
+}
+
+const maxReviewerAutoRecoveryAttempts = 3
+
+type runtimeReviewerCheckpoint struct {
+	ResumePolicy string `json:"resumePolicy,omitempty"`
+	Detail       *struct {
+		State          string   `json:"state,omitempty"`
+		ReviewDecision string   `json:"reviewDecision,omitempty"`
+		Labels         []string `json:"labels,omitempty"`
+	} `json:"detail,omitempty"`
+}
+
+func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, maxConsecutiveFailures int64) bool {
+	if loop.Type != string(domain.LoopTypeReviewer) || loop.Status != "failed" || latestRun == nil || latestRun.Status != "failed" || latestQueue == nil || latestQueue.Status != "failed" {
+		return false
+	}
+	meta := parseRuntimeJSONObject(loop.MetadataJSON)
+	if manual, _ := meta["manual"].(bool); manual {
+		return false
+	}
+	loopMeta := runtimeReviewerLoopMetadata(meta)
+	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" {
+		return false
+	}
+	if maxConsecutiveFailures > 0 && int64(runtimeIntFromAny(loopMeta["consecutiveFailures"])) >= maxConsecutiveFailures {
+		return false
+	}
+	if runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
+		return false
+	}
+	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy == "manual_intervention" {
+		return false
+	}
+	queueKind := derefString(latestQueue.LastErrorKind)
+	queueMessage := derefString(latestQueue.LastError)
+	if queueKind == "manual_intervention" {
+		return false
+	}
+	if checkpoint.Detail == nil {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(checkpoint.Detail.State)) != "open" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") || specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+		return false
+	}
+	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)
+	return (queueKind == "retryable_after_resume" && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review")) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+}
+
+func autoRecoveredReviewerLoop(loop storage.LoopRecord, nowISO string) storage.LoopRecord {
+	updated := loop
+	updated.Status = "queued"
+	updated.NextRunAt = stringPtr(nowISO)
+	updated.UpdatedAt = nowISO
+	meta := parseRuntimeJSONObject(updated.MetadataJSON)
+	loopMeta := runtimeReviewerLoopMetadata(meta)
+	loopMeta["status"] = "active"
+	loopMeta["lastStatus"] = "auto_recovered"
+	loopMeta["autoRecoveryAttempts"] = runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) + 1
+	delete(loopMeta, "terminationReason")
+	meta["loop"] = loopMeta
+	encoded, err := json.Marshal(meta)
+	if err == nil {
+		text := string(encoded)
+		updated.MetadataJSON = &text
+	}
+	return updated
+}
+
+func parseRuntimeReviewerCheckpoint(value *string) runtimeReviewerCheckpoint {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return runtimeReviewerCheckpoint{}
+	}
+	var checkpoint runtimeReviewerCheckpoint
+	_ = json.Unmarshal([]byte(*value), &checkpoint)
+	return checkpoint
+}
+
+func parseRuntimeJSONObject(value *string) map[string]any {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return map[string]any{}
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(*value), &decoded); err != nil || decoded == nil {
+		return map[string]any{}
+	}
+	return decoded
+}
+
+func runtimeReviewerLoopMetadata(meta map[string]any) map[string]any {
+	loopMeta, _ := meta["loop"].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	return loopMeta
+}
+
+func runtimeIntFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
+}
+
+func runtimeStringFromAny(value any) (string, bool) {
+	text, ok := value.(string)
+	return text, ok
+}
+
+func isKnownReviewerRediscoveryGuardrail(message string) bool {
+	return strings.Contains(message, "PR head changed before publish") || strings.Contains(message, "review request removed before publish")
+}
+
+func isRuntimeReviewerRediscoveryRunStep(run *storage.RunRecord) bool {
+	if run == nil || run.CurrentStep == nil {
+		return false
+	}
+	switch strings.TrimSpace(*run.CurrentStep) {
+	case "publish", "review", "thread_resolution":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {

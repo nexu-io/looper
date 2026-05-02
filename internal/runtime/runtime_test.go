@@ -1353,6 +1353,151 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 	}
 }
 
+func TestRunRecoveryPipelineAutoRecoversFailedReviewerGuardrailLoop(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	defer coordinator.Close()
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-17T12:00:00.000Z"
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	loopID := "loop_runtime_reviewer_recover"
+	queueID := "queue_runtime_reviewer_recover"
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"enabled": true, "failureCount": 1, "consecutiveFailures": 1, "lastFailure": "PR head changed before publish"}})
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 165, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"restart_from_discover","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+	errorMessage := "PR head changed before publish: expected old, got new"
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_runtime_reviewer_recover", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("publish"), CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueKind := "retryable_after_resume"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_runtime_reviewer_recover:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 3, MaxAttempts: 3, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, now)
+	if err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	if summary.LoopsRequeued != 1 {
+		t.Fatalf("LoopsRequeued = %d, want 1", summary.LoopsRequeued)
+	}
+	loop, _ := repositories.Loops.GetByID(context.Background(), loopID)
+	queue, _ := repositories.Queue.GetByID(context.Background(), queueID)
+	if loop == nil || loop.Status != "queued" || queue == nil || queue.Status != "queued" {
+		t.Fatalf("loop=%#v queue=%#v, want recovered queued loop and queue", loop, queue)
+	}
+	summary, err = rt.runRecoveryPipeline(context.Background(), repositories, now)
+	if err != nil {
+		t.Fatalf("second runRecoveryPipeline() error = %v", err)
+	}
+	queues, _ := repositories.Queue.List(context.Background())
+	if summary.LoopsRequeued != 0 || len(queues) != 1 {
+		t.Fatalf("second summary=%#v queues=%#v, want idempotent no duplicate", summary, queues)
+	}
+}
+
+func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
+	t.Parallel()
+	errorKind := "retryable_after_resume"
+	errorMessage := "PR head changed before publish: expected old, got new"
+	step := "publish"
+	checkpoint := func(detail string) *string {
+		value := `{"resumePolicy":"restart_from_discover",` + detail + `}`
+		return &value
+	}
+	baseLoop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"consecutiveFailures":1}}`)}
+	baseRun := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}
+	baseQueue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
+
+	tests := []struct {
+		name  string
+		loop  storage.LoopRecord
+		run   storage.RunRecord
+		queue storage.QueueItemRecord
+	}{
+		{name: "manual intervention kind", loop: baseLoop, run: baseRun, queue: func() storage.QueueItemRecord {
+			q := baseQueue
+			kind := "manual_intervention"
+			q.LastErrorKind = &kind
+			return q
+		}()},
+		{name: "closed checkpoint", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			r.CheckpointJSON = checkpoint(`"detail":{"state":"CLOSED","reviewDecision":"","labels":[]}`)
+			return r
+		}(), queue: baseQueue},
+		{name: "approved checkpoint", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`)
+			return r
+		}(), queue: baseQueue},
+		{name: "ready label checkpoint", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`)
+			return r
+		}(), queue: baseQueue},
+		{name: "missing checkpoint detail", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			r.CheckpointJSON = stringPtr(`{"resumePolicy":"restart_from_discover"}`)
+			return r
+		}(), queue: baseQueue},
+		{name: "max failure budget", loop: func() storage.LoopRecord {
+			l := baseLoop
+			l.MetadataJSON = stringPtr(`{"loop":{"consecutiveFailures":3}}`)
+			return l
+		}(), run: baseRun, queue: baseQueue},
+		{name: "attempt cap", loop: func() storage.LoopRecord {
+			l := baseLoop
+			l.MetadataJSON = stringPtr(`{"loop":{"consecutiveFailures":1,"autoRecoveryAttempts":3}}`)
+			return l
+		}(), run: baseRun, queue: baseQueue},
+		{name: "latest queue not failed", loop: baseLoop, run: baseRun, queue: func() storage.QueueItemRecord { q := baseQueue; q.Status = "completed"; return q }()},
+		{name: "unrelated run step", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			s := "setup"
+			r.CurrentStep = &s
+			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":[]}`)
+			r.Summary = &errorMessage
+			r.ErrorMessage = &errorMessage
+			return r
+		}(), queue: func() storage.QueueItemRecord {
+			q := baseQueue
+			kind := "non_retryable"
+			q.LastErrorKind = &kind
+			return q
+		}()},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if shouldAutoRecoverFailedReviewerLoop(tt.loop, &tt.run, &tt.queue, 3) {
+				t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false")
+			}
+		})
+	}
+}
+
 func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.T) {
 	t.Parallel()
 

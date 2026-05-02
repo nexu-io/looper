@@ -1138,6 +1138,70 @@ func (r *QueueRepository) RequeueLatestCancelledByLoop(ctx context.Context, loop
 	return affected, nil
 }
 
+func (r *QueueRepository) RequeueLatestFailedByLoop(ctx context.Context, loopID, queuedAt string) (int64, error) {
+	queueID, err := r.findLatestQueueIDByLoopStatus(ctx, loopID, "failed")
+	if err != nil {
+		return 0, err
+	}
+	if queueID == "" {
+		return 0, nil
+	}
+
+	return r.RequeueFailedByID(ctx, loopID, queueID, queuedAt)
+}
+
+func (r *QueueRepository) RequeueFailedByID(ctx context.Context, loopID, queueID, queuedAt string) (int64, error) {
+	if loopID == "" || queueID == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = 0,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			finished_at = NULL,
+			last_error = NULL,
+			last_error_kind = NULL,
+			updated_at = ?
+		WHERE id = ? AND loop_id = ? AND status = 'failed'
+			AND NOT EXISTS (
+				SELECT 1 FROM queue_items
+				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
+			)
+	`, queuedAt, queuedAt, queueID, loopID, loopID, queueID)
+	if err != nil {
+		return 0, fmt.Errorf("requeue failed queue item by id: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeue failed queue item rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
+func (r *QueueRepository) findLatestQueueIDByLoopStatus(ctx context.Context, loopID, status string) (string, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT id
+		FROM queue_items
+		WHERE loop_id = ? AND status = ?
+		ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1
+	`, loopID, status)
+	var queueID string
+	if err := row.Scan(&queueID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get latest %s queue item by loop: %w", status, err)
+	}
+	return queueID, nil
+}
+
 func (r *QueueRepository) findLatestCancelledQueueIDByLoop(ctx context.Context, loopID string, onlyUnstarted bool) (string, error) {
 	query := `
 		SELECT id

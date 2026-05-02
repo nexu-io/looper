@@ -624,6 +624,57 @@ func TestQueueRoundTripBasics(t *testing.T) {
 	}
 }
 
+func TestQueueRequeueFailedByIDRequiresMatchingLoopAndNoActiveQueue(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_requeue", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for seq, loopID := range []string{"loop_a", "loop_b"} {
+		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: int64(seq + 1), ProjectID: "project_requeue", Type: "reviewer", TargetType: "pull_request", Status: "failed", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
+	}
+	loopA := "loop_a"
+	loopB := "loop_b"
+	lastError := "PR head changed before publish"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "failed_a", LoopID: &loopA, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:a", DedupeKey: "reviewer:a", Priority: QueuePriorityReviewer, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 3, LastError: &lastError, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(failed_a) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "active_b", LoopID: &loopB, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:b", DedupeKey: "reviewer:b", Priority: QueuePriorityReviewer, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(active_b) error = %v", err)
+	}
+
+	affected, err := repos.Queue.RequeueFailedByID(ctx, loopB, "failed_a", now)
+	if err != nil {
+		t.Fatalf("RequeueFailedByID(wrong loop) error = %v", err)
+	}
+	if affected != 0 {
+		t.Fatalf("RequeueFailedByID(wrong loop) affected = %d, want 0", affected)
+	}
+	item, _ := repos.Queue.GetByID(ctx, "failed_a")
+	if item == nil || item.Status != "failed" {
+		t.Fatalf("failed_a status = %#v, want still failed", item)
+	}
+
+	affected, err = repos.Queue.RequeueFailedByID(ctx, loopA, "failed_a", now)
+	if err != nil {
+		t.Fatalf("RequeueFailedByID(correct loop) error = %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("RequeueFailedByID(correct loop) affected = %d, want 1", affected)
+	}
+	item, _ = repos.Queue.GetByID(ctx, "failed_a")
+	if item == nil || item.Status != "queued" || item.LastError != nil || item.Attempts != 0 {
+		t.Fatalf("failed_a = %#v, want requeued with cleared failure metadata", item)
+	}
+}
+
 func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	t.Parallel()
 

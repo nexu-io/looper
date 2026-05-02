@@ -389,6 +389,8 @@ type DiscoveryResult struct {
 	Skipped        int
 }
 
+const maxReviewerAutoRecoveryAttempts = 3
+
 type ProcessResult struct {
 	LoopID      string
 	RunID       string
@@ -595,6 +597,15 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		loopResult, loopErr := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, existing)
 		if loopErr != nil {
 			return loopErr
+		}
+		if terminalReviewerLoopReason(loopResult.record) == "failed" {
+			recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
+			if recoverErr != nil {
+				return recoverErr
+			}
+			if recovered != nil {
+				loopResult.record = *recovered
+			}
 		}
 		if terminalReviewerLoopReason(loopResult.record) != "" {
 			result.Skipped++
@@ -2207,6 +2218,129 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "reviewer", "repo": repo, "prNumber": prNumber}})
 	return loopUpsertResult{record: loop, created: true}, nil
+}
+
+func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary) (*storage.LoopRecord, error) {
+	eligible, queueID, reason, err := r.failedReviewerLoopRecoveryEligibility(ctx, loop, pr)
+	if err != nil {
+		return nil, err
+	}
+	if !eligible {
+		r.logInfo("reviewer auto-recovery skipped", map[string]any{"loopId": loop.ID, "reason": reason})
+		r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.skipped", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason}})
+		return nil, nil
+	}
+	nowISO := r.nowISO()
+	requeued, err := r.repos.Queue.RequeueFailedByID(ctx, loop.ID, queueID, nowISO)
+	if err != nil {
+		return nil, err
+	}
+	if requeued == 0 {
+		active, activeErr := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if activeErr != nil {
+			return nil, activeErr
+		}
+		if active == nil {
+			return nil, fmt.Errorf("reviewer auto-recovery did not requeue failed queue item %s for loop %s", queueID, loop.ID)
+		}
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.NextRunAt = stringPtr(nowISO)
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta := reviewerLoopMetadata(meta)
+		loopMeta["status"] = "active"
+		loopMeta["lastStatus"] = "auto_recovered"
+		loopMeta["autoRecoveryAttempts"] = intFromAny(loopMeta["autoRecoveryAttempts"]) + 1
+		loopMeta["lastAutoRecoveryReason"] = reason
+		delete(loopMeta, "terminationReason")
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	r.logInfo("reviewer auto-recovered failed loop", map[string]any{"loopId": loop.ID, "reason": reason})
+	r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.requeued", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason, "attempt": intFromAny(reviewerLoopMetadata(parseJSONObject(updated.MetadataJSON))["autoRecoveryAttempts"])}})
+	return &updated, nil
+}
+
+func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary) (bool, string, string, error) {
+	if loop.Type != "reviewer" || loop.Status != "failed" || isManualReviewerLoop(loop) {
+		return false, "", "not_failed_reviewer_loop", nil
+	}
+	if normalizePRState(pr.State) != "open" {
+		return false, "", "pr_not_open", nil
+	}
+	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
+		return false, "", "draft_pr", nil
+	}
+	if strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "APPROVED") {
+		return false, "", "approved", nil
+	}
+	if specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
+		return false, "", "ready_label", nil
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" {
+		return false, "", reason, nil
+	}
+	if intFromAny(loopMeta["consecutiveFailures"]) >= r.loopConfig.MaxConsecutiveFailures {
+		return false, "", "max_consecutive_failures", nil
+	}
+	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
+		return false, "", "auto_recovery_attempt_cap", nil
+	}
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return false, "", "", err
+	}
+	latestQueue, err := r.repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return false, "", "", err
+	}
+	if latestQueue == nil || latestQueue.Status != "failed" {
+		return false, "", "latest_queue_not_failed", nil
+	}
+	if latestRun == nil || latestRun.Status != "failed" {
+		return false, "", "latest_run_not_failed", nil
+	}
+	checkpoint := reviewerCheckpoint{}
+	checkpoint = parseCheckpoint(latestRun.CheckpointJSON)
+	queueKind := ""
+	if latestQueue.LastErrorKind != nil {
+		queueKind = *latestQueue.LastErrorKind
+	}
+	if queueKind == string(FailureManualIntervention) || checkpoint.ResumePolicy == "manual_intervention" {
+		return false, "", "manual_intervention", nil
+	}
+	if queueKind == string(FailureRetryableAfterResume) && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review") {
+		return true, latestQueue.ID, "retryable_after_resume_" + checkpoint.ResumePolicy, nil
+	}
+	latestMessage := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
+	if latestMessage == "" {
+		latestMessage = derefString(latestQueue.LastError)
+	}
+	if isKnownReviewerRediscoveryGuardrail(latestMessage) && isReviewerRediscoveryRunStep(latestRun) {
+		return true, latestQueue.ID, "historical_guardrail", nil
+	}
+	return false, "", "not_whitelisted", nil
+}
+
+func isKnownReviewerRediscoveryGuardrail(message string) bool {
+	return strings.Contains(message, "PR head changed before publish") || strings.Contains(message, "review request removed before publish")
+}
+
+func isReviewerRediscoveryRunStep(run *storage.RunRecord) bool {
+	if run == nil || run.CurrentStep == nil {
+		return false
+	}
+	step := strings.TrimSpace(*run.CurrentStep)
+	return step == string(stepPublish) || step == string(stepReview) || step == string(stepThreadResolution)
 }
 
 func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {

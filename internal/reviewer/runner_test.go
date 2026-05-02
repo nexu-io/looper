@@ -48,6 +48,71 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsRecoversRetryableAfterResumeRestartFromDiscover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].ID != queueID {
+		t.Fatalf("QueueItems = %#v, want recovered existing queue item %s", result.QueueItems, queueID)
+	}
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	queue, _ := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if loop == nil || loop.Status != "queued" || queue == nil || queue.Status != "queued" || queue.LastError != nil || queue.LastErrorKind != nil {
+		t.Fatalf("loop=%#v queue=%#v, want queued loop and cleared failed queue metadata", loop, queue)
+	}
+
+	again, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	queues, _ := fixture.repos.Queue.List(context.Background())
+	if len(again.QueueItems) != 1 || len(queues) != 1 {
+		t.Fatalf("second result=%#v queues=%#v, want idempotent single active queue", again, queues)
+	}
+}
+
+func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		seed failedReviewerRecoverySeed
+		pr   PullRequestSummary
+		want bool
+	}{
+		{name: "retryable rerun review", seed: failedReviewerRecoverySeed{ResumePolicy: "rerun_review", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "marker missing"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "historical guardrail non retryable", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "review request removed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "manual intervention", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
+		{name: "approved pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED"}, want: false},
+		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}, want: false},
+		{name: "max failure budget", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", ConsecutiveFailures: 3}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, tt.seed)
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			eligible, _, _, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, tt.pr)
+			if err != nil {
+				t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+			}
+			if eligible != tt.want {
+				t.Fatalf("eligible = %v, want %v", eligible, tt.want)
+			}
+		})
+	}
+}
+
 func TestReviewDisclosureInstructionPreservesVisibleInlineGuidance(t *testing.T) {
 	t.Parallel()
 	disclosureCfg := config.DefaultDisclosureConfig()
@@ -3870,6 +3935,41 @@ func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add
 
 func (f *runnerFixture) nowISO() string {
 	return fmt.Sprintf("%s.000Z", f.current.UTC().Format("2006-01-02T15:04:05"))
+}
+
+type failedReviewerRecoverySeed struct {
+	ResumePolicy         string
+	QueueErrorKind       string
+	ErrorMessage         string
+	ConsecutiveFailures  int
+	AutoRecoveryAttempts int
+}
+
+func seedFailedReviewerRecoveryLoop(t *testing.T, fixture *runnerFixture, seed failedReviewerRecoverySeed) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	loopID := "loop_recover_reviewer"
+	queueID := "queue_recover_reviewer"
+	consecutive := seed.ConsecutiveFailures
+	if consecutive == 0 {
+		consecutive = 1
+	}
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"enabled": true, "failureCount": consecutive, "consecutiveFailures": consecutive, "lastFailure": seed.ErrorMessage, "autoRecoveryAttempts": seed.AutoRecoveryAttempts}})
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 165, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := mustMarshalJSON(reviewerCheckpoint{ResumePolicy: seed.ResumePolicy, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_recover_reviewer", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), CheckpointJSON: &checkpoint, Summary: &seed.ErrorMessage, ErrorMessage: &seed.ErrorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildReviewerDedupeKey("project_1", loopID, repo, prNumber), Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 3, MaxAttempts: 3, FinishedAt: &nowISO, LastError: &seed.ErrorMessage, LastErrorKind: &seed.QueueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	return loopID, queueID
 }
 
 type fakeGitHubGateway struct {
