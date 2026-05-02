@@ -1130,16 +1130,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
-		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
-		}
-		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
-			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
-			return checkpoint, nil
-		}
-	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
 		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
@@ -1153,6 +1143,16 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, err
 		}
 		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
+			return checkpoint, nil
+		}
 	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
