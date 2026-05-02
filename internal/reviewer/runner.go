@@ -1700,7 +1700,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		if reason, ok := rediscoverySignalFromAgentResult(result); ok {
+		if reason, ok := rediscoverySignalFromAgentResult(result, !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest); ok {
 			checkpoint.ResumePolicy = "restart_from_discover"
 			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
 		}
@@ -2485,12 +2485,12 @@ func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA st
 	return false
 }
 
-func rediscoverySignalFromAgentResult(result AgentResult) (string, bool) {
+func rediscoverySignalFromAgentResult(result AgentResult, allowReviewRequestSignal bool) (string, bool) {
 	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
 		switch {
 		case strings.Contains(candidate, "PR head changed before publish"):
 			return candidate, true
-		case strings.Contains(candidate, "review request removed before publish"):
+		case allowReviewRequestSignal && strings.Contains(candidate, "review request removed before publish"):
 			return candidate, true
 		}
 	}
