@@ -1292,7 +1292,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before recording clean review: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
 		}
-		if err := r.applyCleanNoopReviewSideEffects(ctx, input); err != nil {
+		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
 		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
@@ -1377,30 +1377,9 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		specReviewingLabel := r.specReviewingLabel()
-		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
-		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
-			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
-			if err != nil {
-				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
-			}
-			if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
-				return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
-			}
-			detail = freshDetail
-			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
-				return nil
-			}
-			if specpr.HasLabel(detail.Labels, specReviewingLabel) {
-				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
-				}
-			}
-			if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
-				if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-					return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
-				}
-			}
+		shouldTransitionSpecLabels := r.allowAutoApprove && marker.Event == ReviewEventApprove
+		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
+			return err
 		}
 	case "actionable":
 		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
@@ -1412,10 +1391,42 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	return nil
 }
 
-func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput) error {
+func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) error {
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, r.allowAutoApprove)
+}
+
+func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	specReviewingLabel := r.specReviewingLabel()
+	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
+	if !checkpointHadSpecReviewing && !specpr.HasLabel(detail.Labels, specReviewingLabel) {
+		return nil
+	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
+		return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
+	}
+	if !specpr.IsReviewClean(freshDetail.ReviewDecision, freshDetail.Comments) {
+		return nil
+	}
+	if specpr.HasLabel(freshDetail.Labels, specReviewingLabel) {
+		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	if !specpr.HasLabel(freshDetail.Labels, specpr.ReadyLabel) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
 	}
 	return nil
 }
@@ -1425,7 +1436,7 @@ func cleanReviewNoopSummary(summary string) bool {
 	if normalized == "" {
 		return false
 	}
-	return strings.Contains(normalized, "no actionable") || strings.Contains(normalized, "no concrete actionable") || strings.Contains(normalized, "clean review") || strings.Contains(normalized, "clean lgtm")
+	return strings.HasPrefix(normalized, "no actionable findings")
 }
 
 func (r *Runner) specReviewingLabel() string {
