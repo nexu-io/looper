@@ -1401,7 +1401,8 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		shouldTransitionSpecLabels := r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove && marker.Event == ReviewEventApprove
+		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
 		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
 			return err
 		}
@@ -1420,8 +1421,20 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	shouldTransitionSpecLabels := r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove
+	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
 	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
+}
+
+func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {
+	return strings.EqualFold(strings.TrimSpace(outcome), "clean") && policy.Clean == config.ReviewerReviewEventApprove && event == ReviewEventApprove
+}
+
+func cleanReviewEventForPolicy(policy config.ReviewerReviewEventsConfig) ReviewEvent {
+	if policy.Clean == config.ReviewerReviewEventApprove {
+		return ReviewEventApprove
+	}
+	return ReviewEventComment
 }
 
 func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, enabled bool) error {
