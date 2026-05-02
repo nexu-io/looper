@@ -92,11 +92,14 @@ So the most common GitHub-side trigger is:
 
 Planner will:
 
+- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees
 - create a worktree
 - write the spec file
 - push a spec PR
 - add the `looper:spec-reviewing` label to that PR
 - request reviewers when appropriate
+
+If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership.
 
 ## 6. Reviewer: review a spec PR or a normal PR
 
@@ -185,6 +188,8 @@ If that issue already has a related planner loop, worker will try to reuse plann
 - an existing open PR
 
 That means issue → planner → worker can flow through without manually copying the spec path.
+
+When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership.
 
 ### Start directly from a spec
 

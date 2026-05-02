@@ -736,33 +736,75 @@ type resolvedDaemonBinary struct {
 	Source string
 }
 
+type daemonBinaryUsability struct {
+	Path    string
+	Version string
+	Exists  bool
+}
+
 func (r *commandRuntime) resolveDaemonBinary(ctx context.Context) (*resolvedDaemonBinary, error) {
-	managedPath, err := r.managedDaemonBinaryPath()
+	managed, err := r.checkManagedDaemonBinary(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	candidates := []resolvedDaemonBinary{{Path: managedPath, Source: "installed"}, {Path: looperdBinaryName, Source: "path"}}
-	for _, candidate := range candidates {
-		version, err := r.runVersionCommand(ctx, candidate.Path)
-		if err != nil {
-			return nil, err
-		}
-		if version != "" {
-			resolved := candidate
-			return &resolved, nil
-		}
+	if managed.Exists {
+		return &resolvedDaemonBinary{Path: managed.Path, Source: "installed"}, nil
 	}
+
+	version, err := r.runVersionCommandStrict(ctx, looperdBinaryName)
+	if version != "" {
+		return &resolvedDaemonBinary{Path: looperdBinaryName, Source: "path"}, nil
+	}
+	_ = err
 
 	return nil, fmt.Errorf("Cannot find looperd binary. Lookup order: ~/.looper/bin/looperd, then $PATH.")
 }
 
-func (r *commandRuntime) readManagedDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
+func (r *commandRuntime) checkManagedDaemonBinary(ctx context.Context) (daemonBinaryUsability, error) {
 	binaryPath, err := r.managedDaemonBinaryPath()
+	if err != nil {
+		return daemonBinaryUsability{}, err
+	}
+	info, err := os.Stat(binaryPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			version, versionErr := r.runVersionCommandStrict(ctx, binaryPath)
+			if versionErr == nil && strings.TrimSpace(version) != "" {
+				return daemonBinaryUsability{Path: binaryPath, Version: version, Exists: true}, nil
+			}
+			return daemonBinaryUsability{Path: binaryPath}, nil
+		}
+		return daemonBinaryUsability{}, fmt.Errorf("check looperd at %s: %w", binaryPath, err)
+	}
+	if info.IsDir() {
+		return daemonBinaryUsability{}, fmt.Errorf("found looperd at %s, but it is a directory\n\nFix: remove or rename %s\nThen reinstall: looper daemon install --force", binaryPath, binaryPath)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return daemonBinaryUsability{}, fmt.Errorf("found looperd at %s, but it is not executable\n\nFix: chmod +x %s\nOr reinstall: looper daemon install --force", binaryPath, binaryPath)
+	}
+	version, err := r.runVersionCommandStrict(ctx, binaryPath)
+	if err != nil {
+		return daemonBinaryUsability{}, unusableManagedDaemonError(binaryPath, fmt.Sprintf("version check failed: %v", err))
+	}
+	if strings.TrimSpace(version) == "" {
+		return daemonBinaryUsability{}, unusableManagedDaemonError(binaryPath, "it did not report a version")
+	}
+	return daemonBinaryUsability{Path: binaryPath, Version: version, Exists: true}, nil
+}
+
+func unusableManagedDaemonError(path string, reason string) error {
+	return fmt.Errorf("found looperd at %s, but %s\n\nFix: looper daemon install --force", path, reason)
+}
+
+func (r *commandRuntime) readManagedDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
+	state, err := r.checkManagedDaemonBinary(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return r.readDaemonVersion(ctx, binaryPath)
+	if !state.Exists {
+		return nil, nil
+	}
+	return &daemonVersionState{Version: state.Version, Source: "binary", BinaryPath: stringPtr(state.Path)}, nil
 }
 
 func (r *commandRuntime) readPathDaemonVersion(ctx context.Context) (*daemonVersionState, error) {
@@ -781,12 +823,24 @@ func (r *commandRuntime) readDaemonVersion(ctx context.Context, command string) 
 }
 
 func (r *commandRuntime) runVersionCommand(ctx context.Context, command string) (string, error) {
-	result, err := r.runCommand(ctx, command, []string{"--version"}, daemonCommandTimeout)
+	version, err := r.runVersionCommandStrict(ctx, command)
 	if err != nil {
 		return "", nil
 	}
+	return version, nil
+}
+
+func (r *commandRuntime) runVersionCommandStrict(ctx context.Context, command string) (string, error) {
+	result, err := r.runCommand(ctx, command, []string{"--version"}, daemonCommandTimeout)
+	if err != nil {
+		return "", err
+	}
 	if result.ExitCode != 0 {
-		return "", nil
+		message := strings.TrimSpace(result.Stderr)
+		if message == "" {
+			message = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return "", errors.New(message)
 	}
 	return strings.TrimSpace(result.Stdout), nil
 }

@@ -268,8 +268,8 @@ func genericTopLevelLocationName(name string) bool {
 	}
 }
 
-func DowngradeBody(body string, anchor Anchor, reason string) string {
-	location := fallbackLocation(anchor)
+func FallbackBody(body string, anchor Anchor, reason string) string {
+	location := FallbackLocation(anchor)
 	if location == "" {
 		location = "Location: unavailable; follow-up quality gate required."
 	}
@@ -277,8 +277,18 @@ func DowngradeBody(body string, anchor Anchor, reason string) string {
 	if trimmed := strings.TrimSpace(body); trimmed != "" {
 		parts = append(parts, trimmed)
 	}
-	parts = append(parts, "Downgraded from inline review comment: "+reason)
+	if reason = strings.TrimSpace(reason); reason != "" {
+		parts = append(parts, "Inline comment could not be anchored: "+reason)
+	}
 	return strings.Join(parts, "\n\n")
+}
+
+func DowngradeBody(body string, anchor Anchor, reason string) string {
+	return FallbackBody(body, anchor, reason)
+}
+
+func FallbackLocation(anchor Anchor) string {
+	return fallbackLocation(anchor)
 }
 
 func fallbackLocation(anchor Anchor) string {
