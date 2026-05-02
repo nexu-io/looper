@@ -3550,6 +3550,37 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 	loopMeta["maxWallClockSeconds"] = reviewerConfig.Loop.MaxWallClockSeconds
 	loopMeta["maxConsecutiveFailures"] = reviewerConfig.Loop.MaxConsecutiveFailures
 	loopMeta["maxAgentExecutionsPerPR"] = reviewerConfig.Loop.MaxAgentExecutionsPerPR
+	reviewEventsRaw, hasReviewEvents := metadata["reviewEvents"]
+	reviewEventsMeta, _ := reviewEventsRaw.(map[string]any)
+	if hasReviewEvents && reviewEventsMeta == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewEvents must be a JSON object"}
+	}
+	if reviewEventsMeta == nil {
+		reviewEventsMeta = map[string]any{}
+	}
+	if cleanRaw, present := reviewEventsMeta["clean"]; present {
+		clean, ok := cleanRaw.(string)
+		if !ok {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewEvents.clean must be COMMENT or APPROVE"}
+		}
+		if !isValidReviewerCleanReviewEvent(clean) {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewEvents.clean must be COMMENT or APPROVE"}
+		}
+	} else {
+		reviewEventsMeta["clean"] = string(reviewerConfig.ReviewEvents.Clean)
+	}
+	if blockingRaw, present := reviewEventsMeta["blocking"]; present {
+		blocking, ok := blockingRaw.(string)
+		if !ok {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewEvents.blocking must be COMMENT or REQUEST_CHANGES"}
+		}
+		if !isValidReviewerBlockingReviewEvent(blocking) {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "reviewEvents.blocking must be COMMENT or REQUEST_CHANGES"}
+		}
+	} else {
+		reviewEventsMeta["blocking"] = string(reviewerConfig.ReviewEvents.Blocking)
+	}
+	metadata["reviewEvents"] = reviewEventsMeta
 	if target.Repo != "" {
 		loopMeta["repo"] = target.Repo
 	}
@@ -3563,6 +3594,24 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 	}
 	text := string(encoded)
 	return &text, nil
+}
+
+func isValidReviewerCleanReviewEvent(value string) bool {
+	switch config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value))) {
+	case config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidReviewerBlockingReviewEvent(value string) bool {
+	switch config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value))) {
+	case config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges:
+		return true
+	default:
+		return false
+	}
 }
 
 func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {

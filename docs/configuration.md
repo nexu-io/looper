@@ -141,6 +141,12 @@ Example minimal `~/.looper/config.json`:
     "openPrStrategy": "all_done",
     "addSnapshotMode": "async"
   },
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "COMMENT",
+      "blocking": "COMMENT"
+    }
+  },
   "roles": {
     "planner": {
       "autoDiscovery": true,
@@ -308,6 +314,8 @@ Defaults:
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
 - `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
 
+`defaults.allowAutoApprove=true` is a legacy alias for reviewer clean approvals. If `reviewer.reviewEvents.clean` is not explicitly configured, it maps clean reviewer outcomes to `APPROVE`; an explicit `reviewer.reviewEvents.clean` value wins.
+
 Default values:
 
 - `baseBranch`: `main`
@@ -319,6 +327,56 @@ Default values:
 - `fixAllPullRequests`: `false`; legacy fixer discovery switch. Prefer `roles.fixer.triggers.authorFilter` for new config.
 - `openPrStrategy`: `all_done`
 - `addSnapshotMode`: `async`
+
+### `reviewer`
+
+- `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
+- `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
+
+Default reviewer behavior is safe and comment-only:
+
+```json
+{
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "COMMENT",
+      "blocking": "COMMENT"
+    }
+  }
+}
+```
+
+To allow reviewer decision reviews:
+
+```json
+{
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "APPROVE",
+      "blocking": "REQUEST_CHANGES"
+    }
+  }
+}
+```
+
+Reviewer behavior matrix:
+
+| Reviewer outcome | `reviewEvents.clean` | `reviewEvents.blocking` | GitHub event |
+|---|---:|---:|---|
+| `clean` | `COMMENT` | any | `COMMENT` |
+| `clean` | `APPROVE` | any | `APPROVE` |
+| `non_blocking` | any | any | `COMMENT` |
+| `blocking` | any | `COMMENT` | `COMMENT` |
+| `blocking` | any | `REQUEST_CHANGES` | `REQUEST_CHANGES` |
+| legacy `actionable` | any | any | `COMMENT` |
+
+One-off reviewer jobs can snapshot the policy into loop metadata so queued work is not affected by later daemon config changes:
+
+```bash
+looper review owner/repo#123 \
+  --clean-review-event APPROVE \
+  --blocking-review-event REQUEST_CHANGES
+```
 
 To restore the previous synchronous `project add` behavior for one command:
 
@@ -434,6 +492,8 @@ Supported environment overrides:
 - `LOOPER_ALLOW_AUTO_COMMIT`
 - `LOOPER_ALLOW_AUTO_PUSH`
 - `LOOPER_ALLOW_AUTO_APPROVE`
+- `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
+- `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
 - `LOOPER_FIX_ALL_PULL_REQUESTS`
 - `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
 - `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`
@@ -496,6 +556,8 @@ Supported `looperd` flags:
 - `--allow-auto-commit`
 - `--allow-auto-push`
 - `--allow-auto-approve`
+- `--reviewer-clean-review-event`
+- `--reviewer-blocking-review-event`
 
 Example:
 

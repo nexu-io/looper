@@ -163,6 +163,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Reviewer.PublishMode != ReviewerPublishModeSingleReview {
 		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
+	if config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventApprove {
+		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
+	}
+	if config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.blocking", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventRequestChanges)})
+	}
 
 	validateInstructions(config, &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)

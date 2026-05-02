@@ -746,11 +746,39 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 			continue
 		}
 		event := reviewEventFromStateString(row["state"])
-		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
+		if reviewMarkerEventAllowedForOutcome(parsedMarker.Outcome, event, allowedReviewEvents) {
 			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author, Body: body, ReviewID: reviewIDString(row)}
 		}
 	}
 	return newest
+}
+
+func reviewMarkerEventAllowedForOutcome(outcome string, event string, allowedReviewEvents []string) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowedReviewEvents) == 0 {
+		return true
+	}
+	if !reviewEventAllowed(event, allowedReviewEvents) {
+		return false
+	}
+	switch outcome {
+	case "clean":
+		if reviewEventAllowed("APPROVE", allowedReviewEvents) {
+			return event == "APPROVE"
+		}
+		return event == "COMMENT"
+	case "blocking":
+		if reviewEventAllowed("REQUEST_CHANGES", allowedReviewEvents) {
+			return event == "REQUEST_CHANGES"
+		}
+		return event == "COMMENT"
+	case "non_blocking", "actionable":
+		return event == "COMMENT"
+	default:
+		return false
+	}
 }
 
 func reviewIDString(row map[string]any) string {
@@ -807,12 +835,21 @@ func parseReviewIdempotencyMarkers(body string) []reviewIdempotencyMarker {
 		}
 		fields := parseReviewMarkerFields(match[1])
 		parsedMarker := reviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
-		if parsedMarker.ID == "" || parsedMarker.Head == "" || (parsedMarker.Outcome != "clean" && parsedMarker.Outcome != "actionable") {
+		if parsedMarker.ID == "" || parsedMarker.Head == "" || !isValidReviewMarkerOutcome(parsedMarker.Outcome) {
 			continue
 		}
 		markers = append(markers, parsedMarker)
 	}
 	return markers
+}
+
+func isValidReviewMarkerOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseReviewMarkerFields(segment string) map[string]string {

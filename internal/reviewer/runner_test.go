@@ -430,7 +430,7 @@ func TestDiscoverPullRequestsHonorsMinimumPublishInterval(t *testing.T) {
 
 func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 	t.Parallel()
-	runner := New(Options{LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	runner := New(Options{LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}})
 
 	if runner.loopEnabled(map[string]any{}) {
 		t.Fatalf("loopEnabled(empty metadata) = true, want false for legacy persisted loop")
@@ -446,6 +446,20 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 	}
 	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
 		t.Fatalf("followUpdates = %#v, want true", meta["followUpdates"])
+	}
+	reviewEvents, _ := meta["reviewEvents"].(map[string]any)
+	if reviewEvents["clean"] != string(config.ReviewerReviewEventApprove) || reviewEvents["blocking"] != string(config.ReviewerReviewEventRequestChanges) {
+		t.Fatalf("reviewEvents = %#v, want snapshotted decision policy", reviewEvents)
+	}
+	current := `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
+		t.Fatalf("ensureLoopMetadataJSON(invalid reviewEvents) error = %v, want validation error", err)
+	}
+	current = `{"reviewEvents":{"clean":123}}`
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
+		t.Fatalf("ensureLoopMetadataJSON(malformed reviewEvents) error = %v, want validation error", err)
 	}
 }
 
@@ -1124,6 +1138,49 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarker(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemSkipsCleanNoopWhenReviewRequestRemovedBeforePublish(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{removeReviewRequestOnSecondView: true, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_clean_noop_request_removed", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "not requested for review") {
+		t.Fatalf("result = %#v, want skipped not requested", result)
+	}
+	if len(github.addReactionCalls) != 0 {
+		t.Fatalf("addReactionCalls = %d, want no clean signal reaction", len(github.addReactionCalls))
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %s, want no clean no-op publish progress", *updatedLoop.MetadataJSON)
+	}
+}
+
 func TestProcessClaimedItemTransitionsSpecLabelsForCleanNoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1540,7 +1597,7 @@ func TestProcessClaimedItemAppliesCleanSpecSideEffectsBeforePublishSuccess(t *te
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: false, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -1634,7 +1691,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanCommentReview(t *t
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventComment}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: false, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -2794,7 +2851,7 @@ func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *te
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", true, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	for _, want := range []string{
 		"Every comment MUST include",
 		"Bad comment example",
@@ -2805,17 +2862,17 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Group related findings by file, subsystem, function, or rule",
 		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem",
 		"fixture-matrix tests",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123` for actionable reviews",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123` for clean reviews",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT` for finding reviews",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT` for clean reviews",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
 		"`gh api repos/acme/looper/pulls/42/reviews`, or `gh pr review` directly",
 		"gh api repos/acme/looper/pulls/42/reviews",
-		"looper:review id=reviewer:loop:abc123 head=abc123 outcome=clean|actionable",
+		"looper:review id=reviewer:loop:abc123 head=abc123 outcome=clean|non_blocking|blocking",
 		"before posting anything",
 		"existing PR reviews",
-		"COMMENTED or APPROVED PR review",
+		"COMMENTED, APPROVED, or CHANGES_REQUESTED PR review allowed by this run's review event policy",
 		"ensure +1 reaction and spec-ready label transition",
 		"review request removed before publish",
 		"PR head changed before publish",
@@ -2860,7 +2917,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailable(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", true, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "")
 
 	if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
 		t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
@@ -2885,7 +2942,7 @@ func TestBuildReviewPromptIncludesAnchorableDiffLocations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123", PayloadJSON: string(payload)}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123", PayloadJSON: string(payload)}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 
 	for _, want := range []string{
 		"ANCHORABLE DIFF LOCATIONS",
@@ -2903,11 +2960,11 @@ func TestBuildReviewPromptIncludesAnchorableDiffLocations(t *testing.T) {
 func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	for _, want := range []string{
 		"Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review",
 		"Ignore matching markers on APPROVED reviews and post a new COMMENT review instead",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event COMMENT --blocking-review-event COMMENT",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -2932,7 +2989,7 @@ func TestBuildReviewPromptIncludesReviewerScopeInstruction(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, tc.scope, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+			prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, tc.scope, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 			if !strings.Contains(prompt, tc.want) {
 				t.Fatalf("prompt missing %q:\n%s", tc.want, prompt)
 			}
@@ -3031,7 +3088,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 
 	cfg := config.DefaultDisclosureConfig()
 	model := "openai/gpt-5.5"
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model, "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model, "/opt/looper/bin/looper")
 	if !strings.Contains(prompt, "agent=claude-code · model=openai/gpt-5.5") {
 		t.Fatalf("prompt missing configured agent/model disclosure:\n%s", prompt)
 	}
@@ -3040,7 +3097,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 	}
 
 	cfg.Enabled = false
-	disabledPrompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model, "/opt/looper/bin/looper")
+	disabledPrompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model, "/opt/looper/bin/looper")
 	if !strings.Contains(disabledPrompt, "disclosure stamping is disabled") {
 		t.Fatalf("prompt missing disabled disclosure instruction:\n%s", disabledPrompt)
 	}
@@ -3052,7 +3109,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	if !strings.Contains(prompt, "Do not transition spec-review labels") {
 		t.Fatalf("prompt missing no-transition instruction:\n%s", prompt)
 	}

@@ -315,6 +315,22 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--reviewer-clean-review-event"):
+			value, nextIndex, err := takeValue(index, "--reviewer-clean-review-event")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-blocking-review-event"):
+			value, nextIndex, err := takeValue(index, "--reviewer-blocking-review-event")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+			index = nextIndex
 		case matchesFlag(arg, "--reviewer-quiet-period-seconds"):
 			value, nextIndex, err := takeValue(index, "--reviewer-quiet-period-seconds")
 			if err != nil {
@@ -513,6 +529,14 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_LOOP_ENABLED: %q is not a boolean", value)
 		}
 		ensureReviewerLoopConfig(&overrides).EnabledByDefault = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN"); ok {
+		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+		ensureReviewerReviewEventsConfig(&overrides).Clean = &event
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING"); ok {
+		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+		ensureReviewerReviewEventsConfig(&overrides).Blocking = &event
 	}
 	if value, ok := lookupEnv("LOOPER_REVIEWER_QUIET_PERIOD_SECONDS"); ok {
 		parsed, err := parseInteger(value)
@@ -739,6 +763,14 @@ func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig
 		reviewer.Loop = &PartialReviewerLoopConfig{}
 	}
 	return reviewer.Loop
+}
+
+func ensureReviewerReviewEventsConfig(partial *PartialConfig) *PartialReviewerReviewEventsConfig {
+	reviewer := ensureReviewerConfig(partial)
+	if reviewer.ReviewEvents == nil {
+		reviewer.ReviewEvents = &PartialReviewerReviewEventsConfig{}
+	}
+	return reviewer.ReviewEvents
 }
 
 func ensureInstructionsConfig(partial *PartialConfig) *PartialInstructionsConfig {

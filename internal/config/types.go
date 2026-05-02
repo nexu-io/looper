@@ -76,6 +76,14 @@ const (
 	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
 )
 
+type ReviewerReviewEvent string
+
+const (
+	ReviewerReviewEventComment        ReviewerReviewEvent = "COMMENT"
+	ReviewerReviewEventApprove        ReviewerReviewEvent = "APPROVE"
+	ReviewerReviewEventRequestChanges ReviewerReviewEvent = "REQUEST_CHANGES"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -209,10 +217,16 @@ type ReviewerLoopConfig struct {
 }
 
 type ReviewerConfig struct {
-	Loop                    ReviewerLoopConfig  `json:"loop"`
-	Scope                   ReviewerScope       `json:"scope"`
-	PublishMode             ReviewerPublishMode `json:"publishMode"`
-	DetectDuplicateFindings bool                `json:"detectDuplicateFindings"`
+	Loop                    ReviewerLoopConfig         `json:"loop"`
+	Scope                   ReviewerScope              `json:"scope"`
+	PublishMode             ReviewerPublishMode        `json:"publishMode"`
+	ReviewEvents            ReviewerReviewEventsConfig `json:"reviewEvents"`
+	DetectDuplicateFindings bool                       `json:"detectDuplicateFindings"`
+}
+
+type ReviewerReviewEventsConfig struct {
+	Clean    ReviewerReviewEvent `json:"clean"`
+	Blocking ReviewerReviewEvent `json:"blocking"`
 }
 
 type IssueRoleTriggersConfig struct {
@@ -414,11 +428,17 @@ type PartialReviewerLoopConfig struct {
 }
 
 type PartialReviewerConfig struct {
-	Loop                    *PartialReviewerLoopConfig `json:"loop,omitempty"`
-	Scope                   *ReviewerScope             `json:"scope,omitempty"`
-	PublishMode             *ReviewerPublishMode       `json:"publishMode,omitempty"`
-	DetectDuplicateFindings *bool                      `json:"detectDuplicateFindings,omitempty"`
-	DedupeFindings          *bool                      `json:"dedupeFindings,omitempty"`
+	Loop                    *PartialReviewerLoopConfig         `json:"loop,omitempty"`
+	Scope                   *ReviewerScope                     `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode               `json:"publishMode,omitempty"`
+	ReviewEvents            *PartialReviewerReviewEventsConfig `json:"reviewEvents,omitempty"`
+	DetectDuplicateFindings *bool                              `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                              `json:"dedupeFindings,omitempty"`
+}
+
+type PartialReviewerReviewEventsConfig struct {
+	Clean    *ReviewerReviewEvent `json:"clean,omitempty"`
+	Blocking *ReviewerReviewEvent `json:"blocking,omitempty"`
 }
 
 type PartialInstructionsConfig struct {

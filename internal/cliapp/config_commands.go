@@ -25,14 +25,20 @@ type configField struct {
 }
 
 var configFieldRegistry = map[string]configField{
-	"defaults.baseBranch":              stringField("defaults.baseBranch", "", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
-	"defaults.allowAutoCommit":         boolField("defaults.allowAutoCommit", "LOOPER_ALLOW_AUTO_COMMIT", "", func(c config.Config) any { return c.Defaults.AllowAutoCommit }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoCommit }),
-	"defaults.allowAutoPush":           boolField("defaults.allowAutoPush", "LOOPER_ALLOW_AUTO_PUSH", "", func(c config.Config) any { return c.Defaults.AllowAutoPush }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoPush }),
-	"defaults.allowAutoApprove":        boolField("defaults.allowAutoApprove", "LOOPER_ALLOW_AUTO_APPROVE", "", func(c config.Config) any { return c.Defaults.AllowAutoApprove }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoApprove }),
-	"defaults.allowAutoMerge":          boolField("defaults.allowAutoMerge", "", "", func(c config.Config) any { return c.Defaults.AllowAutoMerge }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoMerge }),
-	"defaults.allowRiskyFixes":         boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
-	"defaults.fixAllPullRequests":      boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
-	"defaults.openPrStrategy":          openPRStrategyField(),
+	"defaults.baseBranch":         stringField("defaults.baseBranch", "", "", func(c config.Config) any { return c.Defaults.BaseBranch }, func(p *config.PartialConfig) **string { return &ensurePartialDefaults(p).BaseBranch }),
+	"defaults.allowAutoCommit":    boolField("defaults.allowAutoCommit", "LOOPER_ALLOW_AUTO_COMMIT", "", func(c config.Config) any { return c.Defaults.AllowAutoCommit }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoCommit }),
+	"defaults.allowAutoPush":      boolField("defaults.allowAutoPush", "LOOPER_ALLOW_AUTO_PUSH", "", func(c config.Config) any { return c.Defaults.AllowAutoPush }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoPush }),
+	"defaults.allowAutoApprove":   boolField("defaults.allowAutoApprove", "LOOPER_ALLOW_AUTO_APPROVE", "", func(c config.Config) any { return c.Defaults.AllowAutoApprove }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoApprove }),
+	"defaults.allowAutoMerge":     boolField("defaults.allowAutoMerge", "", "", func(c config.Config) any { return c.Defaults.AllowAutoMerge }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowAutoMerge }),
+	"defaults.allowRiskyFixes":    boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
+	"defaults.fixAllPullRequests": boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
+	"defaults.openPrStrategy":     openPRStrategyField(),
+	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Clean
+	}),
+	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Blocking
+	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
 	"roles.planner.triggers.labels":    stringListField("roles.planner.triggers.labels", "LOOPER_ROLES_PLANNER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Planner.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialPlannerTriggers(p).Labels }),
 	"roles.planner.triggers.labelMode": labelModeField("roles.planner.triggers.labelMode", "LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Planner.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialPlannerTriggers(p).LabelMode }),
@@ -443,6 +449,28 @@ func openPRStrategyField() configField {
 	}}
 }
 
+func reviewerReviewEventField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
+	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
+		switch key {
+		case "reviewer.reviewEvents.clean":
+			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventApprove {
+				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove)
+			}
+		case "reviewer.reviewEvents.blocking":
+			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventRequestChanges {
+				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges)
+			}
+		default:
+			return fmt.Errorf("unsupported review event config key %q", key)
+		}
+		*target(p) = &value
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*target(p) = nil
+	}}
+}
+
 func parseConfigBool(raw string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "true", "1", "yes", "on":
@@ -476,6 +504,16 @@ func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefault
 		partial.Defaults = &config.PartialDefaultsConfig{}
 	}
 	return partial.Defaults
+}
+
+func ensurePartialReviewerReviewEvents(partial *config.PartialConfig) *config.PartialReviewerReviewEventsConfig {
+	if partial.Reviewer == nil {
+		partial.Reviewer = &config.PartialReviewerConfig{}
+	}
+	if partial.Reviewer.ReviewEvents == nil {
+		partial.Reviewer.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
+	}
+	return partial.Reviewer.ReviewEvents
 }
 
 func ensurePartialRoles(partial *config.PartialConfig) *config.PartialRoleConfigs {
@@ -599,6 +637,10 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 			return false
 		}
 		return partial.Defaults.OpenPRStrategy != nil
+	case "reviewer.reviewEvents.clean":
+		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil
+	case "reviewer.reviewEvents.blocking":
+		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Blocking != nil
 	case "roles.planner.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
 	case "roles.planner.triggers.labels":

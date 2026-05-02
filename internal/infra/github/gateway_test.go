@@ -390,7 +390,7 @@ func TestGatewayHasReviewMarkerAllowsChangesRequestedReviewEvent(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
-			return shell.Result{Stdout: `[{"state":"CHANGES_REQUESTED","body":"<!-- looper:review id=abc head=def outcome=actionable -->"}]`}, nil
+			return shell.Result{Stdout: `[{"state":"CHANGES_REQUESTED","body":"<!-- looper:review id=abc head=def outcome=blocking -->"}]`}, nil
 		}
 		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
 		return shell.Result{}, nil
@@ -403,6 +403,29 @@ func TestGatewayHasReviewMarkerAllowsChangesRequestedReviewEvent(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("HasReviewMarker() = false, want true when request-changes review is allowed")
+	}
+}
+
+func TestGatewayHasReviewMarkerRejectsEventOutcomePolicyMismatch(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"COMMENTED","body":"<!-- looper:review id=clean head=def outcome=clean -->"},{"state":"COMMENTED","body":"<!-- looper:review id=blocking head=def outcome=blocking -->"},{"state":"CHANGES_REQUESTED","body":"<!-- looper:review id=nonblocking head=def outcome=non_blocking -->"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	for _, marker := range []string{"looper:review id=clean", "looper:review id=blocking", "looper:review id=nonblocking"} {
+		found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: marker, AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"}})
+		if err != nil {
+			t.Fatalf("HasReviewMarker(%q) error = %v", marker, err)
+		}
+		if found {
+			t.Fatalf("HasReviewMarker(%q) = true, want false for event/outcome policy mismatch", marker)
+		}
 	}
 }
 

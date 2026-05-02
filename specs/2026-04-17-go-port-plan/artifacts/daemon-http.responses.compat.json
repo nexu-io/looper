@@ -238,6 +238,10 @@
             },
             "scope": "changed_ranges",
             "publishMode": "single_review",
+            "reviewEvents": {
+              "clean": "COMMENT",
+              "blocking": "COMMENT"
+            },
             "detectDuplicateFindings": true
           },
           "roles": {

@@ -309,9 +309,11 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
 					boolFlag("no-loop", "Run only one review pass"),
+					stringFlag("clean-review-event", "event", "Clean review event override: COMMENT or APPROVE"),
+					stringFlag("blocking-review-event", "event", "Blocking review event override: COMMENT or REQUEST_CHANGES"),
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT or APPROVE"), stringFlag("commit-id", "sha", "Expected PR head commit SHA")}}),
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy")}}),
 				},
 				exampleLines: []string{
 					"$ looper review 123",

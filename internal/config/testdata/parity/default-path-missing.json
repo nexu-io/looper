@@ -111,6 +111,10 @@
         },
         "scope": "changed_ranges",
         "publishMode": "single_review",
+        "reviewEvents": {
+          "clean": "APPROVE",
+          "blocking": "COMMENT"
+        },
         "detectDuplicateFindings": true
       },
       "instructions": {

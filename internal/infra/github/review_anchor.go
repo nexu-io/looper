@@ -170,7 +170,7 @@ func reviewQualityGateApplies(event string, body string) (bool, error) {
 			return true, fmt.Errorf("review marker outcome=%s does not match APPROVE event", marker.Outcome)
 		}
 	case "REQUEST_CHANGES":
-		if marker.Outcome != "actionable" {
+		if marker.Outcome != "blocking" {
 			return true, fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", marker.Outcome)
 		}
 	}
