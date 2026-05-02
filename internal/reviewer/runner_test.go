@@ -332,6 +332,34 @@ func TestDiscoverPullRequestsExtendsDebounceWhenQueuedFollowUpSeesNewHead(t *tes
 	}
 }
 
+func TestDiscoverPullRequestsHonorsMinimumPublishInterval(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MinPublishIntervalSeconds: 1800, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	lastPublishedAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
+	metadata := fmt.Sprintf(`{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastPublishedAt":%q,"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`, lastPublishedAt)
+	loop := storage.LoopRecord{ID: "loop_min_interval", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(20 * time.Minute))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want min interval %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+}
+
 func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
@@ -956,6 +984,52 @@ func TestProcessClaimedItemDetectsDuplicatePublishedFindings(t *testing.T) {
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("agent starts = %d, want review still executed for detection-only duplicate tracking", len(agent.starts))
+	}
+}
+
+func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_clean_noop", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if github.reviewMarkerCalls != 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want no review marker lookup for clean no-op", github.reviewMarkerCalls)
+	}
+	if len(github.addReactionCalls) != 1 {
+		t.Fatalf("addReactionCalls = %d, want one clean signal reaction", len(github.addReactionCalls))
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %s, want clean no-op recorded as published for head", *updatedLoop.MetadataJSON)
 	}
 }
 
@@ -2535,7 +2609,10 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Good spec/docs comment example",
 		"Spec/docs review rubric",
 		"suggestedChange",
-		"warm, specific LGTM review body",
+		"do not write or publish an LGTM review body",
+		"Group related findings by file, subsystem, function, or rule",
+		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem",
+		"fixture-matrix tests",
 		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123` for actionable reviews",
 		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123` for clean reviews",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",

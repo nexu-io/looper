@@ -304,6 +304,17 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--reviewer-min-publish-interval-seconds"):
+			value, nextIndex, err := takeValue(index, "--reviewer-min-publish-interval-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-min-publish-interval-seconds: %q is not an integer", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).MinPublishIntervalSeconds = parsedValue
+			index = nextIndex
 		case matchesFlag(arg, "--reviewer-max-iterations-per-pr"):
 			value, nextIndex, err := takeValue(index, "--reviewer-max-iterations-per-pr")
 			if err != nil {
@@ -452,6 +463,13 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_QUIET_PERIOD_SECONDS: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS: %q is not an integer", value)
+		}
+		ensureReviewerLoopConfig(&overrides).MinPublishIntervalSeconds = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR"); ok {
 		parsed, err := parseInteger(value)

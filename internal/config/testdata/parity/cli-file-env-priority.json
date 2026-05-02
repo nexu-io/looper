@@ -158,7 +158,8 @@
       "reviewer": {
         "loop": {
           "enabledByDefault": true,
-          "quietPeriodSeconds": 120,
+          "quietPeriodSeconds": 900,
+          "minPublishIntervalSeconds": 1800,
           "maxIterationsPerPR": 20,
           "maxIterationsPerHead": 1,
           "maxWallClockSeconds": 14400,

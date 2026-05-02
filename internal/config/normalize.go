@@ -334,6 +334,9 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	if partial.QuietPeriodSeconds != nil {
 		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
 	}
+	if partial.MinPublishIntervalSeconds != nil {
+		config.MinPublishIntervalSeconds = *partial.MinPublishIntervalSeconds
+	}
 	if partial.MaxIterationsPerPR != nil {
 		config.MaxIterationsPerPR = *partial.MaxIterationsPerPR
 	}

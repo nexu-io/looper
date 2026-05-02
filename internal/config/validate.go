@@ -138,6 +138,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Reviewer.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "reviewer.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
 	}
+	if config.Reviewer.Loop.MinPublishIntervalSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "reviewer.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
+	}
 	if config.Reviewer.Loop.MaxIterationsPerPR < 1 {
 		issues = append(issues, ValidationIssue{Path: "reviewer.loop.maxIterationsPerPR", Message: "must be a positive integer"})
 	}

@@ -172,16 +172,17 @@ type DefaultsConfig struct {
 }
 
 type ReviewerLoopConfig struct {
-	EnabledByDefault        bool `json:"enabledByDefault"`
-	QuietPeriodSeconds      int  `json:"quietPeriodSeconds"`
-	MaxIterationsPerPR      int  `json:"maxIterationsPerPR"`
-	MaxIterationsPerHead    int  `json:"maxIterationsPerHead"`
-	MaxWallClockSeconds     int  `json:"maxWallClockSeconds"`
-	MaxConsecutiveFailures  int  `json:"maxConsecutiveFailures"`
-	MaxAgentExecutionsPerPR int  `json:"maxAgentExecutionsPerPR"`
-	StopOnApproved          bool `json:"stopOnApproved"`
-	StopOnReadyLabel        bool `json:"stopOnReadyLabel"`
-	StopOnIdenticalOutput   bool `json:"stopOnIdenticalOutput"`
+	EnabledByDefault          bool `json:"enabledByDefault"`
+	QuietPeriodSeconds        int  `json:"quietPeriodSeconds"`
+	MinPublishIntervalSeconds int  `json:"minPublishIntervalSeconds"`
+	MaxIterationsPerPR        int  `json:"maxIterationsPerPR"`
+	MaxIterationsPerHead      int  `json:"maxIterationsPerHead"`
+	MaxWallClockSeconds       int  `json:"maxWallClockSeconds"`
+	MaxConsecutiveFailures    int  `json:"maxConsecutiveFailures"`
+	MaxAgentExecutionsPerPR   int  `json:"maxAgentExecutionsPerPR"`
+	StopOnApproved            bool `json:"stopOnApproved"`
+	StopOnReadyLabel          bool `json:"stopOnReadyLabel"`
+	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
 }
 
 type ReviewerConfig struct {
@@ -310,16 +311,17 @@ type PartialDefaultsConfig struct {
 }
 
 type PartialReviewerLoopConfig struct {
-	EnabledByDefault        *bool `json:"enabledByDefault,omitempty"`
-	QuietPeriodSeconds      *int  `json:"quietPeriodSeconds,omitempty"`
-	MaxIterationsPerPR      *int  `json:"maxIterationsPerPR,omitempty"`
-	MaxIterationsPerHead    *int  `json:"maxIterationsPerHead,omitempty"`
-	MaxWallClockSeconds     *int  `json:"maxWallClockSeconds,omitempty"`
-	MaxConsecutiveFailures  *int  `json:"maxConsecutiveFailures,omitempty"`
-	MaxAgentExecutionsPerPR *int  `json:"maxAgentExecutionsPerPR,omitempty"`
-	StopOnApproved          *bool `json:"stopOnApproved,omitempty"`
-	StopOnReadyLabel        *bool `json:"stopOnReadyLabel,omitempty"`
-	StopOnIdenticalOutput   *bool `json:"stopOnIdenticalOutput,omitempty"`
+	EnabledByDefault          *bool `json:"enabledByDefault,omitempty"`
+	QuietPeriodSeconds        *int  `json:"quietPeriodSeconds,omitempty"`
+	MinPublishIntervalSeconds *int  `json:"minPublishIntervalSeconds,omitempty"`
+	MaxIterationsPerPR        *int  `json:"maxIterationsPerPR,omitempty"`
+	MaxIterationsPerHead      *int  `json:"maxIterationsPerHead,omitempty"`
+	MaxWallClockSeconds       *int  `json:"maxWallClockSeconds,omitempty"`
+	MaxConsecutiveFailures    *int  `json:"maxConsecutiveFailures,omitempty"`
+	MaxAgentExecutionsPerPR   *int  `json:"maxAgentExecutionsPerPR,omitempty"`
+	StopOnApproved            *bool `json:"stopOnApproved,omitempty"`
+	StopOnReadyLabel          *bool `json:"stopOnReadyLabel,omitempty"`
+	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
 }
 
 type PartialReviewerConfig struct {
