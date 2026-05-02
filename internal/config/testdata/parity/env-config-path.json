@@ -150,6 +150,7 @@
       "tools": {
         "gitPath": "/cfg/git",
         "ghPath": "/cfg/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/cfg/osascript"
       },
       "daemon": {
@@ -191,6 +192,10 @@
         },
         "scope": "changed_ranges",
         "publishMode": "single_review",
+        "reviewEvents": {
+          "clean": "APPROVE",
+          "blocking": "COMMENT"
+        },
         "detectDuplicateFindings": true,
         "threadResolution": {
           "autoResolve": "objective_only",
@@ -203,6 +208,50 @@
           "scope": "looper_authored_only"
         }
       },
+      "roles": {
+        "planner": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:plan"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        },
+        "reviewer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "requireReviewRequest": true,
+            "labels": [],
+            "labelMode": "all"
+          },
+          "specReview": {
+            "includeReviewingLabel": true,
+            "reviewingLabel": "looper:spec-reviewing"
+          }
+        },
+        "fixer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "labels": [],
+            "labelMode": "all",
+            "authorFilter": "current_user"
+          }
+        },
+        "worker": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:worker-ready"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        }
+      },
       "projects": [
         {
           "id": "alpha",
@@ -211,7 +260,11 @@
           "baseBranch": "develop",
           "worktreeRoot": "__TMP__/alpha-worktrees"
         }
-      ]
+      ],
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
+      }
     },
     "metadata": {
       "configPath": "__TMP__/configs/env-selected.json",
@@ -219,6 +272,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

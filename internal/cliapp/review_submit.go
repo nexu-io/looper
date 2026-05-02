@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/diffanchor"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/shell"
@@ -55,10 +56,18 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateReviewSubmitEventAllowed(event, loaded.Config.Defaults.AllowAutoApprove); err != nil {
+	policy, err := effectiveReviewSubmitPolicy(
+		loaded.Config.Reviewer.ReviewEvents,
+		getStringFlag(cmd, "clean-review-event"),
+		getStringFlag(cmd, "blocking-review-event"),
+	)
+	if err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, commitID, event); err != nil {
+	if err := validateReviewSubmitEventAllowed(event, policy); err != nil {
+		return err
+	}
+	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy); err != nil {
 		return err
 	}
 	if loaded.Config.Tools.GHPath == nil || strings.TrimSpace(*loaded.Config.Tools.GHPath) == "" {
@@ -101,39 +110,100 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 func validateReviewSubmitEvent(raw string) (string, error) {
 	event := strings.ToUpper(strings.TrimSpace(raw))
 	if event == "" {
-		return "", fmt.Errorf("review submit requires --event COMMENT or APPROVE")
+		return "", fmt.Errorf("review submit requires --event COMMENT, APPROVE, or REQUEST_CHANGES")
 	}
-	if event != "COMMENT" && event != "APPROVE" {
+	if event != "COMMENT" && event != "APPROVE" && event != "REQUEST_CHANGES" {
 		return "", fmt.Errorf("unsupported review event %q", event)
 	}
 	return event, nil
 }
 
-func validateReviewSubmitEventAllowed(event string, allowAutoApprove bool) error {
-	if strings.EqualFold(strings.TrimSpace(event), "APPROVE") && !allowAutoApprove {
-		return fmt.Errorf("review submit --event APPROVE requires defaults.allowAutoApprove=true")
+func validateReviewSubmitPolicy(policy config.ReviewerReviewEventsConfig) error {
+	if policy.Clean != config.ReviewerReviewEventComment && policy.Clean != config.ReviewerReviewEventApprove {
+		return fmt.Errorf("clean review event policy must be COMMENT or APPROVE")
+	}
+	if policy.Blocking != config.ReviewerReviewEventComment && policy.Blocking != config.ReviewerReviewEventRequestChanges {
+		return fmt.Errorf("blocking review event policy must be COMMENT or REQUEST_CHANGES")
+	}
+	return nil
+}
+
+func effectiveReviewSubmitPolicy(base config.ReviewerReviewEventsConfig, cleanOverride string, blockingOverride string) (config.ReviewerReviewEventsConfig, error) {
+	if err := validateReviewSubmitPolicy(base); err != nil {
+		return config.ReviewerReviewEventsConfig{}, err
+	}
+	policy := base
+	if value := strings.TrimSpace(cleanOverride); value != "" {
+		policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(value))
+	}
+	if value := strings.TrimSpace(blockingOverride); value != "" {
+		policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(value))
+	}
+	if err := validateReviewSubmitPolicy(policy); err != nil {
+		return config.ReviewerReviewEventsConfig{}, err
+	}
+	return policy, nil
+}
+
+func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReviewEventsConfig) error {
+	switch strings.ToUpper(strings.TrimSpace(event)) {
+	case "APPROVE":
+		if policy.Clean != config.ReviewerReviewEventApprove {
+			return fmt.Errorf("review submit --event APPROVE requires reviewer.reviewEvents.clean=APPROVE")
+		}
+	case "REQUEST_CHANGES":
+		if policy.Blocking != config.ReviewerReviewEventRequestChanges {
+			return fmt.Errorf("review submit --event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES")
+		}
 	}
 	return nil
 }
 
 var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 
-func validateReviewSubmitBody(body string, commitID string, event string) error {
+func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
 	if len(matches) != 1 {
 		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
 	}
 	fields := parseReviewSubmitMarkerFields(matches[0][1])
-	if fields["id"] == "" || fields["head"] == "" || (fields["outcome"] != "clean" && fields["outcome"] != "actionable") {
+	outcome := fields["outcome"]
+	if fields["id"] == "" || fields["head"] == "" || !isValidReviewSubmitOutcome(outcome) {
 		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
 	}
 	if !strings.EqualFold(fields["head"], strings.TrimSpace(commitID)) {
 		return fmt.Errorf("review marker head=%s does not match --commit-id %s", fields["head"], strings.TrimSpace(commitID))
 	}
-	if event == "APPROVE" && fields["outcome"] != "clean" {
-		return fmt.Errorf("review marker outcome=%s does not match APPROVE event", fields["outcome"])
+	switch event {
+	case "APPROVE":
+		if outcome != "clean" {
+			return fmt.Errorf("review marker outcome=%s does not match APPROVE event", outcome)
+		}
+		if len(comments) > 0 {
+			return fmt.Errorf("APPROVE reviews require clean outcome without inline comments")
+		}
+	case "REQUEST_CHANGES":
+		if outcome != "blocking" {
+			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
+		}
+	case "COMMENT":
+		if outcome == "clean" && policy.Clean == config.ReviewerReviewEventApprove {
+			return fmt.Errorf("review marker outcome=clean requires APPROVE under effective policy")
+		}
+		if outcome == "blocking" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
+			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
+		}
 	}
 	return nil
+}
+
+func isValidReviewSubmitOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseReviewSubmitMarkerFields(segment string) map[string]string {

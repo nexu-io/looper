@@ -42,6 +42,7 @@ const (
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+	defaultIssueLimit   = 30
 
 	workerBranchSlugMaxLength = 30
 	workerBranchSlugMaxWords  = 5
@@ -105,6 +106,13 @@ type IssueCommentInput struct {
 	Repo        string
 	IssueNumber int64
 	Body        string
+	CWD         string
+}
+
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
 	CWD         string
 }
 
@@ -180,6 +188,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type GitHubGateway interface {
@@ -188,6 +197,7 @@ type GitHubGateway interface {
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
@@ -350,11 +360,21 @@ type Options struct {
 	AllowAutoPush                   bool
 	OpenPRStrategy                  config.OpenPRStrategy
 	Disclosure                      *config.DisclosureConfig
+	AgentRuntime                    string
+	CustomInstructions              *config.Config
 	AgentModel                      *string
 	RetryBaseDelay                  time.Duration
 	RetryMaxAttempts                int64
 	OnAgentExecutionStarted         AgentExecutionStartedFunc
 	OnRunCompleted                  RunCompletedFunc
+	DiscoveryPolicy                 DiscoveryPolicy
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery              bool
+	Labels                     []string
+	LabelMode                  config.LabelMode
+	RequireAssigneeCurrentUser bool
 }
 
 type Runner struct {
@@ -375,11 +395,14 @@ type Runner struct {
 	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
 	disclosure              config.DisclosureConfig
+	agentRuntime            string
+	customInstructions      config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onRunCompleted          RunCompletedFunc
+	discoveryPolicy         DiscoveryPolicy
 }
 
 type ProcessResult struct {
@@ -410,16 +433,17 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo     string   `json:"issueRepo,omitempty"`
-	BaseBranch    string   `json:"baseBranch,omitempty"`
-	ExecutionMode string   `json:"executionMode,omitempty"`
-	IssueNumber   int64    `json:"issueNumber,omitempty"`
-	IssueURL      string   `json:"issueUrl,omitempty"`
-	PRNumber      int64    `json:"prNumber,omitempty"`
-	PRTitle       string   `json:"prTitle,omitempty"`
-	Branch        string   `json:"branch,omitempty"`
-	HeadSHA       string   `json:"headSha,omitempty"`
-	Reviewers     []string `json:"reviewers,omitempty"`
+	IssueRepo      string   `json:"issueRepo,omitempty"`
+	BaseBranch     string   `json:"baseBranch,omitempty"`
+	ExecutionMode  string   `json:"executionMode,omitempty"`
+	IssueNumber    int64    `json:"issueNumber,omitempty"`
+	IssueURL       string   `json:"issueUrl,omitempty"`
+	PRNumber       int64    `json:"prNumber,omitempty"`
+	PRTitle        string   `json:"prTitle,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	HeadSHA        string   `json:"headSha,omitempty"`
+	AutoDiscovered bool     `json:"autoDiscovered,omitempty"`
+	Reviewers      []string `json:"reviewers,omitempty"`
 }
 
 type workerCheckpoint struct {
@@ -546,6 +570,10 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
+	policy := options.DiscoveryPolicy
+	if policy.LabelMode == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{issueDiscoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -564,11 +592,14 @@ func New(options Options) *Runner {
 		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
 		disclosure:              disclosureCfg,
+		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onRunCompleted:          options.OnRunCompleted,
+		discoveryPolicy:         policy,
 	}
 }
 
@@ -586,21 +617,29 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	login := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		var err error
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
 	}
-	login = normalizeLogin(login)
-	if login == "" {
+	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	issues, err := r.github.ListOpenIssues(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: login, Label: issueDiscoveryLabel})
+	assigneeFilter := ""
+	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+		assigneeFilter = login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimWorkerIssue(issue, login) {
+		if !shouldClaimWorkerIssue(issue, login, r.discoveryPolicy) {
 			result.Skipped++
 			continue
 		}
@@ -929,6 +968,12 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if !acquired {
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || r.discoveryPolicy.RequireAssigneeCurrentUser) {
+		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+			return checkpoint, err
+		}
+	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
 		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
 	}
@@ -938,6 +983,28 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	checkpoint.SkipReason = ""
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusRunning, "")
 	return checkpoint, nil
+}
+
+func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd string) error {
+	if r.github == nil || work.IssueNumber <= 0 {
+		return nil
+	}
+	repo := issueLookupRepo(work)
+	if repo == "" {
+		return nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
+	}
+	login = normalizeLogin(login)
+	if login == "" {
+		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
+	}
+	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {
+		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
+	}
+	return nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -1050,12 +1117,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, err
 	}
 	if !executionCompleted {
-		prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentModel)
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentRuntime, r.agentModel)
 		if err != nil {
 			return checkpoint, err
 		}
 		executionID := eventlog.NewEventID("agent")
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
+		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+			metadata[key] = value
+		}
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1318,7 +1389,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -1628,7 +1699,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL}
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -1677,7 +1748,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL})
+	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID
@@ -2164,7 +2235,14 @@ func implementationPullRequestTitle(work workerInput) string {
 	return title
 }
 
-func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, error) {
+func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentRuntime, agentModel)
+	return prompt, err
+}
+
+func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -2188,22 +2266,35 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 		}
 		parts = append(parts, strings.Join(lines, "\n"))
 	}
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "worker")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
+	}
 	if allowAgentPRCreation {
 		parts = append(parts, buildAgentPullRequestInstruction(work))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
-		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentModel))
+		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
-		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentModel))
+		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), nil
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
 }
 
-func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
+}
+
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
-		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")
@@ -2432,8 +2523,115 @@ func hasLabel(labels []string, target string) bool {
 	return false
 }
 
-func shouldClaimWorkerIssue(issue IssueSummary, login string) bool {
-	return includesLogin(issue.Assignees, login) && hasLabel(issue.Labels, issueDiscoveryLabel)
+func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
+	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
+		return false
+	}
+	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+func safeIssueQueryLabel(labels []string) string {
+	for _, label := range labels {
+		if strings.TrimSpace(label) != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+	if policy.LabelMode != config.LabelModeAny {
+		input.Labels = uniqueNonEmptyLabels(policy.Labels)
+		input.Label = safeIssueQueryLabel(input.Labels)
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func mergeIssuePages(pages [][]IssueSummary, limit int) []IssueSummary {
+	seenIssues := map[int64]struct{}{}
+	merged := []IssueSummary{}
+	for index := 0; len(merged) < limit; index++ {
+		anyPageHasIndex := false
+		for _, page := range pages {
+			if index >= len(page) {
+				continue
+			}
+			anyPageHasIndex = true
+			issue := page[index]
+			if _, ok := seenIssues[issue.Number]; ok {
+				continue
+			}
+			seenIssues[issue.Number] = struct{}{}
+			merged = append(merged, issue)
+			if len(merged) >= limit {
+				break
+			}
+		}
+		if !anyPageHasIndex {
+			break
+		}
+	}
+	return merged
+}
+
+func effectiveIssueLimit(limit int) int {
+	if limit <= 0 {
+		return defaultIssueLimit
+	}
+	return limit
+}
+
+func uniqueNonEmptyLabels(labels []string) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if hasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !hasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
@@ -2575,6 +2773,13 @@ func stringFromAnyDefault(value any) string {
 		return text
 	}
 	return ""
+}
+
+func boolFromAny(value any) bool {
+	if flag, ok := value.(bool); ok {
+		return flag
+	}
+	return false
 }
 
 func firstNonEmpty(values ...string) string {

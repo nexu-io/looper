@@ -55,9 +55,10 @@ type ReviewerStep string
 type ReviewEvent string
 
 const (
-	ReviewEventApprove     ReviewEvent = "APPROVE"
-	ReviewEventComment     ReviewEvent = "COMMENT"
-	reviewEventAgentNative ReviewEvent = "AGENT_NATIVE"
+	ReviewEventApprove        ReviewEvent = "APPROVE"
+	ReviewEventComment        ReviewEvent = "COMMENT"
+	ReviewEventRequestChanges ReviewEvent = "REQUEST_CHANGES"
+	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
 type QueueFailureKind string
@@ -154,10 +155,11 @@ func (e TransientCommandError) Unwrap() error   { return e.Err }
 func (e TransientCommandError) Temporary() bool { return true }
 
 type ListOpenPullRequestsInput struct {
-	Repo  string
-	CWD   string
-	Limit int
-	Label string
+	Repo   string
+	CWD    string
+	Limit  int
+	Label  string
+	Labels []string
 }
 
 type ViewPullRequestInput struct {
@@ -320,17 +322,30 @@ type Options struct {
 	AgentTimeout            time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
+	ReviewEvents            config.ReviewerReviewEventsConfig
 	LoopConfig              config.ReviewerLoopConfig
+	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
 	ThreadResolution        config.ReviewerThreadResolutionConfig
 	Disclosure              *config.DisclosureConfig
+	CustomInstructions      *config.Config
 	AgentRuntime            string
 	AgentModel              *string
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery             bool
+	IncludeDrafts             bool
+	RequireReviewRequest      bool
+	Labels                    []string
+	LabelMode                 config.LabelMode
+	IncludeSpecReviewingLabel bool
+	SpecReviewingLabel        string
 }
 
 type Runner struct {
@@ -344,11 +359,14 @@ type Runner struct {
 	agentTimeout            time.Duration
 	claimTTL                time.Duration
 	allowAutoApprove        bool
+	reviewEvents            config.ReviewerReviewEventsConfig
 	loopConfig              config.ReviewerLoopConfig
+	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
 	threadResolution        config.ReviewerThreadResolutionConfig
 	disclosure              config.DisclosureConfig
+	customInstructions      config.Config
 	agentRuntime            string
 	agentModel              string
 	looperCLIPath           string
@@ -492,6 +510,20 @@ func New(options Options) *Runner {
 	if threadResolution.Mode == "" {
 		threadResolution = config.ReviewerThreadResolutionConfig{Enabled: false, Mode: config.ReviewerThreadResolutionModeReportOnly, Scope: config.ReviewerThreadResolutionScopeLooperAuthoredOnly, AutoResolve: config.ReviewerThreadResolutionAutoResolveObjectiveOnly, RequireAuditComment: true, RequireNewHeadSinceThread: true, RequireCurrentReviewRequest: true, MaxThreadsPerRun: 10}
 	}
+	reviewEvents := options.ReviewEvents
+	if reviewEvents.Clean == "" {
+		reviewEvents.Clean = config.ReviewerReviewEventComment
+	}
+	if reviewEvents.Blocking == "" {
+		reviewEvents.Blocking = config.ReviewerReviewEventComment
+	}
+	if options.AllowAutoApprove && options.ReviewEvents.Clean == "" {
+		reviewEvents.Clean = config.ReviewerReviewEventApprove
+	}
+	policy := options.DiscoveryPolicy
+	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -503,11 +535,14 @@ func New(options Options) *Runner {
 		agentTimeout:            agentTimeout,
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
+		reviewEvents:            reviewEvents,
 		loopConfig:              loopConfig,
+		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
 		threadResolution:        threadResolution,
 		disclosure:              disclosureCfg,
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentModel:              derefString(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
@@ -528,19 +563,27 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit})
+	openPRs, err := r.listOpenPullRequestsForDiscovery(ctx, input.Repo, project.RepoPath, input.Limit)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	specPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: specpr.ReviewingLabel})
-	if err != nil {
-		return DiscoveryResult{}, err
+	specPRs := []PullRequestSummary{}
+	if r.discoveryPolicy.IncludeSpecReviewingLabel {
+		var err error
+		specPRs, err = r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Label: r.discoveryPolicy.SpecReviewingLabel})
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-	if err != nil {
-		return DiscoveryResult{}, err
+	currentLogin := ""
+	if r.discoveryPolicy.RequireReviewRequest {
+		var err error
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = normalizeLogin(currentLogin)
 	}
-	currentLogin = normalizeLogin(currentLogin)
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
@@ -595,7 +638,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return enqueue(pr, nil)
 	}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if !r.prEligibleForDiscovery(pr, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -604,7 +647,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	for _, pr := range specPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if !r.prEligibleForDiscovery(pr, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -629,7 +672,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if detail.IsDraft {
+		if !r.discoveryPolicy.IncludeDrafts && detail.IsDraft {
 			result.Skipped++
 			continue
 		}
@@ -640,7 +683,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		if !isManualReviewerLoop(loop) && r.discoveryPolicy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+			result.Skipped++
+			continue
+		}
+		if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 			result.Skipped++
 			continue
 		}
@@ -650,6 +697,104 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	return result, nil
+}
+
+func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
+	labels := prQueryLabels(r.discoveryPolicy.Labels)
+	effectiveLimit := defaultDiscoveryLimit(limit)
+	if len(labels) == 0 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit})
+	}
+	if len(labels) == 1 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Label: labels[0]})
+	}
+	if r.discoveryPolicy.LabelMode == config.LabelModeAll {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Labels: labels})
+	}
+
+	result := []PullRequestSummary{}
+	seen := map[int64]struct{}{}
+	for _, label := range labels {
+		if len(result) >= effectiveLimit {
+			break
+		}
+		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: effectiveLimit, Label: label})
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range prs {
+			if _, ok := seen[pr.Number]; ok {
+				continue
+			}
+			seen[pr.Number] = struct{}{}
+			result = append(result, pr)
+			if len(result) >= effectiveLimit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func defaultDiscoveryLimit(limit int) int {
+	if limit <= 0 {
+		return 30
+	}
+	return limit
+}
+
+func (r *Runner) prEligibleForDiscovery(pr PullRequestSummary, currentLogin string) bool {
+	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
+		return false
+	}
+	if normalizePRState(pr.State) != "open" {
+		return false
+	}
+	if r.discoveryPolicy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		return false
+	}
+	if !labelsMatch(pr.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+		return false
+	}
+	return true
+}
+
+func prQueryLabels(labels []string) []string {
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -968,7 +1113,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for filter step", kind: FailureRetryableTransient}
 	}
-	if checkpoint.Detail.IsDraft {
+	if !r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped draft pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
@@ -1007,7 +1152,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, nil
 		}
 	}
-	if !isManualReviewerLoop(input.Loop) {
+	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1477,7 +1622,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
+	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+		metadata[key] = value
+	}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1566,7 +1716,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) {
+	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1608,7 +1758,7 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return ReviewMarkerResult{}, err
 	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
-	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
+	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON)), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
 }
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
@@ -1622,8 +1772,10 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
-		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+		specReviewingLabel := r.specReviewingLabel()
+		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
+		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
 			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 			if err != nil {
 				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
@@ -1635,8 +1787,8 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
 				return nil
 			}
-			if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
-				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			if specpr.HasLabel(detail.Labels, specReviewingLabel) {
+				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 				}
 			}
@@ -1646,14 +1798,21 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 				}
 			}
 		}
-	case "actionable":
+	case "actionable", "non_blocking", "blocking":
 		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 	default:
-		return &loopError{message: "Verified review marker is missing outcome=clean|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
+		return &loopError{message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
 	return nil
+}
+
+func (r *Runner) specReviewingLabel() string {
+	if label := strings.TrimSpace(r.discoveryPolicy.SpecReviewingLabel); label != "" {
+		return label
+	}
+	return specpr.ReviewingLabel
 }
 
 func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
@@ -1668,10 +1827,54 @@ func hasPendingReviewMarkerMiss(checkpoint reviewerCheckpoint) bool {
 }
 
 func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
-	if r.allowAutoApprove {
-		return []ReviewEvent{ReviewEventComment, ReviewEventApprove}
+	return r.allowedReviewEventsForPolicy(r.reviewEvents)
+}
+
+func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEventsConfig) []ReviewEvent {
+	events := []ReviewEvent{ReviewEventComment}
+	if policy.Clean == config.ReviewerReviewEventApprove {
+		events = append(events, ReviewEventApprove)
 	}
-	return []ReviewEvent{ReviewEventComment}
+	if policy.Blocking == config.ReviewerReviewEventRequestChanges {
+		events = append(events, ReviewEventRequestChanges)
+	}
+	return events
+}
+
+func (r *Runner) effectiveReviewEvents(metadataJSON *string) config.ReviewerReviewEventsConfig {
+	policy := r.reviewEvents
+	meta := parseJSONObject(metadataJSON)
+	if reviewEvents, ok := meta["reviewEvents"].(map[string]any); ok {
+		if clean, ok := stringFromAny(reviewEvents["clean"]); ok && strings.TrimSpace(clean) != "" {
+			if isValidCleanReviewEvent(clean) {
+				policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(clean)))
+			}
+		}
+		if blocking, ok := stringFromAny(reviewEvents["blocking"]); ok && strings.TrimSpace(blocking) != "" {
+			if isValidBlockingReviewEvent(blocking) {
+				policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(blocking)))
+			}
+		}
+	}
+	return policy
+}
+
+func isValidCleanReviewEvent(value string) bool {
+	switch config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value))) {
+	case config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidBlockingReviewEvent(value string) bool {
+	switch config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value))) {
+	case config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
@@ -2125,7 +2328,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
 	}
-	if isManualReviewerLoop(input.Loop) {
+	if isManualReviewerLoop(input.Loop) || !r.discoveryPolicy.RequireReviewRequest {
 		return "", false
 	}
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -2270,6 +2473,37 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	loopMeta["maxWallClockSeconds"] = r.loopConfig.MaxWallClockSeconds
 	loopMeta["maxConsecutiveFailures"] = r.loopConfig.MaxConsecutiveFailures
 	loopMeta["maxAgentExecutionsPerPR"] = r.loopConfig.MaxAgentExecutionsPerPR
+	reviewEventsRaw, hasReviewEvents := meta["reviewEvents"]
+	reviewEventsMeta, _ := reviewEventsRaw.(map[string]any)
+	if hasReviewEvents && reviewEventsMeta == nil {
+		return "", fmt.Errorf("reviewEvents must be a JSON object")
+	}
+	if reviewEventsMeta == nil {
+		reviewEventsMeta = map[string]any{}
+	}
+	if cleanRaw, present := reviewEventsMeta["clean"]; present {
+		clean, ok := cleanRaw.(string)
+		if !ok {
+			return "", fmt.Errorf("reviewEvents.clean must be COMMENT or APPROVE")
+		}
+		if !isValidCleanReviewEvent(clean) {
+			return "", fmt.Errorf("reviewEvents.clean must be COMMENT or APPROVE")
+		}
+	} else {
+		reviewEventsMeta["clean"] = string(r.reviewEvents.Clean)
+	}
+	if blockingRaw, present := reviewEventsMeta["blocking"]; present {
+		blocking, ok := blockingRaw.(string)
+		if !ok {
+			return "", fmt.Errorf("reviewEvents.blocking must be COMMENT or REQUEST_CHANGES")
+		}
+		if !isValidBlockingReviewEvent(blocking) {
+			return "", fmt.Errorf("reviewEvents.blocking must be COMMENT or REQUEST_CHANGES")
+		}
+	} else {
+		reviewEventsMeta["blocking"] = string(r.reviewEvents.Blocking)
+	}
+	meta["reviewEvents"] = reviewEventsMeta
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
@@ -2560,7 +2794,14 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
 }
 
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
+	return prompt
+}
+
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -2572,7 +2813,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so do not publish a GitHub review yourself; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking.", "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -2599,17 +2840,31 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 			parts = append(parts, "Diff:\n"+diff)
 		}
 	}
-	approveInstruction := "Do not approve; submit clean reviews as COMMENT."
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
+	}
+	approveInstruction := "Submit clean reviews as COMMENT."
+	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels when clean reviews are submitted as COMMENT."
-	reviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint))
-	if allowApprove {
+	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
+	reviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+	if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 		approveInstruction = "If the review is clean, submit an APPROVE review."
-		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT or actionable reviews."
-		reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s` for actionable reviews or `%s review submit %s#%d --event APPROVE --commit-id %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint))
+		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT, non-blocking, or blocking finding reviews."
+		reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for finding reviews or `%s review submit %s#%d --event APPROVE --commit-id %s %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+	}
+	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
+		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
+			reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for non-blocking findings, `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings, or `%s review submit %s#%d --event APPROVE --commit-id %s %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+		} else {
+			reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for clean or non-blocking reviews, or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+		}
 	}
 	existingMarkerEventInstruction := "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review. Ignore matching markers on APPROVED reviews and post a new COMMENT review instead."
-	if allowApprove {
-		existingMarkerEventInstruction = "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED or APPROVED PR review."
+	if reviewEvents.Clean == config.ReviewerReviewEventApprove || reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
+		existingMarkerEventInstruction = "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED, APPROVED, or CHANGES_REQUESTED PR review allowed by this run's review event policy."
 	}
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
 	if manual {
@@ -2622,19 +2877,20 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		submitPayloadInstruction = ""
 	}
 	parts = append(parts,
-		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
+		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=non_blocking, outcome=blocking, or legacy outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
 		existingMarkerEventInstruction,
 		githubOperationContract,
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
-		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
+		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
 		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations. Use ANCHORABLE DIFF LOCATIONS as a summary of known ranges, but if that summary is truncated, the full PR diff remains authoritative. Preserve exact anchors that fit the full diff. If an otherwise useful comment is outside the full diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
-		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
+		"For non-blocking or blocking finding reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
 		approveInstruction,
+		blockingInstruction,
 		"Prefer 3 deeply specific comments over 10 shallow comments. If there is no concrete actionable feedback, post a clean review. Do not invent feedback.",
 		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
@@ -2643,7 +2899,7 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
 		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
-		"For actionable reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
+		"For non-blocking or blocking finding reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
@@ -2656,7 +2912,16 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	if submitPayloadInstruction != "" {
 		parts = append(parts, submitPayloadInstruction)
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func normalizeLooperCLIPath(path string) string {

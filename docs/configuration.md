@@ -141,6 +141,52 @@ Example minimal `~/.looper/config.json`:
     "openPrStrategy": "all_done",
     "addSnapshotMode": "async"
   },
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "COMMENT",
+      "blocking": "COMMENT"
+    }
+  },
+  "roles": {
+    "planner": {
+      "autoDiscovery": true,
+      "triggers": {
+        "labels": ["looper:plan"],
+        "labelMode": "all",
+        "requireAssigneeCurrentUser": true
+      }
+    },
+    "reviewer": {
+      "autoDiscovery": true,
+      "triggers": {
+        "includeDrafts": false,
+        "requireReviewRequest": true,
+        "labels": [],
+        "labelMode": "all"
+      },
+      "specReview": {
+        "includeReviewingLabel": true,
+        "reviewingLabel": "looper:spec-reviewing"
+      }
+    },
+    "fixer": {
+      "autoDiscovery": true,
+      "triggers": {
+        "includeDrafts": false,
+        "authorFilter": "current_user",
+        "labels": [],
+        "labelMode": "all"
+      }
+    },
+    "worker": {
+      "autoDiscovery": true,
+      "triggers": {
+        "labels": ["looper:worker-ready"],
+        "labelMode": "all",
+        "requireAssigneeCurrentUser": true
+      }
+    }
+  },
   "projects": [
     {
       "id": "looper",
@@ -268,6 +314,8 @@ Defaults:
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
 - `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
 
+`defaults.allowAutoApprove=true` is a legacy alias for reviewer clean approvals. If `reviewer.reviewEvents.clean` is not explicitly configured, it maps clean reviewer outcomes to `APPROVE`; an explicit `reviewer.reviewEvents.clean` value wins.
+
 Default values:
 
 - `baseBranch`: `main`
@@ -276,8 +324,59 @@ Default values:
 - `allowAutoApprove`: `false`
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
+- `fixAllPullRequests`: `false`; legacy fixer discovery switch. Prefer `roles.fixer.triggers.authorFilter` for new config.
 - `openPrStrategy`: `all_done`
 - `addSnapshotMode`: `async`
+
+### `reviewer`
+
+- `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
+- `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
+
+Default reviewer behavior is safe and comment-only:
+
+```json
+{
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "COMMENT",
+      "blocking": "COMMENT"
+    }
+  }
+}
+```
+
+To allow reviewer decision reviews:
+
+```json
+{
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "APPROVE",
+      "blocking": "REQUEST_CHANGES"
+    }
+  }
+}
+```
+
+Reviewer behavior matrix:
+
+| Reviewer outcome | `reviewEvents.clean` | `reviewEvents.blocking` | GitHub event |
+|---|---:|---:|---|
+| `clean` | `COMMENT` | any | `COMMENT` |
+| `clean` | `APPROVE` | any | `APPROVE` |
+| `non_blocking` | any | any | `COMMENT` |
+| `blocking` | any | `COMMENT` | `COMMENT` |
+| `blocking` | any | `REQUEST_CHANGES` | `REQUEST_CHANGES` |
+| legacy `actionable` | any | any | `COMMENT` |
+
+One-off reviewer jobs can snapshot the policy into loop metadata so queued work is not affected by later daemon config changes:
+
+```bash
+looper review owner/repo#123 \
+  --clean-review-event APPROVE \
+  --blocking-review-event REQUEST_CHANGES
+```
 
 To restore the previous synchronous `project add` behavior for one command:
 
@@ -294,6 +393,59 @@ To restore it by default for all project additions:
   }
 }
 ```
+
+### `roles`
+
+The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
+
+Defaults preserve Looper's historical behavior:
+
+- planner discovers open issues labeled `looper:plan` assigned to the current GitHub user
+- worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
+- reviewer discovers open non-draft PRs where the current user is requested for review, plus the `looper:spec-reviewing` follow-up path
+- fixer discovers open non-draft PRs authored by the current user that have actionable review items
+
+Common fields:
+
+- `roles.<role>.autoDiscovery`: when `false`, the scheduler skips new discovery for that role only
+- issue roles (`planner`, `worker`): `triggers.labels`, `triggers.labelMode` (`all` or `any`), and `triggers.requireAssigneeCurrentUser`
+- reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
+- fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
+
+Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+
+Examples:
+
+```json
+{
+  "roles": {
+    "planner": {
+      "triggers": {
+        "labels": ["team:alpha", "needs-plan"],
+        "labelMode": "any",
+        "requireAssigneeCurrentUser": false
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "roles": {
+    "reviewer": {
+      "autoDiscovery": false
+    },
+    "fixer": {
+      "triggers": {
+        "authorFilter": "any"
+      }
+    }
+  }
+}
+```
+
+`defaults.fixAllPullRequests=true` remains supported and maps to `roles.fixer.triggers.authorFilter=any` when `roles.fixer.triggers.authorFilter` is not explicitly configured. If both are present, `roles.fixer.triggers.authorFilter` wins.
 
 ### `projects`
 
@@ -340,6 +492,29 @@ Supported environment overrides:
 - `LOOPER_ALLOW_AUTO_COMMIT`
 - `LOOPER_ALLOW_AUTO_PUSH`
 - `LOOPER_ALLOW_AUTO_APPROVE`
+- `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
+- `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
+- `LOOPER_FIX_ALL_PULL_REQUESTS`
+- `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
+- `LOOPER_ROLES_WORKER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_WORKER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
+- `LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL`
+- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL`
+- `LOOPER_ROLES_FIXER_AUTO_DISCOVERY`
+- `LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS`
+- `LOOPER_ROLES_FIXER_TRIGGERS_LABELS`
+- `LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE`
+- `LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER`
 
 Boolean environment variables accept:
 
@@ -381,6 +556,8 @@ Supported `looperd` flags:
 - `--allow-auto-commit`
 - `--allow-auto-push`
 - `--allow-auto-approve`
+- `--reviewer-clean-review-event`
+- `--reviewer-blocking-review-event`
 
 Example:
 

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -228,6 +229,22 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 		metadata := map[string]any{
 			"manual":        true,
 			"followUpdates": loopEnabled,
+		}
+		reviewEvents := map[string]any{}
+		policy := config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}
+		if clean := strings.ToUpper(strings.TrimSpace(getStringFlag(cmd, "clean-review-event"))); clean != "" {
+			policy.Clean = config.ReviewerReviewEvent(clean)
+			reviewEvents["clean"] = clean
+		}
+		if blocking := strings.ToUpper(strings.TrimSpace(getStringFlag(cmd, "blocking-review-event"))); blocking != "" {
+			policy.Blocking = config.ReviewerReviewEvent(blocking)
+			reviewEvents["blocking"] = blocking
+		}
+		if len(reviewEvents) > 0 {
+			if err := validateReviewSubmitPolicy(policy); err != nil {
+				return nil, err
+			}
+			metadata["reviewEvents"] = reviewEvents
 		}
 
 		body := map[string]any{

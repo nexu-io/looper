@@ -101,6 +101,13 @@ type IssueCommentInput struct {
 	CWD         string
 }
 
+type IssueAssigneesInput struct {
+	Repo        string
+	IssueNumber int64
+	Assignees   []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -206,6 +213,7 @@ type ListOpenPullRequestsInput struct {
 	CWD     string
 	Limit   int
 	Label   string
+	Labels  []string
 	Author  string
 	Timeout time.Duration
 }
@@ -216,6 +224,7 @@ type ListOpenIssuesInput struct {
 	Limit    int
 	Assignee string
 	Label    string
+	Labels   []string
 }
 
 type ViewIssueInput struct {
@@ -346,8 +355,9 @@ func New(options Options) *Gateway {
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	labels := prListLabels(input)
+	for _, label := range labels {
+		args = append(args, "--label", label)
 	}
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
@@ -386,6 +396,28 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	return out, nil
 }
 
+func prListLabels(input ListOpenPullRequestsInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
 func (g *Gateway) GetPullRequestAuthor(ctx context.Context, input ViewPullRequestInput) (string, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "author")
 	if err != nil {
@@ -403,8 +435,8 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	if strings.TrimSpace(input.Assignee) != "" {
 		args = append(args, "--assignee", input.Assignee)
 	}
-	if strings.TrimSpace(input.Label) != "" {
-		args = append(args, "--label", input.Label)
+	for _, label := range issueListLabels(input) {
+		args = append(args, "--label", label)
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
 
@@ -430,6 +462,28 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 		})
 	}
 	return out, nil
+}
+
+func issueListLabels(input ListOpenIssuesInput) []string {
+	labels := input.Labels
+	if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+		labels = []string{input.Label}
+	}
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
@@ -469,6 +523,30 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
 	return err
+}
+
+func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
+	assignees := compactIssueAssignees(input.Assignees)
+	if len(assignees) == 0 {
+		return nil
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", input.Repo, input.IssueNumber), "--method", "POST"}
+	for _, assignee := range assignees {
+		args = append(args, "-f", "assignees[]="+assignee)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+func compactIssueAssignees(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -796,11 +874,39 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 			continue
 		}
 		event := reviewEventFromStateString(row["state"])
-		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
+		if reviewMarkerEventAllowedForOutcome(parsedMarker.Outcome, event, allowedReviewEvents) {
 			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author, Body: body, ReviewID: reviewIDString(row)}
 		}
 	}
 	return newest
+}
+
+func reviewMarkerEventAllowedForOutcome(outcome string, event string, allowedReviewEvents []string) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowedReviewEvents) == 0 {
+		return true
+	}
+	if !reviewEventAllowed(event, allowedReviewEvents) {
+		return false
+	}
+	switch outcome {
+	case "clean":
+		if reviewEventAllowed("APPROVE", allowedReviewEvents) {
+			return event == "APPROVE"
+		}
+		return event == "COMMENT"
+	case "blocking":
+		if reviewEventAllowed("REQUEST_CHANGES", allowedReviewEvents) {
+			return event == "REQUEST_CHANGES"
+		}
+		return event == "COMMENT"
+	case "non_blocking", "actionable":
+		return event == "COMMENT"
+	default:
+		return false
+	}
 }
 
 func reviewIDString(row map[string]any) string {
@@ -857,12 +963,21 @@ func parseReviewIdempotencyMarkers(body string) []reviewIdempotencyMarker {
 		}
 		fields := parseReviewMarkerFields(match[1])
 		parsedMarker := reviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
-		if parsedMarker.ID == "" || parsedMarker.Head == "" || (parsedMarker.Outcome != "clean" && parsedMarker.Outcome != "actionable") {
+		if parsedMarker.ID == "" || parsedMarker.Head == "" || !isValidReviewMarkerOutcome(parsedMarker.Outcome) {
 			continue
 		}
 		markers = append(markers, parsedMarker)
 	}
 	return markers
+}
+
+func isValidReviewMarkerOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseReviewMarkerFields(segment string) map[string]string {
