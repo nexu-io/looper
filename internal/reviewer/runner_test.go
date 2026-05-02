@@ -2943,8 +2943,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Group related findings by file, subsystem, function, or rule",
 		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem",
 		"fixture-matrix tests",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT` for finding reviews",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT` for clean reviews",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
@@ -2992,6 +2991,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	}
 	if strings.Contains(prompt, "moving the same actionable feedback into the review body") {
 		t.Fatalf("prompt allows weakening resolvable inline comment contract:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "review submit acme/looper#42 --event APPROVE") {
+		t.Fatalf("actionable-only GitHub contract includes clean review submit command:\n%s", prompt)
 	}
 }
 
