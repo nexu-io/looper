@@ -3380,6 +3380,19 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 	}
 }
 
+func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+
+	if strings.Contains(prompt, "review request removed before publish") {
+		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "does not require a current-user review request") {
+		t.Fatalf("prompt missing disabled review-request instruction:\n%s", prompt)
+	}
+}
+
 func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)
