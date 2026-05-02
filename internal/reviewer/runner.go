@@ -1275,7 +1275,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: normalizedFindingFingerprint(result.Summary), CleanNoop: true}
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, CleanNoop: true}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
@@ -2333,6 +2333,9 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 
 func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string) string {
 	if checkpoint.PendingReview != nil {
+		if checkpoint.PendingReview.CleanNoop {
+			return ""
+		}
 		if fp := strings.TrimSpace(checkpoint.PendingReview.ContentFingerprint); fp != "" {
 			return fp
 		}
