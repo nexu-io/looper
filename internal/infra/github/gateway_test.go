@@ -23,7 +23,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			runner.stdin = options.Stdin
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr list"):
-			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
+			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
 		case strings.HasPrefix(args, "issue list"):
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
@@ -149,6 +149,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	}
 	if got := prs[0].ReviewRequests; len(got) != 1 || got[0] != "OctoCat" {
 		t.Fatalf("prs[0].ReviewRequests = %#v, want [OctoCat]", got)
+	}
+	if prs[0].BaseSHA != "def456" || !prs[0].HasConflicts {
+		t.Fatalf("prs[0] = %#v, want base sha and conflict state", prs[0])
 	}
 	if got := issues[0].Assignees; len(got) != 1 || got[0] != "reviewer" {
 		t.Fatalf("issues[0].Assignees = %#v, want [reviewer]", got)
@@ -1171,7 +1174,7 @@ func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,author,reviewRequests" {
+		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,mergeStateStatus" {
 			t.Fatalf("gh args = %q, want repeated label filters", args)
 		}
 		return shell.Result{Stdout: `[]`}, nil

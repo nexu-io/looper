@@ -1005,6 +1005,163 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 	}
 }
 
+func TestDiscoverPullRequestsSuppressesRepeatedConflictSkipUntilHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{hasConflicts: true, reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	repo := "acme/looper"
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil || len(first.QueueItems) != 1 {
+		t.Fatalf("first DiscoverPullRequests() = (%#v, %v), want one queue item", first, err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed queue item", claimed, err)
+	}
+	processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil || processed.Status != "skipped" || !strings.Contains(processed.Summary, "conflicted") {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want conflicted skip", processed, err)
+	}
+
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(second.QueueItems) != 0 {
+		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged conflicted head", second.QueueItems)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(Queue.List()) = %d, want original completed item only", len(items))
+	}
+
+	github.listHeadSHA = "new-head"
+	github.viewHeadSHA = "new-head"
+	third, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("third DiscoverPullRequests() error = %v", err)
+	}
+	if len(third.QueueItems) != 1 {
+		t.Fatalf("third QueueItems = %#v, want re-enqueue for new head", third.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesConflictedSkipWhenConflictClears(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{hasConflicts: true, reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	repo := "acme/looper"
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil || len(first.QueueItems) != 1 {
+		t.Fatalf("first DiscoverPullRequests() = (%#v, %v), want one queue item", first, err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed queue item", claimed, err)
+	}
+	processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil || processed.Status != "skipped" || !strings.Contains(processed.Summary, "conflicted") {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want conflicted skip", processed, err)
+	}
+
+	github.hasConflicts = false
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(second.QueueItems) != 1 {
+		t.Fatalf("second QueueItems = %#v, want re-enqueue when conflict clears for same head", second.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsSuppressesRepeatedAlreadyReviewedSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", reviews: reviews, reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	repo := "acme/looper"
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil || len(first.QueueItems) != 1 {
+		t.Fatalf("first DiscoverPullRequests() = (%#v, %v), want one queue item", first, err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed queue item", claimed, err)
+	}
+	processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil || processed.Status != "skipped" || !strings.Contains(processed.Summary, "already reviewed head abc123") {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want already-reviewed skip", processed, err)
+	}
+
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(second.QueueItems) != 0 {
+		t.Fatalf("second QueueItems = %#v, want no re-enqueue for unchanged already-reviewed head", second.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotRequeueApprovedReadyOrDraftNonActionablePRs(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		github *fakeGitHubGateway
+		want   string
+	}{
+		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}}, want: "approved"},
+		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready"},
+		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: tc.github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+			repo := "acme/looper"
+
+			first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("first DiscoverPullRequests() error = %v", err)
+			}
+			if tc.want == "draft" {
+				if len(first.QueueItems) != 0 {
+					t.Fatalf("draft QueueItems = %#v, want no queue items", first.QueueItems)
+				}
+			} else {
+				if len(first.QueueItems) != 1 {
+					t.Fatalf("first QueueItems = %#v, want one queue item", first.QueueItems)
+				}
+				claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+				if err != nil || claimed == nil {
+					t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed queue item", claimed, err)
+				}
+				processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+				if err != nil || processed.Status != "skipped" || !strings.Contains(processed.Summary, tc.want) {
+					t.Fatalf("ProcessClaimedItem() = (%#v, %v), want %s skip", processed, err, tc.want)
+				}
+			}
+
+			second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("second DiscoverPullRequests() error = %v", err)
+			}
+			if len(second.QueueItems) != 0 {
+				t.Fatalf("second QueueItems = %#v, want no repeated non-actionable requeue", second.QueueItems)
+			}
+		})
+	}
+}
+
 func TestProcessClaimedItemSkipsTerminalLoopWithoutStartingRun(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3866,6 +4023,10 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 	return fixture
 }
 
+func testReviewerLoopConfig() config.ReviewerLoopConfig {
+	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+}
+
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 func (f *runnerFixture) nowISO() string {
@@ -3924,7 +4085,7 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	if headSHA == "" {
 		headSHA = "abc123"
 	}
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: reviewRequests}}, nil
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
