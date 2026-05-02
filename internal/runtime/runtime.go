@@ -1262,6 +1262,7 @@ type runtimeReviewerCheckpoint struct {
 	ResumePolicy string `json:"resumePolicy,omitempty"`
 	Detail       *struct {
 		State          string   `json:"state,omitempty"`
+		IsDraft        bool     `json:"isDraft,omitempty"`
 		ReviewDecision string   `json:"reviewDecision,omitempty"`
 		Labels         []string `json:"labels,omitempty"`
 	} `json:"detail,omitempty"`
@@ -1301,6 +1302,9 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	if strings.ToLower(strings.TrimSpace(checkpoint.Detail.State)) != "open" {
+		return false
+	}
+	if checkpoint.Detail.IsDraft {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") || specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
