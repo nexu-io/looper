@@ -14,6 +14,36 @@ import (
 	"github.com/powerformer/looper/internal/storage"
 )
 
+func TestBuildPlannerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	prompt := buildPlannerPrompt(storage.ProjectRecord{RepoPath: repoPath}, &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
+func TestBuildPlannerPromptOmitsMissingAgentRuntime(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	prompt := buildPlannerPrompt(storage.ProjectRecord{RepoPath: repoPath}, &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	if strings.Contains(prompt, "agent=") {
+		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
+		t.Fatalf("prompt should include configured model:\n%s", prompt)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

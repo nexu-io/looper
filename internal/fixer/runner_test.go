@@ -14,6 +14,34 @@ import (
 	"github.com/powerformer/looper/internal/storage"
 )
 
+func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildFixerPrompt("acme/looper", 42, "abc123", []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
+func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildFixerPrompt("acme/looper", 42, "abc123", []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	if strings.Contains(prompt, "agent=") {
+		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
+		t.Fatalf("prompt should include configured model:\n%s", prompt)
+	}
+}
+
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

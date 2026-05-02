@@ -230,7 +230,7 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, false, config.DefaultDisclosureConfig(), "")
+	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, false, config.DefaultDisclosureConfig(), "opencode", "")
 	if err != nil {
 		t.Fatalf("buildWorkerPrompt() error = %v", err)
 	}
@@ -251,6 +251,40 @@ func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestBuildWorkerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
+	t.Parallel()
+
+	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	if err != nil {
+		t.Fatalf("buildWorkerPrompt() error = %v", err)
+	}
+	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
+func TestBuildWorkerPromptOmitsMissingAgentRuntime(t *testing.T) {
+	t.Parallel()
+
+	prompt, err := buildWorkerPrompt("", workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main"}, nil, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	if err != nil {
+		t.Fatalf("buildWorkerPrompt() error = %v", err)
+	}
+	if strings.Contains(prompt, "agent=") {
+		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
+		t.Fatalf("prompt should include configured model:\n%s", prompt)
 	}
 }
 

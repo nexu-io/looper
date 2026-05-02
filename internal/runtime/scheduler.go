@@ -693,6 +693,10 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
+	agentRuntime := ""
+	if cfg.Agent.Vendor != nil {
+		agentRuntime = string(*cfg.Agent.Vendor)
+	}
 	plannerRunner = planner.New(planner.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
@@ -703,6 +707,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Now:              now,
 		AllowAutoPush:    boolPtr(cfg.Defaults.AllowAutoPush),
 		Disclosure:       &cfg.Disclosure,
+		AgentRuntime:     agentRuntime,
 		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
@@ -723,16 +728,11 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Scope:                   cfg.Reviewer.Scope,
 		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
 		Disclosure:              &cfg.Disclosure,
-		AgentRuntime: func() string {
-			if cfg.Agent.Vendor == nil {
-				return ""
-			}
-			return string(*cfg.Agent.Vendor)
-		}(),
-		LooperCLIPath:    derefString(cfg.Tools.LooperPath),
-		AgentModel:       cfg.Agent.Model,
-		RetryBaseDelay:   retryBaseDelay,
-		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		AgentRuntime:            agentRuntime,
+		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
+		AgentModel:              cfg.Agent.Model,
+		RetryBaseDelay:          retryBaseDelay,
+		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
@@ -750,6 +750,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 		Disclosure:         &cfg.Disclosure,
+		AgentRuntime:       agentRuntime,
 		AgentModel:         cfg.Agent.Model,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
@@ -772,6 +773,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
 		OpenPRStrategy:   cfg.Defaults.OpenPRStrategy,
 		Disclosure:       &cfg.Disclosure,
+		AgentRuntime:     agentRuntime,
 		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
