@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -159,6 +160,23 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Reviewer.PublishMode != ReviewerPublishModeSingleReview {
 		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
+	if config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventApprove {
+		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
+	}
+	if config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.blocking", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventRequestChanges)})
+	}
+
+	validateInstructions(config, &issues)
+	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
+	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
+	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
+	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	if config.Roles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) == "" {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+	} else if config.Roles.Reviewer.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
+	}
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	for index, project := range config.Projects {
@@ -182,6 +200,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
+		}
+		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
+			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
+		}
+
+		for role, text := range project.Instructions {
+			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
+			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
+			validateAggregateInstructionBytes(path, roleInstructionText(config.Roles, role), text, config.Instructions.MaxBytes, &issues)
 		}
 	}
 
@@ -209,6 +236,87 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateInstructions(config Config, issues *[]ValidationIssue) {
+	if config.Instructions.MaxBytes < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "instructions.maxBytes", Message: "must be a positive integer"})
+	}
+	for _, roleInstruction := range roleInstructions(config.Roles) {
+		validateInstructionText("roles."+roleInstruction.role+".instructions", roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, issues)
+		validateAggregateInstructionBytes("roles."+roleInstruction.role+".instructions", roleInstruction.text, "", config.Instructions.MaxBytes, issues)
+	}
+}
+
+type roleInstruction struct {
+	role string
+	text string
+}
+
+func roleInstructions(roles RoleConfigs) []roleInstruction {
+	return []roleInstruction{
+		{role: "planner", text: roles.Planner.Instructions},
+		{role: "worker", text: roles.Worker.Instructions},
+		{role: "reviewer", text: roles.Reviewer.Instructions},
+		{role: "fixer", text: roles.Fixer.Instructions},
+	}
+}
+
+func roleInstructionText(roles RoleConfigs, role string) string {
+	switch role {
+	case "planner":
+		return roles.Planner.Instructions
+	case "worker":
+		return roles.Worker.Instructions
+	case "reviewer":
+		return roles.Reviewer.Instructions
+	case "fixer":
+		return roles.Fixer.Instructions
+	default:
+		return ""
+	}
+}
+
+func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
+	if !isValidInstructionRole(role) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
+	}
+	if maxBytes > 0 && len([]byte(text)) > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
+	}
+	if protected := protectedInstructionPhrase(text); protected != "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must not attempt to override protected Looper contract %q", protected)})
+	}
+}
+
+func validateAggregateInstructionBytes(path, globalText, projectText string, maxBytes int, issues *[]ValidationIssue) {
+	if maxBytes <= 0 {
+		return
+	}
+	bytes := len([]byte(strings.TrimSpace(globalText))) + len([]byte(strings.TrimSpace(projectText)))
+	if bytes > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("combined custom instructions for this role must be at most %d bytes", maxBytes)})
+	}
+}
+
+func isValidInstructionRole(role string) bool {
+	switch role {
+	case "planner", "worker", "reviewer", "fixer":
+		return true
+	default:
+		return false
+	}
+}
+
+func protectedInstructionPhrase(text string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	protected := []string{"systemprompt", "system prompt", "__looper_result__", "completion marker", "git_pr_lifecycle", "summary field", "commits field", "result json", "allowautopush", "allowautoapprove", "allow auto push", "allow auto approve", "auto approve", "auto push", "pr creation policy", "review submission policy", "looper review submit", "review submit wrapper", "gh pr review", "disclosure stamping", "auth requirement", "permission boundary", "state transition", "state machine", "ignore lifecycle", "override lifecycle", "custom completion"}
+	for _, phrase := range protected {
+		if strings.Contains(normalized, phrase) {
+			return phrase
+		}
+	}
+	return ""
 }
 
 type writablePathKind string
@@ -347,6 +455,62 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isValidLabelMode(mode LabelMode) bool {
+	switch mode {
+	case LabelModeAll, LabelModeAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
+	switch filter {
+	case FixerAuthorFilterCurrentUser, FixerAuthorFilterAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateReviewerRoleTriggers(triggers ReviewerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+}
+
+func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, issues *[]ValidationIssue) {
+	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
+	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateLabelTriggers(labels []string, mode LabelMode, path string, issues *[]ValidationIssue) {
+	if !isValidLabelMode(mode) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".labelMode", Message: fmt.Sprintf("must be one of: %s, %s", LabelModeAll, LabelModeAny)})
+	}
+	seen := map[string]struct{}{}
+	for index, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must be a non-empty string"})
+			continue
+		}
+		if label != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.labels[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
+			continue
+		}
+		if _, ok := seen[label]; ok {
+			*issues = append(*issues, ValidationIssue{Path: path + ".labels", Message: fmt.Sprintf("contains duplicate label: %s", label)})
+			continue
+		}
+		seen[label] = struct{}{}
 	}
 }
 

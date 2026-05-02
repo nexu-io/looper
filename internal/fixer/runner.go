@@ -77,6 +77,7 @@ type PullRequestSummary struct {
 	Number  int64
 	State   string
 	IsDraft bool
+	Labels  []string
 	HeadSHA string
 	Author  string
 }
@@ -102,6 +103,8 @@ type ListOpenPullRequestsInput struct {
 	CWD    string
 	Limit  int
 	Author string
+	Label  string
+	Labels []string
 }
 
 type ViewPullRequestInput struct {
@@ -276,13 +279,23 @@ type Options struct {
 	AllowAutoPush           bool
 	AllowRiskyFixes         bool
 	FixAllPullRequests      bool
+	DiscoveryPolicy         DiscoveryPolicy
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
+	CustomInstructions      *config.Config
 	AgentModel              *string
 	Sleep                   func(time.Duration)
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+}
+
+type DiscoveryPolicy struct {
+	AutoDiscovery bool
+	IncludeDrafts bool
+	AuthorFilter  config.FixerAuthorFilter
+	Labels        []string
+	LabelMode     config.LabelMode
 }
 
 type Runner struct {
@@ -301,8 +314,10 @@ type Runner struct {
 	allowAutoPush           bool
 	allowRiskyFixes         bool
 	fixAllPullRequests      bool
+	discoveryPolicy         DiscoveryPolicy
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
+	customInstructions      config.Config
 	agentModel              string
 	sleep                   func(time.Duration)
 	retryBaseDelay          time.Duration
@@ -482,6 +497,13 @@ func New(options Options) *Runner {
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
 	}
+	policy := options.DiscoveryPolicy
+	if policy.AuthorFilter == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{}, LabelMode: config.LabelModeAll}
+		if options.FixAllPullRequests {
+			policy.AuthorFilter = config.FixerAuthorFilterAny
+		}
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -498,8 +520,10 @@ func New(options Options) *Runner {
 		allowAutoPush:           options.AllowAutoPush,
 		allowRiskyFixes:         options.AllowRiskyFixes,
 		fixAllPullRequests:      options.FixAllPullRequests,
+		discoveryPolicy:         policy,
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
+		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		sleep:                   sleep,
 		retryBaseDelay:          retryBaseDelay,
@@ -520,24 +544,28 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	currentUser := ""
-	if !r.fixAllPullRequests {
+	if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Author: currentUser})
+	openPRs, err := r.listOpenPullRequestsForDiscovery(ctx, input.Repo, project.RepoPath, input.Limit, currentUser)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
+		if (!r.discoveryPolicy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
 			result.Skipped++
 			continue
 		}
-		if !r.fixAllPullRequests && !sameGitHubLogin(pr.Author, currentUser) {
+		if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
+			result.Skipped++
+			continue
+		}
+		if !labelsMatch(pr.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
 			result.Skipped++
 			continue
 		}
@@ -579,6 +607,50 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		result.QueueItems = append(result.QueueItems, queueItem)
 	}
 	return result, nil
+}
+
+func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
+	labels := prQueryLabels(r.discoveryPolicy.Labels)
+	effectiveLimit := defaultDiscoveryLimit(limit)
+	if len(labels) == 0 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author})
+	}
+	if len(labels) == 1 {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: labels[0]})
+	}
+	if r.discoveryPolicy.LabelMode == config.LabelModeAll {
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Labels: labels})
+	}
+
+	result := []PullRequestSummary{}
+	seen := map[int64]struct{}{}
+	for _, label := range labels {
+		if len(result) >= effectiveLimit {
+			break
+		}
+		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: effectiveLimit, Author: author, Label: label})
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range prs {
+			if _, ok := seen[pr.Number]; ok {
+				continue
+			}
+			seen[pr.Number] = struct{}{}
+			result = append(result, pr)
+			if len(result) >= effectiveLimit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func defaultDiscoveryLimit(limit int) int {
+	if limit <= 0 {
+		return 30
+	}
+	return limit
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -899,7 +971,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 }
 
 func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, cwd, repo string, prNumber int64) (string, error) {
-	if r.fixAllPullRequests {
+	if r.discoveryPolicy.AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
 	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
@@ -943,7 +1015,7 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
 	}
-	if checkpoint.Detail.IsDraft || normalizePRState(checkpoint.Detail.State) != "open" {
+	if (!r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
@@ -1032,7 +1104,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildFixerPrompt(input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
+	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
+	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
+		metadata[key] = value
+	}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1898,7 +1975,7 @@ func hashFixItems(items []FixItem) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber)}
 	if headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
@@ -1912,6 +1989,10 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
 	)
+	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "fixer")
+	if instructionBlock.Text != "" {
+		parts = append(parts, instructionBlock.Text)
+	}
 	if allowAutoPush {
 		parts = append(parts, "Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.")
 		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentRuntime, agentModel))
@@ -1919,7 +2000,16 @@ func buildFixerPrompt(repo string, prNumber int64, headSHA string, fixItems []Fi
 		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+}
+
+func customInstructionConfig(value *config.Config) config.Config {
+	if value == nil {
+		cfg, _ := config.Normalize("")
+		cfg.Instructions.Enabled = false
+		return cfg
+	}
+	return *value
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
@@ -2059,6 +2149,44 @@ func sameGitHubLogin(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)
 	return left != "" && right != "" && strings.EqualFold(left, right)
+}
+
+func prQueryLabels(labels []string) []string {
+	result := []string{}
+	seen := map[string]struct{}{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, label)
+	}
+	return result
+}
+
+func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range required {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range required {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSpecReviewClean(detail PullRequestDetail) bool {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveLooperdTarget(t *testing.T) {
@@ -116,6 +117,14 @@ func TestInstallManagedDaemonSkipsExistingBinary(t *testing.T) {
 		HomeDir:  homeDir,
 		Platform: "darwin",
 		Arch:     "arm64",
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == installPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.2.3\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
 	})
 
 	runtime := newCommandRuntime(app, nil)
@@ -131,6 +140,68 @@ func TestInstallManagedDaemonSkipsExistingBinary(t *testing.T) {
 	}
 	if result.Target != "darwin-arm64" {
 		t.Fatalf("result.Target = %q, want %q", result.Target, "darwin-arm64")
+	}
+}
+
+func TestInstallManagedDaemonReportsNonExecutableExistingBinary(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	installPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(installPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(installPath, []byte("existing"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	app := New(Deps{HomeDir: homeDir, Platform: "darwin", Arch: "arm64"})
+	runtime := newCommandRuntime(app, nil)
+	_, err := runtime.installManagedDaemon(context.Background(), false, "", nil)
+	if err == nil {
+		t.Fatalf("installManagedDaemon() error = nil, want permission error")
+	}
+	for _, want := range []string{"not executable", "chmod +x " + installPath, "looper daemon install --force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want to contain %q", err.Error(), want)
+		}
+	}
+}
+
+func TestInstallManagedDaemonReportsInvalidExistingBinary(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	installPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(installPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(installPath, []byte("corrupt"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	app := New(Deps{
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		Arch:     "arm64",
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == installPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "exec format error"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+	runtime := newCommandRuntime(app, nil)
+	_, err := runtime.installManagedDaemon(context.Background(), false, "", nil)
+	if err == nil {
+		t.Fatalf("installManagedDaemon() error = nil, want invalid binary error")
+	}
+	for _, want := range []string{"version check failed", "exec format error", "looper daemon install --force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want to contain %q", err.Error(), want)
+		}
 	}
 }
 
