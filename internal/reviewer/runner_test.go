@@ -603,6 +603,30 @@ func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *tes
 	}
 }
 
+func TestRunFilterStepAllowsReviewWhenOnlyCurrentHeadReviewIsUnsubmitted(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []string{"PENDING", "DISMISSED"} {
+		t.Run(state, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLogin: "octocat"}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+			repo := "acme/looper"
+			prNumber := int64(42)
+			reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": state, "commit": map[string]any{"oid": "abc123"}}}
+
+			checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+			if err != nil {
+				t.Fatalf("runFilterStep() error = %v", err)
+			}
+			if checkpoint.SkipReason != "" {
+				t.Fatalf("SkipReason = %q, want no skip for %s review", checkpoint.SkipReason, state)
+			}
+		})
+	}
+}
+
 func TestRunFilterStepAllowsReviewAfterHeadChanges(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

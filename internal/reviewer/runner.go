@@ -2474,6 +2474,10 @@ func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA st
 		if authorLogin, ok := stringFromAny(author["login"]); !ok || normalizeLogin(authorLogin) != login {
 			continue
 		}
+		state, _ := stringFromAny(review["state"])
+		if !isSubmittedReviewState(state) {
+			continue
+		}
 		commit, ok := review["commit"].(map[string]any)
 		if !ok {
 			continue
@@ -2483,6 +2487,15 @@ func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA st
 		}
 	}
 	return false
+}
+
+func isSubmittedReviewState(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED", "CHANGES_REQUESTED", "COMMENTED":
+		return true
+	default:
+		return false
+	}
 }
 
 func rediscoverySignalFromAgentResult(result AgentResult, allowReviewRequestSignal bool) (string, bool) {
