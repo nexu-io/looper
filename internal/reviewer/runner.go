@@ -2535,14 +2535,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
-	approveInstruction := "Submit clean reviews as COMMENT."
+	cleanNoopInstruction := "For no-actionable-finding results, do not submit a clean COMMENT or APPROVE review; add only the non-comment clean signal and finish successfully."
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
-	specLabelInstruction := "Do not transition spec-review labels when clean reviews are submitted as COMMENT."
+	specLabelInstruction := "Do not transition spec-review labels for reaction-only no-actionable-finding results."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove {
-		approveInstruction = "If the review is clean, submit an APPROVE review."
-		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT, non-blocking, or blocking finding reviews."
+		specLabelInstruction = "Do not transition spec-review labels for reaction-only no-actionable-finding results; only preserve an existing approved-review spec-ready transition when the idempotency check finds a prior matching APPROVED clean review."
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
@@ -2568,14 +2567,14 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		githubOperationContract,
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
 		reviewRequestInstruction,
-		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
+		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete actionable prose yet, exit non-zero instead of posting logs; never use an LGTM or other clean body as a fallback.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
 		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations. Use ANCHORABLE DIFF LOCATIONS as a summary of known ranges, but if that summary is truncated, the full PR diff remains authoritative. Preserve exact anchors that fit the full diff. If an otherwise useful comment is outside the full diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For non-blocking or blocking finding reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
-		approveInstruction,
+		cleanNoopInstruction,
 		blockingInstruction,
 		"Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not submit a PR review or PR comment; add the +1 reaction only and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback.",
 		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
