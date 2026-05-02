@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -881,10 +882,11 @@ func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, git
 	if githubGateway == nil {
 		return false
 	}
-	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, githubAuthHostname(repo))
+	hostname := githubAuthHostname(repo)
+	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, hostname)
 	if err != nil {
 		if logger != nil {
-			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error(), "repo": repo, "hostname": githubAuthHostname(repo)})
+			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error(), "repo": repo, "hostname": hostname})
 		}
 		return false
 	}
@@ -896,6 +898,15 @@ func githubAuthHostname(repo string) string {
 	repo = strings.TrimSpace(repo)
 	if repo == "" {
 		return defaultHost
+	}
+	if parsed, err := url.Parse(repo); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	if at := strings.Index(repo, "@"); at >= 0 {
+		repo = repo[at+1:]
+	}
+	if colon := strings.Index(repo, ":"); colon > 0 {
+		return strings.TrimSpace(repo[:colon])
 	}
 	parts := strings.Split(repo, "/")
 	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
