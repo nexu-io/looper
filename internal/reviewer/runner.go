@@ -103,9 +103,11 @@ type PullRequestDetail struct {
 	BaseRefName    string
 	Author         string
 	ReviewRequests []string
+	HasConflicts   bool
 	ChecksSummary  string
 	Diff           string
 	Comments       []map[string]any
+	Reviews        []map[string]any
 }
 
 type CreateWorktreeInput struct {
@@ -408,17 +410,19 @@ type reviewerCheckpoint struct {
 }
 
 type checkpointDetail struct {
-	Title          string   `json:"title,omitempty"`
-	State          string   `json:"state,omitempty"`
-	IsDraft        bool     `json:"isDraft,omitempty"`
-	ReviewDecision string   `json:"reviewDecision,omitempty"`
-	Labels         []string `json:"labels,omitempty"`
-	HeadSHA        string   `json:"headSha,omitempty"`
-	BaseSHA        string   `json:"baseSha,omitempty"`
-	HeadRefName    string   `json:"headRefName,omitempty"`
-	BaseRefName    string   `json:"baseRefName,omitempty"`
-	Author         string   `json:"author,omitempty"`
-	ReviewRequests []string `json:"reviewRequests,omitempty"`
+	Title          string           `json:"title,omitempty"`
+	State          string           `json:"state,omitempty"`
+	IsDraft        bool             `json:"isDraft,omitempty"`
+	ReviewDecision string           `json:"reviewDecision,omitempty"`
+	Labels         []string         `json:"labels,omitempty"`
+	HeadSHA        string           `json:"headSha,omitempty"`
+	BaseSHA        string           `json:"baseSha,omitempty"`
+	HeadRefName    string           `json:"headRefName,omitempty"`
+	BaseRefName    string           `json:"baseRefName,omitempty"`
+	Author         string           `json:"author,omitempty"`
+	ReviewRequests []string         `json:"reviewRequests,omitempty"`
+	HasConflicts   bool             `json:"hasConflicts,omitempty"`
+	Reviews        []map[string]any `json:"reviews,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -1101,7 +1105,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Reviews: cloneObjectSlice(detail.Reviews)}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -1121,6 +1125,20 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, err
 		}
 		return checkpoint, nil
+	}
+	if checkpoint.Detail.HasConflicts {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
+		return checkpoint, nil
+	}
+	if len(checkpoint.Detail.Reviews) > 0 {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		if hasReviewByAuthor(checkpoint.Detail.Reviews, currentLogin) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed it", input.Repo, input.PRNumber)
+			return checkpoint, nil
+		}
 	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
@@ -2442,6 +2460,23 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 	return "", false
 }
 
+func hasReviewByAuthor(reviews []map[string]any, login string) bool {
+	login = normalizeLogin(login)
+	if login == "" {
+		return false
+	}
+	for _, review := range reviews {
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if authorLogin, ok := stringFromAny(author["login"]); ok && normalizeLogin(authorLogin) == login {
+			return true
+		}
+	}
+	return false
+}
+
 func rediscoverySignalFromAgentResult(result AgentResult) (string, bool) {
 	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
 		switch {
@@ -3187,13 +3222,19 @@ func cloneStrings(values []string) []string {
 	return append([]string(nil), values...)
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
+func cloneObjectSlice(values []map[string]any) []map[string]any {
+	if values == nil {
+		return nil
 	}
-	return ""
+	cloned := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		clonedValue := make(map[string]any, len(value))
+		for key, inner := range value {
+			clonedValue[key] = inner
+		}
+		cloned = append(cloned, clonedValue)
+	}
+	return cloned
 }
 
 func mustMarshalJSON(value any) string {
@@ -3210,6 +3251,15 @@ func stringFromAny(value any) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func optionalString(value string) *string {
