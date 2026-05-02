@@ -2500,11 +2500,14 @@ func isSubmittedReviewState(state string) bool {
 
 func rediscoverySignalFromAgentResult(result AgentResult, allowReviewRequestSignal bool) (string, bool) {
 	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
-		switch {
-		case strings.Contains(candidate, "PR head changed before publish"):
-			return candidate, true
-		case allowReviewRequestSignal && strings.Contains(candidate, "review request removed before publish"):
-			return candidate, true
+		for _, line := range strings.Split(candidate, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case line == "PR head changed before publish" || strings.HasPrefix(line, "PR head changed before publish:"):
+				return line, true
+			case allowReviewRequestSignal && line == "review request removed before publish":
+				return line, true
+			}
 		}
 	}
 	return "", false
