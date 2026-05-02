@@ -118,8 +118,8 @@ func DefaultConfig(cwd string) (Config, error) {
 		Reviewer: ReviewerConfig{
 			Loop: ReviewerLoopConfig{
 				EnabledByDefault:          true,
-				QuietPeriodSeconds:        900,
-				MinPublishIntervalSeconds: 1800,
+				QuietPeriodSeconds:        60,
+				MinPublishIntervalSeconds: 300,
 				MaxIterationsPerPR:        20,
 				MaxIterationsPerHead:      1,
 				MaxWallClockSeconds:       14400,
