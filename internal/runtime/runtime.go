@@ -689,7 +689,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, int64(r.config.Reviewer.Loop.MaxConsecutiveFailures)) {
+		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, runtimeReviewerRecoveryPolicy{
+			includeDrafts:          r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			stopOnApproved:         r.config.Reviewer.Loop.StopOnApproved,
+			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
+			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
+		}) {
 			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
 			if err != nil {
 				return RecoverySummary{}, err
@@ -1268,7 +1273,14 @@ type runtimeReviewerCheckpoint struct {
 	} `json:"detail,omitempty"`
 }
 
-func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, maxConsecutiveFailures int64) bool {
+type runtimeReviewerRecoveryPolicy struct {
+	includeDrafts          bool
+	stopOnApproved         bool
+	stopOnReadyLabel       bool
+	maxConsecutiveFailures int64
+}
+
+func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, policy runtimeReviewerRecoveryPolicy) bool {
 	if loop.Type != string(domain.LoopTypeReviewer) || loop.Status != "failed" || latestRun == nil || latestRun.Status != "failed" || latestQueue == nil || latestQueue.Status != "failed" {
 		return false
 	}
@@ -1283,7 +1295,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" {
 		return false
 	}
-	if maxConsecutiveFailures > 0 && int64(runtimeIntFromAny(loopMeta["consecutiveFailures"])) >= maxConsecutiveFailures {
+	if policy.maxConsecutiveFailures > 0 && int64(runtimeIntFromAny(loopMeta["consecutiveFailures"])) >= policy.maxConsecutiveFailures {
 		return false
 	}
 	if runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
@@ -1304,10 +1316,13 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if strings.ToLower(strings.TrimSpace(checkpoint.Detail.State)) != "open" {
 		return false
 	}
-	if checkpoint.Detail.IsDraft {
+	if !policy.includeDrafts && checkpoint.Detail.IsDraft {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") || specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+	if policy.stopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+		return false
+	}
+	if policy.stopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)

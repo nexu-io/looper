@@ -2278,10 +2278,10 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
 		return false, "", "draft_pr", nil
 	}
-	if strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "APPROVED") {
+	if r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "APPROVED") {
 		return false, "", "approved", nil
 	}
-	if specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
+	if r.loopConfig.StopOnReadyLabel && specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
 		return false, "", "ready_label", nil
 	}
 	meta := parseJSONObject(loop.MetadataJSON)

@@ -1428,6 +1428,7 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 	baseLoop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"consecutiveFailures":1}}`)}
 	baseRun := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}
 	baseQueue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
+	defaultPolicy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3}
 
 	tests := []struct {
 		name  string
@@ -1506,8 +1507,40 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if shouldAutoRecoverFailedReviewerLoop(tt.loop, &tt.run, &tt.queue, 3) {
+			if shouldAutoRecoverFailedReviewerLoop(tt.loop, &tt.run, &tt.queue, defaultPolicy) {
 				t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false")
+			}
+		})
+	}
+}
+
+func TestShouldAutoRecoverFailedReviewerLoopHonorsRecoveryPolicy(t *testing.T) {
+	t.Parallel()
+	errorKind := "retryable_after_resume"
+	errorMessage := "PR head changed before publish: expected old, got new"
+	step := "publish"
+	checkpoint := func(detail string) *string {
+		value := `{"resumePolicy":"restart_from_discover",` + detail + `}`
+		return &value
+	}
+	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
+	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
+	policy := runtimeReviewerRecoveryPolicy{includeDrafts: true, stopOnApproved: false, stopOnReadyLabel: false, maxConsecutiveFailures: 3}
+
+	tests := []struct {
+		name string
+		run  storage.RunRecord
+	}{
+		{name: "draft checkpoint", run: storage.RunRecord{ID: "run_recover_draft", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","isDraft":true,"reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
+		{name: "approved checkpoint", run: storage.RunRecord{ID: "run_recover_approved", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
+		{name: "ready label checkpoint", run: storage.RunRecord{ID: "run_recover_ready", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if !shouldAutoRecoverFailedReviewerLoop(loop, &tt.run, &queue, policy) {
+				t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
 			}
 		})
 	}
