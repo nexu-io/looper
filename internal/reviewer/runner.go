@@ -3145,9 +3145,9 @@ func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRun
 	stamper := disclosure.Stamper{Config: disclosureCfg, Version: version.Current().Version, Agent: agentRuntime, Model: agentModel}
 	reviewBodyInstruction := "Every GitHub review body you post must use looper's configured disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
 	if disclosureCfg.Channels.InlineCommentVisible {
-		return reviewBodyInstruction + " Do not add looper disclosure footers or hidden looper stamp markers to inline review comments."
+		return reviewBodyInstruction + " Every inline review comment you post must also use looper's configured visible inline disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
 	}
-	return reviewBodyInstruction + " Do not add looper disclosure footers or hidden looper stamp markers to inline review comments."
+	return reviewBodyInstruction + " Every inline review comment you post must include only the hidden looper stamp marker `" + disclosure.Marker + "` as its disclosure. Do not add visible looper disclosure footers to inline review comments."
 }
 
 func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
