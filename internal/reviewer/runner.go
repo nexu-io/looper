@@ -1682,6 +1682,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
+		if reason, ok := rediscoverySignalFromAgentResult(result); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
+		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
@@ -2430,6 +2438,18 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 	}
 	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	}
+	return "", false
+}
+
+func rediscoverySignalFromAgentResult(result AgentResult) (string, bool) {
+	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
+		switch {
+		case strings.Contains(candidate, "PR head changed before publish"):
+			return candidate, true
+		case strings.Contains(candidate, "review request removed before publish"):
+			return candidate, true
+		}
 	}
 	return "", false
 }
