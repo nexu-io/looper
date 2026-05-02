@@ -19,6 +19,7 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:        cwd,
 		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
 		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
@@ -50,6 +51,101 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
+		t.Fatalf("planner role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Reviewer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || !got.Triggers.RequireReviewRequest || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 || !got.SpecReview.IncludeReviewingLabel || got.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+		t.Fatalf("reviewer role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
+		t.Fatalf("fixer role defaults = %#v", got)
+	}
+	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
+		t.Fatalf("worker role defaults = %#v", got)
+	}
+}
+
+func TestLegacyFixAllPullRequestsMapsToFixerAuthorFilter(t *testing.T) {
+	trueValue := true
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Defaults: &PartialDefaultsConfig{FixAllPullRequests: &trueValue}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if cfg.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny {
+		t.Fatalf("fixer authorFilter = %q, want %q", cfg.Roles.Fixer.Triggers.AuthorFilter, FixerAuthorFilterAny)
+	}
+
+	currentUser := FixerAuthorFilterCurrentUser
+	cfg, err = Normalize(t.TempDir(), PartialConfig{Defaults: &PartialDefaultsConfig{FixAllPullRequests: &trueValue}, Roles: &PartialRoleConfigs{Fixer: &PartialFixerRoleConfig{Triggers: &PartialFixerRoleTriggersConfig{AuthorFilter: &currentUser}}}})
+	if err != nil {
+		t.Fatalf("Normalize() with explicit role error = %v", err)
+	}
+	if cfg.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser {
+		t.Fatalf("explicit fixer authorFilter = %q, want %q", cfg.Roles.Fixer.Triggers.AuthorFilter, FixerAuthorFilterCurrentUser)
+	}
+}
+
+func TestRoleEnvironmentOverrides(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_OSASCRIPT_ENABLED":                                    "false",
+			"LOOPER_ROLES_PLANNER_AUTO_DISCOVERY":                         "false",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_LABELS":                        "needs-plan,team:alpha",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE":                    "any",
+			"LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER": "false",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS":               "true",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST":       "false",
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS":                       "needs-review,spec",
+			"LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL":   "false",
+			"LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER":                   "any",
+			"LOOPER_ROLES_FIXER_TRIGGERS_LABELS":                          "bugfix",
+		}),
+		LookPath: fakeLookPath(map[string]string{}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if loaded.Config.Roles.Planner.AutoDiscovery {
+		t.Fatal("planner autoDiscovery = true, want false")
+	}
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Planner.Triggers.Labels, []string{"needs-plan", "team:alpha"}) {
+		t.Fatalf("planner labels = %#v", loaded.Config.Roles.Planner.Triggers.Labels)
+	}
+	if loaded.Config.Roles.Planner.Triggers.LabelMode != LabelModeAny || loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("planner triggers = %#v", loaded.Config.Roles.Planner.Triggers)
+	}
+	if !loaded.Config.Roles.Reviewer.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Triggers.RequireReviewRequest {
+		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Triggers)
+	}
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.SpecReview.IncludeReviewingLabel {
+		t.Fatalf("reviewer config = %#v", loaded.Config.Roles.Reviewer)
+	}
+	if loaded.Config.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(loaded.Config.Roles.Fixer.Triggers.Labels, []string{"bugfix"}) {
+		t.Fatalf("fixer config = %#v", loaded.Config.Roles.Fixer)
+	}
+}
+
+func reflectStringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 	cwd := t.TempDir()
 	relativePath := filepath.Join("configs", "looper.json")
@@ -66,7 +162,7 @@ func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath})
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: relativePath, LookupEnv: emptyEnvLookup})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -99,13 +195,99 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath})
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
 	if err == nil {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
 
 	if !strings.Contains(err.Error(), "failed to read config file at "+configPath) {
 		t.Fatalf("LoadFile() error = %q, want path context", err)
+	}
+}
+
+func TestLoadFileSupportsCustomInstructions(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"roles": {"planner": {"instructions": "Keep specs scoped."}},
+		"projects": [{"id": "demo", "name": "Demo", "path": "/repos/demo", "instructions": {"planner": "Respect local config precedence."}}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got := loaded.Config.Roles.Planner.Instructions; got != "Keep specs scoped." {
+		t.Fatalf("planner instructions = %q", got)
+	}
+	if got := loaded.Config.Projects[0].RepoPath; got != "/repos/demo" {
+		t.Fatalf("project repo path = %q", got)
+	}
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
+	if !strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
+		t.Fatalf("custom block missing instructions: %s", block.Text)
+	}
+}
+
+func TestValidateRejectsOversizedAndProtectedInstructions(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
+		Roles: &PartialRoleConfigs{
+			Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("this is too long")},
+			Fixer:  &PartialFixerRoleConfig{Instructions: stringPtr("Change the __LOOPER_RESULT__ completion marker")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want validation error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "config validation failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNoCustomInstructionsCLIOverrideDisablesInstructions(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"roles": {"worker": {"instructions": "Prefer minimal changes."}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, Args: []string{"--no-custom-instructions"}, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if loaded.Config.Instructions.Enabled {
+		t.Fatal("instructions enabled = true, want false")
+	}
+	if block := BuildCustomInstructionBlock(loaded.Config, "", "worker"); block.Text != "" {
+		t.Fatalf("disabled custom instruction block = %q", block.Text)
+	}
+}
+
+func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"instructions": {"enabled": false}, "roles": {"worker": {"instructions": "Prefer minimal changes."}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, Args: []string{"--no-custom-instructions", "false"}, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Instructions.Enabled {
+		t.Fatal("instructions enabled = false, want true")
+	}
+	if block := BuildCustomInstructionBlock(loaded.Config, "", "worker"); !strings.Contains(block.Text, "Prefer minimal changes.") {
+		t.Fatalf("enabled custom instruction block = %q", block.Text)
 	}
 }
 
@@ -361,7 +543,7 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
 func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
-	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"loop":{"enabledByDefault":false,"quietPeriodSeconds":30,"maxIterationsPerPR":7,"maxIterationsPerHead":2}}}`), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"loop":{"enabledByDefault":false,"quietPeriodSeconds":30,"minPublishIntervalSeconds":900,"maxIterationsPerPR":7,"maxIterationsPerHead":2}}}`), 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
@@ -373,16 +555,78 @@ func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 			"--reviewer-max-iterations-per-pr", "11",
 		},
 		LookupEnv: mapEnvLookup(map[string]string{
-			"LOOPER_REVIEWER_QUIET_PERIOD_SECONDS":    "45",
-			"LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD": "3",
+			"LOOPER_REVIEWER_QUIET_PERIOD_SECONDS":         "45",
+			"LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS": "1200",
+			"LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD":      "3",
 		}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 	loop := loaded.Config.Reviewer.Loop
-	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
+	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MinPublishIntervalSeconds != 1200 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
 		t.Fatalf("reviewer loop config = %#v, want cli/env/file precedence applied", loop)
+	}
+}
+
+func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"reviewEvents":{"clean":"COMMENT","blocking":"COMMENT"}}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD: cwd,
+		Args: []string{
+			"--config", configPath,
+			"--reviewer-blocking-review-event", "REQUEST_CHANGES",
+		},
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN": "APPROVE",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got := loaded.Config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := loaded.Config.Reviewer.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+		t.Fatalf("blocking review event = %q, want %q", got, ReviewerReviewEventRequestChanges)
+	}
+}
+
+func TestNormalizeAllowAutoApproveLegacyAliasRespectsExplicitReviewerCleanEvent(t *testing.T) {
+	trueValue := true
+	comment := ReviewerReviewEventComment
+	config, err := Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, Reviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
+	if err != nil {
+		t.Fatalf("Normalize(explicit) error = %v", err)
+	}
+	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("explicit clean review event = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Reviewer.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
+	cfg.Reviewer.ReviewEvents.Blocking = ReviewerReviewEventApprove
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "config validation failed") {
+		t.Fatalf("ValidateWithOptions() error = %v, want validation failure", err)
 	}
 }
 
@@ -452,7 +696,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 		"logging": {"level": "verbose", "maxFiles": 0},
 		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
-		"reviewer": {"loop": {"quietPeriodSeconds": -1, "maxIterationsPerPR": 0}, "scope": "wide", "publishMode": "stream"},
+		"reviewer": {"loop": {"quietPeriodSeconds": -1, "minPublishIntervalSeconds": -1, "maxIterationsPerPR": 0}, "scope": "wide", "publishMode": "stream"},
 		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
 		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
 	}`
@@ -480,6 +724,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
 	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "reviewer.loop.minPublishIntervalSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.loop.maxIterationsPerPR", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
 	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")

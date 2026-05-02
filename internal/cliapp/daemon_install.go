@@ -83,10 +83,12 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 	installDir := filepath.Join(homeDir, ".looper", "bin")
 	installPath := filepath.Join(installDir, looperdBinaryName)
 	if !force {
-		if _, err := os.Stat(installPath); err == nil {
+		state, err := r.checkManagedDaemonBinary(ctx)
+		if err != nil {
+			return daemonInstallResult{}, err
+		}
+		if state.Exists {
 			return daemonInstallResult{Target: target, InstallPath: installPath, Skipped: true}, nil
-		} else if !os.IsNotExist(err) {
-			return daemonInstallResult{}, fmt.Errorf("check existing install: %w", err)
 		}
 	}
 

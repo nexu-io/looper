@@ -48,7 +48,10 @@
         "inApp": false,
         "osascript": {
           "enabled": false,
-          "soundForLevels": ["action_required", "failure"],
+          "soundForLevels": [
+            "action_required",
+            "failure"
+          ],
           "throttleWindowSeconds": 60
         }
       },
@@ -67,6 +70,7 @@
       "tools": {
         "gitPath": "/envonly/git",
         "ghPath": "/envonly/gh",
+        "looperPath": "/detected/looper",
         "osascriptPath": "/envonly/osascript"
       },
       "daemon": {
@@ -94,7 +98,8 @@
       "reviewer": {
         "loop": {
           "enabledByDefault": true,
-          "quietPeriodSeconds": 120,
+          "quietPeriodSeconds": 900,
+          "minPublishIntervalSeconds": 1800,
           "maxIterationsPerPR": 20,
           "maxIterationsPerHead": 1,
           "maxWallClockSeconds": 14400,
@@ -106,7 +111,59 @@
         },
         "scope": "changed_ranges",
         "publishMode": "single_review",
+        "reviewEvents": {
+          "clean": "APPROVE",
+          "blocking": "COMMENT"
+        },
         "detectDuplicateFindings": true
+      },
+      "instructions": {
+        "enabled": true,
+        "maxBytes": 8192
+      },
+      "roles": {
+        "planner": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:plan"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        },
+        "reviewer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "requireReviewRequest": true,
+            "labels": [],
+            "labelMode": "all"
+          },
+          "specReview": {
+            "includeReviewingLabel": true,
+            "reviewingLabel": "looper:spec-reviewing"
+          }
+        },
+        "fixer": {
+          "autoDiscovery": true,
+          "triggers": {
+            "includeDrafts": false,
+            "labels": [],
+            "labelMode": "all",
+            "authorFilter": "current_user"
+          }
+        },
+        "worker": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:worker-ready"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": true
+          }
+        }
       },
       "projects": []
     },
@@ -116,6 +173,7 @@
       "toolDetection": {
         "gitPath": "configured",
         "ghPath": "configured",
+        "looperPath": "detected",
         "osascriptPath": "configured"
       }
     }

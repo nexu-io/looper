@@ -117,20 +117,63 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Reviewer: ReviewerConfig{
 			Loop: ReviewerLoopConfig{
-				EnabledByDefault:        true,
-				QuietPeriodSeconds:      120,
-				MaxIterationsPerPR:      20,
-				MaxIterationsPerHead:    1,
-				MaxWallClockSeconds:     14400,
-				MaxConsecutiveFailures:  3,
-				MaxAgentExecutionsPerPR: 25,
-				StopOnApproved:          true,
-				StopOnReadyLabel:        true,
-				StopOnIdenticalOutput:   true,
+				EnabledByDefault:          true,
+				QuietPeriodSeconds:        900,
+				MinPublishIntervalSeconds: 1800,
+				MaxIterationsPerPR:        20,
+				MaxIterationsPerHead:      1,
+				MaxWallClockSeconds:       14400,
+				MaxConsecutiveFailures:    3,
+				MaxAgentExecutionsPerPR:   25,
+				StopOnApproved:            true,
+				StopOnReadyLabel:          true,
+				StopOnIdenticalOutput:     true,
 			},
 			Scope:                   ReviewerScopeChangedRanges,
 			PublishMode:             ReviewerPublishModeSingleReview,
+			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
 			DetectDuplicateFindings: true,
+		},
+		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
+		Roles: RoleConfigs{
+			Planner: PlannerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: IssueRoleTriggersConfig{
+					Labels:                     []string{"looper:plan"},
+					LabelMode:                  LabelModeAll,
+					RequireAssigneeCurrentUser: true,
+				},
+			},
+			Reviewer: ReviewerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: ReviewerRoleTriggersConfig{
+					IncludeDrafts:        false,
+					RequireReviewRequest: true,
+					Labels:               []string{},
+					LabelMode:            LabelModeAll,
+				},
+				SpecReview: ReviewerSpecReviewConfig{
+					IncludeReviewingLabel: true,
+					ReviewingLabel:        "looper:spec-reviewing",
+				},
+			},
+			Fixer: FixerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: FixerRoleTriggersConfig{
+					IncludeDrafts: false,
+					AuthorFilter:  FixerAuthorFilterCurrentUser,
+					Labels:        []string{},
+					LabelMode:     LabelModeAll,
+				},
+			},
+			Worker: WorkerRoleConfig{
+				AutoDiscovery: true,
+				Triggers: IssueRoleTriggersConfig{
+					Labels:                     []string{"looper:worker-ready"},
+					LabelMode:                  LabelModeAll,
+					RequireAssigneeCurrentUser: true,
+				},
+			},
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

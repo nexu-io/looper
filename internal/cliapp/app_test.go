@@ -445,8 +445,13 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"--osascript-path",
 		"/opt/osascript",
 		"--reviewer-loop-enabled=false",
+		"--no-custom-instructions",
+		"false",
+		"--no-custom-instructions=true",
 		"--reviewer-quiet-period-seconds",
 		"60",
+		"--reviewer-min-publish-interval-seconds",
+		"300",
 		"--reviewer-max-iterations-per-pr",
 		"7",
 		"--reviewer-max-iterations-per-head=2",
@@ -472,8 +477,13 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"--osascript-path",
 		"/opt/osascript",
 		"--reviewer-loop-enabled=false",
+		"--no-custom-instructions",
+		"false",
+		"--no-custom-instructions=true",
 		"--reviewer-quiet-period-seconds",
 		"60",
+		"--reviewer-min-publish-interval-seconds",
+		"300",
 		"--reviewer-max-iterations-per-pr",
 		"7",
 		"--reviewer-max-iterations-per-head=2",
@@ -885,6 +895,22 @@ func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "not a boolean") {
 		t.Fatalf("stderr = %q, want boolean error", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "reviewer.reviewEvents.clean", "REQUEST_CHANGES", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid clean review event]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "reviewer.reviewEvents.clean") || !strings.Contains(stderr, "COMMENT, APPROVE") {
+		t.Fatalf("stderr = %q, want clean review event enum error", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "reviewer.reviewEvents.blocking", "APPROVE", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config set invalid blocking review event]) exit code = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr, "reviewer.reviewEvents.blocking") || !strings.Contains(stderr, "COMMENT, REQUEST_CHANGES") {
+		t.Fatalf("stderr = %q, want blocking review event enum error", stderr)
 	}
 }
 

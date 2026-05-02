@@ -6,11 +6,31 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	explicitReviewerCleanReviewEvent := hasExplicitReviewerCleanReviewEvent(partials)
+	fixerAuthorFilterExplicit := false
 	for _, partial := range partials {
+		if partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.AuthorFilter != nil {
+			fixerAuthorFilterExplicit = true
+		}
 		mergeConfig(&config, partial)
+	}
+	if config.Defaults.AllowAutoApprove && !explicitReviewerCleanReviewEvent {
+		config.Reviewer.ReviewEvents.Clean = ReviewerReviewEventApprove
+	}
+	if !fixerAuthorFilterExplicit && config.Defaults.FixAllPullRequests {
+		config.Roles.Fixer.Triggers.AuthorFilter = FixerAuthorFilterAny
 	}
 
 	return config, nil
+}
+
+func hasExplicitReviewerCleanReviewEvent(partials []PartialConfig) bool {
+	for _, partial := range partials {
+		if partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeConfig(config *Config, partial PartialConfig) {
@@ -60,6 +80,14 @@ func mergeConfig(config *Config, partial PartialConfig) {
 
 	if partial.Reviewer != nil {
 		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
+	}
+
+	if partial.Instructions != nil {
+		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
+	}
+
+	if partial.Roles != nil {
+		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
 
 	if partial.Projects != nil {
@@ -320,10 +348,22 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.PublishMode != nil {
 		config.PublishMode = *partial.PublishMode
 	}
+	if partial.ReviewEvents != nil {
+		mergeReviewerReviewEventsConfig(&config.ReviewEvents, *partial.ReviewEvents)
+	}
 	if partial.DetectDuplicateFindings != nil {
 		config.DetectDuplicateFindings = *partial.DetectDuplicateFindings
 	} else if partial.DedupeFindings != nil {
 		config.DetectDuplicateFindings = *partial.DedupeFindings
+	}
+}
+
+func mergeReviewerReviewEventsConfig(config *ReviewerReviewEventsConfig, partial PartialReviewerReviewEventsConfig) {
+	if partial.Clean != nil {
+		config.Clean = *partial.Clean
+	}
+	if partial.Blocking != nil {
+		config.Blocking = *partial.Blocking
 	}
 }
 
@@ -333,6 +373,9 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	}
 	if partial.QuietPeriodSeconds != nil {
 		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
+	if partial.MinPublishIntervalSeconds != nil {
+		config.MinPublishIntervalSeconds = *partial.MinPublishIntervalSeconds
 	}
 	if partial.MaxIterationsPerPR != nil {
 		config.MaxIterationsPerPR = *partial.MaxIterationsPerPR
@@ -357,6 +400,141 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	}
 	if partial.StopOnIdenticalOutput != nil {
 		config.StopOnIdenticalOutput = *partial.StopOnIdenticalOutput
+	}
+}
+
+func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstructionsConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MaxBytes != nil {
+		config.MaxBytes = *partial.MaxBytes
+	}
+}
+
+func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
+	if partial.Planner != nil {
+		mergePlannerRoleConfig(&config.Planner, *partial.Planner)
+	}
+	if partial.Reviewer != nil {
+		mergeReviewerRoleConfig(&config.Reviewer, *partial.Reviewer)
+	}
+	if partial.Fixer != nil {
+		mergeFixerRoleConfig(&config.Fixer, *partial.Fixer)
+	}
+	if partial.Worker != nil {
+		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
+	}
+}
+
+func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRoleConfig) {
+	if partial.AutoDiscovery != nil {
+		config.AutoDiscovery = *partial.AutoDiscovery
+	}
+	if partial.Triggers != nil {
+		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
+	if partial.AutoDiscovery != nil {
+		config.AutoDiscovery = *partial.AutoDiscovery
+	}
+	if partial.Triggers != nil {
+		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewerRoleConfig) {
+	if partial.AutoDiscovery != nil {
+		config.AutoDiscovery = *partial.AutoDiscovery
+	}
+	if partial.Triggers != nil {
+		mergeReviewerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.SpecReview != nil {
+		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfig) {
+	if partial.AutoDiscovery != nil {
+		config.AutoDiscovery = *partial.AutoDiscovery
+	}
+	if partial.Triggers != nil {
+		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeIssueRoleTriggersConfig(config *IssueRoleTriggersConfig, partial PartialIssueRoleTriggersConfig) {
+	if partial.Labels != nil {
+		config.Labels = cloneStrings(*partial.Labels)
+	}
+	if partial.LabelMode != nil {
+		config.LabelMode = *partial.LabelMode
+	}
+	if partial.RequireAssigneeCurrentUser != nil {
+		config.RequireAssigneeCurrentUser = *partial.RequireAssigneeCurrentUser
+	}
+}
+
+func mergePullRequestRoleTriggersConfig(config *PullRequestRoleTriggersConfig, partial PartialPullRequestRoleTriggersConfig) {
+	if partial.IncludeDrafts != nil {
+		config.IncludeDrafts = *partial.IncludeDrafts
+	}
+	if partial.RequireReviewRequest != nil {
+		config.RequireReviewRequest = *partial.RequireReviewRequest
+	}
+}
+
+func mergeReviewerRoleTriggersConfig(config *ReviewerRoleTriggersConfig, partial PartialReviewerRoleTriggersConfig) {
+	if partial.IncludeDrafts != nil {
+		config.IncludeDrafts = *partial.IncludeDrafts
+	}
+	if partial.RequireReviewRequest != nil {
+		config.RequireReviewRequest = *partial.RequireReviewRequest
+	}
+	if partial.Labels != nil {
+		config.Labels = cloneStrings(*partial.Labels)
+	}
+	if partial.LabelMode != nil {
+		config.LabelMode = *partial.LabelMode
+	}
+}
+
+func mergeReviewerSpecReviewConfig(config *ReviewerSpecReviewConfig, partial PartialReviewerSpecReviewConfig) {
+	if partial.IncludeReviewingLabel != nil {
+		config.IncludeReviewingLabel = *partial.IncludeReviewingLabel
+	}
+	if partial.ReviewingLabel != nil {
+		config.ReviewingLabel = *partial.ReviewingLabel
+	}
+}
+
+func mergeFixerRoleTriggersConfig(config *FixerRoleTriggersConfig, partial PartialFixerRoleTriggersConfig) {
+	if partial.IncludeDrafts != nil {
+		config.IncludeDrafts = *partial.IncludeDrafts
+	}
+	if partial.AuthorFilter != nil {
+		config.AuthorFilter = *partial.AuthorFilter
+	}
+	if partial.Labels != nil {
+		config.Labels = cloneStrings(*partial.Labels)
+	}
+	if partial.LabelMode != nil {
+		config.LabelMode = *partial.LabelMode
 	}
 }
 
@@ -427,6 +605,15 @@ func cloneSoundLevels(levels []NotificationSoundLevel) []NotificationSoundLevel 
 	return cloned
 }
 
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
 func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	if projects == nil {
 		return nil
@@ -435,9 +622,11 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = ProjectRefConfig{
-			ID:       project.ID,
-			Name:     project.Name,
-			RepoPath: project.RepoPath,
+			ID:           project.ID,
+			Name:         project.Name,
+			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
+			Path:         project.Path,
+			Instructions: cloneStringMap(project.Instructions),
 		}
 
 		if project.BaseBranch != nil {
@@ -450,4 +639,24 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

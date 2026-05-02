@@ -18,7 +18,7 @@ func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) 
 	if len(comments) != 1 || comments[0].Body != "Valid inline" || comments[0].Line != 1 || comments[0].Side != "RIGHT" {
 		t.Fatalf("valid anchor was not preserved exactly: %#v", comments)
 	}
-	if !strings.Contains(body, "Invalid inline") || !strings.Contains(body, "Location: app.go RIGHT line 99") || !strings.Contains(body, "Downgraded from inline review comment") {
+	if !strings.Contains(body, "Invalid inline") || !strings.Contains(body, "Location: app.go RIGHT line 99") || !strings.Contains(body, "Inline comment could not be anchored") {
 		t.Fatalf("invalid anchor was not downgraded with fallback location:\n%s", body)
 	}
 	if strings.Index(body, "Location: app.go RIGHT line 99") > strings.Index(body, "Invalid inline") {
@@ -26,6 +26,87 @@ func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) 
 	}
 	if len(flags) != 0 {
 		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+}
+
+func TestNormalizeReviewAnchorsMovesNearbyOutOfRangeAnchorToNearestHunk(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,2 +10,2 @@\n old\n+new\n")
+	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Nearby issue", Path: "app.go", Line: 13, Side: "RIGHT"},
+	}, &idx)
+
+	if len(flags) != 0 {
+		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+	if body != "Needs changes" {
+		t.Fatalf("body = %q, want unchanged top-level body", body)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("comments = %#v, want one nearest-anchored comment", comments)
+	}
+	if comments[0].Path != "app.go" || comments[0].Line != 11 || comments[0].Side != "RIGHT" {
+		t.Fatalf("comment anchor = %#v, want app.go RIGHT line 11", comments[0])
+	}
+	if !strings.Contains(comments[0].Body, "Original requested location: app.go RIGHT line 13") || !strings.Contains(comments[0].Body, "Nearby issue") {
+		t.Fatalf("comment body did not preserve original location:\n%s", comments[0].Body)
+	}
+}
+
+func TestNormalizeReviewAnchorsFallsBackForFarOutOfRangeAnchor(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,2 +10,2 @@\n old\n+new\n")
+	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Far issue", Path: "app.go", Line: 99, Side: "RIGHT"},
+	}, &idx)
+
+	if len(comments) != 0 {
+		t.Fatalf("comments = %#v, want unanchorable comment converted to body", comments)
+	}
+	if len(flags) != 0 {
+		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+	if !strings.Contains(body, "Location: app.go RIGHT line 99") || !strings.Contains(body, "Far issue") || !strings.Contains(body, "Inline comment could not be anchored") {
+		t.Fatalf("body did not preserve far out-of-range feedback with context:\n%s", body)
+	}
+	if strings.Contains(body, "Downgraded from inline review comment") {
+		t.Fatalf("body contains noisy downgrade wording:\n%s", body)
+	}
+}
+
+func TestNormalizeReviewAnchorsDoesNotMoveWrongSideContextAnchor(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,3 +10,3 @@\n context\n-old\n+new\n tail\n")
+	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Context issue", Path: "app.go", Line: 10, Side: "LEFT"},
+	}, &idx)
+
+	if len(comments) != 0 {
+		t.Fatalf("comments = %#v, want wrong-side context anchor converted to body", comments)
+	}
+	if len(flags) != 0 {
+		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+	if !strings.Contains(body, "Location: app.go LEFT line 10") || !strings.Contains(body, "Context issue") {
+		t.Fatalf("body did not preserve wrong-side context feedback with context:\n%s", body)
+	}
+}
+
+func TestNormalizeReviewAnchorsDoesNotMoveAmbiguousNearestAnchor(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,1 +10,1 @@\n-a\n+b\n@@ -14,1 +14,1 @@\n-c\n+d\n")
+	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Between hunks", Path: "app.go", Line: 12, Side: "RIGHT"},
+	}, &idx)
+
+	if len(comments) != 0 {
+		t.Fatalf("comments = %#v, want ambiguous nearest anchor converted to body", comments)
+	}
+	if len(flags) != 0 {
+		t.Fatalf("unexpected quality flags: %#v", flags)
+	}
+	if !strings.Contains(body, "Location: app.go RIGHT line 12") || !strings.Contains(body, "Between hunks") {
+		t.Fatalf("body did not preserve ambiguous nearest feedback with context:\n%s", body)
 	}
 }
 
