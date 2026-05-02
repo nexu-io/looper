@@ -1135,8 +1135,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
-		if hasReviewByAuthor(checkpoint.Detail.Reviews, currentLogin) {
-			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed it", input.Repo, input.PRNumber)
+		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
 			return checkpoint, nil
 		}
 	}
@@ -2460,9 +2460,10 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 	return "", false
 }
 
-func hasReviewByAuthor(reviews []map[string]any, login string) bool {
+func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
 	login = normalizeLogin(login)
-	if login == "" {
+	headSHA = strings.TrimSpace(headSHA)
+	if login == "" || headSHA == "" {
 		return false
 	}
 	for _, review := range reviews {
@@ -2470,7 +2471,14 @@ func hasReviewByAuthor(reviews []map[string]any, login string) bool {
 		if !ok {
 			continue
 		}
-		if authorLogin, ok := stringFromAny(author["login"]); ok && normalizeLogin(authorLogin) == login {
+		if authorLogin, ok := stringFromAny(author["login"]); !ok || normalizeLogin(authorLogin) != login {
+			continue
+		}
+		commit, ok := review["commit"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if oid, ok := stringFromAny(commit["oid"]); ok && strings.TrimSpace(oid) == headSHA {
 			return true
 		}
 	}
