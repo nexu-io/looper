@@ -1304,7 +1304,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
-			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before recording clean review: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
 		}
 		if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
