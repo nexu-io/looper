@@ -1451,6 +1451,16 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`)
 			return r
 		}(), queue: baseQueue},
+		{name: "follow updates disabled", loop: func() storage.LoopRecord {
+			l := baseLoop
+			l.MetadataJSON = stringPtr(`{"followUpdates":false,"loop":{"enabled":true,"consecutiveFailures":1}}`)
+			return l
+		}(), run: baseRun, queue: baseQueue},
+		{name: "loop disabled", loop: func() storage.LoopRecord {
+			l := baseLoop
+			l.MetadataJSON = stringPtr(`{"loop":{"enabled":false,"consecutiveFailures":1}}`)
+			return l
+		}(), run: baseRun, queue: baseQueue},
 		{name: "ready label checkpoint", loop: baseLoop, run: func() storage.RunRecord {
 			r := baseRun
 			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`)

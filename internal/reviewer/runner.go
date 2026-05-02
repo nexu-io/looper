@@ -2285,6 +2285,9 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		return false, "", "ready_label", nil
 	}
 	meta := parseJSONObject(loop.MetadataJSON)
+	if !r.loopEnabled(meta) {
+		return false, "", "loop_disabled", nil
+	}
 	loopMeta := reviewerLoopMetadata(meta)
 	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" {
 		return false, "", reason, nil

@@ -1275,6 +1275,9 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if manual, _ := meta["manual"].(bool); manual {
 		return false
 	}
+	if !runtimeReviewerLoopEnabled(meta) {
+		return false
+	}
 	loopMeta := runtimeReviewerLoopMetadata(meta)
 	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" {
 		return false
@@ -1353,6 +1356,18 @@ func runtimeReviewerLoopMetadata(meta map[string]any) map[string]any {
 		loopMeta = map[string]any{}
 	}
 	return loopMeta
+}
+
+func runtimeReviewerLoopEnabled(meta map[string]any) bool {
+	if enabled, ok := meta["followUpdates"].(bool); ok {
+		return enabled
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			return enabled
+		}
+	}
+	return false
 }
 
 func runtimeIntFromAny(value any) int {
