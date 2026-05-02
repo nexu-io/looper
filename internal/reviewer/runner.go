@@ -1346,6 +1346,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		if !auditedForHead && r.threadResolutionShouldComment(policy, decision) {
 			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
 			if err != nil {
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
 				return checkpoint, err
 			}
 			if latestThread == nil {
@@ -1364,6 +1365,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		if r.threadResolutionShouldResolve(policy, decision) {
 			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
 			if err != nil {
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
 				return checkpoint, err
 			}
 			if latestThread == nil {
@@ -1394,6 +1396,14 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	checkpoint.ThreadResolution = result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint, err error) reviewerCheckpoint {
+	var typed *loopError
+	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume && strings.Contains(typed.message, "PR changed during thread reconciliation") {
+		checkpoint.ResumePolicy = "restart_from_discover"
+	}
+	return checkpoint
 }
 
 func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig) bool {
@@ -2311,10 +2321,10 @@ func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSu
 	if status != "failed" && status != "interrupted" {
 		return false
 	}
-	if failedStep != stepPublish && failedStep != stepReview {
+	if failedStep != stepPublish && failedStep != stepReview && failedStep != stepThreadResolution {
 		return false
 	}
-	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish")
+	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish") || strings.Contains(failureSummary, "PR changed during thread reconciliation")
 }
 
 func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {

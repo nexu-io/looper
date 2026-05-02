@@ -2819,6 +2819,14 @@ func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) 
 	}
 }
 
+func TestShouldRestartFromDiscoverForThreadResolutionHeadChange(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRestartFromDiscover("failed", stepThreadResolution, "PR changed during thread reconciliation") {
+		t.Fatalf("shouldRestartFromDiscover(thread_resolution head change) = false, want true")
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverOnHeadChangeSignal(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2975,6 +2983,27 @@ func TestRunThreadResolutionStepRequiresLooperAuthoredMarker(t *testing.T) {
 	}
 }
 
+func TestRunThreadResolutionStepRestartsFromDiscoverOnHeadChange(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, viewHeadSHA: "new-head", reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"objectively_fixed","evidence":"the nil check is now present","confidence":"high"}]}`}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err == nil || !strings.Contains(err.Error(), "PR changed during thread reconciliation") {
+		t.Fatalf("runThreadResolutionStep() error = %v, want head-change reconciliation error", err)
+	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+	if len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("side effects: replies=%d resolves=%d, want none", len(github.addThreadReplyCalls), len(github.resolveThreadCalls))
+	}
+}
+
 func defaultThreadResolutionPolicy(t *testing.T) config.ReviewerThreadResolutionConfig {
 	t.Helper()
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -3066,6 +3095,7 @@ type fakeGitHubGateway struct {
 	addLabelErr                     error
 	removeLabelErr                  error
 	reviewThreads                   []ReviewThread
+	viewHeadSHA                     string
 	addThreadReplyCalls             []AddReviewThreadReplyInput
 	resolveThreadCalls              []ResolveReviewThreadInput
 	addReactionCalls                []PullRequestReactionInput
@@ -3102,6 +3132,9 @@ func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error) {
 	g.viewCalls++
 	headSHA := "abc123"
+	if g.viewHeadSHA != "" {
+		headSHA = g.viewHeadSHA
+	}
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
