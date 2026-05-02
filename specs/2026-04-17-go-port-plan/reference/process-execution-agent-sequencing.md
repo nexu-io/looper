@@ -18,10 +18,10 @@ The goal of this checkpoint is not to introduce new runtime behavior. It is to p
 
 ### Frozen daemon API compatibility
 
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json` freezes the `/api/v1/*` HTTP contract.
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-http.requests.compat.json` freezes request body shapes.
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-http.responses.compat.json` freezes success envelopes and response payloads.
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-http.errors.compat.json` freezes error envelopes and error codes.
+- `internal/api/testdata/contracts/daemon-http.compat.json` freezes the `/api/v1/*` HTTP contract.
+- `internal/api/testdata/contracts/daemon-http.requests.compat.json` freezes request body shapes.
+- `internal/api/testdata/contracts/daemon-http.responses.compat.json` freezes success envelopes and response payloads.
+- `internal/api/testdata/contracts/daemon-http.errors.compat.json` freezes error envelopes and error codes.
 - `internal/api/handler_test.go` machine-verifies the Go handler against the frozen compatibility boundary.
 
 ## Execution and orchestration layered on top afterward

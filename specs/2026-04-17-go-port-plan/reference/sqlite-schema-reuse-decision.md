@@ -14,9 +14,9 @@ The compatibility boundary for this decision is the existing TypeScript storage 
 - `apps/looperd/src/storage/sqlite/migrations.gen.ts`
 - `apps/looperd/src/storage/sqlite/migrate.ts`
 - `apps/looperd/src/storage/sqlite/db.ts`
-- `specs/2026-04-17-go-port-plan/artifacts/sqlite-inventory.md`
-- `specs/2026-04-17-go-port-plan/artifacts/sqlite-migration-sequence.md`
-- `specs/2026-04-17-go-port-plan/artifacts/sqlite-schema.snapshot.sql`
+- `specs/2026-04-17-go-port-plan/reference/sqlite-inventory.md`
+- `specs/2026-04-17-go-port-plan/reference/sqlite-migration-sequence.md`
+- `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`
 
 Today that means preserving the schema produced by migrations `0001` through `0007`, with `0007_agent_execution_run_index` as the current latest migration ID.
 
@@ -32,7 +32,7 @@ No blocker was found that justifies a schema redesign before the Go port:
 ## Implications
 
 - The Go migration runner must preserve the existing migration IDs, lexical ordering, and `schema_migrations` bookkeeping behavior.
-- The Go storage layer must match the current post-migration DDL in `sqlite-schema.snapshot.sql`, not a merely similar schema.
+- The Go storage layer must match the current post-migration DDL in `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`, not a merely similar schema.
 - Startup migration, backup, queue recovery, and event-log behavior remain part of the persisted compatibility boundary.
 - If a future blocker is found, it must be documented explicitly before changing schema shape or migration history.
 

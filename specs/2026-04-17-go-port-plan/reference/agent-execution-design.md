@@ -12,9 +12,9 @@ Source of truth inspected from:
 - `internal/reviewer/runner.go`
 - `internal/fixer/runner.go`
 - `internal/worker/runner.go`
-- `specs/2026-04-17-go-port-plan/artifacts/spec-pr-and-agent-completion.md`
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-lifecycle-parity.md`
-- `specs/2026-04-17-go-port-plan/artifacts/sqlite-inventory.md`
+- `specs/2026-04-17-go-port-plan/reference/spec-pr-and-agent-completion.md`
+- `specs/2026-04-17-go-port-plan/reference/daemon-lifecycle-parity.md`
+- `specs/2026-04-17-go-port-plan/reference/sqlite-inventory.md`
 
 This document is the dedicated design spike for the Go agent-execution subsystem. It defines the package shape, lifecycle contract, parity requirements, intentional deviations, and sequencing for the next implementation tasks.
 

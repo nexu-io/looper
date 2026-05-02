@@ -3,7 +3,7 @@
   "generatedFrom": [
     "apps/looperd/src/server/index.ts",
     "apps/looperd/src/server/index.test.ts",
-    "specs/2026-04-17-go-port-plan/artifacts/daemon-http-endpoints.md"
+    "specs/2026-04-17-go-port-plan/reference/daemon-http-endpoints.md"
   ],
   "notes": [
     "This artifact freezes the current /api/v1 HTTP compatibility boundary for the Go port.",

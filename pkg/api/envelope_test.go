@@ -63,7 +63,7 @@ func TestAllErrorCodesMatchFrozenArtifact(t *testing.T) {
 		ErrorCodes []frozenErrorCode `json:"errorCodes"`
 	}
 
-	artifactPath := filepath.Join("..", "..", "specs", "2026-04-17-go-port-plan", "artifacts", "daemon-http.errors.compat.json")
+	artifactPath := filepath.Join("..", "..", "internal", "api", "testdata", "contracts", "daemon-http.errors.compat.json")
 	contents, err := os.ReadFile(artifactPath)
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) error = %v", artifactPath, err)

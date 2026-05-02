@@ -9,12 +9,12 @@ Source of truth inspected from:
 
 - Binary mapping: `apps/cli/package.json`
 - CLI composition and dispatch: `apps/cli/src/index.ts`
-- Compatibility artifact for flag names/semantics: `specs/2026-04-17-go-port-plan/artifacts/cli-flags.compat.json`
+- Compatibility artifact for flag names/semantics: `internal/cliapp/testdata/contracts/cli-flags.compat.json`
 
 ## Compatibility boundary
 
 - CLI flag names and meanings are part of the Go-port compatibility boundary.
-- `specs/2026-04-17-go-port-plan/artifacts/cli-flags.compat.json` is the machine-verifiable artifact for:
+- `internal/cliapp/testdata/contracts/cli-flags.compat.json` is the machine-verifiable artifact for:
   - global flag names
   - command-local flag names
   - forwarded-vs-local semantics

@@ -369,7 +369,7 @@ CLI framework decision:
 
 > Use `github.com/spf13/cobra` for the Go `looper` CLI.
 >
-> The frozen command tree under `specs/2026-04-17-go-port-plan/artifacts/cli-commands.md` maps directly to Cobra's nested `Command` model, and the frozen global/config-forwarded flag contract maps cleanly to root persistent flags plus per-command local flags. Cobra also gives enough control over command help to reproduce Looper's existing group-level `Subcommands:` sections without keeping a fully custom parser/dispatcher, while still allowing an injected-dependency `App` or `CLI` struct to build a fresh root command per test. We are explicitly not using Cobra's package-global patterns; command construction should stay instance-based so the next testing/DI task can preserve the current `runCli(argv, deps)` isolation model.
+> The frozen command tree under `specs/2026-04-17-go-port-plan/reference/cli-commands.md` maps directly to Cobra's nested `Command` model, and the frozen global/config-forwarded flag contract maps cleanly to root persistent flags plus per-command local flags. Cobra also gives enough control over command help to reproduce Looper's existing group-level `Subcommands:` sections without keeping a fully custom parser/dispatcher, while still allowing an injected-dependency `App` or `CLI` struct to build a fresh root command per test. We are explicitly not using Cobra's package-global patterns; command construction should stay instance-based so the next testing/DI task can preserve the current `runCli(argv, deps)` isolation model.
 
 ---
 
@@ -434,7 +434,7 @@ Recommendation:
 
 > Reuse the current SQLite schema first, unless the existing schema is fundamentally broken.
 
-Decision recorded in `artifacts/sqlite-schema-reuse-decision.md`:
+Decision recorded in `specs/2026-04-17-go-port-plan/reference/sqlite-schema-reuse-decision.md`:
 
 - no blocker has been found in the current schema or migration lineage
 - the Go port should treat the TypeScript migration history through `0007_agent_execution_run_index` as the storage compatibility boundary
@@ -570,7 +570,7 @@ Testing consequences:
 3. CLI golden tests should verify help output, JSON output, and selected human-readable formatting against the frozen contract artifacts.
 4. End-to-end binary tests remain valuable, but they are secondary validation on top of the injected-dependency test suite.
 
-See `specs/2026-04-17-go-port-plan/artifacts/cli-di-testing-pattern.md` for the concrete pattern and rejected alternatives.
+See `specs/2026-04-17-go-port-plan/reference/cli-di-testing-pattern.md` for the concrete pattern and rejected alternatives.
 
 ---
 
@@ -778,7 +778,7 @@ Deliverables:
 
 Decision artifact:
 
-- `specs/2026-04-17-go-port-plan/artifacts/cutover-go-no-go-checklist.md`
+- `specs/2026-04-17-go-port-plan/reference/cutover-go-no-go-checklist.md`
 
 Acceptance criteria:
 

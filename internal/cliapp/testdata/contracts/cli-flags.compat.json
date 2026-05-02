@@ -3,8 +3,8 @@
   "generatedFrom": [
     "apps/cli/src/index.ts",
     "apps/cli/src/index.test.ts",
-    "specs/2026-04-17-go-port-plan/artifacts/cli-commands.md",
-    "specs/2026-04-17-go-port-plan/artifacts/config-surface.md"
+    "specs/2026-04-17-go-port-plan/reference/cli-commands.md",
+    "specs/2026-04-17-go-port-plan/reference/config-surface.md"
   ],
   "notes": [
     "This artifact freezes the current looper CLI flag surface as part of the Go-port compatibility boundary.",

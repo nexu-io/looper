@@ -3,7 +3,7 @@
   "generatedFrom": [
     "apps/looperd/src/server/index.ts",
     "apps/looperd/src/server/index.test.ts",
-    "specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json"
+    "internal/api/testdata/contracts/daemon-http.compat.json"
   ],
   "notes": [
     "This artifact freezes the current /api/v1 success-envelope JSON shapes using the seeded fixture in apps/looperd/src/server/index.test.ts.",

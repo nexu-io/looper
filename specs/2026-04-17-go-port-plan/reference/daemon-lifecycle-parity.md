@@ -7,8 +7,8 @@ Source of truth inspected from:
 - `apps/looperd/src/runtime/index.test.ts`
 - `apps/looperd/src/server/index.ts`
 - `specs/2026-04-17-go-port-plan/spec.md`
-- `specs/2026-04-17-go-port-plan/artifacts/sqlite-inventory.md`
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-http-endpoints.md`
+- `specs/2026-04-17-go-port-plan/reference/sqlite-inventory.md`
+- `specs/2026-04-17-go-port-plan/reference/daemon-http-endpoints.md`
 
 ## Compatibility boundary
 

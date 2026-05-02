@@ -171,7 +171,7 @@ Source: `apps/looperd/src/config/load.ts:99-228`
 
 These are defined as global CLI options and are the only flags forwarded by `extractConfigArgs()` into CLI config loading and daemon-launch argument building.
 
-Machine-verifiable freeze artifact: `specs/2026-04-17-go-port-plan/artifacts/cli-flags.compat.json`
+Machine-verifiable freeze artifact: `internal/cliapp/testdata/contracts/cli-flags.compat.json`
 
 | Flag | Used by | Notes |
 | --- | --- | --- |

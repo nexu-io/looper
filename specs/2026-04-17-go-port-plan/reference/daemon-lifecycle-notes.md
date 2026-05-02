@@ -7,7 +7,7 @@ Source of truth inspected from:
 - `apps/looperd/src/server/index.ts`
 - `apps/cli/src/index.ts`
 - `docs/configuration.md`
-- `specs/2026-04-17-go-port-plan/artifacts/daemon-lifecycle-parity.md`
+- `specs/2026-04-17-go-port-plan/reference/daemon-lifecycle-parity.md`
 
 This document is the operator-focused companion to `daemon-lifecycle-parity.md`. The parity file defines the compatibility contract; this file describes how the current daemon actually starts, stops, recovers, and shuts down from an operator point of view.
 

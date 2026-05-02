@@ -3,7 +3,7 @@
   "generatedFrom": [
     "apps/looperd/src/server/index.ts",
     "apps/looperd/src/server/index.test.ts",
-    "specs/2026-04-17-go-port-plan/artifacts/daemon-http.compat.json"
+    "internal/api/testdata/contracts/daemon-http.compat.json"
   ],
   "notes": [
     "This artifact freezes the current /api/v1 JSON request body shapes for routes that accept application/json.",

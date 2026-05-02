@@ -41,4 +41,4 @@ All six commands passed.
 
 ## Result
 
-The Go rewrite still exercises the expected contract-sensitive Git/GitHub/spec-PR behaviors described in `specs/2026-04-17-go-port-plan/spec.md` and `specs/2026-04-17-go-port-plan/artifacts/spec-pr-and-agent-completion.md`.
+The Go rewrite still exercises the expected contract-sensitive Git/GitHub/spec-PR behaviors described in `specs/2026-04-17-go-port-plan/spec.md` and `specs/2026-04-17-go-port-plan/reference/spec-pr-and-agent-completion.md`.

@@ -6,7 +6,7 @@ This artifact complements `sqlite-inventory.md` with the exact post-migration DD
 
 - Migration files: `apps/looperd/src/storage/sqlite/migrations/*.sql`
 - Runner: `apps/looperd/src/storage/sqlite/migrate.ts`
-- Snapshot file: `artifacts/sqlite-schema.snapshot.sql`
+- Snapshot file: `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`
 
 The snapshot was produced by applying migrations `0001` through `0007` in lexical order to an empty SQLite database and then reading `sqlite_master` for all non-internal tables and indexes.
 
@@ -77,6 +77,6 @@ There are no views or triggers in the current runtime schema.
 
 ## Compatibility implications for the Go port
 
-- Reusing the current schema means matching the final DDL in `sqlite-schema.snapshot.sql`, not just recreating tables with similar names.
+- Reusing the current schema means matching the final DDL in `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`, not just recreating tables with similar names.
 - Migration compatibility includes preserving lexical ordering, `schema_migrations` IDs, and the same foreign-key toggling behavior for rebuild migrations.
 - The latest schema version is `0007_agent_execution_run_index`; the latest schema shape still includes all runtime tables inventoried in `sqlite-inventory.md`.

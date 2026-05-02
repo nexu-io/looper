@@ -145,7 +145,7 @@
 
 ## Phase 10 - Cut over
 
-- [x] Complete a written cutover go/no-go checklist before replacing TypeScript binaries (`artifacts/cutover-go-no-go-checklist.md`)
+- [x] Complete a written cutover go/no-go checklist before replacing TypeScript binaries (`specs/2026-04-17-go-port-plan/reference/cutover-go-no-go-checklist.md`)
 - [x] Make Go binaries the default supported implementation
 - [ ] Switch CI and release pipelines to Go-first
 - [ ] Remove Bun from the required production runtime path
