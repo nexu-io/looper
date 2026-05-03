@@ -10,6 +10,7 @@ import (
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/diffanchor"
+	"github.com/powerformer/looper/internal/disclosure"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
@@ -182,6 +183,9 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if len(comments) > 0 {
 			return fmt.Errorf("APPROVE reviews require clean outcome without inline comments")
 		}
+		if err := validateCleanApproveBody(body); err != nil {
+			return err
+		}
 	case "REQUEST_CHANGES":
 		if outcome != "blocking" {
 			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
@@ -195,6 +199,23 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		}
 	}
 	return nil
+}
+
+func validateCleanApproveBody(body string) error {
+	visible := cleanReviewHumanBody(body)
+	if !strings.HasPrefix(visible, "@") {
+		return fmt.Errorf("APPROVE clean review body must start with an @mention of the PR author")
+	}
+	if len(strings.Fields(visible)) < 12 {
+		return fmt.Errorf("APPROVE clean review body must include a short human summary and friendly acknowledgement, not only markers or disclosure")
+	}
+	return nil
+}
+
+func cleanReviewHumanBody(body string) string {
+	cleaned := reviewSubmitMarkerRE.ReplaceAllString(body, "")
+	cleaned = disclosure.StripMarkdownStamp(cleaned)
+	return strings.TrimSpace(cleaned)
 }
 
 func isValidReviewSubmitOutcome(outcome string) bool {
