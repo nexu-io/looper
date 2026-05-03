@@ -120,13 +120,20 @@ func previewWorkerAllowsRemoteLifecycle(cfg config.Config) bool {
 }
 
 func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+	minimalSeedContract := strings.Join([]string{
+		"PR handoff contract: Looper provides a minimal PR seed by default: repo, pr_number/url, base_ref, head_ref, head_sha, expected state/draft status, task intent, and optional scope such as paths, comment IDs, review thread IDs, or constraints.",
+		"Child agents must fetch PR details on demand with `gh`: use `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` with the seeded PR URL or number plus repository for metadata and drift checks; `gh pr diff <pr-url> -R <repo> --name-only` before scoped diffs; fetch the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filter locally or fetch refs and run `git diff <base>...<head> -- <path>` for relevant files only; paginated `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate` for review feedback; and `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
+		"Safeguards: validate live headRefOid against seeded head_sha, baseRefName against seeded base_ref, and PR state/draft status against expectations before acting and before final conclusions; fail fast with structured auth, network, rate_limit, or pr_drift errors; never rely only on `gh pr view --comments`; do not pass full diffs or full comment dumps through parent context by default.",
+	}, "\n")
 	if strings.TrimSpace(looperCLIPath) == "" {
 		return strings.Join([]string{
+			minimalSeedContract,
 			"GitHub operation contract: a trusted Looper CLI path was not detected for reviewer runs, so agents cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.",
 			lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentRuntime, agentModel),
 		}, "\n")
 	}
 	return strings.Join([]string{
+		minimalSeedContract,
 		"Use Looper's trusted `looper review submit` wrapper for review submission. Do not bypass approval, publication, or disclosure policy.",
 		"GitHub operation contract: submit exactly one PR review for the run through the trusted Looper CLI review-submit wrapper, with review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly for review submission.",
 		"Before posting, confirm the PR is still open, the head SHA still matches the expected head SHA, and the current GitHub user is still requested for review unless the run is manual.",

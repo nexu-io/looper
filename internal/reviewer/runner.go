@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,7 +19,6 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/diffanchor"
 	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
@@ -3349,6 +3349,73 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 	return prompt
 }
 
+func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope) string {
+	seed := map[string]any{
+		"repo":           repo,
+		"pr_number":      prNumber,
+		"url":            seededPullRequestURL(repo, prNumber),
+		"head_sha":       snapshotHeadSHA(checkpoint),
+		"expected_state": "OPEN",
+		"expected_draft": false,
+		"task_intent":    "review_pull_request",
+		"scope": map[string]any{
+			"review_scope": scope,
+		},
+	}
+	if checkpoint.Detail != nil {
+		seed["base_ref"] = checkpoint.Detail.BaseRefName
+		seed["head_ref"] = checkpoint.Detail.HeadRefName
+		seed["expected_state"] = firstNonEmpty(strings.ToUpper(strings.TrimSpace(checkpoint.Detail.State)), "OPEN")
+		seed["expected_draft"] = checkpoint.Detail.IsDraft
+	} else {
+		seed["base_ref"] = ""
+		seed["head_ref"] = ""
+	}
+	encoded, _ := json.MarshalIndent(seed, "", "  ")
+	return "Minimal PR seed (authoritative handoff fields; fetch all mutable PR details yourself):\n" + string(encoded)
+}
+
+func seededPullRequestURL(repo string, prNumber int64) string {
+	host, path := seededPullRequestRepoParts(repo)
+	return fmt.Sprintf("https://%s/%s/pull/%d", host, path, prNumber)
+}
+
+func seededPullRequestRepoParts(repo string) (host string, path string) {
+	const defaultHost = "github.com"
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultHost, ""
+	}
+	if parsed, err := url.Parse(repo); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname(), strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	}
+	if at := strings.Index(repo, "@"); at >= 0 {
+		repo = repo[at+1:]
+	}
+	if colon := strings.Index(repo, ":"); colon > 0 {
+		host = strings.TrimSpace(repo[:colon])
+		path = strings.Trim(strings.TrimSpace(repo[colon+1:]), "/")
+		if host != "" && path != "" {
+			return host, path
+		}
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) >= 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0]), strings.Join(parts[1:], "/")
+	}
+	return defaultHost, strings.Trim(repo, "/")
+}
+
+func reviewerAgentSideGitHubFetchContract() string {
+	return strings.Join([]string{
+		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
+		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
+		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
+		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
+	}, "\n")
+}
+
 func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
@@ -3367,17 +3434,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		outcomeInstruction = "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), reviewerAgentSideGitHubFetchContract(), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
 	if checkpoint.Snapshot != nil {
-		if checkpoint.Snapshot.Title != "" {
-			parts = append(parts, "Title: "+checkpoint.Snapshot.Title)
-		}
-		if checkpoint.Snapshot.Body != "" {
-			parts = append(parts, "Body:\n"+checkpoint.Snapshot.Body)
-		}
 		parts = append(parts, "Head SHA: "+checkpoint.Snapshot.HeadSHA)
 		if checkpoint.Detail != nil && checkpoint.Detail.Author != "" {
 			parts = append(parts, "Author: "+checkpoint.Detail.Author)
@@ -3387,11 +3448,6 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		}
 		if checkpoint.Snapshot.UnresolvedThreadCount != nil {
 			parts = append(parts, fmt.Sprintf("Unresolved threads: %d", *checkpoint.Snapshot.UnresolvedThreadCount))
-		}
-		payload := parseJSONObject(optionalString(checkpoint.Snapshot.PayloadJSON))
-		if diff, ok := stringFromAny(payload["diff"]); ok && diff != "" {
-			parts = append(parts, diffanchor.Parse(diff).FormatPromptSection(80))
-			parts = append(parts, "Diff:\n"+diff)
 		}
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
@@ -3438,7 +3494,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
-		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations. Use ANCHORABLE DIFF LOCATIONS as a summary of known ranges, but if that summary is truncated, the full PR diff remains authoritative. Preserve exact anchors that fit the full diff. If an otherwise useful comment is outside the full diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
+		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		"Do not add or remove the PR main-conversation +1 reaction yourself. After Looper validates the resulting review marker or accepted clean no-op outcome for this run, the runner will reconcile clean-signal reactions automatically.",
 		specLabelInstruction,
 		cleanInstruction,
@@ -3509,7 +3565,7 @@ func shellQuote(value string) string {
 func reviewerScopeInstruction(scope config.ReviewerScope) string {
 	switch scope {
 	case config.ReviewerScopeFullPR:
-		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff payload below. You may report actionable issues anywhere in the PR diff when they are supported by the included context."
+		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff fetched through `gh` according to the agent-side GitHub fetch contract. You may report actionable issues anywhere in the PR diff when they are supported by the fetched context."
 	case config.ReviewerScopeChangedFiles:
 		return "Review scope: changed_files. Limit actionable findings to files changed by this PR. Use unchanged hunks only as context for changed files, and do not request changes in unrelated files unless the changed-file behavior cannot be fixed locally."
 	case config.ReviewerScopeChangedRanges:

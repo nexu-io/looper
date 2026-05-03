@@ -17,7 +17,8 @@ import (
 func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, "abc123", []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -33,12 +34,55 @@ func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, "abc123", []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
 	if strings.Contains(prompt, "agent=") {
 		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
 		t.Fatalf("prompt should include configured model:\n%s", prompt)
+	}
+}
+
+func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
+	t.Parallel()
+
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{
+		"Minimal PR seed",
+		"\"repo\": \"acme/looper\"",
+		"\"pr_number\": 42",
+		"\"base_ref\": \"main\"",
+		"\"head_ref\": \"feature/fix\"",
+		"\"head_sha\": \"abc123\"",
+		"\"task_intent\": \"repair_pull_request_feedback\"",
+		"\"fix_item_ids\"",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr diff <pr-url> -R <repo> --name-only",
+		"gh pr diff <pr-url> -R <repo> --patch",
+		"gh pr checks <pr-url> -R <repo>",
+		"git diff <base>...<head> -- <path>",
+		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
+		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
+		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
+		"structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "gh pr diff -- <path>") {
+		t.Fatalf("prompt contains unsupported gh pr diff pathspec instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildFixerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
+	t.Parallel()
+
+	seed := buildFixerMinimalPRSeed("ghe.example.com/acme/looper", 42, &checkpointDetail{}, nil)
+	if !strings.Contains(seed, "\"url\": \"https://ghe.example.com/acme/looper/pull/42\"") {
+		t.Fatalf("seed = %q, want enterprise host PR URL", seed)
 	}
 }
 
