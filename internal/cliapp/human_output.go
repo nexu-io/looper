@@ -164,9 +164,11 @@ type loopLogsOutput struct {
 	LoopType   string `json:"loopType"`
 	LoopStatus string `json:"loopStatus"`
 	Run        *struct {
-		RunID       string  `json:"runId"`
-		Status      string  `json:"status"`
-		CurrentStep *string `json:"currentStep"`
+		RunID        string  `json:"runId"`
+		Status       string  `json:"status"`
+		CurrentStep  *string `json:"currentStep"`
+		Summary      *string `json:"summary"`
+		ErrorMessage *string `json:"errorMessage"`
 	} `json:"run"`
 	Agent *struct {
 		ExecutionID  string  `json:"executionId"`
@@ -361,6 +363,10 @@ func writeHumanLoopLogsSnapshot(w io.Writer, data loopLogsOutput, stderr bool, f
 		return err
 	}
 	if data.Agent == nil {
+		if failure := loopLogsRunFailureMessage(data); failure != "" {
+			_, err := fmt.Fprintf(w, "Failure: %s\n", failure)
+			return err
+		}
 		message := "No agent output for the current step."
 		if follow && loopLogsCanContinue(data) {
 			message = "Waiting for agent output..."
@@ -377,6 +383,10 @@ func writeHumanLoopLogsSnapshot(w io.Writer, data loopLogsOutput, stderr bool, f
 		return err
 	}
 	if content == "" {
+		if failure := loopLogsRunFailureMessage(data); failure != "" {
+			_, err := fmt.Fprintf(w, "Failure: %s\n", failure)
+			return err
+		}
 		message := "No output captured."
 		if follow && loopLogsCanContinue(data) {
 			message = "Waiting for log output..."
@@ -386,6 +396,32 @@ func writeHumanLoopLogsSnapshot(w io.Writer, data loopLogsOutput, stderr bool, f
 	}
 
 	return writeLoopLogContent(w, content)
+}
+
+func loopLogsRunFailureMessage(data loopLogsOutput) string {
+	if data.Run == nil {
+		return ""
+	}
+	if data.Run.ErrorMessage != nil {
+		if message := strings.TrimSpace(*data.Run.ErrorMessage); message != "" {
+			return message
+		}
+	}
+	if data.Run.Summary != nil {
+		if message := strings.TrimSpace(*data.Run.Summary); message != "" && loopLogsRunFailed(data.Run.Status) {
+			return message
+		}
+	}
+	return ""
+}
+
+func loopLogsRunFailed(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "failed", "parse_failed", "terminated", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeHumanLoopLogsHeader(w io.Writer, data loopLogsOutput) error {

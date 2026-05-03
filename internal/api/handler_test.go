@@ -3889,6 +3889,95 @@ func TestActiveRunsIncludesPausedLoopWithRunningRun(t *testing.T) {
 	assertEqual(t, item["status"], "running")
 }
 
+func TestActiveRunsDedupesQueuedLoopWhenRunIsRunning(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_1"
+	loopID := "loop_fixer_running_and_queued"
+	targetID := "issue:acme/looper:177"
+	payload := `{"issue":"177"}`
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        projectID,
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         loopID,
+		Seq:        244,
+		ProjectID:  projectID,
+		Type:       "fixer",
+		TargetType: "issue",
+		TargetID:   &targetID,
+		Repo:       stringPtr("acme/looper"),
+		Status:     "queued",
+		NextRunAt:  stringPtr(nowISO),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:              "run_fixer_active",
+		LoopID:          loopID,
+		Status:          "running",
+		CurrentStep:     stringPtr("discover-pr"),
+		StartedAt:       nowISO,
+		LastHeartbeatAt: stringPtr(nowISO),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_fixer_active",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "fixer",
+		TargetType:  "issue",
+		TargetID:    targetID,
+		Repo:        stringPtr("acme/looper"),
+		DedupeKey:   "fixer:loop_fixer_running_and_queued",
+		Priority:    storage.QueuePriorityFixer,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		Attempts:    0,
+		MaxAttempts: 3,
+		PayloadJSON: &payload,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["seq"], float64(244))
+	assertEqual(t, item["loopId"], loopID)
+	assertEqual(t, item["runId"], "run_fixer_active")
+	assertEqual(t, item["status"], "running")
+	assertEqual(t, item["currentStep"], "discover-pr")
+}
+
 func TestActiveRunsStatusAndTypeFiltersIncludeInactiveCompletedWorkerLoops(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

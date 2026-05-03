@@ -1489,6 +1489,82 @@ func TestLogsWithoutJSONPrintsAgentErrorMessage(t *testing.T) {
 	}
 }
 
+func TestLogsWithoutJSONPrintsRunFailureWhenNoAgentOutput(t *testing.T) {
+	t.Parallel()
+
+	failureMessage := "Command exited with code 1: GraphQL: Could not resolve to a PullRequest with the number of 345. (repository.pullRequest)"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{
+			"seq":        12,
+			"loopId":     "loop_1",
+			"loopType":   "reviewer",
+			"loopStatus": "failed",
+			"run": map[string]any{
+				"runId":        "run_1",
+				"currentStep":  "discover",
+				"status":       "failed",
+				"errorMessage": failureMessage,
+			},
+			"agent": nil,
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop #12 · reviewer · failed", "Run run_1 · step: discover", "Failure: " + failureMessage} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "No agent output for the current step.") {
+		t.Fatalf("Run([logs loop_1]) stdout = %q, did not expect no-output message", stdout)
+	}
+}
+
+func TestLogsWithoutJSONPrintsRunSummaryWhenAgentOutputEmpty(t *testing.T) {
+	t.Parallel()
+
+	summary := "discover failed before agent output was captured"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{
+			"seq":        12,
+			"loopId":     "loop_1",
+			"loopType":   "reviewer",
+			"loopStatus": "failed",
+			"run":        map[string]any{"runId": "run_1", "currentStep": "discover", "status": "failed", "summary": summary},
+			"agent":      map[string]any{"vendor": "codex", "status": "failed", "stdout": "", "stderr": ""},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Agent: codex", "Failure: " + summary} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "No output captured.") {
+		t.Fatalf("Run([logs loop_1]) stdout = %q, did not expect no-output message", stdout)
+	}
+}
+
 func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -1595,6 +1671,53 @@ func TestLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
 	}
 	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: codex · pid 1234 · running", "codex line1", "codex line2"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestLogsFollowPrintsFailureAfterEmptyOutputRunFails(t *testing.T) {
+	t.Parallel()
+
+	failureMessage := "Command exited with code 1: GraphQL: Could not resolve to a PullRequest with the number of 345. (repository.pullRequest)"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/loops/loop_1/logs"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		requests++
+		if r.URL.Query().Get("follow") == "1" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: snapshot\n")
+			_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"discover\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"codex\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"\",\"stderr\":\"\"}}\n\n")
+			_, _ = io.WriteString(w, "event: end\n")
+			_, _ = io.WriteString(w, "data: {\"reason\":\"run_completed\"}\n\n")
+			return
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{
+			"seq":        12,
+			"loopId":     "loop_1",
+			"loopType":   "reviewer",
+			"loopStatus": "failed",
+			"run":        map[string]any{"runId": "run_1", "currentStep": "discover", "status": "failed", "errorMessage": failureMessage},
+			"agent":      map[string]any{"executionId": "exec_1", "vendor": "codex", "pid": 1234, "status": "failed", "stdout": "", "stderr": ""},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "logs", "loop_1", "--follow", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([logs loop_1 --follow]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want follow stream plus final snapshot fetch", requests)
+	}
+	for _, want := range []string{"Waiting for log output...", "Loop #12 · reviewer · failed", "Failure: " + failureMessage} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
 		}
