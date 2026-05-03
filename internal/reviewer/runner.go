@@ -92,6 +92,7 @@ type PullRequestSummary struct {
 	HasConflicts   bool
 	Author         string
 	ReviewRequests []string
+	Reviews        []map[string]any
 }
 
 type PullRequestDetail struct {
@@ -431,6 +432,7 @@ type checkpointDetail struct {
 	Author         string           `json:"author,omitempty"`
 	ReviewRequests []string         `json:"reviewRequests,omitempty"`
 	HasConflicts   bool             `json:"hasConflicts,omitempty"`
+	CurrentLogin   string           `json:"currentLogin,omitempty"`
 	Reviews        []map[string]any `json:"reviews,omitempty"`
 }
 
@@ -1161,7 +1163,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
-	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+	currentLogin := ""
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && len(checkpoint.Detail.Reviews) == 0 && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "approved"
 		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
@@ -1182,15 +1185,37 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipKind = "conflicted"
 		return checkpoint, nil
 	}
+	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
+		if currentLogin == "" {
+			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+			checkpoint.Detail.CurrentLogin = currentLogin
+		}
+		if r.loopConfig.StopOnApproved && hasApprovedReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
+			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
+			checkpoint.SkipKind = "approved"
+			if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
+	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
-		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		if currentLogin == "" {
+			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+			checkpoint.Detail.CurrentLogin = currentLogin
 		}
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
 			checkpoint.SkipKind = "already_reviewed_by_current_user"
-			checkpoint.SkipReviewerLogin = normalizeLogin(currentLogin)
+			checkpoint.SkipReviewerLogin = currentLogin
 			return checkpoint, nil
 		}
 	}
@@ -1211,11 +1236,15 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
-		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		if currentLogin == "" {
+			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+			checkpoint.Detail.CurrentLogin = currentLogin
 		}
-		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
@@ -2406,9 +2435,6 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
 		return false, "", "draft_pr", nil
 	}
-	if r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "APPROVED") {
-		return false, "", "approved", nil
-	}
 	if r.loopConfig.StopOnReadyLabel && specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
 		return false, "", "ready_label", nil
 	}
@@ -2449,7 +2475,24 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if queueKind == string(FailureManualIntervention) || checkpoint.ResumePolicy == "manual_intervention" {
 		return false, "", "manual_intervention", nil
 	}
+	approvedByCurrentUser := func() (bool, error) {
+		if !r.loopConfig.StopOnApproved || len(pr.Reviews) == 0 {
+			return false, nil
+		}
+		currentLogin, err := r.currentLoginForLoop(ctx, loop)
+		if err != nil {
+			return false, err
+		}
+		return hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA), nil
+	}
 	if queueKind == string(FailureRetryableAfterResume) && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review") {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
 		return true, latestQueue.ID, "retryable_after_resume_" + checkpoint.ResumePolicy, nil
 	}
 	latestMessage := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
@@ -2457,6 +2500,13 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		latestMessage = derefString(latestQueue.LastError)
 	}
 	if isKnownReviewerRediscoveryGuardrail(latestMessage) && isReviewerRediscoveryRunStep(latestRun) {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
 		return true, latestQueue.ID, "historical_guardrail", nil
 	}
 	return false, "", "not_whitelisted", nil
@@ -2729,9 +2779,19 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 }
 
 func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
+	return hasReviewByAuthorForHeadMatchingState(reviews, login, headSHA, isSubmittedReviewState)
+}
+
+func hasApprovedReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
+	return hasReviewByAuthorForHeadMatchingState(reviews, login, headSHA, func(state string) bool {
+		return strings.EqualFold(strings.TrimSpace(state), "APPROVED")
+	})
+}
+
+func hasReviewByAuthorForHeadMatchingState(reviews []map[string]any, login string, headSHA string, stateMatches func(string) bool) bool {
 	login = normalizeLogin(login)
 	headSHA = strings.TrimSpace(headSHA)
-	if login == "" || headSHA == "" {
+	if login == "" || headSHA == "" || stateMatches == nil {
 		return false
 	}
 	for _, review := range reviews {
@@ -2743,7 +2803,7 @@ func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA st
 			continue
 		}
 		state, _ := stringFromAny(review["state"])
-		if !isSubmittedReviewState(state) {
+		if !stateMatches(state) {
 			continue
 		}
 		commit, ok := review["commit"].(map[string]any)
@@ -2755,6 +2815,22 @@ func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA st
 		}
 	}
 	return false
+}
+
+func (r *Runner) currentLoginForLoop(ctx context.Context, loop storage.LoopRecord) (string, error) {
+	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	cwd := ""
+	if project != nil {
+		cwd = project.RepoPath
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	return normalizeLogin(login), nil
 }
 
 func isSubmittedReviewState(state string) bool {
@@ -3308,7 +3384,7 @@ func containsAnyString(values []any, target string) bool {
 }
 
 func summaryFromDetail(detail PullRequestDetail) PullRequestSummary {
-	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HasConflicts: detail.HasConflicts, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
+	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HasConflicts: detail.HasConflicts, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func normalizePRState(value string) string {
