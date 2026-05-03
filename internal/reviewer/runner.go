@@ -1754,6 +1754,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if cleanReviewNoopSummary(result.Summary) {
 		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 		if policy.Clean == config.ReviewerReviewEventApprove {
+			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			} else if cleanApprovedReviewMarker(found) {
+				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
+				checkpoint.ResumePolicy = "advance_from_checkpoint"
+				return checkpoint, nil
+			}
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, CleanNoop: true}
@@ -1956,6 +1963,10 @@ func cleanReviewNoopSummary(summary string) bool {
 		return false
 	}
 	return strings.HasPrefix(normalized, "no actionable findings")
+}
+
+func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
+	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean")
 }
 
 func (r *Runner) specReviewingLabel() string {
