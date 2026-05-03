@@ -61,6 +61,7 @@ type PullRequestSummary struct {
 	HasConflicts   bool
 	Author         string
 	ReviewRequests []string
+	Reviews        []map[string]any
 }
 
 type PullRequestDetail struct {
@@ -372,7 +373,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -403,6 +404,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 			HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
 			Author:         extractAuthor(row["author"]),
 			ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
+			Reviews:        toObjectSlice(row["reviews"]),
 		})
 	}
 	return out, nil

@@ -346,7 +346,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	if err := r.syncConfiguredProjects(ctx, repositories, r.config, startedAt); err != nil {
 		return err
 	}
-	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, startedAt)
+	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, startedAt)
 	if err != nil {
 		return err
 	}
@@ -537,7 +537,7 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 	return tick(ctx, services)
 }
 
-func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage.Repositories, now time.Time) (RecoverySummary, error) {
+func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, now time.Time) (RecoverySummary, error) {
 	nowISO := formatJavaScriptISOString(now)
 	eventsWritten := int64(0)
 	summary := createEmptyRecoverySummary()
@@ -689,12 +689,18 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, runtimeReviewerRecoveryPolicy{
+		policy := runtimeReviewerRecoveryPolicy{
 			includeDrafts:          r.config.Roles.Reviewer.Triggers.IncludeDrafts,
 			stopOnApproved:         r.config.Reviewer.Loop.StopOnApproved,
 			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
 			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
-		}) {
+		}
+		if canRefreshReviewerLoginForRecovery(loop, latestRun) {
+			if login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy); ok {
+				policy.currentLogin = login
+			}
+		}
+		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
 			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
 			if err != nil {
 				return RecoverySummary{}, err
@@ -1266,10 +1272,13 @@ const maxReviewerAutoRecoveryAttempts = 3
 type runtimeReviewerCheckpoint struct {
 	ResumePolicy string `json:"resumePolicy,omitempty"`
 	Detail       *struct {
-		State          string   `json:"state,omitempty"`
-		IsDraft        bool     `json:"isDraft,omitempty"`
-		ReviewDecision string   `json:"reviewDecision,omitempty"`
-		Labels         []string `json:"labels,omitempty"`
+		State          string           `json:"state,omitempty"`
+		IsDraft        bool             `json:"isDraft,omitempty"`
+		ReviewDecision string           `json:"reviewDecision,omitempty"`
+		Labels         []string         `json:"labels,omitempty"`
+		HeadSHA        string           `json:"headSha,omitempty"`
+		CurrentLogin   string           `json:"currentLogin,omitempty"`
+		Reviews        []map[string]any `json:"reviews,omitempty"`
 	} `json:"detail,omitempty"`
 }
 
@@ -1278,6 +1287,43 @@ type runtimeReviewerRecoveryPolicy struct {
 	stopOnApproved         bool
 	stopOnReadyLabel       bool
 	maxConsecutiveFailures int64
+	currentLogin           string
+}
+
+func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, loop storage.LoopRecord, latestRun *storage.RunRecord, policy runtimeReviewerRecoveryPolicy) (string, bool) {
+	if githubGateway == nil || !policy.stopOnApproved || latestRun == nil || strings.TrimSpace(loop.ProjectID) == "" {
+		return "", false
+	}
+	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.Detail == nil || len(checkpoint.Detail.Reviews) == 0 {
+		return "", false
+	}
+	project, err := repositories.Projects.GetByID(ctx, loop.ProjectID)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("failed to load project for reviewer recovery login refresh", map[string]any{"loopId": loop.ID, "projectId": loop.ProjectID, "error": err.Error()})
+		}
+		return "", false
+	}
+	if project == nil || strings.TrimSpace(project.RepoPath) == "" {
+		return "", false
+	}
+	login, err := githubGateway.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("failed to refresh reviewer login during recovery", map[string]any{"loopId": loop.ID, "projectId": loop.ProjectID, "error": err.Error()})
+		}
+		return "", false
+	}
+	login = strings.ToLower(strings.TrimSpace(login))
+	if login == "" {
+		return "", false
+	}
+	return login, true
+}
+
+func canRefreshReviewerLoginForRecovery(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
+	return loop.Type == string(domain.LoopTypeReviewer) && loop.Status == "failed" && latestRun != nil && latestRun.Status == "failed"
 }
 
 func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, policy runtimeReviewerRecoveryPolicy) bool {
@@ -1319,7 +1365,11 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if !policy.includeDrafts && checkpoint.Detail.IsDraft {
 		return false
 	}
-	if policy.stopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+	currentLogin := checkpoint.Detail.CurrentLogin
+	if strings.TrimSpace(policy.currentLogin) != "" {
+		currentLogin = policy.currentLogin
+	}
+	if policy.stopOnApproved && runtimeReviewerCheckpointApprovedForRecovery(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA, checkpoint.Detail.ReviewDecision) {
 		return false
 	}
 	if policy.stopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
@@ -1405,6 +1455,46 @@ func runtimeIntFromAny(value any) int {
 func runtimeStringFromAny(value any) (string, bool) {
 	text, ok := value.(string)
 	return text, ok
+}
+
+func runtimeHasApprovedReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
+	login = strings.ToLower(strings.TrimSpace(login))
+	headSHA = strings.TrimSpace(headSHA)
+	if login == "" || headSHA == "" {
+		return false
+	}
+	for _, review := range reviews {
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+		authorLogin, ok := runtimeStringFromAny(author["login"])
+		if !ok || strings.ToLower(strings.TrimSpace(authorLogin)) != login {
+			continue
+		}
+		state, _ := runtimeStringFromAny(review["state"])
+		if !strings.EqualFold(strings.TrimSpace(state), "APPROVED") {
+			continue
+		}
+		commit, ok := review["commit"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if oid, ok := runtimeStringFromAny(commit["oid"]); ok && strings.TrimSpace(oid) == headSHA {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeReviewerCheckpointApprovedForRecovery(reviews []map[string]any, login string, headSHA string, reviewDecision string) bool {
+	if runtimeHasApprovedReviewByAuthorForHead(reviews, login, headSHA) {
+		return true
+	}
+	if strings.TrimSpace(login) != "" && strings.TrimSpace(headSHA) != "" && len(reviews) > 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(reviewDecision), "APPROVED")
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {

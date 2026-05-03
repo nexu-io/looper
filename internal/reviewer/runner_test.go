@@ -89,7 +89,8 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		{name: "historical guardrail non retryable", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "review request removed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
 		{name: "manual intervention", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
-		{name: "approved pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED"}, want: false},
+		{name: "approved by current user on head", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: false},
+		{name: "approved by another user", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: true},
 		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}, want: false},
 		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
@@ -141,6 +142,126 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 				t.Fatalf("eligible = false, want true")
 			}
 		})
+	}
+}
+
+func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		seed       failedReviewerRecoverySeed
+		wantReason string
+	}{
+		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
+		{name: "max consecutive failures", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", ConsecutiveFailures: 3}, wantReason: "max_consecutive_failures"},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, wantReason: "auto_recovery_attempt_cap"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, tt.seed)
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}})
+			if err != nil {
+				t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+			}
+			if eligible {
+				t.Fatalf("eligible = true, want false")
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if github.currentLoginCalls != 0 {
+				t.Fatalf("currentLoginCalls = %d, want 0", github.currentLoginCalls)
+			}
+		})
+	}
+}
+
+func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForDeterministicBlockers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		seed       failedReviewerRecoverySeed
+		mutate     func(t *testing.T, fixture *runnerFixture, loopID string)
+		wantReason string
+	}{
+		{
+			name:       "latest queue not failed",
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			wantReason: "latest_queue_not_failed",
+			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
+				t.Helper()
+				queue, err := fixture.repos.Queue.GetLatestByLoopID(context.Background(), loopID)
+				if err != nil || queue == nil {
+					t.Fatalf("Queue.GetLatestByLoopID() = (%#v, %v), want queue", queue, err)
+				}
+				queue.Status = "queued"
+				if err := fixture.repos.Queue.Upsert(context.Background(), *queue); err != nil {
+					t.Fatalf("Queue.Upsert() error = %v", err)
+				}
+			},
+		},
+		{
+			name:       "latest run not failed",
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			wantReason: "latest_run_not_failed",
+			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
+				t.Helper()
+				run, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), loopID)
+				if err != nil || run == nil {
+					t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want run", run, err)
+				}
+				run.Status = "completed"
+				if err := fixture.repos.Runs.Upsert(context.Background(), *run); err != nil {
+					t.Fatalf("Runs.Upsert() error = %v", err)
+				}
+			},
+		},
+		{name: "manual intervention", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
+		{name: "not whitelisted", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "marker missing"}, wantReason: "not_whitelisted"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, tt.seed)
+			if tt.mutate != nil {
+				tt.mutate(t, fixture, loopID)
+			}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}})
+			if err != nil {
+				t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+			}
+			if eligible {
+				t.Fatalf("eligible = true, want false")
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if github.currentLoginCalls != 0 {
+				t.Fatalf("currentLoginCalls = %d, want 0", github.currentLoginCalls)
+			}
+		})
+	}
+}
+
+func TestSummaryFromDetailPreservesReviewsForApprovalRecovery(t *testing.T) {
+	t.Parallel()
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	summary := summaryFromDetail(PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: reviews})
+
+	if !hasApprovedReviewByAuthorForHead(summary.Reviews, "octocat", "abc123") {
+		t.Fatalf("summary reviews = %#v, want current-user approved review preserved", summary.Reviews)
 	}
 }
 
@@ -709,7 +830,28 @@ func TestRunFilterStepSkipsConflictedPullRequest(t *testing.T) {
 	}
 }
 
-func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
+func TestRunFilterStepSkipsConflictedPullRequestBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED", Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "conflicted" {
+		t.Fatalf("SkipKind = %q, want conflicted", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 0 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 0", github.currentLoginCalls)
+	}
+}
+
+func TestRunFilterStepTerminatesLegacyApprovedWithoutReviewsBeforeConflictSkip(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
@@ -733,6 +875,35 @@ func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
 	}
 	if updated.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepDoesNotTerminateWhenOnlyAnotherReviewerApproved(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_other_approved", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewDecision: "APPROVED", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind == "approved" {
+		t.Fatalf("SkipKind = %q, want no approved termination", checkpoint.SkipKind)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -763,6 +934,31 @@ func TestRunFilterStepTerminatesReadyBeforeConflictSkip(t *testing.T) {
 	}
 }
 
+func TestRunFilterStepTerminatesReadyBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_ready_login_error", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{specpr.ReadyLabel}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "ready_label" {
+		t.Fatalf("SkipKind = %q, want ready_label", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 0 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 0", github.currentLoginCalls)
+	}
+}
+
 func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -778,6 +974,30 @@ func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *tes
 	}
 	if !strings.Contains(checkpoint.SkipReason, "current user already reviewed head abc123") {
 		t.Fatalf("SkipReason = %q, want already-reviewed-by-current-user skip", checkpoint.SkipReason)
+	}
+}
+
+func TestRunFilterStepRefreshesCurrentLoginBeforeAlreadyReviewedCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-user"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "old-user"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", CurrentLogin: "old-user", ReviewRequests: []string{"new-user"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip for stale checkpoint login", checkpoint.SkipReason)
+	}
+	if checkpoint.Detail.CurrentLogin != "new-user" {
+		t.Fatalf("CurrentLogin = %q, want refreshed login", checkpoint.Detail.CurrentLogin)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
 	}
 }
 
@@ -807,6 +1027,38 @@ func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) 
 	}
 	if updated.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepRefreshesCurrentLoginBeforeApprovedCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-user"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_stale_approved", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "old-user"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", CurrentLogin: "old-user", ReviewRequests: []string{"new-user"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no termination for stale checkpoint login", checkpoint.SkipReason)
+	}
+	if checkpoint.Detail.CurrentLogin != "new-user" {
+		t.Fatalf("CurrentLogin = %q, want refreshed login", checkpoint.Detail.CurrentLogin)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -1235,7 +1487,7 @@ func TestDiscoverPullRequestsDoesNotRequeueApprovedReadyOrDraftNonActionablePRs(
 		github *fakeGitHubGateway
 		want   string
 	}{
-		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}}, want: "approved"},
+		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}, reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: "approved"},
 		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready"},
 		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft"},
 	} {
@@ -4498,6 +4750,7 @@ type fakeGitHubGateway struct {
 	reviewRequests                  []string
 	currentLogin                    string
 	currentLoginErr                 error
+	currentLoginCalls               int
 	reviewMarkerMissing             bool
 	reviewMarkerErr                 error
 	reviewMarkerEvent               ReviewEvent
@@ -4534,10 +4787,11 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	if headSHA == "" {
 		headSHA = "abc123"
 	}
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	g.currentLoginCalls++
 	if g.currentLoginErr != nil {
 		return "", g.currentLoginErr
 	}
