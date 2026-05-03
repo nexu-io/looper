@@ -3969,6 +3969,29 @@ func TestBuildReviewPromptIncludesReviewerScopeInstruction(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	for _, want := range []string{
+		"Review scope: full_pr",
+		"complete diff fetched through `gh` according to the agent-side GitHub fetch contract",
+		"supported by the fetched context",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"complete diff payload below",
+		"supported by the included context",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("prompt still contains stale embedded-context guidance %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
 func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) {
 	t.Parallel()
 

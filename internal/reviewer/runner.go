@@ -3533,7 +3533,7 @@ func shellQuote(value string) string {
 func reviewerScopeInstruction(scope config.ReviewerScope) string {
 	switch scope {
 	case config.ReviewerScopeFullPR:
-		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff payload below. You may report actionable issues anywhere in the PR diff when they are supported by the included context."
+		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff fetched through `gh` according to the agent-side GitHub fetch contract. You may report actionable issues anywhere in the PR diff when they are supported by the fetched context."
 	case config.ReviewerScopeChangedFiles:
 		return "Review scope: changed_files. Limit actionable findings to files changed by this PR. Use unchanged hunks only as context for changed files, and do not request changes in unrelated files unless the changed-file behavior cannot be fixed locally."
 	case config.ReviewerScopeChangedRanges:
