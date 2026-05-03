@@ -991,6 +991,13 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if !shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
 			continue
 		}
+		currentLoop, err := repositories.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return requeued, err
+		}
+		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
+			continue
+		}
 		recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
 		if err != nil {
 			return requeued, err
@@ -1004,7 +1011,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 				return requeued, fmt.Errorf("reviewer deferred recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
 			}
 		}
-		requeuedLoop := autoRecoveredReviewerLoop(loop, nowISO)
+		requeuedLoop := autoRecoveredReviewerLoop(*currentLoop, nowISO)
 		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 			return requeued, err
 		}
