@@ -1105,7 +1105,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -1979,9 +1979,52 @@ func hashFixItems(items []FixItem) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
-	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber)}
-	if headSHA != "" {
+func buildFixerMinimalPRSeed(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	seed := map[string]any{
+		"repo":           repo,
+		"pr_number":      prNumber,
+		"url":            fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNumber),
+		"base_ref":       "",
+		"head_ref":       "",
+		"head_sha":       detailHeadSHA(detail),
+		"expected_state": "OPEN",
+		"expected_draft": false,
+		"task_intent":    "repair_pull_request_feedback",
+		"scope": map[string]any{
+			"fix_item_ids": fixItemIDs(fixItems),
+		},
+	}
+	if detail != nil {
+		seed["base_ref"] = detail.BaseRefName
+		seed["head_ref"] = detail.HeadRefName
+		seed["expected_state"] = firstNonEmpty(strings.ToUpper(strings.TrimSpace(detail.State)), "OPEN")
+		seed["expected_draft"] = detail.IsDraft
+	}
+	encoded, _ := json.MarshalIndent(seed, "", "  ")
+	return "Minimal PR seed (authoritative handoff fields; fetch all mutable PR details yourself):\n" + string(encoded)
+}
+
+func fixItemIDs(items []FixItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, firstNonEmpty(item.ID, item.ThreadID, item.Name, item.Type))
+	}
+	return ids
+}
+
+func fixerAgentSideGitHubFetchContract() string {
+	return strings.Join([]string{
+		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume full PR diffs, full comment dumps, reviews, checks, or thread state from this prompt are complete or fresh.",
+		"Before editing and again before final conclusions or pushing, run `gh pr view --json number,state,isDraft,baseRefName,headRefName,headRefOid,url` and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+		"Fetch scoped data on demand with `gh pr diff --name-only` before selecting files, `gh pr diff -- <path>` for relevant file diffs, and `gh pr checks` only when CI status matters.",
+		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
+		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
+	}, "\n")
+}
+
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideGitHubFetchContract()}
+	if headSHA := detailHeadSHA(detail); headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
 	}
 	encodedItems := make([]string, 0, len(fixItems))

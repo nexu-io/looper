@@ -131,6 +131,13 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 		t.Fatalf("Run(prompt preview reviewer) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
 	for _, want := range []string{
+		"PR handoff contract: Looper provides a minimal PR seed by default",
+		"gh pr view --json number,state,isDraft,baseRefName,headRefName,headRefOid,url",
+		"gh pr diff --name-only",
+		"gh api repos/{owner}/{repo}/pulls/{number}/comments",
+		"gh api repos/{owner}/{repo}/pulls/{number}/reviews",
+		"gh api repos/{owner}/{repo}/issues/{number}/comments",
+		"structured auth, network, rate_limit, or pr_drift errors",
 		"trusted `looper review submit` wrapper",
 		"GitHub operation contract: submit exactly one PR review",
 		"looper:review id=... head=... outcome=clean|actionable",
