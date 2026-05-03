@@ -1470,49 +1470,63 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 
 func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 	t.Parallel()
+	tests := []struct {
+		name          string
+		loopStatus    string
+		heartbeatTime func(time.Time) string
+	}{
+		{name: "running stale heartbeat", loopStatus: "running", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-2 * time.Hour)) }},
+		{name: "paused fresh heartbeat", loopStatus: "paused", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }},
+		{name: "queued fresh heartbeat", loopStatus: "queued", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }},
+	}
 
-	workingDir := t.TempDir()
-	cfg, err := config.DefaultConfig(workingDir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
-	if err != nil {
-		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
-	}
-	defer coordinator.Close()
-	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
-		t.Fatalf("RunPending() error = %v", err)
-	}
-	repositories := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
-	nowISO := formatJavaScriptISOString(now)
-	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	repo := "powerformer/looper"
-	prNumber := int64(184)
-	targetID := "pr:powerformer/looper:184"
-	loopID := "loop_recovery_stale_latest"
-	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 185, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_latest", LoopID: loopID, Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
-	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, now)
-	if err != nil {
-		t.Fatalf("runRecoveryPipeline() error = %v", err)
-	}
-	if summary.InterruptedRunsMarked != 1 {
-		t.Fatalf("InterruptedRunsMarked = %d, want 1", summary.InterruptedRunsMarked)
-	}
-	run, _ := repositories.Runs.GetByID(context.Background(), "run_stale_latest")
-	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
-		t.Fatalf("run = %#v, want interrupted with ended_at", run)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			cfg, err := config.DefaultConfig(workingDir)
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+			}
+			defer coordinator.Close()
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repositories := storage.NewRepositories(coordinator.DB())
+			now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+			nowISO := formatJavaScriptISOString(now)
+			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+			heartbeatISO := tt.heartbeatTime(now)
+			if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "powerformer/looper"
+			prNumber := int64(184)
+			targetID := "pr:powerformer/looper:184"
+			loopID := "loop_recovery_stale_latest"
+			if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 185, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: tt.loopStatus, CreatedAt: oldISO, UpdatedAt: heartbeatISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_latest", LoopID: loopID, Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldISO, LastHeartbeatAt: &heartbeatISO, CreatedAt: oldISO, UpdatedAt: heartbeatISO}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+			summary, err := rt.runRecoveryPipeline(context.Background(), repositories, now)
+			if err != nil {
+				t.Fatalf("runRecoveryPipeline() error = %v", err)
+			}
+			if summary.InterruptedRunsMarked != 1 {
+				t.Fatalf("InterruptedRunsMarked = %d, want 1", summary.InterruptedRunsMarked)
+			}
+			run, _ := repositories.Runs.GetByID(context.Background(), "run_stale_latest")
+			if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
+				t.Fatalf("run = %#v, want interrupted with ended_at", run)
+			}
+		})
 	}
 }
 

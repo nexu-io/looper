@@ -676,12 +676,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if err != nil {
 				return RecoverySummary{}, err
 			}
-			activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, run.LoopID)
-			if err != nil {
-				return RecoverySummary{}, err
-			}
 			_, hasActiveAgent := activeAgentRunIDs[run.ID]
-			if !shouldInterruptStaleRunningRun(run, loop, latestRun, activeQueue != nil, hasActiveAgent, now) {
+			if !shouldInterruptStaleRunningRun(run, latestRun, hasActiveAgent) {
 				continue
 			}
 			if err := interruptRecoveryRun(ctx, repositories, run, loop, nowISO, "Interrupted stale/orphaned running run during looperd recovery"); err != nil {
@@ -960,48 +956,19 @@ func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Reposito
 	return repositories.Queue.Upsert(ctx, queueRecord)
 }
 
-func shouldInterruptStaleRunningRun(run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, hasActiveQueue bool, hasActiveAgent bool, now time.Time) bool {
-	_ = hasActiveQueue
+func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool) bool {
 	if run.Status != string(domain.RunStatusRunning) {
 		return false
 	}
 	if latestRun == nil || latestRun.ID != run.ID {
 		return true
 	}
-	if !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
-		return true
-	}
 	if hasActiveAgent {
 		return false
 	}
-	if loop.Status == string(domain.LoopStatusRunning) {
-		// Recovery runs during daemon startup, so a running queue item from a previous
-		// daemon is not by itself evidence of live work. Without an active agent
-		// execution there is no owned process to resume, so requeue the loop.
-		return true
-	}
-	return !recoveryRunHeartbeatIsRecent(run, now, 30*time.Minute)
-}
-
-func recoveryRunHeartbeatIsRecent(run storage.RunRecord, now time.Time, ttl time.Duration) bool {
-	if ttl <= 0 {
-		return true
-	}
-	heartbeatAt := run.LastHeartbeatAt
-	if heartbeatAt == nil || strings.TrimSpace(*heartbeatAt) == "" {
-		heartbeatAt = &run.UpdatedAt
-	}
-	if heartbeatAt == nil || strings.TrimSpace(*heartbeatAt) == "" {
-		heartbeatAt = &run.StartedAt
-	}
-	if heartbeatAt == nil || strings.TrimSpace(*heartbeatAt) == "" {
-		return false
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*heartbeatAt))
-	if err != nil {
-		return false
-	}
-	return !parsed.UTC().Before(now.UTC().Add(-ttl))
+	// Recovery runs during daemon startup, so a persisted running run without an
+	// active agent execution is orphaned regardless of loop status or heartbeat.
+	return true
 }
 
 func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositories, run storage.RunRecord, loop storage.LoopRecord, nowISO string, message string) error {
