@@ -786,7 +786,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}()
 	manual := isManualPlannerQueue(payload)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if currentLogin == "" {
+	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser) {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}

@@ -324,7 +324,7 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, loginErr: fmt.Errorf("login unavailable")}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
 
@@ -343,9 +343,12 @@ func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	if len(github.addAssigneeCalls) != 0 {
 		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment when assignee policy is disabled", github.addAssigneeCalls)
 	}
+	if github.loginCalls != 0 {
+		t.Fatalf("loginCalls = %d, want no login lookup when assignee policy is disabled", github.loginCalls)
+	}
 }
 
-func TestProcessClaimedItemExcludesCurrentUserFromRequestedReviewersWhenAssigneePolicyDisabled(t *testing.T) {
+func TestProcessClaimedItemRequestsAssigneeReviewersWhenAssigneePolicyDisabledAndLoginUnknown(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
@@ -360,8 +363,8 @@ func TestProcessClaimedItemExcludesCurrentUserFromRequestedReviewersWhenAssignee
 	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if len(github.addReviewerCalls) != 0 {
-		t.Fatalf("addReviewerCalls = %#v, want no requested reviewers after excluding octocat", github.addReviewerCalls)
+	if len(github.addReviewerCalls) != 1 || len(github.addReviewerCalls[0].Reviewers) != 1 || github.addReviewerCalls[0].Reviewers[0] != "octocat" {
+		t.Fatalf("addReviewerCalls = %#v, want assignee reviewer when current login is unknown", github.addReviewerCalls)
 	}
 }
 
@@ -892,6 +895,9 @@ type fakeGitHubGateway struct {
 	addReviewerCalls   []PullRequestReviewersInput
 	addAssigneeCalls   []IssueAssigneesInput
 	addAssigneeErr     error
+	login              string
+	loginErr           error
+	loginCalls         int
 }
 
 func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
@@ -910,7 +916,14 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 	return detail, nil
 }
 
-func (*fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	f.loginCalls++
+	if f.loginErr != nil {
+		return "", f.loginErr
+	}
+	if f.login != "" {
+		return f.login, nil
+	}
 	return "octocat", nil
 }
 
