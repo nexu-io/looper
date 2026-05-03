@@ -35,6 +35,7 @@ const (
 	apiBasePath                = "/api/v1"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
+	activeRunHeartbeatTTL      = 30 * time.Minute
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -1825,9 +1826,11 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	}
 
 	queuedLoopIDs := make(map[string]struct{})
+	activeQueueByLoopID := make(map[string]struct{})
 	for _, item := range queueItems {
 		if item.LoopID != nil && (item.Status == "queued" || item.Status == "running") {
 			queuedLoopIDs[*item.LoopID] = struct{}{}
+			activeQueueByLoopID[*item.LoopID] = struct{}{}
 		}
 	}
 
@@ -1863,6 +1866,15 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	for _, run := range activeRuns {
 		loop, ok := loopsByID[run.LoopID]
 		if !ok {
+			continue
+		}
+		latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, run.LoopID)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		_, hasActiveQueue := activeQueueByLoopID[run.LoopID]
+		hasActiveAgent := activeAgentByRunID[run.ID] != nil
+		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveQueue, hasActiveAgent, h.now().UTC()) {
 			continue
 		}
 		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
@@ -2038,6 +2050,34 @@ func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[stri
 	}
 
 	return result
+}
+
+func isPlausiblyLiveActiveRun(run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, hasActiveQueue bool, hasActiveAgent bool, now time.Time) bool {
+	if latestRun == nil || latestRun.ID != run.ID {
+		return false
+	}
+	if !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+		return false
+	}
+	if hasActiveQueue || hasActiveAgent {
+		return true
+	}
+	return runHeartbeatIsRecent(run, now, activeRunHeartbeatTTL)
+}
+
+func runHeartbeatIsRecent(run storage.RunRecord, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
+	}
+	heartbeatAt := firstNonEmptyString(run.LastHeartbeatAt, stringPtrOrNil(run.UpdatedAt), stringPtrOrNil(run.StartedAt))
+	if heartbeatAt == nil || strings.TrimSpace(*heartbeatAt) == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*heartbeatAt))
+	if err != nil {
+		return false
+	}
+	return !parsed.UTC().Before(now.UTC().Add(-ttl))
 }
 
 func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.LoopRecord) (activeRunTarget, bool, error) {

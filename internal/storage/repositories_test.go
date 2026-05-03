@@ -518,14 +518,16 @@ func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
+	for index, loopID := range []string{"loop_1", "loop_2", "loop_3"} {
+		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: int64(index + 1), ProjectID: "project_1", Type: "reviewer", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
 	}
 
 	for _, run := range []RunRecord{
 		{ID: "run_1", LoopID: "loop_1", Status: "running", StartedAt: "2026-04-11T12:00:00.000Z", CreatedAt: now, UpdatedAt: now},
-		{ID: "run_3", LoopID: "loop_1", Status: "running", StartedAt: "2026-04-11T12:00:00.000Z", CreatedAt: now, UpdatedAt: now},
-		{ID: "run_2", LoopID: "loop_1", Status: "running", StartedAt: "2026-04-11T12:01:00.000Z", CreatedAt: now, UpdatedAt: now},
+		{ID: "run_3", LoopID: "loop_3", Status: "running", StartedAt: "2026-04-11T12:00:00.000Z", CreatedAt: now, UpdatedAt: now},
+		{ID: "run_2", LoopID: "loop_2", Status: "running", StartedAt: "2026-04-11T12:01:00.000Z", CreatedAt: now, UpdatedAt: now},
 	} {
 		if err := repos.Runs.Upsert(ctx, run); err != nil {
 			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
@@ -546,6 +548,33 @@ func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("Runs.ListByStatus() order = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestRunsEnforceOneRunningRunPerLoop(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_running_unique", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_running_unique", ProjectID: "project_running_unique", Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_running_unique_1", LoopID: "loop_running_unique", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("first Runs.Upsert() error = %v", err)
+	}
+	if hasRunning, err := repos.Runs.HasRunningByLoopID(ctx, "loop_running_unique"); err != nil || !hasRunning {
+		t.Fatalf("HasRunningByLoopID() = %v, %v; want true, nil", hasRunning, err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_running_unique_2", LoopID: "loop_running_unique", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err == nil {
+		t.Fatal("second running Runs.Upsert() error = nil, want unique constraint failure")
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_running_unique_2", LoopID: "loop_running_unique", Status: "success", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("terminal Runs.Upsert() error = %v", err)
 	}
 }
 

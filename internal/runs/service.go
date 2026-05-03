@@ -60,11 +60,11 @@ func (s *Service) StartRun(ctx context.Context, input StartInput) (storage.RunRe
 		if loop == nil {
 			return storage.RunRecord{}, fmt.Errorf("loop not found: %s", input.LoopID)
 		}
-		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, input.LoopID)
+		hasRunningRun, err := repos.Runs.HasRunningByLoopID(ctx, input.LoopID)
 		if err != nil {
 			return storage.RunRecord{}, err
 		}
-		if latestRun != nil && latestRun.Status == string(domain.RunStatusRunning) {
+		if hasRunningRun {
 			return storage.RunRecord{}, fmt.Errorf("loop %s already has a running run", input.LoopID)
 		}
 		if loop.Status != string(domain.LoopStatusRunning) {

@@ -522,6 +522,78 @@ func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(
 	}
 }
 
+func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) {
+	t.Parallel()
+
+	if len(EmbeddedMigrations) < 8 || EmbeddedMigrations[7].ID != "0008_one_running_run_per_loop" {
+		t.Fatalf("EmbeddedMigrations[7] = %#v, want 0008_one_running_run_per_loop", EmbeddedMigrations[7])
+	}
+
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+	seedRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:7]})
+	if _, err := seedRunner.RunPending(ctx); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+
+	repos := NewRepositories(db)
+	now := "2026-04-17T12:00:00.000Z"
+	oldAt := "2026-04-17T10:00:00.000Z"
+	newAt := "2026-04-17T11:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_migration_0008", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for _, loop := range []LoopRecord{
+		{ID: "loop_older_running", Seq: 1, ProjectID: "project_migration_0008", Type: "fixer", TargetType: "pull_request", Status: "completed", CreatedAt: oldAt, UpdatedAt: newAt},
+		{ID: "loop_terminal_running", Seq: 2, ProjectID: "project_migration_0008", Type: "fixer", TargetType: "pull_request", Status: "completed", CreatedAt: oldAt, UpdatedAt: newAt},
+		{ID: "loop_duplicate_running", Seq: 3, ProjectID: "project_migration_0008", Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: oldAt, UpdatedAt: newAt},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	for _, run := range []RunRecord{
+		{ID: "run_older_running", LoopID: "loop_older_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
+		{ID: "run_newer_success", LoopID: "loop_older_running", Status: "success", StartedAt: newAt, EndedAt: &newAt, CreatedAt: newAt, UpdatedAt: newAt},
+		{ID: "run_terminal_running", LoopID: "loop_terminal_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
+		{ID: "run_duplicate_old", LoopID: "loop_duplicate_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
+		{ID: "run_duplicate_new", LoopID: "loop_duplicate_running", Status: "running", StartedAt: newAt, CreatedAt: newAt, UpdatedAt: newAt},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+
+	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations})
+	result, err := migrationRunner.RunPending(ctx)
+	if err != nil {
+		t.Fatalf("RunPending() applying 0008 error = %v", err)
+	}
+	if !reflect.DeepEqual(result.AppliedIDs, []string{"0008_one_running_run_per_loop"}) {
+		t.Fatalf("RunPending().AppliedIDs = %v, want [0008_one_running_run_per_loop]", result.AppliedIDs)
+	}
+
+	for _, runID := range []string{"run_older_running", "run_terminal_running", "run_duplicate_old"} {
+		run, err := repos.Runs.GetByID(ctx, runID)
+		if err != nil {
+			t.Fatalf("Runs.GetByID(%s) error = %v", runID, err)
+		}
+		if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
+			t.Fatalf("Runs.GetByID(%s) = %#v, want interrupted with ended_at", runID, run)
+		}
+	}
+	run, err := repos.Runs.GetByID(ctx, "run_duplicate_new")
+	if err != nil {
+		t.Fatalf("Runs.GetByID(run_duplicate_new) error = %v", err)
+	}
+	if run == nil || run.Status != "running" {
+		t.Fatalf("run_duplicate_new = %#v, want remaining running run", run)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_duplicate_extra", LoopID: "loop_duplicate_running", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err == nil {
+		t.Fatal("Runs.Upsert(extra running) error = nil, want unique index failure")
+	}
+}
+
 func openTestSQLiteDB(t *testing.T) *sql.DB {
 	t.Helper()
 
