@@ -1002,6 +1002,98 @@ func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+	oldISO := formatJavaScriptISOString(startedAt.Add(-2 * time.Hour))
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	repo := "powerformer/looper"
+	prNumber := int64(186)
+	targetID := "pr:powerformer/looper:186"
+	loopID := "loop_mismatched_agent_running"
+	runID := "run_mismatched_agent_running"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 186, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() seed error = %v", err)
+	}
+	pid := int64(4343)
+	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:             "agent_mismatched_running_run",
+		ProjectID:      stringPtr("project_1"),
+		LoopID:         &loopID,
+		RunID:          &runID,
+		Vendor:         "codex",
+		Status:         "running",
+		PID:            &pid,
+		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
+		CWD:            stringPtr(workingDir),
+		HeartbeatCount: 0,
+		StartedAt:      oldISO,
+		CreatedAt:      oldISO,
+		UpdatedAt:      oldISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			return "python unrelated.py", nil
+		},
+		SignalProcess: func(int, syscall.Signal) error {
+			return nil
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
+		t.Fatalf("Runs.GetByID(%s) = %#v, want interrupted with ended_at", runID, run)
+	}
+	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_mismatched_running_run")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if agentExecution == nil || agentExecution.Status != "running" {
+		t.Fatalf("AgentExecutions.GetByID(agent_mismatched_running_run) = %#v, want still running stale row", agentExecution)
+	}
+	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 1 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary() = %#v, want interrupted run without cleaned orphan agent", recovery)
+	}
+}
+
 func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
 	t.Parallel()
 

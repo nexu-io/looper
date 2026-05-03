@@ -663,7 +663,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 		activeAgentRunIDs := make(map[string]struct{}, len(activeExecutions))
 		for _, execution := range activeExecutions {
-			if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+			if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
+				continue
+			}
+			matches, running, err := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+			if err != nil {
+				if r.logger != nil {
+					r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+				}
+				continue
+			}
+			if running && matches {
 				activeAgentRunIDs[*execution.RunID] = struct{}{}
 			}
 		}
