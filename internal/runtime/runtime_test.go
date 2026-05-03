@@ -1394,7 +1394,7 @@ func TestRunRecoveryPipelineAutoRecoversFailedReviewerGuardrailLoop(t *testing.T
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
-	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, now)
+	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
 	if err != nil {
 		t.Fatalf("runRecoveryPipeline() error = %v", err)
 	}
@@ -1406,7 +1406,7 @@ func TestRunRecoveryPipelineAutoRecoversFailedReviewerGuardrailLoop(t *testing.T
 	if loop == nil || loop.Status != "queued" || queue == nil || queue.Status != "queued" {
 		t.Fatalf("loop=%#v queue=%#v, want recovered queued loop and queue", loop, queue)
 	}
-	summary, err = rt.runRecoveryPipeline(context.Background(), repositories, now)
+	summary, err = rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
 	if err != nil {
 		t.Fatalf("second runRecoveryPipeline() error = %v", err)
 	}
@@ -1534,6 +1534,22 @@ func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *test
 	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
 	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
 	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3}
+
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
+	}
+}
+
+func TestShouldAutoRecoverFailedReviewerLoopUsesRefreshedCurrentLogin(t *testing.T) {
+	t.Parallel()
+	errorKind := "retryable_after_resume"
+	errorMessage := "PR head changed before publish: expected old, got new"
+	step := "publish"
+	checkpoint := `{"resumePolicy":"restart_from_discover","detail":{"state":"OPEN","reviewDecision":"APPROVED","headSha":"abc123","currentLogin":"octocat","reviews":[{"author":{"login":"octocat"},"state":"APPROVED","commit":{"oid":"abc123"}}],"labels":[]}}`
+	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
+	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
+	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
+	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3, currentLogin: "other"}
 
 	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
 		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
