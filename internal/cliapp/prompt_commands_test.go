@@ -132,11 +132,13 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"PR handoff contract: Looper provides a minimal PR seed by default",
-		"gh pr view --json number,state,isDraft,baseRefName,headRefName,headRefOid,url",
-		"gh pr diff --name-only",
-		"gh api repos/{owner}/{repo}/pulls/{number}/comments",
-		"gh api repos/{owner}/{repo}/pulls/{number}/reviews",
-		"gh api repos/{owner}/{repo}/issues/{number}/comments",
+		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr diff <pr-url> -R <repo> --name-only",
+		"gh pr diff <pr-url> -R <repo> --patch",
+		"git diff <base>...<head> -- <path>",
+		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
+		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
+		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
 		"structured auth, network, rate_limit, or pr_drift errors",
 		"trusted `looper review submit` wrapper",
 		"GitHub operation contract: submit exactly one PR review",
@@ -146,7 +148,7 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
 		}
 	}
-	for _, notWant := range []string{"git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request"} {
+	for _, notWant := range []string{"gh pr diff -- <path>", "git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request"} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("reviewer prompt preview included generic git/PR lifecycle text %q:\n%s", notWant, stdout)
 		}

@@ -3769,9 +3769,10 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"\"pr_number\": 42",
 		"\"head_sha\": \"abc123\"",
 		"Agent-side GitHub fetch contract",
-		"gh pr view --json number,state,isDraft,baseRefName,headRefName,headRefOid,url",
-		"gh pr diff --name-only",
-		"gh pr diff -- <path>",
+		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr diff <pr-url> -R <repo> --name-only",
+		"gh pr diff <pr-url> -R <repo> --patch",
+		"git diff <base>...<head> -- <path>",
 		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
 		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
@@ -3894,13 +3895,15 @@ func TestBuildReviewPromptUsesMinimalSeedInsteadOfEmbeddedDiff(t *testing.T) {
 		"\"pr_number\": 42",
 		"\"head_sha\": \"abc123\"",
 		"fetch all mutable PR details yourself",
-		"gh pr diff -- <path>",
+		"gh pr diff <pr-url> -R <repo> --patch",
+		"git diff <base>...<head> -- <path>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
 	for _, forbidden := range []string{
+		"gh pr diff -- <path>",
 		"ANCHORABLE DIFF LOCATIONS",
 		"Diff:\n" + diff,
 		"docs/spec.md RIGHT lines 4-7",

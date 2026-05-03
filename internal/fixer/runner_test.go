@@ -58,9 +58,10 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"\"head_sha\": \"abc123\"",
 		"\"task_intent\": \"repair_pull_request_feedback\"",
 		"\"fix_item_ids\"",
-		"gh pr view --json number,state,isDraft,baseRefName,headRefName,headRefOid,url",
-		"gh pr diff --name-only",
-		"gh pr diff -- <path>",
+		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr diff <pr-url> -R <repo> --name-only",
+		"gh pr diff <pr-url> -R <repo> --patch",
+		"git diff <base>...<head> -- <path>",
 		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
 		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
@@ -69,6 +70,9 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+	if strings.Contains(prompt, "gh pr diff -- <path>") {
+		t.Fatalf("prompt contains unsupported gh pr diff pathspec instruction:\n%s", prompt)
 	}
 }
 
