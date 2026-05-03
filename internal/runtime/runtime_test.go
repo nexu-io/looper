@@ -1471,13 +1471,16 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name          string
-		loopStatus    string
-		heartbeatTime func(time.Time) string
+		name           string
+		loopStatus     string
+		heartbeatTime  func(time.Time) string
+		hasActiveQueue bool
 	}{
 		{name: "running stale heartbeat", loopStatus: "running", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-2 * time.Hour)) }},
 		{name: "paused fresh heartbeat", loopStatus: "paused", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }},
 		{name: "queued fresh heartbeat", loopStatus: "queued", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }},
+		{name: "paused fresh heartbeat with active queue", loopStatus: "paused", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }, hasActiveQueue: true},
+		{name: "queued fresh heartbeat with active queue", loopStatus: "queued", heartbeatTime: func(now time.Time) string { return formatJavaScriptISOString(now.Add(-5 * time.Minute)) }, hasActiveQueue: true},
 	}
 
 	for _, tt := range tests {
@@ -1513,6 +1516,11 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 			}
 			if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_latest", LoopID: loopID, Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldISO, LastHeartbeatAt: &heartbeatISO, CreatedAt: oldISO, UpdatedAt: heartbeatISO}); err != nil {
 				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			if tt.hasActiveQueue {
+				if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_stale_latest", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_recovery_stale_latest:powerformer/looper:184", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+					t.Fatalf("Queue.Upsert() error = %v", err)
+				}
 			}
 			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 			summary, err := rt.runRecoveryPipeline(context.Background(), repositories, now)
