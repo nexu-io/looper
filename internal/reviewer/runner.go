@@ -1164,7 +1164,28 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	currentLogin := ""
-	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && (r.loopConfig.StopOnApproved || r.discoveryPolicy.RequireReviewRequest) {
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && len(checkpoint.Detail.Reviews) == 0 && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "approved"
+		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
+			return checkpoint, err
+		}
+		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "ready_label"
+		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
+			return checkpoint, err
+		}
+		return checkpoint, nil
+	}
+	if checkpoint.Detail.HasConflicts {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "conflicted"
+		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
 		if currentLogin == "" {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -1181,19 +1202,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			}
 			return checkpoint, nil
 		}
-	}
-	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
-		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
-		checkpoint.SkipKind = "ready_label"
-		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
-			return checkpoint, err
-		}
-		return checkpoint, nil
-	}
-	if checkpoint.Detail.HasConflicts {
-		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
-		checkpoint.SkipKind = "conflicted"
-		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
 		if currentLogin == "" {

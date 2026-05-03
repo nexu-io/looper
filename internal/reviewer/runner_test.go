@@ -721,7 +721,28 @@ func TestRunFilterStepSkipsConflictedPullRequest(t *testing.T) {
 	}
 }
 
-func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
+func TestRunFilterStepSkipsConflictedPullRequestBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED", Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "conflicted" {
+		t.Fatalf("SkipKind = %q, want conflicted", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 0 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 0", github.currentLoginCalls)
+	}
+}
+
+func TestRunFilterStepTerminatesLegacyApprovedWithoutReviewsBeforeConflictSkip(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
@@ -732,9 +753,7 @@ func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
-
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED", Reviews: reviews}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED"}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -803,6 +822,31 @@ func TestRunFilterStepTerminatesReadyBeforeConflictSkip(t *testing.T) {
 	}
 	if updated.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepTerminatesReadyBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_ready_login_error", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{specpr.ReadyLabel}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "ready_label" {
+		t.Fatalf("SkipKind = %q, want ready_label", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 0 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 0", github.currentLoginCalls)
 	}
 }
 
