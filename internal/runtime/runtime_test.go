@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -1091,6 +1092,107 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 	}
 	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 1 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
 		t.Fatalf("RecoverySummary() = %#v, want interrupted run without cleaned orphan agent", recovery)
+	}
+}
+
+func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+	oldISO := formatJavaScriptISOString(startedAt.Add(-2 * time.Hour))
+
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	repo := "powerformer/looper"
+	prNumber := int64(186)
+	targetID := "pr:powerformer/looper:186"
+	loopID := "loop_active_agent_running"
+	runID := "run_active_agent_running"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 186, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() seed error = %v", err)
+	}
+	pid := int64(4444)
+	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:             "agent_active_running_run",
+		ProjectID:      stringPtr("project_1"),
+		LoopID:         &loopID,
+		RunID:          &runID,
+		Vendor:         "codex",
+		Status:         "running",
+		PID:            &pid,
+		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
+		CWD:            stringPtr(workingDir),
+		HeartbeatCount: 0,
+		StartedAt:      oldISO,
+		CreatedAt:      oldISO,
+		UpdatedAt:      oldISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator close error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return startedAt
+		},
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			return "codex exec", nil
+		},
+		SignalProcess: func(int, syscall.Signal) error {
+			return errors.New("process cleanup skipped")
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	services := rt.Services()
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loopID, loop)
+	}
+	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run == nil || run.Status != "running" || run.EndedAt != nil {
+		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", runID, run)
+	}
+	queueItems, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	for _, item := range queueItems {
+		if item.LoopID != nil && *item.LoopID == loopID {
+			t.Fatalf("unexpected queue item for active running loop: %#v", item)
+		}
+	}
+	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary() = %#v, want no run interruption or loop requeue while active agent remains", recovery)
 	}
 }
 

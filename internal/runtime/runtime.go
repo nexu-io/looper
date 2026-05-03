@@ -652,12 +652,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	for _, loop := range loops {
 		loopsByID[loop.ID] = loop
 	}
+	activeAgentRunIDs := make(map[string]struct{})
 	if repositories.Runs != nil {
 		runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		activeAgentRunIDs := make(map[string]struct{})
 		if repositories.AgentExecutions != nil {
 			activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 			if err != nil {
@@ -760,7 +760,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			continue
 		}
 
-		if shouldRequeueLoop(loop, latestRun) {
+		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
+		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
 			requeuedLoop.NextRunAt = stringPtr(nowISO)
@@ -1586,7 +1587,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
+func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasActiveAgent bool) bool {
 	if loop.Status == "paused" {
 		return false
 	}
@@ -1596,8 +1597,18 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bo
 	if latestRun == nil {
 		return loop.Status == "running"
 	}
+	if latestRun.Status == string(domain.RunStatusRunning) && latestRunHasActiveAgent {
+		return false
+	}
 
 	return loop.Status == "running" || latestRun.Status == "interrupted"
+}
+
+func derefRunID(run *storage.RunRecord) string {
+	if run == nil {
+		return ""
+	}
+	return run.ID
 }
 
 func normalizeStaleQueuedLoopStatus(latestRun storage.RunRecord) string {
