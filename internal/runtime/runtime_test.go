@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -1884,6 +1887,114 @@ func TestCanRefreshReviewerLoginForRecovery(t *testing.T) {
 	}
 }
 
+func TestRunRecoveryPipelineDefersReviewerLoginRefresh(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	projectOneRepoPath := filepath.Join(workingDir, "repo-one")
+	projectTwoRepoPath := filepath.Join(workingDir, "repo-two")
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper One", RepoPath: projectOneRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Looper Two", RepoPath: projectTwoRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_a", 1, nowISO)
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_b", 2, nowISO)
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_2", "loop_project2_a", 3, nowISO)
+
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		t.Fatal("startup recovery should not call gh api user")
+		return shell.Result{}, nil
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, githubGateway, now)
+	if err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	if summary.LoopsRequeued != 0 {
+		t.Fatalf("LoopsRequeued = %d, want 0 for reviewer loops needing fresh login", summary.LoopsRequeued)
+	}
+	assertLoopStatus(t, repositories, "loop_project1_a", "failed")
+	assertLoopStatus(t, repositories, "loop_project1_b", "failed")
+	assertLoopStatus(t, repositories, "loop_project2_a", "failed")
+}
+
+func TestDeferredReviewerRecoveryRefreshesLoginAtMostOncePerProject(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	projectOneRepoPath := filepath.Join(workingDir, "repo-one")
+	projectTwoRepoPath := filepath.Join(workingDir, "repo-two")
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper One", RepoPath: projectOneRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Looper Two", RepoPath: projectTwoRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_a", 1, nowISO)
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_b", 2, nowISO)
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_2", "loop_project2_a", 3, nowISO)
+
+	var mu sync.Mutex
+	loginCallsByCWD := map[string]int{}
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		mu.Lock()
+		loginCallsByCWD[options.CWD]++
+		mu.Unlock()
+		return shell.Result{Stdout: "other\n"}, nil
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	requeued, err := rt.runDeferredReviewerRecovery(context.Background(), repositories, githubGateway, now)
+	if err != nil {
+		t.Fatalf("runDeferredReviewerRecovery() error = %v", err)
+	}
+	if requeued != 3 {
+		t.Fatalf("runDeferredReviewerRecovery() = %d, want 3", requeued)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := loginCallsByCWD[projectOneRepoPath]; got != 1 {
+		t.Fatalf("GetCurrentUserLogin() calls for %q = %d, want 1", projectOneRepoPath, got)
+	}
+	if got := loginCallsByCWD[projectTwoRepoPath]; got != 1 {
+		t.Fatalf("GetCurrentUserLogin() calls for %q = %d, want 1", projectTwoRepoPath, got)
+	}
+	if len(loginCallsByCWD) != 2 {
+		t.Fatalf("GetCurrentUserLogin() call map = %#v, want exactly two project repo paths", loginCallsByCWD)
+	}
+	assertLoopStatus(t, repositories, "loop_project1_a", "queued")
+	assertLoopStatus(t, repositories, "loop_project1_b", "queued")
+	assertLoopStatus(t, repositories, "loop_project2_a", "queued")
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopUsesRefreshedCurrentLogin(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"
@@ -2090,6 +2201,34 @@ func seedLoopWithRun(t *testing.T, repos *storage.Repositories, projectID, loopI
 	}); err != nil {
 		t.Fatalf("Runs.Upsert(%s) error = %v", loopID, err)
 	}
+}
+
+func seedFailedReviewerRecoveryLoop(t *testing.T, repos *storage.Repositories, projectID, loopID string, seq int64, nowISO string) {
+	t.Helper()
+
+	repo := "acme/looper"
+	prNumber := int64(42 + seq)
+	targetID := "pr:acme/looper:" + mustFormatInt64(prNumber)
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"enabled": true, "failureCount": 1, "consecutiveFailures": 1, "lastFailure": "PR head changed before publish"}})
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: seq, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+	}
+	step := "publish"
+	errorMessage := "PR head changed before publish: expected old, got new"
+	checkpoint := `{"resumePolicy":"restart_from_discover","detail":{"state":"OPEN","reviewDecision":"APPROVED","headSha":"abc123","currentLogin":"octocat","reviews":[{"author":{"login":"octocat"},"state":"APPROVED","commit":{"oid":"abc123"}}],"labels":[]}}`
+	runID := "run_" + loopID
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert(%s) error = %v", runID, err)
+	}
+	queueKind := "retryable_after_resume"
+	queueID := "queue_" + loopID
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:" + projectID + ":" + loopID + ":acme/looper:" + mustFormatInt64(prNumber), Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert(%s) error = %v", queueID, err)
+	}
+}
+
+func mustFormatInt64(value int64) string {
+	return strconv.FormatInt(value, 10)
 }
 
 func assertLoopStatus(t *testing.T, repos *storage.Repositories, loopID, want string) {

@@ -18,7 +18,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const daemonCommandTimeout = 5 * time.Second
+const (
+	daemonCommandTimeout       = 5 * time.Second
+	daemonStartReadyTimeout    = 30 * time.Second
+	daemonStartReadyPollPeriod = 100 * time.Millisecond
+)
 
 type commandExecutionResult struct {
 	Stdout   string
@@ -206,7 +210,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Failed to start looperd: process did not report a pid")
 	}
 
-	err = r.waitForDaemonReady(ctx, client, pid, startupLogPath, apiURL, 5*time.Second, 100*time.Millisecond)
+	err = r.waitForDaemonReady(ctx, client, pid, startupLogPath, apiURL, r.daemonStartReadyTimeout(), daemonStartReadyPollPeriod)
 	if err != nil {
 		if r.isProcessAlive(pid) {
 			_ = r.killProcess(pid, int(syscall.SIGTERM))
@@ -233,6 +237,13 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal and does not provide full background supervision.")
 	return err
+}
+
+func (r *commandRuntime) daemonStartReadyTimeout() time.Duration {
+	if r.app != nil && r.app.deps.DaemonStartTimeout > 0 {
+		return r.app.deps.DaemonStartTimeout
+	}
+	return daemonStartReadyTimeout
 }
 
 func (r *commandRuntime) daemonSpawnCallerCWD(args []string, env []string) (string, error) {

@@ -896,9 +896,10 @@ func TestDaemonStartReadinessTimeoutTerminatesSpawnedProcessAndRemovesPIDFile(t 
 		signal int
 	}, 0, 8)
 	app := New(Deps{
-		Stdout:  stdout,
-		Stderr:  stderr,
-		HomeDir: homeDir,
+		Stdout:             stdout,
+		Stderr:             stderr,
+		HomeDir:            homeDir,
+		DaemonStartTimeout: 200 * time.Millisecond,
 		ReadFile: func(path string) ([]byte, error) {
 			return nil, os.ErrNotExist
 		},

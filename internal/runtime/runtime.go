@@ -101,8 +101,12 @@ type Runtime struct {
 	schedulerWake    chan struct{}
 	schedulerCancel  context.CancelFunc
 	schedulerTasks   *schedulerTaskTracker
+	recoveryCancel   context.CancelFunc
+	recoveryDone     chan struct{}
 	activeExecutions *ActiveExecutionRegistry
 }
+
+const reviewerRecoveryLoginTimeout = 3 * time.Second
 
 func New(options Options) *Runtime {
 	now := options.Now
@@ -188,6 +192,7 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		r.stopDeferredReviewerRecovery()
 		r.stopSchedulerLoop()
 
 		r.mu.Lock()
@@ -346,7 +351,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	if err := r.syncConfiguredProjects(ctx, repositories, r.config, startedAt); err != nil {
 		return err
 	}
-	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, startedAt)
+	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, nil, startedAt)
 	if err != nil {
 		return err
 	}
@@ -386,6 +391,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	if !schedulerDisabled {
 		r.startSchedulerLoop()
 	}
+	r.startDeferredReviewerRecovery(githubGateway)
 
 	started = true
 
@@ -489,6 +495,65 @@ func (r *Runtime) stopSchedulerLoop() {
 		r.schedulerTasks = nil
 	}
 	r.mu.Unlock()
+}
+
+func (r *Runtime) startDeferredReviewerRecovery(githubGateway *githubinfra.Gateway) {
+	if githubGateway == nil {
+		return
+	}
+	services := r.Services()
+	if services.Repositories == nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	r.mu.Lock()
+	r.recoveryCancel = cancel
+	r.recoveryDone = done
+	r.mu.Unlock()
+
+	go func(repositories *storage.Repositories) {
+		defer close(done)
+		requeued, err := r.runDeferredReviewerRecovery(ctx, repositories, githubGateway, r.now().UTC())
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if r.logger != nil {
+				r.logger.Warn("looperd deferred reviewer recovery failed", map[string]any{"error": err.Error()})
+			}
+			return
+		}
+		if requeued > 0 && r.logger != nil {
+			r.logger.Info("looperd deferred reviewer recovery completed", map[string]any{"loopsRequeued": requeued})
+		}
+	}(services.Repositories)
+}
+
+func (r *Runtime) stopDeferredReviewerRecovery() {
+	r.mu.Lock()
+	cancel := r.recoveryCancel
+	done := r.recoveryDone
+	r.recoveryCancel = nil
+	r.recoveryDone = nil
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(r.shutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		if r.logger != nil {
+			r.logger.Warn("looperd stop timed out waiting for deferred reviewer recovery", map[string]any{"timeoutMs": r.shutdownTimeout.Milliseconds()})
+		}
+	}
 }
 
 func (r *Runtime) TriggerSchedulerTick() {
@@ -716,10 +781,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
 			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
 		}
-		if canRefreshReviewerLoginForRecovery(loop, latestRun) {
-			if login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy); ok {
-				policy.currentLogin = login
-			}
+		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
+			continue
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
 			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
@@ -881,6 +944,92 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.EventsWritten = eventsWritten
 
 	return summary, nil
+}
+
+func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, now time.Time) (int64, error) {
+	if repositories == nil || githubGateway == nil {
+		return 0, nil
+	}
+	nowISO := formatJavaScriptISOString(now)
+	loops, err := repositories.Loops.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	reviewerLoginByProjectID := make(map[string]*string)
+	requeued := int64(0)
+	for _, loop := range loops {
+		if err := ctx.Err(); err != nil {
+			return requeued, err
+		}
+		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return requeued, err
+		}
+		latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return requeued, err
+		}
+		policy := runtimeReviewerRecoveryPolicy{
+			includeDrafts:          r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			stopOnApproved:         r.config.Reviewer.Loop.StopOnApproved,
+			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
+			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
+		}
+		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
+			continue
+		}
+		if _, cached := reviewerLoginByProjectID[loop.ProjectID]; !cached {
+			login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy)
+			if ok {
+				reviewerLoginByProjectID[loop.ProjectID] = stringPtr(login)
+			} else {
+				reviewerLoginByProjectID[loop.ProjectID] = nil
+			}
+		}
+		cachedLogin := reviewerLoginByProjectID[loop.ProjectID]
+		if cachedLogin == nil {
+			continue
+		}
+		policy.currentLogin = *cachedLogin
+		if !shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
+			continue
+		}
+		recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
+		if err != nil {
+			return requeued, err
+		}
+		if recoveredQueueItems == 0 {
+			active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if activeErr != nil {
+				return requeued, activeErr
+			}
+			if active == nil {
+				return requeued, fmt.Errorf("reviewer deferred recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
+			}
+		}
+		requeuedLoop := autoRecoveredReviewerLoop(loop, nowISO)
+		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+			return requeued, err
+		}
+		requeued += 1
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.reviewer_auto_recovered",
+			LoopID:     stringPtr(loop.ID),
+			EntityType: stringPtr("loop"),
+			EntityID:   stringPtr(loop.ID),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"previousStatus":      loop.Status,
+				"nextRunAt":           nowISO,
+				"recoveredQueueItems": recoveredQueueItems,
+				"deferred":            true,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return requeued, err
+		}
+	}
+	return requeued, nil
 }
 
 func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) error {
@@ -1373,7 +1522,9 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 	if project == nil || strings.TrimSpace(project.RepoPath) == "" {
 		return "", false
 	}
-	login, err := githubGateway.GetCurrentUserLogin(ctx, project.RepoPath)
+	loginCtx, cancel := context.WithTimeout(ctx, reviewerRecoveryLoginTimeout)
+	defer cancel()
+	login, err := githubGateway.GetCurrentUserLogin(loginCtx, project.RepoPath)
 	if err != nil {
 		if r.logger != nil {
 			r.logger.Warn("failed to refresh reviewer login during recovery", map[string]any{"loopId": loop.ID, "projectId": loop.ProjectID, "error": err.Error()})
@@ -1389,6 +1540,14 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 
 func canRefreshReviewerLoginForRecovery(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
 	return loop.Type == string(domain.LoopTypeReviewer) && loop.Status == "failed" && latestRun != nil && latestRun.Status == "failed"
+}
+
+func reviewerRecoveryNeedsFreshLogin(loop storage.LoopRecord, latestRun *storage.RunRecord, policy runtimeReviewerRecoveryPolicy) bool {
+	if !canRefreshReviewerLoginForRecovery(loop, latestRun) || !policy.stopOnApproved || latestRun == nil {
+		return false
+	}
+	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
+	return checkpoint.Detail != nil && len(checkpoint.Detail.Reviews) > 0
 }
 
 func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, policy runtimeReviewerRecoveryPolicy) bool {

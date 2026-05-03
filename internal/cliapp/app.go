@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/version"
@@ -33,6 +34,11 @@ type Deps struct {
 	Sleep          sleepFunc
 	Getwd          getwdFunc
 	ExecutablePath string
+
+	// DaemonStartTimeout overrides how long daemon start/restart waits for the
+	// spawned looperd process to become API-ready. It is primarily intended for
+	// tests; production uses the CLI default.
+	DaemonStartTimeout time.Duration
 }
 
 type App struct {
