@@ -145,6 +145,43 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 	}
 }
 
+func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		seed       failedReviewerRecoverySeed
+		wantReason string
+	}{
+		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
+		{name: "max consecutive failures", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", ConsecutiveFailures: 3}, wantReason: "max_consecutive_failures"},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, wantReason: "auto_recovery_attempt_cap"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, tt.seed)
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}})
+			if err != nil {
+				t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+			}
+			if eligible {
+				t.Fatalf("eligible = true, want false")
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if github.currentLoginCalls != 0 {
+				t.Fatalf("currentLoginCalls = %d, want 0", github.currentLoginCalls)
+			}
+		})
+	}
+}
+
 func TestSummaryFromDetailPreservesReviewsForApprovalRecovery(t *testing.T) {
 	t.Parallel()
 	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}

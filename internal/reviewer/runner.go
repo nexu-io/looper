@@ -2435,15 +2435,6 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if !r.discoveryPolicy.IncludeDrafts && pr.IsDraft {
 		return false, "", "draft_pr", nil
 	}
-	if r.loopConfig.StopOnApproved && len(pr.Reviews) > 0 {
-		currentLogin, err := r.currentLoginForLoop(ctx, loop)
-		if err != nil {
-			return false, "", "", err
-		}
-		if hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA) {
-			return false, "", "approved", nil
-		}
-	}
 	if r.loopConfig.StopOnReadyLabel && specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
 		return false, "", "ready_label", nil
 	}
@@ -2460,6 +2451,15 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	}
 	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
 		return false, "", "auto_recovery_attempt_cap", nil
+	}
+	if r.loopConfig.StopOnApproved && len(pr.Reviews) > 0 {
+		currentLogin, err := r.currentLoginForLoop(ctx, loop)
+		if err != nil {
+			return false, "", "", err
+		}
+		if hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA) {
+			return false, "", "approved", nil
+		}
 	}
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
