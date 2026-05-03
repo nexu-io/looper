@@ -232,6 +232,96 @@ func TestLoadFileSupportsCustomInstructions(t *testing.T) {
 	}
 }
 
+func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {
+			"worker": {"autoDiscovery": false, "triggers": {"labels": ["global"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global worker guidance."},
+			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "labels": ["review"], "labelMode": "all"}}
+		},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"roles": {
+				"worker": {"autoDiscovery": true, "triggers": {"labels": ["project"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project worker guidance."},
+				"reviewer": {"triggers": {"includeDrafts": true}}
+			}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	global := ProjectRoleConfigs(loaded.Config, "missing")
+	if global.Worker.AutoDiscovery || !reflectStringSlicesEqual(global.Worker.Triggers.Labels, []string{"global"}) || !global.Worker.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("global worker roles = %#v", global.Worker)
+	}
+
+	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
+	if !projectRoles.Worker.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Worker.Triggers.Labels, []string{"project"}) || projectRoles.Worker.Triggers.LabelMode != LabelModeAny || projectRoles.Worker.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("project worker roles = %#v", projectRoles.Worker)
+	}
+	if !projectRoles.Reviewer.Triggers.IncludeDrafts || !projectRoles.Reviewer.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Triggers.Labels, []string{"review"}) {
+		t.Fatalf("project reviewer roles = %#v", projectRoles.Reviewer)
+	}
+	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "worker") {
+		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(worker) = false, want true from project override")
+	}
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if strings.Contains(block.Text, "Global worker guidance.") || !strings.Contains(block.Text, "Project worker guidance.") {
+		t.Fatalf("custom instruction block did not use project role override: %s", block.Text)
+	}
+}
+
+func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Roles:    &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("Global worker guidance.")}},
+		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("")}}}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	block := BuildCustomInstructionBlock(cfg, "demo", "worker")
+	if block.Text != "" {
+		t.Fatalf("custom instruction block = %q, want empty because project role cleared global instructions", block.Text)
+	}
+}
+
+func TestValidateProjectRoleInstructionAggregateBytes(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
+		Projects:     &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("12345")}}, Instructions: map[string]string{"worker": "6789"}}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if err == nil || !errors.As(err, &validationErr) || !hasValidationIssue(validationErr.Issues, "projects[0].instructions.worker") {
+		t.Fatalf("ValidateWithOptions() error = %v, issues = %#v, want aggregate project instruction validation", err, validationErr)
+	}
+}
+
+func TestValidateProjectReviewerLabelCanBeClearedWhenDisabled(t *testing.T) {
+	falseValue := false
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{SpecReview: &PartialReviewerSpecReviewConfig{IncludeReviewingLabel: &falseValue, ReviewingLabel: stringPtr("")}}}}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want nil", err)
+	}
+}
+
 func TestValidateRejectsOversizedAndProtectedInstructions(t *testing.T) {
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
 		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
@@ -1363,6 +1453,15 @@ func assertValidationIssue(t *testing.T, err *ConfigValidationError, path string
 	}
 
 	t.Fatalf("ConfigValidationError missing issue {%q, %q}: %#v", path, message, err.Issues)
+}
+
+func hasValidationIssue(issues []ValidationIssue, path string) bool {
+	for _, issue := range issues {
+		if issue.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func emptyEnvLookup(string) (string, bool) {

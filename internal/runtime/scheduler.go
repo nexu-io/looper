@@ -870,10 +870,10 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
 			Snapshotter:              githubGateway,
-			PlannerDiscoveryEnabled:  boolPtr(cfg.Roles.Planner.AutoDiscovery),
-			ReviewerDiscoveryEnabled: boolPtr(cfg.Roles.Reviewer.AutoDiscovery),
-			FixerDiscoveryEnabled:    boolPtr(cfg.Roles.Fixer.AutoDiscovery),
-			WorkerDiscoveryEnabled:   boolPtr(cfg.Roles.Worker.AutoDiscovery),
+			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
+			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
+			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 		})
 	}
 }

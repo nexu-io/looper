@@ -319,6 +319,7 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	customInstructions      config.Config
+	projectRoleConfig       *config.Config
 	agentModel              string
 	sleep                   func(time.Duration)
 	retryBaseDelay          time.Duration
@@ -525,6 +526,7 @@ func New(options Options) *Runner {
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:       options.CustomInstructions,
 		agentModel:              derefString(options.AgentModel),
 		sleep:                   sleep,
 		retryBaseDelay:          retryBaseDelay,
@@ -544,29 +546,33 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	currentUser := ""
-	if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscovery(ctx, input.Repo, project.RepoPath, input.Limit, currentUser)
+	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
-		if (!r.discoveryPolicy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
+		if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
 			result.Skipped++
 			continue
 		}
-		if r.discoveryPolicy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
+		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
 			result.Skipped++
 			continue
 		}
-		if !labelsMatch(pr.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+		if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 			result.Skipped++
 			continue
 		}
@@ -611,7 +617,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
-	labels := prQueryLabels(r.discoveryPolicy.Labels)
+	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, author, r.discoveryPolicy)
+}
+
+func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, author string, policy DiscoveryPolicy) ([]PullRequestSummary, error) {
+	labels := prQueryLabels(policy.Labels)
 	effectiveLimit := defaultDiscoveryLimit(limit)
 	if len(labels) == 0 {
 		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author})
@@ -619,7 +629,7 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 	if len(labels) == 1 {
 		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: labels[0]})
 	}
-	if r.discoveryPolicy.LabelMode == config.LabelModeAll {
+	if policy.LabelMode == config.LabelModeAll {
 		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Labels: labels})
 	}
 
@@ -645,6 +655,14 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 		}
 	}
 	return result, nil
+}
+
+func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
+	if r.projectRoleConfig == nil {
+		return r.discoveryPolicy
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: roles.Fixer.AutoDiscovery, IncludeDrafts: roles.Fixer.Triggers.IncludeDrafts, AuthorFilter: roles.Fixer.Triggers.AuthorFilter, Labels: append([]string(nil), roles.Fixer.Triggers.Labels...), LabelMode: roles.Fixer.Triggers.LabelMode}
 }
 
 func defaultDiscoveryLimit(limit int) int {
@@ -814,7 +832,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
-	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
 		checkpoint.SkipReason = reason
@@ -971,8 +989,8 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	return checkpoint, nil
 }
 
-func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, cwd, repo string, prNumber int64) (string, error) {
-	if r.discoveryPolicy.AuthorFilter == config.FixerAuthorFilterAny {
+func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, projectID, cwd, repo string, prNumber int64) (string, error) {
+	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
 	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
@@ -1016,7 +1034,8 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
 	}
-	if (!r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
+	policy := r.discoveryPolicyForProject(input.Project.ID)
+	if (!policy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}

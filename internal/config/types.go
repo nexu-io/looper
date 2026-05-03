@@ -325,13 +325,14 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	RepoPath     string            `json:"repoPath"`
-	Path         string            `json:"path,omitempty"`
-	BaseBranch   *string           `json:"baseBranch,omitempty"`
-	WorktreeRoot *string           `json:"worktreeRoot,omitempty"`
-	Instructions map[string]string `json:"instructions,omitempty"`
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	RepoPath     string              `json:"repoPath"`
+	Path         string              `json:"path,omitempty"`
+	BaseBranch   *string             `json:"baseBranch,omitempty"`
+	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
+	Instructions map[string]string   `json:"instructions,omitempty"`
+	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
 }
 
 type Config struct {

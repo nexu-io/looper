@@ -398,6 +398,7 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	customInstructions      config.Config
+	projectRoleConfig       *config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -595,6 +596,7 @@ func New(options Options) *Runner {
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:       options.CustomInstructions,
 		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
@@ -618,8 +620,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	login := ""
-	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser {
 		var err error
 		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
@@ -627,20 +633,20 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		login = normalizeLogin(login)
 	}
-	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
+	if policy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimWorkerIssue(issue, login, r.discoveryPolicy) {
+		if !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
@@ -662,6 +668,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		result.QueueItems = append(result.QueueItems, queueItem)
 	}
 	return result, nil
+}
+
+func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
+	if r.projectRoleConfig == nil {
+		return r.discoveryPolicy
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -969,7 +983,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if !acquired {
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
-	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || r.discoveryPolicy.RequireAssigneeCurrentUser) {
+	policy := r.discoveryPolicyForProject(input.Project.ID)
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err

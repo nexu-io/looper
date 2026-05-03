@@ -223,10 +223,22 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
 		}
 
+		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
+		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
 		for role, text := range project.Instructions {
 			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
 			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
-			validateAggregateInstructionBytes(path, roleInstructionText(config.Roles, role), text, config.Instructions.MaxBytes, &issues)
+			validateAggregateInstructionBytes(path, roleInstructionText(effectiveProjectRoles, role), text, config.Instructions.MaxBytes, &issues)
+		}
+		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
+			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
+				continue
+			}
+			path := fmt.Sprintf("%s.roles.%s.instructions", prefix, roleInstruction.role)
+			validateAggregateInstructionBytes(path, roleInstruction.text, project.Instructions[roleInstruction.role], config.Instructions.MaxBytes, &issues)
+		}
+		if effectiveProjectRoles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.SpecReview.ReviewingLabel) == "" {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
 	}
 
@@ -254,6 +266,67 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxInstructionBytes int, issues *[]ValidationIssue) {
+	if roles == nil {
+		return
+	}
+	if roles.Planner != nil {
+		validateProjectRoleInstruction(prefix+".planner.instructions", "planner", roles.Planner.Instructions, maxInstructionBytes, issues)
+		if roles.Planner.Triggers != nil {
+			validateIssueRoleTriggers(partialIssueRoleTriggers(*roles.Planner.Triggers), prefix+".planner.triggers", issues)
+		}
+	}
+	if roles.Worker != nil {
+		validateProjectRoleInstruction(prefix+".worker.instructions", "worker", roles.Worker.Instructions, maxInstructionBytes, issues)
+		if roles.Worker.Triggers != nil {
+			validateIssueRoleTriggers(partialIssueRoleTriggers(*roles.Worker.Triggers), prefix+".worker.triggers", issues)
+		}
+	}
+	if roles.Reviewer != nil {
+		validateProjectRoleInstruction(prefix+".reviewer.instructions", "reviewer", roles.Reviewer.Instructions, maxInstructionBytes, issues)
+		if roles.Reviewer.Triggers != nil {
+			validateReviewerRoleTriggers(partialReviewerRoleTriggers(*roles.Reviewer.Triggers), prefix+".reviewer.triggers", issues)
+		}
+		if roles.Reviewer.SpecReview != nil && roles.Reviewer.SpecReview.ReviewingLabel != nil {
+			label := *roles.Reviewer.SpecReview.ReviewingLabel
+			if label != "" && label != strings.TrimSpace(label) {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
+			}
+		}
+	}
+	if roles.Fixer != nil {
+		validateProjectRoleInstruction(prefix+".fixer.instructions", "fixer", roles.Fixer.Instructions, maxInstructionBytes, issues)
+		if roles.Fixer.Triggers != nil {
+			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
+		}
+	}
+}
+
+func validateProjectRoleInstruction(path, role string, text *string, maxBytes int, issues *[]ValidationIssue) {
+	if text == nil {
+		return
+	}
+	validateInstructionText(path, role, *text, maxBytes, issues)
+}
+
+func partialIssueRoleTriggers(partial PartialIssueRoleTriggersConfig) IssueRoleTriggersConfig {
+	config := IssueRoleTriggersConfig{LabelMode: LabelModeAll}
+	mergeIssueRoleTriggersConfig(&config, partial)
+	return config
+}
+
+func partialReviewerRoleTriggers(partial PartialReviewerRoleTriggersConfig) ReviewerRoleTriggersConfig {
+	config := ReviewerRoleTriggersConfig{LabelMode: LabelModeAll}
+	mergeReviewerRoleTriggersConfig(&config, partial)
+	return config
+}
+
+func partialFixerRoleTriggers(partial PartialFixerRoleTriggersConfig) FixerRoleTriggersConfig {
+	config := FixerRoleTriggersConfig{AuthorFilter: FixerAuthorFilterCurrentUser, LabelMode: LabelModeAll}
+	mergeFixerRoleTriggersConfig(&config, partial)
+	return config
 }
 
 func validateInstructions(config Config, issues *[]ValidationIssue) {

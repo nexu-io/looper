@@ -292,6 +292,7 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	customInstructions      config.Config
+	projectRoleConfig       *config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -438,7 +439,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -455,8 +456,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	login := ""
-	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser {
 		var err error
 		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
@@ -464,20 +469,20 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		login = normalizeLogin(login)
 	}
-	if r.discoveryPolicy.RequireAssigneeCurrentUser && login == "" {
+	if policy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if r.discoveryPolicy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, r.discoveryPolicy)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if !shouldClaimIssue(issue, login, r.discoveryPolicy) {
+		if !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
@@ -499,6 +504,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		result.QueueItems = append(result.QueueItems, queueItem)
 	}
 	return result, nil
+}
+
+func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
+	if r.projectRoleConfig == nil {
+		return r.discoveryPolicy
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -772,6 +785,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 	}()
 	manual := isManualPlannerQueue(payload)
+	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if currentLogin == "" {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
@@ -782,7 +796,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !labelsMatch(detail.Labels, r.discoveryPolicy.Labels, r.discoveryPolicy.LabelMode) {
+	if !manual && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -791,7 +805,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if !manual && r.discoveryPolicy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if !manual && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey

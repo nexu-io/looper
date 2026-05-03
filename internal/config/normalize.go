@@ -657,6 +657,7 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
 			Path:         project.Path,
 			Instructions: cloneStringMap(project.Instructions),
+			Roles:        clonePartialRoleConfigs(project.Roles),
 		}
 
 		if project.BaseBranch != nil {
@@ -669,6 +670,66 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
+	if configs == nil {
+		return nil
+	}
+	cloned := PartialRoleConfigs{}
+	if configs.Planner != nil {
+		planner := *configs.Planner
+		if configs.Planner.Triggers != nil {
+			triggers := *configs.Planner.Triggers
+			if triggers.Labels != nil {
+				labels := cloneStrings(*triggers.Labels)
+				triggers.Labels = &labels
+			}
+			planner.Triggers = &triggers
+		}
+		cloned.Planner = &planner
+	}
+	if configs.Worker != nil {
+		worker := *configs.Worker
+		if configs.Worker.Triggers != nil {
+			triggers := *configs.Worker.Triggers
+			if triggers.Labels != nil {
+				labels := cloneStrings(*triggers.Labels)
+				triggers.Labels = &labels
+			}
+			worker.Triggers = &triggers
+		}
+		cloned.Worker = &worker
+	}
+	if configs.Reviewer != nil {
+		reviewer := *configs.Reviewer
+		if configs.Reviewer.Triggers != nil {
+			triggers := *configs.Reviewer.Triggers
+			if triggers.Labels != nil {
+				labels := cloneStrings(*triggers.Labels)
+				triggers.Labels = &labels
+			}
+			reviewer.Triggers = &triggers
+		}
+		if configs.Reviewer.SpecReview != nil {
+			specReview := *configs.Reviewer.SpecReview
+			reviewer.SpecReview = &specReview
+		}
+		cloned.Reviewer = &reviewer
+	}
+	if configs.Fixer != nil {
+		fixer := *configs.Fixer
+		if configs.Fixer.Triggers != nil {
+			triggers := *configs.Fixer.Triggers
+			if triggers.Labels != nil {
+				labels := cloneStrings(*triggers.Labels)
+				triggers.Labels = &labels
+			}
+			fixer.Triggers = &triggers
+		}
+		cloned.Fixer = &fixer
+	}
+	return &cloned
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

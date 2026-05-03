@@ -193,7 +193,15 @@ Example minimal `~/.looper/config.json`:
       "name": "Looper",
       "repoPath": "/absolute/path/to/looper",
       "baseBranch": "main",
-      "worktreeRoot": "/Users/you/.looper/worktrees/looper"
+      "worktreeRoot": "/Users/you/.looper/worktrees/looper",
+      "roles": {
+        "worker": {
+          "triggers": {
+            "labels": ["team:alpha", "worker-ready"],
+            "labelMode": "any"
+          }
+        }
+      }
     }
   ]
 }
@@ -447,6 +455,10 @@ Examples:
 
 `defaults.fixAllPullRequests=true` remains supported and maps to `roles.fixer.triggers.authorFilter=any` when `roles.fixer.triggers.authorFilter` is not explicitly configured. If both are present, `roles.fixer.triggers.authorFilter` wins.
 
+Project entries can override supported role settings with `projects[].roles`. Looper resolves these values as built-in defaults → global config/env/CLI `roles` → matching `projects[].roles`; fields omitted from a project role fall back to the effective global role value. Set a project role `instructions` value to an empty string to clear inherited global role instructions for that project.
+
+Supported project role keys match the global role keys for the built-in roles: `planner`, `worker`, `reviewer`, and `fixer`. Unknown role keys are rejected during config loading. The initially role-overridable settings are auto-discovery, trigger settings, reviewer spec-review label settings, and role instructions. Project role overrides affect scheduler auto-discovery and the role-specific eligibility checks that use those same trigger settings for the matching project.
+
 ### `projects`
 
 Each entry registers a repo that `looper` can target.
@@ -456,6 +468,7 @@ Each entry registers a repo that `looper` can target.
 - `repoPath`: absolute repository path
 - `baseBranch`: optional per-project override
 - `worktreeRoot`: optional per-project worktree root
+- `roles`: optional per-project role overrides for `planner`, `worker`, `reviewer`, and `fixer`; absent fields fall back to global `roles`
 
 Example:
 
@@ -467,7 +480,18 @@ Example:
       "name": "Looper",
       "repoPath": "/Users/you/src/looper",
       "baseBranch": "main",
-      "worktreeRoot": "/Users/you/.looper/worktrees/looper"
+      "worktreeRoot": "/Users/you/.looper/worktrees/looper",
+      "roles": {
+        "reviewer": {
+          "triggers": {
+            "labels": ["needs-review"],
+            "requireReviewRequest": false
+          }
+        },
+        "worker": {
+          "autoDiscovery": false
+        }
+      }
     }
   ]
 }

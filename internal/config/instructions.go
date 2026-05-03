@@ -27,12 +27,24 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 	if !cfg.Instructions.Enabled || strings.TrimSpace(role) == "" {
 		return block
 	}
-	sections := make([]string, 0, 2)
-	if globalInstructions := strings.TrimSpace(roleInstructionText(cfg.Roles, role)); globalInstructions != "" {
-		sections = append(sections, fmt.Sprintf("Global %s instructions:\n%s", role, globalInstructions))
-		block.Sources = append(block.Sources, CustomInstructionSource{Kind: "global-role", Path: "roles." + role + ".instructions"})
+	sections := make([]string, 0, 3)
+	globalInstructions := strings.TrimSpace(roleInstructionText(cfg.Roles, role))
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || !projectRoleInstructionsConfigured(project.Roles, role) {
+		if globalInstructions == "" {
+			// No global role instructions are configured for this role.
+		} else {
+			sections = append(sections, fmt.Sprintf("Global %s instructions:\n%s", role, globalInstructions))
+			block.Sources = append(block.Sources, CustomInstructionSource{Kind: "global-role", Path: "roles." + role + ".instructions"})
+		}
 	}
-	if project := findConfiguredProject(cfg.Projects, projectID); project != nil {
+	if project != nil {
+		if projectRoleInstructionsConfigured(project.Roles, role) {
+			if text := strings.TrimSpace(roleInstructionText(ProjectRoleConfigs(cfg, projectID), role)); text != "" {
+				sections = append(sections, fmt.Sprintf("Project %s %s role instructions:\n%s", project.ID, role, text))
+				block.Sources = append(block.Sources, CustomInstructionSource{Kind: "project-role", Path: "projects." + project.ID + ".roles." + role + ".instructions"})
+			}
+		}
 		if text := strings.TrimSpace(project.Instructions[role]); text != "" {
 			sections = append(sections, fmt.Sprintf("Project %s %s instructions:\n%s", project.ID, role, text))
 			block.Sources = append(block.Sources, CustomInstructionSource{Kind: "project-role", Path: "projects." + project.ID + ".instructions." + role})
@@ -46,6 +58,24 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 	sum := sha256.Sum256([]byte(block.Text))
 	block.PromptHash = hex.EncodeToString(sum[:])
 	return block
+}
+
+func projectRoleInstructionsConfigured(roles *PartialRoleConfigs, role string) bool {
+	if roles == nil {
+		return false
+	}
+	switch role {
+	case "planner":
+		return roles.Planner != nil && roles.Planner.Instructions != nil
+	case "worker":
+		return roles.Worker != nil && roles.Worker.Instructions != nil
+	case "reviewer":
+		return roles.Reviewer != nil && roles.Reviewer.Instructions != nil
+	case "fixer":
+		return roles.Fixer != nil && roles.Fixer.Instructions != nil
+	default:
+		return false
+	}
 }
 
 func CustomInstructionMetadata(block CustomInstructionBlock, finalPrompt string) map[string]any {
