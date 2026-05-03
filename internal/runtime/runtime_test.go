@@ -1995,6 +1995,68 @@ func TestDeferredReviewerRecoveryRefreshesLoginAtMostOncePerProject(t *testing.T
 	assertLoopStatus(t, repositories, "loop_project2_a", "queued")
 }
 
+func TestDeferredReviewerRecoveryDoesNotCacheFailedLoginRefresh(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	projectRepoPath := filepath.Join(workingDir, "repo-one")
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper One", RepoPath: projectRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_a", 1, nowISO)
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_1", "loop_project1_b", 2, nowISO)
+
+	loginCalls := 0
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		loginCalls++
+		if loginCalls == 1 {
+			return shell.Result{}, errors.New("transient gh timeout")
+		}
+		return shell.Result{Stdout: "other\n"}, nil
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	requeued, err := rt.runDeferredReviewerRecovery(context.Background(), repositories, githubGateway, now)
+	if err != nil {
+		t.Fatalf("runDeferredReviewerRecovery() error = %v", err)
+	}
+	if requeued != 1 {
+		t.Fatalf("runDeferredReviewerRecovery() = %d, want 1", requeued)
+	}
+	if loginCalls != 2 {
+		t.Fatalf("GetCurrentUserLogin() calls = %d, want retry after failed refresh", loginCalls)
+	}
+	projectLoops, err := repositories.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	queued := 0
+	failed := 0
+	for _, loop := range projectLoops {
+		switch loop.Status {
+		case "queued":
+			queued++
+		case "failed":
+			failed++
+		}
+	}
+	if queued != 1 || failed != 1 {
+		t.Fatalf("loop statuses queued=%d failed=%d, want queued=1 failed=1", queued, failed)
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopUsesRefreshedCurrentLogin(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"

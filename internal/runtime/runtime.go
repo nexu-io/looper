@@ -955,7 +955,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	if err != nil {
 		return 0, err
 	}
-	reviewerLoginByProjectID := make(map[string]*string)
+	reviewerLoginByProjectID := make(map[string]string)
 	requeued := int64(0)
 	for _, loop := range loops {
 		if err := ctx.Err(); err != nil {
@@ -978,19 +978,16 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
 		}
-		if _, cached := reviewerLoginByProjectID[loop.ProjectID]; !cached {
+		cachedLogin, cached := reviewerLoginByProjectID[loop.ProjectID]
+		if !cached {
 			login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy)
-			if ok {
-				reviewerLoginByProjectID[loop.ProjectID] = stringPtr(login)
-			} else {
-				reviewerLoginByProjectID[loop.ProjectID] = nil
+			if !ok {
+				continue
 			}
+			cachedLogin = login
+			reviewerLoginByProjectID[loop.ProjectID] = cachedLogin
 		}
-		cachedLogin := reviewerLoginByProjectID[loop.ProjectID]
-		if cachedLogin == nil {
-			continue
-		}
-		policy.currentLogin = *cachedLogin
+		policy.currentLogin = cachedLogin
 		if !shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
 			continue
 		}
