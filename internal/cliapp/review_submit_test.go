@@ -124,6 +124,8 @@ func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 		{name: "marker only", body: marker, want: "must start with an @mention"},
 		{name: "disclosure only", body: marker + "\n\n" + stamp, want: "must start with an @mention"},
 		{name: "too terse", body: "@octocat Nice work.\n\n" + marker, want: "short human summary"},
+		{name: "hidden html filler", body: "@octocat <!-- these hidden filler words should not count toward the human summary requirement -->\n\n" + marker, want: "short human summary"},
+		{name: "reference definition filler", body: "@octocat\n\n[hidden]:https://example.com\n  these hidden filler words should not count toward the human summary requirement\n\n" + marker, want: "short human summary"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateReviewSubmitBody(tc.body, nil, "def", "APPROVE", decisionReviewPolicy)

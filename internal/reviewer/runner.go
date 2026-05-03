@@ -50,6 +50,8 @@ var reviewerStepSequence = []ReviewerStep{
 }
 
 var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
+var reviewHumanHTMLCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
+var reviewHumanReferenceDefinitionPattern = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 
 type ReviewerStep string
 
@@ -1854,6 +1856,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
+	if cleanReviewNoopSummary(pending.Summary) && r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove && !cleanApprovedReviewMarker(markerResult) {
+		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
+	}
 	checkpoint.PendingReview = pending.clone()
 	if checkpoint.PendingReview.ContentFingerprint == "" {
 		if fp := reviewMarkerFingerprint(markerResult); fp != "" {
@@ -1966,7 +1971,20 @@ func cleanReviewNoopSummary(summary string) bool {
 }
 
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
-	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean")
+	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean") && len(found.InlineCommentBodies) == 0 && validCleanApprovedReviewBody(found.Body)
+}
+
+func validCleanApprovedReviewBody(body string) bool {
+	visible := reviewHumanVisibleBody(body)
+	return strings.HasPrefix(visible, "@") && len(strings.Fields(visible)) >= 12
+}
+
+func reviewHumanVisibleBody(body string) string {
+	cleaned := reviewMarkerCommentPattern.ReplaceAllString(body, "")
+	cleaned = disclosure.StripMarkdownStamp(cleaned)
+	cleaned = reviewHumanHTMLCommentPattern.ReplaceAllString(cleaned, "")
+	cleaned = reviewHumanReferenceDefinitionPattern.ReplaceAllString(cleaned, "")
+	return strings.TrimSpace(cleaned)
 }
 
 func (r *Runner) specReviewingLabel() string {

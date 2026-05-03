@@ -161,6 +161,8 @@ func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReview
 }
 
 var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
+var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
@@ -215,6 +217,8 @@ func validateCleanApproveBody(body string) error {
 func cleanReviewHumanBody(body string) string {
 	cleaned := reviewSubmitMarkerRE.ReplaceAllString(body, "")
 	cleaned = disclosure.StripMarkdownStamp(cleaned)
+	cleaned = markdownHTMLCommentRE.ReplaceAllString(cleaned, "")
+	cleaned = markdownReferenceDefinitionRE.ReplaceAllString(cleaned, "")
 	return strings.TrimSpace(cleaned)
 }
 
