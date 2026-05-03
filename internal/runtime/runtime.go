@@ -1266,12 +1266,13 @@ const maxReviewerAutoRecoveryAttempts = 3
 type runtimeReviewerCheckpoint struct {
 	ResumePolicy string `json:"resumePolicy,omitempty"`
 	Detail       *struct {
-		State        string           `json:"state,omitempty"`
-		IsDraft      bool             `json:"isDraft,omitempty"`
-		Labels       []string         `json:"labels,omitempty"`
-		HeadSHA      string           `json:"headSha,omitempty"`
-		CurrentLogin string           `json:"currentLogin,omitempty"`
-		Reviews      []map[string]any `json:"reviews,omitempty"`
+		State          string           `json:"state,omitempty"`
+		IsDraft        bool             `json:"isDraft,omitempty"`
+		ReviewDecision string           `json:"reviewDecision,omitempty"`
+		Labels         []string         `json:"labels,omitempty"`
+		HeadSHA        string           `json:"headSha,omitempty"`
+		CurrentLogin   string           `json:"currentLogin,omitempty"`
+		Reviews        []map[string]any `json:"reviews,omitempty"`
 	} `json:"detail,omitempty"`
 }
 
@@ -1321,7 +1322,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if !policy.includeDrafts && checkpoint.Detail.IsDraft {
 		return false
 	}
-	if policy.stopOnApproved && runtimeHasApprovedReviewByAuthorForHead(checkpoint.Detail.Reviews, checkpoint.Detail.CurrentLogin, checkpoint.Detail.HeadSHA) {
+	if policy.stopOnApproved && runtimeReviewerCheckpointApprovedForRecovery(checkpoint.Detail.Reviews, checkpoint.Detail.CurrentLogin, checkpoint.Detail.HeadSHA, checkpoint.Detail.ReviewDecision) {
 		return false
 	}
 	if policy.stopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
@@ -1437,6 +1438,16 @@ func runtimeHasApprovedReviewByAuthorForHead(reviews []map[string]any, login str
 		}
 	}
 	return false
+}
+
+func runtimeReviewerCheckpointApprovedForRecovery(reviews []map[string]any, login string, headSHA string, reviewDecision string) bool {
+	if runtimeHasApprovedReviewByAuthorForHead(reviews, login, headSHA) {
+		return true
+	}
+	if strings.TrimSpace(login) != "" && strings.TrimSpace(headSHA) != "" && len(reviews) > 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(reviewDecision), "APPROVED")
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {
