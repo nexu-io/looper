@@ -1728,6 +1728,34 @@ func TestProcessClaimedItemAcceptsCleanNoopWithApprovedMarkerForApprovePolicy(t 
 	if len(github.addReactionCalls) != 1 {
 		t.Fatalf("addReactionCalls = %#v, want clean signal reaction", github.addReactionCalls)
 	}
+	if claim.LoopID == nil {
+		t.Fatal("claim.LoopID = nil, want associated loop ID")
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
+		t.Fatalf("loop metadata = %s, want accepted clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
+	}
+}
+
+func TestValidateCleanApprovedReviewMarkerBodyAcceptsCaseInsensitiveAuthorMention(t *testing.T) {
+	t.Parallel()
+	checkpoint := reviewerCheckpoint{
+		Detail:   &checkpointDetail{Author: "OctoCat"},
+		Snapshot: &checkpointSnapshot{Author: "OctoCat"},
+	}
+	detail := PullRequestDetail{Author: "OctoCat"}
+	marker := ReviewMarkerResult{Body: strings.Join([]string{
+		"@octocat Thanks for the thoughtful update — the changes are clear and well scoped.",
+		"Summary: this keeps the approval flow safe while preserving the intended reviewer behavior.",
+		"<!-- looper:review outcome=clean -->",
+	}, "\n\n")}
+
+	if err := validateCleanApprovedReviewMarkerBody(marker, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
+		t.Fatalf("validateCleanApprovedReviewMarkerBody() error = %v", err)
+	}
 }
 
 func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForApprovePolicy(t *testing.T) {

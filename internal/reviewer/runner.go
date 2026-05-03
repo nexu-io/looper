@@ -1762,7 +1762,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
-				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
+				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
 				checkpoint.ResumePolicy = "advance_from_checkpoint"
 				return checkpoint, nil
 			}
@@ -1808,6 +1808,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 				return checkpoint, nil
 			}
+		}
+		if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove {
+			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if !cleanApprovedReviewMarker(found) {
+				return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
+			}
+			if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			checkpoint.PendingReview = pending.clone()
+			if checkpoint.PendingReview.ContentFingerprint == "" {
+				if fp := reviewMarkerFingerprint(found); fp != "" {
+					checkpoint.PendingReview.ContentFingerprint = fp
+				}
+			}
+			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
+				return checkpoint, err
+			}
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
 		}
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
@@ -1997,7 +2022,7 @@ func validateCleanApprovedReviewMarkerBody(marker ReviewMarkerResult, authorLogi
 		return fmt.Errorf("clean APPROVE review body requires the PR author login for @mention validation")
 	}
 	fields := strings.Fields(visible)
-	if len(fields) == 0 || fields[0] != mention {
+	if len(fields) == 0 || !strings.EqualFold(fields[0], mention) {
 		return fmt.Errorf("clean APPROVE review body must start with PR author mention %s", mention)
 	}
 	if len(fields) < 12 {

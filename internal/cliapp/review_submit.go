@@ -210,7 +210,7 @@ func validateCleanApproveBody(body string, authorLogin string) error {
 		return fmt.Errorf("APPROVE clean review body requires the PR author login for @mention validation")
 	}
 	fields := strings.Fields(visible)
-	if len(fields) == 0 || fields[0] != mention {
+	if len(fields) == 0 || !strings.EqualFold(fields[0], mention) {
 		return fmt.Errorf("APPROVE clean review body must start with an @mention of the PR author")
 	}
 	if len(fields) < 12 {

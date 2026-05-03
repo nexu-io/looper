@@ -143,7 +143,7 @@ func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 		marker,
 		stamp,
 	}, "\n\n")
-	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy, "octocat"); err != nil {
+	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy, "OctoCat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody(APPROVE human body) error = %v", err)
 	}
 }
