@@ -3772,6 +3772,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
+		"gh pr checks <pr-url> -R <repo>",
 		"git diff <base>...<head> -- <path>",
 		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
@@ -3812,6 +3813,15 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt contains conflicting no-actionable clean-review instruction %q:\n%s", forbidden, prompt)
 		}
+	}
+}
+
+func TestBuildReviewerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
+	t.Parallel()
+
+	seed := buildReviewerMinimalPRSeed("ghe.example.com/acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, config.ReviewerScopeFullPR)
+	if !strings.Contains(seed, "\"url\": \"https://ghe.example.com/acme/looper/pull/42\"") {
+		t.Fatalf("seed = %q, want enterprise host PR URL", seed)
 	}
 }
 

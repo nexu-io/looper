@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -3352,7 +3353,7 @@ func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewer
 	seed := map[string]any{
 		"repo":           repo,
 		"pr_number":      prNumber,
-		"url":            fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNumber),
+		"url":            seededPullRequestURL(repo, prNumber),
 		"head_sha":       snapshotHeadSHA(checkpoint),
 		"expected_state": "OPEN",
 		"expected_draft": false,
@@ -3374,11 +3375,42 @@ func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewer
 	return "Minimal PR seed (authoritative handoff fields; fetch all mutable PR details yourself):\n" + string(encoded)
 }
 
+func seededPullRequestURL(repo string, prNumber int64) string {
+	host, path := seededPullRequestRepoParts(repo)
+	return fmt.Sprintf("https://%s/%s/pull/%d", host, path, prNumber)
+}
+
+func seededPullRequestRepoParts(repo string) (host string, path string) {
+	const defaultHost = "github.com"
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultHost, ""
+	}
+	if parsed, err := url.Parse(repo); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname(), strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	}
+	if at := strings.Index(repo, "@"); at >= 0 {
+		repo = repo[at+1:]
+	}
+	if colon := strings.Index(repo, ":"); colon > 0 {
+		host = strings.TrimSpace(repo[:colon])
+		path = strings.Trim(strings.TrimSpace(repo[colon+1:]), "/")
+		if host != "" && path != "" {
+			return host, path
+		}
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) >= 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0]), strings.Join(parts[1:], "/")
+	}
+	return defaultHost, strings.Trim(repo, "/")
+}
+
 func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
 		"Before acting and again before final conclusions or publishing, run `gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
-		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks` only when CI status matters.",
+		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
 		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
 	}, "\n")

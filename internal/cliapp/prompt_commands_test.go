@@ -135,6 +135,7 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
+		"gh pr checks <pr-url> -R <repo>",
 		"git diff <base>...<head> -- <path>",
 		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",

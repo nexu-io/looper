@@ -61,6 +61,7 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
+		"gh pr checks <pr-url> -R <repo>",
 		"git diff <base>...<head> -- <path>",
 		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
@@ -73,6 +74,15 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	}
 	if strings.Contains(prompt, "gh pr diff -- <path>") {
 		t.Fatalf("prompt contains unsupported gh pr diff pathspec instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildFixerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
+	t.Parallel()
+
+	seed := buildFixerMinimalPRSeed("ghe.example.com/acme/looper", 42, &checkpointDetail{}, nil)
+	if !strings.Contains(seed, "\"url\": \"https://ghe.example.com/acme/looper/pull/42\"") {
+		t.Fatalf("seed = %q, want enterprise host PR URL", seed)
 	}
 }
 
