@@ -1546,6 +1546,7 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_latest_success", LoopID: loopID, Status: "success", StartedAt: completedISO, EndedAt: &completedISO, CreatedAt: completedISO, UpdatedAt: completedISO}); err != nil {
 		t.Fatalf("Runs.Upsert(latest) error = %v", err)
 	}
+	repositories.AgentExecutions = nil
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
 	if err != nil {

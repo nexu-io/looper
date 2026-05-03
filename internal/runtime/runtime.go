@@ -657,24 +657,27 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
-		if err != nil {
-			return RecoverySummary{}, err
-		}
-		activeAgentRunIDs := make(map[string]struct{}, len(activeExecutions))
-		for _, execution := range activeExecutions {
-			if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
-				continue
-			}
-			matches, running, err := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+		activeAgentRunIDs := make(map[string]struct{})
+		if repositories.AgentExecutions != nil {
+			activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 			if err != nil {
-				if r.logger != nil {
-					r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
-				}
-				continue
+				return RecoverySummary{}, err
 			}
-			if running && matches {
-				activeAgentRunIDs[*execution.RunID] = struct{}{}
+			activeAgentRunIDs = make(map[string]struct{}, len(activeExecutions))
+			for _, execution := range activeExecutions {
+				if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
+					continue
+				}
+				matches, running, err := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+				if err != nil {
+					if r.logger != nil {
+						r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+					}
+					continue
+				}
+				if running && matches {
+					activeAgentRunIDs[*execution.RunID] = struct{}{}
+				}
 			}
 		}
 		for _, run := range runningRuns {
