@@ -564,7 +564,7 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 		}
 	}
 
-	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations})
+	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:8]})
 	result, err := migrationRunner.RunPending(ctx)
 	if err != nil {
 		t.Fatalf("RunPending() applying 0008 error = %v", err)

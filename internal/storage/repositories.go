@@ -557,7 +557,7 @@ func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, er
 }
 
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC, created_at DESC LIMIT 1`, loopID)
 	record, err := scanRun(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
