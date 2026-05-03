@@ -132,7 +132,7 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"PR handoff contract: Looper provides a minimal PR seed by default",
-		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
 		"gh pr checks <pr-url> -R <repo>",

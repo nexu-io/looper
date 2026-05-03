@@ -58,7 +58,7 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"\"head_sha\": \"abc123\"",
 		"\"task_intent\": \"repair_pull_request_feedback\"",
 		"\"fix_item_ids\"",
-		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
 		"gh pr checks <pr-url> -R <repo>",

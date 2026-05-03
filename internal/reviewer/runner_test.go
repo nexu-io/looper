@@ -3769,7 +3769,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"\"pr_number\": 42",
 		"\"head_sha\": \"abc123\"",
 		"Agent-side GitHub fetch contract",
-		"gh pr view --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
 		"gh pr checks <pr-url> -R <repo>",
