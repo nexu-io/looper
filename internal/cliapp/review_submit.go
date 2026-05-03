@@ -77,14 +77,14 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run})
-	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	metadata, err := gh.GetPullRequestHeadAndAuthor(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return fmt.Errorf("validate expected PR head commit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+	if err := validateExpectedHeadCommit(commitID, metadata.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
+	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
 		return err
 	}
 	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})

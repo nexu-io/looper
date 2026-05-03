@@ -84,6 +84,11 @@ type PullRequestDetail struct {
 	Checks         []map[string]any
 }
 
+type PullRequestHeadAndAuthor struct {
+	HeadSHA string
+	Author  string
+}
+
 type IssueSummary struct {
 	Number        int64
 	Title         string
@@ -435,6 +440,18 @@ func (g *Gateway) GetPullRequestAuthor(ctx context.Context, input ViewPullReques
 		return "", err
 	}
 	return extractAuthor(row["author"]), nil
+}
+
+func (g *Gateway) GetPullRequestHeadAndAuthor(ctx context.Context, input ViewPullRequestInput) (PullRequestHeadAndAuthor, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,author")
+	if err != nil {
+		return PullRequestHeadAndAuthor{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestHeadAndAuthor{}, err
+	}
+	return PullRequestHeadAndAuthor{HeadSHA: asString(row["headRefOid"]), Author: extractAuthor(row["author"])}, nil
 }
 
 func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {

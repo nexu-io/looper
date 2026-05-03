@@ -243,6 +243,27 @@ func TestGetPullRequestHeadSHA(t *testing.T) {
 	}
 }
 
+func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr view 42 --repo acme/looper --json headRefOid,author" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"headRefOid":"abc123","author":{"login":"octocat"}}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	metadata, err := gateway.GetPullRequestHeadAndAuthor(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("GetPullRequestHeadAndAuthor() error = %v", err)
+	}
+	if metadata.HeadSHA != "abc123" || metadata.Author != "octocat" {
+		t.Fatalf("GetPullRequestHeadAndAuthor() = %+v, want head abc123 author octocat", metadata)
+	}
+}
+
 func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing.T) {
 	t.Parallel()
 
