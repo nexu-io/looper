@@ -249,7 +249,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 	}
 	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests})
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, Reviews: pr.Reviews})
 	}
 	return result, nil
 }

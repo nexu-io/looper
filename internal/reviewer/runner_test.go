@@ -89,7 +89,8 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		{name: "historical guardrail non retryable", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "review request removed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
 		{name: "manual intervention", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
-		{name: "approved pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED"}, want: false},
+		{name: "approved by current user on head", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: false},
+		{name: "approved by another user", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: true},
 		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}, want: false},
 		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
@@ -141,6 +142,17 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 				t.Fatalf("eligible = false, want true")
 			}
 		})
+	}
+}
+
+func TestSummaryFromDetailPreservesReviewsForApprovalRecovery(t *testing.T) {
+	t.Parallel()
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	summary := summaryFromDetail(PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: reviews})
+
+	if !hasApprovedReviewByAuthorForHead(summary.Reviews, "octocat", "abc123") {
+		t.Fatalf("summary reviews = %#v, want current-user approved review preserved", summary.Reviews)
 	}
 }
 
@@ -720,7 +732,9 @@ func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED"}}})
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, ReviewDecision: "APPROVED", Reviews: reviews}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -733,6 +747,35 @@ func TestRunFilterStepTerminatesApprovedBeforeConflictSkip(t *testing.T) {
 	}
 	if updated.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepDoesNotTerminateWhenOnlyAnotherReviewerApproved(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_other_approved", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewDecision: "APPROVED", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind == "approved" {
+		t.Fatalf("SkipKind = %q, want no approved termination", checkpoint.SkipKind)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -1235,7 +1278,7 @@ func TestDiscoverPullRequestsDoesNotRequeueApprovedReadyOrDraftNonActionablePRs(
 		github *fakeGitHubGateway
 		want   string
 	}{
-		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}}, want: "approved"},
+		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}, reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: "approved"},
 		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready"},
 		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft"},
 	} {
@@ -4477,7 +4520,7 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	if headSHA == "" {
 		headSHA = "abc123"
 	}
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {

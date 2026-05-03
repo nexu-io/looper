@@ -1224,7 +1224,7 @@ func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,mergeStateStatus" {
+		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,reviews,mergeStateStatus" {
 			t.Fatalf("gh args = %q, want repeated label filters", args)
 		}
 		return shell.Result{Stdout: `[]`}, nil

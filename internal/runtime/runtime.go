@@ -1266,10 +1266,12 @@ const maxReviewerAutoRecoveryAttempts = 3
 type runtimeReviewerCheckpoint struct {
 	ResumePolicy string `json:"resumePolicy,omitempty"`
 	Detail       *struct {
-		State          string   `json:"state,omitempty"`
-		IsDraft        bool     `json:"isDraft,omitempty"`
-		ReviewDecision string   `json:"reviewDecision,omitempty"`
-		Labels         []string `json:"labels,omitempty"`
+		State        string           `json:"state,omitempty"`
+		IsDraft      bool             `json:"isDraft,omitempty"`
+		Labels       []string         `json:"labels,omitempty"`
+		HeadSHA      string           `json:"headSha,omitempty"`
+		CurrentLogin string           `json:"currentLogin,omitempty"`
+		Reviews      []map[string]any `json:"reviews,omitempty"`
 	} `json:"detail,omitempty"`
 }
 
@@ -1319,7 +1321,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if !policy.includeDrafts && checkpoint.Detail.IsDraft {
 		return false
 	}
-	if policy.stopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+	if policy.stopOnApproved && runtimeHasApprovedReviewByAuthorForHead(checkpoint.Detail.Reviews, checkpoint.Detail.CurrentLogin, checkpoint.Detail.HeadSHA) {
 		return false
 	}
 	if policy.stopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
@@ -1405,6 +1407,36 @@ func runtimeIntFromAny(value any) int {
 func runtimeStringFromAny(value any) (string, bool) {
 	text, ok := value.(string)
 	return text, ok
+}
+
+func runtimeHasApprovedReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
+	login = strings.ToLower(strings.TrimSpace(login))
+	headSHA = strings.TrimSpace(headSHA)
+	if login == "" || headSHA == "" {
+		return false
+	}
+	for _, review := range reviews {
+		author, ok := review["author"].(map[string]any)
+		if !ok {
+			continue
+		}
+		authorLogin, ok := runtimeStringFromAny(author["login"])
+		if !ok || strings.ToLower(strings.TrimSpace(authorLogin)) != login {
+			continue
+		}
+		state, _ := runtimeStringFromAny(review["state"])
+		if !strings.EqualFold(strings.TrimSpace(state), "APPROVED") {
+			continue
+		}
+		commit, ok := review["commit"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if oid, ok := runtimeStringFromAny(commit["oid"]); ok && strings.TrimSpace(oid) == headSHA {
+			return true
+		}
+	}
+	return false
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {
