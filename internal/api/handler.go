@@ -1997,12 +1997,31 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	}
 
 	items := append(runningViews, runningLoopViews...)
+	queuedViews = excludeActiveRunViewsByLoopID(queuedViews, items)
 	items = append(items, queuedViews...)
 	items = append(items, inactiveLoopViews...)
 	sort.Slice(items, func(i, j int) bool {
 		return compareActiveRunViews(items[i], items[j]) < 0
 	})
 	return items, nil
+}
+
+func excludeActiveRunViewsByLoopID(items []activeRunView, excluded []activeRunView) []activeRunView {
+	if len(items) == 0 || len(excluded) == 0 {
+		return items
+	}
+	excludedLoopIDs := make(map[string]struct{}, len(excluded))
+	for _, item := range excluded {
+		excludedLoopIDs[item.LoopID] = struct{}{}
+	}
+	filtered := items[:0]
+	for _, item := range items {
+		if _, ok := excludedLoopIDs[item.LoopID]; ok {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
