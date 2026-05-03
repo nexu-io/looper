@@ -1540,6 +1540,33 @@ func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *test
 	}
 }
 
+func TestCanRefreshReviewerLoginForRecovery(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		loop      storage.LoopRecord
+		latestRun *storage.RunRecord
+		want      bool
+	}{
+		{name: "reviewer failed loop and run", loop: storage.LoopRecord{Type: "reviewer", Status: "failed"}, latestRun: &storage.RunRecord{Status: "failed"}, want: true},
+		{name: "non-reviewer loop", loop: storage.LoopRecord{Type: "worker", Status: "failed"}, latestRun: &storage.RunRecord{Status: "failed"}, want: false},
+		{name: "non-failed loop status", loop: storage.LoopRecord{Type: "reviewer", Status: "running"}, latestRun: &storage.RunRecord{Status: "failed"}, want: false},
+		{name: "nil latest run", loop: storage.LoopRecord{Type: "reviewer", Status: "failed"}, latestRun: nil, want: false},
+		{name: "non-failed latest run", loop: storage.LoopRecord{Type: "reviewer", Status: "failed"}, latestRun: &storage.RunRecord{Status: "completed"}, want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := canRefreshReviewerLoginForRecovery(tt.loop, tt.latestRun); got != tt.want {
+				t.Fatalf("canRefreshReviewerLoginForRecovery() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopUsesRefreshedCurrentLogin(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"

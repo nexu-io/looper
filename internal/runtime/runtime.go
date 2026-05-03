@@ -695,8 +695,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
 			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
 		}
-		if login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy); ok {
-			policy.currentLogin = login
+		if canRefreshReviewerLoginForRecovery(loop, latestRun) {
+			if login, ok := r.currentReviewerLoginForRecovery(ctx, repositories, githubGateway, loop, latestRun, policy); ok {
+				policy.currentLogin = login
+			}
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
 			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
@@ -1318,6 +1320,10 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 		return "", false
 	}
 	return login, true
+}
+
+func canRefreshReviewerLoginForRecovery(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
+	return loop.Type == string(domain.LoopTypeReviewer) && loop.Status == "failed" && latestRun != nil && latestRun.Status == "failed"
 }
 
 func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestQueue *storage.QueueItemRecord, policy runtimeReviewerRecoveryPolicy) bool {
