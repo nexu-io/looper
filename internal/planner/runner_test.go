@@ -324,7 +324,7 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, loginErr: fmt.Errorf("login unavailable")}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, loginErr: fmt.Errorf("login unavailable")}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"team:alpha"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
 
@@ -348,7 +348,7 @@ func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemRequestsAssigneeReviewersWhenAssigneePolicyDisabledAndLoginUnknown(t *testing.T) {
+func TestProcessClaimedItemExcludesCurrentUserFromAssigneeReviewersWhenAssigneePolicyDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"team:alpha"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
@@ -363,8 +363,11 @@ func TestProcessClaimedItemRequestsAssigneeReviewersWhenAssigneePolicyDisabledAn
 	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if len(github.addReviewerCalls) != 1 || len(github.addReviewerCalls[0].Reviewers) != 1 || github.addReviewerCalls[0].Reviewers[0] != "octocat" {
-		t.Fatalf("addReviewerCalls = %#v, want assignee reviewer when current login is unknown", github.addReviewerCalls)
+	if github.loginCalls != 1 {
+		t.Fatalf("loginCalls = %d, want login lookup before resolving assignee reviewers", github.loginCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no self review request", github.addReviewerCalls)
 	}
 }
 

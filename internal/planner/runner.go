@@ -786,7 +786,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}()
 	manual := isManualPlannerQueue(payload)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser) {
+	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
@@ -1758,6 +1758,15 @@ func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopR
 		}
 	}
 	return requested
+}
+
+func hasRequestedReviewerSources(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string) bool {
+	if len(assignees) > 0 {
+		return true
+	}
+	projectMetadata := parseJSONObject(project.MetadataJSON)
+	loopConfig := parseJSONObject(loop.ConfigJSON)
+	return len(toStrings(loopConfig["reviewers"])) > 0 || len(toStrings(projectMetadata["reviewers"])) > 0
 }
 
 func buildIssueTargetID(repo string, issueNumber int64) string {
