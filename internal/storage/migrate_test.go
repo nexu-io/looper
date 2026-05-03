@@ -540,6 +540,7 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 	now := "2026-04-17T12:00:00.000Z"
 	oldAt := "2026-04-17T10:00:00.000Z"
 	newAt := "2026-04-17T11:00:00.000Z"
+	newerCreatedAt := "2026-04-17T11:00:00.001Z"
 	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_migration_0008", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -558,6 +559,7 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 		{ID: "run_terminal_running", LoopID: "loop_terminal_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
 		{ID: "run_duplicate_old", LoopID: "loop_duplicate_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
 		{ID: "run_duplicate_new", LoopID: "loop_duplicate_running", Status: "running", StartedAt: newAt, CreatedAt: newAt, UpdatedAt: newAt},
+		{ID: "run_duplicate_created_later", LoopID: "loop_duplicate_running", Status: "running", StartedAt: newAt, CreatedAt: newerCreatedAt, UpdatedAt: newerCreatedAt},
 	} {
 		if err := repos.Runs.Upsert(ctx, run); err != nil {
 			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
@@ -586,8 +588,15 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Runs.GetByID(run_duplicate_new) error = %v", err)
 	}
+	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
+		t.Fatalf("run_duplicate_new = %#v, want interrupted with ended_at", run)
+	}
+	run, err = repos.Runs.GetByID(ctx, "run_duplicate_created_later")
+	if err != nil {
+		t.Fatalf("Runs.GetByID(run_duplicate_created_later) error = %v", err)
+	}
 	if run == nil || run.Status != "running" {
-		t.Fatalf("run_duplicate_new = %#v, want remaining running run", run)
+		t.Fatalf("run_duplicate_created_later = %#v, want remaining running run", run)
 	}
 	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_duplicate_extra", LoopID: "loop_duplicate_running", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err == nil {
 		t.Fatal("Runs.Upsert(extra running) error = nil, want unique index failure")

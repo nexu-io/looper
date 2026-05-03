@@ -3964,7 +3964,7 @@ func TestActiveRunsDefaultExcludesOlderRunningRunWhenLatestCompleted(t *testing.
 	assertEqual(t, item["status"], "completed")
 }
 
-func TestActiveRunsDefaultExcludesStaleRunningRunWithoutAgentQueueOrHeartbeat(t *testing.T) {
+func TestActiveRunsDefaultFallsBackToRunningLoopWhenRunIsStale(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	oldHeartbeat := fixture.now.Add(-2 * time.Hour).UTC().Format(javaScriptISOString)
@@ -3988,9 +3988,13 @@ func TestActiveRunsDefaultExcludesStaleRunningRunWithoutAgentQueueOrHeartbeat(t 
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	items := body["data"].(map[string]any)["items"].([]any)
-	if len(items) != 0 {
-		t.Fatalf("len(items) = %d, want 0: %#v", len(items), items)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1: %#v", len(items), items)
 	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], "loop_stale_no_activity")
+	assertEqual(t, item["runId"], nil)
+	assertEqual(t, item["status"], "running")
 }
 
 func TestActiveRunsDefaultExcludesPausedLoopWithStaleRunningRun(t *testing.T) {

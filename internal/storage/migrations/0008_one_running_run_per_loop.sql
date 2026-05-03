@@ -10,7 +10,13 @@ WHERE status = 'running'
     WHERE newer.loop_id = runs.loop_id
       AND (
         newer.started_at > runs.started_at
-        OR (newer.started_at = runs.started_at AND newer.id > runs.id)
+        OR (
+          newer.started_at = runs.started_at
+          AND (
+            newer.created_at > runs.created_at
+            OR (newer.created_at = runs.created_at AND newer.id > runs.id)
+          )
+        )
       )
   );
 

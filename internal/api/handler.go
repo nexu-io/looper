@@ -1843,25 +1843,8 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		}
 	}
 
-	runningLoopsWithoutRuns := make([]storage.LoopRecord, 0)
-	if includeRunningLoopsWithoutRuns {
-		runningLoopIDs := make(map[string]struct{}, len(activeRuns))
-		for _, run := range activeRuns {
-			runningLoopIDs[run.LoopID] = struct{}{}
-		}
-
-		for _, loop := range loopsList {
-			if loop.Status != string(domain.LoopStatusRunning) {
-				continue
-			}
-			if _, ok := runningLoopIDs[loop.ID]; ok {
-				continue
-			}
-			runningLoopsWithoutRuns = append(runningLoopsWithoutRuns, loop)
-		}
-	}
-
 	activeAgentByRunID := buildActiveAgentByRunID(activeExecutions)
+	plausiblyLiveRunningLoopIDs := make(map[string]struct{}, len(activeRuns))
 	runningViews := make([]activeRunView, 0, len(activeRuns))
 	for _, run := range activeRuns {
 		loop, ok := loopsByID[run.LoopID]
@@ -1877,6 +1860,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveQueue, hasActiveAgent, h.now().UTC()) {
 			continue
 		}
+		plausiblyLiveRunningLoopIDs[run.LoopID] = struct{}{}
 		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
 		if err != nil {
 			return nil, err
@@ -1898,6 +1882,19 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       activeAgentByRunID[run.ID],
 			Worktree:    buildWorktreeSummary(loop, run),
 		})
+	}
+
+	runningLoopsWithoutRuns := make([]storage.LoopRecord, 0)
+	if includeRunningLoopsWithoutRuns {
+		for _, loop := range loopsList {
+			if loop.Status != string(domain.LoopStatusRunning) {
+				continue
+			}
+			if _, ok := plausiblyLiveRunningLoopIDs[loop.ID]; ok {
+				continue
+			}
+			runningLoopsWithoutRuns = append(runningLoopsWithoutRuns, loop)
+		}
 	}
 
 	queuedViews := make([]activeRunView, 0, len(queuedLoops))
