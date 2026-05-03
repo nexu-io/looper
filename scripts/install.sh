@@ -43,7 +43,8 @@ in_path_dir() {
 }
 
 guess_profile() {
-  shell_name="${SHELL##*/}"
+  shell_name="${SHELL:-}"
+  shell_name="${shell_name##*/}"
   case "$shell_name" in
     zsh) printf '%s/.zprofile\n' "$HOME" ;;
     bash) printf '%s/.bash_profile\n' "$HOME" ;;
@@ -160,10 +161,12 @@ mkdir -p "$install_dir"
 
 profile_updated=0
 if ! in_path_dir "$install_dir"; then
-  profile="$(guess_profile)"
-  if [ "$install_dir" = "$HOME/.local/bin" ] && confirm "~/.local/bin is not on PATH. Add it to $(basename "$profile")?"; then
-    append_path_export "$profile" "$install_dir"
-    profile_updated=1
+  if [ "$install_dir" = "$HOME/.local/bin" ]; then
+    profile="$(guess_profile)"
+    if confirm "~/.local/bin is not on PATH. Add it to $(basename "$profile")?"; then
+      append_path_export "$profile" "$install_dir"
+      profile_updated=1
+    fi
   fi
 fi
 
