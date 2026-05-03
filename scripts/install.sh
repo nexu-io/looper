@@ -66,7 +66,12 @@ confirm() {
 
 append_path_export() {
   profile="$1"
-  export_line='export PATH="$HOME/.local/bin:$PATH"'
+  install_dir="$2"
+  if [ "$install_dir" = "$HOME/.local/bin" ]; then
+    export_line='export PATH="$HOME/.local/bin:$PATH"'
+  else
+    export_line="export PATH=\"$install_dir:\$PATH\""
+  fi
   mkdir -p "$(dirname "$profile")"
   touch "$profile"
   if grep -F "$export_line" "$profile" >/dev/null 2>&1; then
@@ -83,21 +88,6 @@ pick_install_dir() {
     printf '%s\n' "$LOOPER_INSTALL_DIR"
     return 0
   fi
-
-  old_ifs=$IFS
-  IFS=:
-  for entry in $PATH; do
-    case "$entry" in
-      "$HOME"/*)
-        if [ -d "$entry" ] && [ -w "$entry" ]; then
-          IFS=$old_ifs
-          printf '%s\n' "$entry"
-          return 0
-        fi
-        ;;
-    esac
-  done
-  IFS=$old_ifs
 
   printf '%s/.local/bin\n' "$HOME"
 }
@@ -169,10 +159,10 @@ install_dir="$(pick_install_dir)"
 mkdir -p "$install_dir"
 
 profile_updated=0
-if [ "$install_dir" = "$HOME/.local/bin" ] && ! in_path_dir "$install_dir"; then
+if ! in_path_dir "$install_dir"; then
   profile="$(guess_profile)"
-  if confirm "~/.local/bin is not on PATH. Add it to $(basename "$profile")?"; then
-    append_path_export "$profile"
+  if [ "$install_dir" = "$HOME/.local/bin" ] && confirm "~/.local/bin is not on PATH. Add it to $(basename "$profile")?"; then
+    append_path_export "$profile" "$install_dir"
     profile_updated=1
   fi
 fi
@@ -198,11 +188,11 @@ mv "$tmp_binary" "$install_path"
 
 log "Installed looper to $install_path"
 if [ "$profile_updated" -eq 1 ]; then
-  log "Added ~/.local/bin to PATH in $(guess_profile)"
+  log "Added $install_dir to PATH in $(guess_profile)"
 fi
 
-if [ "$install_dir" = "$HOME/.local/bin" ] && ! in_path_dir "$install_dir"; then
-  log "Open a new shell or run: export PATH=\"$HOME/.local/bin:\$PATH\""
+if ! in_path_dir "$install_dir"; then
+  log "Open a new shell or run: export PATH=\"$install_dir:\$PATH\""
 fi
 
 log ""
