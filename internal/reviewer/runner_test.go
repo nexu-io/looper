@@ -824,6 +824,30 @@ func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *tes
 	}
 }
 
+func TestRunFilterStepRefreshesCurrentLoginBeforeAlreadyReviewedCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-user"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "old-user"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", CurrentLogin: "old-user", ReviewRequests: []string{"new-user"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip for stale checkpoint login", checkpoint.SkipReason)
+	}
+	if checkpoint.Detail.CurrentLogin != "new-user" {
+		t.Fatalf("CurrentLogin = %q, want refreshed login", checkpoint.Detail.CurrentLogin)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
+	}
+}
+
 func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -850,6 +874,38 @@ func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) 
 	}
 	if updated.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepRefreshesCurrentLoginBeforeApprovedCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-user"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_stale_approved", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "old-user"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", CurrentLogin: "old-user", ReviewRequests: []string{"new-user"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no termination for stale checkpoint login", checkpoint.SkipReason)
+	}
+	if checkpoint.Detail.CurrentLogin != "new-user" {
+		t.Fatalf("CurrentLogin = %q, want refreshed login", checkpoint.Detail.CurrentLogin)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -4484,6 +4540,7 @@ type fakeGitHubGateway struct {
 	reviewRequests                  []string
 	currentLogin                    string
 	currentLoginErr                 error
+	currentLoginCalls               int
 	reviewMarkerMissing             bool
 	reviewMarkerErr                 error
 	reviewMarkerEvent               ReviewEvent
@@ -4524,6 +4581,7 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	g.currentLoginCalls++
 	if g.currentLoginErr != nil {
 		return "", g.currentLoginErr
 	}

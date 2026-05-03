@@ -1163,7 +1163,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
-	currentLogin := normalizeLogin(checkpoint.Detail.CurrentLogin)
+	currentLogin := ""
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && (r.loopConfig.StopOnApproved || r.discoveryPolicy.RequireReviewRequest) {
 		if currentLogin == "" {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -1228,11 +1228,15 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
-		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		if currentLogin == "" {
+			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+			checkpoint.Detail.CurrentLogin = currentLogin
 		}
-		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
