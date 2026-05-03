@@ -51,6 +51,7 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 	reader := bufio.NewReader(response.Body)
 	lastExecutionID := ""
 	lastRunID := ""
+	sawLogContent := false
 	sawEnd := false
 
 	for {
@@ -73,6 +74,9 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 			data, decodeErr := decodeLoopLogsOutput(json.RawMessage(payload))
 			if decodeErr != nil {
 				return decodeErr
+			}
+			if loopLogsSnapshotHasOutput(data, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail")) {
+				sawLogContent = true
 			}
 			if err := writeHumanLoopLogsSnapshot(cmd.OutOrStdout(), data, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail"), true); err != nil {
 				return err
@@ -113,11 +117,38 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 			if _, err := io.WriteString(cmd.OutOrStdout(), chunk.Content); err != nil {
 				return err
 			}
+			if strings.TrimSpace(chunk.Content) != "" {
+				sawLogContent = true
+			}
 		case "end":
 			sawEnd = true
+			if !sawLogContent {
+				payload, err := r.getJSON(cmd.Context(), "/api/v1/loops/"+url.PathEscape(loopID)+"/logs")
+				if err != nil {
+					return err
+				}
+				data, err := decodeLoopLogsOutput(payload)
+				if err != nil {
+					return err
+				}
+				if loopLogsRunFailureMessage(data) != "" {
+					if _, err := fmt.Fprintln(cmd.OutOrStdout()); err != nil {
+						return err
+					}
+					return writeHumanLoopLogsSnapshot(cmd.OutOrStdout(), data, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail"), false)
+				}
+			}
 			return nil
 		}
 	}
+}
+
+func loopLogsSnapshotHasOutput(data loopLogsOutput, stderr bool, full bool, tail string) bool {
+	content, err := loopLogsInitialContent(data, stderr, full, tail)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(content) != "" || loopLogsRunFailureMessage(data) != ""
 }
 
 func readServerSentEvent(reader *bufio.Reader) (string, string, error) {
