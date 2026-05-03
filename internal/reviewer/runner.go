@@ -3259,11 +3259,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	publishInstruction := "For actionable findings, you must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, do not publish a GitHub review or PR comment; use the non-comment clean signal instructions instead. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
+	publishInstruction := "For actionable findings, you must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so do not publish a GitHub review yourself; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not create a noisy PR review/comment; add only a +1 reaction/check-style signal as instructed and finish with a completion summary that starts with `No actionable findings`.", "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`.", "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -3295,11 +3295,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		parts = append(parts, instructionBlock.Text)
 	}
 	cleanNoopInstruction := "For no-actionable-finding results, do not submit a clean COMMENT or APPROVE review; add only the non-comment clean signal and finish successfully."
+	cleanInstruction := cleanNoopInstruction
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels for reaction-only no-actionable-finding results."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
-	if reviewEvents.Clean == config.ReviewerReviewEventApprove {
+	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" {
+		cleanInstruction = fmt.Sprintf("For no-actionable-finding results, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s %s`. Do not write an LGTM-style clean body; keep the visible review body minimal and marker-bearing only.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 		specLabelInstruction = "Do not transition spec-review labels for reaction-only no-actionable-finding results; only preserve an existing approved-review spec-ready transition when the idempotency check finds a prior matching APPROVED clean review."
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
@@ -3335,9 +3337,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For non-blocking or blocking finding reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
-		cleanNoopInstruction,
+		cleanInstruction,
 		blockingInstruction,
-		"Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not submit a PR review or PR comment; add the +1 reaction only and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback.",
+		"Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback.",
 		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
 		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem or the same failure mode, publish one architecture-level recommendation that names the systemic cause and preferred design direction instead of continuing one-off edge-case comments.",
 		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
