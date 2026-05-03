@@ -68,9 +68,6 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateReviewSubmitEventAllowed(event, policy); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy); err != nil {
-		return err
-	}
 	if loaded.Config.Tools.GHPath == nil || strings.TrimSpace(*loaded.Config.Tools.GHPath) == "" {
 		return fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
@@ -80,11 +77,14 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run})
-	headSHA, err := gh.GetPullRequestHeadSHA(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return fmt.Errorf("validate expected PR head commit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, headSHA); err != nil {
+	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+		return err
+	}
+	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
 		return err
 	}
 	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
@@ -164,7 +164,7 @@ var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 
-func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig) error {
+func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
 	if len(matches) != 1 {
 		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
@@ -185,7 +185,7 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if len(comments) > 0 {
 			return fmt.Errorf("APPROVE reviews require clean outcome without inline comments")
 		}
-		if err := validateCleanApproveBody(body); err != nil {
+		if err := validateCleanApproveBody(body, authorLogin); err != nil {
 			return err
 		}
 	case "REQUEST_CHANGES":
@@ -203,12 +203,17 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 	return nil
 }
 
-func validateCleanApproveBody(body string) error {
+func validateCleanApproveBody(body string, authorLogin string) error {
 	visible := cleanReviewHumanBody(body)
-	if !strings.HasPrefix(visible, "@") {
+	mention := authorMention(authorLogin)
+	if mention == "" {
+		return fmt.Errorf("APPROVE clean review body requires the PR author login for @mention validation")
+	}
+	fields := strings.Fields(visible)
+	if len(fields) == 0 || fields[0] != mention {
 		return fmt.Errorf("APPROVE clean review body must start with an @mention of the PR author")
 	}
-	if len(strings.Fields(visible)) < 12 {
+	if len(fields) < 12 {
 		return fmt.Errorf("APPROVE clean review body must include a short human summary and friendly acknowledgement, not only markers or disclosure")
 	}
 	return nil
@@ -220,6 +225,14 @@ func cleanReviewHumanBody(body string) string {
 	cleaned = markdownHTMLCommentRE.ReplaceAllString(cleaned, "")
 	cleaned = markdownReferenceDefinitionRE.ReplaceAllString(cleaned, "")
 	return strings.TrimSpace(cleaned)
+}
+
+func authorMention(login string) string {
+	login = strings.TrimSpace(strings.TrimPrefix(login, "@"))
+	if login == "" {
+		return ""
+	}
+	return "@" + login
 }
 
 func isValidReviewSubmitOutcome(outcome string) bool {

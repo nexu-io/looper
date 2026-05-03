@@ -1759,6 +1759,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			} else if cleanApprovedReviewMarker(found) {
+				if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
+					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				}
 				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 				checkpoint.ResumePolicy = "advance_from_checkpoint"
 				return checkpoint, nil
@@ -1858,6 +1861,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	if cleanReviewNoopSummary(pending.Summary) && r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove && !cleanApprovedReviewMarker(markerResult) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
+	}
+	if cleanApprovedReviewMarker(markerResult) {
+		if err := validateCleanApprovedReviewMarkerBody(markerResult, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
 	}
 	checkpoint.PendingReview = pending.clone()
 	if checkpoint.PendingReview.ContentFingerprint == "" {
@@ -1971,12 +1979,7 @@ func cleanReviewNoopSummary(summary string) bool {
 }
 
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
-	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean") && len(found.InlineCommentBodies) == 0 && validCleanApprovedReviewBody(found.Body)
-}
-
-func validCleanApprovedReviewBody(body string) bool {
-	visible := reviewHumanVisibleBody(body)
-	return strings.HasPrefix(visible, "@") && len(strings.Fields(visible)) >= 12
+	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean") && len(found.InlineCommentBodies) == 0
 }
 
 func reviewHumanVisibleBody(body string) string {
@@ -1985,6 +1988,43 @@ func reviewHumanVisibleBody(body string) string {
 	cleaned = reviewHumanHTMLCommentPattern.ReplaceAllString(cleaned, "")
 	cleaned = reviewHumanReferenceDefinitionPattern.ReplaceAllString(cleaned, "")
 	return strings.TrimSpace(cleaned)
+}
+
+func validateCleanApprovedReviewMarkerBody(marker ReviewMarkerResult, authorLogin string) error {
+	visible := reviewHumanVisibleBody(marker.Body)
+	mention := cleanReviewAuthorMention(authorLogin)
+	if mention == "" {
+		return fmt.Errorf("clean APPROVE review body requires the PR author login for @mention validation")
+	}
+	fields := strings.Fields(visible)
+	if len(fields) == 0 || fields[0] != mention {
+		return fmt.Errorf("clean APPROVE review body must start with PR author mention %s", mention)
+	}
+	if len(fields) < 12 {
+		return fmt.Errorf("clean APPROVE review body must include a short human summary and friendly acknowledgement, not only markers or disclosure")
+	}
+	return nil
+}
+
+func cleanReviewAuthorLogin(checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
+	if author := strings.TrimSpace(detail.Author); author != "" {
+		return author
+	}
+	if checkpoint.Detail != nil && strings.TrimSpace(checkpoint.Detail.Author) != "" {
+		return checkpoint.Detail.Author
+	}
+	if checkpoint.Snapshot != nil && strings.TrimSpace(checkpoint.Snapshot.Author) != "" {
+		return checkpoint.Snapshot.Author
+	}
+	return ""
+}
+
+func cleanReviewAuthorMention(login string) string {
+	login = strings.TrimSpace(strings.TrimPrefix(login, "@"))
+	if login == "" {
+		return ""
+	}
+	return "@" + login
 }
 
 func (r *Runner) specReviewingLabel() string {
@@ -3296,7 +3336,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`.", "Run ID for logging only, not for idempotency: " + runID}
+	outcomeInstruction := "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
+	cleanResultCompletionInstruction := "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
+	if looperCLIPath == "" {
+		outcomeInstruction = "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
+	}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -3330,6 +3376,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	cleanReviewAuthorMention := cleanReviewAuthorTarget(checkpoint)
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
 	cleanInstruction := cleanNoopInstruction
+	if looperCLIPath == "" {
+		cleanInstruction = "For no-actionable-finding results, do not use the clean COMMENT no-op path and do not finish successfully because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+	}
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
@@ -3369,7 +3418,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		specLabelInstruction,
 		cleanInstruction,
 		blockingInstruction,
-		"Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback.",
+		cleanResultCompletionInstruction,
 		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
 		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem or the same failure mode, publish one architecture-level recommendation that names the systemic cause and preferred design direction instead of continuing one-off edge-case comments.",
 		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
@@ -3406,18 +3455,11 @@ func customInstructionConfig(value *config.Config) config.Config {
 }
 
 func cleanReviewAuthorTarget(checkpoint reviewerCheckpoint) string {
-	author := ""
-	if checkpoint.Detail != nil {
-		author = checkpoint.Detail.Author
-	}
-	if strings.TrimSpace(author) == "" && checkpoint.Snapshot != nil {
-		author = checkpoint.Snapshot.Author
-	}
-	author = strings.TrimSpace(strings.TrimPrefix(author, "@"))
-	if author == "" {
+	mention := cleanReviewAuthorMention(cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+	if mention == "" {
 		return "@<PR-author-login>"
 	}
-	return "@" + author
+	return mention
 }
 
 func normalizeLooperCLIPath(path string) string {

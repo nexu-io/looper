@@ -1748,8 +1748,8 @@ func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForAppro
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
-		t.Fatalf("result = %#v, want retryable approve-marker-required failure", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
+		t.Fatalf("result = %#v, want retryable invalid approval body failure", result)
 	}
 	if github.reviewMarkerCalls == 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want marker lookup before rejecting invalid clean APPROVE body", github.reviewMarkerCalls)
@@ -1796,7 +1796,7 @@ func TestProcessClaimedItemRejectsCleanNoopResumeWithInvalidApprovedMarkerBodyFo
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "valid human approval body") {
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
 		t.Fatalf("result = %#v, want retryable invalid approval body failure", result)
 	}
 	if len(agent.starts) != 0 {
@@ -3830,6 +3830,8 @@ func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailabl
 		"'' review submit",
 		" review submit acme/looper#42",
 		"You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper",
+		"finish successfully with the `No actionable findings` summary only",
+		"finish successfully with a summary beginning `No actionable findings`",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt contains unavailable submit-path instruction %q:\n%s", forbidden, prompt)
@@ -4533,9 +4535,17 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	}
 	body := g.reviewMarkerBody
 	if body == "" && !g.reviewMarkerBodyExplicit {
-		body = "review body <!-- looper:review outcome=" + outcome + " -->"
+		if outcome == "clean" && g.reviewMarkerEvent == ReviewEventApprove {
+			body = cleanApproveReviewBody("octocat", outcome)
+		} else {
+			body = "review body <!-- looper:review outcome=" + outcome + " -->"
+		}
 	}
 	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent, Body: body, InlineCommentBodies: append([]string(nil), g.reviewMarkerInlineCommentBodies...)}, nil
+}
+
+func cleanApproveReviewBody(author string, outcome string) string {
+	return fmt.Sprintf("@%s Thanks for the thoughtful update — I verified the changes are clear, focused, and safe to approve. Nice work tightening this up; it should be easier to maintain going forward.\n\n<!-- looper:review id=abc head=abc123 outcome=%s -->", author, outcome)
 }
 
 func (g *fakeGitHubGateway) AddPullRequestReaction(_ context.Context, input PullRequestReactionInput) error {

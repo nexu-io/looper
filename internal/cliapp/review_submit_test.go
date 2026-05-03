@@ -57,7 +57,7 @@ func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
 	t.Parallel()
 	body := "Review body\n<!-- looper:review id=abc head=def outcome=actionable -->"
-	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy); err != nil {
+	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody() error = %v", err)
 	}
 	for _, tc := range []struct {
@@ -75,7 +75,7 @@ func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
 			if tc.name == "stale" {
 				commitID = "new"
 			}
-			err := validateReviewSubmitBody(tc.body, nil, commitID, "COMMENT", commentOnlyReviewPolicy)
+			err := validateReviewSubmitBody(tc.body, nil, commitID, "COMMENT", commentOnlyReviewPolicy, "octocat")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("validateReviewSubmitBody() error = %v, want %q", err, tc.want)
 			}
@@ -86,7 +86,7 @@ func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
 func TestValidateReviewSubmitBodyRejectsApproveActionableMismatch(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=actionable -->"
-	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy); err == nil || !strings.Contains(err.Error(), "does not match APPROVE") {
+	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "does not match APPROVE") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE actionable) error = %v, want mismatch", err)
 	}
 }
@@ -94,11 +94,11 @@ func TestValidateReviewSubmitBodyRejectsApproveActionableMismatch(t *testing.T) 
 func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=blocking -->"
-	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "REQUEST_CHANGES", decisionReviewPolicy); err != nil {
+	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody(REQUEST_CHANGES blocking) error = %v", err)
 	}
 	nonBlocking := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
-	if err := validateReviewSubmitBody(nonBlocking, nil, "def", "REQUEST_CHANGES", decisionReviewPolicy); err == nil || !strings.Contains(err.Error(), "does not match REQUEST_CHANGES") {
+	if err := validateReviewSubmitBody(nonBlocking, nil, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "does not match REQUEST_CHANGES") {
 		t.Fatalf("validateReviewSubmitBody(REQUEST_CHANGES non_blocking) error = %v, want mismatch", err)
 	}
 }
@@ -106,7 +106,7 @@ func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.
 func TestValidateReviewSubmitBodyRejectsCleanApproveWithInlineComments(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=clean -->"
-	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy)
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy, "octocat")
 	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE with comments) error = %v, want inline rejection", err)
 	}
@@ -123,12 +123,13 @@ func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 	}{
 		{name: "marker only", body: marker, want: "must start with an @mention"},
 		{name: "disclosure only", body: marker + "\n\n" + stamp, want: "must start with an @mention"},
+		{name: "wrong author", body: "@someone Thanks for the thoughtful update with clear safe changes and encouraging maintainable implementation.\n\n" + marker, want: "must start with an @mention"},
 		{name: "too terse", body: "@octocat Nice work.\n\n" + marker, want: "short human summary"},
 		{name: "hidden html filler", body: "@octocat <!-- these hidden filler words should not count toward the human summary requirement -->\n\n" + marker, want: "short human summary"},
 		{name: "reference definition filler", body: "@octocat\n\n[hidden]:https://example.com\n  these hidden filler words should not count toward the human summary requirement\n\n" + marker, want: "short human summary"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateReviewSubmitBody(tc.body, nil, "def", "APPROVE", decisionReviewPolicy)
+			err := validateReviewSubmitBody(tc.body, nil, "def", "APPROVE", decisionReviewPolicy, "octocat")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("validateReviewSubmitBody() error = %v, want %q", err, tc.want)
 			}
@@ -142,7 +143,7 @@ func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 		marker,
 		stamp,
 	}, "\n\n")
-	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy); err != nil {
+	if err := validateReviewSubmitBody(body, nil, "def", "APPROVE", decisionReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody(APPROVE human body) error = %v", err)
 	}
 }
