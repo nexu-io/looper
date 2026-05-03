@@ -182,6 +182,78 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(
 	}
 }
 
+func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForDeterministicBlockers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		seed       failedReviewerRecoverySeed
+		mutate     func(t *testing.T, fixture *runnerFixture, loopID string)
+		wantReason string
+	}{
+		{
+			name:       "latest queue not failed",
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			wantReason: "latest_queue_not_failed",
+			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
+				t.Helper()
+				queue, err := fixture.repos.Queue.GetLatestByLoopID(context.Background(), loopID)
+				if err != nil || queue == nil {
+					t.Fatalf("Queue.GetLatestByLoopID() = (%#v, %v), want queue", queue, err)
+				}
+				queue.Status = "queued"
+				if err := fixture.repos.Queue.Upsert(context.Background(), *queue); err != nil {
+					t.Fatalf("Queue.Upsert() error = %v", err)
+				}
+			},
+		},
+		{
+			name:       "latest run not failed",
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			wantReason: "latest_run_not_failed",
+			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
+				t.Helper()
+				run, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), loopID)
+				if err != nil || run == nil {
+					t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want run", run, err)
+				}
+				run.Status = "completed"
+				if err := fixture.repos.Runs.Upsert(context.Background(), *run); err != nil {
+					t.Fatalf("Runs.Upsert() error = %v", err)
+				}
+			},
+		},
+		{name: "manual intervention", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
+		{name: "not whitelisted", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "marker missing"}, wantReason: "not_whitelisted"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, tt.seed)
+			if tt.mutate != nil {
+				tt.mutate(t, fixture, loopID)
+			}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}})
+			if err != nil {
+				t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+			}
+			if eligible {
+				t.Fatalf("eligible = true, want false")
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if github.currentLoginCalls != 0 {
+				t.Fatalf("currentLoginCalls = %d, want 0", github.currentLoginCalls)
+			}
+		})
+	}
+}
+
 func TestSummaryFromDetailPreservesReviewsForApprovalRecovery(t *testing.T) {
 	t.Parallel()
 	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}

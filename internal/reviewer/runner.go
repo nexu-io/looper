@@ -2452,15 +2452,6 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
 		return false, "", "auto_recovery_attempt_cap", nil
 	}
-	if r.loopConfig.StopOnApproved && len(pr.Reviews) > 0 {
-		currentLogin, err := r.currentLoginForLoop(ctx, loop)
-		if err != nil {
-			return false, "", "", err
-		}
-		if hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA) {
-			return false, "", "approved", nil
-		}
-	}
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return false, "", "", err
@@ -2484,7 +2475,24 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if queueKind == string(FailureManualIntervention) || checkpoint.ResumePolicy == "manual_intervention" {
 		return false, "", "manual_intervention", nil
 	}
+	approvedByCurrentUser := func() (bool, error) {
+		if !r.loopConfig.StopOnApproved || len(pr.Reviews) == 0 {
+			return false, nil
+		}
+		currentLogin, err := r.currentLoginForLoop(ctx, loop)
+		if err != nil {
+			return false, err
+		}
+		return hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA), nil
+	}
 	if queueKind == string(FailureRetryableAfterResume) && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review") {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
 		return true, latestQueue.ID, "retryable_after_resume_" + checkpoint.ResumePolicy, nil
 	}
 	latestMessage := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
@@ -2492,6 +2500,13 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		latestMessage = derefString(latestQueue.LastError)
 	}
 	if isKnownReviewerRediscoveryGuardrail(latestMessage) && isReviewerRediscoveryRunStep(latestRun) {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
 		return true, latestQueue.ID, "historical_guardrail", nil
 	}
 	return false, "", "not_whitelisted", nil
