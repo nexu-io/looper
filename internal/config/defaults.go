@@ -137,7 +137,7 @@ func DefaultConfig(cwd string) (Config, error) {
 				MinPublishIntervalSeconds: 300,
 				MaxIterationsPerPR:        20,
 				MaxIterationsPerHead:      1,
-				MaxWallClockSeconds:       14400,
+				MaxWallClockSeconds:       0,
 				MaxConsecutiveFailures:    3,
 				MaxAgentExecutionsPerPR:   25,
 				StopOnApproved:            true,

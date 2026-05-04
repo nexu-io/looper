@@ -349,12 +349,16 @@ Default values:
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
+- `loop.maxWallClockSeconds`: maximum wall-clock lifetime for a follow-up reviewer loop, measured from loop creation. Use `0` for no wall-clock limit. Default: `0`.
 
 Default reviewer behavior is safe and comment-only:
 
 ```json
 {
   "reviewer": {
+    "loop": {
+      "maxWallClockSeconds": 0
+    },
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"

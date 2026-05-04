@@ -75,6 +75,9 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
 		t.Fatalf("worker role defaults = %#v", got)
 	}
+	if got := cfg.Reviewer.Loop.MaxWallClockSeconds; got != 0 {
+		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
+	}
 }
 
 func TestAgentTimeoutConfigOverrides(t *testing.T) {
@@ -859,7 +862,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 		"logging": {"level": "verbose", "maxFiles": 0},
 		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
-		"reviewer": {"loop": {"quietPeriodSeconds": -1, "minPublishIntervalSeconds": -1, "maxIterationsPerPR": 0}, "scope": "wide", "publishMode": "stream"},
+		"reviewer": {"loop": {"quietPeriodSeconds": -1, "minPublishIntervalSeconds": -1, "maxIterationsPerPR": 0, "maxWallClockSeconds": -1}, "scope": "wide", "publishMode": "stream"},
 		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
 		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
 	}`
@@ -889,6 +892,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.loop.minPublishIntervalSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.loop.maxIterationsPerPR", "must be a positive integer")
+	assertValidationIssue(t, validationErr, "reviewer.loop.maxWallClockSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
 	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")

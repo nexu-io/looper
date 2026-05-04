@@ -782,6 +782,13 @@ func TestReviewerLoopBudgetTerminationReasons(t *testing.T) {
 	if got := runner.loopBudgetTerminationReason(loop, "abc123"); got != "max_iterations_per_pr" {
 		t.Fatalf("loopBudgetTerminationReason() = %q, want max_iterations_per_pr", got)
 	}
+
+	unlimitedRunner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	metadata = `{"loop":{"iterationCount":1,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"old":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
+	loop.MetadataJSON = &metadata
+	if got := unlimitedRunner.loopBudgetTerminationReason(loop, "abc123"); got != "" {
+		t.Fatalf("loopBudgetTerminationReason() = %q, want no termination when max wall clock is 0", got)
+	}
 }
 
 func TestRunFilterStepSkipsAlreadyReviewedHeadBeforeBudgetTermination(t *testing.T) {

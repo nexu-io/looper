@@ -243,7 +243,7 @@
               "minPublishIntervalSeconds": 300,
               "maxIterationsPerPR": 20,
               "maxIterationsPerHead": 1,
-              "maxWallClockSeconds": 14400,
+              "maxWallClockSeconds": 0,
               "maxConsecutiveFailures": 3,
               "maxAgentExecutionsPerPR": 25,
               "stopOnApproved": true,
