@@ -179,17 +179,17 @@
             "params": {},
             "timeouts": {
               "fixerIdleTimeoutSeconds": 600,
-              "fixerMaxRuntimeSeconds": 3600,
-              "fixerSeconds": 3600,
+              "fixerMaxRuntimeSeconds": 7200,
+              "fixerSeconds": 7200,
               "plannerIdleTimeoutSeconds": 600,
-              "plannerMaxRuntimeSeconds": 1800,
-              "plannerSeconds": 1800,
+              "plannerMaxRuntimeSeconds": 3600,
+              "plannerSeconds": 3600,
               "reviewerIdleTimeoutSeconds": 600,
-              "reviewerMaxRuntimeSeconds": 3600,
-              "reviewerSeconds": 3600,
+              "reviewerMaxRuntimeSeconds": 5400,
+              "reviewerSeconds": 5400,
               "workerIdleTimeoutSeconds": 900,
-              "workerMaxRuntimeSeconds": 5400,
-              "workerSeconds": 5400
+              "workerMaxRuntimeSeconds": 10800,
+              "workerSeconds": 10800
             },
             "vendor": "opencode"
           },

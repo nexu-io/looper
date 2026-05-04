@@ -59,7 +59,7 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 		t.Fatalf("Normalize() error = %v", err)
 	}
 
-	if got := cfg.Agent.Timeouts; got.PlannerSeconds != 1800 || got.WorkerSeconds != 5400 || got.ReviewerSeconds != 3600 || got.FixerSeconds != 3600 || got.PlannerIdleTimeoutSeconds != 600 || got.WorkerIdleTimeoutSeconds != 900 || got.ReviewerIdleTimeoutSeconds != 600 || got.FixerIdleTimeoutSeconds != 600 {
+	if got := cfg.Agent.Timeouts; got.PlannerSeconds != 3600 || got.WorkerSeconds != 10800 || got.ReviewerSeconds != 5400 || got.FixerSeconds != 7200 || got.PlannerMaxRuntimeSeconds != 3600 || got.WorkerMaxRuntimeSeconds != 10800 || got.ReviewerMaxRuntimeSeconds != 5400 || got.FixerMaxRuntimeSeconds != 7200 || got.PlannerIdleTimeoutSeconds != 600 || got.WorkerIdleTimeoutSeconds != 900 || got.ReviewerIdleTimeoutSeconds != 600 || got.FixerIdleTimeoutSeconds != 600 {
 		t.Fatalf("agent timeout defaults = %#v", got)
 	}
 

@@ -123,18 +123,18 @@
           "OPENAI_API_KEY": "test"
         },
         "timeouts": {
-          "plannerSeconds": 1800,
-          "workerSeconds": 5400,
+          "plannerSeconds": 3600,
+          "workerSeconds": 10800,
           "reviewerSeconds": 2700,
-          "fixerSeconds": 3600,
+          "fixerSeconds": 7200,
           "plannerIdleTimeoutSeconds": 600,
-          "plannerMaxRuntimeSeconds": 1800,
+          "plannerMaxRuntimeSeconds": 3600,
           "workerIdleTimeoutSeconds": 900,
-          "workerMaxRuntimeSeconds": 5400,
+          "workerMaxRuntimeSeconds": 10800,
           "reviewerIdleTimeoutSeconds": 600,
           "reviewerMaxRuntimeSeconds": 2700,
           "fixerIdleTimeoutSeconds": 600,
-          "fixerMaxRuntimeSeconds": 3600
+          "fixerMaxRuntimeSeconds": 7200
         }
       },
       "logging": {
