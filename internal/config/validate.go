@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type ValidationIssue struct {
@@ -85,6 +86,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI)})
 	}
+	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
 	if !isValidLogLevel(config.Logging.Level) {
 		issues = append(issues, ValidationIssue{Path: "logging.level", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError)})
@@ -266,6 +268,26 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]ValidationIssue) {
+	validateAgentTimeoutSeconds(timeouts.PlannerSeconds, path+".plannerSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.WorkerSeconds, path+".workerSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.ReviewerSeconds, path+".reviewerSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.FixerSeconds, path+".fixerSeconds", issues)
+}
+
+func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationIssue) {
+	if seconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a positive integer"})
+		return
+	}
+
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	if int64(seconds) > maxSeconds {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must fit within time.Duration when converted from seconds"})
+	}
 }
 
 func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxInstructionBytes int, issues *[]ValidationIssue) {

@@ -39,7 +39,7 @@ const (
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
 
-	defaultAgentTimeout = 30 * time.Minute
+	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3

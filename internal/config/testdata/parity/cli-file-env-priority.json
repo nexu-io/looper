@@ -62,6 +62,9 @@
           },
           "env": {
             "FILE_ENV": "file"
+          },
+          "timeouts": {
+            "workerSeconds": 2400
           }
         },
         "projects": [
@@ -99,6 +102,12 @@
         },
         "env": {
           "FILE_ENV": "file"
+        },
+        "timeouts": {
+          "plannerSeconds": 1800,
+          "workerSeconds": 2400,
+          "reviewerSeconds": 1800,
+          "fixerSeconds": 1800
         }
       },
       "logging": {

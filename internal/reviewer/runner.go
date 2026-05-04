@@ -74,7 +74,7 @@ const (
 )
 
 const (
-	defaultAgentTimeout = 15 * time.Minute
+	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3

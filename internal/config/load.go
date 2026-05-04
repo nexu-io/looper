@@ -260,6 +260,50 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureToolPathsConfig(&parsed.overrides).LooperPath = stringPtr(value)
 			index = nextIndex
+		case matchesFlag(arg, "--planner-agent-timeout-seconds"):
+			value, nextIndex, err := takeValue(index, "--planner-agent-timeout-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --planner-agent-timeout-seconds: %q is not an integer", value)
+			}
+			ensureAgentTimeoutConfig(&parsed.overrides).PlannerSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--worker-agent-timeout-seconds"):
+			value, nextIndex, err := takeValue(index, "--worker-agent-timeout-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --worker-agent-timeout-seconds: %q is not an integer", value)
+			}
+			ensureAgentTimeoutConfig(&parsed.overrides).WorkerSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-agent-timeout-seconds"):
+			value, nextIndex, err := takeValue(index, "--reviewer-agent-timeout-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-agent-timeout-seconds: %q is not an integer", value)
+			}
+			ensureAgentTimeoutConfig(&parsed.overrides).ReviewerSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--fixer-agent-timeout-seconds"):
+			value, nextIndex, err := takeValue(index, "--fixer-agent-timeout-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fixer-agent-timeout-seconds: %q is not an integer", value)
+			}
+			ensureAgentTimeoutConfig(&parsed.overrides).FixerSeconds = parsedValue
+			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-commit"):
 			value, nextIndex, err := takeValue(index, "--allow-auto-commit")
 			if err != nil {
@@ -495,6 +539,9 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
 	}
+	if err := applyAgentTimeoutEnvOverrides(&overrides, lookupEnv); err != nil {
+		return PartialConfig{}, err
+	}
 	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_COMMIT"); ok {
 		parsed, err := parseBoolean(value)
 		if err != nil {
@@ -601,6 +648,35 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	}
 
 	return overrides, nil
+}
+
+func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
+	integerEnv := func(name string, set func(*int)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not an integer", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_PLANNER_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).PlannerSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_WORKER_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).WorkerSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_REVIEWER_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).ReviewerSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_FIXER_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).FixerSeconds = v }); err != nil {
+		return err
+	}
+	return nil
 }
 
 func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
@@ -725,6 +801,23 @@ func ensureStorageConfig(partial *PartialConfig) *PartialStorageConfig {
 	}
 
 	return partial.Storage
+}
+
+func ensureAgentConfig(partial *PartialConfig) *PartialAgentConfig {
+	if partial.Agent == nil {
+		partial.Agent = &PartialAgentConfig{}
+	}
+
+	return partial.Agent
+}
+
+func ensureAgentTimeoutConfig(partial *PartialConfig) *PartialAgentTimeoutConfig {
+	agent := ensureAgentConfig(partial)
+	if agent.Timeouts == nil {
+		agent.Timeouts = &PartialAgentTimeoutConfig{}
+	}
+
+	return agent.Timeouts
 }
 
 func ensureNotificationConfig(partial *PartialConfig) *PartialNotificationConfig {

@@ -134,10 +134,18 @@ type SchedulerConfig struct {
 }
 
 type AgentConfig struct {
-	Vendor *AgentVendor      `json:"vendor,omitempty"`
-	Model  *string           `json:"model,omitempty"`
-	Params map[string]any    `json:"params"`
-	Env    map[string]string `json:"env"`
+	Vendor   *AgentVendor       `json:"vendor,omitempty"`
+	Model    *string            `json:"model,omitempty"`
+	Params   map[string]any     `json:"params"`
+	Env      map[string]string  `json:"env"`
+	Timeouts AgentTimeoutConfig `json:"timeouts"`
+}
+
+type AgentTimeoutConfig struct {
+	PlannerSeconds  int `json:"plannerSeconds"`
+	WorkerSeconds   int `json:"workerSeconds"`
+	ReviewerSeconds int `json:"reviewerSeconds"`
+	FixerSeconds    int `json:"fixerSeconds"`
 }
 
 type NotificationConfig struct {
@@ -375,10 +383,18 @@ type PartialSchedulerConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor *AgentVendor      `json:"vendor,omitempty"`
-	Model  *string           `json:"model,omitempty"`
-	Params map[string]any    `json:"params,omitempty"`
-	Env    map[string]string `json:"env,omitempty"`
+	Vendor   *AgentVendor               `json:"vendor,omitempty"`
+	Model    *string                    `json:"model,omitempty"`
+	Params   map[string]any             `json:"params,omitempty"`
+	Env      map[string]string          `json:"env,omitempty"`
+	Timeouts *PartialAgentTimeoutConfig `json:"timeouts,omitempty"`
+}
+
+type PartialAgentTimeoutConfig struct {
+	PlannerSeconds  *int `json:"plannerSeconds,omitempty"`
+	WorkerSeconds   *int `json:"workerSeconds,omitempty"`
+	ReviewerSeconds *int `json:"reviewerSeconds,omitempty"`
+	FixerSeconds    *int `json:"fixerSeconds,omitempty"`
 }
 
 type PartialNotificationConfig struct {

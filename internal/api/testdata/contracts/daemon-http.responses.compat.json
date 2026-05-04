@@ -177,6 +177,12 @@
           "agent": {
             "env": {},
             "params": {},
+            "timeouts": {
+              "fixerSeconds": 1800,
+              "plannerSeconds": 1800,
+              "reviewerSeconds": 1800,
+              "workerSeconds": 3600
+            },
             "vendor": "opencode"
           },
           "logging": {

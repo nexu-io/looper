@@ -73,6 +73,12 @@ func DefaultConfig(cwd string) (Config, error) {
 		Agent: AgentConfig{
 			Params: map[string]any{},
 			Env:    map[string]string{},
+			Timeouts: AgentTimeoutConfig{
+				PlannerSeconds:  30 * 60,
+				WorkerSeconds:   60 * 60,
+				ReviewerSeconds: 30 * 60,
+				FixerSeconds:    30 * 60,
+			},
 		},
 		Logging: LoggingConfig{
 			Level:     LogLevelInfo,

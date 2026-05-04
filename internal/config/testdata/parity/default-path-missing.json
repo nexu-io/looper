@@ -37,7 +37,13 @@
       },
       "agent": {
         "params": {},
-        "env": {}
+        "env": {},
+        "timeouts": {
+          "plannerSeconds": 1800,
+          "workerSeconds": 3600,
+          "reviewerSeconds": 1800,
+          "fixerSeconds": 1800
+        }
       },
       "logging": {
         "level": "info",

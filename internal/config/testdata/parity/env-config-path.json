@@ -32,6 +32,9 @@
           },
           "env": {
             "OPENAI_API_KEY": "test"
+          },
+          "timeouts": {
+            "reviewerSeconds": 2700
           }
         },
         "logging": {
@@ -118,6 +121,12 @@
         },
         "env": {
           "OPENAI_API_KEY": "test"
+        },
+        "timeouts": {
+          "plannerSeconds": 1800,
+          "workerSeconds": 3600,
+          "reviewerSeconds": 2700,
+          "fixerSeconds": 1800
         }
       },
       "logging": {

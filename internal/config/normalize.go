@@ -166,6 +166,25 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 	if partial.Env != nil {
 		config.Env = mergeStringMap(config.Env, partial.Env)
 	}
+
+	if partial.Timeouts != nil {
+		mergeAgentTimeoutConfig(&config.Timeouts, *partial.Timeouts)
+	}
+}
+
+func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {
+	if partial.PlannerSeconds != nil {
+		config.PlannerSeconds = *partial.PlannerSeconds
+	}
+	if partial.WorkerSeconds != nil {
+		config.WorkerSeconds = *partial.WorkerSeconds
+	}
+	if partial.ReviewerSeconds != nil {
+		config.ReviewerSeconds = *partial.ReviewerSeconds
+	}
+	if partial.FixerSeconds != nil {
+		config.FixerSeconds = *partial.FixerSeconds
+	}
 }
 
 func mergeLoggingConfig(config *LoggingConfig, partial PartialLoggingConfig) {

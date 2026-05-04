@@ -748,6 +748,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AgentRuntime:       agentRuntime,
 		CustomInstructions: &cfg,
 		AgentModel:         cfg.Agent.Model,
+		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerSeconds) * time.Second,
 		DiscoveryPolicy: planner.DiscoveryPolicy{
 			AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
 			Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
@@ -788,6 +789,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		CustomInstructions:      &cfg,
 		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
 		AgentModel:              cfg.Agent.Model,
+		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerSeconds) * time.Second,
 		RetryBaseDelay:          retryBaseDelay,
 		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
@@ -817,6 +819,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AgentRuntime:       agentRuntime,
 		CustomInstructions: &cfg,
 		AgentModel:         cfg.Agent.Model,
+		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.FixerSeconds) * time.Second,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
@@ -847,6 +850,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AgentRuntime:       agentRuntime,
 		CustomInstructions: &cfg,
 		AgentModel:         cfg.Agent.Model,
+		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.WorkerSeconds) * time.Second,
 		RetryBaseDelay:     retryBaseDelay,
 		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
