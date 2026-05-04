@@ -124,9 +124,17 @@
         },
         "timeouts": {
           "plannerSeconds": 1800,
-          "workerSeconds": 3600,
+          "workerSeconds": 5400,
           "reviewerSeconds": 2700,
-          "fixerSeconds": 1800
+          "fixerSeconds": 3600,
+          "plannerIdleTimeoutSeconds": 600,
+          "plannerMaxRuntimeSeconds": 1800,
+          "workerIdleTimeoutSeconds": 900,
+          "workerMaxRuntimeSeconds": 5400,
+          "reviewerIdleTimeoutSeconds": 600,
+          "reviewerMaxRuntimeSeconds": 2700,
+          "fixerIdleTimeoutSeconds": 600,
+          "fixerMaxRuntimeSeconds": 3600
         }
       },
       "logging": {

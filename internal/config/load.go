@@ -676,6 +676,30 @@ func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookup
 	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_FIXER_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).FixerSeconds = v }); err != nil {
 		return err
 	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_PLANNER_IDLE_TIMEOUT_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).PlannerIdleTimeoutSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_PLANNER_MAX_RUNTIME_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).PlannerMaxRuntimeSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_WORKER_IDLE_TIMEOUT_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).WorkerIdleTimeoutSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_WORKER_MAX_RUNTIME_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).WorkerMaxRuntimeSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_REVIEWER_IDLE_TIMEOUT_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).ReviewerIdleTimeoutSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_REVIEWER_MAX_RUNTIME_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).ReviewerMaxRuntimeSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_FIXER_IDLE_TIMEOUT_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).FixerIdleTimeoutSeconds = v }); err != nil {
+		return err
+	}
+	if err := integerEnv("LOOPER_AGENT_TIMEOUTS_FIXER_MAX_RUNTIME_SECONDS", func(v *int) { ensureAgentTimeoutConfig(overrides).FixerMaxRuntimeSeconds = v }); err != nil {
+		return err
+	}
 	return nil
 }
 

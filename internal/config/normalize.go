@@ -175,15 +175,47 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {
 	if partial.PlannerSeconds != nil {
 		config.PlannerSeconds = *partial.PlannerSeconds
+		config.PlannerMaxRuntimeSeconds = *partial.PlannerSeconds
 	}
 	if partial.WorkerSeconds != nil {
 		config.WorkerSeconds = *partial.WorkerSeconds
+		config.WorkerMaxRuntimeSeconds = *partial.WorkerSeconds
 	}
 	if partial.ReviewerSeconds != nil {
 		config.ReviewerSeconds = *partial.ReviewerSeconds
+		config.ReviewerMaxRuntimeSeconds = *partial.ReviewerSeconds
 	}
 	if partial.FixerSeconds != nil {
 		config.FixerSeconds = *partial.FixerSeconds
+		config.FixerMaxRuntimeSeconds = *partial.FixerSeconds
+	}
+	if partial.PlannerIdleTimeoutSeconds != nil {
+		config.PlannerIdleTimeoutSeconds = *partial.PlannerIdleTimeoutSeconds
+	}
+	if partial.PlannerMaxRuntimeSeconds != nil {
+		config.PlannerMaxRuntimeSeconds = *partial.PlannerMaxRuntimeSeconds
+		config.PlannerSeconds = *partial.PlannerMaxRuntimeSeconds
+	}
+	if partial.WorkerIdleTimeoutSeconds != nil {
+		config.WorkerIdleTimeoutSeconds = *partial.WorkerIdleTimeoutSeconds
+	}
+	if partial.WorkerMaxRuntimeSeconds != nil {
+		config.WorkerMaxRuntimeSeconds = *partial.WorkerMaxRuntimeSeconds
+		config.WorkerSeconds = *partial.WorkerMaxRuntimeSeconds
+	}
+	if partial.ReviewerIdleTimeoutSeconds != nil {
+		config.ReviewerIdleTimeoutSeconds = *partial.ReviewerIdleTimeoutSeconds
+	}
+	if partial.ReviewerMaxRuntimeSeconds != nil {
+		config.ReviewerMaxRuntimeSeconds = *partial.ReviewerMaxRuntimeSeconds
+		config.ReviewerSeconds = *partial.ReviewerMaxRuntimeSeconds
+	}
+	if partial.FixerIdleTimeoutSeconds != nil {
+		config.FixerIdleTimeoutSeconds = *partial.FixerIdleTimeoutSeconds
+	}
+	if partial.FixerMaxRuntimeSeconds != nil {
+		config.FixerMaxRuntimeSeconds = *partial.FixerMaxRuntimeSeconds
+		config.FixerSeconds = *partial.FixerMaxRuntimeSeconds
 	}
 }
 

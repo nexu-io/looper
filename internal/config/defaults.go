@@ -75,9 +75,18 @@ func DefaultConfig(cwd string) (Config, error) {
 			Env:    map[string]string{},
 			Timeouts: AgentTimeoutConfig{
 				PlannerSeconds:  30 * 60,
-				WorkerSeconds:   60 * 60,
-				ReviewerSeconds: 30 * 60,
-				FixerSeconds:    30 * 60,
+				WorkerSeconds:   90 * 60,
+				ReviewerSeconds: 60 * 60,
+				FixerSeconds:    60 * 60,
+
+				PlannerIdleTimeoutSeconds:  10 * 60,
+				PlannerMaxRuntimeSeconds:   30 * 60,
+				WorkerIdleTimeoutSeconds:   15 * 60,
+				WorkerMaxRuntimeSeconds:    90 * 60,
+				ReviewerIdleTimeoutSeconds: 10 * 60,
+				ReviewerMaxRuntimeSeconds:  60 * 60,
+				FixerIdleTimeoutSeconds:    10 * 60,
+				FixerMaxRuntimeSeconds:     60 * 60,
 			},
 		},
 		Logging: LoggingConfig{

@@ -287,16 +287,22 @@ type AgentRunInput struct {
 	Prompt           string
 	WorkingDirectory string
 	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
 }
 
 type AgentResult struct {
-	Status      string
-	Summary     string
-	Stdout      string
-	Stderr      string
-	ParseStatus string
+	Status                       string
+	Summary                      string
+	Stdout                       string
+	Stderr                       string
+	ParseStatus                  string
+	TimeoutType                  string
+	ConfiguredIdleTimeoutSeconds int64
+	ConfiguredMaxRuntimeSeconds  int64
+	ElapsedRuntimeSeconds        int64
+	LastProgressAt               string
 }
 
 type AgentExecution interface {
@@ -328,6 +334,7 @@ type Options struct {
 	Logger                  bootstrap.Logger
 	Now                     func() time.Time
 	AgentTimeout            time.Duration
+	AgentIdleTimeout        time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
 	ReviewEvents            config.ReviewerReviewEventsConfig
@@ -365,6 +372,7 @@ type Runner struct {
 	logger                  bootstrap.Logger
 	now                     func() time.Time
 	agentTimeout            time.Duration
+	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	allowAutoApprove        bool
 	reviewEvents            config.ReviewerReviewEventsConfig
@@ -499,6 +507,10 @@ func New(options Options) *Runner {
 	if agentTimeout <= 0 {
 		agentTimeout = defaultAgentTimeout
 	}
+	agentIdleTimeout := options.AgentIdleTimeout
+	if agentIdleTimeout <= 0 {
+		agentIdleTimeout = 10 * time.Minute
+	}
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
 		claimTTL = defaultClaimTTL
@@ -550,6 +562,7 @@ func New(options Options) *Runner {
 		logger:                  options.Logger,
 		now:                     now,
 		agentTimeout:            agentTimeout,
+		agentIdleTimeout:        agentIdleTimeout,
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
 		reviewEvents:            reviewEvents,
@@ -1581,7 +1594,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	}
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return nil, err
 	}
@@ -1749,7 +1762,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}

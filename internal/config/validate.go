@@ -275,6 +275,14 @@ func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]V
 	validateAgentTimeoutSeconds(timeouts.WorkerSeconds, path+".workerSeconds", issues)
 	validateAgentTimeoutSeconds(timeouts.ReviewerSeconds, path+".reviewerSeconds", issues)
 	validateAgentTimeoutSeconds(timeouts.FixerSeconds, path+".fixerSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.PlannerIdleTimeoutSeconds, path+".plannerIdleTimeoutSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.PlannerMaxRuntimeSeconds, path+".plannerMaxRuntimeSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.WorkerIdleTimeoutSeconds, path+".workerIdleTimeoutSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.WorkerMaxRuntimeSeconds, path+".workerMaxRuntimeSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.ReviewerIdleTimeoutSeconds, path+".reviewerIdleTimeoutSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.ReviewerMaxRuntimeSeconds, path+".reviewerMaxRuntimeSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.FixerIdleTimeoutSeconds, path+".fixerIdleTimeoutSeconds", issues)
+	validateAgentTimeoutSeconds(timeouts.FixerMaxRuntimeSeconds, path+".fixerMaxRuntimeSeconds", issues)
 }
 
 func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationIssue) {

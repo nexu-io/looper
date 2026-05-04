@@ -146,6 +146,15 @@ type AgentTimeoutConfig struct {
 	WorkerSeconds   int `json:"workerSeconds"`
 	ReviewerSeconds int `json:"reviewerSeconds"`
 	FixerSeconds    int `json:"fixerSeconds"`
+
+	PlannerIdleTimeoutSeconds  int `json:"plannerIdleTimeoutSeconds"`
+	PlannerMaxRuntimeSeconds   int `json:"plannerMaxRuntimeSeconds"`
+	WorkerIdleTimeoutSeconds   int `json:"workerIdleTimeoutSeconds"`
+	WorkerMaxRuntimeSeconds    int `json:"workerMaxRuntimeSeconds"`
+	ReviewerIdleTimeoutSeconds int `json:"reviewerIdleTimeoutSeconds"`
+	ReviewerMaxRuntimeSeconds  int `json:"reviewerMaxRuntimeSeconds"`
+	FixerIdleTimeoutSeconds    int `json:"fixerIdleTimeoutSeconds"`
+	FixerMaxRuntimeSeconds     int `json:"fixerMaxRuntimeSeconds"`
 }
 
 type NotificationConfig struct {
@@ -395,6 +404,15 @@ type PartialAgentTimeoutConfig struct {
 	WorkerSeconds   *int `json:"workerSeconds,omitempty"`
 	ReviewerSeconds *int `json:"reviewerSeconds,omitempty"`
 	FixerSeconds    *int `json:"fixerSeconds,omitempty"`
+
+	PlannerIdleTimeoutSeconds  *int `json:"plannerIdleTimeoutSeconds,omitempty"`
+	PlannerMaxRuntimeSeconds   *int `json:"plannerMaxRuntimeSeconds,omitempty"`
+	WorkerIdleTimeoutSeconds   *int `json:"workerIdleTimeoutSeconds,omitempty"`
+	WorkerMaxRuntimeSeconds    *int `json:"workerMaxRuntimeSeconds,omitempty"`
+	ReviewerIdleTimeoutSeconds *int `json:"reviewerIdleTimeoutSeconds,omitempty"`
+	ReviewerMaxRuntimeSeconds  *int `json:"reviewerMaxRuntimeSeconds,omitempty"`
+	FixerIdleTimeoutSeconds    *int `json:"fixerIdleTimeoutSeconds,omitempty"`
+	FixerMaxRuntimeSeconds     *int `json:"fixerMaxRuntimeSeconds,omitempty"`
 }
 
 type PartialNotificationConfig struct {
