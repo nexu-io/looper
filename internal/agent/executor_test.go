@@ -552,6 +552,28 @@ func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 	}
 }
 
+func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutdown(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}}})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 120 * time.Millisecond, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout", result.Status)
+	}
+	if result.TimeoutType != "idle" {
+		t.Fatalf("result.TimeoutType = %q, want idle preserved after max runtime fires", result.TimeoutType)
+	}
+}
+
 func TestExecutorMaxRuntimeTimeoutIgnoresProgressResets(t *testing.T) {
 	t.Parallel()
 

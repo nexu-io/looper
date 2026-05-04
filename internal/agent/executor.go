@@ -312,8 +312,10 @@ func (x *execution) run(ctx context.Context) {
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
-			timedOut = true
-			timeoutType = "max_runtime"
+			if !timedOut {
+				timedOut = true
+				timeoutType = "max_runtime"
+			}
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
