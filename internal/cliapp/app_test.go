@@ -2057,6 +2057,39 @@ func TestWorkCreateIssueRequiresExplicitProjectWhenCurrentProjectIsAmbiguous(t *
 	}
 }
 
+func TestWorkCreateIssuePrintsReusedWorkerMessage(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/workers":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_worker", map[string]any{"id": "loop_existing", "projectId": "project_1", "repo": "acme/looper", "status": "queued", "issueNumber": 54, "title": "Implement issue #54", "baseBranch": "main", "reused": true}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr})
+
+	exitCode := app.Run(context.Background(), []string{"work", "--issue", "54", "--project", "project_1", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([work --issue 54]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([work --issue 54]) stderr = %q, want empty string", got)
+	}
+	if got := stdout.String(); !strings.Contains(got, "Existing worker reused") {
+		t.Fatalf("Run([work --issue 54]) stdout = %q, want to contain %q", got, "Existing worker reused")
+	}
+}
+
 func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 

@@ -110,6 +110,7 @@ type pullRequestOutput struct {
 		LatestRunStatus *string `json:"latestRunStatus"`
 	} `json:"loopStatus"`
 	Stopped     bool    `json:"stopped"`
+	Reused      bool    `json:"reused"`
 	LoopID      string  `json:"loopId"`
 	RunID       *string `json:"runId"`
 	ExecutionID *string `json:"executionId"`
@@ -579,7 +580,11 @@ func writeHumanWorkerCreate(w io.Writer, payload json.RawMessage) error {
 	if data.Title != nil {
 		title = *data.Title
 	}
-	printSection(w, "Worker started", [][2]any{{"id", data.ID}, {"title", title}, {"status", data.Status}})
+	heading := "Worker started"
+	if data.Reused {
+		heading = "Existing worker reused"
+	}
+	printSection(w, heading, [][2]any{{"id", data.ID}, {"title", title}, {"status", data.Status}})
 	return nil
 }
 
