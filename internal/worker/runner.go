@@ -1183,6 +1183,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if result.Status != "completed" {
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
 			message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {

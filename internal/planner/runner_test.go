@@ -655,6 +655,13 @@ func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepWriteSpec) {
 		t.Fatalf("run = %#v, want failed run on write-spec", run)
 	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.ResumePolicy != "retry_from_timeout_context" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want retry_from_timeout_context", checkpoint.ResumePolicy)
+	}
+	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "failed" || checkpoint.WriteSpec.Summary != "agent failed" {
+		t.Fatalf("checkpoint.WriteSpec = %#v, want failed persisted write-spec checkpoint", checkpoint.WriteSpec)
+	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)

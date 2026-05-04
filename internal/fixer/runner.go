@@ -1169,6 +1169,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if !strings.EqualFold(result.Status, "completed") {
 		checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
 		kind := FailureRetryableTransient
 		if agent.IsAgentSetupFailureMessage(message) {

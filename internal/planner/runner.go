@@ -926,6 +926,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if !strings.EqualFold(result.Status, "completed") {
 			checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
 			message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
