@@ -21,7 +21,11 @@
       "daemon-mode",
       "git-path",
       "gh-path",
-      "osascript-path"
+      "osascript-path",
+      "planner-agent-timeout-seconds",
+      "worker-agent-timeout-seconds",
+      "reviewer-agent-timeout-seconds",
+      "fixer-agent-timeout-seconds"
     ],
     "rules": [
       {
@@ -103,6 +107,34 @@
       "syntax": "--osascript-path <path>",
       "valueKind": "string",
       "semantics": "Forward an explicit osascript binary path into daemon startup/config loading.",
+      "forwarded": true
+    },
+    {
+      "name": "planner-agent-timeout-seconds",
+      "syntax": "--planner-agent-timeout-seconds <seconds>",
+      "valueKind": "string",
+      "semantics": "Override planner agent execution timeout in seconds for CLI config loading and daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "worker-agent-timeout-seconds",
+      "syntax": "--worker-agent-timeout-seconds <seconds>",
+      "valueKind": "string",
+      "semantics": "Override worker agent execution timeout in seconds for CLI config loading and daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "reviewer-agent-timeout-seconds",
+      "syntax": "--reviewer-agent-timeout-seconds <seconds>",
+      "valueKind": "string",
+      "semantics": "Override reviewer agent execution timeout in seconds for CLI config loading and daemon-management flows.",
+      "forwarded": true
+    },
+    {
+      "name": "fixer-agent-timeout-seconds",
+      "syntax": "--fixer-agent-timeout-seconds <seconds>",
+      "valueKind": "string",
+      "semantics": "Override fixer agent execution timeout in seconds for CLI config loading and daemon-management flows.",
       "forwarded": true
     }
   ],
