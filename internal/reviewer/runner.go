@@ -1706,7 +1706,7 @@ func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint
 
 func (r *Runner) hasThreadResolutionFollowUpCandidate(ctx context.Context, cwd, repo string, prNumber int64, headSHA, currentLogin string) bool {
 	policy := r.threadResolution
-	if !policy.Enabled || r.github == nil || strings.TrimSpace(headSHA) == "" || strings.TrimSpace(currentLogin) == "" {
+	if !policy.Enabled || policy.RequireCurrentReviewRequest || r.github == nil || strings.TrimSpace(headSHA) == "" || strings.TrimSpace(currentLogin) == "" {
 		return false
 	}
 	limit := policy.MaxThreadsPerRun

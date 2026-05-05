@@ -480,6 +480,7 @@ func TestDiscoverPullRequestsAllowsThreadResolutionFollowUpWhenCurrentUserIsNotR
 	policy := defaultThreadResolutionPolicy(t)
 	policy.Enabled = true
 	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = false
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
@@ -496,6 +497,33 @@ func TestDiscoverPullRequestsAllowsThreadResolutionFollowUpWhenCurrentUserIsNotR
 	}
 	if len(result.QueueItems) != 1 {
 		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+}
+
+func TestDiscoverPullRequestsRequiresCurrentReviewRequestBeforeThreadResolutionFollowUp(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "bob", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_follow_thread_resolution_requires_request", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("len(QueueItems) = %d, want 0", len(result.QueueItems))
 	}
 }
 
