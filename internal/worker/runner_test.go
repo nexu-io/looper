@@ -481,6 +481,68 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	}
 }
 
+func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	recoveredPath := t.TempDir()
+	stalePath := filepath.Join(t.TempDir(), "old-worktree")
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreResult: &RestoreWorktreeResult{WorktreePath: recoveredPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recovered"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_stale_worktree", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project,
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: stalePath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recoveredPath || checkpoint.Worktree.ID != "worktree_recovered" || checkpoint.Worktree.HeadSHA != "abc123" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recovered worktree", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 || git.restoreCalls[0].Branch != branch || git.restoreCalls[0].ExpectedWorktreePath != stalePath {
+		t.Fatalf("restoreCalls = %#v, want branch recovery from stale path", git.restoreCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
+		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	}
+	if len(git.inspectCalls) != 1 || git.inspectCalls[0].WorktreePath != recoveredPath {
+		t.Fatalf("inspectCalls = %#v, want recovered worktree path", git.inspectCalls)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", persisted, err)
+	}
+	persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != recoveredPath {
+		t.Fatalf("persisted checkpoint worktree = %#v, want recovered path", persistedCheckpoint.Worktree)
+	}
+}
+
 func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(t *testing.T) {
 	t.Parallel()
 
@@ -2406,6 +2468,7 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
+	restoreResult  *RestoreWorktreeResult
 	prepareResult  PrepareWorktreeResult
 	inspectResult  InspectHeadResult
 	inspectResults []InspectHeadResult
@@ -2413,6 +2476,7 @@ type fakeGitGateway struct {
 	inspectIndex   int
 	commitResult   CommitResult
 	createCalls    []CreateWorktreeInput
+	restoreCalls   []RestoreWorktreeInput
 	pushCalls      []PushInput
 	prepareCalls   []PrepareWorktreeInput
 	inspectCalls   []InspectHeadInput
@@ -2424,6 +2488,14 @@ type fakeGitGateway struct {
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
 	f.createCalls = append(f.createCalls, input)
 	return f.createResult, nil
+}
+
+func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
+	f.restoreCalls = append(f.restoreCalls, input)
+	if f.restoreResult != nil {
+		return f.restoreResult, nil
+	}
+	return &RestoreWorktreeResult{WorktreePath: input.ExpectedWorktreePath, Branch: input.Branch}, nil
 }
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {

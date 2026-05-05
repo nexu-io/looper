@@ -1,12 +1,16 @@
 package cliapp
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/powerformer/looper/internal/config"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
+	"github.com/powerformer/looper/internal/infra/shell"
+	"github.com/spf13/cobra"
 )
 
 var commentOnlyReviewPolicy = config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}
@@ -207,4 +211,93 @@ func TestEffectiveReviewSubmitPolicyAllowsBaseAndNarrowingOverrides(t *testing.T
 	if policy != decisionReviewPolicy {
 		t.Fatalf("effectiveReviewSubmitPolicy(base decisions) = %+v, want %+v", policy, decisionReviewPolicy)
 	}
+}
+
+func TestEffectiveReviewSubmitEventDowngradesSelfAuthoredApproval(t *testing.T) {
+	t.Parallel()
+
+	runner := &reviewSubmitFakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api user --jq .login" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: "Reviewer\n"}, nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	cmd := &cobra.Command{Use: "test"}
+	stderr := &bytes.Buffer{}
+	cmd.SetErr(stderr)
+
+	got, err := (&commandRuntime{}).effectiveReviewSubmitEvent(cmd, gh, "acme/looper", 42, "APPROVE", "reviewer", "")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitEvent() error = %v", err)
+	}
+	if got != "COMMENT" {
+		t.Fatalf("effectiveReviewSubmitEvent() = %q, want COMMENT", got)
+	}
+	if log := stderr.String(); !strings.Contains(log, "downgrading APPROVE review to COMMENT") || !strings.Contains(log, "GitHub does not allow self-approval") {
+		t.Fatalf("stderr = %q, want self-approval downgrade log", log)
+	}
+}
+
+func TestEffectiveReviewSubmitEventKeepsApprovalForDifferentAuthor(t *testing.T) {
+	t.Parallel()
+
+	runner := &reviewSubmitFakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api user --jq .login" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: "reviewer\n"}, nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	cmd := &cobra.Command{Use: "test"}
+	stderr := &bytes.Buffer{}
+	cmd.SetErr(stderr)
+
+	got, err := (&commandRuntime{}).effectiveReviewSubmitEvent(cmd, gh, "acme/looper", 42, "APPROVE", "octocat", "")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitEvent() error = %v", err)
+	}
+	if got != "APPROVE" {
+		t.Fatalf("effectiveReviewSubmitEvent() = %q, want APPROVE", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestEffectiveReviewSubmitEventDoesNotFetchUserForComment(t *testing.T) {
+	t.Parallel()
+
+	runner := &reviewSubmitFakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	cmd := &cobra.Command{Use: "test"}
+
+	got, err := (&commandRuntime{}).effectiveReviewSubmitEvent(cmd, gh, "acme/looper", 42, "COMMENT", "reviewer", "")
+	if err != nil {
+		t.Fatalf("effectiveReviewSubmitEvent() error = %v", err)
+	}
+	if got != "COMMENT" {
+		t.Fatalf("effectiveReviewSubmitEvent() = %q, want COMMENT", got)
+	}
+}
+
+type reviewSubmitFakeGHRunner struct {
+	t       *testing.T
+	respond func(options shell.Options) (shell.Result, error)
+}
+
+func (f *reviewSubmitFakeGHRunner) run(_ context.Context, options shell.Options) (shell.Result, error) {
+	f.t.Helper()
+	if f.respond == nil {
+		f.t.Fatalf("fake GH runner missing responder for args: %q", strings.Join(options.Args, " "))
+	}
+	return f.respond(options)
 }

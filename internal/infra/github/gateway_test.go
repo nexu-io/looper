@@ -35,7 +35,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.ts b/a.ts\n"}, nil
 		case strings.HasPrefix(args, "api user"):
@@ -183,6 +183,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if len(detail.Comments) != 1 || detail.Comments[0]["id"] != "comment-1" || detail.Comments[0]["threadId"] != "thread-1" || detail.Comments[0]["state"] != "UNRESOLVED" || detail.Comments[0]["body"] != "Fix this" {
 		t.Fatalf("detail.Comments = %#v, want normalized review thread", detail.Comments)
 	}
+	if len(detail.IssueComments) != 1 || detail.IssueComments[0]["id"] != "issue-comment-1" || detail.IssueComments[0]["body"] != "conversation notice" {
+		t.Fatalf("detail.IssueComments = %#v, want PR conversation comments", detail.IssueComments)
+	}
 	if login != "reviewer" {
 		t.Fatalf("login = %q, want reviewer", login)
 	}
@@ -274,6 +277,8 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "gateway-wrapped tls handshake timeout", err: &TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "net/http: TLS handshake timeout"}}}},
 		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
+		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
+		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -712,6 +717,27 @@ func TestGatewayHasReviewMarkerRejectsEventOutcomePolicyMismatch(t *testing.T) {
 		if found {
 			t.Fatalf("HasReviewMarker(%q) = true, want false for event/outcome policy mismatch", marker)
 		}
+	}
+}
+
+func TestGatewayHasReviewMarkerAllowsCleanCommentFallback(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"COMMENTED","body":"<!-- looper:review id=clean head=def outcome=clean -->"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=clean", AllowedReviewEvents: []string{"COMMENT", "APPROVE"}, AllowCleanComment: true})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true for allowed clean COMMENT fallback")
 	}
 }
 

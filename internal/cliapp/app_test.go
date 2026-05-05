@@ -2465,6 +2465,14 @@ func (g smokeGitGateway) CreateWorktree(ctx context.Context, input worker.Create
 	}, nil
 }
 
+func (g smokeGitGateway) RestoreWorktree(ctx context.Context, input worker.RestoreWorktreeInput) (*worker.RestoreWorktreeResult, error) {
+	record, err := g.gateway.RestoreWorktree(ctx, gitinfra.RestoreWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, Branch: input.Branch, WorktreeRoot: input.WorktreeRoot, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode), ExpectedWorktreePath: input.ExpectedWorktreePath})
+	if err != nil || record == nil {
+		return nil, err
+	}
+	return &worker.RestoreWorktreeResult{WorktreePath: record.WorktreePath, Branch: record.Branch, BaseBranch: strings.TrimSpace(derefString(record.BaseBranch)), HeadSHA: strings.TrimSpace(derefString(record.HeadSHA)), WorktreeID: record.ID}, nil
+}
+
 func (g smokeGitGateway) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
 	prepared, err := g.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{
 		WorktreePath:    input.WorktreePath,

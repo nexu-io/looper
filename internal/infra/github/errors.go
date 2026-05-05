@@ -34,10 +34,10 @@ func IsTransientError(err error) bool {
 	var commandErr *shell.CommandExecutionError
 	if errors.As(err, &commandErr) {
 		message := strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")
-		return looksLikeGitHubFailure(message) && isTransientGitHubMessage(message)
+		return (looksLikeGitHubFailure(message) && isTransientGitHubMessage(message)) || isExplicitTransientGitHubStatus(message)
 	}
 	message := err.Error()
-	if !looksLikeGitHubFailure(message) {
+	if !looksLikeGitHubFailure(message) && !isExplicitTransientGitHubStatus(message) {
 		return false
 	}
 	return isTransientGitHubMessage(message)
@@ -73,10 +73,36 @@ func isTransientGitHubMessage(message string) bool {
 		"network is unreachable",
 		"stream error",
 		"http2: server sent goaway",
+		"http 502",
+		"502 bad gateway",
+		"http 503",
+		"503 service unavailable",
+		"http 504",
+		"504 gateway timeout",
+		"secondary rate limit",
+		"rate limit exceeded",
+		"api rate limit exceeded",
+		"graphql: something went wrong",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExplicitTransientGitHubStatus(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"http 502",
+		"http 503",
+		"http 504",
 		"502 bad gateway",
 		"503 service unavailable",
 		"504 gateway timeout",
-		"graphql: something went wrong",
+		"secondary rate limit",
+		"rate limit exceeded",
+		"api rate limit exceeded",
 	} {
 		if strings.Contains(message, fragment) {
 			return true
