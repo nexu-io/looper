@@ -156,6 +156,24 @@ func TestExtractNativeSessionID(t *testing.T) {
 	}
 }
 
+func TestOnOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	x := &execution{
+		executor:       New(ExecutorOptions{Now: func() time.Time { return now }}),
+		maxOutputBytes: 1024,
+	}
+	x.onOutput("stdout", []byte("session_id: abc"))
+	if got := x.nativeSessionID; got != "abc" {
+		t.Fatalf("nativeSessionID after first chunk = %q, want abc", got)
+	}
+	x.onOutput("stdout", []byte("def\n"))
+	if got := x.nativeSessionID; got != "abcdef" {
+		t.Fatalf("nativeSessionID after second chunk = %q, want abcdef", got)
+	}
+}
+
 func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	t.Parallel()
 

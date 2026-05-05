@@ -810,8 +810,8 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	heartbeatCount := x.heartbeatCount
 	stdout := string(x.stdout)
 	stderr := string(x.stderr)
-	if x.nativeSessionID == "" {
-		x.nativeSessionID = extractNativeSessionID(stdout, stderr)
+	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
+		x.nativeSessionID = nativeSessionID
 	}
 	x.mu.Unlock()
 
@@ -893,7 +893,9 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
-	nativeSessionID = firstNonEmpty(nativeSessionID, extractNativeSessionID(embeddedStdout, embeddedStderr))
+	if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
+		nativeSessionID = extractedNativeSessionID
+	}
 	if nativeResumeMode == "native_resume" && status == "failed" {
 		nativeResumeStatus = "failed"
 		nativeResumeError = firstNonEmpty(nativeResumeError, errorMessage, strings.TrimSpace(result.Stderr))
