@@ -1599,12 +1599,12 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
 	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
-	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "thread_resolution", executionID, map[string]any{"promptBytes": len(prompt), "threadCount": len(threads), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout)})
-	agentStartedAt := r.now()
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return nil, err
 	}
+	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "thread_resolution", executionID, map[string]any{"promptBytes": len(prompt), "threadCount": len(threads), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout)})
+	agentStartedAt := r.now()
 	result, err := execution.Wait(ctx)
 	if err != nil {
 		return nil, err
@@ -1771,12 +1771,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "review", executionID, map[string]any{"promptBytes": len(prompt), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout), "scope": string(r.scope), "headSha": checkpoint.Snapshot.HeadSHA})
-	agentStartedAt := r.now()
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
+	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "review", executionID, map[string]any{"promptBytes": len(prompt), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout), "scope": string(r.scope), "headSha": checkpoint.Snapshot.HeadSHA})
+	agentStartedAt := r.now()
 	if err := r.recordAgentExecutionStarted(ctx, input.Loop.ID); err != nil {
 		r.logWarn("reviewer agent execution start metadata update failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 	}

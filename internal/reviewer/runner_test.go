@@ -4020,6 +4020,37 @@ func TestProcessClaimedItemClassifiesReviewerTimeoutWithDiagnostics(t *testing.T
 	}
 }
 
+func TestProcessClaimedItemDoesNotEmitStartedWhenReviewerAgentStartFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	agent := &fakeAgentExecutor{startErr: fmt.Errorf("executor setup failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed start result", result)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType == "reviewer.agent.started" {
+			t.Fatalf("events = %#v, want no reviewer.agent.started on start failure", events)
+		}
+	}
+}
+
 func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{})
@@ -5039,14 +5070,18 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 }
 
 type fakeAgentExecutor struct {
-	results []AgentResult
-	starts  []AgentRunInput
-	waitErr error
-	wait    func(context.Context) error
+	results  []AgentResult
+	starts   []AgentRunInput
+	startErr error
+	waitErr  error
+	wait     func(context.Context) error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	if len(f.results) == 0 {
 		return nil, fmt.Errorf("no queued agent result")
 	}
