@@ -531,6 +531,7 @@ func (x *execution) run(ctx context.Context) {
 		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
 			result = fallbackResult
 			status = fallbackResult.Status
+			timeoutType = fallbackResult.TimeoutType
 			errorMessage = fallbackErrorMessage
 			endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 		}
@@ -1278,7 +1279,14 @@ func extractKeyValue(line string, key string) string {
 	if after < len(lowerLine) && isSessionKeyChar(lowerLine[after]) {
 		return ""
 	}
-	rest := strings.TrimLeft(line[after:], " \t:=\"")
+	rest := strings.TrimLeft(line[after:], " \t")
+	if strings.HasPrefix(rest, "\"") || strings.HasPrefix(rest, "'") {
+		rest = strings.TrimLeft(rest[1:], " \t")
+	}
+	if rest == "" || (rest[0] != ':' && rest[0] != '=') {
+		return ""
+	}
+	rest = strings.TrimLeft(rest[1:], " \t\"'")
 	if rest == "" {
 		return ""
 	}

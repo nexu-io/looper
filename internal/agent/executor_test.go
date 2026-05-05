@@ -148,6 +148,12 @@ func TestExtractNativeSessionID(t *testing.T) {
 	if got := extractNativeSessionID("started chatId: cursor-chat-1"); got != "cursor-chat-1" {
 		t.Fatalf("extractNativeSessionID(text) = %q, want cursor-chat-1", got)
 	}
+	if got := extractNativeSessionID("session_id not found"); got != "" {
+		t.Fatalf("extractNativeSessionID(error text) = %q, want empty session ID", got)
+	}
+	if got := extractNativeSessionID(`event "session_id": "session-quoted"`); got != "session-quoted" {
+		t.Fatalf("extractNativeSessionID(quoted text) = %q, want session-quoted", got)
+	}
 }
 
 func TestExecutorResumesPersistedNativeSession(t *testing.T) {
@@ -298,6 +304,72 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
 	if len(lines) != 2 || lines[0] != "exec resume codex-session-1 continue work" || lines[1] != "exec continue work" {
 		t.Fatalf("spawned args = %#v, want native resume then immediate checkpoint restart", lines)
+	}
+}
+
+func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	script := "#!/bin/sh\ncase \"$*\" in *resume*) printf '%s\\n' 'resume failed' >&2; exit 2;; esac\nprintf '%s\\n' 'fallback progress'\nsleep 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_fallback_timeout", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: time.Second, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" || result.TimeoutType != "idle" {
+		t.Fatalf("result = %#v, want fallback idle timeout", result)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "agent_fallback_timeout")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEvent(events, "agent.idle_timeout") || containsEvent(events, "agent.timed_out") {
+		t.Fatalf("agent events = %#v, want idle timeout event without generic timeout", events)
 	}
 }
 
