@@ -2247,6 +2247,9 @@ func reviewerAgentTerminalEvent(result AgentResult) string {
 	if result.Status == "timeout" {
 		return "reviewer.agent.timed_out"
 	}
+	if result.Status != "completed" {
+		return "reviewer.agent.failed"
+	}
 	return "reviewer.agent.completed"
 }
 

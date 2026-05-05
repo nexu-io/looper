@@ -4282,6 +4282,43 @@ func TestProcessClaimedItemClassifiesReviewerTimeoutWithDiagnostics(t *testing.T
 	}
 }
 
+func TestProcessClaimedItemEmitsFailedTerminalEventForReviewerAgentFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent failed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundFailedEvent := false
+	for _, event := range events {
+		switch event.EventType {
+		case "reviewer.agent.failed":
+			if strings.Contains(event.PayloadJSON, `"status":"failed"`) {
+				foundFailedEvent = true
+			}
+		case "reviewer.agent.completed":
+			t.Fatalf("events = %#v, want reviewer.agent.failed instead of reviewer.agent.completed", events)
+		}
+	}
+	if !foundFailedEvent {
+		t.Fatalf("events = %#v, want reviewer.agent.failed terminal event", events)
+	}
+}
+
 func TestProcessClaimedItemDoesNotEmitStartedWhenReviewerAgentStartFails(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
