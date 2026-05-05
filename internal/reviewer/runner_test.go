@@ -5049,6 +5049,78 @@ func TestRunReviewStepIgnoresUnparsedReviewRequestGuardrailForManualLoop(t *test
 	}
 }
 
+func TestRunReviewStepSkipsWhenFollowUpLostReviewRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "should not run", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_followup_request_gone", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_followup_request_gone", LoopID: "loop_followup_request_gone"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:                       &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", ReviewRequests: []string{"alice"}, CurrentLogin: "bob"},
+			Snapshot:                     &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree:                     &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+			ThreadResolutionFollowUpOnly: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "not_requested" {
+		t.Fatalf("SkipKind = %q, want not_requested", checkpoint.SkipKind)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want 0", len(agent.starts))
+	}
+}
+
+func TestRunPublishStepSkipsPendingReviewWhenFollowUpLostReviewRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "non_blocking"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_publish_request_gone", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_publish_request_gone", LoopID: "loop_publish_request_gone"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:                       &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", ReviewRequests: []string{"bob"}, CurrentLogin: "bob"},
+			Snapshot:                     &checkpointSnapshot{HeadSHA: "abc123"},
+			ThreadResolutionFollowUpOnly: true,
+			PendingReview:                &pendingReviewCheckpoint{HeadSHA: "abc123", IdempotencyKey: "reviewer:loop_publish_request_gone:abc123", Event: reviewEventAgentNative, Summary: "posted review"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "not_requested" {
+		t.Fatalf("SkipKind = %q, want not_requested", checkpoint.SkipKind)
+	}
+	if checkpoint.PendingReview != nil {
+		t.Fatalf("PendingReview = %#v, want nil", checkpoint.PendingReview)
+	}
+	if github.reviewMarkerCalls != 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want 0", github.reviewMarkerCalls)
+	}
+}
+
 func TestProcessClaimedItemMarksStaleOnUnparsedHeadChangeGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

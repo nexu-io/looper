@@ -437,16 +437,17 @@ type ProcessResult struct {
 }
 
 type reviewerCheckpoint struct {
-	ResumePolicy      string                      `json:"resumePolicy,omitempty"`
-	Detail            *checkpointDetail           `json:"detail,omitempty"`
-	ClaimedLockKey    string                      `json:"claimedLockKey,omitempty"`
-	Snapshot          *checkpointSnapshot         `json:"snapshot,omitempty"`
-	Worktree          *checkpointWorktree         `json:"worktree,omitempty"`
-	ThreadResolution  *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
-	PendingReview     *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
-	SkipReason        string                      `json:"skipReason,omitempty"`
-	SkipKind          string                      `json:"skipKind,omitempty"`
-	SkipReviewerLogin string                      `json:"skipReviewerLogin,omitempty"`
+	ResumePolicy                 string                      `json:"resumePolicy,omitempty"`
+	Detail                       *checkpointDetail           `json:"detail,omitempty"`
+	ClaimedLockKey               string                      `json:"claimedLockKey,omitempty"`
+	Snapshot                     *checkpointSnapshot         `json:"snapshot,omitempty"`
+	Worktree                     *checkpointWorktree         `json:"worktree,omitempty"`
+	ThreadResolution             *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
+	ThreadResolutionFollowUpOnly bool                        `json:"threadResolutionFollowUpOnly,omitempty"`
+	PendingReview                *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
+	SkipReason                   string                      `json:"skipReason,omitempty"`
+	SkipKind                     string                      `json:"skipKind,omitempty"`
+	SkipReviewerLogin            string                      `json:"skipReviewerLogin,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -1241,9 +1242,13 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
+	checkpoint.Detail = checkpointDetailFromDetail(detail)
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
+}
+
+func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
+	return &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -1331,7 +1336,11 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			currentLogin = normalizeLogin(lookupLogin)
 			checkpoint.Detail.CurrentLogin = currentLogin
 		}
-		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
+				checkpoint.ThreadResolutionFollowUpOnly = true
+				return checkpoint, nil
+			}
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
@@ -2015,6 +2024,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.PendingReview != nil {
 		return checkpoint, nil
 	}
+	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
+		return next, err
+	}
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
@@ -2210,6 +2222,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
 	}
+	checkpoint.Detail = checkpointDetailFromDetail(detail)
+	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
+		return next, err
+	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
 		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
@@ -2223,12 +2239,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest && !markerResult.Found {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) && !markerResult.Found {
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
@@ -2266,6 +2282,32 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, reviewerCheckpoint, error) {
+	if !checkpoint.ThreadResolutionFollowUpOnly {
+		return false, checkpoint, nil
+	}
+	policy := r.discoveryPolicyForProject(input.Project.ID)
+	if isManualReviewerLoop(input.Loop) || !policy.RequireReviewRequest || checkpoint.Detail == nil {
+		return false, checkpoint, nil
+	}
+	currentLogin := strings.TrimSpace(checkpoint.Detail.CurrentLogin)
+	if currentLogin == "" {
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return false, checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		currentLogin = normalizeLogin(lookupLogin)
+		checkpoint.Detail.CurrentLogin = currentLogin
+	}
+	if isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+		return false, checkpoint, nil
+	}
+	checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+	checkpoint.SkipKind = "not_requested"
+	checkpoint.PendingReview = nil
+	return true, checkpoint, nil
 }
 
 func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string, idempotencyKey string, prAuthorLogin string) (ReviewMarkerResult, error) {
