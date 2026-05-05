@@ -1271,7 +1271,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "conflicted"
 		if err := r.notifyConflictedPullRequest(ctx, input, checkpoint); err != nil {
-			return checkpoint, err
+			r.logWarn("conflicted pull request notification failed; preserving skip", map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "headSha": checkpoint.Detail.HeadSHA, "error": err.Error()})
 		}
 		return checkpoint, nil
 	}

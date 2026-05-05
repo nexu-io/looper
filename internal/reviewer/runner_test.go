@@ -851,6 +851,29 @@ func TestRunFilterStepSkipsConflictedPullRequest(t *testing.T) {
 	}
 }
 
+func TestRunFilterStepSkipsConflictedPullRequestWhenNotificationFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueCommentErr: fmt.Errorf("permission denied")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", Author: "octocat", HasConflicts: true}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v, want nil", err)
+	}
+	if checkpoint.SkipKind != "conflicted" {
+		t.Fatalf("SkipKind = %q, want conflicted", checkpoint.SkipKind)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "Skipped conflicted pull request acme/looper#42") {
+		t.Fatalf("SkipReason = %q, want conflicted PR skip", checkpoint.SkipReason)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issue comment calls = %d, want 1", len(github.issueCommentCalls))
+	}
+}
+
 func TestRunFilterStepDeduplicatesConflictedPullRequestNoticeByHeadSHA(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
