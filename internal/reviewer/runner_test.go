@@ -2411,6 +2411,63 @@ func TestProcessClaimedItemMarksCleanNoopStaleWhenHeadChangesBeforePublish(t *te
 	}
 }
 
+func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{changeHeadOnSecondView: true, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed", Summary: "stale review", Stdout: `__LOOPER_RESULT__={"summary":"stale review"}`, ParseStatus: "parsed"}},
+		wait: func(context.Context) error {
+			time.Sleep(25 * time.Millisecond)
+			return nil
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, HeadChangePollInterval: time.Millisecond, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_interrupt_head_changed", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed while reviewer was running") {
+		t.Fatalf("result = %#v, want retryable interruption for head change", result)
+	}
+	if len(agent.killedReasons) != 1 || !contains(agent.killedReasons[0], "new-head") {
+		t.Fatalf("killedReasons = %#v, want one head-change kill", agent.killedReasons)
+	}
+	failedRun, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+	if err != nil || failedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want failed run", failedRun, err)
+	}
+	checkpoint := parseCheckpoint(failedRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "restart_from_discover" || checkpoint.PendingReview != nil {
+		t.Fatalf("checkpoint = %#v, want restart_from_discover without stale pending review", checkpoint)
+	}
+	requeued, err := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || requeued == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", requeued, err)
+	}
+	if requeued.Status != "queued" || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableAfterResume) {
+		t.Fatalf("queue = %#v, want queued retryable-after-resume", requeued)
+	}
+}
+
 func TestProcessClaimedItemMarksStaleWhenPullRequestStateDriftsBeforePublish(t *testing.T) {
 	t.Parallel()
 
@@ -5504,12 +5561,13 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 }
 
 type fakeAgentExecutor struct {
-	results  []AgentResult
-	starts   []AgentRunInput
-	startErr error
-	waitErr  error
-	waitErrs []error
-	wait     func(context.Context) error
+	results       []AgentResult
+	starts        []AgentRunInput
+	startErr      error
+	waitErr       error
+	waitErrs      []error
+	wait          func(context.Context) error
+	killedReasons []string
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
@@ -5527,20 +5585,32 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 		waitErr = f.waitErrs[0]
 		f.waitErrs = f.waitErrs[1:]
 	}
-	return fakeAgentExecution{result: result, waitErr: waitErr, wait: f.wait}, nil
+	return &fakeAgentExecution{parent: f, result: result, waitErr: waitErr, wait: f.wait, killed: make(chan string, 1)}, nil
 }
 
 type fakeAgentExecution struct {
+	parent  *fakeAgentExecutor
 	result  AgentResult
 	waitErr error
 	wait    func(context.Context) error
+	killed  chan string
 }
 
-func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
+func (f *fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
+	select {
+	case reason := <-f.killed:
+		return AgentResult{Status: "killed", Summary: reason}, nil
+	default:
+	}
 	if f.wait != nil {
 		if err := f.wait(ctx); err != nil {
 			return AgentResult{}, err
 		}
+	}
+	select {
+	case reason := <-f.killed:
+		return AgentResult{Status: "killed", Summary: reason}, nil
+	default:
 	}
 	if f.waitErr != nil {
 		return AgentResult{}, f.waitErr
@@ -5549,6 +5619,17 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 		f.result.ParseStatus = "parsed"
 	}
 	return f.result, nil
+}
+
+func (f *fakeAgentExecution) Kill(reason string) error {
+	if f.parent != nil {
+		f.parent.killedReasons = append(f.parent.killedReasons, reason)
+	}
+	select {
+	case f.killed <- reason:
+	default:
+	}
+	return nil
 }
 
 type testLogger struct {
