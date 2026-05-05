@@ -12,6 +12,7 @@ import (
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -3713,6 +3714,110 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 	}
 }
 
+func TestProcessClaimedItemRetriesTransientSnapshotFailureInRun(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{captureSnapshotErrs: []error{&githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504")}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	logger := &testLogger{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}, AgentExecutor: agent, Logger: logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claim", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("ProcessClaimedItem() = %#v, want success after snapshot retry", result)
+	}
+	if github.captureSnapshotCalls != 2 {
+		t.Fatalf("captureSnapshotCalls = %d, want 2", github.captureSnapshotCalls)
+	}
+	if !logger.hasMessage("reviewer transient external failure retrying") || !logger.hasMessage("reviewer transient external retry succeeded") {
+		t.Fatalf("logger messages = %#v, want retry attempt and success logs", logger.messages)
+	}
+}
+
+func TestExecuteStepDoesNotRetryNonTransientSnapshotFailure(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{captureSnapshotErrs: []error{fmt.Errorf("GraphQL: Resource not accessible by integration")}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+
+	_, err = runner.executeStep(context.Background(), stepSnapshot, stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_1"}, Run: storage.RunRecord{ID: "run_1"}, QueueItem: storage.QueueItemRecord{ID: "queue_1"}, Repo: "acme/looper", PRNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "Resource not accessible") {
+		t.Fatalf("executeStep(snapshot) error = %v, want non-transient failure", err)
+	}
+	if github.captureSnapshotCalls != 1 {
+		t.Fatalf("captureSnapshotCalls = %d, want 1", github.captureSnapshotCalls)
+	}
+}
+
+func TestExecuteStepPreservesFinalTransientFailureAfterRetryExhaustion(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{captureSnapshotErrs: []error{
+		&githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504 first")},
+		&githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504 final")},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond, RetryMaxAttempts: 2})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+
+	_, err = runner.executeStep(context.Background(), stepSnapshot, stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_1"}, Run: storage.RunRecord{ID: "run_1"}, QueueItem: storage.QueueItemRecord{ID: "queue_1"}, Repo: "acme/looper", PRNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "final") || strings.Contains(err.Error(), "first") {
+		t.Fatalf("executeStep(snapshot) error = %v, want final transient failure only", err)
+	}
+	if github.captureSnapshotCalls != 2 {
+		t.Fatalf("captureSnapshotCalls = %d, want 2", github.captureSnapshotCalls)
+	}
+}
+
+func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
+	runner := New(Options{})
+	err := &loopError{message: "GraphQL request failed with HTTP 504", kind: FailureRetryableTransient}
+	if !runner.isTransientExternalFailure(err) {
+		t.Fatal("isTransientExternalFailure(wrapped HTTP 504) = false, want true")
+	}
+}
+
+func TestProcessClaimedItemRetriesTransientModelOverloadInRun(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed"}, {Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}, waitErrs: []error{fmt.Errorf("service_unavailable_error: server_is_overloaded")}}
+	logger := &testLogger{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}, AgentExecutor: agent, Logger: logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claim", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("ProcessClaimedItem() = %#v, want success after model retry", result)
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("len(agent.starts) = %d, want 2", len(agent.starts))
+	}
+	if !logger.hasMessage("reviewer transient external failure retrying") || !logger.hasMessage("reviewer transient external retry succeeded") {
+		t.Fatalf("logger messages = %#v, want retry attempt and success logs", logger.messages)
+	}
+}
+
 func TestProcessClaimedItemPersistsFailedLoopWhenMaxConsecutiveFailuresReached(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4784,6 +4889,8 @@ type fakeGitHubGateway struct {
 	removeLabelErr                  error
 	reviewThreads                   []ReviewThread
 	viewHeadSHA                     string
+	captureSnapshotErrs             []error
+	captureSnapshotCalls            int
 	addThreadReplyCalls             []AddReviewThreadReplyInput
 	resolveThreadCalls              []ResolveReviewThreadInput
 	addReactionCalls                []PullRequestReactionInput
@@ -4867,6 +4974,14 @@ func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
 }
 
 func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	g.captureSnapshotCalls++
+	if len(g.captureSnapshotErrs) > 0 {
+		err := g.captureSnapshotErrs[0]
+		g.captureSnapshotErrs = g.captureSnapshotErrs[1:]
+		if err != nil {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
+	}
 	headSHA := "abc123"
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
@@ -4990,10 +5105,11 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 }
 
 type fakeAgentExecutor struct {
-	results []AgentResult
-	starts  []AgentRunInput
-	waitErr error
-	wait    func(context.Context) error
+	results  []AgentResult
+	starts   []AgentRunInput
+	waitErr  error
+	waitErrs []error
+	wait     func(context.Context) error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
@@ -5003,7 +5119,12 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 	}
 	result := f.results[0]
 	f.results = f.results[1:]
-	return fakeAgentExecution{result: result, waitErr: f.waitErr, wait: f.wait}, nil
+	waitErr := f.waitErr
+	if len(f.waitErrs) > 0 {
+		waitErr = f.waitErrs[0]
+		f.waitErrs = f.waitErrs[1:]
+	}
+	return fakeAgentExecution{result: result, waitErr: waitErr, wait: f.wait}, nil
 }
 
 type fakeAgentExecution struct {
@@ -5027,11 +5148,26 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 	return f.result, nil
 }
 
-type testLogger struct{}
+type testLogger struct {
+	messages []string
+}
 
-func (*testLogger) Debug(string, map[string]any) {}
-func (*testLogger) Info(string, map[string]any)  {}
-func (*testLogger) Warn(string, map[string]any)  {}
-func (*testLogger) Error(string, map[string]any) {}
+func (l *testLogger) Debug(message string, _ map[string]any) {
+	l.messages = append(l.messages, message)
+}
+func (l *testLogger) Info(message string, _ map[string]any) { l.messages = append(l.messages, message) }
+func (l *testLogger) Warn(message string, _ map[string]any) { l.messages = append(l.messages, message) }
+func (l *testLogger) Error(message string, _ map[string]any) {
+	l.messages = append(l.messages, message)
+}
+
+func (l *testLogger) hasMessage(want string) bool {
+	for _, message := range l.messages {
+		if message == want {
+			return true
+		}
+	}
+	return false
+}
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }

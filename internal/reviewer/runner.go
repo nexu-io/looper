@@ -1147,6 +1147,13 @@ type stepInput struct {
 }
 
 func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
+	if reviewerStepSupportsTransientExternalRetry(step) {
+		return r.executeStepWithTransientExternalRetry(ctx, step, input)
+	}
+	return r.executeStepOnce(ctx, step, input)
+}
+
+func (r *Runner) executeStepOnce(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
 	switch step {
 	case stepDiscover:
 		return r.runDiscoverStep(ctx, input)
@@ -1167,6 +1174,33 @@ func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepI
 	default:
 		return input.Checkpoint, fmt.Errorf("unsupported reviewer step: %s", step)
 	}
+}
+
+func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
+	maxAttempts := r.retryMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultRetryMax
+	}
+	checkpoint := input.Checkpoint
+	var err error
+	for attempt := int64(1); attempt <= maxAttempts; attempt++ {
+		checkpoint, err = r.executeStepOnce(ctx, step, input)
+		if err == nil {
+			if attempt > 1 {
+				r.logInfo("reviewer transient external retry succeeded", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "maxAttempts": maxAttempts})
+			}
+			return checkpoint, nil
+		}
+		if attempt >= maxAttempts || !r.isTransientExternalFailure(err) {
+			break
+		}
+		delay := backoffDelay(r.retryBaseDelay, attempt)
+		r.logWarn("reviewer transient external failure retrying", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "nextAttempt": attempt + 1, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
+		if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+			return checkpoint, errors.Join(err, sleepErr)
+		}
+	}
+	return checkpoint, err
 }
 
 func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -2744,7 +2778,24 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if githubinfra.IsTransientError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
+	if isTransientModelProviderError(err) {
+		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}
+}
+
+func (r *Runner) isTransientExternalFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if githubinfra.IsTransientError(err) || isTransientModelProviderError(err) {
+		return true
+	}
+	var loopErr *loopError
+	if errors.As(err, &loopErr) {
+		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderMessage(loopErr.message)
+	}
+	return false
 }
 
 func (r *Runner) nowISO() string {
@@ -3793,6 +3844,52 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 		delay *= 2
 	}
 	return delay
+}
+
+func reviewerStepSupportsTransientExternalRetry(step ReviewerStep) bool {
+	switch step {
+	case stepSnapshot, stepThreadResolution, stepReview:
+		return true
+	default:
+		return false
+	}
+}
+
+func isTransientModelProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isTransientModelProviderMessage(err.Error())
+}
+
+func isTransientModelProviderMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"server_is_overloaded",
+		"service_unavailable_error",
+		"server is overloaded",
+		"service unavailable",
+		"overloaded",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
