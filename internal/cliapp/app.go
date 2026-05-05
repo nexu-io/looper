@@ -592,8 +592,8 @@ func globalFlags() []flagSpec {
 		stringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
 		stringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
 		stringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
-		stringFlag("reviewer-max-iterations-per-pr", "count", "Reviewer loop max iterations per PR"),
-		stringFlag("reviewer-max-iterations-per-head", "count", "Reviewer loop max iterations per head"),
+		stringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
+		stringFlag("reviewer-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
 		boolFlag("no-custom-instructions", "Disable custom instructions for debugging"),
 	}
 }

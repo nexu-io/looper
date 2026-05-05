@@ -94,7 +94,7 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}, want: false},
 		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
-		{name: "max failure budget", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", ConsecutiveFailures: 3}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "legacy budget termination metadata", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", TerminationReason: "max_wall_clock"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
 		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 	}
 	for _, tt := range tests {
@@ -153,7 +153,6 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(
 		wantReason string
 	}{
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
-		{name: "max consecutive failures", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", ConsecutiveFailures: 3}, wantReason: "max_consecutive_failures"},
 		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, wantReason: "auto_recovery_attempt_cap"},
 	}
 	for _, tt := range tests {
@@ -696,7 +695,24 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 	if reviewEvents["clean"] != string(config.ReviewerReviewEventApprove) || reviewEvents["blocking"] != string(config.ReviewerReviewEventRequestChanges) {
 		t.Fatalf("reviewEvents = %#v, want snapshotted decision policy", reviewEvents)
 	}
-	current := `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
+	current := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	if err != nil {
+		t.Fatalf("ensureLoopMetadataJSON(legacy budget metadata) error = %v", err)
+	}
+	loopMeta := reviewerLoopMetadata(parseJSONObject(&metadataJSON))
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		if _, ok := loopMeta[key]; ok {
+			t.Fatalf("loop metadata retained deprecated budget key %q: %#v", key, loopMeta)
+		}
+	}
+	if _, ok := loopMeta["terminationReason"]; ok {
+		t.Fatalf("loop metadata retained budget termination reason: %#v", loopMeta)
+	}
+	if loopMeta["status"] != "active" {
+		t.Fatalf("loop metadata status = %#v, want active after removing budget termination", loopMeta["status"])
+	}
+	current = `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
 	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(invalid reviewEvents) error = %v, want validation error", err)
@@ -736,6 +752,55 @@ func TestEnsureLoopForPullRequestBackfillsLegacyFollowUpdatesDisabled(t *testing
 	}
 }
 
+func TestEnsureLoopForPullRequestReactivatesLegacyBudgetTerminatedLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","maxIterationsPerPR":2,"maxWallClockSeconds":60}}`
+	loop := storage.LoopRecord{ID: "loop_budget_terminated", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ensureLoopForPullRequest(context.Background(), *project, repo, prNumber, &loop)
+	if err != nil {
+		t.Fatalf("ensureLoopForPullRequest() error = %v", err)
+	}
+	if result.record.Status != "queued" || result.record.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued legacy budget loop", result.record)
+	}
+	loopMeta := reviewerLoopMetadata(parseJSONObject(result.record.MetadataJSON))
+	if _, ok := loopMeta["terminationReason"]; ok {
+		t.Fatalf("loop metadata retained budget termination reason: %#v", loopMeta)
+	}
+	if loopMeta["status"] != "active" {
+		t.Fatalf("loop metadata status = %#v, want active", loopMeta["status"])
+	}
+}
+
+func TestRecordLoopSuccessMetadataRemovesDeprecatedBudgetMetadata(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{LoopConfig: testReviewerLoopConfig()})
+	current := `{"loop":{"enabled":true,"maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
+
+	metadataJSON, err := runner.recordLoopSuccessMetadata(&current, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, PendingReview: &pendingReviewCheckpoint{}}, "clean")
+	if err != nil {
+		t.Fatalf("recordLoopSuccessMetadata() error = %v", err)
+	}
+	loopMeta := reviewerLoopMetadata(parseJSONObject(&metadataJSON))
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		if _, ok := loopMeta[key]; ok {
+			t.Fatalf("loop metadata retained deprecated budget key %q: %#v", key, loopMeta)
+		}
+	}
+}
+
 func TestDiscoverPullRequestsDoesNotMarkSkippedExistingLoopQueued(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -767,27 +832,32 @@ func TestDiscoverPullRequestsDoesNotMarkSkippedExistingLoopQueued(t *testing.T) 
 	}
 }
 
-func TestReviewerLoopBudgetTerminationReasons(t *testing.T) {
+func TestRunFilterStepDoesNotTerminateLongRunningLoopOnBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 2, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
-	metadata := `{"loop":{"iterationCount":1,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"abc123":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
-	loop := storage.LoopRecord{ID: "loop_budget", MetadataJSON: &metadata}
-	if got := runner.loopBudgetTerminationReason(loop, "abc123"); got != "max_iterations_per_head" {
-		t.Fatalf("loopBudgetTerminationReason() = %q, want max_iterations_per_head", got)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "octocat"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 2, MaxIterationsPerHead: 1, MaxWallClockSeconds: 60, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true,"iterationCount":99,"agentExecutionCount":99,"consecutiveFailures":99,"iterationsByHead":{"abc123":99},"startTime":"2026-04-11T10:00:00.000Z"}}`
+	loop := storage.LoopRecord{ID: "loop_stale_budget", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	metadata = `{"loop":{"iterationCount":2,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"old":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
-	loop.MetadataJSON = &metadata
-	if got := runner.loopBudgetTerminationReason(loop, "abc123"); got != "max_iterations_per_pr" {
-		t.Fatalf("loopBudgetTerminationReason() = %q, want max_iterations_per_pr", got)
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
 	}
-
-	unlimitedRunner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
-	metadata = `{"loop":{"iterationCount":1,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"old":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
-	loop.MetadataJSON = &metadata
-	if got := unlimitedRunner.loopBudgetTerminationReason(loop, "abc123"); got != "" {
-		t.Fatalf("loopBudgetTerminationReason() = %q, want no termination when max wall clock is 0", got)
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no budget skip", checkpoint.SkipReason)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persisted, err)
+	}
+	if persisted.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", persisted.Status)
 	}
 }
 
@@ -858,7 +928,7 @@ func TestRunFilterStepSkipsConflictedPullRequestBeforeLoginLookup(t *testing.T) 
 	}
 }
 
-func TestRunFilterStepTerminatesLegacyApprovedWithoutReviewsBeforeConflictSkip(t *testing.T) {
+func TestRunFilterStepSkipsConflictedPullRequestWithAggregateApproval(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
@@ -873,15 +943,15 @@ func TestRunFilterStepTerminatesLegacyApprovedWithoutReviewsBeforeConflictSkip(t
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
-	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for approved pull request") {
-		t.Fatalf("SkipReason = %q, want approved termination", checkpoint.SkipReason)
+	if checkpoint.SkipKind != "conflicted" {
+		t.Fatalf("SkipKind = %q, want conflicted", checkpoint.SkipKind)
 	}
 	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || updated == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
 	}
-	if updated.Status != "terminated" {
-		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -3713,7 +3783,7 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 	}
 }
 
-func TestProcessClaimedItemPersistsFailedLoopWhenMaxConsecutiveFailuresReached(t *testing.T) {
+func TestProcessClaimedItemDoesNotTerminateLoopWhenMaxConsecutiveFailuresReached(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewMarkerMissing: true}
@@ -3743,19 +3813,19 @@ func TestProcessClaimedItemPersistsFailedLoopWhenMaxConsecutiveFailuresReached(t
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
 	}
-	if loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed loop with no next run", loop)
+	if loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop with next run", loop)
 	}
 	loopMeta := reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))
-	if loopMeta["status"] != "failed" || loopMeta["terminationReason"] != "max_consecutive_failures" {
-		t.Fatalf("loop metadata = %#v, want max consecutive failure terminal metadata", loopMeta)
+	if loopMeta["terminationReason"] == "max_consecutive_failures" {
+		t.Fatalf("loop metadata = %#v, want no budget termination metadata", loopMeta)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "failed" || queue.FinishedAt == nil {
-		t.Fatalf("queue = %#v, want failed terminal queue item", queue)
+	if queue.Status != "queued" || queue.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued retry item", queue)
 	}
 }
 
@@ -4712,6 +4782,7 @@ type failedReviewerRecoverySeed struct {
 	ErrorMessage         string
 	ConsecutiveFailures  int
 	AutoRecoveryAttempts int
+	TerminationReason    string
 	FollowUpdates        *bool
 	LoopEnabled          *bool
 }
@@ -4733,7 +4804,12 @@ func seedFailedReviewerRecoveryLoop(t *testing.T, fixture *runnerFixture, seed f
 	if seed.LoopEnabled != nil {
 		loopEnabled = *seed.LoopEnabled
 	}
-	metadataMap := map[string]any{"loop": map[string]any{"enabled": loopEnabled, "failureCount": consecutive, "consecutiveFailures": consecutive, "lastFailure": seed.ErrorMessage, "autoRecoveryAttempts": seed.AutoRecoveryAttempts}}
+	loopMeta := map[string]any{"enabled": loopEnabled, "failureCount": consecutive, "consecutiveFailures": consecutive, "lastFailure": seed.ErrorMessage, "autoRecoveryAttempts": seed.AutoRecoveryAttempts}
+	if seed.TerminationReason != "" {
+		loopMeta["status"] = "terminated"
+		loopMeta["terminationReason"] = seed.TerminationReason
+	}
+	metadataMap := map[string]any{"loop": loopMeta}
 	if seed.FollowUpdates != nil {
 		metadataMap["followUpdates"] = *seed.FollowUpdates
 	}

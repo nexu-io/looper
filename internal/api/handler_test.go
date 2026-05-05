@@ -165,6 +165,34 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	}
 }
 
+func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig("")
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	existing := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_iterations_per_pr","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
+
+	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Reviewer, target, "2026-04-11T12:00:00.000Z")
+	if err != nil {
+		t.Fatalf("reviewerLoopMetadataJSON() error = %v", err)
+	}
+	metadata := parseJSONObject(metadataJSON)
+	loopMeta := metadata["loop"].(map[string]any)
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		if _, ok := loopMeta[key]; ok {
+			t.Fatalf("loop metadata retained deprecated budget key %q: %#v", key, loopMeta)
+		}
+	}
+	if _, ok := loopMeta["terminationReason"]; ok {
+		t.Fatalf("loop metadata retained budget termination reason: %#v", loopMeta)
+	}
+	if loopMeta["status"] != "active" {
+		t.Fatalf("loop metadata status = %#v, want active", loopMeta["status"])
+	}
+}
+
 func TestHandlerAuthMisconfigured(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.Server.AuthMode = config.AuthModeLocalToken

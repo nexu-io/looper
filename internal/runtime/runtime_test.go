@@ -1748,7 +1748,7 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 	baseLoop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"consecutiveFailures":1}}`)}
 	baseRun := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}
 	baseQueue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
-	defaultPolicy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3}
+	defaultPolicy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true}
 
 	tests := []struct {
 		name  string
@@ -1777,11 +1777,6 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","headSha":"abc123","currentLogin":"octocat","reviews":[{"author":{"login":"octocat"},"state":"APPROVED","commit":{"oid":"abc123"}}],"labels":[]}`)
 			return r
 		}(), queue: baseQueue},
-		{name: "legacy approved review decision checkpoint", loop: baseLoop, run: func() storage.RunRecord {
-			r := baseRun
-			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`)
-			return r
-		}(), queue: baseQueue},
 		{name: "approved decision before current login checkpoint", loop: baseLoop, run: func() storage.RunRecord {
 			r := baseRun
 			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","headSha":"abc123","reviewDecision":"APPROVED","reviews":[{"author":{"login":"octocat"},"state":"APPROVED","commit":{"oid":"abc123"}}],"labels":[]}`)
@@ -1807,11 +1802,6 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 			r.CheckpointJSON = stringPtr(`{"resumePolicy":"restart_from_discover"}`)
 			return r
 		}(), queue: baseQueue},
-		{name: "max failure budget", loop: func() storage.LoopRecord {
-			l := baseLoop
-			l.MetadataJSON = stringPtr(`{"loop":{"consecutiveFailures":3}}`)
-			return l
-		}(), run: baseRun, queue: baseQueue},
 		{name: "attempt cap", loop: func() storage.LoopRecord {
 			l := baseLoop
 			l.MetadataJSON = stringPtr(`{"loop":{"consecutiveFailures":1,"autoRecoveryAttempts":3}}`)
@@ -1844,6 +1834,29 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 	}
 }
 
+func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *testing.T) {
+	t.Parallel()
+	errorKind := "retryable_after_resume"
+	errorMessage := "PR head changed before publish: expected old, got new"
+	step := "publish"
+	checkpoint := `{"resumePolicy":"restart_from_discover","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","consecutiveFailures":99,"maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`)}
+	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
+	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
+	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true}
+
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
+	}
+	updated := autoRecoveredReviewerLoop(loop, "2026-04-11T12:00:00.000Z")
+	loopMeta := runtimeReviewerLoopMetadata(parseRuntimeJSONObject(updated.MetadataJSON))
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		if _, ok := loopMeta[key]; ok {
+			t.Fatalf("loop metadata retained deprecated budget key %q: %#v", key, loopMeta)
+		}
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"
@@ -1853,7 +1866,7 @@ func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *test
 	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
 	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
 	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
-	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3}
+	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true}
 
 	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
 		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
@@ -2116,7 +2129,7 @@ func TestShouldAutoRecoverFailedReviewerLoopUsesRefreshedCurrentLogin(t *testing
 	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
 	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
 	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
-	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, maxConsecutiveFailures: 3, currentLogin: "other"}
+	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, currentLogin: "other"}
 
 	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
 		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
@@ -2134,7 +2147,7 @@ func TestShouldAutoRecoverFailedReviewerLoopHonorsRecoveryPolicy(t *testing.T) {
 	}
 	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
 	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", LastError: &errorMessage, LastErrorKind: &errorKind}
-	policy := runtimeReviewerRecoveryPolicy{includeDrafts: true, stopOnApproved: false, stopOnReadyLabel: false, maxConsecutiveFailures: 3}
+	policy := runtimeReviewerRecoveryPolicy{includeDrafts: true, stopOnApproved: false, stopOnReadyLabel: false}
 
 	tests := []struct {
 		name string

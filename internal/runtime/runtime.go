@@ -776,10 +776,9 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			return RecoverySummary{}, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:          r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:         r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
-			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
+			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
 		}
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -970,10 +969,9 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 			return requeued, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:          r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:         r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel:       r.config.Reviewer.Loop.StopOnReadyLabel,
-			maxConsecutiveFailures: int64(r.config.Reviewer.Loop.MaxConsecutiveFailures),
+			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
 		}
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -1501,11 +1499,10 @@ type runtimeReviewerCheckpoint struct {
 }
 
 type runtimeReviewerRecoveryPolicy struct {
-	includeDrafts          bool
-	stopOnApproved         bool
-	stopOnReadyLabel       bool
-	maxConsecutiveFailures int64
-	currentLogin           string
+	includeDrafts    bool
+	stopOnApproved   bool
+	stopOnReadyLabel bool
+	currentLogin     string
 }
 
 func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, loop storage.LoopRecord, latestRun *storage.RunRecord, policy runtimeReviewerRecoveryPolicy) (string, bool) {
@@ -1566,10 +1563,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	loopMeta := runtimeReviewerLoopMetadata(meta)
-	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" {
-		return false
-	}
-	if policy.maxConsecutiveFailures > 0 && int64(runtimeIntFromAny(loopMeta["consecutiveFailures"])) >= policy.maxConsecutiveFailures {
+	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
 		return false
 	}
 	if runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
@@ -1618,6 +1612,7 @@ func autoRecoveredReviewerLoop(loop storage.LoopRecord, nowISO string) storage.L
 	loopMeta["lastStatus"] = "auto_recovered"
 	loopMeta["autoRecoveryAttempts"] = runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) + 1
 	delete(loopMeta, "terminationReason")
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	if err == nil {
@@ -1719,10 +1714,30 @@ func runtimeReviewerCheckpointApprovedForRecovery(reviews []map[string]any, logi
 	if runtimeHasApprovedReviewByAuthorForHead(reviews, login, headSHA) {
 		return true
 	}
-	if strings.TrimSpace(login) != "" && strings.TrimSpace(headSHA) != "" && len(reviews) > 0 {
+	return false
+}
+
+func isDeprecatedReviewerLoopBudgetReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "max_iterations_per_pr", "max_iterations_per_head", "max_wall_clock", "max_consecutive_failures", "max_agent_executions_per_pr":
+		return true
+	default:
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(reviewDecision), "APPROVED")
+}
+
+func removeDeprecatedReviewerLoopBudgetMetadata(loopMeta map[string]any) {
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		delete(loopMeta, key)
+	}
+}
+
+var deprecatedReviewerLoopBudgetMetadataKeys = []string{
+	"maxIterationsPerPR",
+	"maxIterationsPerHead",
+	"maxWallClockSeconds",
+	"maxConsecutiveFailures",
+	"maxAgentExecutionsPerPR",
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {

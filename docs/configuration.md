@@ -349,16 +349,13 @@ Default values:
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
-- `loop.maxWallClockSeconds`: maximum wall-clock lifetime for a follow-up reviewer loop, measured from loop creation. Use `0` for no wall-clock limit. Default: `0`.
+- Reviewer loop budget options (`maxIterationsPerPR`, `maxIterationsPerHead`, `maxWallClockSeconds`, `maxConsecutiveFailures`, and `maxAgentExecutionsPerPR`) are deprecated and ignored by the reviewer filter. Reviewer loops keep following PR updates until a clear terminal product state such as the PR closing/merging, an approved Looper review for the current head, or the ready label.
 
 Default reviewer behavior is safe and comment-only:
 
 ```json
 {
   "reviewer": {
-    "loop": {
-      "maxWallClockSeconds": 0
-    },
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"

@@ -32,8 +32,8 @@ Global Flags:
   --port <port>               Server port
   --reviewer-agent-timeout-seconds <seconds> Reviewer agent execution timeout
   --reviewer-loop-enabled <bool> Enable reviewer follow-up loops by default
-  --reviewer-max-iterations-per-head <count> Reviewer loop max iterations per head
-  --reviewer-max-iterations-per-pr <count> Reviewer loop max iterations per PR
+  --reviewer-max-iterations-per-head <count> Deprecated; ignored by reviewer loop filtering
+  --reviewer-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering
   --reviewer-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
   --reviewer-quiet-period-seconds <seconds> Reviewer loop quiet period
   --worker-agent-timeout-seconds <seconds> Worker agent execution timeout

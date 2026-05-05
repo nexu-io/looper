@@ -528,7 +528,7 @@ func New(options Options) *Runner {
 		disclosureCfg = *options.Disclosure
 	}
 	loopConfig := options.LoopConfig
-	if loopConfig.MaxIterationsPerPR == 0 {
+	if loopConfig == (config.ReviewerLoopConfig{}) {
 		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 	}
 	scope := options.Scope
@@ -1200,14 +1200,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	currentLogin := ""
-	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && len(checkpoint.Detail.Reviews) == 0 && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
-		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
-		checkpoint.SkipKind = "approved"
-		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
-			return checkpoint, err
-		}
-		return checkpoint, nil
-	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "ready_label"
@@ -1260,16 +1252,6 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
-	}
-	if r.loopEnabled(meta) {
-		if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
-			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
-			checkpoint.SkipKind = reason
-			if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
-		}
 	}
 	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
 		if currentLogin == "" {
@@ -2373,7 +2355,8 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
-		if terminalReviewerLoopReason(*existing) != "" {
+		budgetTerminationReason := deprecatedReviewerLoopBudgetTerminationReason(*existing)
+		if terminalReviewerLoopReason(*existing) != "" && budgetTerminationReason == "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
 		updated := *existing
@@ -2393,6 +2376,10 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		updated.MetadataJSON = &metadataJSON
+		if budgetTerminationReason != "" && updated.Status == "terminated" {
+			updated.Status = "queued"
+			updated.NextRunAt = &nowISO
+		}
 		updated.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 			return loopUpsertResult{}, err
@@ -2450,6 +2437,7 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 		loopMeta["autoRecoveryAttempts"] = intFromAny(loopMeta["autoRecoveryAttempts"]) + 1
 		loopMeta["lastAutoRecoveryReason"] = reason
 		delete(loopMeta, "terminationReason")
+		removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 		meta["loop"] = loopMeta
 		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
 			text := string(encoded)
@@ -2482,11 +2470,8 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		return false, "", "loop_disabled", nil
 	}
 	loopMeta := reviewerLoopMetadata(meta)
-	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" {
+	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
 		return false, "", reason, nil
-	}
-	if intFromAny(loopMeta["consecutiveFailures"]) >= r.loopConfig.MaxConsecutiveFailures {
-		return false, "", "max_consecutive_failures", nil
 	}
 	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
 		return false, "", "auto_recovery_attempt_cap", nil
@@ -3090,11 +3075,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	loopMeta["scope"] = string(r.scope)
 	loopMeta["quietPeriodSeconds"] = r.loopConfig.QuietPeriodSeconds
 	loopMeta["minPublishIntervalSeconds"] = r.loopConfig.MinPublishIntervalSeconds
-	loopMeta["maxIterationsPerPR"] = r.loopConfig.MaxIterationsPerPR
-	loopMeta["maxIterationsPerHead"] = r.loopConfig.MaxIterationsPerHead
-	loopMeta["maxWallClockSeconds"] = r.loopConfig.MaxWallClockSeconds
-	loopMeta["maxConsecutiveFailures"] = r.loopConfig.MaxConsecutiveFailures
-	loopMeta["maxAgentExecutionsPerPR"] = r.loopConfig.MaxAgentExecutionsPerPR
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	reviewEventsRaw, hasReviewEvents := meta["reviewEvents"]
 	reviewEventsMeta, _ := reviewEventsRaw.(map[string]any)
 	if hasReviewEvents && reviewEventsMeta == nil {
@@ -3195,6 +3176,16 @@ func terminalReviewerLoopReason(loop storage.LoopRecord) string {
 	return ""
 }
 
+func deprecatedReviewerLoopBudgetTerminationReason(loop storage.LoopRecord) string {
+	meta := parseJSONObject(loop.MetadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	reason, _ := stringFromAny(loopMeta["terminationReason"])
+	if isDeprecatedReviewerLoopBudgetReason(reason) {
+		return reason
+	}
+	return ""
+}
+
 func (r *Runner) recordLoopFailureMetadata(current *string, message string) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta := reviewerLoopMetadata(meta)
@@ -3204,10 +3195,7 @@ func (r *Runner) recordLoopFailureMetadata(current *string, message string) (str
 	loopMeta["consecutiveFailures"] = consecutive + 1
 	loopMeta["lastStatus"] = "failed"
 	loopMeta["lastFailure"] = message
-	if consecutive+1 >= r.loopConfig.MaxConsecutiveFailures {
-		loopMeta["status"] = "failed"
-		loopMeta["terminationReason"] = "max_consecutive_failures"
-	}
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
@@ -3260,6 +3248,7 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	if loopMeta["terminationReason"] == nil {
 		loopMeta["status"] = "waiting"
 	}
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	if checkpoint.SkipReason != "" {
 		delete(meta, "lastFilterSkip")
 		if skip := filterSkipMetadata(checkpoint, r.nowISO()); skip != nil {
@@ -3331,32 +3320,33 @@ func reviewMarkerFingerprint(found ReviewMarkerResult) string {
 	return normalizedFindingFingerprint(strings.Join(parts, "\n"))
 }
 
-func (r *Runner) loopBudgetTerminationReason(loop storage.LoopRecord, headSHA string) string {
-	meta := parseJSONObject(loop.MetadataJSON)
-	loopMeta := reviewerLoopMetadata(meta)
-	if intFromAny(loopMeta["iterationCount"]) >= r.loopConfig.MaxIterationsPerPR {
-		return "max_iterations_per_pr"
+func removeDeprecatedReviewerLoopBudgetMetadata(loopMeta map[string]any) {
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		delete(loopMeta, key)
 	}
-	if intFromAny(loopMeta["agentExecutionCount"]) >= r.loopConfig.MaxAgentExecutionsPerPR {
-		return "max_agent_executions_per_pr"
-	}
-	if intFromAny(loopMeta["consecutiveFailures"]) >= r.loopConfig.MaxConsecutiveFailures {
-		return "max_consecutive_failures"
-	}
-	if headSHA != "" {
-		byHead, _ := loopMeta["iterationsByHead"].(map[string]any)
-		if intFromAny(byHead[headSHA]) >= r.loopConfig.MaxIterationsPerHead {
-			return "max_iterations_per_head"
+	if reason, _ := stringFromAny(loopMeta["terminationReason"]); isDeprecatedReviewerLoopBudgetReason(reason) {
+		delete(loopMeta, "terminationReason")
+		if status, _ := stringFromAny(loopMeta["status"]); status == "failed" || status == "terminated" {
+			loopMeta["status"] = "active"
 		}
 	}
-	if r.loopConfig.MaxWallClockSeconds > 0 {
-		if start, ok := loopMeta["startTime"].(string); ok && start != "" {
-			if parsed, err := time.Parse(time.RFC3339Nano, start); err == nil && r.now().Sub(parsed) >= time.Duration(r.loopConfig.MaxWallClockSeconds)*time.Second {
-				return "max_wall_clock"
-			}
-		}
+}
+
+var deprecatedReviewerLoopBudgetMetadataKeys = []string{
+	"maxIterationsPerPR",
+	"maxIterationsPerHead",
+	"maxWallClockSeconds",
+	"maxConsecutiveFailures",
+	"maxAgentExecutionsPerPR",
+}
+
+func isDeprecatedReviewerLoopBudgetReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "max_iterations_per_pr", "max_iterations_per_head", "max_wall_clock", "max_consecutive_failures", "max_agent_executions_per_pr":
+		return true
+	default:
+		return false
 	}
-	return ""
 }
 
 func (r *Runner) terminateLoop(ctx context.Context, loop storage.LoopRecord, reason string) error {

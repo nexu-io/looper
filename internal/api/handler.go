@@ -3750,11 +3750,7 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 	}
 	loopMeta["scope"] = string(reviewerConfig.Scope)
 	loopMeta["quietPeriodSeconds"] = reviewerConfig.Loop.QuietPeriodSeconds
-	loopMeta["maxIterationsPerPR"] = reviewerConfig.Loop.MaxIterationsPerPR
-	loopMeta["maxIterationsPerHead"] = reviewerConfig.Loop.MaxIterationsPerHead
-	loopMeta["maxWallClockSeconds"] = reviewerConfig.Loop.MaxWallClockSeconds
-	loopMeta["maxConsecutiveFailures"] = reviewerConfig.Loop.MaxConsecutiveFailures
-	loopMeta["maxAgentExecutionsPerPR"] = reviewerConfig.Loop.MaxAgentExecutionsPerPR
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	reviewEventsRaw, hasReviewEvents := metadata["reviewEvents"]
 	reviewEventsMeta, _ := reviewEventsRaw.(map[string]any)
 	if hasReviewEvents && reviewEventsMeta == nil {
@@ -3804,6 +3800,36 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 func isValidReviewerCleanReviewEvent(value string) bool {
 	switch config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value))) {
 	case config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove:
+		return true
+	default:
+		return false
+	}
+}
+
+func removeDeprecatedReviewerLoopBudgetMetadata(loopMeta map[string]any) {
+	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
+		delete(loopMeta, key)
+	}
+	reason, _ := loopMeta["terminationReason"].(string)
+	if isDeprecatedReviewerLoopBudgetReason(reason) {
+		delete(loopMeta, "terminationReason")
+		if status, _ := loopMeta["status"].(string); status == "failed" || status == "terminated" {
+			loopMeta["status"] = "active"
+		}
+	}
+}
+
+var deprecatedReviewerLoopBudgetMetadataKeys = []string{
+	"maxIterationsPerPR",
+	"maxIterationsPerHead",
+	"maxWallClockSeconds",
+	"maxConsecutiveFailures",
+	"maxAgentExecutionsPerPR",
+}
+
+func isDeprecatedReviewerLoopBudgetReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "max_iterations_per_pr", "max_iterations_per_head", "max_wall_clock", "max_consecutive_failures", "max_agent_executions_per_pr":
 		return true
 	default:
 		return false
