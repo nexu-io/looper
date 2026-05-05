@@ -87,11 +87,15 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
 		return err
 	}
+	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, metadata.Author, cwd)
+	if err != nil {
+		return err
+	}
 	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	var anchors *diffanchor.Index
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, event, payload, commitID, cwd, loaded.Config.Disclosure)
+			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
 	}
@@ -102,10 +106,31 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return fmt.Errorf("submit validated PR review: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
+	if !strings.EqualFold(strings.TrimSpace(event), "APPROVE") || strings.TrimSpace(authorLogin) == "" {
+		return event, nil
+	}
+	currentLogin, err := gh.GetCurrentUserLogin(cmd.Context(), cwd)
+	if err != nil {
+		return "", fmt.Errorf("determine authenticated GitHub user for self-approval check: %w", err)
+	}
+	if !sameGitHubLogin(currentLogin, authorLogin) {
+		return event, nil
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "looper: downgrading APPROVE review to COMMENT for %s#%d because authenticated GitHub user %q authored the pull request and GitHub does not allow self-approval\n", repo, prNumber, strings.TrimSpace(currentLogin))
+	return "COMMENT", nil
+}
+
+func sameGitHubLogin(a string, b string) bool {
+	a = strings.TrimSpace(strings.TrimPrefix(a, "@"))
+	b = strings.TrimSpace(strings.TrimPrefix(b, "@"))
+	return a != "" && strings.EqualFold(a, b)
 }
 
 func validateReviewSubmitEvent(raw string) (string, error) {

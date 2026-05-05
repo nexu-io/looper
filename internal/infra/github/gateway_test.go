@@ -715,6 +715,27 @@ func TestGatewayHasReviewMarkerRejectsEventOutcomePolicyMismatch(t *testing.T) {
 	}
 }
 
+func TestGatewayHasReviewMarkerAllowsCleanCommentFallback(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"COMMENTED","body":"<!-- looper:review id=clean head=def outcome=clean -->"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=clean", AllowedReviewEvents: []string{"COMMENT", "APPROVE"}, AllowCleanComment: true})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true for allowed clean COMMENT fallback")
+	}
+}
+
 func TestGatewayHasReviewMarkerReadsSlurpedPaginatedReviews(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

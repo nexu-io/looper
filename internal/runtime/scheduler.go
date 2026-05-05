@@ -275,7 +275,7 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 	for _, event := range input.AllowedReviewEvents {
 		allowedReviewEvents = append(allowedReviewEvents, string(event))
 	}
-	marker, err := a.gateway.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, AllowedReviewEvents: allowedReviewEvents, AuthorLogin: input.AuthorLogin, CWD: input.CWD})
+	marker, err := a.gateway.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, AllowedReviewEvents: allowedReviewEvents, AuthorLogin: input.AuthorLogin, AllowCleanComment: input.AllowCleanComment, CWD: input.CWD})
 	if err != nil {
 		return reviewer.ReviewMarkerResult{}, err
 	}

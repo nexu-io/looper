@@ -2017,6 +2017,22 @@ func TestValidateCleanApprovedReviewMarkerBodyAcceptsCaseInsensitiveAuthorMentio
 	}
 }
 
+func TestCleanReviewMarkerSatisfiesCleanPolicyAllowsSelfAuthoredCommentFallback(t *testing.T) {
+	t.Parallel()
+
+	marker := ReviewMarkerResult{Found: true, Outcome: "clean", Event: ReviewEventComment, AuthorLogin: "Reviewer"}
+	if !cleanReviewMarkerSatisfiesCleanPolicy(marker, "reviewer") {
+		t.Fatal("cleanReviewMarkerSatisfiesCleanPolicy() = false, want true for self-authored clean COMMENT fallback")
+	}
+	if cleanReviewMarkerSatisfiesCleanPolicy(marker, "octocat") {
+		t.Fatal("cleanReviewMarkerSatisfiesCleanPolicy() = true, want false for non-self-authored clean COMMENT")
+	}
+	marker.InlineCommentBodies = []string{"inline"}
+	if cleanReviewMarkerSatisfiesCleanPolicy(marker, "reviewer") {
+		t.Fatal("cleanReviewMarkerSatisfiesCleanPolicy() = true, want false when clean COMMENT has inline comments")
+	}
+}
+
 func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForApprovePolicy(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
