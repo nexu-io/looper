@@ -2524,6 +2524,7 @@ type workerCreateResponse struct {
 	SpecPath    *string `json:"specPath"`
 	BaseBranch  string  `json:"baseBranch"`
 	IssueNumber *int64  `json:"issueNumber,omitempty"`
+	Reused      bool    `json:"reused,omitempty"`
 }
 
 type plannerCreateResponse struct {
@@ -2755,6 +2756,10 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if baseBranch == nil {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "baseBranch is required"}
 	}
+	requestedIssueTarget := (*domain.LoopTarget)(nil)
+	if issueNumber != nil {
+		requestedIssueTarget = &domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	}
 
 	effectivePRNumber := (*int64)(nil)
 	if prNumber != nil {
@@ -2829,20 +2834,34 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	metadataJSON := string(payloadJSONBytes)
+	reusedWorkerLoop := false
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
-		seq, seqErr := repos.Loops.AllocateSeq(r.Context())
-		if seqErr != nil {
-			return storage.LoopRecord{}, seqErr
-		}
 
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
+		if issueNumber != nil {
+			if existingLoop, existingTarget, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+				return storage.LoopRecord{}, reuseErr
+			} else if ok {
+				reusedWorkerLoop = true
+				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO)
+				if resumeErr != nil {
+					return storage.LoopRecord{}, resumeErr
+				}
+				return resumed, nil
+			}
+		}
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
+		}
+
+		seq, seqErr := repos.Loops.AllocateSeq(r.Context())
+		if seqErr != nil {
+			return storage.LoopRecord{}, seqErr
 		}
 
 		record := storage.LoopRecord{
@@ -2910,7 +2929,13 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	if h.context.TriggerSchedulerTick != nil {
-		h.context.TriggerSchedulerTick()
+		if !reusedWorkerLoop || record.Status == string(domain.LoopStatusQueued) {
+			h.context.TriggerSchedulerTick()
+		}
+	}
+
+	if reusedWorkerLoop {
+		title, prompt, effectiveSpecPath, baseBranch, issueNumber = reusedWorkerResponseFields(record, title, prompt, effectiveSpecPath, baseBranch, issueNumber)
 	}
 
 	response := workerCreateResponse{
@@ -2918,11 +2943,135 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		Title:        title,
 		Prompt:       prompt,
 		SpecPath:     effectiveSpecPath,
-		BaseBranch:   *baseBranch,
+		BaseBranch:   derefString(baseBranch),
 		IssueNumber:  issueNumber,
+		Reused:       reusedWorkerLoop,
 	}
 
 	return response, nil
+}
+
+func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
+	for _, loop := range existing {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) {
+			continue
+		}
+		status := domain.LoopStatus(loop.Status)
+		if !domain.IsConflictingActiveLoopStatus(status) {
+			continue
+		}
+		loopTarget, err := loopTargetFromRecordCompat(loop)
+		if err != nil {
+			return storage.LoopRecord{}, domain.LoopTarget{}, false, err
+		}
+		key := loopTargetKeyFromRecordCompat(loop)
+		if key != loopTargetKeyCompat(issueTarget) && key != loopTargetKeyCompat(effectiveTarget) {
+			continue
+		}
+		return loop, loopTarget, true, nil
+	}
+
+	return storage.LoopRecord{}, domain.LoopTarget{}, false, nil
+}
+
+func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string) (storage.LoopRecord, error) {
+	status := domain.LoopStatus(loop.Status)
+	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
+	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
+		if err := domain.AssertLoopStatusTransition(status, domain.LoopStatusQueued); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		loop.Status = string(domain.LoopStatusQueued)
+		loop.NextRunAt = &nowISO
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
+
+	if shouldQueue {
+		requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loop.ID, nowISO)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if requeued == 0 {
+			activeQueue, findErr := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if activeQueue == nil {
+				latestQueue, latestErr := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+				if latestErr != nil {
+					return storage.LoopRecord{}, latestErr
+				}
+				if latestQueue != nil {
+					if latestQueue.DedupeKey != "" {
+						activeDedupe, dedupeErr := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
+						if dedupeErr != nil {
+							return storage.LoopRecord{}, dedupeErr
+						}
+						if activeDedupe != nil {
+							return loop, nil
+						}
+					}
+					replacement := *latestQueue
+					replacement.ID = generateRequestID()
+					replacement.Status = "queued"
+					replacement.AvailableAt = nowISO
+					replacement.Attempts = 0
+					replacement.ClaimedBy = nil
+					replacement.ClaimedAt = nil
+					replacement.StartedAt = nil
+					replacement.FinishedAt = nil
+					replacement.LastError = nil
+					replacement.LastErrorKind = nil
+					replacement.CreatedAt = nowISO
+					replacement.UpdatedAt = nowISO
+					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+						return storage.LoopRecord{}, err
+					}
+				} else {
+					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+					if queueErr != nil {
+						return storage.LoopRecord{}, queueErr
+					}
+					if ok {
+						if upsertQueueErr := repos.Queue.Upsert(ctx, queueRecord); upsertQueueErr != nil {
+							return storage.LoopRecord{}, upsertQueueErr
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return loop, nil
+}
+
+func reusedWorkerResponseFields(loop storage.LoopRecord, fallbackTitle string, fallbackPrompt, fallbackSpecPath, fallbackBaseBranch *string, fallbackIssueNumber *int64) (string, *string, *string, *string, *int64) {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	worker, _ := metadata["worker"].(map[string]any)
+	title := fallbackTitle
+	if value := readStringAny(worker["title"]); value != nil {
+		title = *value
+	}
+	prompt := fallbackPrompt
+	if value := readStringAny(worker["prompt"]); value != nil {
+		prompt = value
+	}
+	specPath := fallbackSpecPath
+	if value := readStringAny(worker["specPath"]); value != nil {
+		specPath = value
+	}
+	baseBranch := fallbackBaseBranch
+	if value := readStringAny(worker["baseBranch"]); value != nil {
+		baseBranch = value
+	}
+	issueNumber := fallbackIssueNumber
+	if value := int64MetadataPtr(worker, "issueNumber"); value != nil {
+		issueNumber = value
+	}
+	return title, prompt, specPath, baseBranch, issueNumber
 }
 
 func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateResponse, error) {

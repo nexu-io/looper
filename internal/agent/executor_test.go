@@ -524,7 +524,9 @@ func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'beat\n'; sleep 1"}}}})
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'beat\n'; sleep 1"}}}, Repos: repos})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
 	if err != nil {
@@ -537,6 +539,69 @@ func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 	}
 	if result.Status != "timeout" {
 		t.Fatalf("result.Status = %q, want timeout", result.Status)
+	}
+	if result.TimeoutType != "idle" || result.ConfiguredIdleTimeoutSeconds != 1 || result.ConfiguredMaxRuntimeSeconds != 1 || result.LastProgressAt == "" {
+		t.Fatalf("timeout diagnostics = %#v, want idle metadata", result)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "agent_heartbeat_timeout")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEvent(events, "agent.idle_timeout") {
+		t.Fatalf("agent events = %#v, want idle timeout event", events)
+	}
+}
+
+func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutdown(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}}})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 120 * time.Millisecond, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout", result.Status)
+	}
+	if result.TimeoutType != "idle" {
+		t.Fatalf("result.TimeoutType = %q, want idle preserved after max runtime fires", result.TimeoutType)
+	}
+}
+
+func TestExecutorMaxRuntimeTimeoutIgnoresProgressResets(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "while true; do printf 'beat\n'; sleep 0.02; done"}}}, Repos: repos})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_max_runtime_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 80 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" || result.TimeoutType != "max_runtime" {
+		t.Fatalf("result = %#v, want max runtime timeout", result)
+	}
+	if result.HeartbeatCount < 2 {
+		t.Fatalf("HeartbeatCount = %d, want progress before max runtime timeout", result.HeartbeatCount)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "agent_max_runtime_timeout")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEvent(events, "agent.max_runtime_timeout") {
+		t.Fatalf("agent events = %#v, want max runtime timeout event", events)
 	}
 }
 

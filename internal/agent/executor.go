@@ -56,18 +56,23 @@ type RunInput struct {
 }
 
 type Result struct {
-	Status           string
-	Summary          string
-	Stdout           string
-	Stderr           string
-	ParseStatus      string
-	CompletionSignal string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
-	HeartbeatCount   int64
-	PID              int
+	Status                       string
+	Summary                      string
+	Stdout                       string
+	Stderr                       string
+	ParseStatus                  string
+	CompletionSignal             string
+	Artifacts                    []string
+	ChangedFiles                 []string
+	Commits                      []string
+	Lifecycle                    *lifecycle.State
+	HeartbeatCount               int64
+	TimeoutType                  string
+	ConfiguredIdleTimeoutSeconds int64
+	ConfiguredMaxRuntimeSeconds  int64
+	ElapsedRuntimeSeconds        int64
+	LastProgressAt               string
+	PID                          int
 }
 
 type completionParse struct {
@@ -140,6 +145,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		executor:           e,
 		input:              input,
 		executionID:        executionID,
+		startedAt:          startedAt,
 		command:            command,
 		args:               args,
 		startedAtISO:       startedAtISO,
@@ -178,6 +184,7 @@ type execution struct {
 	executor           *ConfiguredExecutor
 	input              RunInput
 	executionID        string
+	startedAt          time.Time
 	command            string
 	args               []string
 	startedAtISO       string
@@ -257,6 +264,7 @@ func (x *execution) run(ctx context.Context) {
 	var (
 		waitErr         error
 		timedOut        bool
+		timeoutType     string
 		killed          bool
 		killReason      string
 		graceKillTimer  <-chan time.Time
@@ -304,9 +312,12 @@ func (x *execution) run(ctx context.Context) {
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
-			timedOut = true
+			if !timedOut {
+				timedOut = true
+				timeoutType = "max_runtime"
+			}
 			if killReason == "" {
-				killReason = "agent timed out"
+				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
 			x.setStatus("timeout")
 			terminateSignal()
@@ -324,8 +335,9 @@ func (x *execution) run(ctx context.Context) {
 				continue
 			}
 			timedOut = true
+			timeoutType = "idle"
 			if killReason == "" {
-				killReason = fmt.Sprintf("agent heartbeat timed out after %s", x.heartbeatTimeout)
+				killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
 			}
 			x.setStatus("timeout")
 			terminateSignal()
@@ -376,33 +388,51 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+	lastProgressAt := x.lastProgressAtISO()
 	result := Result{
-		Status:           status,
-		Summary:          completion.Summary,
-		Stdout:           stdout,
-		Stderr:           stderr,
-		ParseStatus:      completion.ParseStatus,
-		CompletionSignal: completion.CompletionSignal,
-		Artifacts:        append([]string(nil), completion.Artifacts...),
-		ChangedFiles:     append([]string(nil), completion.ChangedFiles...),
-		Commits:          append([]string(nil), completion.Commits...),
-		Lifecycle:        completion.Lifecycle,
-		HeartbeatCount:   x.heartbeatCountValue(),
-		PID:              pidOrZero(x.process.Process),
+		Status:                       status,
+		Summary:                      completion.Summary,
+		Stdout:                       stdout,
+		Stderr:                       stderr,
+		ParseStatus:                  completion.ParseStatus,
+		CompletionSignal:             completion.CompletionSignal,
+		Artifacts:                    append([]string(nil), completion.Artifacts...),
+		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
+		Commits:                      append([]string(nil), completion.Commits...),
+		Lifecycle:                    completion.Lifecycle,
+		HeartbeatCount:               x.heartbeatCountValue(),
+		TimeoutType:                  timeoutType,
+		ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+		LastProgressAt:               lastProgressAt,
+		PID:                          pidOrZero(x.process.Process),
 	}
 
 	x.persistFinal(status, result, errorMessage, endedAtISO)
 	eventType := "agent.completed"
 	if status == "timeout" {
-		eventType = "agent.timed_out"
+		switch timeoutType {
+		case "idle":
+			eventType = "agent.idle_timeout"
+		case "max_runtime":
+			eventType = "agent.max_runtime_timeout"
+		default:
+			eventType = "agent.timed_out"
+		}
 	} else if status == "killed" {
 		eventType = "agent.killed"
 	}
 	x.executor.appendLifecycleEvent(eventType, x.input, x.executionID, map[string]any{
-		"status":         status,
-		"parseStatus":    result.ParseStatus,
-		"heartbeatCount": result.HeartbeatCount,
-		"summary":        result.Summary,
+		"status":                       status,
+		"timeoutType":                  timeoutType,
+		"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
+		"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
+		"elapsedRuntimeSeconds":        result.ElapsedRuntimeSeconds,
+		"lastProgressAt":               result.LastProgressAt,
+		"parseStatus":                  result.ParseStatus,
+		"heartbeatCount":               result.HeartbeatCount,
+		"summary":                      result.Summary,
 	}, endedAtISO)
 
 	x.doneCh <- execOutcome{result: result, err: nil}
@@ -455,7 +485,7 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return
 	}
-	metadata := mustJSON(map[string]any{"idempotencyKey": emptyToNil(x.input.IdempotencyKey), "metadata": x.input.Metadata})
+	metadata := mustJSON(x.executionMetadata(""))
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	pid := int64(pidOrZero(x.process.Process))
 	record := storage.AgentExecutionRecord{
@@ -491,7 +521,7 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		return
 	}
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
-	metadata := mustJSON(map[string]any{"idempotencyKey": emptyToNil(x.input.IdempotencyKey), "metadata": x.input.Metadata})
+	metadata := mustJSON(x.executionMetadata(result.TimeoutType))
 	embeddedStdout := x.stdoutString()
 	embeddedStderr := x.stderrString()
 	if embeddedStderr == "" && result.Stderr != "" {
@@ -576,6 +606,44 @@ func (x *execution) heartbeatCountValue() int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.heartbeatCount
+}
+
+func (x *execution) lastProgressAtISO() string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.lastHeartbeatAtISO
+}
+
+func (x *execution) executionMetadata(timeoutType string) map[string]any {
+	metadata := map[string]any{
+		"idempotencyKey": emptyToNil(x.input.IdempotencyKey),
+		"metadata":       x.input.Metadata,
+		"timeoutPolicy": map[string]any{
+			"idleTimeoutSeconds": durationSeconds(x.heartbeatTimeout),
+			"maxRuntimeSeconds":  durationSeconds(x.timeout),
+		},
+	}
+	if timeoutType != "" {
+		metadata["timeout"] = map[string]any{
+			"type":                         timeoutType,
+			"configuredIdleTimeoutSeconds": durationSeconds(x.heartbeatTimeout),
+			"configuredMaxRuntimeSeconds":  durationSeconds(x.timeout),
+			"elapsedRuntimeSeconds":        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+			"lastProgressAt":               x.lastProgressAtISO(),
+		}
+	}
+	return metadata
+}
+
+func durationSeconds(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	seconds := int64(duration / time.Second)
+	if seconds == 0 {
+		return 1
+	}
+	return seconds
 }
 
 func (x *execution) resolveOutputLogs() (string, string) {

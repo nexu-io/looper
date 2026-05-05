@@ -86,6 +86,12 @@ Example minimal `~/.looper/config.json`:
     },
     "env": {
       "OPENAI_API_KEY": "replace-me"
+    },
+    "timeouts": {
+      "plannerSeconds": 1800,
+      "workerSeconds": 3600,
+      "reviewerSeconds": 1800,
+      "fixerSeconds": 1800
     }
   },
   "logging": {
@@ -240,8 +246,11 @@ Default storage paths:
 - `model`: optional model identifier
 - `params`: free-form vendor-specific parameters
 - `env`: environment variables passed to the agent process
+- `timeouts`: role-specific agent execution timeout seconds; defaults are planner `1800`, worker `3600`, reviewer `1800`, fixer `1800`
 
 `vendor` is required for agent-driven loops. If it is omitted, the daemon can still run, but planner / reviewer / fixer / worker loops cannot be created or started.
+
+All timeout values must be positive integers. If a run exceeds its configured role timeout, Looper uses the existing timeout failure and retry behavior.
 
 ### `logging`
 
@@ -340,12 +349,16 @@ Default values:
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
+- `loop.maxWallClockSeconds`: maximum wall-clock lifetime for a follow-up reviewer loop, measured from loop creation. Use `0` for no wall-clock limit. Default: `0`.
 
 Default reviewer behavior is safe and comment-only:
 
 ```json
 {
   "reviewer": {
+    "loop": {
+      "maxWallClockSeconds": 0
+    },
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"
@@ -513,6 +526,10 @@ Supported environment overrides:
 - `LOOPER_OSASCRIPT_PATH`
 - `LOOPER_OSASCRIPT_ENABLED`
 - `LOOPER_IN_APP_NOTIFICATIONS`
+- `LOOPER_AGENT_TIMEOUTS_PLANNER_SECONDS`
+- `LOOPER_AGENT_TIMEOUTS_WORKER_SECONDS`
+- `LOOPER_AGENT_TIMEOUTS_REVIEWER_SECONDS`
+- `LOOPER_AGENT_TIMEOUTS_FIXER_SECONDS`
 - `LOOPER_ALLOW_AUTO_COMMIT`
 - `LOOPER_ALLOW_AUTO_PUSH`
 - `LOOPER_ALLOW_AUTO_APPROVE`
@@ -577,6 +594,10 @@ Supported `looperd` flags:
 - `--git-path`
 - `--gh-path`
 - `--osascript-path`
+- `--planner-agent-timeout-seconds`
+- `--worker-agent-timeout-seconds`
+- `--reviewer-agent-timeout-seconds`
+- `--fixer-agent-timeout-seconds`
 - `--allow-auto-commit`
 - `--allow-auto-push`
 - `--allow-auto-approve`

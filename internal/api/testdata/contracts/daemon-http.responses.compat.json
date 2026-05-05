@@ -177,6 +177,20 @@
           "agent": {
             "env": {},
             "params": {},
+            "timeouts": {
+              "fixerIdleTimeoutSeconds": 600,
+              "fixerMaxRuntimeSeconds": 7200,
+              "fixerSeconds": 7200,
+              "plannerIdleTimeoutSeconds": 600,
+              "plannerMaxRuntimeSeconds": 3600,
+              "plannerSeconds": 3600,
+              "reviewerIdleTimeoutSeconds": 600,
+              "reviewerMaxRuntimeSeconds": 5400,
+              "reviewerSeconds": 5400,
+              "workerIdleTimeoutSeconds": 900,
+              "workerMaxRuntimeSeconds": 10800,
+              "workerSeconds": 10800
+            },
             "vendor": "opencode"
           },
           "logging": {
@@ -229,7 +243,7 @@
               "minPublishIntervalSeconds": 300,
               "maxIterationsPerPR": 20,
               "maxIterationsPerHead": 1,
-              "maxWallClockSeconds": 14400,
+              "maxWallClockSeconds": 0,
               "maxConsecutiveFailures": 3,
               "maxAgentExecutionsPerPR": 25,
               "stopOnApproved": true,

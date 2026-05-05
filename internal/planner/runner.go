@@ -217,17 +217,23 @@ type AgentRunInput struct {
 	Prompt           string
 	WorkingDirectory string
 	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
 }
 
 type AgentResult struct {
-	Status    string
-	Summary   string
-	Stdout    string
-	Stderr    string
-	Commits   []string
-	Lifecycle *lifecycle.State
+	Status                       string
+	Summary                      string
+	Stdout                       string
+	Stderr                       string
+	Commits                      []string
+	Lifecycle                    *lifecycle.State
+	TimeoutType                  string
+	ConfiguredIdleTimeoutSeconds int64
+	ConfiguredMaxRuntimeSeconds  int64
+	ElapsedRuntimeSeconds        int64
+	LastProgressAt               string
 }
 
 type AgentExecution interface {
@@ -259,6 +265,7 @@ type Options struct {
 	Logger                  bootstrap.Logger
 	Now                     func() time.Time
 	AgentTimeout            time.Duration
+	AgentIdleTimeout        time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
@@ -287,6 +294,7 @@ type Runner struct {
 	logger                  bootstrap.Logger
 	now                     func() time.Time
 	agentTimeout            time.Duration
+	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
@@ -356,12 +364,17 @@ type checkpointWorktree struct {
 }
 
 type checkpointWriteSpec struct {
-	Status        string           `json:"status,omitempty"`
-	Summary       string           `json:"summary,omitempty"`
-	Stdout        string           `json:"stdout,omitempty"`
-	Commits       []string         `json:"commits,omitempty"`
-	Lifecycle     *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	GitReconciled bool             `json:"gitReconciled,omitempty"`
+	Status                       string           `json:"status,omitempty"`
+	Summary                      string           `json:"summary,omitempty"`
+	Stdout                       string           `json:"stdout,omitempty"`
+	Commits                      []string         `json:"commits,omitempty"`
+	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	GitReconciled                bool             `json:"gitReconciled,omitempty"`
+	TimeoutType                  string           `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64            `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64            `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64            `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string           `json:"lastProgressAt,omitempty"`
 }
 
 type checkpointPullRequest struct {
@@ -380,6 +393,10 @@ type checkpointPublishState struct {
 type checkpointNotify struct {
 	SentAt  string `json:"sentAt,omitempty"`
 	Message string `json:"message,omitempty"`
+}
+
+func checkpointWriteSpecFromAgentResult(result AgentResult) *checkpointWriteSpec {
+	return &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
 }
 
 type resumedRunContext struct {
@@ -415,6 +432,10 @@ func New(options Options) *Runner {
 	if agentTimeout <= 0 {
 		agentTimeout = defaultAgentTimeout
 	}
+	agentIdleTimeout := options.AgentIdleTimeout
+	if agentIdleTimeout <= 0 {
+		agentIdleTimeout = 10 * time.Minute
+	}
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
 		claimTTL = defaultClaimTTL
@@ -439,7 +460,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -889,7 +910,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -903,6 +924,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, err
 		}
 		if !strings.EqualFold(result.Status, "completed") {
+			checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
 			message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
@@ -910,7 +936,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
-		checkpoint.WriteSpec = &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle}
+		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())

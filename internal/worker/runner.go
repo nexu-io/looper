@@ -39,7 +39,7 @@ const (
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
 
-	defaultAgentTimeout = 30 * time.Minute
+	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
@@ -280,19 +280,25 @@ type AgentRunInput struct {
 	Prompt           string
 	WorkingDirectory string
 	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
 }
 
 type AgentResult struct {
-	Status       string
-	Summary      string
-	Stdout       string
-	Stderr       string
-	ParseStatus  string
-	ChangedFiles []string
-	Commits      []string
-	Lifecycle    *lifecycle.State
+	Status                       string
+	Summary                      string
+	Stdout                       string
+	Stderr                       string
+	ParseStatus                  string
+	ChangedFiles                 []string
+	Commits                      []string
+	Lifecycle                    *lifecycle.State
+	TimeoutType                  string
+	ConfiguredIdleTimeoutSeconds int64
+	ConfiguredMaxRuntimeSeconds  int64
+	ElapsedRuntimeSeconds        int64
+	LastProgressAt               string
 }
 
 type AgentExecution interface {
@@ -354,6 +360,7 @@ type Options struct {
 	Logger                          bootstrap.Logger
 	Now                             func() time.Time
 	AgentTimeout                    time.Duration
+	AgentIdleTimeout                time.Duration
 	ClaimTTL                        time.Duration
 	ValidationCommands              []string
 	ValidationRunner                ValidationRunner
@@ -387,6 +394,7 @@ type Runner struct {
 	logger                  bootstrap.Logger
 	now                     func() time.Time
 	agentTimeout            time.Duration
+	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	validationCommands      []string
 	validationRunner        ValidationRunner
@@ -484,14 +492,19 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	Status        string           `json:"status,omitempty"`
-	Summary       string           `json:"summary,omitempty"`
-	ParseStatus   string           `json:"parseStatus,omitempty"`
-	ChangedFiles  []string         `json:"changedFiles,omitempty"`
-	Commits       []string         `json:"commits,omitempty"`
-	Lifecycle     *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	Stdout        string           `json:"stdout,omitempty"`
-	GitReconciled bool             `json:"gitReconciled,omitempty"`
+	Status                       string           `json:"status,omitempty"`
+	Summary                      string           `json:"summary,omitempty"`
+	ParseStatus                  string           `json:"parseStatus,omitempty"`
+	ChangedFiles                 []string         `json:"changedFiles,omitempty"`
+	Commits                      []string         `json:"commits,omitempty"`
+	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	Stdout                       string           `json:"stdout,omitempty"`
+	GitReconciled                bool             `json:"gitReconciled,omitempty"`
+	TimeoutType                  string           `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64            `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64            `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64            `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string           `json:"lastProgressAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -537,6 +550,15 @@ func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error 
 	}
 }
 
+func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution {
+	return &checkpointExecution{
+		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus,
+		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
+		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
+		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
+	}
+}
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -547,6 +569,10 @@ func New(options Options) *Runner {
 	agentTimeout := options.AgentTimeout
 	if agentTimeout <= 0 {
 		agentTimeout = defaultAgentTimeout
+	}
+	agentIdleTimeout := options.AgentIdleTimeout
+	if agentIdleTimeout <= 0 {
+		agentIdleTimeout = 15 * time.Minute
 	}
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
@@ -585,6 +611,7 @@ func New(options Options) *Runner {
 		logger:                  options.Logger,
 		now:                     now,
 		agentTimeout:            agentTimeout,
+		agentIdleTimeout:        agentIdleTimeout,
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
 		validationRunner:        options.ValidationRunner,
@@ -1142,7 +1169,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1154,6 +1181,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			return checkpoint, err
 		}
 		if result.Status != "completed" {
+			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
 			message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
@@ -1164,7 +1196,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
-		checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout}
+		checkpoint.Execution = checkpointExecutionFromAgentResult(result)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())

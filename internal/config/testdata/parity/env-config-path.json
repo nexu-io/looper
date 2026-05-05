@@ -32,6 +32,9 @@
           },
           "env": {
             "OPENAI_API_KEY": "test"
+          },
+          "timeouts": {
+            "reviewerSeconds": 2700
           }
         },
         "logging": {
@@ -118,6 +121,20 @@
         },
         "env": {
           "OPENAI_API_KEY": "test"
+        },
+        "timeouts": {
+          "plannerSeconds": 3600,
+          "workerSeconds": 10800,
+          "reviewerSeconds": 2700,
+          "fixerSeconds": 7200,
+          "plannerIdleTimeoutSeconds": 600,
+          "plannerMaxRuntimeSeconds": 3600,
+          "workerIdleTimeoutSeconds": 900,
+          "workerMaxRuntimeSeconds": 10800,
+          "reviewerIdleTimeoutSeconds": 600,
+          "reviewerMaxRuntimeSeconds": 2700,
+          "fixerIdleTimeoutSeconds": 600,
+          "fixerMaxRuntimeSeconds": 7200
         }
       },
       "logging": {
@@ -184,7 +201,7 @@
           "minPublishIntervalSeconds": 300,
           "maxIterationsPerPR": 20,
           "maxIterationsPerHead": 1,
-          "maxWallClockSeconds": 14400,
+          "maxWallClockSeconds": 0,
           "maxConsecutiveFailures": 3,
           "maxAgentExecutionsPerPR": 25,
           "stopOnApproved": true,

@@ -134,10 +134,27 @@ type SchedulerConfig struct {
 }
 
 type AgentConfig struct {
-	Vendor *AgentVendor      `json:"vendor,omitempty"`
-	Model  *string           `json:"model,omitempty"`
-	Params map[string]any    `json:"params"`
-	Env    map[string]string `json:"env"`
+	Vendor   *AgentVendor       `json:"vendor,omitempty"`
+	Model    *string            `json:"model,omitempty"`
+	Params   map[string]any     `json:"params"`
+	Env      map[string]string  `json:"env"`
+	Timeouts AgentTimeoutConfig `json:"timeouts"`
+}
+
+type AgentTimeoutConfig struct {
+	PlannerSeconds  int `json:"plannerSeconds"`
+	WorkerSeconds   int `json:"workerSeconds"`
+	ReviewerSeconds int `json:"reviewerSeconds"`
+	FixerSeconds    int `json:"fixerSeconds"`
+
+	PlannerIdleTimeoutSeconds  int `json:"plannerIdleTimeoutSeconds"`
+	PlannerMaxRuntimeSeconds   int `json:"plannerMaxRuntimeSeconds"`
+	WorkerIdleTimeoutSeconds   int `json:"workerIdleTimeoutSeconds"`
+	WorkerMaxRuntimeSeconds    int `json:"workerMaxRuntimeSeconds"`
+	ReviewerIdleTimeoutSeconds int `json:"reviewerIdleTimeoutSeconds"`
+	ReviewerMaxRuntimeSeconds  int `json:"reviewerMaxRuntimeSeconds"`
+	FixerIdleTimeoutSeconds    int `json:"fixerIdleTimeoutSeconds"`
+	FixerMaxRuntimeSeconds     int `json:"fixerMaxRuntimeSeconds"`
 }
 
 type NotificationConfig struct {
@@ -375,10 +392,27 @@ type PartialSchedulerConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor *AgentVendor      `json:"vendor,omitempty"`
-	Model  *string           `json:"model,omitempty"`
-	Params map[string]any    `json:"params,omitempty"`
-	Env    map[string]string `json:"env,omitempty"`
+	Vendor   *AgentVendor               `json:"vendor,omitempty"`
+	Model    *string                    `json:"model,omitempty"`
+	Params   map[string]any             `json:"params,omitempty"`
+	Env      map[string]string          `json:"env,omitempty"`
+	Timeouts *PartialAgentTimeoutConfig `json:"timeouts,omitempty"`
+}
+
+type PartialAgentTimeoutConfig struct {
+	PlannerSeconds  *int `json:"plannerSeconds,omitempty"`
+	WorkerSeconds   *int `json:"workerSeconds,omitempty"`
+	ReviewerSeconds *int `json:"reviewerSeconds,omitempty"`
+	FixerSeconds    *int `json:"fixerSeconds,omitempty"`
+
+	PlannerIdleTimeoutSeconds  *int `json:"plannerIdleTimeoutSeconds,omitempty"`
+	PlannerMaxRuntimeSeconds   *int `json:"plannerMaxRuntimeSeconds,omitempty"`
+	WorkerIdleTimeoutSeconds   *int `json:"workerIdleTimeoutSeconds,omitempty"`
+	WorkerMaxRuntimeSeconds    *int `json:"workerMaxRuntimeSeconds,omitempty"`
+	ReviewerIdleTimeoutSeconds *int `json:"reviewerIdleTimeoutSeconds,omitempty"`
+	ReviewerMaxRuntimeSeconds  *int `json:"reviewerMaxRuntimeSeconds,omitempty"`
+	FixerIdleTimeoutSeconds    *int `json:"fixerIdleTimeoutSeconds,omitempty"`
+	FixerMaxRuntimeSeconds     *int `json:"fixerMaxRuntimeSeconds,omitempty"`
 }
 
 type PartialNotificationConfig struct {

@@ -73,6 +73,21 @@ func DefaultConfig(cwd string) (Config, error) {
 		Agent: AgentConfig{
 			Params: map[string]any{},
 			Env:    map[string]string{},
+			Timeouts: AgentTimeoutConfig{
+				PlannerSeconds:  60 * 60,
+				WorkerSeconds:   3 * 60 * 60,
+				ReviewerSeconds: 90 * 60,
+				FixerSeconds:    2 * 60 * 60,
+
+				PlannerIdleTimeoutSeconds:  10 * 60,
+				PlannerMaxRuntimeSeconds:   60 * 60,
+				WorkerIdleTimeoutSeconds:   15 * 60,
+				WorkerMaxRuntimeSeconds:    3 * 60 * 60,
+				ReviewerIdleTimeoutSeconds: 10 * 60,
+				ReviewerMaxRuntimeSeconds:  90 * 60,
+				FixerIdleTimeoutSeconds:    10 * 60,
+				FixerMaxRuntimeSeconds:     2 * 60 * 60,
+			},
 		},
 		Logging: LoggingConfig{
 			Level:     LogLevelInfo,
@@ -122,7 +137,7 @@ func DefaultConfig(cwd string) (Config, error) {
 				MinPublishIntervalSeconds: 300,
 				MaxIterationsPerPR:        20,
 				MaxIterationsPerHead:      1,
-				MaxWallClockSeconds:       14400,
+				MaxWallClockSeconds:       0,
 				MaxConsecutiveFailures:    3,
 				MaxAgentExecutionsPerPR:   25,
 				StopOnApproved:            true,

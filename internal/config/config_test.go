@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
@@ -57,6 +59,10 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 		t.Fatalf("Normalize() error = %v", err)
 	}
 
+	if got := cfg.Agent.Timeouts; got.PlannerSeconds != 3600 || got.WorkerSeconds != 10800 || got.ReviewerSeconds != 5400 || got.FixerSeconds != 7200 || got.PlannerMaxRuntimeSeconds != 3600 || got.WorkerMaxRuntimeSeconds != 10800 || got.ReviewerMaxRuntimeSeconds != 5400 || got.FixerMaxRuntimeSeconds != 7200 || got.PlannerIdleTimeoutSeconds != 600 || got.WorkerIdleTimeoutSeconds != 900 || got.ReviewerIdleTimeoutSeconds != 600 || got.FixerIdleTimeoutSeconds != 600 {
+		t.Fatalf("agent timeout defaults = %#v", got)
+	}
+
 	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
 		t.Fatalf("planner role defaults = %#v", got)
 	}
@@ -68,6 +74,76 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	}
 	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
 		t.Fatalf("worker role defaults = %#v", got)
+	}
+	if got := cfg.Reviewer.Loop.MaxWallClockSeconds; got != 0 {
+		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
+	}
+}
+
+func TestAgentTimeoutConfigOverrides(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"agent": {"timeouts": {"plannerSeconds": 1200, "workerSeconds": 2400, "reviewerSeconds": 1500, "fixerSeconds": 900}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		Args:       []string{"--reviewer-agent-timeout-seconds", "2100", "--fixer-agent-timeout-seconds=1800"},
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_OSASCRIPT_ENABLED":               "false",
+			"LOOPER_AGENT_TIMEOUTS_WORKER_SECONDS":   "4200",
+			"LOOPER_AGENT_TIMEOUTS_REVIEWER_SECONDS": "3300",
+		}),
+		LookPath: fakeLookPath(map[string]string{}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	got := loaded.Config.Agent.Timeouts
+	if got.PlannerSeconds != 1200 || got.PlannerMaxRuntimeSeconds != 1200 || got.WorkerSeconds != 4200 || got.WorkerMaxRuntimeSeconds != 4200 || got.ReviewerSeconds != 2100 || got.ReviewerMaxRuntimeSeconds != 2100 || got.FixerSeconds != 1800 || got.FixerMaxRuntimeSeconds != 1800 {
+		t.Fatalf("agent timeouts = %#v", got)
+	}
+}
+
+func TestValidateRejectsInvalidAgentTimeouts(t *testing.T) {
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	cfg.Agent.Timeouts.WorkerSeconds = 0
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want ConfigValidationError", err)
+	}
+	if len(validationErr.Issues) != 1 || validationErr.Issues[0].Path != "agent.timeouts.workerSeconds" {
+		t.Fatalf("validation issues = %#v", validationErr.Issues)
+	}
+}
+
+func TestValidateRejectsAgentTimeoutDurationOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("overflow timeout value requires 64-bit int")
+	}
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	cfg.Agent.Timeouts.ReviewerSeconds = int(maxDuration/time.Second) + 1
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want ConfigValidationError", err)
+	}
+	if len(validationErr.Issues) != 1 || validationErr.Issues[0].Path != "agent.timeouts.reviewerSeconds" {
+		t.Fatalf("validation issues = %#v", validationErr.Issues)
 	}
 }
 
@@ -786,7 +862,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 		"logging": {"level": "verbose", "maxFiles": 0},
 		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
-		"reviewer": {"loop": {"quietPeriodSeconds": -1, "minPublishIntervalSeconds": -1, "maxIterationsPerPR": 0}, "scope": "wide", "publishMode": "stream"},
+		"reviewer": {"loop": {"quietPeriodSeconds": -1, "minPublishIntervalSeconds": -1, "maxIterationsPerPR": 0, "maxWallClockSeconds": -1}, "scope": "wide", "publishMode": "stream"},
 		"notifications": {"osascript": {"soundForLevels": ["ring"]}},
 		"projects": [{"id": "../../tmp", "name": "bad", "repoPath": "/repos/bad"}]
 	}`
@@ -816,6 +892,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.loop.minPublishIntervalSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.loop.maxIterationsPerPR", "must be a positive integer")
+	assertValidationIssue(t, validationErr, "reviewer.loop.maxWallClockSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
 	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")

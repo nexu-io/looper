@@ -277,6 +277,8 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "gateway-wrapped tls handshake timeout", err: &TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "net/http: TLS handshake timeout"}}}},
 		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
+		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
+		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -715,6 +717,27 @@ func TestGatewayHasReviewMarkerRejectsEventOutcomePolicyMismatch(t *testing.T) {
 		if found {
 			t.Fatalf("HasReviewMarker(%q) = true, want false for event/outcome policy mismatch", marker)
 		}
+	}
+}
+
+func TestGatewayHasReviewMarkerAllowsCleanCommentFallback(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"COMMENTED","body":"<!-- looper:review id=clean head=def outcome=clean -->"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=clean", AllowedReviewEvents: []string{"COMMENT", "APPROVE"}, AllowCleanComment: true})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true for allowed clean COMMENT fallback")
 	}
 }
 

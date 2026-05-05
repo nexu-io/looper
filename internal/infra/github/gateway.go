@@ -158,6 +158,7 @@ type VerifyReviewMarkerInput struct {
 	Marker              string
 	AllowedReviewEvents []string
 	AuthorLogin         string
+	AllowCleanComment   bool
 	CWD                 string
 }
 
@@ -866,7 +867,7 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin)
+	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin, input.AllowCleanComment)
 	if marker.Found && marker.ReviewID != "" {
 		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
 		if err != nil {
@@ -896,10 +897,10 @@ func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prN
 }
 
 func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
-	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "").Found
+	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "", false).Found
 }
 
-func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string) ReviewMarkerResult {
+func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string, allowCleanComment bool) ReviewMarkerResult {
 	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
@@ -929,14 +930,14 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 			continue
 		}
 		event := reviewEventFromStateString(row["state"])
-		if reviewMarkerEventAllowedForOutcome(parsedMarker.Outcome, event, allowedReviewEvents) {
+		if reviewMarkerEventAllowedForOutcome(parsedMarker.Outcome, event, allowedReviewEvents, allowCleanComment) {
 			newest = ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: event, AuthorLogin: author, Body: body, ReviewID: reviewIDString(row)}
 		}
 	}
 	return newest
 }
 
-func reviewMarkerEventAllowedForOutcome(outcome string, event string, allowedReviewEvents []string) bool {
+func reviewMarkerEventAllowedForOutcome(outcome string, event string, allowedReviewEvents []string, allowCleanComment bool) bool {
 	if event == "" {
 		return false
 	}
@@ -948,6 +949,9 @@ func reviewMarkerEventAllowedForOutcome(outcome string, event string, allowedRev
 	}
 	switch outcome {
 	case "clean":
+		if allowCleanComment && event == "COMMENT" {
+			return true
+		}
 		if reviewEventAllowed("APPROVE", allowedReviewEvents) {
 			return event == "APPROVE"
 		}

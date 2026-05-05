@@ -219,17 +219,23 @@ type AgentRunInput struct {
 	Prompt           string
 	WorkingDirectory string
 	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
 }
 
 type AgentResult struct {
-	Status      string
-	Summary     string
-	Stdout      string
-	Stderr      string
-	ParseStatus string
-	Lifecycle   *lifecycle.State
+	Status                       string
+	Summary                      string
+	Stdout                       string
+	Stderr                       string
+	ParseStatus                  string
+	Lifecycle                    *lifecycle.State
+	TimeoutType                  string
+	ConfiguredIdleTimeoutSeconds int64
+	ConfiguredMaxRuntimeSeconds  int64
+	ElapsedRuntimeSeconds        int64
+	LastProgressAt               string
 }
 
 type AgentExecution interface {
@@ -274,6 +280,7 @@ type Options struct {
 	Logger                  bootstrap.Logger
 	Now                     func() time.Time
 	AgentTimeout            time.Duration
+	AgentIdleTimeout        time.Duration
 	ClaimTTL                time.Duration
 	ValidationCommands      []string
 	ValidationRunner        ValidationRunner
@@ -309,6 +316,7 @@ type Runner struct {
 	logger                  bootstrap.Logger
 	now                     func() time.Time
 	agentTimeout            time.Duration
+	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	validationCommands      []string
 	validationRunner        ValidationRunner
@@ -391,12 +399,18 @@ type checkpointWorktree struct {
 }
 
 type checkpointRepair struct {
-	AgentExecutionID string           `json:"agentExecutionId,omitempty"`
-	Summary          string           `json:"summary,omitempty"`
-	HeadSHA          string           `json:"headSha,omitempty"`
-	ParseStatus      string           `json:"parseStatus,omitempty"`
-	Lifecycle        *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	CompletedAt      string           `json:"completedAt,omitempty"`
+	AgentExecutionID             string           `json:"agentExecutionId,omitempty"`
+	Summary                      string           `json:"summary,omitempty"`
+	HeadSHA                      string           `json:"headSha,omitempty"`
+	ParseStatus                  string           `json:"parseStatus,omitempty"`
+	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
+	CompletedAt                  string           `json:"completedAt,omitempty"`
+	Status                       string           `json:"status,omitempty"`
+	TimeoutType                  string           `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64            `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64            `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64            `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string           `json:"lastProgressAt,omitempty"`
 }
 
 type checkpointReconcileCommits struct {
@@ -456,6 +470,8 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+func (e *loopError) Error() string { return e.message }
+
 func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	if repair == nil {
 		return nil
@@ -469,7 +485,9 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	}
 }
 
-func (e *loopError) Error() string { return e.message }
+func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
+	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+}
 
 func New(options Options) *Runner {
 	now := options.Now
@@ -479,6 +497,10 @@ func New(options Options) *Runner {
 	agentTimeout := options.AgentTimeout
 	if agentTimeout <= 0 {
 		agentTimeout = defaultAgentTimeout
+	}
+	agentIdleTimeout := options.AgentIdleTimeout
+	if agentIdleTimeout <= 0 {
+		agentIdleTimeout = 10 * time.Minute
 	}
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
@@ -516,6 +538,7 @@ func New(options Options) *Runner {
 		logger:                  options.Logger,
 		now:                     now,
 		agentTimeout:            agentTimeout,
+		agentIdleTimeout:        agentIdleTimeout,
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
 		validationRunner:        options.ValidationRunner,
@@ -1130,7 +1153,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1144,6 +1167,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
+		checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
 		kind := FailureRetryableTransient
 		if agent.IsAgentSetupFailureMessage(message) {
@@ -1154,7 +1182,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
 	}
-	checkpoint.Repair = &checkpointRepair{AgentExecutionID: executionID, Summary: result.Summary, HeadSHA: detailHeadSHA(checkpoint.Detail), ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: r.nowISO()}
+	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
