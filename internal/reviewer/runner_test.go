@@ -4313,6 +4313,47 @@ func TestProcessClaimedItemDoesNotEmitStartedWhenReviewerAgentStartFails(t *test
 	}
 }
 
+func TestProcessClaimedItemEmitsTerminalEventWhenReviewerAgentWaitFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed"}}, waitErr: fmt.Errorf("execution transport failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed wait result", result)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundStarted := false
+	foundFailed := false
+	for _, event := range events {
+		switch event.EventType {
+		case "reviewer.agent.started":
+			foundStarted = true
+		case "reviewer.agent.failed":
+			if strings.Contains(event.PayloadJSON, `"status":"wait_error"`) && strings.Contains(event.PayloadJSON, "execution transport failed") {
+				foundFailed = true
+			}
+		}
+	}
+	if !foundStarted || !foundFailed {
+		t.Fatalf("events = %#v, want started and terminal wait-error events", events)
+	}
+}
+
 func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{})

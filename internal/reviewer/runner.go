@@ -1788,6 +1788,8 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	agentStartedAt := r.now()
 	result, err := execution.Wait(ctx)
 	if err != nil {
+		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "thread_resolution", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
+		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
 		return nil, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "thread_resolution", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
@@ -1968,6 +1970,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	result, err := execution.Wait(ctx)
 	if err != nil {
+		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
+		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
 		return checkpoint, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
@@ -2256,6 +2260,18 @@ func reviewerAgentResultPayload(result AgentResult, observedElapsed time.Duratio
 		"lastProgressAt":               result.LastProgressAt,
 		"parseStatus":                  result.ParseStatus,
 		"summary":                      firstNonEmpty(result.Summary, summarizeAgentStderr(result.Stderr)),
+	}
+}
+
+func reviewerAgentWaitErrorPayload(err error, observedElapsed time.Duration) map[string]any {
+	summary := ""
+	if err != nil {
+		summary = err.Error()
+	}
+	return map[string]any{
+		"status":                "wait_error",
+		"elapsedRuntimeSeconds": durationSeconds(observedElapsed),
+		"summary":               summary,
 	}
 }
 
