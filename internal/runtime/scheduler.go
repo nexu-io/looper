@@ -266,6 +266,10 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: detail.IssueComments, Reviews: detail.Reviews}, nil
 }
 
+func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
+	return a.gateway.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+}
+
 func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, input reviewer.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
@@ -371,6 +375,10 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 		return reviewer.AgentResult{}, err
 	}
 	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
 }
 
 type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
@@ -904,6 +912,9 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
+	if configuredPath := strings.TrimSpace(derefString(cfg.Tools.GHPath)); configuredPath != "" {
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: configuredPath, CWD: cwd})
+	}
 	if githubGateway == nil {
 		return false
 	}

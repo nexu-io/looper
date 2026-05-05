@@ -78,6 +78,8 @@ const (
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+
+	defaultHeadChangePollInterval = 15 * time.Second
 )
 
 type PullRequestSummary struct {
@@ -276,6 +278,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
@@ -322,6 +325,7 @@ type AgentResult struct {
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
+	Kill(string) error
 }
 
 type AgentExecutor interface {
@@ -365,6 +369,7 @@ type Options struct {
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
+	HeadChangePollInterval  time.Duration
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 }
 
@@ -404,6 +409,7 @@ type Runner struct {
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
+	headChangePollInterval  time.Duration
 	onAgentExecutionStarted AgentExecutionStartedFunc
 }
 
@@ -540,6 +546,10 @@ func New(options Options) *Runner {
 	if retryMax <= 0 {
 		retryMax = defaultRetryMax
 	}
+	headChangePollInterval := options.HeadChangePollInterval
+	if headChangePollInterval <= 0 {
+		headChangePollInterval = defaultHeadChangePollInterval
+	}
 	disclosureCfg := config.DefaultDisclosureConfig()
 	if options.Disclosure != nil {
 		disclosureCfg = *options.Disclosure
@@ -596,6 +606,7 @@ func New(options Options) *Runner {
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
+		headChangePollInterval:  headChangePollInterval,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 	}
 }
@@ -1940,6 +1951,69 @@ func originalThreadFeedbackCommitOID(thread ReviewThread) string {
 	return ""
 }
 
+type reviewerHeadChangeMonitor struct {
+	cancel func()
+	done   chan struct{}
+	reason chan string
+}
+
+func (m reviewerHeadChangeMonitor) stop() string {
+	if m.cancel == nil {
+		return ""
+	}
+	m.cancel()
+	<-m.done
+	select {
+	case reason := <-m.reason:
+		return reason
+	default:
+		return ""
+	}
+}
+
+func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, execution AgentExecution, executionID string) reviewerHeadChangeMonitor {
+	expectedHead := snapshotHeadSHA(checkpoint)
+	if expectedHead == "" || r.github == nil || execution == nil || r.headChangePollInterval <= 0 {
+		return reviewerHeadChangeMonitor{}
+	}
+	monitorCtx, cancel := context.WithCancel(ctx)
+	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), reason: make(chan string, 1)}
+	go func() {
+		defer close(monitor.done)
+		ticker := time.NewTicker(r.headChangePollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-ticker.C:
+				headSHA, err := r.github.GetPullRequestHeadSHA(monitorCtx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+				if err != nil {
+					if monitorCtx.Err() == nil {
+						r.logWarn("reviewer head change poll failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "error": err.Error()})
+					}
+					continue
+				}
+				if headSHA == "" || headSHA == expectedHead {
+					continue
+				}
+				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, headSHA)
+				r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.interrupted", "review", executionID, map[string]any{"headSha": expectedHead, "newHeadSha": headSHA, "reason": reason})
+				r.logInfo("reviewer agent interrupted for newer PR head", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": headSHA})
+				select {
+				case monitor.reason <- reason:
+				default:
+				}
+				if err := execution.Kill(reason); err != nil {
+					r.logWarn("reviewer agent interrupt signal failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "error": err.Error()})
+				}
+				return
+			}
+		}
+	}()
+	return monitor
+}
+
 func (r *Runner) appendThreadResolutionEvent(ctx context.Context, input stepInput, headSHA, decision, evidence, threadID, action, skippedReason string) {
 	r.appendEvent(ctx, eventInput{eventType: "reviewer.thread_resolution", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "threadId": threadID, "headSha": headSHA, "decision": decision, "evidence": evidence, "action": action, "skippedReason": skippedReason}})
 }
@@ -1988,7 +2062,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
+	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
 	result, err := execution.Wait(ctx)
+	headChangeReason := headMonitor.stop()
+	if headChangeReason != "" {
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "restart_from_discover"
+		return checkpoint, &loopError{message: headChangeReason, kind: FailureRetryableAfterResume}
+	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
