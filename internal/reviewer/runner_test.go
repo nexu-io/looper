@@ -5186,11 +5186,12 @@ func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *test
 	}
 }
 
-func TestRunThreadResolutionStepResolvesLooperThreadWhenCurrentUserNotRequested(t *testing.T) {
+func TestRunThreadResolutionStepResolvesLooperThreadWhenCurrentUserRequestNotRequired(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)
 	policy.Enabled = true
 	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = false
 	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"alice"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"objectively_fixed","evidence":"the nil check is now present","confidence":"high"}]}`}}}
 	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
@@ -5206,6 +5207,30 @@ func TestRunThreadResolutionStepResolvesLooperThreadWhenCurrentUserNotRequested(
 	}
 	if len(github.resolveThreadCalls) != 1 || github.resolveThreadCalls[0].ThreadID != "thread_1" {
 		t.Fatalf("resolveThreadCalls = %#v, want thread_1 resolved", github.resolveThreadCalls)
+	}
+}
+
+func TestRunThreadResolutionStepRechecksCurrentReviewRequestBeforeThreadAction(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = true
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"alice"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"objectively_fixed","evidence":"the nil check is now present","confidence":"high"}]}`}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+	input := threadResolutionStepInput()
+	input.Checkpoint.Detail.ReviewRequests = []string{"looper-bot"}
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Reported != 1 || checkpoint.ThreadResolution.Processed != 1 || checkpoint.ThreadResolution.Commented != 0 || checkpoint.ThreadResolution.Resolved != 0 {
+		t.Fatalf("ThreadResolution = %#v, want candidate processed but no thread action", checkpoint.ThreadResolution)
+	}
+	if len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("side effects: replies=%d resolves=%d, want none", len(github.addThreadReplyCalls), len(github.resolveThreadCalls))
 	}
 }
 

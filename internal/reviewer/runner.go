@@ -1761,6 +1761,9 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 	if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
 		return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
 	}
+	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		return nil, detail, nil
+	}
 	latest, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: limit})
 	if err != nil {
 		return nil, detail, &loopError{message: err.Error(), kind: FailureRetryableTransient}
