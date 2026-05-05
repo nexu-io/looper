@@ -113,6 +113,7 @@ type PullRequestDetail struct {
 	ChecksSummary  string
 	Diff           string
 	Comments       []map[string]any
+	IssueComments  []map[string]any
 	Reviews        []map[string]any
 }
 
@@ -209,6 +210,18 @@ type PullRequestReactionInput struct {
 	CWD      string
 }
 
+type IssueCommentInput struct {
+	Repo        string
+	IssueNumber int64
+	Body        string
+	CWD         string
+}
+
+type IssueCommentResult struct {
+	ID  int64
+	URL string
+}
+
 type PullRequestLabelsInput struct {
 	Repo     string
 	PRNumber int64
@@ -264,6 +277,7 @@ type GitHubGateway interface {
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
+	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	AddPullRequestReaction(context.Context, PullRequestReactionInput) error
 	RemovePullRequestReaction(context.Context, PullRequestReactionInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -435,6 +449,8 @@ type checkpointDetail struct {
 	HasConflicts   bool             `json:"hasConflicts,omitempty"`
 	CurrentLogin   string           `json:"currentLogin,omitempty"`
 	Reviews        []map[string]any `json:"reviews,omitempty"`
+	Comments       []map[string]any `json:"comments,omitempty"`
+	IssueComments  []map[string]any `json:"issueComments,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -1162,7 +1178,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Reviews: cloneObjectSlice(detail.Reviews)}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -1206,6 +1222,9 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Detail.HasConflicts {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "conflicted"
+		if err := r.notifyConflictedPullRequest(ctx, input, checkpoint); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
@@ -1274,6 +1293,133 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	return checkpoint, nil
+}
+
+const conflictedPRNotificationChannel = "github_pr_comment"
+
+func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) error {
+	if r.github == nil || r.repos == nil || r.repos.Notifications == nil || checkpoint.Detail == nil {
+		return nil
+	}
+	headSHA := strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	dedupeKey := fmt.Sprintf("reviewer.conflicted_pr:%s:%d:%s", input.Repo, input.PRNumber, firstNonEmpty(headSHA, "unknown"))
+	marker := conflictNoticeMarker(dedupeKey)
+	lockKey := "notification:" + dedupeKey
+	if r.repos.Locks != nil {
+		acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: lockKey, Owner: firstNonEmpty(input.Run.ID, input.QueueItem.ID, "reviewer"), Reason: stringPtr("conflicted-pr-notification"), ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(5 * time.Minute)), CreatedAt: r.nowISO(), UpdatedAt: r.nowISO()})
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			return nil
+		}
+		defer func() { _ = r.repos.Locks.Release(context.Background(), lockKey) }()
+	}
+	latest, err := r.repos.Notifications.GetLatestByDedupe(ctx, conflictedPRNotificationChannel, dedupeKey)
+	if err != nil {
+		return err
+	}
+	if latest != nil && latest.Status == "sent" {
+		return nil
+	}
+
+	nowISO := r.now().UTC().Format(time.RFC3339Nano)
+	notificationID := eventlog.NewEventID("notification")
+	if latest != nil && latest.ID != "" {
+		notificationID = latest.ID
+	}
+	body := buildConflictedPullRequestNotice(input.Repo, input.PRNumber, checkpoint.Detail.Author, checkpoint.Detail.BaseRefName, marker)
+	entityID := fmt.Sprintf("%s#%d", input.Repo, input.PRNumber)
+	title := "PR review skipped due to merge conflicts"
+	pending := storage.NotificationRecord{
+		ID:         notificationID,
+		ProjectID:  optionalString(input.Project.ID),
+		LoopID:     optionalString(input.Loop.ID),
+		RunID:      optionalString(input.Run.ID),
+		EntityType: stringPtr("pull_request"),
+		EntityID:   &entityID,
+		Channel:    conflictedPRNotificationChannel,
+		Level:      "action_required",
+		Title:      title,
+		Subtitle:   &entityID,
+		Body:       body,
+		Status:     "pending",
+		DedupeKey:  &dedupeKey,
+		CreatedAt:  firstNonEmpty(latestCreatedAt(latest), nowISO),
+		UpdatedAt:  nowISO,
+	}
+	if err := r.repos.Notifications.Upsert(ctx, pending); err != nil {
+		return err
+	}
+	if conflictNoticeAlreadyPosted(checkpoint.Detail.IssueComments, marker) {
+		payload, _ := json.Marshal(map[string]any{"dedupedBy": "existing_comment", "headSha": headSHA})
+		sentAt := r.now().UTC().Format(time.RFC3339Nano)
+		sent := pending
+		sent.Status = "sent"
+		sent.PayloadJSON = optionalString(string(payload))
+		sent.SentAt = &sentAt
+		sent.UpdatedAt = sentAt
+		return r.repos.Notifications.Upsert(ctx, sent)
+	}
+
+	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+	if err != nil {
+		failed := pending
+		failed.Status = "failed"
+		failed.ErrorMessage = optionalString(err.Error())
+		failed.UpdatedAt = r.now().UTC().Format(time.RFC3339Nano)
+		_ = r.repos.Notifications.Upsert(ctx, failed)
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{"commentId": comment.ID, "commentUrl": comment.URL, "headSha": headSHA})
+	sentAt := r.now().UTC().Format(time.RFC3339Nano)
+	sent := pending
+	sent.Status = "sent"
+	sent.PayloadJSON = optionalString(string(payload))
+	sent.SentAt = &sentAt
+	sent.UpdatedAt = sentAt
+	if err := r.repos.Notifications.Upsert(ctx, sent); err != nil {
+		r.logWarn("conflicted pull request notification status update failed after posting comment", map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "headSha": headSHA, "error": err.Error()})
+	}
+	return nil
+}
+
+func buildConflictedPullRequestNotice(repo string, prNumber int64, author string, baseRefName string, marker string) string {
+	author = strings.TrimPrefix(strings.TrimSpace(author), "@")
+	mention := "PR author"
+	if author != "" {
+		mention = "@" + author
+	}
+	base := strings.TrimSpace(baseRefName)
+	if base == "" {
+		base = "the base branch"
+	}
+	return fmt.Sprintf("%s I couldn't generate review comments for %s#%d because this pull request currently has merge conflicts.\n\nPlease resolve the conflicts with %s, push the updated branch, and then request or wait for the review to run again.\n\n%s", mention, repo, prNumber, base, marker)
+}
+
+func conflictNoticeMarker(dedupeKey string) string {
+	sum := sha256.Sum256([]byte(dedupeKey))
+	return fmt.Sprintf("<!-- looper:conflict-notice id=%s -->", hex.EncodeToString(sum[:])[:16])
+}
+
+func conflictNoticeAlreadyPosted(comments []map[string]any, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	for _, comment := range comments {
+		body, _ := stringFromAny(comment["body"])
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func latestCreatedAt(record *storage.NotificationRecord) string {
+	if record == nil {
+		return ""
+	}
+	return record.CreatedAt
 }
 
 func (r *Runner) runClaimStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {

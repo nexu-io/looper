@@ -81,6 +81,7 @@ type PullRequestDetail struct {
 	ReviewRequests []string
 	HasConflicts   bool
 	Comments       []map[string]any
+	IssueComments  []map[string]any
 	Reviews        []map[string]any
 	Checks         []map[string]any
 }
@@ -605,6 +606,7 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
 		HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
 		Comments:       threads,
+		IssueComments:  toObjectSlice(row["comments"]),
 		Reviews:        toObjectSlice(row["reviews"]),
 		Checks:         toObjectSlice(row["statusCheckRollup"]),
 	}, nil
