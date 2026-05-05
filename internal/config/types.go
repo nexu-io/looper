@@ -32,6 +32,14 @@ const (
 	DaemonModeLaunchd    DaemonMode = "launchd"
 )
 
+type DaemonRestartPolicy string
+
+const (
+	DaemonRestartNever     DaemonRestartPolicy = "never"
+	DaemonRestartOnFailure DaemonRestartPolicy = "on-failure"
+	DaemonRestartAlways    DaemonRestartPolicy = "always"
+)
+
 type OpenPRStrategy string
 
 const (
@@ -197,12 +205,14 @@ const (
 )
 
 type DaemonConfig struct {
-	Mode              DaemonMode        `json:"mode"`
-	PlistPath         *string           `json:"plistPath,omitempty"`
-	LogDir            string            `json:"logDir"`
-	ShutdownTimeoutMS int               `json:"shutdownTimeoutMs"`
-	WorkingDirectory  string            `json:"workingDirectory"`
-	Environment       map[string]string `json:"environment"`
+	Mode                   DaemonMode          `json:"mode"`
+	RestartPolicy          DaemonRestartPolicy `json:"restartPolicy"`
+	RestartThrottleSeconds int                 `json:"restartThrottleSeconds"`
+	PlistPath              *string             `json:"plistPath,omitempty"`
+	LogDir                 string              `json:"logDir"`
+	ShutdownTimeoutMS      int                 `json:"shutdownTimeoutMs"`
+	WorkingDirectory       string              `json:"workingDirectory"`
+	Environment            map[string]string   `json:"environment"`
 }
 
 type PackageConfig struct {
@@ -421,12 +431,14 @@ type PartialToolPathsConfig struct {
 }
 
 type PartialDaemonConfig struct {
-	Mode              *DaemonMode       `json:"mode,omitempty"`
-	PlistPath         *string           `json:"plistPath,omitempty"`
-	LogDir            *string           `json:"logDir,omitempty"`
-	ShutdownTimeoutMS *int              `json:"shutdownTimeoutMs,omitempty"`
-	WorkingDirectory  *string           `json:"workingDirectory,omitempty"`
-	Environment       map[string]string `json:"environment,omitempty"`
+	Mode                   *DaemonMode          `json:"mode,omitempty"`
+	RestartPolicy          *DaemonRestartPolicy `json:"restartPolicy,omitempty"`
+	RestartThrottleSeconds *int                 `json:"restartThrottleSeconds,omitempty"`
+	PlistPath              *string              `json:"plistPath,omitempty"`
+	LogDir                 *string              `json:"logDir,omitempty"`
+	ShutdownTimeoutMS      *int                 `json:"shutdownTimeoutMs,omitempty"`
+	WorkingDirectory       *string              `json:"workingDirectory,omitempty"`
+	Environment            map[string]string    `json:"environment,omitempty"`
 }
 
 type PartialPackageConfig struct {

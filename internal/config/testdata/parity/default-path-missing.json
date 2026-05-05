@@ -75,6 +75,8 @@
       },
       "daemon": {
         "mode": "foreground",
+        "restartPolicy": "on-failure",
+        "restartThrottleSeconds": 10,
         "logDir": "__TMP__/runtime-logs",
         "workingDirectory": "__TMP__/runtime",
         "environment": {}

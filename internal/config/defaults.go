@@ -93,11 +93,13 @@ func DefaultConfig(cwd string) (Config, error) {
 		Disclosure: DefaultDisclosureConfig(),
 		Tools:      ToolPathsConfig{},
 		Daemon: DaemonConfig{
-			Mode:              DaemonModeForeground,
-			LogDir:            logDir,
-			ShutdownTimeoutMS: 1000,
-			WorkingDirectory:  cwd,
-			Environment:       map[string]string{},
+			Mode:                   DaemonModeForeground,
+			RestartPolicy:          DaemonRestartOnFailure,
+			RestartThrottleSeconds: 10,
+			LogDir:                 logDir,
+			ShutdownTimeoutMS:      1000,
+			WorkingDirectory:       cwd,
+			Environment:            map[string]string{},
 		},
 		Package: PackageConfig{
 			Distribution:               "github-release",

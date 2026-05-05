@@ -137,6 +137,8 @@
       },
       "daemon": {
         "mode": "foreground",
+        "restartPolicy": "on-failure",
+        "restartThrottleSeconds": 10,
         "logDir": "__TMP__/env-logs",
         "workingDirectory": "__TMP__/workspace",
         "environment": {

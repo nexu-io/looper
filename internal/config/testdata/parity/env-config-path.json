@@ -155,6 +155,8 @@
       },
       "daemon": {
         "mode": "launchd",
+        "restartPolicy": "on-failure",
+        "restartThrottleSeconds": 10,
         "logDir": "__TMP__/launchd-logs",
         "workingDirectory": "__TMP__/launchd-workdir",
         "environment": {

@@ -239,6 +239,25 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			daemonMode := DaemonMode(value)
 			ensureDaemonConfig(&parsed.overrides).Mode = &daemonMode
 			index = nextIndex
+		case matchesFlag(arg, "--daemon-restart-policy"):
+			value, nextIndex, err := takeValue(index, "--daemon-restart-policy")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			policy := DaemonRestartPolicy(value)
+			ensureDaemonConfig(&parsed.overrides).RestartPolicy = &policy
+			index = nextIndex
+		case matchesFlag(arg, "--daemon-restart-throttle-seconds"):
+			value, nextIndex, err := takeValue(index, "--daemon-restart-throttle-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --daemon-restart-throttle-seconds: %q is not an integer", value)
+			}
+			ensureDaemonConfig(&parsed.overrides).RestartThrottleSeconds = parsedValue
+			index = nextIndex
 		case matchesFlag(arg, "--git-path"):
 			value, nextIndex, err := takeValue(index, "--git-path")
 			if err != nil {
@@ -477,6 +496,17 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	if value, ok := lookupEnv("LOOPER_DAEMON_MODE"); ok {
 		daemonMode := DaemonMode(value)
 		ensureDaemonConfig(&overrides).Mode = &daemonMode
+	}
+	if value, ok := lookupEnv("LOOPER_DAEMON_RESTART_POLICY"); ok {
+		policy := DaemonRestartPolicy(value)
+		ensureDaemonConfig(&overrides).RestartPolicy = &policy
+	}
+	if value, ok := lookupEnv("LOOPER_DAEMON_RESTART_THROTTLE_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_DAEMON_RESTART_THROTTLE_SECONDS: %q is not an integer", value)
+		}
+		ensureDaemonConfig(&overrides).RestartThrottleSeconds = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_WORKING_DIRECTORY"); ok {
 		ensureDaemonConfig(&overrides).WorkingDirectory = stringPtr(value)

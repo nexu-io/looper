@@ -872,6 +872,68 @@ func TestValidateAllowsLegacyProjectIDsForUpgradeCompatibility(t *testing.T) {
 	}
 }
 
+func TestValidateDaemonSupervisionConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mutate    func(*Config)
+		wantPath  string
+		wantError string
+	}{
+		{
+			name: "valid launchd restart policy",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.Mode = DaemonModeLaunchd
+				cfg.Daemon.RestartPolicy = DaemonRestartAlways
+				cfg.Daemon.RestartThrottleSeconds = 30
+			},
+		},
+		{
+			name: "invalid restart policy",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.RestartPolicy = DaemonRestartPolicy("sometimes")
+			},
+			wantPath:  "daemon.restartPolicy",
+			wantError: "must be one of: never, on-failure, always",
+		},
+		{
+			name: "invalid throttle",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.RestartThrottleSeconds = 0
+			},
+			wantPath:  "daemon.restartThrottleSeconds",
+			wantError: "must be a positive integer",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			tt.mutate(&cfg)
+			err = Validate(cfg)
+			if tt.wantPath == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() error = nil, want validation error")
+			}
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, tt.wantPath, tt.wantError)
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
 	config, err := DefaultConfig(t.TempDir())
 	if err != nil {

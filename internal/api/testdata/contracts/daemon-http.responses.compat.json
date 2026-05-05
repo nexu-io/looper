@@ -202,6 +202,8 @@
           },
           "daemon": {
             "mode": "foreground",
+            "restartPolicy": "on-failure",
+            "restartThrottleSeconds": 10,
             "logDir": "<tmp-root>/logs",
             "workingDirectory": "<tmp-root>",
             "environment": {}

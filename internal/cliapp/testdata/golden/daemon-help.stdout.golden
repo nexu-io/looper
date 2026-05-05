@@ -13,10 +13,13 @@ Flags:
   --force                     Overwrite existing installed daemon binary
   --full                      Show all retained daemon log lines, including rotated log files
   --lines <count>             Line count
+  --startup                   Show daemon startup logs instead of main logs
 
 Global Flags:
   --config <path>             Config path
   --daemon-mode <mode>        Daemon mode
+  --daemon-restart-policy <policy> Daemon supervisor restart policy: never, on-failure, or always
+  --daemon-restart-throttle-seconds <seconds> Daemon supervisor restart throttle
   --db-path <path>            Database path
   --fix-all-pull-requests <bool> Allow fixer to inspect and fix PRs created by any author
   --gh-path <path>            GitHub CLI path

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/config"
 	pkgapi "github.com/powerformer/looper/pkg/api"
 )
 
@@ -93,11 +94,13 @@ func TestDaemonStatusJSONUsesAPIVersionAndBinaryPath(t *testing.T) {
 	defer server.Close()
 
 	configPath := writeDaemonCLIConfig(t, server.URL)
+	homeDir := t.TempDir()
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
 			_ = command
@@ -136,8 +139,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 		args    []string
 		cwd     string
 	}{}
-	var wrotePath string
-	var wroteBody string
+	writes := map[string]string{}
 	var mkdirPath string
 	killCalls := make([]struct {
 		pid    int
@@ -193,8 +195,7 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 		},
 		WriteFile: func(path string, data []byte, perm os.FileMode) error {
 			_ = perm
-			wrotePath = path
-			wroteBody = string(data)
+			writes[path] = string(data)
 			return nil
 		},
 		Sleep: func(duration time.Duration) {
@@ -221,17 +222,120 @@ func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	if got, want := mkdirPath, filepath.Join(homeDir, ".looper"); got != want {
 		t.Fatalf("mkdirPath = %q, want %q", got, want)
 	}
-	if got, want := wrotePath, filepath.Join(homeDir, ".looper", "looperd.pid"); got != want {
-		t.Fatalf("wrotePath = %q, want %q", got, want)
+	pidPath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	if writes[pidPath] != "4321\n" {
+		t.Fatalf("pid write = %q, want %q", writes[pidPath], "4321\n")
 	}
-	if wroteBody != "4321\n" {
-		t.Fatalf("wroteBody = %q, want %q", wroteBody, "4321\n")
+	statePath := filepath.Join(homeDir, ".looper", "looperd.state.json")
+	if !strings.Contains(writes[statePath], `"mode": "foreground"`) || !strings.Contains(writes[statePath], `"pid": 4321`) {
+		t.Fatalf("state write = %q, want foreground state with pid", writes[statePath])
 	}
 	if len(killCalls) != 2 || killCalls[0].pid != 4321 || killCalls[0].signal != 0 || killCalls[1].pid != 4321 || killCalls[1].signal != 0 {
 		t.Fatalf("killCalls = %#v, want readiness liveness probes for pid 4321", killCalls)
 	}
 	if !strings.Contains(stdout.String(), "Started looperd") {
 		t.Fatalf("stdout = %q, want start confirmation", stdout.String())
+	}
+}
+
+func TestDaemonLifecycleStateReadWriteAndStaleDetection(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	statePath := filepath.Join(homeDir, ".looper", "looperd.state.json")
+	startedAt := time.Date(2026, 5, 2, 10, 15, 30, 0, time.UTC)
+	app := New(Deps{
+		HomeDir: homeDir,
+		KillProcess: func(pid int, signal int) error {
+			_ = signal
+			if pid == 9999 {
+				return os.ErrProcessDone
+			}
+			return nil
+		},
+	})
+	runtime := newCommandRuntime(app, nil)
+	state := daemonLifecycleState{Mode: "foreground", PID: 9999, StartedAt: &startedAt, BinaryPath: "/tmp/looperd", Logs: daemonLifecycleLogState{Main: "/tmp/looperd.log"}}
+	if err := runtime.writeDaemonLifecycleState(statePath, state); err != nil {
+		t.Fatalf("writeDaemonLifecycleState() error = %v", err)
+	}
+	readState, err := runtime.readDaemonLifecycleState(statePath)
+	if err != nil {
+		t.Fatalf("readDaemonLifecycleState() error = %v", err)
+	}
+	if readState.SchemaVersion != daemonStateSchemaVersion || readState.PID != 9999 || readState.BinaryPath != "/tmp/looperd" {
+		t.Fatalf("read state = %#v, want persisted schema/pid/binary", readState)
+	}
+
+	loaded := writeDaemonCLIConfig(t, "http://daemon.test")
+	status, err := runtime.daemonLifecycleStatus(context.Background(), mustLoadConfig(t, loaded))
+	if err != nil {
+		t.Fatalf("daemonLifecycleStatus() error = %v", err)
+	}
+	if status.Process != "exited" || !status.StaleState || status.State.LastExit == nil || !strings.Contains(status.State.LastExit.Reason, "no longer running") {
+		t.Fatalf("status = %#v, want inferred stale exit", status)
+	}
+}
+
+func TestGenerateLaunchdPlistRestartPolicyMapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		policy     string
+		want       string
+		wantAbsent string
+	}{
+		{name: "never", policy: "never", wantAbsent: "<key>KeepAlive</key>"},
+		{name: "on failure", policy: "on-failure", want: "<key>SuccessfulExit</key>\n\t\t<false/>"},
+		{name: "always", policy: "always", want: "<key>KeepAlive</key>\n\t<true/>"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			plist, err := generateLaunchdPlist(launchdPlistConfig{Label: launchdLooperdLabel, ProgramArguments: []string{"/bin/looperd", "--config", "/tmp/config.json"}, WorkingDirectory: "/tmp", Environment: map[string]string{"LOOPER_CONFIG": "/tmp/config.json"}, RunAtLoad: true, RestartPolicy: config.DaemonRestartPolicy(tt.policy), RestartThrottleSeconds: 10, StandardOutPath: "/tmp/stdout.log", StandardErrorPath: "/tmp/stderr.log"})
+			if err != nil {
+				t.Fatalf("generateLaunchdPlist() error = %v", err)
+			}
+			got := string(plist)
+			for _, want := range []string{"<key>Label</key>", launchdLooperdLabel, "<key>ProgramArguments</key>", "<key>RunAtLoad</key>", "<key>ThrottleInterval</key>", "<integer>10</integer>", "<key>StandardOutPath</key>", "<key>StandardErrorPath</key>"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("plist missing %q:\n%s", want, got)
+				}
+			}
+			if tt.want != "" && !strings.Contains(got, tt.want) {
+				t.Fatalf("plist missing policy mapping %q:\n%s", tt.want, got)
+			}
+			if tt.wantAbsent != "" && strings.Contains(got, tt.wantAbsent) {
+				t.Fatalf("plist contains %q unexpectedly:\n%s", tt.wantAbsent, got)
+			}
+		})
+	}
+}
+
+func TestDaemonStartLaunchdUnsupportedPlatform(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeDaemonCLIConfig(t, "http://daemon.test")
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: homeDir, Platform: "linux", HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, os.ErrNotExist })}, RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		if command == managedPath && strings.Join(args, " ") == "--version" {
+			return commandExecutionResult{Stdout: "0.6.0\n", ExitCode: 0}, nil
+		}
+		return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+	}})
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--daemon-mode", "launchd", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([daemon start --daemon-mode launchd]) exit code = 0, want error")
+	}
+	if !strings.Contains(stderr.String(), "only supported on macOS") {
+		t.Fatalf("stderr = %q, want unsupported platform guidance", stderr.String())
 	}
 }
 
@@ -607,7 +711,7 @@ func TestDaemonStartStalePIDFileUsesReachableLooperdAPI(t *testing.T) {
 	}
 }
 
-func TestDaemonStartAliveNonLooperdPIDFileUsesReachableLooperdAPI(t *testing.T) {
+func TestDaemonStartAliveNonLooperdPIDFileFailsEvenWithReachableLooperdAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -620,7 +724,6 @@ func TestDaemonStartAliveNonLooperdPIDFileUsesReachableLooperdAPI(t *testing.T) 
 	configPath := writeDaemonCLIConfigForBindEndpoint(t, server.URL, nil)
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	removed := false
 	app := New(Deps{
 		Stdout:  stdout,
 		Stderr:  stderr,
@@ -645,12 +748,7 @@ func TestDaemonStartAliveNonLooperdPIDFileUsesReachableLooperdAPI(t *testing.T) 
 			}
 			return nil
 		},
-		RemoveFile: func(path string) error {
-			if path == pidFilePath {
-				removed = true
-			}
-			return nil
-		},
+		RemoveFile: func(path string) error { return nil },
 		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
 			t.Fatal("SpawnDetached() called, want existing API reused")
 			return 0, nil
@@ -658,17 +756,11 @@ func TestDaemonStartAliveNonLooperdPIDFileUsesReachableLooperdAPI(t *testing.T) 
 	})
 
 	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", configPath})
-	if exitCode != 0 {
-		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	if exitCode == 0 {
+		t.Fatal("Run([daemon start]) exit code = 0, want non-zero")
 	}
-	if !removed {
-		t.Fatal("stale pid file pointing at alive non-looperd process was not removed")
-	}
-	if !strings.Contains(stdout.String(), "pid file points to non-looperd pid 9876") || !strings.Contains(stdout.String(), server.URL) {
-		t.Fatalf("stdout = %q, want already running message with URL and non-looperd pid", stdout.String())
-	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	if !strings.Contains(stderr.String(), "alive non-looperd process 9876") {
+		t.Fatalf("stderr = %q, want non-looperd pid refusal", stderr.String())
 	}
 }
 
@@ -925,7 +1017,12 @@ func TestDaemonStartReadinessTimeoutTerminatesSpawnedProcessAndRemovesPIDFile(t 
 			return nil
 		},
 		WriteFile: func(path string, data []byte, perm os.FileMode) error {
-			t.Fatalf("WriteFile(%q) called, want readiness failure before pid file write", path)
+			if !strings.HasSuffix(path, "looperd.state.json") {
+				t.Fatalf("WriteFile(%q) called, want only lifecycle failure state write", path)
+			}
+			if !strings.Contains(string(data), "detached looperd exited or failed readiness during startup") {
+				t.Fatalf("state write = %s, want startup failure diagnostics", string(data))
+			}
 			return nil
 		},
 		Sleep: func(duration time.Duration) {},
@@ -1408,6 +1505,15 @@ func writeDaemonCLIConfig(t *testing.T, baseURL string) string {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}
 	return configPath
+}
+
+func mustLoadConfig(t *testing.T, path string) config.LoadedFileConfig {
+	t.Helper()
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", path}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	return loaded
 }
 
 func writeDaemonCLIConfigForBindEndpoint(t *testing.T, bindURL string, baseURL *string) string {

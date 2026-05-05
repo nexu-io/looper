@@ -630,11 +630,13 @@ type configServerResponse struct {
 }
 
 type configDaemonResponse struct {
-	Mode             config.DaemonMode `json:"mode"`
-	PlistPath        *string           `json:"plistPath,omitempty"`
-	LogDir           string            `json:"logDir"`
-	WorkingDirectory string            `json:"workingDirectory"`
-	Environment      map[string]string `json:"environment"`
+	Mode                   config.DaemonMode          `json:"mode"`
+	RestartPolicy          config.DaemonRestartPolicy `json:"restartPolicy"`
+	RestartThrottleSeconds int                        `json:"restartThrottleSeconds"`
+	PlistPath              *string                    `json:"plistPath,omitempty"`
+	LogDir                 string                     `json:"logDir"`
+	WorkingDirectory       string                     `json:"workingDirectory"`
+	Environment            map[string]string          `json:"environment"`
 }
 
 func (h *Handler) buildConfigResponse() configResponse {
@@ -655,11 +657,13 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Notifications: cfg.Notifications,
 		Tools:         cfg.Tools,
 		Daemon: configDaemonResponse{
-			Mode:             cfg.Daemon.Mode,
-			PlistPath:        cfg.Daemon.PlistPath,
-			LogDir:           cfg.Daemon.LogDir,
-			WorkingDirectory: cfg.Daemon.WorkingDirectory,
-			Environment:      cfg.Daemon.Environment,
+			Mode:                   cfg.Daemon.Mode,
+			RestartPolicy:          cfg.Daemon.RestartPolicy,
+			RestartThrottleSeconds: cfg.Daemon.RestartThrottleSeconds,
+			PlistPath:              cfg.Daemon.PlistPath,
+			LogDir:                 cfg.Daemon.LogDir,
+			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
+			Environment:            cfg.Daemon.Environment,
 		},
 		Package:  cfg.Package,
 		Defaults: cfg.Defaults,

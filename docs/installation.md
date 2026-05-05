@@ -67,7 +67,40 @@ Manual fallback:
 
 Daemon lookup order is fixed to `~/.looper/bin/looperd`, then `$PATH`.
 
-`looper daemon start` writes a pid file and launches the daemon, but it does not provide full background supervision.
+By default, `looper daemon start` launches `looperd` detached and prints `started detached, not supervised`. Detached mode writes `~/.looper/looperd.pid` and `~/.looper/looperd.state.json`, but it does not restart after crashes, logout, or reboot.
+
+### Supervised daemon mode on macOS
+
+For actively supervised `looperd` lifecycle management on macOS, use the user LaunchAgent mode:
+
+```bash
+looper daemon start --daemon-mode launchd
+looper daemon status
+looper daemon status --json
+looper daemon logs
+```
+
+Launchd mode:
+
+- creates a user LaunchAgent plist at `~/Library/LaunchAgents/com.powerformer.looper.looperd.plist` unless `daemon.plistPath` is set
+- stores launchd stdout/stderr logs under `~/.looper/logs/launchd/`
+- stores startup logs under `~/.looper/logs/startup/`
+- stores lifecycle state in `~/.looper/looperd.state.json`
+- maps `daemon.restartPolicy` to launchd `KeepAlive` behavior
+- uses `daemon.restartThrottleSeconds` as the launchd `ThrottleInterval`
+- may recover after login/system restart when launchd loads the user agent
+
+Supported restart policies are `never`, `on-failure`, and `always`; the default is `on-failure` with a 10 second throttle. Linux/systemd supervision is not implemented yet; on unsupported platforms, `--daemon-mode launchd` returns an actionable error instead of silently falling back.
+
+Troubleshooting commands:
+
+```bash
+looper daemon status
+looper daemon status --json
+looper daemon logs --startup
+```
+
+Status output distinguishes detached mode from launchd-supervised mode and includes PID, start time, supervisor, restart policy, stale/exited state, last error/reason, and log locations.
 
 ## Verify the install
 

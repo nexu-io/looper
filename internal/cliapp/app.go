@@ -186,6 +186,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
 					boolFlag("full", "Show all retained daemon log lines, including rotated log files"),
+					boolFlag("startup", "Show daemon startup logs instead of main logs"),
 					boolFlag("force", "Overwrite existing installed daemon binary"),
 				},
 				exampleLines: []string{
@@ -580,6 +581,8 @@ func globalFlags() []flagSpec {
 		stringFlag("db-path", "path", "Database path"),
 		stringFlag("log-dir", "path", "Daemon log directory"),
 		stringFlag("daemon-mode", "mode", "Daemon mode"),
+		stringFlag("daemon-restart-policy", "policy", "Daemon supervisor restart policy: never, on-failure, or always"),
+		stringFlag("daemon-restart-throttle-seconds", "seconds", "Daemon supervisor restart throttle"),
 		stringFlag("git-path", "path", "Git binary path"),
 		stringFlag("gh-path", "path", "GitHub CLI path"),
 		stringFlag("looper-path", "path", "Looper CLI path"),
@@ -643,6 +646,8 @@ var configFlagNames = map[string]struct{}{
 	"db-path":                               {},
 	"log-dir":                               {},
 	"daemon-mode":                           {},
+	"daemon-restart-policy":                 {},
+	"daemon-restart-throttle-seconds":       {},
 	"git-path":                              {},
 	"gh-path":                               {},
 	"looper-path":                           {},

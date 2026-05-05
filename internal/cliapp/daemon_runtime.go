@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -47,15 +48,20 @@ type daemonVersionState struct {
 }
 
 type daemonStatusOutput struct {
-	Mode                config.DaemonMode `json:"mode"`
-	ConfigPath          string            `json:"configPath"`
-	LogDir              string            `json:"logDir"`
-	APIReachable        bool              `json:"apiReachable"`
-	DaemonVersion       *string           `json:"daemonVersion"`
-	DaemonVersionSource *string           `json:"daemonVersionSource"`
-	DaemonBinaryPath    *string           `json:"daemonBinaryPath"`
-	Status              json.RawMessage   `json:"status"`
-	Health              json.RawMessage   `json:"health"`
+	Mode                   config.DaemonMode          `json:"mode"`
+	ConfiguredMode         config.DaemonMode          `json:"configuredMode"`
+	RunningMode            *config.DaemonMode         `json:"runningMode,omitempty"`
+	RestartPolicy          config.DaemonRestartPolicy `json:"restartPolicy"`
+	RestartThrottleSeconds int                        `json:"restartThrottleSeconds"`
+	ConfigPath             string                     `json:"configPath"`
+	LogDir                 string                     `json:"logDir"`
+	APIReachable           bool                       `json:"apiReachable"`
+	DaemonVersion          *string                    `json:"daemonVersion"`
+	DaemonVersionSource    *string                    `json:"daemonVersionSource"`
+	DaemonBinaryPath       *string                    `json:"daemonBinaryPath"`
+	Lifecycle              daemonLifecycleStatus      `json:"lifecycle"`
+	Status                 json.RawMessage            `json:"status"`
+	Health                 json.RawMessage            `json:"health"`
 }
 
 type daemonLogsOutput struct {
@@ -88,14 +94,26 @@ func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	lifecycle, err := r.daemonLifecycleStatus(cmd.Context(), loaded)
+	if err != nil {
+		return err
+	}
 
 	output := daemonStatusOutput{
-		Mode:         loaded.Config.Daemon.Mode,
-		ConfigPath:   loaded.Metadata.ConfigPath,
-		LogDir:       loaded.Config.Daemon.LogDir,
-		APIReachable: apiReachable,
-		Status:       statusPayload,
-		Health:       healthPayload,
+		Mode:                   loaded.Config.Daemon.Mode,
+		ConfiguredMode:         loaded.Config.Daemon.Mode,
+		RestartPolicy:          loaded.Config.Daemon.RestartPolicy,
+		RestartThrottleSeconds: loaded.Config.Daemon.RestartThrottleSeconds,
+		ConfigPath:             loaded.Metadata.ConfigPath,
+		LogDir:                 loaded.Config.Daemon.LogDir,
+		APIReachable:           apiReachable,
+		Lifecycle:              lifecycle,
+		Status:                 statusPayload,
+		Health:                 healthPayload,
+	}
+	if lifecycle.State != nil && lifecycle.Process == "running" {
+		runningMode := lifecycle.State.Mode
+		output.RunningMode = &runningMode
 	}
 	if versionState != nil {
 		output.DaemonVersion = &versionState.Version
@@ -120,6 +138,70 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	}
 	client := r.localAPIClientFromLoaded(loaded)
 	apiURL := client.baseURL
+	if !r.skipAPIStartProbe {
+		lifecycle, err := r.daemonLifecycleStatus(ctx, loaded)
+		if err != nil {
+			return err
+		}
+		if lifecycle.Process == "running" {
+			if lifecycle.State != nil && lifecycle.State.Mode != loaded.Config.Daemon.Mode {
+				return fmt.Errorf("looperd is already running in %s mode; refusing to start %s mode. Stop the existing daemon first with `looper daemon stop`", lifecycle.State.Mode, loaded.Config.Daemon.Mode)
+			}
+			if lifecycle.State != nil {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd already appears to be running in %s mode (pid %d)\n", lifecycle.State.Mode, lifecycle.State.PID); err != nil {
+					return err
+				}
+				return nil
+			}
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), "looperd already appears to be running from an existing pid file"); err != nil {
+				return err
+			}
+			return nil
+		}
+		if lifecycle.Process == "not-looperd" {
+			pid := 0
+			if lifecycle.State != nil {
+				pid = lifecycle.State.PID
+			} else if filePID, ok := r.readPIDFile(lifecycle.PIDPath); ok {
+				pid = filePID
+			}
+			return fmt.Errorf("daemon lifecycle state or pid file points to alive non-looperd process %d; refusing to start %s mode", pid, loaded.Config.Daemon.Mode)
+		}
+	}
+
+	if loaded.Config.Daemon.Mode == config.DaemonModeLaunchd {
+		if !r.skipAPIStartProbe {
+			probe, err := r.probeDaemonStatus(ctx, client)
+			if err != nil {
+				return err
+			}
+			if probe.isLooperd {
+				return fmt.Errorf("looperd already appears to be serving %s but is not recorded as launchd-supervised; stop the existing daemon before starting launchd supervision", apiURL)
+			}
+		}
+		binary, err := r.resolveDaemonBinary(ctx)
+		if err != nil {
+			return err
+		}
+		env := os.Environ()
+		extractedArgs := ExtractConfigArgs(r.argv)
+		callerCWD, err := r.daemonSpawnCallerCWD(extractedArgs, env)
+		if err != nil {
+			return err
+		}
+		forwardedArgs := normalizeForwardedConfigPathArgs(extractedArgs, callerCWD)
+		cwd := loaded.Config.Daemon.WorkingDirectory
+		if strings.TrimSpace(callerCWD) == "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			callerCWD, err = r.getwd()
+			if err != nil {
+				return fmt.Errorf("resolve current working directory for launchd WorkingDirectory: %w", err)
+			}
+		}
+		if strings.TrimSpace(callerCWD) != "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(callerCWD, cwd)
+		}
+		return r.startLaunchdDaemon(ctx, cmd.OutOrStdout(), loaded, binary, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD), client, apiURL)
+	}
 
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
 	if err != nil {
@@ -216,6 +298,11 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 			_ = r.killProcess(pid, int(syscall.SIGTERM))
 		}
 		r.removePIDFile(pidFilePath)
+		if statePath, stateErr := r.resolveDaemonStatePath(); stateErr == nil {
+			now := time.Now().UTC()
+			state := daemonLifecycleState{SchemaVersion: daemonStateSchemaVersion, Mode: config.DaemonModeForeground, PID: pid, StartedAt: &now, BinaryPath: binary.Path, Logs: daemonLogState(loaded), LastExit: &daemonLifecycleExitState{At: now, Reason: "detached looperd exited or failed readiness during startup", LogPath: startupLogPath}, LastError: err.Error()}
+			_ = r.writeDaemonLifecycleState(statePath, state)
+		}
 		return err
 	}
 
@@ -225,17 +312,29 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	if err := r.writeFile(pidFilePath, []byte(fmt.Sprintf("%d\n", pid)), 0o644); err != nil {
 		return fmt.Errorf("write daemon pid file: %w", err)
 	}
+	statePath, err := r.resolveDaemonStatePath()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	state := daemonLifecycleState{SchemaVersion: daemonStateSchemaVersion, Mode: config.DaemonModeForeground, PID: pid, StartedAt: &now, BinaryPath: binary.Path, Logs: daemonLogState(loaded)}
+	if err := r.writeDaemonLifecycleState(statePath, state); err != nil {
+		return fmt.Errorf("write daemon lifecycle state: %w", err)
+	}
 
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Started looperd (%s) with pid %d\n", binary.Path, pid); err != nil {
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Started looperd detached, not supervised (%s) with pid %d\n", binary.Path, pid); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "PID file: %s\n", pidFilePath); err != nil {
 		return err
 	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "State file: %s\n", statePath); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Startup log: %s\n", startupLogPath); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Phase 1 process management is minimal and does not provide full background supervision.")
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Detached mode does not restart after crashes or system reboot. Use --daemon-mode launchd on macOS for supervised lifecycle management.")
 	return err
 }
 
@@ -397,6 +496,22 @@ func (r *commandRuntime) daemonStop(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, startIfMissing bool) (bool, error) {
+	statePath, err := r.resolveDaemonStatePath()
+	if err != nil {
+		return false, err
+	}
+	state, err := r.readDaemonLifecycleState(statePath)
+	if err != nil {
+		return false, err
+	}
+	if state != nil && state.Mode == config.DaemonModeLaunchd {
+		loaded, err := r.loadConfig()
+		if err != nil {
+			return false, err
+		}
+		return r.stopLaunchdDaemon(ctx, out, loaded, startIfMissing)
+	}
+
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
 	if err != nil {
 		return false, err
@@ -404,6 +519,10 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 
 	existingPID, ok := r.readPIDFile(pidFilePath)
 	if !ok {
+		loaded, loadErr := r.loadConfig()
+		if loadErr == nil && loaded.Config.Daemon.Mode == config.DaemonModeLaunchd {
+			return r.stopLaunchdDaemon(ctx, out, loaded, startIfMissing)
+		}
 		if startIfMissing {
 			if _, err := fmt.Fprintln(out, "No daemon pid file found; starting daemon."); err != nil {
 				return false, err
@@ -453,6 +572,12 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 		return false, err
 	}
 	r.removePIDFile(pidFilePath)
+	if state != nil {
+		now := time.Now().UTC()
+		state.LastExit = &daemonLifecycleExitState{At: now, Reason: "stopped by looper daemon stop", LogPath: state.Logs.Main}
+		state.PID = 0
+		_ = r.writeDaemonLifecycleState(statePath, *state)
+	}
 	if _, err := fmt.Fprintf(out, "Stopped looperd pid %d\n", existingPID); err != nil {
 		return false, err
 	}
@@ -481,7 +606,14 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	logPath := filepath.Join(loaded.Config.Daemon.LogDir, "looperd.log")
-	content, logPaths, err := r.readRetainedDaemonLogs(logPath, loaded.Config.Logging.MaxFiles)
+	var content string
+	var logPaths []string
+	if getBoolFlag(cmd, "startup") {
+		logPath = filepath.Join(loaded.Config.Daemon.LogDir, "startup")
+		content, logPaths, err = r.readStartupDaemonLogs(logPath)
+	} else {
+		content, logPaths, err = r.readRetainedDaemonLogs(logPath, loaded.Config.Logging.MaxFiles)
+	}
 	if err != nil {
 		return err
 	}
@@ -504,6 +636,41 @@ func (r *commandRuntime) daemonLogs(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+func (r *commandRuntime) readStartupDaemonLogs(startupDir string) (string, []string, error) {
+	paths, err := filepath.Glob(filepath.Join(startupDir, "looperd-*.log"))
+	if err != nil {
+		return "", nil, err
+	}
+	if len(paths) == 0 {
+		return "", nil, os.ErrNotExist
+	}
+	sort.Strings(paths)
+	if len(paths) > 10 {
+		paths = paths[len(paths)-10:]
+	}
+	var builder strings.Builder
+	readPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		raw, err := r.readFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", nil, err
+		}
+		if builder.Len() > 0 && !strings.HasSuffix(builder.String(), "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(strings.TrimRight(string(raw), "\n"))
+		builder.WriteString("\n")
+		readPaths = append(readPaths, path)
+	}
+	if len(readPaths) == 0 {
+		return "", nil, os.ErrNotExist
+	}
+	return strings.TrimRight(builder.String(), "\n"), readPaths, nil
 }
 
 func (r *commandRuntime) readRetainedDaemonLogs(logPath string, maxFiles int) (string, []string, error) {
@@ -687,7 +854,22 @@ func (r *commandRuntime) createStartupLogPath(loaded config.LoadedFileConfig) (s
 	if err := r.mkdirAll(startupLogDir, 0o700); err != nil {
 		return "", fmt.Errorf("create daemon startup log directory: %w", err)
 	}
+	r.pruneStartupLogs(startupLogDir, loaded.Config.Logging.MaxFiles*2)
 	return filepath.Join(startupLogDir, fmt.Sprintf("looperd-%s.log", time.Now().UTC().Format("20060102T150405.000000000Z"))), nil
+}
+
+func (r *commandRuntime) pruneStartupLogs(startupLogDir string, keep int) {
+	if keep < 1 {
+		keep = 10
+	}
+	paths, err := filepath.Glob(filepath.Join(startupLogDir, "looperd-*.log"))
+	if err != nil || len(paths) <= keep {
+		return
+	}
+	sort.Strings(paths)
+	for _, path := range paths[:len(paths)-keep] {
+		_ = r.removeFile(path)
+	}
 }
 
 func (r *commandRuntime) waitForDaemonReady(ctx context.Context, client *DaemonAPIClient, pid int, startupLogPath string, apiURL string, timeout time.Duration, interval time.Duration) error {
@@ -1136,8 +1318,31 @@ func tailLines(content string, count int) []string {
 }
 
 func writeHumanDaemonStatus(w io.Writer, payload daemonStatusOutput) error {
-	entries := [][2]any{{"mode", payload.Mode}, {"configPath", payload.ConfigPath}, {"logDir", payload.LogDir}, {"apiReachable", payload.APIReachable}, {"daemonVersion", payload.DaemonVersion}, {"daemonVersionSource", payload.DaemonVersionSource}, {"daemonBinaryPath", payload.DaemonBinaryPath}}
+	entries := [][2]any{{"configuredMode", payload.ConfiguredMode}, {"runningMode", payload.RunningMode}, {"restartPolicy", payload.RestartPolicy}, {"restartThrottleSeconds", payload.RestartThrottleSeconds}, {"configPath", payload.ConfigPath}, {"logDir", payload.LogDir}, {"apiReachable", payload.APIReachable}, {"daemonVersion", payload.DaemonVersion}, {"daemonVersionSource", payload.DaemonVersionSource}, {"daemonBinaryPath", payload.DaemonBinaryPath}}
+	if payload.ConfiguredMode == config.DaemonModeForeground {
+		entries = append(entries, [2]any{"restartBehavior", "not supervised; detached mode does not restart after crashes or reboot"})
+	}
 	printSection(w, "Daemon", entries)
+	if payload.Lifecycle.StatePath != "" {
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		lifecycleEntries := [][2]any{{"process", payload.Lifecycle.Process}, {"statePath", payload.Lifecycle.StatePath}, {"pidPath", payload.Lifecycle.PIDPath}, {"staleState", payload.Lifecycle.StaleState}}
+		if state := payload.Lifecycle.State; state != nil {
+			lifecycleEntries = append(lifecycleEntries, [2]any{"pid", state.PID}, [2]any{"startedAt", state.StartedAt}, [2]any{"binaryPath", state.BinaryPath})
+			if state.Supervisor != nil {
+				lifecycleEntries = append(lifecycleEntries, [2]any{"supervisor", state.Supervisor.Source}, [2]any{"supervisorLabel", state.Supervisor.Label}, [2]any{"plistPath", state.Supervisor.PlistPath})
+			}
+			lifecycleEntries = append(lifecycleEntries, [2]any{"logMain", state.Logs.Main}, [2]any{"logStartupDir", state.Logs.StartupDir}, [2]any{"logStdout", state.Logs.Stdout}, [2]any{"logStderr", state.Logs.Stderr})
+			if state.LastExit != nil {
+				lifecycleEntries = append(lifecycleEntries, [2]any{"lastExitAt", state.LastExit.At}, [2]any{"lastExitReason", state.LastExit.Reason}, [2]any{"lastExitLog", state.LastExit.LogPath})
+			}
+			if state.LastError != "" {
+				lifecycleEntries = append(lifecycleEntries, [2]any{"lastError", state.LastError})
+			}
+		}
+		printSection(w, "Lifecycle", lifecycleEntries)
+	}
 
 	if !payload.APIReachable {
 		return nil

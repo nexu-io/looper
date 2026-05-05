@@ -112,6 +112,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
 	}
 
+	if !isValidDaemonRestartPolicy(config.Daemon.RestartPolicy) {
+		issues = append(issues, ValidationIssue{Path: "daemon.restartPolicy", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways)})
+	}
+
+	if config.Daemon.RestartThrottleSeconds < 1 {
+		issues = append(issues, ValidationIssue{Path: "daemon.restartThrottleSeconds", Message: "must be a positive integer"})
+	}
+
 	if config.Daemon.LogDir == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.logDir", Message: "must be a non-empty path"})
 	}
@@ -507,6 +515,15 @@ func isValidAuthMode(mode AuthMode) bool {
 func isValidDaemonMode(mode DaemonMode) bool {
 	switch mode {
 	case DaemonModeForeground, DaemonModeLaunchd:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidDaemonRestartPolicy(policy DaemonRestartPolicy) bool {
+	switch policy {
+	case DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways:
 		return true
 	default:
 		return false

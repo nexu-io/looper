@@ -265,6 +265,14 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 		config.Mode = *partial.Mode
 	}
 
+	if partial.RestartPolicy != nil {
+		config.RestartPolicy = *partial.RestartPolicy
+	}
+
+	if partial.RestartThrottleSeconds != nil {
+		config.RestartThrottleSeconds = *partial.RestartThrottleSeconds
+	}
+
 	if partial.PlistPath != nil {
 		config.PlistPath = stringPtr(*partial.PlistPath)
 	}

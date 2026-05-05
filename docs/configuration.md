@@ -9,6 +9,7 @@ For the default supported macOS install flow:
 - `looper` is installed from a GitHub Release Go binary
 - `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
 - `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
+- `looper daemon start` writes lifecycle diagnostics to `~/.looper/looperd.state.json`
 
 The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
@@ -120,6 +121,8 @@ Example minimal `~/.looper/config.json`:
   },
   "daemon": {
     "mode": "foreground",
+    "restartPolicy": "on-failure",
+    "restartThrottleSeconds": 10,
     "logDir": "/Users/you/.looper/logs",
     "workingDirectory": "/absolute/path/to/where/you/start/looperd",
     "environment": {
@@ -207,6 +210,33 @@ Example minimal `~/.looper/config.json`:
 }
 ```
 
+## Daemon supervision
+
+Supervision applies only to the `looperd` daemon lifecycle. Looper does not supervise arbitrary user commands or agent subprocesses.
+
+`daemon.mode` controls how `looper daemon start` manages `looperd`:
+
+- `foreground` (default): starts `looperd` as a detached background process. This mode writes `~/.looper/looperd.pid` and `~/.looper/looperd.state.json`, but it is not actively supervised and will not automatically restart after a crash, logout, or reboot.
+- `launchd`: on macOS, installs and bootstraps a user LaunchAgent for `looperd`. This mode can restart according to `daemon.restartPolicy` and can start again at login through launchd. On non-macOS platforms it returns an actionable unsupported-platform error.
+
+Restart options:
+
+- `daemon.restartPolicy`: `never`, `on-failure`, or `always` (default `on-failure`). For launchd, `on-failure` maps to `KeepAlive` with unsuccessful-exit semantics, and `always` maps to `KeepAlive=true`.
+- `daemon.restartThrottleSeconds`: positive integer throttle passed to the supervisor to avoid tight crash loops (default `10`).
+- `daemon.plistPath`: optional macOS LaunchAgent plist path. If omitted, Looper uses `~/Library/LaunchAgents/com.powerformer.looper.looperd.plist`.
+
+Runtime diagnostics are discoverable from `looper daemon status` and `looper daemon status --json`:
+
+- state file: `~/.looper/looperd.state.json`
+- compatibility pid file: `~/.looper/looperd.pid`
+- main daemon log: `~/.looper/logs/looperd.log`
+- startup logs: `~/.looper/logs/startup/`
+- launchd stdout/stderr logs: `~/.looper/logs/launchd/looperd.stdout.log` and `~/.looper/logs/launchd/looperd.stderr.log`
+
+`looper daemon status` reports mode, PID, start time, supervisor source, restart policy, stale/exited process detection, last exit reason when known or inferred, and log paths. Some abnormal exits, such as SIGKILL, OOM, or reboot, cannot be recorded by the exiting process; the next status command infers them from stale state/PID records.
+
+Use `looper daemon logs` for the main retained daemon log and `looper daemon logs --startup` for recent startup logs.
+
 ## Field reference
 
 ### `server`
@@ -291,16 +321,21 @@ If these are omitted, `looperd` tries to detect them from `PATH`. Startup valida
 ### `daemon`
 
 - `mode`: `foreground` or `launchd`
+- `restartPolicy`: `never`, `on-failure`, or `always`; applies to supervised modes such as `launchd`
+- `restartThrottleSeconds`: positive supervisor restart throttle in seconds
+- `plistPath`: optional macOS user LaunchAgent plist path for `launchd` mode
 - `logDir`: daemon log directory
 - `shutdownTimeoutMs`: graceful shutdown timeout in milliseconds
 - `workingDirectory`: working directory used by the daemon
 - `environment`: reserved daemon environment map; currently part of the config surface, but not a primary user-facing runtime control in the documented flow
 
-Current packaged install and CLI management flows use `foreground` as the primary documented path. `launchd` remains part of the configuration surface, but it is not the primary documented install flow.
+`foreground` starts a detached process only and does not survive crashes or reboot. `launchd` is the supported supervised mode on macOS; unsupported platforms return an actionable error instead of silently falling back.
 
 Defaults:
 
 - `mode`: `foreground`
+- `restartPolicy`: `on-failure`
+- `restartThrottleSeconds`: `10`
 - `logDir`: `~/.looper/logs`
 - `shutdownTimeoutMs`: `1000`
 - `workingDirectory`: current working directory when config is loaded
@@ -507,6 +542,8 @@ Supported environment overrides:
 - `LOOPER_DB_PATH`
 - `LOOPER_LOG_DIR`
 - `LOOPER_DAEMON_MODE`
+- `LOOPER_DAEMON_RESTART_POLICY`
+- `LOOPER_DAEMON_RESTART_THROTTLE_SECONDS`
 - `LOOPER_WORKING_DIRECTORY`
 - `LOOPER_GIT_PATH`
 - `LOOPER_GH_PATH`
@@ -574,6 +611,8 @@ Supported `looperd` flags:
 - `--db-path`
 - `--log-dir`
 - `--daemon-mode`
+- `--daemon-restart-policy`
+- `--daemon-restart-throttle-seconds`
 - `--git-path`
 - `--gh-path`
 - `--osascript-path`
