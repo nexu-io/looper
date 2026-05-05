@@ -2184,7 +2184,7 @@ func TestProcessClaimedItemSkipsCleanNoopWhenReviewRequestRemovedBeforePublish(t
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverWhenCleanNoopHeadChangesBeforePublish(t *testing.T) {
+func TestProcessClaimedItemMarksCleanNoopStaleWhenHeadChangesBeforePublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{changeHeadOnSecondView: true, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
@@ -2212,22 +2212,70 @@ func TestProcessClaimedItemRestartsFromDiscoverWhenCleanNoopHeadChangesBeforePub
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed before publish") {
-		t.Fatalf("result = %#v, want standard retryable head-change failure", result)
+	if result.Status != "skipped" || !contains(result.Summary, "PR head changed before publish") {
+		t.Fatalf("result = %#v, want stale head-change skip", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(ctx, result.LoopID)
 	if err != nil || latestRun == nil {
-		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
+	}
+	if latestRun.Status != "success" {
+		t.Fatalf("latestRun.Status = %q, want success for stale skip", latestRun.Status)
 	}
 	if !contains(derefString(latestRun.Summary), "PR head changed before publish") {
 		t.Fatalf("Summary = %q, want standard head-change message", derefString(latestRun.Summary))
 	}
-	resumed, err := runner.createRunContext(ctx, loop)
-	if err != nil {
-		t.Fatalf("createRunContext() error = %v", err)
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
 	}
-	if resumed.StartStep != stepDiscover {
-		t.Fatalf("StartStep = %q, want discover", resumed.StartStep)
+}
+
+func TestProcessClaimedItemMarksStaleWhenPullRequestStateDriftsBeforePublish(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		observed  string
+		wantInMsg string
+	}{
+		{name: "merged", observed: "MERGED", wantInMsg: "observed MERGED"},
+		{name: "closed", observed: "CLOSED", wantInMsg: "observed CLOSED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{viewStateAfterFirstView: tc.observed, reviewRequests: []string{"octocat"}}
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Found actionable issue", Stdout: `__LOOPER_RESULT__={"summary":"Found actionable issue"}`, ParseStatus: "parsed"}}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+
+			if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+			}
+
+			result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if result.Status != "skipped" || !contains(result.Summary, "PR drift detected before publish") || !contains(result.Summary, tc.wantInMsg) {
+				t.Fatalf("result = %#v, want stale PR state drift skip", result)
+			}
+			if github.reviewMarkerCalls != 0 {
+				t.Fatalf("reviewMarkerCalls = %d, want no publish verification after state drift", github.reviewMarkerCalls)
+			}
+			latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+			if err != nil || latestRun == nil {
+				t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
+			}
+			checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+			if checkpoint.SkipKind != "stale" || !contains(checkpoint.SkipReason, tc.wantInMsg) {
+				t.Fatalf("checkpoint = %#v, want stale reason containing %q", checkpoint, tc.wantInMsg)
+			}
+		})
 	}
 }
 
@@ -3353,7 +3401,7 @@ func TestProcessClaimedItemAgentNativeReviewCompletesWithoutPublishRetry(t *test
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *testing.T) {
+func TestProcessClaimedItemMarksStaleWhenHeadChangesBeforePublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{changeHeadOnSecondView: true}
@@ -3371,8 +3419,8 @@ func TestProcessClaimedItemRestartsFromDiscoverWhenHeadChangesBeforePublish(t *t
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableAfterResume || !contains(firstResult.Summary, "PR head changed before publish") {
-		t.Fatalf("first result = %#v, want retryable head-change failure", firstResult)
+	if firstResult.Status != "skipped" || !contains(firstResult.Summary, "PR head changed before publish") {
+		t.Fatalf("first result = %#v, want stale head-change skip", firstResult)
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("agent starts=%d, want 1", len(agent.starts))
@@ -4292,7 +4340,7 @@ func TestShouldRestartFromDiscoverForThreadResolutionHeadChange(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverOnHeadChangeSignal(t *testing.T) {
+func TestProcessClaimedItemMarksStaleOnHeadChangeSignal(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{changeHeadOnSecondView: true}
@@ -4310,31 +4358,20 @@ func TestProcessClaimedItemRestartsFromDiscoverOnHeadChangeSignal(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed before publish") {
-		t.Fatalf("result = %#v, want structured head-change retry", result)
+	if result.Status != "skipped" || !contains(result.Summary, "PR head changed before publish") {
+		t.Fatalf("result = %#v, want stale head-change skip", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
 	if err != nil || latestRun == nil {
-		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy != "restart_from_discover" {
-		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
-	}
-	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
-	}
-	resumed, err := runner.createRunContext(context.Background(), *loop)
-	if err != nil {
-		t.Fatalf("createRunContext() error = %v", err)
-	}
-	if resumed.StartStep != stepDiscover {
-		t.Fatalf("StartStep = %q, want discover", resumed.StartStep)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverOnReviewRequestSignal(t *testing.T) {
+func TestProcessClaimedItemMarksStaleOnReviewRequestSignal(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{removeReviewRequestOnSecondView: true, reviewMarkerMissing: true}
@@ -4352,20 +4389,20 @@ func TestProcessClaimedItemRestartsFromDiscoverOnReviewRequestSignal(t *testing.
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "review request removed before publish") {
-		t.Fatalf("result = %#v, want structured review-request retry", result)
+	if result.Status != "skipped" || !contains(result.Summary, "review request removed before publish") {
+		t.Fatalf("result = %#v, want stale review-request skip", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
 	if err != nil || latestRun == nil {
-		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy != "restart_from_discover" {
-		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedReviewRequestGuardrail(t *testing.T) {
+func TestProcessClaimedItemMarksStaleOnUnparsedReviewRequestGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewMarkerMissing: true}
@@ -4383,16 +4420,16 @@ func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedReviewRequestGuardrail(
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "review request removed before publish") {
-		t.Fatalf("result = %#v, want structured review-request retry", result)
+	if result.Status != "skipped" || !contains(result.Summary, "review request removed before publish") {
+		t.Fatalf("result = %#v, want stale review-request skip", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
 	if err != nil || latestRun == nil {
-		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy != "restart_from_discover" {
-		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
 	}
 }
 
@@ -4459,7 +4496,7 @@ func TestRunReviewStepIgnoresUnparsedReviewRequestGuardrailForManualLoop(t *test
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedHeadChangeGuardrail(t *testing.T) {
+func TestProcessClaimedItemMarksStaleOnUnparsedHeadChangeGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewMarkerMissing: true}
@@ -4477,16 +4514,16 @@ func TestProcessClaimedItemRestartsFromDiscoverOnUnparsedHeadChangeGuardrail(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed before publish") {
-		t.Fatalf("result = %#v, want structured head-change retry", result)
+	if result.Status != "skipped" || !contains(result.Summary, "PR head changed before publish") {
+		t.Fatalf("result = %#v, want stale head-change skip", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
 	if err != nil || latestRun == nil {
-		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want failed run", latestRun, err)
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy != "restart_from_discover" {
-		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
 	}
 }
 
@@ -4778,6 +4815,7 @@ type fakeGitHubGateway struct {
 	reviewMarkerCalls               int
 	viewDraft                       bool
 	viewState                       string
+	viewStateAfterFirstView         string
 	addReactionErr                  error
 	removeReactionErr               error
 	addLabelErr                     error
@@ -4838,6 +4876,9 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 		comments = g.commentsAfterFirstView
 	}
 	state := g.viewState
+	if g.viewStateAfterFirstView != "" && g.viewCalls > 1 {
+		state = g.viewStateAfterFirstView
+	}
 	if state == "" {
 		state = "OPEN"
 	}
