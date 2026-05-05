@@ -307,6 +307,82 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 	}
 }
 
+func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	argsPath := filepath.Join(scriptDir, "args.txt")
+	scriptPath := filepath.Join(scriptDir, "mock-codex")
+	script := "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$ARGS_PATH\"\ncase \"$*\" in *resume*) printf '%s\n' 'failed to resume work: missing session token' >&2; exit 2;; esac\nprintf '%s\n' '__LOOPER_RESULT__={\"summary\":\"checkpoint\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_attached_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "failed" || result.Summary != "failed to resume work: missing session token" {
+		t.Fatalf("result = %#v, want native resume failure without checkpoint fallback", result)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resume_attached_failed")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "native_resume" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "failed" {
+		t.Fatalf("native resume metadata = mode:%#v status:%#v, want native resume failed", record.NativeResumeMode, record.NativeResumeStatus)
+	}
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(argsPath) error = %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
+	if len(lines) != 1 || lines[0] != "exec resume codex-session-1 continue work" {
+		t.Fatalf("spawned args = %#v, want only native resume invocation", lines)
+	}
+}
+
 func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {
 	t.Parallel()
 

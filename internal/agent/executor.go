@@ -527,7 +527,7 @@ func (x *execution) run(ctx context.Context) {
 		LastProgressAt:               lastProgressAt,
 		PID:                          pidOrZero(x.process.Process),
 	}
-	if x.shouldFallbackNativeResume(status) {
+	if x.shouldFallbackNativeResume(status, stdout, stderr) {
 		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
 			result = fallbackResult
 			status = fallbackResult.Status
@@ -566,9 +566,38 @@ func (x *execution) run(ctx context.Context) {
 	x.doneCh <- execOutcome{result: result, err: nil}
 }
 
-func (x *execution) shouldFallbackNativeResume(status string) bool {
+func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
 	_, mode, resumeStatus, _ := x.nativeResumeSnapshot()
-	return mode == "native_resume" && resumeStatus == "started" && status == "failed"
+	return mode == "native_resume" && resumeStatus == "started" && status == "failed" && isNativeResumeAttachFailure(stdout, stderr)
+}
+
+func isNativeResumeAttachFailure(stdout string, stderr string) bool {
+	if strings.TrimSpace(stdout) != "" {
+		return false
+	}
+	message := strings.TrimSpace(stderr)
+	if message == "" {
+		return false
+	}
+	for _, line := range strings.Split(message, "\n") {
+		line = normalizeNativeResumeErrorLine(line)
+		switch {
+		case line == "resume failed" || strings.HasPrefix(line, "resume failed:"):
+			return true
+		case strings.HasPrefix(line, "failed to resume session") || strings.HasPrefix(line, "could not resume session") || strings.HasPrefix(line, "cannot resume session"):
+			return true
+		case strings.HasPrefix(line, "failed to resume conversation") || strings.HasPrefix(line, "could not resume conversation") || strings.HasPrefix(line, "cannot resume conversation"):
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeNativeResumeErrorLine(line string) string {
+	line = strings.ToLower(strings.TrimSpace(line))
+	line = strings.TrimPrefix(line, "error:")
+	line = strings.TrimPrefix(strings.TrimSpace(line), "fatal:")
+	return strings.TrimSpace(line)
 }
 
 func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
