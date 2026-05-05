@@ -3979,6 +3979,55 @@ func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *te
 	}
 }
 
+func TestProcessClaimedItemClassifiesReviewerTimeoutWithDiagnostics(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "timeout", Summary: "processed 900 files before timeout", TimeoutType: "max_runtime", ConfiguredMaxRuntimeSeconds: 5400, ConfiguredIdleTimeoutSeconds: 600, ElapsedRuntimeSeconds: 5400, LastProgressAt: "2026-04-11T12:45:00.000Z"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable timeout failure", result)
+	}
+	for _, want := range []string{"timed out (max_runtime)", "configured max runtime 5400s", "idle timeout 600s", "last progress at 2026-04-11T12:45:00.000Z", "processed 900 files"} {
+		if !strings.Contains(result.Summary, want) {
+			t.Fatalf("result.Summary = %q, want %q", result.Summary, want)
+		}
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundTimeoutEvent := false
+	for _, event := range events {
+		if event.EventType == "reviewer.agent.timed_out" && strings.Contains(event.PayloadJSON, `"timeoutType":"max_runtime"`) && strings.Contains(event.PayloadJSON, `"elapsedRuntimeSeconds":5400`) {
+			foundTimeoutEvent = true
+		}
+	}
+	if !foundTimeoutEvent {
+		t.Fatalf("events = %#v, want reviewer.agent.timed_out diagnostics", events)
+	}
+}
+
+func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{})
+	if runner.agentTimeout != 90*time.Minute {
+		t.Fatalf("agentTimeout = %s, want 90m", runner.agentTimeout)
+	}
+}
+
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 

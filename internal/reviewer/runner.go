@@ -74,7 +74,7 @@ const (
 )
 
 const (
-	defaultAgentTimeout = 30 * time.Minute
+	defaultAgentTimeout = 90 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
@@ -1009,13 +1009,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
 	for _, step := range stepsFrom(resumedRun.StartStep) {
+		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
 		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
+		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
@@ -1041,9 +1043,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
-			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep)}})
+			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
-			r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "failureKind": string(failure.kind), "summary": failure.message})
+			r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
 			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
@@ -1095,7 +1097,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			return ProcessResult{}, err
 		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
+		stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
+		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "elapsedSeconds": stepElapsedSeconds}})
+		r.logInfo("reviewer step completed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "step": string(step), "elapsedSeconds": stepElapsedSeconds})
 		if checkpoint.SkipReason != "" {
 			break
 		}
@@ -1594,7 +1598,10 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	}
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
+	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "thread_resolution", executionID, map[string]any{"promptBytes": len(prompt), "threadCount": len(threads), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout)})
+	agentStartedAt := r.now()
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return nil, err
 	}
@@ -1602,8 +1609,10 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if err != nil {
 		return nil, err
 	}
+	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "thread_resolution", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
+	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
 	if result.Status != "completed" {
-		return nil, &loopError{message: firstNonEmpty(result.Summary, result.Stderr, "thread resolution classifier failed"), kind: FailureRetryableTransient}
+		return nil, &loopError{message: reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed"), kind: FailureRetryableTransient}
 	}
 	parsed, err := parseThreadResolutionOutput(result.Stdout)
 	if err != nil {
@@ -1762,6 +1771,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
+	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "review", executionID, map[string]any{"promptBytes": len(prompt), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout), "scope": string(r.scope), "headSha": checkpoint.Snapshot.HeadSHA})
+	agentStartedAt := r.now()
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
@@ -1778,6 +1789,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, err
 	}
+	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
+	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
 	if result.Status != "completed" {
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
 			checkpoint.ResumePolicy = "restart_from_discover"
@@ -1794,7 +1807,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "restart_from_discover"
 			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
 		}
-		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Reviewer agent %s", result.Status))
+		message := reviewerAgentFailureMessage("review", result, fmt.Sprintf("Reviewer agent %s", result.Status))
 		kind := FailureRetryableTransient
 		if agent.IsAgentSetupFailureMessage(message) {
 			kind = FailureManualIntervention
@@ -1982,6 +1995,88 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
 	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON)), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
+}
+
+func (r *Runner) appendReviewerAgentEvent(ctx context.Context, input stepInput, eventType, phase, executionID string, payload map[string]any) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["repo"] = input.Repo
+	payload["prNumber"] = input.PRNumber
+	payload["phase"] = phase
+	payload["executionId"] = executionID
+	r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: payload})
+}
+
+func reviewerAgentTerminalEvent(result AgentResult) string {
+	if result.Status == "timeout" {
+		return "reviewer.agent.timed_out"
+	}
+	return "reviewer.agent.completed"
+}
+
+func reviewerAgentResultPayload(result AgentResult, observedElapsed time.Duration) map[string]any {
+	return map[string]any{
+		"status":                       result.Status,
+		"timeoutType":                  result.TimeoutType,
+		"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
+		"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
+		"elapsedRuntimeSeconds":        elapsedSeconds(result, observedElapsed),
+		"lastProgressAt":               result.LastProgressAt,
+		"parseStatus":                  result.ParseStatus,
+		"summary":                      firstNonEmpty(result.Summary, summarizeAgentStderr(result.Stderr)),
+	}
+}
+
+func reviewerAgentFailureMessage(phase string, result AgentResult, fallback string) string {
+	base := firstNonEmpty(result.Summary, result.Stderr, fallback)
+	if result.Status != "timeout" {
+		return base
+	}
+	timeoutType := result.TimeoutType
+	if timeoutType == "" {
+		timeoutType = "unknown"
+	}
+	parts := []string{fmt.Sprintf("Reviewer %s agent timed out (%s)", phase, timeoutType)}
+	if result.ElapsedRuntimeSeconds > 0 {
+		parts = append(parts, fmt.Sprintf("after %ds", result.ElapsedRuntimeSeconds))
+	}
+	if result.ConfiguredMaxRuntimeSeconds > 0 || result.ConfiguredIdleTimeoutSeconds > 0 {
+		parts = append(parts, fmt.Sprintf("configured max runtime %ds, idle timeout %ds", result.ConfiguredMaxRuntimeSeconds, result.ConfiguredIdleTimeoutSeconds))
+	}
+	if result.LastProgressAt != "" {
+		parts = append(parts, "last progress at "+result.LastProgressAt)
+	}
+	if base != "" {
+		parts = append(parts, "summary: "+base)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func summarizeAgentStderr(stderr string) string {
+	stderr = strings.TrimSpace(stderr)
+	if len(stderr) <= 240 {
+		return stderr
+	}
+	return strings.TrimSpace(stderr[:240]) + "…"
+}
+
+func elapsedSeconds(result AgentResult, observedElapsed time.Duration) int64 {
+	if result.ElapsedRuntimeSeconds > 0 {
+		return result.ElapsedRuntimeSeconds
+	}
+	return durationSeconds(observedElapsed)
+}
+
+func durationSeconds(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	seconds := int64(duration / time.Second)
+	if seconds == 0 {
+		return 1
+	}
+	return seconds
 }
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
