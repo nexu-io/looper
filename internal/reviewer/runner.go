@@ -1428,7 +1428,7 @@ func buildConflictedPullRequestNotice(repo string, prNumber int64, author string
 	if base == "" {
 		base = "the base branch"
 	}
-	return fmt.Sprintf("%s I couldn't generate review comments for %s#%d because this pull request currently has merge conflicts.\n\nPlease resolve the conflicts with %s, push the updated branch, and then request or wait for the review to run again.\n\n%s", mention, repo, prNumber, base, marker)
+	return fmt.Sprintf("%s I'm holding off on generating review comments for %s#%d because this pull request has merge conflicts right now.\n\nPlease resolve the conflicts with %s and push the updated branch. Once that's done, request or wait for the review to run again and I'll take another look.\n\n%s", mention, repo, prNumber, base, marker)
 }
 
 func conflictNoticeMarker(dedupeKey string) string {

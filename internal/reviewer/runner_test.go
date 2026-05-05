@@ -911,7 +911,7 @@ func TestRunFilterStepSkipsConflictedPullRequest(t *testing.T) {
 		t.Fatalf("issue comment calls = %d, want 1", len(github.issueCommentCalls))
 	}
 	body := github.issueCommentCalls[0].Body
-	for _, want := range []string{"@octocat", "acme/looper#42", "merge conflicts", "resolve the conflicts with main"} {
+	for _, want := range []string{"@octocat", "I'm holding off on generating review comments", "acme/looper#42", "merge conflicts", "resolve the conflicts with main", "I'll take another look"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("issue comment body = %q, want to contain %q", body, want)
 		}
