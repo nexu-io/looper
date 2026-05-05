@@ -2010,9 +2010,6 @@ func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, 
 		if checkpoint.Detail.IsDraft != detail.IsDraft {
 			return fmt.Sprintf("PR drift detected before publish: draft status changed from %t to %t for %s#%d", checkpoint.Detail.IsDraft, detail.IsDraft, input.Repo, input.PRNumber)
 		}
-		if checkpoint.Detail.BaseSHA != "" && detail.BaseSHA != "" && checkpoint.Detail.BaseSHA != detail.BaseSHA {
-			return fmt.Sprintf("PR base changed before publish: expected %s, got %s", checkpoint.Detail.BaseSHA, detail.BaseSHA)
-		}
 		if checkpoint.Detail.BaseRefName != "" && detail.BaseRefName != "" && checkpoint.Detail.BaseRefName != detail.BaseRefName {
 			return fmt.Sprintf("PR base branch changed before publish: expected %s, got %s", checkpoint.Detail.BaseRefName, detail.BaseRefName)
 		}
