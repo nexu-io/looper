@@ -71,8 +71,9 @@ func DefaultConfig(cwd string) (Config, error) {
 			RetryBaseDelayMS:    5000,
 		},
 		Agent: AgentConfig{
-			Params: map[string]any{},
-			Env:    map[string]string{},
+			Params:       map[string]any{},
+			Env:          map[string]string{},
+			NativeResume: AgentNativeResumeConfig{Enabled: true},
 			Timeouts: AgentTimeoutConfig{
 				PlannerSeconds:  60 * 60,
 				WorkerSeconds:   3 * 60 * 60,

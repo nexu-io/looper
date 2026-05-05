@@ -745,10 +745,11 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
-			Vendor: *cfg.Agent.Vendor,
-			Model:  cfg.Agent.Model,
-			Params: cfg.Agent.Params,
-			Env:    cfg.Agent.Env,
+			Vendor:              *cfg.Agent.Vendor,
+			Model:               cfg.Agent.Model,
+			Params:              cfg.Agent.Params,
+			Env:                 cfg.Agent.Env,
+			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 		},
 		Repos:  repos,
 		LogDir: cfg.Daemon.LogDir,

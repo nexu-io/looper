@@ -134,11 +134,16 @@ type SchedulerConfig struct {
 }
 
 type AgentConfig struct {
-	Vendor   *AgentVendor       `json:"vendor,omitempty"`
-	Model    *string            `json:"model,omitempty"`
-	Params   map[string]any     `json:"params"`
-	Env      map[string]string  `json:"env"`
-	Timeouts AgentTimeoutConfig `json:"timeouts"`
+	Vendor       *AgentVendor            `json:"vendor,omitempty"`
+	Model        *string                 `json:"model,omitempty"`
+	Params       map[string]any          `json:"params"`
+	Env          map[string]string       `json:"env"`
+	Timeouts     AgentTimeoutConfig      `json:"timeouts"`
+	NativeResume AgentNativeResumeConfig `json:"nativeResume"`
+}
+
+type AgentNativeResumeConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 type AgentTimeoutConfig struct {
@@ -392,11 +397,16 @@ type PartialSchedulerConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor   *AgentVendor               `json:"vendor,omitempty"`
-	Model    *string                    `json:"model,omitempty"`
-	Params   map[string]any             `json:"params,omitempty"`
-	Env      map[string]string          `json:"env,omitempty"`
-	Timeouts *PartialAgentTimeoutConfig `json:"timeouts,omitempty"`
+	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
+	Model        *string                         `json:"model,omitempty"`
+	Params       map[string]any                  `json:"params,omitempty"`
+	Env          map[string]string               `json:"env,omitempty"`
+	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
+	NativeResume *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+}
+
+type PartialAgentNativeResumeConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type PartialAgentTimeoutConfig struct {

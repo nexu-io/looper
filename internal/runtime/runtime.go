@@ -657,6 +657,15 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if cleaned.ErrorMessage == nil {
 				cleaned.ErrorMessage = stringPtr("Killed during looperd recovery")
 			}
+			if r.config.Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
+				cleaned.NativeResumeMode = stringPtr("native_resume")
+				cleaned.NativeResumeStatus = stringPtr("pending")
+				if r.logger != nil {
+					r.logger.Info("agent execution eligible for native resume", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
+				}
+			} else if r.logger != nil {
+				r.logger.Info("agent execution will restart from checkpoint", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
+			}
 			cleaned.EndedAt = stringPtr(nowISO)
 			cleaned.UpdatedAt = nowISO
 			if err := repositories.AgentExecutions.Upsert(ctx, cleaned); err != nil {
@@ -943,6 +952,15 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.EventsWritten = eventsWritten
 
 	return summary, nil
+}
+
+func runtimeNativeResumeSupported(vendor string) bool {
+	switch config.AgentVendor(vendor) {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, now time.Time) (int64, error) {

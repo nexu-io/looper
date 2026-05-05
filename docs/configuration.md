@@ -246,11 +246,14 @@ Default storage paths:
 - `model`: optional model identifier
 - `params`: free-form vendor-specific parameters
 - `env`: environment variables passed to the agent process
+- `nativeResume.enabled`: enables local-machine native session resume after daemon restart; defaults to `true`
 - `timeouts`: role-specific agent execution timeout seconds; defaults are planner `1800`, worker `3600`, reviewer `1800`, fixer `1800`
 
 `vendor` is required for agent-driven loops. If it is omitted, the daemon can still run, but planner / reviewer / fixer / worker loops cannot be created or started.
 
 All timeout values must be positive integers. If a run exceeds its configured role timeout, Looper uses the existing timeout failure and retry behavior.
+
+Native resume is intentionally local-machine only. When supported vendors expose a session/chat identifier (`claude-code`, `codex`, `opencode`, or `cursor-cli`), Looper persists that identifier in SQLite and, after `looperd` recovery, prefers the vendor's resume command before falling back to the normal checkpoint restart path. Vendor session stores are not portable across hosts or users, and resume can still fall back if the underlying CLI cannot reattach. Session capture depends on vendor CLI output that includes a structured session/chat id; use vendor-specific JSON or streaming output flags in `agent.params.args` if the default CLI output does not expose one. Set `LOOPER_AGENT_NATIVE_RESUME_ENABLED=false` to disable native resume via the environment.
 
 ### `logging`
 

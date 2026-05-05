@@ -170,6 +170,10 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 	if partial.Timeouts != nil {
 		mergeAgentTimeoutConfig(&config.Timeouts, *partial.Timeouts)
 	}
+
+	if partial.NativeResume != nil && partial.NativeResume.Enabled != nil {
+		config.NativeResume.Enabled = *partial.NativeResume.Enabled
+	}
 }
 
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {

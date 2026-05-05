@@ -51,6 +51,9 @@
           "reviewerMaxRuntimeSeconds": 5400,
           "fixerIdleTimeoutSeconds": 600,
           "fixerMaxRuntimeSeconds": 7200
+        },
+        "nativeResume": {
+          "enabled": true
         }
       },
       "logging": {

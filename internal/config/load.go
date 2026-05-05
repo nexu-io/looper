@@ -643,6 +643,13 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	if value, ok := lookupEnv("LOOPER_OSASCRIPT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).OsascriptPath = stringPtr(value)
 	}
+	if value, ok := lookupEnv("LOOPER_AGENT_NATIVE_RESUME_ENABLED"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_AGENT_NATIVE_RESUME_ENABLED: %q is not a boolean", value)
+		}
+		ensureAgentNativeResumeConfig(&overrides).Enabled = parsed
+	}
 	if err := applyRoleEnvOverrides(&overrides, lookupEnv); err != nil {
 		return PartialConfig{}, err
 	}
@@ -842,6 +849,15 @@ func ensureAgentTimeoutConfig(partial *PartialConfig) *PartialAgentTimeoutConfig
 	}
 
 	return agent.Timeouts
+}
+
+func ensureAgentNativeResumeConfig(partial *PartialConfig) *PartialAgentNativeResumeConfig {
+	agent := ensureAgentConfig(partial)
+	if agent.NativeResume == nil {
+		agent.NativeResume = &PartialAgentNativeResumeConfig{}
+	}
+
+	return agent.NativeResume
 }
 
 func ensureNotificationConfig(partial *PartialConfig) *PartialNotificationConfig {

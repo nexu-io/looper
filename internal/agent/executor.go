@@ -26,10 +26,11 @@ const (
 )
 
 type ExecutorConfig struct {
-	Vendor config.AgentVendor
-	Model  *string
-	Params map[string]any
-	Env    map[string]string
+	Vendor              config.AgentVendor
+	Model               *string
+	Params              map[string]any
+	Env                 map[string]string
+	NativeResumeEnabled bool
 }
 
 type ExecutorOptions struct {
@@ -53,6 +54,7 @@ type RunInput struct {
 	Metadata         map[string]any
 	IdempotencyKey   string
 	Env              map[string]string
+	NativeSessionID  string
 }
 
 type Result struct {
@@ -105,6 +107,76 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now}
 }
 
+type nativeResumeInfo struct {
+	Enabled           bool
+	SessionID         string
+	Mode              string
+	Status            string
+	SourceExecutionID string
+}
+
+func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunInput) (nativeResumeInfo, error) {
+	if !e.config.NativeResumeEnabled {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
+	}
+	if sessionID := strings.TrimSpace(input.NativeSessionID); sessionID != "" {
+		if nativeResumeSupported(e.config.Vendor) {
+			return nativeResumeInfo{Enabled: true, SessionID: sessionID, Mode: "native_resume", Status: "started"}, nil
+		}
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
+	}
+	if e.repos == nil || e.repos.AgentExecutions == nil || strings.TrimSpace(input.LoopID) == "" {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
+	}
+	latest, err := e.repos.AgentExecutions.GetLatestByLoopID(ctx, input.LoopID)
+	if err != nil {
+		return nativeResumeInfo{}, fmt.Errorf("load latest agent execution for native resume: %w", err)
+	}
+	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
+	}
+	if latest.Vendor != string(e.config.Vendor) || !nativeResumeSupported(e.config.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
+	}
+	return nativeResumeInfo{Enabled: true, SessionID: strings.TrimSpace(*latest.NativeSessionID), Mode: "native_resume", Status: "started", SourceExecutionID: latest.ID}, nil
+}
+
+func (e *ConfiguredExecutor) markNativeResumeFailed(ctx context.Context, executionID string, message string) error {
+	if executionID == "" || e.repos == nil || e.repos.AgentExecutions == nil {
+		return nil
+	}
+	record, err := e.repos.AgentExecutions.GetByID(ctx, executionID)
+	if err != nil || record == nil {
+		return err
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(e.now().UTC())
+	record.NativeResumeStatus = stringPtr("failed")
+	record.NativeResumeError = stringPtr(message)
+	record.UpdatedAt = nowISO
+	return e.repos.AgentExecutions.Upsert(ctx, *record)
+}
+
+func nativeResumeSupported(vendor config.AgentVendor) bool {
+	switch vendor {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecoverableNativeResumeSource(status string, resumeStatus *string) bool {
+	if resumeStatus == nil || *resumeStatus != "pending" {
+		return false
+	}
+	switch status {
+	case "running", "cancelling", "killed", "timeout", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Execution, error) {
 	if strings.TrimSpace(input.Prompt) == "" {
 		return nil, fmt.Errorf("agent prompt is required")
@@ -119,7 +191,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
-	command, args := ResolveSpawn(e.config, input.Prompt)
+	resume, err := e.resolveNativeResume(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	command, args := ResolveSpawnWithNativeResume(e.config, input.Prompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
@@ -157,6 +233,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		lastHeartbeatAtISO: startedAtISO,
 		lastOutputAt:       startedAt,
 		status:             "running",
+		nativeSessionID:    resume.SessionID,
+		nativeResumeMode:   resume.Mode,
+		nativeResumeStatus: resume.Status,
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 	}
@@ -165,11 +244,47 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start agent command: %w", err)
+		if resume.Enabled {
+			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
+				// best-effort marker only; command fallback is the important recovery behavior
+			}
+			command, args = ResolveSpawn(e.config, input.Prompt)
+			cmd = exec.Command(command, args...)
+			cmd.Dir = input.WorkingDirectory
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Env = os.Environ()
+			for key, value := range e.config.Env {
+				cmd.Env = append(cmd.Env, key+"="+value)
+			}
+			for key, value := range input.Env {
+				cmd.Env = append(cmd.Env, key+"="+value)
+			}
+			cmd.Env = append(cmd.Env,
+				"LOOPER_PROMPT="+input.Prompt,
+				completionMarkerEnv+"="+CompletionMarkerPrefix,
+			)
+			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
+			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+			x.mu.Lock()
+			x.command = command
+			x.args = args
+			x.process = cmd
+			x.nativeSessionID = ""
+			x.nativeResumeMode = "checkpoint_restart"
+			x.nativeResumeStatus = "fallback_started"
+			x.nativeResumeError = err.Error()
+			x.mu.Unlock()
+			if startErr := cmd.Start(); startErr != nil {
+				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", startErr, err)
+			}
+		} else {
+			return nil, fmt.Errorf("start agent command: %w", err)
+		}
 	}
 
+	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
 	x.persistStatus("running", nil, nil, nil)
-	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory}, startedAtISO)
+	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
 	return x, nil
@@ -204,6 +319,10 @@ type execution struct {
 	stderrLogPath           string
 	persistedLogWriteFailed bool
 	heartbeatCount          int64
+	nativeSessionID         string
+	nativeResumeMode        string
+	nativeResumeStatus      string
+	nativeResumeError       string
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -408,6 +527,14 @@ func (x *execution) run(ctx context.Context) {
 		LastProgressAt:               lastProgressAt,
 		PID:                          pidOrZero(x.process.Process),
 	}
+	if x.shouldFallbackNativeResume(status) {
+		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
+			result = fallbackResult
+			status = fallbackResult.Status
+			errorMessage = fallbackErrorMessage
+			endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+		}
+	}
 
 	x.persistFinal(status, result, errorMessage, endedAtISO)
 	eventType := "agent.completed"
@@ -438,6 +565,200 @@ func (x *execution) run(ctx context.Context) {
 	x.doneCh <- execOutcome{result: result, err: nil}
 }
 
+func (x *execution) shouldFallbackNativeResume(status string) bool {
+	_, mode, resumeStatus, _ := x.nativeResumeSnapshot()
+	return mode == "native_resume" && resumeStatus == "started" && status == "failed"
+}
+
+func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+	command, args := ResolveSpawn(x.executor.config, x.input.Prompt)
+	cmd := exec.Command(command, args...)
+	cmd.Dir = x.input.WorkingDirectory
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = os.Environ()
+	for key, value := range x.executor.config.Env {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	for key, value := range x.input.Env {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	cmd.Env = append(cmd.Env,
+		"LOOPER_PROMPT="+x.input.Prompt,
+		completionMarkerEnv+"="+CompletionMarkerPrefix,
+	)
+	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
+	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+
+	now := x.executor.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	x.mu.Lock()
+	x.command = command
+	x.args = args
+	x.process = cmd
+	x.status = "running"
+	x.stdout = nil
+	x.stderr = nil
+	x.nativeSessionID = ""
+	x.nativeResumeMode = "checkpoint_restart"
+	x.nativeResumeStatus = "fallback_started"
+	x.nativeResumeError = nativeError
+	x.lastHeartbeatAtISO = nowISO
+	x.lastOutputAt = now
+	x.mu.Unlock()
+	x.persistStatus("running", nil, nil, nil)
+	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
+
+	if err := cmd.Start(); err != nil {
+		x.mu.Lock()
+		x.status = "failed"
+		x.nativeResumeStatus = "fallback_failed"
+		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
+		x.mu.Unlock()
+		return Result{}, "", false
+	}
+
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	var (
+		waitErr        error
+		timedOut       bool
+		killed         bool
+		timeoutType    string
+		killReason     string
+		timeoutTimer   <-chan time.Time
+		graceKillTimer <-chan time.Time
+		idleTicker     *time.Ticker
+		termDelivered  bool
+	)
+	if x.timeout > 0 {
+		timeoutTimer = time.After(x.timeout)
+	}
+	if x.heartbeatTimeout > 0 {
+		interval := x.heartbeatTimeout
+		if interval > time.Second {
+			interval = time.Second
+		}
+		idleTicker = time.NewTicker(interval)
+		defer idleTicker.Stop()
+	}
+	terminate := func() {
+		if cmd.Process == nil {
+			return
+		}
+		if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+			if err != os.ErrProcessDone {
+				_ = x.killProcessGroup()
+			}
+			return
+		}
+		termDelivered = true
+		grace := x.gracefulShutdown
+		if grace <= 0 {
+			grace = 5 * time.Second
+		}
+		graceKillTimer = time.After(grace)
+	}
+	waiting := true
+	for waiting {
+		select {
+		case waitErr = <-waitCh:
+			waiting = false
+		case <-timeoutTimer:
+			timeoutTimer = nil
+			if !timedOut {
+				timedOut = true
+				timeoutType = "max_runtime"
+				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
+			}
+			terminate()
+		case <-tickerChan(idleTicker):
+			if timedOut || killed || x.timeSinceLastOutput() < x.heartbeatTimeout {
+				continue
+			}
+			timedOut = true
+			timeoutType = "idle"
+			killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
+			terminate()
+		case reason := <-x.killCh:
+			killed = true
+			killReason = reason
+			terminate()
+		case <-ctx.Done():
+			killed = true
+			killReason = ctx.Err().Error()
+			terminate()
+		case <-graceKillTimer:
+			graceKillTimer = nil
+			_ = x.killProcessGroup()
+		}
+	}
+	if termDelivered && (killed || timedOut) {
+		_ = x.killProcessGroup()
+	}
+	stdout := x.stdoutString()
+	stderr := x.stderrString()
+	now = x.executor.now().UTC()
+	nowISO = eventlog.FormatJavaScriptISOString(now)
+	x.mu.Lock()
+	x.stdout = []byte(stdout)
+	x.stderr = []byte(stderr)
+	x.lastHeartbeatAtISO = nowISO
+	x.lastOutputAt = now
+	x.heartbeatCount++
+	x.mu.Unlock()
+	status := "completed"
+	if timedOut {
+		status = "timeout"
+	} else if killed {
+		status = "killed"
+	} else if waitErr != nil || (cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0) {
+		status = "failed"
+	}
+	errorMessage := ""
+	if status != "completed" {
+		errorMessage = strings.TrimSpace(stderr)
+		if errorMessage == "" && waitErr != nil {
+			errorMessage = waitErr.Error()
+		}
+		if errorMessage == "" {
+			errorMessage = killReason
+		}
+	}
+	completion := parseCompletion(stdout, stderr)
+	if status != "completed" {
+		completion = completionParse{ParseStatus: "missing"}
+	}
+	if completion.Summary == "" {
+		completion.Summary = firstNonEmpty(errorMessage, summarizeLogs(stdout, stderr))
+	}
+	x.mu.Lock()
+	x.status = status
+	x.nativeResumeStatus = "fallback_completed"
+	if status != "completed" {
+		x.nativeResumeStatus = "fallback_failed"
+	}
+	x.mu.Unlock()
+	return Result{
+		Status:                       status,
+		Summary:                      completion.Summary,
+		Stdout:                       stdout,
+		Stderr:                       stderr,
+		ParseStatus:                  completion.ParseStatus,
+		CompletionSignal:             completion.CompletionSignal,
+		Artifacts:                    append([]string(nil), completion.Artifacts...),
+		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
+		Commits:                      append([]string(nil), completion.Commits...),
+		Lifecycle:                    completion.Lifecycle,
+		HeartbeatCount:               x.heartbeatCountValue(),
+		TimeoutType:                  timeoutType,
+		ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+		LastProgressAt:               x.lastProgressAtISO(),
+		PID:                          pidOrZero(cmd.Process),
+	}, errorMessage, true
+}
+
 func (x *execution) onOutput(stream string, chunk []byte) {
 	now := x.executor.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
@@ -459,6 +780,9 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	heartbeatCount := x.heartbeatCount
 	stdout := string(x.stdout)
 	stderr := string(x.stderr)
+	if x.nativeSessionID == "" {
+		x.nativeSessionID = extractNativeSessionID(stdout, stderr)
+	}
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
@@ -485,25 +809,30 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return
 	}
+	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	metadata := mustJSON(x.executionMetadata(""))
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	pid := int64(pidOrZero(x.process.Process))
 	record := storage.AgentExecutionRecord{
-		ID:              x.executionID,
-		ProjectID:       emptyToNil(x.input.ProjectID),
-		LoopID:          emptyToNil(x.input.LoopID),
-		RunID:           emptyToNil(x.input.RunID),
-		Vendor:          string(x.executor.config.Vendor),
-		Status:          status,
-		PID:             int64PtrIfPositive(pid),
-		CommandJSON:     &commandJSON,
-		CWD:             &x.input.WorkingDirectory,
-		HeartbeatCount:  0,
-		LastHeartbeatAt: &x.startedAtISO,
-		StartedAt:       x.startedAtISO,
-		MetadataJSON:    &metadata,
-		CreatedAt:       x.startedAtISO,
-		UpdatedAt:       x.startedAtISO,
+		ID:                 x.executionID,
+		ProjectID:          emptyToNil(x.input.ProjectID),
+		LoopID:             emptyToNil(x.input.LoopID),
+		RunID:              emptyToNil(x.input.RunID),
+		Vendor:             string(x.executor.config.Vendor),
+		Status:             status,
+		PID:                int64PtrIfPositive(pid),
+		CommandJSON:        &commandJSON,
+		CWD:                &x.input.WorkingDirectory,
+		HeartbeatCount:     0,
+		LastHeartbeatAt:    &x.startedAtISO,
+		NativeSessionID:    emptyToNil(nativeSessionID),
+		NativeResumeMode:   emptyToNil(nativeResumeMode),
+		NativeResumeStatus: emptyToNil(nativeResumeStatus),
+		NativeResumeError:  emptyToNil(nativeResumeError),
+		StartedAt:          x.startedAtISO,
+		MetadataJSON:       &metadata,
+		CreatedAt:          x.startedAtISO,
+		UpdatedAt:          x.startedAtISO,
 	}
 	if heartbeatCount != nil {
 		record.HeartbeatCount = *heartbeatCount
@@ -520,6 +849,7 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return
 	}
+	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	metadata := mustJSON(x.executionMetadata(result.TimeoutType))
 	embeddedStdout := x.stdoutString()
@@ -533,28 +863,40 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
+	nativeSessionID = firstNonEmpty(nativeSessionID, extractNativeSessionID(embeddedStdout, embeddedStderr))
+	if nativeResumeMode == "native_resume" && status == "failed" {
+		nativeResumeStatus = "failed"
+		nativeResumeError = firstNonEmpty(nativeResumeError, errorMessage, strings.TrimSpace(result.Stderr))
+	}
+	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
+		nativeResumeStatus = "captured"
+	}
 	record := storage.AgentExecutionRecord{
-		ID:               x.executionID,
-		ProjectID:        emptyToNil(x.input.ProjectID),
-		LoopID:           emptyToNil(x.input.LoopID),
-		RunID:            emptyToNil(x.input.RunID),
-		Vendor:           string(x.executor.config.Vendor),
-		Status:           status,
-		PID:              int64PtrIfPositive(pid),
-		CommandJSON:      &commandJSON,
-		CWD:              &x.input.WorkingDirectory,
-		Summary:          emptyToNil(result.Summary),
-		ParseStatus:      &parseStatus,
-		CompletionSignal: completionSignal,
-		HeartbeatCount:   result.HeartbeatCount,
-		LastHeartbeatAt:  &x.lastHeartbeatAtISO,
-		OutputJSON:       &outputJSON,
-		ErrorMessage:     emptyToNil(errorMessage),
-		StartedAt:        x.startedAtISO,
-		EndedAt:          &endedAtISO,
-		MetadataJSON:     &metadata,
-		CreatedAt:        x.startedAtISO,
-		UpdatedAt:        endedAtISO,
+		ID:                 x.executionID,
+		ProjectID:          emptyToNil(x.input.ProjectID),
+		LoopID:             emptyToNil(x.input.LoopID),
+		RunID:              emptyToNil(x.input.RunID),
+		Vendor:             string(x.executor.config.Vendor),
+		Status:             status,
+		PID:                int64PtrIfPositive(pid),
+		CommandJSON:        &commandJSON,
+		CWD:                &x.input.WorkingDirectory,
+		Summary:            emptyToNil(result.Summary),
+		ParseStatus:        &parseStatus,
+		CompletionSignal:   completionSignal,
+		HeartbeatCount:     result.HeartbeatCount,
+		LastHeartbeatAt:    &x.lastHeartbeatAtISO,
+		OutputJSON:         &outputJSON,
+		ErrorMessage:       emptyToNil(errorMessage),
+		NativeSessionID:    emptyToNil(nativeSessionID),
+		NativeResumeMode:   emptyToNil(nativeResumeMode),
+		NativeResumeStatus: emptyToNil(nativeResumeStatus),
+		NativeResumeError:  emptyToNil(nativeResumeError),
+		StartedAt:          x.startedAtISO,
+		EndedAt:            &endedAtISO,
+		MetadataJSON:       &metadata,
+		CreatedAt:          x.startedAtISO,
+		UpdatedAt:          endedAtISO,
 	}
 	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
 }
@@ -612,6 +954,12 @@ func (x *execution) lastProgressAtISO() string {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.lastHeartbeatAtISO
+}
+
+func (x *execution) nativeResumeSnapshot() (sessionID string, mode string, status string, resumeError string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.nativeSessionID, x.nativeResumeMode, x.nativeResumeStatus, x.nativeResumeError
 }
 
 func (x *execution) executionMetadata(timeoutType string) map[string]any {
@@ -701,6 +1049,15 @@ func ResolveSpawn(cfg ExecutorConfig, prompt string) (string, []string) {
 	return command, args
 }
 
+func ResolveSpawnWithNativeResume(cfg ExecutorConfig, prompt string, sessionID string, enabled bool) (string, []string) {
+	if !enabled || strings.TrimSpace(sessionID) == "" || !nativeResumeSupported(cfg.Vendor) {
+		return ResolveSpawn(cfg, prompt)
+	}
+	command := resolveCommand(cfg)
+	args := resolveNativeResumeArgs(cfg, stringArgs(cfg.Params["args"]), strings.TrimSpace(sessionID), prompt)
+	return command, args
+}
+
 func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
@@ -771,6 +1128,53 @@ func resolveCursorArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 	return append(resolved, "--print", prompt)
 }
 
+func resolveNativeResumeArgs(cfg ExecutorConfig, args []string, sessionID string, prompt string) []string {
+	switch cfg.Vendor {
+	case config.AgentVendorClaudeCode:
+		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+		if !hasAnyFlag(resolved, []string{"--continue", "--resume"}) {
+			resolved = append(resolved, "--resume", sessionID)
+		}
+		if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+			resolved = append(resolved, "--print", prompt)
+		}
+		return resolved
+	case config.AgentVendorCodex:
+		resolved := removeFirstArg(args, "exec")
+		resolved = removeFirstArg(resolved, "resume")
+		withModel := prependModelFlag(append([]string{"exec"}, resolved...), cfg.Model, "--model", []string{"--model", "-m"})
+		base := append(withModel, "resume")
+		base = append(base, sessionID)
+		if containsArg(withModel, "-") {
+			return base
+		}
+		return append(base, prompt)
+	case config.AgentVendorOpenCode:
+		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model", "-m"})
+		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
+			resolved = append(resolved, "--session", sessionID)
+		}
+		if !containsArg(resolved, "run") {
+			resolved = append([]string{"run"}, resolved...)
+		}
+		if !hasAnyFlag(resolved, []string{"-p", "--prompt", "-f", "--file"}) {
+			resolved = append(resolved, prompt)
+		}
+		return resolved
+	case config.AgentVendorCursorCLI:
+		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+		if !hasAnyFlag(resolved, []string{"--continue", "--resume"}) {
+			resolved = append(resolved, "--resume", sessionID)
+		}
+		if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+			resolved = append(resolved, "--print", prompt)
+		}
+		return resolved
+	default:
+		return append([]string{}, args...)
+	}
+}
+
 func prependModelFlag(args []string, model *string, flag string, recognizedFlags []string) []string {
 	if model == nil || *model == "" || hasAnyFlag(args, recognizedFlags) {
 		return append([]string{}, args...)
@@ -784,7 +1188,7 @@ func prependModelFlag(args []string, model *string, flag string, recognizedFlags
 func hasAnyFlag(args []string, flags []string) bool {
 	for _, flag := range flags {
 		for _, arg := range args {
-			if arg == flag {
+			if arg == flag || (strings.HasPrefix(flag, "--") && strings.HasPrefix(arg, flag+"=")) {
 				return true
 			}
 		}
@@ -799,6 +1203,19 @@ func containsArg(args []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func removeFirstArg(args []string, target string) []string {
+	resolved := make([]string, 0, len(args))
+	removed := false
+	for _, arg := range args {
+		if !removed && arg == target {
+			removed = true
+			continue
+		}
+		resolved = append(resolved, arg)
+	}
+	return resolved
 }
 
 func stringArgs(value any) []string {
@@ -816,6 +1233,67 @@ func stringArgs(value any) []string {
 		}
 	}
 	return result
+}
+
+func extractNativeSessionID(outputs ...string) string {
+	keys := []string{"nativeSessionId", "native_session_id", "sessionId", "session_id", "chatId", "chat_id"}
+	for _, output := range outputs {
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(line), &payload); err == nil {
+				for _, key := range keys {
+					if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+						return strings.TrimSpace(value)
+					}
+				}
+			}
+			for _, key := range keys {
+				if value := extractKeyValue(line, key); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func extractKeyValue(line string, key string) string {
+	lowerLine := strings.ToLower(line)
+	lowerKey := strings.ToLower(key)
+	idx := strings.Index(lowerLine, lowerKey)
+	if idx < 0 {
+		return ""
+	}
+	if idx > 0 {
+		prev := lowerLine[idx-1]
+		if isSessionKeyChar(prev) {
+			return ""
+		}
+	}
+	after := idx + len(key)
+	if after < len(lowerLine) && isSessionKeyChar(lowerLine[after]) {
+		return ""
+	}
+	rest := strings.TrimLeft(line[after:], " \t:=\"")
+	if rest == "" {
+		return ""
+	}
+	end := len(rest)
+	for i, r := range rest {
+		if r == ' ' || r == '\t' || r == '\'' || r == '"' || r == ',' || r == '}' {
+			end = i
+			break
+		}
+	}
+	return strings.Trim(strings.TrimSpace(rest[:end]), "'\"")
+}
+
+func isSessionKeyChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-'
 }
 
 func (e *ConfiguredExecutor) executionLogPaths(input RunInput, executionID string) (string, string) {

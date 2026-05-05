@@ -70,23 +70,29 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	agentCommand := `{"command":"codex","args":["exec","prompt"]}`
 	agentCWD := "/tmp/looper"
 	agentOutput := `{"stdout":"ok","stderr":""}`
+	nativeSessionID := "codex-session-1"
+	nativeResumeMode := "native_resume"
+	nativeResumeStatus := "pending"
 	pid := int64(12345)
 	if err := repos.AgentExecutions.Upsert(ctx, AgentExecutionRecord{
-		ID:              "agent_1",
-		RunID:           strPtr("run_1"),
-		LoopID:          strPtr("loop_1"),
-		ProjectID:       strPtr("project_1"),
-		Vendor:          "codex",
-		Status:          "running",
-		PID:             &pid,
-		CommandJSON:     &agentCommand,
-		CWD:             &agentCWD,
-		HeartbeatCount:  2,
-		OutputJSON:      &agentOutput,
-		StartedAt:       now,
-		LastHeartbeatAt: &now,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ID:                 "agent_1",
+		RunID:              strPtr("run_1"),
+		LoopID:             strPtr("loop_1"),
+		ProjectID:          strPtr("project_1"),
+		Vendor:             "codex",
+		Status:             "running",
+		PID:                &pid,
+		CommandJSON:        &agentCommand,
+		CWD:                &agentCWD,
+		HeartbeatCount:     2,
+		OutputJSON:         &agentOutput,
+		NativeSessionID:    &nativeSessionID,
+		NativeResumeMode:   &nativeResumeMode,
+		NativeResumeStatus: &nativeResumeStatus,
+		StartedAt:          now,
+		LastHeartbeatAt:    &now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
@@ -212,8 +218,8 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if agentExecution == nil || agentExecution.ID != "agent_1" || agentExecution.HeartbeatCount != 2 {
-		t.Fatalf("AgentExecutions.GetByID() = %#v, want agent_1 with heartbeat_count=2", agentExecution)
+	if agentExecution == nil || agentExecution.ID != "agent_1" || agentExecution.HeartbeatCount != 2 || agentExecution.NativeSessionID == nil || *agentExecution.NativeSessionID != nativeSessionID {
+		t.Fatalf("AgentExecutions.GetByID() = %#v, want agent_1 with heartbeat_count=2 and native session", agentExecution)
 	}
 
 	latestExecution, err := repos.AgentExecutions.GetLatestByRunID(ctx, "run_1")

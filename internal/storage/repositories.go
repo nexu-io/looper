@@ -88,27 +88,31 @@ type RunRecord struct {
 }
 
 type AgentExecutionRecord struct {
-	ID               string
-	ProjectID        *string
-	LoopID           *string
-	RunID            *string
-	Vendor           string
-	Status           string
-	PID              *int64
-	CommandJSON      *string
-	CWD              *string
-	Summary          *string
-	ParseStatus      *string
-	CompletionSignal *string
-	HeartbeatCount   int64
-	LastHeartbeatAt  *string
-	OutputJSON       *string
-	ErrorMessage     *string
-	StartedAt        string
-	EndedAt          *string
-	MetadataJSON     *string
-	CreatedAt        string
-	UpdatedAt        string
+	ID                 string
+	ProjectID          *string
+	LoopID             *string
+	RunID              *string
+	Vendor             string
+	Status             string
+	PID                *int64
+	CommandJSON        *string
+	CWD                *string
+	Summary            *string
+	ParseStatus        *string
+	CompletionSignal   *string
+	HeartbeatCount     int64
+	LastHeartbeatAt    *string
+	OutputJSON         *string
+	ErrorMessage       *string
+	NativeSessionID    *string
+	NativeResumeMode   *string
+	NativeResumeStatus *string
+	NativeResumeError  *string
+	StartedAt          string
+	EndedAt            *string
+	MetadataJSON       *string
+	CreatedAt          string
+	UpdatedAt          string
 }
 
 type PullRequestSnapshotRecord struct {
@@ -520,6 +524,8 @@ type RunsRepository struct{ q sqliteQuerier }
 
 type AgentExecutionsRepository struct{ q sqliteQuerier }
 
+const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
+
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at)
@@ -610,8 +616,8 @@ func (r *RunsRepository) ListByLoop(ctx context.Context, loopID string) ([]RunRe
 
 func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExecutionRecord) error {
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, started_at, ended_at, metadata_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project_id=excluded.project_id,
 			loop_id=excluded.loop_id,
@@ -628,11 +634,15 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 			last_heartbeat_at=excluded.last_heartbeat_at,
 			output_json=excluded.output_json,
 			error_message=excluded.error_message,
+			native_session_id=excluded.native_session_id,
+			native_resume_mode=excluded.native_resume_mode,
+			native_resume_status=excluded.native_resume_status,
+			native_resume_error=excluded.native_resume_error,
 			started_at=excluded.started_at,
 			ended_at=excluded.ended_at,
 			metadata_json=excluded.metadata_json,
 			updated_at=excluded.updated_at
-	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
+	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.NativeSessionID, record.NativeResumeMode, record.NativeResumeStatus, record.NativeResumeError, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert agent execution: %w", err)
 	}
@@ -641,7 +651,7 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 }
 
 func (r *AgentExecutionsRepository) GetByID(ctx context.Context, id string) (*AgentExecutionRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM agent_executions WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE id = ?`, id)
 	record, err := scanAgentExecution(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -654,7 +664,7 @@ func (r *AgentExecutionsRepository) GetByID(ctx context.Context, id string) (*Ag
 }
 
 func (r *AgentExecutionsRepository) GetLatestByRunID(ctx context.Context, runID string) (*AgentExecutionRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM agent_executions WHERE run_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, runID)
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE run_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, runID)
 	record, err := scanAgentExecution(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -666,8 +676,21 @@ func (r *AgentExecutionsRepository) GetLatestByRunID(ctx context.Context, runID 
 	return &record, nil
 }
 
+func (r *AgentExecutionsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*AgentExecutionRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
+	record, err := scanAgentExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest agent execution by loop id: %w", err)
+	}
+
+	return &record, nil
+}
+
 func (r *AgentExecutionsRepository) ListActive(ctx context.Context) ([]AgentExecutionRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list active agent executions: %w", err)
 	}
@@ -1620,21 +1643,25 @@ func scanAgentExecutions(rows *sql.Rows) ([]AgentExecutionRecord, error) {
 
 func scanAgentExecution(row interface{ Scan(...any) error }) (AgentExecutionRecord, error) {
 	var (
-		record           AgentExecutionRecord
-		projectID        sql.NullString
-		loopID           sql.NullString
-		runID            sql.NullString
-		pid              sql.NullInt64
-		commandJSON      sql.NullString
-		cwd              sql.NullString
-		summary          sql.NullString
-		parseStatus      sql.NullString
-		completionSignal sql.NullString
-		lastHeartbeatAt  sql.NullString
-		outputJSON       sql.NullString
-		errorMessage     sql.NullString
-		endedAt          sql.NullString
-		metadataJSON     sql.NullString
+		record             AgentExecutionRecord
+		projectID          sql.NullString
+		loopID             sql.NullString
+		runID              sql.NullString
+		pid                sql.NullInt64
+		commandJSON        sql.NullString
+		cwd                sql.NullString
+		summary            sql.NullString
+		parseStatus        sql.NullString
+		completionSignal   sql.NullString
+		lastHeartbeatAt    sql.NullString
+		outputJSON         sql.NullString
+		errorMessage       sql.NullString
+		nativeSessionID    sql.NullString
+		nativeResumeMode   sql.NullString
+		nativeResumeStatus sql.NullString
+		nativeResumeError  sql.NullString
+		endedAt            sql.NullString
+		metadataJSON       sql.NullString
 	)
 
 	err := row.Scan(
@@ -1654,6 +1681,10 @@ func scanAgentExecution(row interface{ Scan(...any) error }) (AgentExecutionReco
 		&lastHeartbeatAt,
 		&outputJSON,
 		&errorMessage,
+		&nativeSessionID,
+		&nativeResumeMode,
+		&nativeResumeStatus,
+		&nativeResumeError,
 		&record.StartedAt,
 		&endedAt,
 		&metadataJSON,
@@ -1676,6 +1707,10 @@ func scanAgentExecution(row interface{ Scan(...any) error }) (AgentExecutionReco
 	record.LastHeartbeatAt = nullableString(lastHeartbeatAt)
 	record.OutputJSON = nullableString(outputJSON)
 	record.ErrorMessage = nullableString(errorMessage)
+	record.NativeSessionID = nullableString(nativeSessionID)
+	record.NativeResumeMode = nullableString(nativeResumeMode)
+	record.NativeResumeStatus = nullableString(nativeResumeStatus)
+	record.NativeResumeError = nullableString(nativeResumeError)
 	record.EndedAt = nullableString(endedAt)
 	record.MetadataJSON = nullableString(metadataJSON)
 

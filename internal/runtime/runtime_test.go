@@ -857,17 +857,19 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
 	pid := int64(4242)
+	nativeSessionID := "codex-session-1"
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID:             "agent_orphan_1",
-		Vendor:         "codex",
-		Status:         "running",
-		PID:            &pid,
-		CommandJSON:    stringPtr(`{"command":"codex","args":["exec","fix failing tests"]}`),
-		CWD:            stringPtr(workingDir),
-		HeartbeatCount: 0,
-		StartedAt:      nowISO,
-		CreatedAt:      nowISO,
-		UpdatedAt:      nowISO,
+		ID:              "agent_orphan_1",
+		Vendor:          "codex",
+		Status:          "running",
+		PID:             &pid,
+		CommandJSON:     stringPtr(`{"command":"codex","args":["exec","fix failing tests"]}`),
+		CWD:             stringPtr(workingDir),
+		HeartbeatCount:  0,
+		NativeSessionID: &nativeSessionID,
+		StartedAt:       nowISO,
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
 	}
@@ -906,6 +908,9 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	}
 	if agentExecution == nil || agentExecution.Status != "killed" || agentExecution.EndedAt == nil {
 		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want killed with ended_at", agentExecution)
+	}
+	if agentExecution.NativeSessionID == nil || *agentExecution.NativeSessionID != nativeSessionID || agentExecution.NativeResumeMode == nil || *agentExecution.NativeResumeMode != "native_resume" || agentExecution.NativeResumeStatus == nil || *agentExecution.NativeResumeStatus != "pending" {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want native resume pending metadata", agentExecution)
 	}
 
 	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_1")

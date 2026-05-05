@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0009_runs_latest_created_at_index",
-              "latestAppliedId": "0009_runs_latest_created_at_index",
+              "latestAvailableId": "0010_agent_native_resume",
+              "latestAppliedId": "0010_agent_native_resume",
               "pendingCount": 0
             }
           }
@@ -79,7 +79,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0009_runs_latest_created_at_index",
+            "schemaVersion": "0010_agent_native_resume",
             "pendingMigrations": [],
             "healthy": true
           },
@@ -176,6 +176,9 @@
           },
           "agent": {
             "env": {},
+            "nativeResume": {
+              "enabled": true
+            },
             "params": {},
             "timeouts": {
               "fixerIdleTimeoutSeconds": 600,

@@ -86,6 +86,221 @@ func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	}
 }
 
+func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		vendor config.AgentVendor
+		want   string
+	}{
+		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello"},
+		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
+		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --session session-123 hello"},
+		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, args := ResolveSpawnWithNativeResume(ExecutorConfig{Vendor: tc.vendor}, "hello", "session-123", true)
+			if got := strings.Join(args, " "); got != tc.want {
+				t.Fatalf("args = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSpawnWithNativeResumeCodexPreservesExecOptions(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	_, args := ResolveSpawnWithNativeResume(ExecutorConfig{
+		Vendor: config.AgentVendorCodex,
+		Model:  &model,
+		Params: map[string]any{"args": []any{"exec", "--json", "--sandbox", "workspace-write"}},
+	}, "hello", "session-123", true)
+	if got, want := strings.Join(args, " "), "exec --model gpt-5 --json --sandbox workspace-write resume session-123 hello"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	_, args := ResolveSpawnWithNativeResume(ExecutorConfig{
+		Vendor: config.AgentVendorOpenCode,
+		Model:  &model,
+		Params: map[string]any{"args": []any{"run", "--model=gpt-4", "--session=existing", "--prompt=from-args"}},
+	}, "hello", "session-123", true)
+	if got, want := strings.Join(args, " "), "run --model=gpt-4 --session=existing --prompt=from-args"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestExtractNativeSessionID(t *testing.T) {
+	t.Parallel()
+
+	if got := extractNativeSessionID(`{"session_id":"session-json"}`); got != "session-json" {
+		t.Fatalf("extractNativeSessionID(json) = %q, want session-json", got)
+	}
+	if got := extractNativeSessionID("started chatId: cursor-chat-1"); got != "cursor-chat-1" {
+		t.Fatalf("extractNativeSessionID(text) = %q, want cursor-chat-1", got)
+	}
+}
+
+func TestExecutorResumesPersistedNativeSession(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	argsPath := filepath.Join(scriptDir, "args.txt")
+	scriptPath := filepath.Join(scriptDir, "mock-codex")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$ARGS_PATH\"\nprintf '%s\\n' '{\"session_id\":\"codex-session-1\"}'\nprintf '%s\\n' '__LOOPER_RESULT__={\"summary\":\"resumed\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resumed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.Summary != "resumed" {
+		t.Fatalf("result = %#v, want completed resumed execution", result)
+	}
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(argsPath) error = %v", err)
+	}
+	if got, want := strings.TrimSpace(string(argsBytes)), "exec resume codex-session-1 continue work"; got != want {
+		t.Fatalf("resume args = %q, want %q", got, want)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resumed")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.NativeSessionID == nil || *record.NativeSessionID != sessionID || record.NativeResumeMode == nil || *record.NativeResumeMode != "native_resume" {
+		t.Fatalf("agent execution record = %#v, want native resume session metadata", record)
+	}
+}
+
+func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	argsPath := filepath.Join(scriptDir, "args.txt")
+	scriptPath := filepath.Join(scriptDir, "mock-codex")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ARGS_PATH\"\ncase \"$*\" in *resume*) printf '%s\\n' 'resume failed' >&2; exit 2;; esac\nprintf '%s\\n' '__LOOPER_RESULT__={\"summary\":\"checkpoint\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	failedExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
+	if err != nil {
+		t.Fatalf("Start(first) error = %v", err)
+	}
+	result, err := failedExec.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait(first) error = %v", err)
+	}
+	if result.Status != "completed" || result.Summary != "checkpoint" {
+		t.Fatalf("result = %#v, want immediate checkpoint fallback completion", result)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resume_failed")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "checkpoint_restart" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "fallback_completed" {
+		t.Fatalf("native resume metadata = mode:%#v status:%#v, want checkpoint fallback completed", record.NativeResumeMode, record.NativeResumeStatus)
+	}
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(argsPath) error = %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
+	if len(lines) != 2 || lines[0] != "exec resume codex-session-1 continue work" || lines[1] != "exec continue work" {
+		t.Fatalf("spawned args = %#v, want native resume then immediate checkpoint restart", lines)
+	}
+}
+
 func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	t.Parallel()
 
@@ -680,6 +895,10 @@ func containsEvent(events []storage.EventLogRecord, eventType string) bool {
 
 func containsText(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
+}
+
+func strPtr(value string) *string {
+	return &value
 }
 
 func waitForPIDFile(t *testing.T, path string) int {
