@@ -5209,7 +5209,7 @@ func TestRunThreadResolutionStepResolvesLooperThreadWhenCurrentUserNotRequested(
 	}
 }
 
-func TestRunThreadResolutionStepUsesOriginalThreadCommitForNewHeadCheck(t *testing.T) {
+func TestRunThreadResolutionStepRequiresNewHeadAfterLatestThreadFeedback(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)
 	policy.Enabled = true
@@ -5225,8 +5225,11 @@ func TestRunThreadResolutionStepUsesOriginalThreadCommitForNewHeadCheck(t *testi
 	if err != nil {
 		t.Fatalf("runThreadResolutionStep() error = %v", err)
 	}
-	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Reported != 1 || checkpoint.ThreadResolution.Resolved != 1 {
-		t.Fatalf("ThreadResolution = %#v, want thread eligible and resolved", checkpoint.ThreadResolution)
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Reported != 0 || checkpoint.ThreadResolution.Processed != 0 {
+		t.Fatalf("ThreadResolution = %#v, want no eligible candidates", checkpoint.ThreadResolution)
+	}
+	if len(agent.starts) != 0 || len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("side effects: agent=%d replies=%d resolves=%d, want none", len(agent.starts), len(github.addThreadReplyCalls), len(github.resolveThreadCalls))
 	}
 }
 

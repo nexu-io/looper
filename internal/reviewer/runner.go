@@ -1742,7 +1742,7 @@ func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, current
 		return false
 	}
 	if policy.RequireNewHeadSinceThread && headSHA != "" {
-		threadSHA := originalThreadFeedbackCommitOID(thread)
+		threadSHA := latestThreadFeedbackCommitOID(thread)
 		if threadSHA == "" || threadSHA == headSHA {
 			return false
 		}
@@ -1929,18 +1929,6 @@ func isLooperAuthoredThread(thread ReviewThread) bool {
 func latestThreadFeedbackCommitOID(thread ReviewThread) string {
 	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
-		if strings.Contains(comment.Body, "looper:thread-resolution") {
-			continue
-		}
-		if oid := firstNonEmpty(comment.CommitOID, comment.OriginalCommitOID); oid != "" {
-			return oid
-		}
-	}
-	return ""
-}
-
-func originalThreadFeedbackCommitOID(thread ReviewThread) string {
-	for _, comment := range thread.Comments {
 		if strings.Contains(comment.Body, "looper:thread-resolution") {
 			continue
 		}
