@@ -278,6 +278,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
@@ -1948,19 +1949,19 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 			case <-monitorCtx.Done():
 				return
 			case <-ticker.C:
-				detail, err := r.github.ViewPullRequest(monitorCtx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+				headSHA, err := r.github.GetPullRequestHeadSHA(monitorCtx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 				if err != nil {
 					if monitorCtx.Err() == nil {
 						r.logWarn("reviewer head change poll failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "error": err.Error()})
 					}
 					continue
 				}
-				if detail.HeadSHA == "" || detail.HeadSHA == expectedHead {
+				if headSHA == "" || headSHA == expectedHead {
 					continue
 				}
-				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, detail.HeadSHA)
-				r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.interrupted", "review", executionID, map[string]any{"headSha": expectedHead, "newHeadSha": detail.HeadSHA, "reason": reason})
-				r.logInfo("reviewer agent interrupted for newer PR head", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": detail.HeadSHA})
+				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, headSHA)
+				r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.interrupted", "review", executionID, map[string]any{"headSha": expectedHead, "newHeadSha": headSHA, "reason": reason})
+				r.logInfo("reviewer agent interrupted for newer PR head", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": headSHA})
 				select {
 				case monitor.reason <- reason:
 				default:

@@ -5330,6 +5330,7 @@ type fakeGitHubGateway struct {
 	issueCommentResult              IssueCommentResult
 	reviewThreads                   []ReviewThread
 	viewHeadSHA                     string
+	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
 	captureSnapshotErrs             []error
 	captureSnapshotCalls            int
@@ -5394,6 +5395,18 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 		state = "OPEN"
 	}
 	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+}
+
+func (g *fakeGitHubGateway) GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error) {
+	g.headSHACalls++
+	headSHA := "abc123"
+	if g.viewHeadSHA != "" {
+		headSHA = g.viewHeadSHA
+	}
+	if g.changeHeadOnSecondView && g.viewCalls+g.headSHACalls >= 2 {
+		headSHA = "new-head"
+	}
+	return headSHA, nil
 }
 
 func cloneCommentMaps(comments []map[string]any) []map[string]any {
