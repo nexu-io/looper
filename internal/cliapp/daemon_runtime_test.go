@@ -314,6 +314,125 @@ func TestGenerateLaunchdPlistRestartPolicyMapping(t *testing.T) {
 	}
 }
 
+func TestResolveLaunchdPlistPathNormalizesRelativeConfigPath(t *testing.T) {
+	t.Parallel()
+
+	callerDir := t.TempDir()
+	plistPath := filepath.Join("agents", "looperd.plist")
+	loaded := config.LoadedFileConfig{}
+	loaded.Config.Daemon.PlistPath = &plistPath
+	runtime := newCommandRuntime(New(Deps{Getwd: func() (string, error) { return callerDir, nil }}), nil)
+
+	resolved, err := runtime.resolveLaunchdPlistPath(loaded)
+	if err != nil {
+		t.Fatalf("resolveLaunchdPlistPath() error = %v", err)
+	}
+	if got, want := resolved, filepath.Join(callerDir, "agents", "looperd.plist"); got != want {
+		t.Fatalf("resolveLaunchdPlistPath() = %q, want %q", got, want)
+	}
+}
+
+func TestStopLaunchdDaemonUsesPersistedStatePlistPath(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	currentPlistPath := filepath.Join(homeDir, "current.plist")
+	persistedPlistPath := filepath.Join(homeDir, "persisted.plist")
+	loaded := config.LoadedFileConfig{}
+	loaded.Config.Daemon.PlistPath = &currentPlistPath
+	state := &daemonLifecycleState{Mode: config.DaemonModeLaunchd, PID: 4321, Logs: daemonLifecycleLogState{Main: filepath.Join(homeDir, "looperd.log")}, Supervisor: &daemonSupervisorState{Source: "launchd", Label: launchdLooperdLabel, PlistPath: persistedPlistPath}}
+	var bootoutArgs []string
+	var removed []string
+	runtime := newCommandRuntime(New(Deps{
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		LookPath: func(file string) (string, error) {
+			if file == "launchctl" {
+				return "/bin/launchctl", nil
+			}
+			return "", os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			bootoutArgs = append([]string{}, args...)
+			return commandExecutionResult{ExitCode: 0}, nil
+		},
+		RemoveFile: func(path string) error {
+			removed = append(removed, path)
+			return nil
+		},
+	}), nil)
+
+	stopped, err := runtime.stopLaunchdDaemon(context.Background(), &bytes.Buffer{}, loaded, state, false)
+	if err != nil {
+		t.Fatalf("stopLaunchdDaemon() error = %v", err)
+	}
+	if !stopped {
+		t.Fatal("stopLaunchdDaemon() stopped = false, want true")
+	}
+	if len(bootoutArgs) != 3 || bootoutArgs[0] != "bootout" || bootoutArgs[2] != persistedPlistPath {
+		t.Fatalf("launchctl args = %#v, want bootout of persisted plist %q", bootoutArgs, persistedPlistPath)
+	}
+	if len(removed) == 0 || removed[len(removed)-1] != persistedPlistPath {
+		t.Fatalf("removed files = %#v, want persisted plist removed", removed)
+	}
+}
+
+func TestRefreshLaunchdLifecycleStateClearsStalePIDWhenServiceAbsent(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	statePath := filepath.Join(homeDir, ".looper", "looperd.state.json")
+	pidPath := filepath.Join(homeDir, ".looper", "looperd.pid")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte("4321\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(pid) error = %v", err)
+	}
+	runtime := newCommandRuntime(New(Deps{
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		LookPath: func(file string) (string, error) {
+			if file == "launchctl" {
+				return "/bin/launchctl", nil
+			}
+			return "", os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = args
+			_ = timeout
+			return commandExecutionResult{Stdout: "{ service = inactive; }\n", ExitCode: 0}, nil
+		},
+	}), nil)
+	state := daemonLifecycleState{Mode: config.DaemonModeLaunchd, PID: 4321, Logs: daemonLifecycleLogState{Main: filepath.Join(homeDir, "looperd.log")}, Supervisor: &daemonSupervisorState{Source: "launchd", Label: launchdLooperdLabel}}
+	if err := runtime.writeDaemonLifecycleState(statePath, state); err != nil {
+		t.Fatalf("writeDaemonLifecycleState() error = %v", err)
+	}
+
+	updated, err := runtime.refreshLaunchdLifecycleState(context.Background(), loadedLaunchdTestConfig(homeDir), statePath, &state)
+	if err != nil {
+		t.Fatalf("refreshLaunchdLifecycleState() error = %v", err)
+	}
+	if updated == nil || updated.PID != 0 || updated.LastExit == nil || !strings.Contains(updated.LastExit.Reason, "clearing stale pid 4321") {
+		t.Fatalf("updated state = %#v, want stale pid cleared with last exit reason", updated)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("pid file stat error = %v, want not exist", err)
+	}
+	persisted, err := runtime.readDaemonLifecycleState(statePath)
+	if err != nil {
+		t.Fatalf("readDaemonLifecycleState() error = %v", err)
+	}
+	if persisted.PID != 0 {
+		t.Fatalf("persisted PID = %d, want 0", persisted.PID)
+	}
+}
+
 func TestDaemonStartLaunchdUnsupportedPlatform(t *testing.T) {
 	t.Parallel()
 
@@ -1585,6 +1704,12 @@ func writeLooperdStatusEnvelope(t *testing.T, w http.ResponseWriter) {
 			},
 		},
 	}))
+}
+
+func loadedLaunchdTestConfig(root string) config.LoadedFileConfig {
+	loaded := config.LoadedFileConfig{}
+	loaded.Config.Daemon.LogDir = filepath.Join(root, "logs")
+	return loaded
 }
 
 func daemonVersionCommand(managedPath string) runCommandFunc {

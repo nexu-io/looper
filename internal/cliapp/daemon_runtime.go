@@ -509,7 +509,7 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 		if err != nil {
 			return false, err
 		}
-		return r.stopLaunchdDaemon(ctx, out, loaded, startIfMissing)
+		return r.stopLaunchdDaemon(ctx, out, loaded, state, startIfMissing)
 	}
 
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
@@ -521,7 +521,7 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 	if !ok {
 		loaded, loadErr := r.loadConfig()
 		if loadErr == nil && loaded.Config.Daemon.Mode == config.DaemonModeLaunchd {
-			return r.stopLaunchdDaemon(ctx, out, loaded, startIfMissing)
+			return r.stopLaunchdDaemon(ctx, out, loaded, nil, startIfMissing)
 		}
 		if startIfMissing {
 			if _, err := fmt.Fprintln(out, "No daemon pid file found; starting daemon."); err != nil {

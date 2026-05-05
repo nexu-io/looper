@@ -87,13 +87,35 @@ func (r *commandRuntime) resolveDaemonStatePath() (string, error) {
 
 func (r *commandRuntime) resolveLaunchdPlistPath(loaded config.LoadedFileConfig) (string, error) {
 	if loaded.Config.Daemon.PlistPath != nil && strings.TrimSpace(*loaded.Config.Daemon.PlistPath) != "" {
-		return *loaded.Config.Daemon.PlistPath, nil
+		return r.resolveStablePath(*loaded.Config.Daemon.PlistPath)
 	}
 	homeDir, err := r.homeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(homeDir, "Library", "LaunchAgents", launchdLooperdLabel+".plist"), nil
+}
+
+func (r *commandRuntime) resolveStablePath(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", nil
+	}
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed), nil
+	}
+	cwd, err := r.getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(filepath.Join(cwd, trimmed)), nil
+}
+
+func (r *commandRuntime) resolveLaunchdPlistPathForState(loaded config.LoadedFileConfig, state *daemonLifecycleState) (string, error) {
+	if state != nil && state.Supervisor != nil && strings.TrimSpace(state.Supervisor.PlistPath) != "" {
+		return r.resolveStablePath(state.Supervisor.PlistPath)
+	}
+	return r.resolveLaunchdPlistPath(loaded)
 }
 
 func daemonLogState(loaded config.LoadedFileConfig) daemonLifecycleLogState {
@@ -222,7 +244,28 @@ func (r *commandRuntime) refreshLaunchdLifecycleState(ctx context.Context, loade
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	pid := r.launchdPID(ctx, launchctlPath, domain, label)
-	if pid <= 0 || pid == state.PID {
+	if pid <= 0 {
+		if state.PID == 0 {
+			return state, nil
+		}
+		updated := *state
+		updated.PID = 0
+		now := time.Now().UTC()
+		updated.LastExit = &daemonLifecycleExitState{At: now, Reason: fmt.Sprintf("launchd service %s is not reporting a pid; clearing stale pid %d", label, state.PID), LogPath: state.Logs.Main}
+		updated.LastError = updated.LastExit.Reason
+		if updated.Logs.Main == "" {
+			updated.Logs = daemonLogState(loaded)
+		}
+		if err := r.writeDaemonLifecycleState(statePath, updated); err != nil {
+			return state, err
+		}
+		pidPath, err := r.resolveDaemonPIDFilePath()
+		if err == nil {
+			r.removePIDFile(pidPath)
+		}
+		return &updated, nil
+	}
+	if pid == state.PID {
 		return state, nil
 	}
 	updated := *state
@@ -312,7 +355,7 @@ func (r *commandRuntime) startLaunchdDaemon(ctx context.Context, out io.Writer, 
 	return err
 }
 
-func (r *commandRuntime) stopLaunchdDaemon(ctx context.Context, out io.Writer, loaded config.LoadedFileConfig, startIfMissing bool) (bool, error) {
+func (r *commandRuntime) stopLaunchdDaemon(ctx context.Context, out io.Writer, loaded config.LoadedFileConfig, state *daemonLifecycleState, startIfMissing bool) (bool, error) {
 	if r.platform() != "darwin" {
 		return false, fmt.Errorf("daemon.mode=launchd is only supported on macOS; cannot stop launchd supervision on this platform")
 	}
@@ -320,7 +363,7 @@ func (r *commandRuntime) stopLaunchdDaemon(ctx context.Context, out io.Writer, l
 	if err != nil || strings.TrimSpace(launchctlPath) == "" {
 		return false, fmt.Errorf("daemon.mode=launchd requires launchctl to stop supervised looperd")
 	}
-	plistPath, err := r.resolveLaunchdPlistPath(loaded)
+	plistPath, err := r.resolveLaunchdPlistPathForState(loaded, state)
 	if err != nil {
 		return false, err
 	}
@@ -333,7 +376,9 @@ func (r *commandRuntime) stopLaunchdDaemon(ctx context.Context, out io.Writer, l
 		return false, fmt.Errorf("launchctl bootout failed: %s", strings.TrimSpace(result.Stderr))
 	}
 	statePath, _ := r.resolveDaemonStatePath()
-	state, _ := r.readDaemonLifecycleState(statePath)
+	if state == nil {
+		state, _ = r.readDaemonLifecycleState(statePath)
+	}
 	if state != nil {
 		now := time.Now().UTC()
 		state.LastExit = &daemonLifecycleExitState{At: now, Reason: "stopped by looper daemon stop", LogPath: state.Logs.Main}
