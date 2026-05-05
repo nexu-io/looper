@@ -101,6 +101,7 @@ func isExplicitTransientGitHubStatus(message string) bool {
 		"503 service unavailable",
 		"504 gateway timeout",
 		"secondary rate limit",
+		"rate limit exceeded",
 		"api rate limit exceeded",
 	} {
 		if strings.Contains(message, fragment) {

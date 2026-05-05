@@ -275,6 +275,7 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
 		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
+		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
