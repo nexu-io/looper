@@ -756,7 +756,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -1320,7 +1320,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			currentLogin = normalizeLogin(lookupLogin)
 			checkpoint.Detail.CurrentLogin = currentLogin
 		}
-		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
@@ -1586,10 +1586,6 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	currentLogin = normalizeLogin(currentLogin)
-	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
-		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, "skipped", "current_user_not_requested", "", "skipped", "current_user_not_requested")
-		return checkpoint, nil
-	}
 	limit := policy.MaxThreadsPerRun
 	if limit <= 0 {
 		limit = 10
@@ -1630,7 +1626,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			decision = threadResolutionAgentDecision{ThreadID: thread.ID, Decision: "needs_human", Evidence: "no classifier decision returned", Confidence: "low"}
 		}
 		result.Processed++
-		auditedForHead := hasThreadResolutionAuditForHead(thread, checkpoint.Snapshot.HeadSHA)
+		auditedForHead := hasSufficientThreadResolutionAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision)
 		commented := false
 		resolved := false
 		skippedReason := ""
@@ -1697,6 +1693,32 @@ func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint
 	return checkpoint
 }
 
+func (r *Runner) hasThreadResolutionFollowUpCandidate(ctx context.Context, cwd, repo string, prNumber int64, headSHA, currentLogin string) bool {
+	policy := r.threadResolution
+	if !policy.Enabled || r.github == nil || strings.TrimSpace(headSHA) == "" || strings.TrimSpace(currentLogin) == "" {
+		return false
+	}
+	limit := policy.MaxThreadsPerRun
+	if limit <= 0 {
+		limit = 10
+	}
+	fetchLimit := limit * 5
+	if fetchLimit < 100 {
+		fetchLimit = 100
+	}
+	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: prNumber, CWD: cwd, Limit: fetchLimit})
+	if err != nil {
+		r.logWarn("reviewer thread resolution follow-up candidate lookup failed", map[string]any{"repo": repo, "prNumber": prNumber, "error": err.Error()})
+		return false
+	}
+	for _, thread := range threads {
+		if r.threadResolutionCandidate(thread, headSHA, currentLogin, policy) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig) bool {
 	if thread.IsResolved || thread.ID == "" || len(thread.Comments) == 0 {
 		return false
@@ -1709,7 +1731,7 @@ func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, current
 		return false
 	}
 	if policy.RequireNewHeadSinceThread && headSHA != "" {
-		threadSHA := latestThreadFeedbackCommitOID(thread)
+		threadSHA := originalThreadFeedbackCommitOID(thread)
 		if threadSHA == "" || threadSHA == headSHA {
 			return false
 		}
@@ -1727,9 +1749,6 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 	}
 	if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
 		return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
-	}
-	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
-		return nil, detail, nil
 	}
 	latest, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: limit})
 	if err != nil {
@@ -1871,6 +1890,13 @@ func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
 	return false
 }
 
+func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadResolutionConfig, thread ReviewThread, headSHA string, decision threadResolutionAgentDecision) bool {
+	if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && isObjectiveThreadResolutionDecision(decision) {
+		return hasObjectiveThreadResolutionAuditForHead(thread, thread.ID, headSHA)
+	}
+	return hasThreadResolutionAuditForHead(thread, headSHA)
+}
+
 func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA string) bool {
 	for _, comment := range thread.Comments {
 		body := comment.Body
@@ -1892,6 +1918,18 @@ func isLooperAuthoredThread(thread ReviewThread) bool {
 func latestThreadFeedbackCommitOID(thread ReviewThread) string {
 	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
+		if strings.Contains(comment.Body, "looper:thread-resolution") {
+			continue
+		}
+		if oid := firstNonEmpty(comment.CommitOID, comment.OriginalCommitOID); oid != "" {
+			return oid
+		}
+	}
+	return ""
+}
+
+func originalThreadFeedbackCommitOID(thread ReviewThread) string {
+	for _, comment := range thread.Comments {
 		if strings.Contains(comment.Body, "looper:thread-resolution") {
 			continue
 		}
