@@ -2043,6 +2043,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
 			return checkpoint, err
 		}
+		if checkpoint.SkipReason != "" {
+			return checkpoint, nil
+		}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {

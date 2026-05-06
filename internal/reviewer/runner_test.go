@@ -4009,6 +4009,61 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunReviewStepStopsAfterStaleReprepareDuringReview(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{prepareErr: &gitinfra.RemoteHeadChangedError{Branch: "refs/pull/42/head", ExpectedHeadSHA: "abc123", ActualHeadSHA: "def456"}, worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	prNumber := int64(42)
+	loopTarget := "pr:42"
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	initialCheckpoint := reviewerCheckpoint{
+		Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+		Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "deleted-worktree"), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+	}
+	checkpointJSON := mustMarshalJSON(initialCheckpoint)
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:    *project,
+		Loop:       loop,
+		Run:        run,
+		Repo:       "acme/looper",
+		PRNumber:   prNumber,
+		Checkpoint: initialCheckpoint,
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "stale" || !contains(checkpoint.SkipReason, "Remote head changed for refs/pull/42/head") {
+		t.Fatalf("checkpoint = %#v, want stale remote-head skip", checkpoint)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want 0", len(agent.starts))
+	}
+	persistedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persistedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", persistedRun, err)
+	}
+	persistedCheckpoint := parseCheckpoint(persistedRun.CheckpointJSON)
+	if persistedCheckpoint.SkipKind != "stale" || !contains(persistedCheckpoint.SkipReason, "Remote head changed for refs/pull/42/head") {
+		t.Fatalf("persisted checkpoint = %#v, want stale remote-head skip", persistedCheckpoint)
+	}
+}
+
 func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
