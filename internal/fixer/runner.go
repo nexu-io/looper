@@ -1339,6 +1339,18 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Push == nil {
 		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
 	}
+	fixItems := checkpoint.FixItems
+	if checkpoint.Push != nil && !checkpoint.Push.Pushed {
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, err
+		}
+		fixItems = collectFixItems(detail)
+		checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+	}
+	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
+		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
+	}
 	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != "" {
 		if err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: checkpoint.ReconcileCommits.FinalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
 			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", checkpoint.ReconcileCommits.FinalHeadSHA, firstNonEmpty(actual, "unknown"))
@@ -1350,7 +1362,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
 	failedCount := 0
-	for _, item := range checkpoint.FixItems {
+	for _, item := range fixItems {
 		if item.Type != "comment" {
 			continue
 		}
@@ -2211,6 +2223,30 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {
 	return checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.PreparedAt == ""
+}
+
+func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem) bool {
+	if checkpoint.Push == nil || checkpoint.Push.Pushed {
+		return false
+	}
+	if checkpoint.ReconcileCommits == nil {
+		return false
+	}
+	if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
+		return false
+	}
+	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.BaseHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA != checkpoint.ReconcileCommits.BaseHeadSHA {
+		return false
+	}
+	if checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Pushed {
+		return false
+	}
+	for _, item := range fixItems {
+		if item.Type == "comment" {
+			return true
+		}
+	}
+	return false
 }
 
 func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint {
