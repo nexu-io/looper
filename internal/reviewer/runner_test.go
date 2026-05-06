@@ -4128,6 +4128,34 @@ func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
 	}
 }
 
+func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t *testing.T) {
+	runner := New(Options{})
+	for _, message := range []string{
+		`Error: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded"}}`,
+		"anthropic overloaded_error: retry later",
+		"POST https://api.anthropic.com/v1/messages: unexpected EOF",
+		"net/http: TLS handshake timeout",
+		"anthropic request failed with HTTP 529",
+		"anthropic request failed with status code: 429",
+	} {
+		if !runner.isTransientExternalFailure(fmt.Errorf("%s", message)) {
+			t.Fatalf("isTransientExternalFailure(%q) = false, want true", message)
+		}
+	}
+}
+
+func TestRetryDelayHonorsRetryAfterAndCapsBackoff(t *testing.T) {
+	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7")); got != 7*time.Second {
+		t.Fatalf("retryDelay(retry-after) = %v, want 7s", got)
+	}
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120")); got != maxRetryDelay {
+		t.Fatalf("retryDelay(capped retry-after) = %v, want %v", got, maxRetryDelay)
+	}
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded")); got != maxRetryDelay {
+		t.Fatalf("retryDelay(capped exponential) = %v, want %v", got, maxRetryDelay)
+	}
+}
+
 func TestProcessClaimedItemRetriesTransientModelOverloadInRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed"}, {Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}, waitErrs: []error{fmt.Errorf("service_unavailable_error: server_is_overloaded")}}

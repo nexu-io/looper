@@ -78,9 +78,12 @@ const (
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 3
+	maxRetryDelay       = 60 * time.Second
 
 	defaultHeadChangePollInterval = 15 * time.Second
 )
+
+var retryAfterPattern = regexp.MustCompile(`(?i)retry-after\s*[:=]\s*(\d+)`)
 
 type PullRequestSummary struct {
 	Number         int64
@@ -1210,6 +1213,11 @@ func (r *Runner) executeStepOnce(ctx context.Context, step ReviewerStep, input s
 }
 
 func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
+	if _, ok := ctx.Deadline(); !ok && r.agentTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.agentTimeout)
+		defer cancel()
+	}
 	maxAttempts := r.retryMaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = defaultRetryMax
@@ -1227,8 +1235,12 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 		if attempt >= maxAttempts || !r.isTransientExternalFailure(err) {
 			break
 		}
-		delay := backoffDelay(r.retryBaseDelay, attempt)
-		r.logWarn("reviewer transient external failure retrying", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "nextAttempt": attempt + 1, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
+		delay := retryDelay(r.retryBaseDelay, attempt, err)
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+			r.logWarn("reviewer transient external retry budget exhausted", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
+			break
+		}
+		r.logInfo("reviewer transient external failure retrying", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "nextAttempt": attempt + 1, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
 		if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
 			return checkpoint, errors.Join(err, sleepErr)
 		}
@@ -4296,7 +4308,35 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	for i := int64(1); i < attempts; i++ {
 		delay *= 2
 	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
 	return delay
+}
+
+func retryDelay(base time.Duration, attempts int64, err error) time.Duration {
+	if delay, ok := retryAfterDelay(err); ok {
+		if delay > maxRetryDelay {
+			return maxRetryDelay
+		}
+		return delay
+	}
+	return backoffDelay(base, attempts)
+}
+
+func retryAfterDelay(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	matches := retryAfterPattern.FindStringSubmatch(err.Error())
+	if len(matches) != 2 {
+		return 0, false
+	}
+	seconds, parseErr := time.ParseDuration(matches[1] + "s")
+	if parseErr != nil || seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
 }
 
 func reviewerStepSupportsTransientExternalRetry(step ReviewerStep) bool {
@@ -4320,9 +4360,38 @@ func isTransientModelProviderMessage(message string) bool {
 	for _, fragment := range []string{
 		"server_is_overloaded",
 		"service_unavailable_error",
+		"overloaded_error",
 		"server is overloaded",
 		"service unavailable",
 		"overloaded",
+		"unexpected eof",
+		"tls handshake timeout",
+		"connection reset by peer",
+		"connection refused",
+		"connection timed out",
+		"i/o timeout",
+		"temporary failure in name resolution",
+		"network is unreachable",
+		"http 408",
+		"http 429",
+		"http 500",
+		"http 502",
+		"http 503",
+		"http 504",
+		"http 529",
+		"status code: 408",
+		"status code: 429",
+		"status code: 500",
+		"status code: 502",
+		"status code: 503",
+		"status code: 504",
+		"status code: 529",
+		"408 request timeout",
+		"429 too many requests",
+		"500 internal server error",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
 	} {
 		if strings.Contains(message, fragment) {
 			return true
