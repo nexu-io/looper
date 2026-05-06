@@ -2121,7 +2121,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		message := reviewerAgentFailureMessage("review", result, fmt.Sprintf("Reviewer agent %s", result.Status))
 		kind := FailureRetryableTransient
-		if agent.IsAgentSetupFailureMessage(message) {
+		if isGitHubSelfApprovalFailure(message) {
+			kind = FailureNonRetryable
+		} else if agent.IsAgentSetupFailureMessage(message) {
 			kind = FailureManualIntervention
 		}
 		return checkpoint, &loopError{message: message, kind: kind}
@@ -2460,6 +2462,12 @@ func reviewerAgentFailureMessage(phase string, result AgentResult, fallback stri
 		parts = append(parts, "summary: "+base)
 	}
 	return strings.Join(parts, "; ")
+}
+
+func isGitHubSelfApprovalFailure(message string) bool {
+	normalized := strings.ToLower(message)
+	return strings.Contains(normalized, "can not approve your own pull request") ||
+		strings.Contains(normalized, "cannot approve your own pull request")
 }
 
 func summarizeAgentStderr(stderr string) string {

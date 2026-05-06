@@ -4053,6 +4053,37 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 	}
 }
 
+func TestProcessClaimedItemDoesNotRetryGitHubSelfApprovalFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: `submit validated PR review: HTTP 422: Review Can not approve your own pull request`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+		t.Fatalf("result = %#v, want non_retryable self-approval failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
+	}
+	if queue.Status != "failed" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want failed non_retryable queue item", queue)
+	}
+}
+
 func TestProcessClaimedItemRetriesTransientSnapshotFailureInRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{captureSnapshotErrs: []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "HTTP 504: We couldn't respond to your request in time"}}}}
