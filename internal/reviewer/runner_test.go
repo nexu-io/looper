@@ -12,6 +12,7 @@ import (
 
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
+	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -5152,6 +5153,67 @@ func TestProcessClaimedItemMarksStaleOnUnparsedHeadChangeGuardrail(t *testing.T)
 	}
 }
 
+func TestProcessClaimedItemMarksStaleOnEmbeddedUnparsedGuardrail(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stderr: "fatal: publish aborted: review request removed before publish; not posting review"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "review request removed before publish") {
+		t.Fatalf("result = %#v, want stale review-request skip", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
+	}
+}
+
+func TestProcessClaimedItemMarksStaleWhenRemoteHeadChangesDuringWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{prepareErr: &gitinfra.RemoteHeadChangedError{Branch: "refs/pull/42/head", ExpectedHeadSHA: "abc123", ActualHeadSHA: "def456"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "Remote head changed for refs/pull/42/head") {
+		t.Fatalf("result = %#v, want stale remote-head skip", result)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("GetLatestByLoopID() = (%#v, %v), want run", latestRun, err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
+	}
+}
+
 func TestRunReviewStepIgnoresPromptEchoedRediscoveryGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -5766,6 +5828,7 @@ type fakeGitGateway struct {
 	prepareCalls []PrepareWorktreeInput
 	cleanupCalls []CleanupWorktreeInput
 	prepareClean *bool
+	prepareErr   error
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -5783,6 +5846,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
 	f.prepareCalls = append(f.prepareCalls, input)
+	if f.prepareErr != nil {
+		return PrepareWorktreeResult{}, f.prepareErr
+	}
 	clean := true
 	if f.prepareClean != nil {
 		clean = *f.prepareClean

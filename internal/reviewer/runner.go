@@ -21,6 +21,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
+	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
@@ -1564,6 +1565,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	}
 	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
+		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
+		if errors.As(err, &remoteHeadChanged) {
+			return markReviewerRunStale(checkpoint, remoteHeadChanged.Error()), nil
+		}
 		return checkpoint, err
 	}
 	if !prepared.Clean {
@@ -3219,6 +3224,10 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if errors.As(err, &typed) {
 		return typed
 	}
+	var remoteHeadChanged *gitinfra.RemoteHeadChangedError
+	if errors.As(err, &remoteHeadChanged) {
+		return &loopError{message: remoteHeadChanged.Error(), kind: FailureRetryableAfterResume}
+	}
 	var transient transientFailure
 	if errors.As(err, &transient) && transient.Temporary() {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -3384,15 +3393,39 @@ func rediscoverySignalFromAgentResult(result AgentResult, allowReviewRequestSign
 	for _, candidate := range []string{result.Summary, result.Stdout, result.Stderr} {
 		for _, line := range strings.Split(candidate, "\n") {
 			line = strings.TrimSpace(line)
+			searchable := stripMarkdownCodeSpans(line)
 			switch {
-			case line == "PR head changed before publish" || strings.HasPrefix(line, "PR head changed before publish:"):
-				return line, true
-			case allowReviewRequestSignal && line == "review request removed before publish":
-				return line, true
+			case strings.Contains(searchable, "PR head changed before publish"):
+				return extractRediscoverySignal(searchable, "PR head changed before publish"), true
+			case allowReviewRequestSignal && strings.Contains(searchable, "review request removed before publish"):
+				return extractRediscoverySignal(searchable, "review request removed before publish"), true
 			}
 		}
 	}
 	return "", false
+}
+
+func stripMarkdownCodeSpans(line string) string {
+	for {
+		start := strings.Index(line, "`")
+		if start < 0 {
+			return line
+		}
+		end := strings.Index(line[start+1:], "`")
+		if end < 0 {
+			return line
+		}
+		end += start + 1
+		line = line[:start] + line[end+1:]
+	}
+}
+
+func extractRediscoverySignal(line, signal string) string {
+	index := strings.Index(line, signal)
+	if index < 0 {
+		return strings.TrimSpace(line)
+	}
+	return strings.TrimSpace(line[index:])
 }
 
 func stepsFrom(start ReviewerStep) []ReviewerStep {
