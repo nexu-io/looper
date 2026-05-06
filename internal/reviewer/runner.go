@@ -2140,6 +2140,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, MarkerVerificationMisses: 1}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
@@ -2347,8 +2349,8 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	if err != nil || found.Found {
 		return found, err
 	}
-	headMarker := agentNativeHeadReviewMarker(headSHA)
-	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: headMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	loopMarker := agentNativeLoopReviewMarker(input.Loop.ID, headSHA)
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
@@ -4268,8 +4270,8 @@ func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey strin
 	return fmt.Sprintf("looper:review id=%s head=%s", idempotencyKey, headSHA)
 }
 
-func agentNativeHeadReviewMarker(headSHA string) string {
-	return fmt.Sprintf("looper:review head=%s", headSHA)
+func agentNativeLoopReviewMarker(loopID string, headSHA string) string {
+	return fmt.Sprintf("looper:review id_prefix=reviewer:%s: head=%s", loopID, headSHA)
 }
 
 func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {

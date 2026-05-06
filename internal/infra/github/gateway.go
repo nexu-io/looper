@@ -1056,6 +1056,9 @@ func (m reviewIdempotencyMarker) matches(marker string) bool {
 	if id := fields["id"]; id != "" && id != m.ID {
 		return false
 	}
+	if idPrefix := fields["id_prefix"]; idPrefix != "" && !strings.HasPrefix(m.ID, idPrefix) {
+		return false
+	}
 	if head := fields["head"]; head != "" && head != m.Head {
 		return false
 	}

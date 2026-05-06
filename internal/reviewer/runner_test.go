@@ -3256,6 +3256,14 @@ func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "valid completion marker") {
 		t.Fatalf("result = %#v, want retryable completion marker failure", result)
 	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("GetLatestByLoopID() error = %v", err)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" || checkpoint.PendingReview == nil || checkpoint.PendingReview.MarkerVerificationMisses != 1 {
+		t.Fatalf("checkpoint = %#v, want pending marker verification before retry", checkpoint)
+	}
 }
 
 func TestProcessClaimedItemRecoversMissingCompletionMarkerWhenReviewMarkerExists(t *testing.T) {
@@ -3319,6 +3327,10 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarker
 		if input.AuthorLogin == "" {
 			t.Fatalf("review marker input %d has empty author login; tolerant lookup must stay author-scoped", i)
 		}
+	}
+	wantIDPrefix := fmt.Sprintf("id_prefix=reviewer:%s:", result.LoopID)
+	if !contains(github.reviewMarkerInputs[1].Marker, wantIDPrefix) {
+		t.Fatalf("tolerant marker = %q, want loop-scoped id prefix", github.reviewMarkerInputs[1].Marker)
 	}
 }
 
