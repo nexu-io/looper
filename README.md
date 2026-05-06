@@ -4,77 +4,96 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
 
-**Run an autonomous AI dev team across all your GitHub repos — plan, review, fix, and ship, on a loop.**
+**An autonomous AI dev team for your GitHub repos — plan, review, fix, and ship PRs, on a loop.**
 
-Register every repo you own. Looper watches them all, picks up labeled issues, and runs specialized AI agents — **planner → reviewer ↔ fixer → worker** — until the work is shipped. You stay in GitHub; Looper handles the spec, review cycle, and implementation in isolated worktrees.
+> *"LLMs are exceptionally good at looping until they meet specific goals... Don't tell it what to do, give it success criteria and watch it go."*
+> — Andrej Karpathy
+
+Looper turns that idea into a local AI dev team. Register the repos you want it to watch; Looper picks up assigned, labeled issues and runs specialized agents — **planner → reviewer ↔ fixer → worker** — each looping against its own success criteria until the PR is ready for human merge. GitHub stays the source of truth; Looper handles the spec, review cycle, and implementation in isolated worktrees.
 
 ![Looper technical architecture](assets/looper-technical-architecture.png)
 
-# Features
+Looper ships two binaries:
 
-- 🚢 **Ship from an issue, not a prompt.** Label `looper:plan`, assign it, and a spec PR shows up. Approve it, and implementation begins.
-- 🛰️ **Every repo, one daemon.** Register all your projects once — Looper watches them together and runs loops across repos in parallel.
-- 🔁 **Review loops that converge.** Reviewer and fixer ping-pong on a PR until threads are resolved and the review is clean — no babysitting.
-- 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents can work across issues and repos without stepping on each other.
+- `looperd` — the background daemon that polls GitHub, runs loops, and manages worktrees
+- `looper` — the CLI for setup, control, inspection, and manual loop starts
+
+## Four loops, four success criteria
+
+Each role is an agent that keeps looping until *its* exit condition is met — no fixed step counts, just goals.
+
+- 🧭 **Planner** — *loops until the spec is reviewable.* Reads the issue, explores the repo, drafts a spec, critiques it, and revises until the plan is concrete enough to open a spec PR. Done when the spec PR is open and labeled `looper:spec-reviewing`.
+- 🔍 **Reviewer** — *loops until the PR meets the bar.* Re-reads the PR on every new commit, posts inline threads, and keeps re-reviewing as the fixer pushes changes. Done when no actionable threads remain and the review comes back clean.
+- 🔧 **Fixer** — *loops until reviewer threads are handled.* Pulls open review comments, addresses them in the worktree, pushes, and waits for the reviewer's next pass. Ping-pongs with the reviewer until the PR converges. Done when every actionable thread is resolved, or replied to when human input is needed.
+- 🚢 **Worker** — *loops until the PR is ready for merge.* Takes the `looper:spec-ready` spec PR, implements the spec on top of it, runs checks, and iterates on its own output. Done when checks pass and the PR is ready for human review and merge.
+
+The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands off to worker, and `looperd` gates each transition on GitHub labels — so you can pause, intervene, or take over at any boundary.
+
+## Features
+
+- 🚢 **Start from an issue, not a prompt.** Label an issue `looper:plan`, assign it to yourself, and a spec PR shows up. Once it reaches `looper:spec-ready`, implementation begins.
+- 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
+- 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
-- 🧰 **Local, inspectable, killable.** A Go daemon (`looperd`) on your machine, a thin CLI (`looper`) to drive it. `looper ps`, `looper logs`, `looper stop` — it's just processes.
-
-This repo ships two binaries:
-
-- `cmd/looperd` — the background daemon that runs loops, polls GitHub, and manages worktrees
-- `cmd/looper` — the CLI you actually talk to
+- 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI to drive it. `looper ps`, `looper logs`, `looper stop` — no hosted control plane.
 
 ## How it works
 
+The four loops above are the conceptual model. Here's the GitHub label state machine `looperd` actually drives:
+
 ```
-GitHub issue  ──►  planner  ──►  spec PR
-                                   │
-                                   ▼
-                    ┌──────  reviewer  ◄─────┐
-                    │                        │
-                    ▼                        │
-              review clean?  ── no ──►  fixer
-                    │
-                   yes
-                    │
-                    ▼
-                 worker  ──►  implementation PR  ──►  🎉
+issue (looper:plan, assigned)
+       │
+       ▼
+   planner ──► spec PR (looper:spec-reviewing)
+                       │
+                       ▼
+                reviewer ⇄ fixer
+                       │  clean
+                       ▼
+              PR labeled looper:spec-ready
+                       │
+                       ▼
+                    worker
+                       │
+                       ▼
+              PR ready for human merge  🎉
 ```
 
-Each role is an agent run in its own worktree, coordinated by `looperd` and gated by GitHub labels. The planner opens a spec PR, reviewer and fixer loop until the spec is clean, and `looper:spec-ready` hands the approved spec to the worker for implementation.
+Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
 Looper is poll-driven, not webhook-driven: keep `looperd` running and `gh` authenticated for the loop to fire. Everything runs locally — no hosted control plane required.
 
 ## Install
 
-One-liner (macOS, `darwin-arm64`):
+Fast path (macOS, `darwin-arm64`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/install.sh | sh
 looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 ```
 
-`bootstrap` writes your config, installs the managed daemon, registers the project, and starts `looperd`.
+`bootstrap` writes your config, installs the managed daemon, registers the repo as a project, and starts `looperd`.
 
 Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
 
 ## Quick start
 
-Once `looper status` and `gh auth status` both look healthy:
+Once `looper status` succeeds and `gh auth status` shows an authenticated account:
 
 ```bash
 # plan a spec from an issue
-looper plan --project myproj --issue 123
+looper plan --project <id> --issue <num>
 
-# review a PR (one-shot, or keep looping as new commits land)
-looper review owner/repo#42
-looper review owner/repo#42 --loop
+# review a PR — one-shot, or keep looping as new commits land
+looper review <owner>/<repo>#<pr>
+looper review <owner>/<repo>#<pr> --loop
 
 # implement from an issue (reuses planner's spec PR if one exists)
-looper work --issue 123
+looper work --project <id> --issue <num>
 ```
 
-Inside a registered repo, `--project` is usually optional for `review` and `work`. Pass it explicitly from outside the repo or when multiple projects could match.
+Inside a registered repo, `--project` is usually optional for `review` and `work`, and you can drop the `<owner>/<repo>` prefix on PR refs. Pass them explicitly from outside the repo or when multiple projects could match.
 
 The full workflow — label conventions, assignment rules, how planner / reviewer / fixer / worker hand off — is in **[docs/users-guide.md](docs/users-guide.md)**.
 
@@ -86,24 +105,27 @@ The full workflow — label conventions, assignment rules, how planner / reviewe
 looper bootstrap            # first-run setup
 looper status               # daemon + config health
 looper version
-looper project list|add
+looper project list
+looper project add /path/to/repo
 ```
 
-**Run the loop**
+**Start loops manually**
 
 ```bash
 looper plan   --project <id> --issue <num>
-looper review <pr> [--loop]
-looper work   --issue <num>
-looper loop start --type fixer --pr <repo>#<pr>
+looper review <owner>/<repo>#<pr> [--loop]
+looper work   --project <id> --issue <num>
+looper loop start --type fixer --pr <owner>/<repo>#<pr>
 ```
+
+`--project` and the `<owner>/<repo>` prefix can be omitted when run from inside a uniquely registered repo.
 
 **Inspect PRs**
 
 ```bash
 looper pr list
-looper pr show   <repo>#<pr>
-looper pr status <repo>#<pr>
+looper pr show   <owner>/<repo>#<pr>
+looper pr status <owner>/<repo>#<pr>
 ```
 
 **Manage running loops**
@@ -124,9 +146,9 @@ looper daemon install|start|stop|restart|status
 ## Configuration
 
 - Default config: `~/.looper/config.json`
-- Precedence: defaults → config file → environment → CLI flags
+- Precedence: defaults → config file → env → CLI flags
 - `agent.vendor` is required to run loops (no default)
-- If `server.authMode=local-token`, the CLI reads `LOOPER_TOKEN`
+- If `server.authMode=local-token`, set `server.localToken` and export `LOOPER_TOKEN` for the CLI
 
 Every field, env var, CLI flag, validation rule, and troubleshooting note lives in **[docs/configuration.md](docs/configuration.md)**.
 
@@ -138,8 +160,8 @@ From the repo root:
 go run ./cmd/looperd
 go run ./cmd/looper <args>
 go build ./...
-go vet   ./...
-go test  ./...
+go vet ./...
+go test ./...
 ```
 
 Build artifacts go to `dist/` and are gitignored — don't edit generated files.
@@ -147,7 +169,7 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 ## Runtime notes
 
 - `looperd` fails fast on invalid config; runtime paths must be writable
-- Managed daemon installs live at `~/.looper/bin/looperd`
-- Daemon-managed worktrees live under `~/.looper/worktrees/<project-id>/`
+- The managed daemon binary lives at `~/.looper/bin/looperd`
+- Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
 - When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
-- Automation is poll-driven, not webhook-driven — keep `looperd` and `gh` running for the loop to fire
+- Automation is poll-driven, not webhook-driven — keep `looperd` running and `gh` installed and authenticated for the loop to fire
