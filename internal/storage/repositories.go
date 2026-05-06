@@ -1332,6 +1332,44 @@ func (r *QueueRepository) RequeueFailedByID(ctx context.Context, loopID, queueID
 	return affected, nil
 }
 
+func (r *QueueRepository) RequeueFailedByIDWithAttempts(ctx context.Context, loopID, queueID, queuedAt string, attempts int64) (int64, error) {
+	if loopID == "" || queueID == "" {
+		return 0, nil
+	}
+	if attempts < 0 {
+		attempts = 0
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			finished_at = NULL,
+			last_error = NULL,
+			last_error_kind = NULL,
+			updated_at = ?
+		WHERE id = ? AND loop_id = ? AND status = 'failed'
+			AND NOT EXISTS (
+				SELECT 1 FROM queue_items
+				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
+			)
+	`, queuedAt, attempts, queuedAt, queueID, loopID, loopID, queueID)
+	if err != nil {
+		return 0, fmt.Errorf("requeue failed queue item by id with attempts: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeue failed queue item rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
 func (r *QueueRepository) findLatestQueueIDByLoopStatus(ctx context.Context, loopID, status string) (string, error) {
 	row := r.q.QueryRowContext(ctx, `
 		SELECT id

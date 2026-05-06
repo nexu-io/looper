@@ -2911,7 +2911,11 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 		return nil, nil
 	}
 	nowISO := r.nowISO()
-	requeued, err := r.repos.Queue.RequeueFailedByID(ctx, loop.ID, queueID, nowISO)
+	latestQueue, err := r.repos.Queue.GetByID(ctx, queueID)
+	if err != nil {
+		return nil, err
+	}
+	requeued, err := r.requeueFailedReviewerQueueItem(ctx, loop.ID, queueID, nowISO, latestQueue)
 	if err != nil {
 		return nil, err
 	}
@@ -2947,6 +2951,13 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 	r.logInfo("reviewer auto-recovered failed loop", map[string]any{"loopId": loop.ID, "reason": reason})
 	r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.requeued", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason, "attempt": intFromAny(reviewerLoopMetadata(parseJSONObject(updated.MetadataJSON))["autoRecoveryAttempts"])}})
 	return &updated, nil
+}
+
+func (r *Runner) requeueFailedReviewerQueueItem(ctx context.Context, loopID, queueID, queuedAt string, queue *storage.QueueItemRecord) (int64, error) {
+	if queue != nil && isRetryableTransientWithRemainingAttempts(*queue) {
+		return r.repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, queueID, queuedAt, queue.Attempts)
+	}
+	return r.repos.Queue.RequeueFailedByID(ctx, loopID, queueID, queuedAt)
 }
 
 func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary) (bool, string, string, error) {
@@ -3016,6 +3027,16 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		}
 		return true, latestQueue.ID, "retryable_after_resume_" + checkpoint.ResumePolicy, nil
 	}
+	if isRetryableTransientWithRemainingAttempts(*latestQueue) {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
+		return true, latestQueue.ID, "retryable_transient_attempts_remaining", nil
+	}
 	latestMessage := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 	if latestMessage == "" {
 		latestMessage = derefString(latestQueue.LastError)
@@ -3031,6 +3052,10 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		return true, latestQueue.ID, "historical_guardrail", nil
 	}
 	return false, "", "not_whitelisted", nil
+}
+
+func isRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {
+	return derefString(queue.LastErrorKind) == string(FailureRetryableTransient) && queue.Attempts < queue.MaxAttempts
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {

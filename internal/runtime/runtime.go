@@ -793,7 +793,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			continue
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
-			recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
+			recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO)
 			if err != nil {
 				return RecoverySummary{}, err
 			}
@@ -1014,7 +1014,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
 			continue
 		}
-		recoveredQueueItems, err := repositories.Queue.RequeueFailedByID(ctx, loop.ID, latestQueue.ID, nowISO)
+		recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO)
 		if err != nil {
 			return requeued, err
 		}
@@ -1616,7 +1616,21 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)
-	return (queueKind == "retryable_after_resume" && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review")) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+	return (queueKind == "retryable_after_resume" && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+}
+
+func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories *storage.Repositories, loopID string, latestQueue *storage.QueueItemRecord, queuedAt string) (int64, error) {
+	if latestQueue != nil && isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) {
+		return repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, latestQueue.ID, queuedAt, latestQueue.Attempts)
+	}
+	if latestQueue == nil {
+		return 0, nil
+	}
+	return repositories.Queue.RequeueFailedByID(ctx, loopID, latestQueue.ID, queuedAt)
+}
+
+func isRuntimeRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {
+	return derefString(queue.LastErrorKind) == "retryable_transient" && queue.Attempts < queue.MaxAttempts
 }
 
 func autoRecoveredReviewerLoop(loop storage.LoopRecord, nowISO string) storage.LoopRecord {

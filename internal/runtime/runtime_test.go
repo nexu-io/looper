@@ -1862,6 +1862,26 @@ func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *te
 	}
 }
 
+func TestShouldAutoRecoverFailedReviewerLoopAllowsRetryableTransientWithAttemptsRemaining(t *testing.T) {
+	t.Parallel()
+	errorKind := "retryable_transient"
+	errorMessage := "reviewer agent timed out (max_runtime)"
+	step := "review"
+	checkpoint := `{"resumePolicy":"replay_step","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":3}}`)}
+	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
+	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", Attempts: 3, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &errorKind}
+	policy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true}
+
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
+	}
+	queue.Attempts = 5
+	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false after retry budget exhausted")
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"

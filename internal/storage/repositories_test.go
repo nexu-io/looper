@@ -761,6 +761,40 @@ func TestQueueRequeueFailedByIDRequiresMatchingLoopAndNoActiveQueue(t *testing.T
 	}
 }
 
+func TestQueueRequeueFailedByIDWithAttemptsPreservesAttemptBudget(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_requeue_attempts", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_requeue_attempts"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_requeue_attempts", Type: "reviewer", TargetType: "pull_request", Status: "failed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastError := "reviewer agent timed out"
+	lastErrorKind := "retryable_transient"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "failed_attempts", LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:a", DedupeKey: "reviewer:attempts", Priority: QueuePriorityReviewer, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 5, LastError: &lastError, LastErrorKind: &lastErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	affected, err := repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, "failed_attempts", now, 3)
+	if err != nil {
+		t.Fatalf("RequeueFailedByIDWithAttempts() error = %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("RequeueFailedByIDWithAttempts() affected = %d, want 1", affected)
+	}
+	item, _ := repos.Queue.GetByID(ctx, "failed_attempts")
+	if item == nil || item.Status != "queued" || item.Attempts != 3 || item.LastError != nil || item.LastErrorKind != nil {
+		t.Fatalf("failed_attempts = %#v, want queued with preserved attempts and cleared failure metadata", item)
+	}
+}
+
 func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	t.Parallel()
 
