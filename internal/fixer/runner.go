@@ -1346,7 +1346,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			return checkpoint, err
 		}
 		fixItems = collectFixItems(detail)
-		checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
 		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
@@ -2238,9 +2238,6 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.BaseHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA != checkpoint.ReconcileCommits.BaseHeadSHA {
 		return false
 	}
-	if checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Pushed {
-		return false
-	}
 	for _, item := range fixItems {
 		if item.Type == "comment" {
 			return true
@@ -2360,6 +2357,14 @@ func detailLabels(detail *checkpointDetail) []string {
 		return nil
 	}
 	return detail.Labels
+}
+
+func mergeCheckpointDetailPreservingLabels(existing *checkpointDetail, live PullRequestDetail) *checkpointDetail {
+	merged := &checkpointDetail{State: live.State, IsDraft: live.IsDraft, Labels: cloneStrings(live.Labels), HeadSHA: live.HeadSHA, HeadRefName: live.HeadRefName, BaseRefName: live.BaseRefName, BaseSHA: live.BaseSHA, ReviewDecision: live.ReviewDecision, Comments: cloneObjectSlice(live.Comments), Checks: cloneObjectSlice(live.Checks), HasConflicts: live.HasConflicts}
+	if existing != nil {
+		merged.Labels = cloneStrings(existing.Labels)
+	}
+	return merged
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {

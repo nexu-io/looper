@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -533,6 +534,115 @@ func TestProcessClaimedItemAllowsNoCommitWhenCommentsAlreadyResolved(t *testing.
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
 		t.Fatalf("commit calls=%d push calls=%d resolve calls=%d, want 0/0/0 after already-resolved live comments", len(git.commitCalls), len(git.pushCalls), len(github.resolveCalls))
+	}
+}
+
+func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{GitHub: &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "base-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}}})
+	checkpoint := fixerCheckpoint{
+		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Push:       &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Lifecycle:  &lifecycle.State{Pushed: true},
+		ReconcileCommits: &checkpointReconcileCommits{
+			BaseHeadSHA:      "base-head",
+			FinalHeadSHA:     "base-head",
+			NewCommitSHAs:    nil,
+			WorkingTreeClean: true,
+		},
+	}
+
+	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err == nil {
+		t.Fatal("runResolveCommentsStep() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !contains(loopErr.Error(), "produced no new commits") {
+		t.Fatalf("error = %q, want no-new-commits message", loopErr.Error())
+	}
+}
+
+func TestRunResolveCommentsStepPreservesCheckpointLabelSnapshotOnLiveRefresh(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "base-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Labels:      nil,
+		Comments: []map[string]any{{
+			"id":         "c1",
+			"threadId":   "t1",
+			"body":       "please fix",
+			"isResolved": true,
+			"state":      "RESOLVED",
+		}},
+	}}}
+	runner := New(Options{GitHub: github, Now: time.Now})
+	originalLabels := []string{specpr.ReviewingLabel}
+	checkpoint := fixerCheckpoint{
+		Detail: &checkpointDetail{
+			Labels:      append([]string(nil), originalLabels...),
+			HeadSHA:     "base-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			Comments: []map[string]any{{
+				"id":       "c1",
+				"threadId": "t1",
+				"body":     "please fix",
+			}},
+		},
+		FixItems:         []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
+		Validation:       &ValidationResult{Passed: true, Summary: "ok"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if updated.Detail == nil {
+		t.Fatal("updated.Detail = nil, want merged detail")
+	}
+	if !specpr.HasLabel(updated.Detail.Labels, specpr.ReviewingLabel) {
+		t.Fatalf("updated.Detail.Labels = %#v, want preserved %q label", updated.Detail.Labels, specpr.ReviewingLabel)
+	}
+	if len(updated.Detail.Labels) != 1 {
+		t.Fatalf("updated.Detail.Labels = %#v, want preserved snapshot only", updated.Detail.Labels)
 	}
 }
 
