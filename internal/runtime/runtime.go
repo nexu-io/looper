@@ -1630,7 +1630,11 @@ func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories
 }
 
 func isRuntimeRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {
-	return derefString(queue.LastErrorKind) == "retryable_transient" && queue.Attempts < queue.MaxAttempts
+	if derefString(queue.LastErrorKind) != "retryable_transient" {
+		return false
+	}
+	nextAttempts := queue.Attempts + 1
+	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
 }
 
 func autoRecoveredReviewerLoop(loop storage.LoopRecord, nowISO string) storage.LoopRecord {

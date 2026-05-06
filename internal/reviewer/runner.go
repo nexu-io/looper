@@ -3055,7 +3055,11 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 }
 
 func isRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {
-	return derefString(queue.LastErrorKind) == string(FailureRetryableTransient) && queue.Attempts < queue.MaxAttempts
+	if derefString(queue.LastErrorKind) != string(FailureRetryableTransient) {
+		return false
+	}
+	nextAttempts := queue.Attempts + 1
+	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {

@@ -1876,9 +1876,9 @@ func TestShouldAutoRecoverFailedReviewerLoopAllowsRetryableTransientWithAttempts
 	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
 		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
 	}
-	queue.Attempts = 5
+	queue.Attempts = 4
 	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
-		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false after retry budget exhausted")
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false on final allowed run")
 	}
 }
 
