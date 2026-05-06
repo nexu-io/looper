@@ -13,6 +13,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/eventlog"
 	githubinfra "github.com/powerformer/looper/internal/infra/github"
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -4054,7 +4055,7 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 
 func TestProcessClaimedItemRetriesTransientSnapshotFailureInRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{captureSnapshotErrs: []error{&githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504")}}}
+	github := &fakeGitHubGateway{captureSnapshotErrs: []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "HTTP 504: We couldn't respond to your request in time"}}}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	logger := &testLogger{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}, AgentExecutor: agent, Logger: logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
@@ -4078,6 +4079,97 @@ func TestProcessClaimedItemRetriesTransientSnapshotFailureInRun(t *testing.T) {
 	}
 	if !logger.hasMessage("reviewer transient external failure retrying") || !logger.hasMessage("reviewer transient external retry succeeded") {
 		t.Fatalf("logger messages = %#v, want retry attempt and success logs", logger.messages)
+	}
+}
+
+func TestExecuteStepRetriesTransientDiscoverShellFailure(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewErrs: []error{
+		&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": net/http: TLS handshake timeout`}},
+	}}
+	logger := &testLogger{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+
+	checkpoint, err := runner.executeStep(context.Background(), stepDiscover, stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_1"}, Run: storage.RunRecord{ID: "run_1"}, QueueItem: storage.QueueItemRecord{ID: "queue_1"}, Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("executeStep(discover) error = %v, want success after retry", err)
+	}
+	if checkpoint.Detail == nil || checkpoint.Detail.HeadSHA != "abc123" {
+		t.Fatalf("checkpoint.Detail = %#v, want discovered PR detail", checkpoint.Detail)
+	}
+	if github.viewCalls != 2 {
+		t.Fatalf("viewCalls = %d, want 2", github.viewCalls)
+	}
+	if !logger.hasMessage("reviewer transient external failure retrying") || !logger.hasMessage("reviewer transient external retry succeeded") {
+		t.Fatalf("logger messages = %#v, want retry attempt and success logs", logger.messages)
+	}
+}
+
+func TestProcessClaimedItemPersistsExhaustedTransientDiscoverShellFailureAsRetryable(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond, RetryMaxAttempts: 1})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	github.viewErrs = []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": unexpected EOF`}}}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claim", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !strings.Contains(result.Summary, "unexpected EOF") {
+		t.Fatalf("result = %#v, want retryable transient failure preserving GitHub error", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
+	}
+	if queue.Status != "failed" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") {
+		t.Fatalf("queue = %#v, want exhausted retryable transient failure preserving GitHub error", queue)
+	}
+}
+
+func TestProcessClaimedItemSkipsMissingPullRequestInDiscover(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	github.viewErrs = []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Could not resolve to a PullRequest with the number of 345. (repository.pullRequest)"}}}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claim", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "Could not resolve to a PullRequest") {
+		t.Fatalf("result = %#v, want skipped missing PR with original GitHub error", result)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if terminalReviewerLoopReason(*loop) != "terminated" {
+		t.Fatalf("loop = %#v, want terminal terminated loop", loop)
+	}
+	loopMeta := reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))
+	if loopMeta["terminationReason"] != "pr_not_found" {
+		t.Fatalf("loop metadata = %#v, want pr_not_found termination", loopMeta)
 	}
 }
 
@@ -5544,6 +5636,7 @@ type fakeGitHubGateway struct {
 	viewDraft                       bool
 	viewState                       string
 	viewStateAfterFirstView         string
+	viewErrs                        []error
 	addReactionErr                  error
 	removeReactionErr               error
 	addLabelErr                     error
@@ -5592,6 +5685,13 @@ func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 
 func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error) {
 	g.viewCalls++
+	if len(g.viewErrs) > 0 {
+		err := g.viewErrs[0]
+		g.viewErrs = g.viewErrs[1:]
+		if err != nil {
+			return PullRequestDetail{}, err
+		}
+	}
 	headSHA := "abc123"
 	if g.viewHeadSHA != "" {
 		headSHA = g.viewHeadSHA

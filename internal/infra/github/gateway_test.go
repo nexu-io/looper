@@ -298,6 +298,15 @@ func TestIsTransientErrorIgnoresNonGitHubShellFailures(t *testing.T) {
 	}
 }
 
+func TestIsPullRequestNotFoundErrorDetectsGraphQLResolveFailure(t *testing.T) {
+	t.Parallel()
+
+	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Could not resolve to a PullRequest with the number of 345. (repository.pullRequest)"}}
+	if !IsPullRequestNotFoundError(err) {
+		t.Fatal("IsPullRequestNotFoundError(GraphQL resolve failure) = false, want true")
+	}
+}
+
 func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

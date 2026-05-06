@@ -43,6 +43,44 @@ func IsTransientError(err error) bool {
 	return isTransientGitHubMessage(message)
 }
 
+// ErrorMessage returns the most useful user-facing text for a GitHub CLI/API
+// error, including captured command output when the shell error message is only
+// a generic exit-code summary.
+func ErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		return strings.TrimSpace(strings.Join(nonEmptyStrings(commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr), "\n"))
+	}
+	return err.Error()
+}
+
+// IsPullRequestNotFoundError reports whether GitHub could not resolve the PR
+// object, which usually means a queued reviewer loop is stale.
+func IsPullRequestNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		message := strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")
+		return isPullRequestNotFoundMessage(message)
+	}
+	return isPullRequestNotFoundMessage(err.Error())
+}
+
+func nonEmptyStrings(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func looksLikeGitHubFailure(message string) bool {
 	message = strings.ToLower(message)
 	for _, fragment := range []string{
@@ -57,6 +95,11 @@ func looksLikeGitHubFailure(message string) bool {
 		}
 	}
 	return false
+}
+
+func isPullRequestNotFoundMessage(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "could not resolve to a pullrequest")
 }
 
 func isTransientGitHubMessage(message string) bool {

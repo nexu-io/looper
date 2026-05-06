@@ -1239,6 +1239,16 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
+		if githubinfra.IsPullRequestNotFoundError(err) {
+			checkpoint := input.Checkpoint
+			checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
+			checkpoint.SkipKind = "pr_not_found"
+			checkpoint.ResumePolicy = ""
+			if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
+				return checkpoint, terminateErr
+			}
+			return checkpoint, nil
+		}
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
@@ -3224,7 +3234,7 @@ func (r *Runner) classifyFailure(err error) *loopError {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	if githubinfra.IsTransientError(err) {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &loopError{message: githubinfra.ErrorMessage(err), kind: FailureRetryableTransient}
 	}
 	if isTransientModelProviderError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -4301,7 +4311,7 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 
 func reviewerStepSupportsTransientExternalRetry(step ReviewerStep) bool {
 	switch step {
-	case stepSnapshot, stepThreadResolution, stepReview:
+	case stepDiscover, stepSnapshot, stepThreadResolution, stepReview:
 		return true
 	default:
 		return false
