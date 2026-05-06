@@ -1348,15 +1348,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		fixItems = collectFixItems(detail)
 		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
 	}
-	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
-		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
-	}
 	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != "" {
 		if err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: checkpoint.ReconcileCommits.FinalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
 			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", checkpoint.ReconcileCommits.FinalHeadSHA, firstNonEmpty(actual, "unknown"))
 		}}); err != nil {
 			return checkpoint, err
 		}
+	}
+	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
+		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
 	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
