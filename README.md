@@ -118,7 +118,7 @@ looper work   --project <id> --issue <num>
 looper loop start --type fixer --pr <owner>/<repo>#<pr>
 ```
 
-`--project` and the `<owner>/<repo>` prefix can be omitted when run from inside a uniquely registered repo.
+`--project` can be omitted for `plan` / `work` when run from inside a uniquely registered repo; `review` can also omit the `<owner>/<repo>` prefix in that case, but `loop start --pr` always requires `<owner>/<repo>#<pr>`.
 
 **Inspect PRs**
 
