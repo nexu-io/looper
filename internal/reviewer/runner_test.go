@@ -3253,8 +3253,8 @@ func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "valid completion marker") {
-		t.Fatalf("result = %#v, want non-retryable completion marker failure", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "valid completion marker") {
+		t.Fatalf("result = %#v, want retryable completion marker failure", result)
 	}
 }
 
@@ -3288,6 +3288,32 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWhenReviewMarkerExists
 	}
 	if github.reviewMarkerCalls != 2 {
 		t.Fatalf("review marker calls = %d, want parse recovery lookup plus publish verification", github.reviewMarkerCalls)
+	}
+}
+
+func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarkerID(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerExactMissing: true, reviewMarkerBody: "posted review <!-- looper:review id=reviewer:legacy-loop:abc123 head=abc123 outcome=actionable -->"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted maybe", Stdout: "posted maybe"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success after legacy marker recovery", result)
+	}
+	if github.reviewMarkerCalls < 3 {
+		t.Fatalf("review marker calls = %d, want exact miss followed by tolerant lookup", github.reviewMarkerCalls)
 	}
 }
 
@@ -3360,8 +3386,8 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) after retry = %d, want marker recheck without review rerun", len(agent.starts))
 	}
-	if github.reviewMarkerCalls != 2 {
-		t.Fatalf("review marker calls = %d, want initial lookup plus retry", github.reviewMarkerCalls)
+	if github.reviewMarkerCalls != 4 {
+		t.Fatalf("review marker calls = %d, want exact and tolerant initial lookups plus retry", github.reviewMarkerCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
@@ -5666,6 +5692,7 @@ type fakeGitHubGateway struct {
 	currentLoginErr                 error
 	currentLoginCalls               int
 	reviewMarkerMissing             bool
+	reviewMarkerExactMissing        bool
 	reviewMarkerErr                 error
 	reviewMarkerEvent               ReviewEvent
 	reviewMarkerOutcome             string
@@ -5813,6 +5840,9 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	g.reviewMarkerCalls++
 	if g.reviewMarkerErr != nil {
 		return ReviewMarkerResult{}, g.reviewMarkerErr
+	}
+	if g.reviewMarkerExactMissing && strings.Contains(input.Marker, " id=") {
+		return ReviewMarkerResult{}, nil
 	}
 	if g.reviewMarkerEvent != "" && !reviewEventIn(input.AllowedReviewEvents, g.reviewMarkerEvent) {
 		return ReviewMarkerResult{}, nil

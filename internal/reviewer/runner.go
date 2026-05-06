@@ -2140,7 +2140,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
-		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
+		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
 		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
@@ -2341,7 +2341,18 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return ReviewMarkerResult{}, err
 	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
-	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON)), AuthorLogin: currentLogin, AllowCleanComment: sameReviewAuthorLogin(currentLogin, prAuthorLogin), CWD: input.Project.RepoPath})
+	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON))
+	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
+	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	if err != nil || found.Found {
+		return found, err
+	}
+	headMarker := agentNativeHeadReviewMarker(headSHA)
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: headMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	if err != nil || found.Found {
+		return found, err
+	}
+	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: headMarker, AllowedReviewEvents: allowedEvents, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {
@@ -4255,6 +4266,10 @@ func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey strin
 		idempotencyKey = fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 	}
 	return fmt.Sprintf("looper:review id=%s head=%s", idempotencyKey, headSHA)
+}
+
+func agentNativeHeadReviewMarker(headSHA string) string {
+	return fmt.Sprintf("looper:review head=%s", headSHA)
 }
 
 func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {

@@ -792,6 +792,30 @@ func TestGatewayFindReviewMarkerExtractsOutcomeFromMatchedMarker(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerMatchesExpectedHeadWithLegacyID(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"COMMENTED","body":"<!-- looper:review id=reviewer:old-loop:abc123 head=abc123 outcome=actionable -->"},
+				{"state":"COMMENTED","body":"<!-- looper:review id=reviewer:old-loop:def456 head=def456 outcome=actionable -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review head=abc123", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "actionable" || marker.Event != "COMMENT" {
+		t.Fatalf("FindReviewMarker() = %#v, want marker matching expected head despite legacy id", marker)
+	}
+}
+
 func TestGatewayFindReviewMarkerRequiresWellFormedMarker(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
