@@ -4156,6 +4156,18 @@ func TestRetryDelayHonorsRetryAfterAndCapsBackoff(t *testing.T) {
 	}
 }
 
+func TestRetryDelayAddsBoundedJitter(t *testing.T) {
+	base := time.Second
+	wantMin := 2 * base
+	wantMax := wantMin + wantMin/retryJitterDivisor
+	for i := 0; i < 20; i++ {
+		got := retryDelay(base, 2, fmt.Errorf("anthropic overloaded"))
+		if got < wantMin || got > wantMax {
+			t.Fatalf("retryDelay(jittered) = %v, want between %v and %v", got, wantMin, wantMax)
+		}
+	}
+}
+
 func TestProcessClaimedItemRetriesTransientModelOverloadInRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed"}, {Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}, waitErrs: []error{fmt.Errorf("service_unavailable_error: server_is_overloaded")}}

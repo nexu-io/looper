@@ -2,12 +2,14 @@ package reviewer
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -77,8 +79,9 @@ const (
 	defaultAgentTimeout = 90 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
-	defaultRetryMax     = 3
+	defaultRetryMax     = 5
 	maxRetryDelay       = 60 * time.Second
+	retryJitterDivisor  = 4
 
 	defaultHeadChangePollInterval = 15 * time.Second
 )
@@ -4321,7 +4324,26 @@ func retryDelay(base time.Duration, attempts int64, err error) time.Duration {
 		}
 		return delay
 	}
-	return backoffDelay(base, attempts)
+	return jitterDelay(backoffDelay(base, attempts))
+}
+
+func jitterDelay(delay time.Duration) time.Duration {
+	if delay <= 0 || delay >= maxRetryDelay {
+		return delay
+	}
+	maxJitter := delay / retryJitterDivisor
+	if maxJitter <= 0 {
+		return delay
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxJitter)+1))
+	if err != nil {
+		return delay
+	}
+	delay += time.Duration(n.Int64())
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
 }
 
 func retryAfterDelay(err error) (time.Duration, bool) {
