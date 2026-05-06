@@ -2352,7 +2352,7 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	if err != nil || found.Found {
 		return found, err
 	}
-	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: headMarker, AllowedReviewEvents: allowedEvents, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	return found, nil
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {

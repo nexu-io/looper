@@ -3315,6 +3315,11 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarker
 	if github.reviewMarkerCalls < 3 {
 		t.Fatalf("review marker calls = %d, want exact miss followed by tolerant lookup", github.reviewMarkerCalls)
 	}
+	for i, input := range github.reviewMarkerInputs {
+		if input.AuthorLogin == "" {
+			t.Fatalf("review marker input %d has empty author login; tolerant lookup must stay author-scoped", i)
+		}
+	}
 }
 
 func TestProcessClaimedItemRecoversFailedAgentRunWhenReviewMarkerExists(t *testing.T) {
@@ -3386,7 +3391,7 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) after retry = %d, want marker recheck without review rerun", len(agent.starts))
 	}
-	if github.reviewMarkerCalls != 4 {
+	if github.reviewMarkerCalls != 3 {
 		t.Fatalf("review marker calls = %d, want exact and tolerant initial lookups plus retry", github.reviewMarkerCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5700,6 +5705,7 @@ type fakeGitHubGateway struct {
 	reviewMarkerBodyExplicit        bool
 	reviewMarkerInlineCommentBodies []string
 	reviewMarkerCalls               int
+	reviewMarkerInputs              []VerifyReviewMarkerInput
 	viewDraft                       bool
 	viewState                       string
 	viewStateAfterFirstView         string
@@ -5838,6 +5844,7 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 
 func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {
 	g.reviewMarkerCalls++
+	g.reviewMarkerInputs = append(g.reviewMarkerInputs, input)
 	if g.reviewMarkerErr != nil {
 		return ReviewMarkerResult{}, g.reviewMarkerErr
 	}
