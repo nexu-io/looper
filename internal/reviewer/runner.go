@@ -1861,15 +1861,15 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
+	parsed, err := parseThreadResolutionOutput(result.Stdout)
+	if err == nil {
+		return parsed.Decisions, nil
+	}
 	if message := transientProviderMessageFromAgentResult(result); message != "" {
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
-	parsed, err := parseThreadResolutionOutput(result.Stdout)
-	if err != nil {
-		return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
-	}
-	return parsed.Decisions, nil
+	return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
 func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread) string {

@@ -5746,6 +5746,28 @@ func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *test
 	}
 }
 
+func TestRunThreadResolutionStepIgnoresProviderWordsInSuccessfulSummaryJSON(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeCommentOnly
+	jsonOutput := `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"the previous report mentioned service unavailable and overloaded capacity","confidence":"high"}]}`
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", ParseStatus: "missing", Summary: jsonOutput, Stdout: jsonOutput}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 1 {
+		t.Fatalf("ThreadResolution = %#v, want one comment", checkpoint.ThreadResolution)
+	}
+	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "service unavailable") {
+		t.Fatalf("addThreadReplyCalls = %#v, want evidence comment", github.addThreadReplyCalls)
+	}
+}
+
 func TestTransientProviderMessageFromAgentResultIgnoresSuccessfulStdout(t *testing.T) {
 	t.Parallel()
 
