@@ -206,8 +206,8 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 		return output, err
 	}
 	for _, item := range queues {
-		createdAt, ok := parseRunStatsTime(item.CreatedAt)
-		if !ok || createdAt.Before(sinceAt) || item.Attempts <= 0 {
+		updatedAt, ok := parseRunStatsTime(item.UpdatedAt)
+		if !ok || updatedAt.Before(sinceAt) || item.Attempts <= 0 {
 			continue
 		}
 		role := item.Type
