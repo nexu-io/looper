@@ -197,6 +197,33 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 		addEventToStats(&stats, event)
 		output.Roles[role] = stats
 	}
+	queues, err := repos.Queue.List(ctx)
+	if err != nil {
+		return output, err
+	}
+	for _, item := range queues {
+		updatedAt, ok := parseRunStatsTime(item.UpdatedAt)
+		if !ok || updatedAt.Before(sinceAt) || item.Attempts <= 0 {
+			continue
+		}
+		role := item.Type
+		if item.LoopID != nil {
+			if loopFilter != "" && *item.LoopID != loopFilter {
+				continue
+			}
+			if mappedRole := loopRoles[*item.LoopID]; mappedRole != "" {
+				role = mappedRole
+			}
+		} else if loopFilter != "" {
+			continue
+		}
+		if !includeRunStatsRole(role, roleFilter) {
+			continue
+		}
+		stats := output.Roles[role]
+		stats.Retried += item.Attempts
+		output.Roles[role] = stats
+	}
 	for _, stats := range output.Roles {
 		addRoleStats(&output.Total, stats)
 	}

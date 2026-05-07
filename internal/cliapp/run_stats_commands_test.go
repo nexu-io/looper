@@ -54,7 +54,7 @@ func TestRunStatsCommandOutputsJSONAndHuman(t *testing.T) {
 				t.Fatalf("reviewer outcomes = %#v, want approved=1 requested_changes=1", reviewer.Outcomes)
 			}
 			fixer := decoded.Roles["fixer"]
-			if fixer.Success != 1 || fixer.Failure != 1 || fixer.Retried != 1 || fixer.AgentExecutions.Success != 1 || fixer.AgentExecutions.Failure != 1 || fixer.AgentExecutions.Status["completed"] != 1 {
+			if fixer.Success != 1 || fixer.Failure != 1 || fixer.Retried != 4 || fixer.AgentExecutions.Success != 1 || fixer.AgentExecutions.Failure != 1 || fixer.AgentExecutions.Status["completed"] != 1 {
 				t.Fatalf("fixer stats = %#v, want run and agent breakdowns", fixer)
 			}
 		}},
