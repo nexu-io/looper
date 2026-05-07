@@ -1229,6 +1229,7 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 	checkpoint := input.Checkpoint
 	var err error
 	for attempt := int64(1); attempt <= maxAttempts; attempt++ {
+		input.Checkpoint = checkpoint
 		checkpoint, err = r.executeStepOnce(ctx, step, input)
 		if err == nil {
 			if attempt > 1 {
@@ -1240,6 +1241,9 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 			break
 		}
 		delay := retryDelay(r.retryBaseDelay, attempt, err)
+		if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+			delay = 0
+		}
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			r.logWarn("reviewer transient external retry budget exhausted", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
 			break
@@ -1844,12 +1848,19 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "thread_resolution", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return nil, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "thread_resolution", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
 	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
 	if result.Status != "completed" {
-		return nil, &loopError{message: reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed"), kind: FailureRetryableTransient}
+		message := reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed")
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		return nil, &loopError{message: message, kind: FailureRetryableTransient}
+	}
+	if message := transientProviderMessageFromAgentResult(result); message != "" {
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	parsed, err := parseThreadResolutionOutput(result.Stdout)
 	if err != nil {
@@ -2109,6 +2120,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return checkpoint, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
@@ -2134,6 +2146,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		} else if agent.IsAgentSetupFailureMessage(message) {
 			kind = FailureManualIntervention
 		}
+		if kind == FailureRetryableTransient {
+			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		}
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if result.ParseStatus != "parsed" {
@@ -2149,6 +2164,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
+		}
+		if message := transientProviderMessageFromAgentResult(result); message != "" {
+			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, MarkerVerificationMisses: 1}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -3331,6 +3350,55 @@ func (r *Runner) isTransientExternalFailure(err error) bool {
 		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderMessage(loopErr.message)
 	}
 	return false
+}
+
+func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx context.Context, executionID string, message string) bool {
+	if strings.TrimSpace(executionID) == "" || !isTransientModelProviderMessage(message) || r.repos == nil || r.repos.AgentExecutions == nil {
+		return false
+	}
+	record, err := r.repos.AgentExecutions.GetByID(ctx, executionID)
+	if err != nil {
+		r.logWarn("reviewer native resume source lookup failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	if record == nil || record.NativeSessionID == nil || strings.TrimSpace(*record.NativeSessionID) == "" {
+		return false
+	}
+	if record.NativeResumeStatus != nil && *record.NativeResumeStatus == "pending" {
+		return true
+	}
+	record.NativeResumeMode = stringPtr("native_resume")
+	record.NativeResumeStatus = stringPtr("pending")
+	record.NativeResumeError = stringPtr(strings.TrimSpace(message))
+	record.UpdatedAt = r.nowISO()
+	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
+		r.logWarn("reviewer native resume source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	r.logInfo("reviewer native resume retry queued", map[string]any{"executionId": executionID, "loopId": derefString(record.LoopID), "runId": derefString(record.RunID)})
+	return true
+}
+
+func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+		return false
+	}
+	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
+		return false
+	}
+	return latest != nil && latest.NativeSessionID != nil && strings.TrimSpace(*latest.NativeSessionID) != "" && latest.NativeResumeStatus != nil && *latest.NativeResumeStatus == "pending"
+}
+
+func transientProviderMessageFromAgentResult(result AgentResult) string {
+	for _, candidate := range []string{result.Summary, result.Stderr, result.Stdout} {
+		candidate = strings.TrimSpace(candidate)
+		if isTransientModelProviderMessage(candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func (r *Runner) nowISO() string {

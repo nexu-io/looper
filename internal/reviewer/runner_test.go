@@ -4392,6 +4392,69 @@ func TestRetryDelayAddsBoundedJitter(t *testing.T) {
 	}
 }
 
+func TestMarkAgentExecutionNativeResumePendingForTransientProvider(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loopID := "loop_native_resume"
+	runID := "run_native_resume"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	if !runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_native_resume", `{"type":"error","error":{"code":"server_is_overloaded"}}`) {
+		t.Fatalf("markAgentExecutionNativeResumePendingForTransientProvider() = false, want true")
+	}
+	record, err := fixture.repos.AgentExecutions.GetByID(ctx, "agent_native_resume")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "native_resume" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "pending" {
+		t.Fatalf("native resume fields = mode:%v status:%v, want native_resume/pending", record.NativeResumeMode, record.NativeResumeStatus)
+	}
+	if !runner.hasPendingNativeResume(ctx, loopID) {
+		t.Fatalf("hasPendingNativeResume() = false, want true")
+	}
+}
+
+func TestMarkAgentExecutionNativeResumePendingRequiresSessionAndProviderError(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loopID := "loop_no_session"
+	runID := "run_no_session"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_no_session", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_no_session", "server_is_overloaded") {
+		t.Fatalf("mark without native session = true, want false")
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_non_provider", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_non_provider", "permission denied") {
+		t.Fatalf("mark non-provider failure = true, want false")
+	}
+}
+
 func TestProcessClaimedItemRetriesTransientModelOverloadInRun(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed"}, {Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}, waitErrs: []error{fmt.Errorf("service_unavailable_error: server_is_overloaded")}}

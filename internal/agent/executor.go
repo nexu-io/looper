@@ -170,7 +170,7 @@ func isRecoverableNativeResumeSource(status string, resumeStatus *string) bool {
 		return false
 	}
 	switch status {
-	case "running", "cancelling", "killed", "timeout", "failed":
+	case "running", "cancelling", "killed", "timeout", "failed", "completed":
 		return true
 	default:
 		return false

@@ -139,6 +139,19 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 	}
 }
 
+func TestRecoverableNativeResumeSourceAllowsCompletedPending(t *testing.T) {
+	t.Parallel()
+
+	pending := "pending"
+	if !isRecoverableNativeResumeSource("completed", &pending) {
+		t.Fatalf("isRecoverableNativeResumeSource(completed, pending) = false, want true")
+	}
+	notPending := "captured"
+	if isRecoverableNativeResumeSource("completed", &notPending) {
+		t.Fatalf("isRecoverableNativeResumeSource(completed, captured) = true, want false")
+	}
+}
+
 func TestExtractNativeSessionID(t *testing.T) {
 	t.Parallel()
 
