@@ -183,13 +183,13 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{ID: "event_review_requested_changes", EventType: "pr.review.posted", LoopID: stringPtr("loop_reviewer"), RunID: stringPtr("run_reviewer_failed"), PayloadJSON: `{"event":"REQUEST_CHANGES"}`, CreatedAt: now}); err != nil {
 		t.Fatalf("Events.Append(review requested changes) error = %v", err)
 	}
-	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{ID: "event_retry", EventType: "fixer.push.retryable", LoopID: stringPtr("loop_fixer"), PayloadJSON: `{}`, CreatedAt: now}); err != nil {
+	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{ID: "event_retryable_failure", EventType: "fixer.push.retryable", LoopID: stringPtr("loop_fixer"), PayloadJSON: `{}`, CreatedAt: now}); err != nil {
 		t.Fatalf("Events.Append(retry) error = %v", err)
 	}
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_retry", LoopID: stringPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "239", DedupeKey: "queue_fixer_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 5, CreatedAt: old, UpdatedAt: now}); err != nil {
+	retryableKind := "retryable_transient"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_retry", LoopID: stringPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "239", DedupeKey: "queue_fixer_retry", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 1, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(retry) error = %v", err)
 	}
-	retryableKind := "retryable_transient"
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_retry", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 2, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(worker retry) error = %v", err)
 	}

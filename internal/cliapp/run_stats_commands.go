@@ -184,7 +184,6 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 	if err != nil {
 		return output, err
 	}
-	loopRetryEvents := map[string]struct{}{}
 	for _, event := range events {
 		createdAt, ok := parseRunStatsTime(event.CreatedAt)
 		if !ok || createdAt.Before(sinceAt) || event.LoopID == nil {
@@ -197,9 +196,6 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 		stats := output.Roles[role]
 		addEventToStats(&stats, event)
 		output.Roles[role] = stats
-		if runStatsEventIsRetry(event.EventType) {
-			loopRetryEvents[*event.LoopID] = struct{}{}
-		}
 	}
 	queues, err := repos.Queue.List(ctx)
 	if err != nil {
@@ -213,9 +209,6 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 		role := item.Type
 		if item.LoopID != nil {
 			if loopFilter != "" && *item.LoopID != loopFilter {
-				continue
-			}
-			if _, countedFromEvents := loopRetryEvents[*item.LoopID]; countedFromEvents {
 				continue
 			}
 			if mappedRole := loopRoles[*item.LoopID]; mappedRole != "" {
@@ -369,8 +362,6 @@ func addEventToStats(stats *runRoleStats, event storage.EventLogRecord) {
 	switch {
 	case strings.Contains(eventType, "requeued"):
 		stats.Requeued++
-	case runStatsEventIsRetry(eventType):
-		stats.Retried++
 	}
 }
 
@@ -380,10 +371,6 @@ func queueItemHasRecentRetry(item storage.QueueItemRecord) bool {
 	}
 	errorKind := strings.ToLower(strings.TrimSpace(*item.LastErrorKind))
 	return strings.Contains(errorKind, "retryable")
-}
-
-func runStatsEventIsRetry(eventType string) bool {
-	return strings.Contains(strings.ToLower(eventType), "retry")
 }
 
 func addRoleStats(total *runRoleStats, stats runRoleStats) {
