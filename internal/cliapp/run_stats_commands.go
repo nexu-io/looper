@@ -366,16 +366,15 @@ func addEventToStats(stats *runRoleStats, event storage.EventLogRecord) {
 }
 
 func queueItemHasRecentRetry(item storage.QueueItemRecord) bool {
-	if item.Attempts <= 0 || item.LastErrorKind == nil {
+	if item.Attempts <= 0 {
 		return false
 	}
 	switch item.Status {
-	case "queued", "running", "completed", "failed":
+	case "queued", "running", "completed", "failed", "cancelled":
 	default:
 		return false
 	}
-	errorKind := strings.ToLower(strings.TrimSpace(*item.LastErrorKind))
-	return strings.Contains(errorKind, "retryable")
+	return true
 }
 
 func addRoleStats(total *runRoleStats, stats runRoleStats) {

@@ -58,7 +58,7 @@ func TestRunStatsCommandOutputsJSONAndHuman(t *testing.T) {
 				t.Fatalf("fixer stats = %#v, want run and agent breakdowns", fixer)
 			}
 			worker := decoded.Roles["worker"]
-			if worker.Retried != 11 {
+			if worker.Retried != 13 {
 				t.Fatalf("worker retried = %d, want queued, running, and terminal queue attempts counted", worker.Retried)
 			}
 		}},
@@ -201,6 +201,13 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_failed_after_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_failed_after_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 2, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(worker failed after retry) error = %v", err)
+	}
+	nonRetryableKind := "non_retryable"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_non_retryable_after_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_non_retryable_after_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 1, MaxAttempts: 5, LastErrorKind: &nonRetryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(worker non-retryable after retry) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_cancelled_after_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_cancelled_after_retry", Priority: 1, Status: "cancelled", AvailableAt: now, Attempts: 1, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(worker cancelled after retry) error = %v", err)
 	}
 	return configPath
 }
