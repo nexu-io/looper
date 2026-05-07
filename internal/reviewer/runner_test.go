@@ -5696,6 +5696,27 @@ func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *test
 	}
 }
 
+func TestTransientProviderMessageFromAgentResultIgnoresSuccessfulStdout(t *testing.T) {
+	t.Parallel()
+
+	result := AgentResult{Status: "completed", Summary: "classified threads", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"the previous report mentioned service unavailable and overloaded capacity","confidence":"high"}]}`}
+
+	if message := transientProviderMessageFromAgentResult(result); message != "" {
+		t.Fatalf("transientProviderMessageFromAgentResult() = %q, want empty", message)
+	}
+}
+
+func TestTransientProviderMessageFromAgentResultUsesSummaryAndStderr(t *testing.T) {
+	t.Parallel()
+
+	if message := transientProviderMessageFromAgentResult(AgentResult{Status: "completed", Summary: "server_is_overloaded"}); message == "" {
+		t.Fatalf("transientProviderMessageFromAgentResult(summary overload) = empty, want message")
+	}
+	if message := transientProviderMessageFromAgentResult(AgentResult{Status: "completed", Stderr: "service unavailable"}); message == "" {
+		t.Fatalf("transientProviderMessageFromAgentResult(stderr overload) = empty, want message")
+	}
+}
+
 func TestRunThreadResolutionStepResolvesLooperThreadWhenCurrentUserRequestNotRequired(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)

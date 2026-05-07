@@ -3411,7 +3411,7 @@ If the review or thread-resolution result was already posted, report the existin
 }
 
 func transientProviderMessageFromAgentResult(result AgentResult) string {
-	for _, candidate := range []string{result.Summary, result.Stderr, result.Stdout} {
+	for _, candidate := range []string{result.Summary, result.Stderr} {
 		candidate = strings.TrimSpace(candidate)
 		if isTransientModelProviderMessage(candidate) {
 			return candidate
