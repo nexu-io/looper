@@ -1241,7 +1241,7 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 			break
 		}
 		delay := retryDelay(r.retryBaseDelay, attempt, err)
-		if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+		if r.shouldSkipTransientRetryDelayForNativeResume(ctx, input.Loop.ID, err) {
 			delay = 0
 		}
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
@@ -3395,6 +3395,39 @@ func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool
 		return false
 	}
 	return r.isResumableNativeSession(latest)
+}
+
+func (r *Runner) shouldSkipTransientRetryDelayForNativeResume(ctx context.Context, loopID string, err error) bool {
+	return isTransientModelProviderOverloadFailure(err) && r.hasPendingNativeResume(ctx, loopID)
+}
+
+func isTransientModelProviderOverloadFailure(err error) bool {
+	if err == nil || githubinfra.IsTransientError(err) {
+		return false
+	}
+	var loopErr *loopError
+	if errors.As(err, &loopErr) {
+		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderOverloadMessage(loopErr.message)
+	}
+	return isTransientModelProviderOverloadMessage(err.Error())
+}
+
+func isTransientModelProviderOverloadMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"server_is_overloaded",
+		"service_unavailable_error",
+		"overloaded_error",
+		"server is overloaded",
+		"overloaded",
+		"http 529",
+		"status code: 529",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) bool {
