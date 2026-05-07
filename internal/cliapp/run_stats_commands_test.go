@@ -181,6 +181,9 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{ID: "event_retry", EventType: "fixer.push.retryable", LoopID: stringPtr("loop_fixer"), PayloadJSON: `{}`, CreatedAt: now}); err != nil {
 		t.Fatalf("Events.Append(retry) error = %v", err)
 	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_retry", LoopID: stringPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "239", DedupeKey: "queue_fixer_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 5, CreatedAt: old, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(retry) error = %v", err)
+	}
 	return configPath
 }
 
