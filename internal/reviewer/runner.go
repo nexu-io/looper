@@ -3394,7 +3394,42 @@ func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool
 		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
 		return false
 	}
-	return latest != nil && latest.NativeSessionID != nil && strings.TrimSpace(*latest.NativeSessionID) != "" && latest.NativeResumeStatus != nil && *latest.NativeResumeStatus == "pending"
+	return r.isResumableNativeSession(latest)
+}
+
+func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) bool {
+	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
+		return false
+	}
+	if !isRecoverableReviewerNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+		return false
+	}
+	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if currentVendor == "" {
+		return true
+	}
+	return nativeResumeSupportedForReviewer(currentVendor) && latest.Vendor == string(currentVendor)
+}
+
+func nativeResumeSupportedForReviewer(vendor config.AgentVendor) bool {
+	switch vendor {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecoverableReviewerNativeResumeSource(status string, resumeStatus *string) bool {
+	if resumeStatus == nil || *resumeStatus != "pending" {
+		return false
+	}
+	switch status {
+	case "running", "cancelling", "killed", "timeout", "failed", "completed":
+		return true
+	default:
+		return false
+	}
 }
 
 func nativeResumeContinuationPrompt(phase string, repo string, prNumber int64, headSHA string, idempotencyKey string) string {
