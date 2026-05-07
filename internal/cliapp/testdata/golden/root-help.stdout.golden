@@ -46,6 +46,7 @@ Flags:
   --planner-agent-timeout-seconds <seconds> Planner agent execution timeout
   --port <port>               Server port
   --reviewer-agent-timeout-seconds <seconds> Reviewer agent execution timeout
+  --reviewer-enable-self-review <bool> Allow reviewer triggers to process self-authored pull requests
   --reviewer-loop-enabled <bool> Enable reviewer follow-up loops by default
   --reviewer-max-iterations-per-head <count> Deprecated; ignored by reviewer loop filtering
   --reviewer-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering

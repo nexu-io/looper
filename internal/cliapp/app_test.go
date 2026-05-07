@@ -451,6 +451,7 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"1800",
 		"--fixer-agent-timeout-seconds=900",
 		"--reviewer-loop-enabled=false",
+		"--reviewer-enable-self-review=true",
 		"--no-custom-instructions",
 		"false",
 		"--no-custom-instructions=true",
@@ -489,6 +490,7 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"1800",
 		"--fixer-agent-timeout-seconds=900",
 		"--reviewer-loop-enabled=false",
+		"--reviewer-enable-self-review=true",
 		"--no-custom-instructions",
 		"false",
 		"--no-custom-instructions=true",
@@ -547,6 +549,27 @@ func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
 	}
 	if stderr != "" {
 		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	}
+}
+
+func TestStatusAcceptsReviewerEnableSelfReviewConfigOverrideFlag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "status", "--reviewer-enable-self-review=true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status --reviewer-enable-self-review=true]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want empty string", stderr)
 	}
 }
 
