@@ -370,7 +370,7 @@ func queueItemHasRecentRetry(item storage.QueueItemRecord) bool {
 		return false
 	}
 	switch item.Status {
-	case "queued", "running", "completed", "failed", "cancelled":
+	case "queued", "running", "completed", "failed", "cancelled", "manual_intervention":
 	default:
 		return false
 	}
