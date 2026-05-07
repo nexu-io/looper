@@ -58,8 +58,8 @@ func TestRunStatsCommandOutputsJSONAndHuman(t *testing.T) {
 				t.Fatalf("fixer stats = %#v, want run and agent breakdowns", fixer)
 			}
 			worker := decoded.Roles["worker"]
-			if worker.Retried != 1 {
-				t.Fatalf("worker retried = %d, want queue-only retries counted", worker.Retried)
+			if worker.Retried != 6 {
+				t.Fatalf("worker retried = %d, want queued and running queue attempts counted", worker.Retried)
 			}
 		}},
 		{name: "human", args: []string{"run", "stats", "--since", "1000d", "--role", "reviewer"}, assert: func(t *testing.T, output string) {

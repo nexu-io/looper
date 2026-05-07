@@ -221,7 +221,7 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 			continue
 		}
 		stats := output.Roles[role]
-		stats.Retried++
+		stats.Retried += item.Attempts
 		output.Roles[role] = stats
 	}
 	for _, stats := range output.Roles {
@@ -366,7 +366,10 @@ func addEventToStats(stats *runRoleStats, event storage.EventLogRecord) {
 }
 
 func queueItemHasRecentRetry(item storage.QueueItemRecord) bool {
-	if item.Attempts <= 0 || item.Status != "queued" || item.LastErrorKind == nil {
+	if item.Attempts <= 0 || item.LastErrorKind == nil {
+		return false
+	}
+	if item.Status != "queued" && item.Status != "running" {
 		return false
 	}
 	errorKind := strings.ToLower(strings.TrimSpace(*item.LastErrorKind))
