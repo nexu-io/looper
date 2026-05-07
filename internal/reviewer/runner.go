@@ -1838,6 +1838,9 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
 	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
+	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	}
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return nil, err
@@ -2091,6 +2094,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+		prompt = nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	}
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -3389,6 +3395,19 @@ func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool
 		return false
 	}
 	return latest != nil && latest.NativeSessionID != nil && strings.TrimSpace(*latest.NativeSessionID) != "" && latest.NativeResumeStatus != nil && *latest.NativeResumeStatus == "pending"
+}
+
+func nativeResumeContinuationPrompt(phase string, repo string, prNumber int64, headSHA string, idempotencyKey string) string {
+	return fmt.Sprintf(`Continue the existing Looper reviewer %s task in this resumed native session.
+
+Do not restart from scratch or ask for more context. Reuse the prior session context and continue from the transient provider interruption.
+
+Before any GitHub side effect, re-check the current PR/head/idempotency guards from the existing instructions:
+- PR: %s#%d
+- expected head SHA: %s
+- idempotency key: %s
+
+If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
 }
 
 func transientProviderMessageFromAgentResult(result AgentResult) string {
