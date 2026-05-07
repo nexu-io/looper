@@ -310,7 +310,7 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 		},
 	})
 
-	failedExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
+	failedExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "full checkpoint prompt", NativeResumePrompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
 	if err != nil {
 		t.Fatalf("Start(first) error = %v", err)
 	}
@@ -333,7 +333,7 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 		t.Fatalf("ReadFile(argsPath) error = %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
-	if len(lines) != 2 || lines[0] != "exec resume codex-session-1 continue work" || lines[1] != "exec continue work" {
+	if len(lines) != 2 || lines[0] != "exec resume codex-session-1 continue work" || lines[1] != "exec full checkpoint prompt" {
 		t.Fatalf("spawned args = %#v, want native resume then immediate checkpoint restart", lines)
 	}
 }

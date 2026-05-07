@@ -4004,7 +4004,7 @@ func TestRunReviewStepUsesStableIdempotencyKeyAcrossRuns(t *testing.T) {
 	}
 }
 
-func TestRunReviewStepUsesShortPromptForPendingNativeResume(t *testing.T) {
+func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	ctx := context.Background()
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
@@ -4046,11 +4046,15 @@ func TestRunReviewStepUsesShortPromptForPendingNativeResume(t *testing.T) {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
 	prompt := agent.starts[0].Prompt
-	if !strings.Contains(prompt, "Continue the existing Looper reviewer review task") || !strings.Contains(prompt, "idempotency key: reviewer:loop_native_resume_prompt:abc123") {
-		t.Fatalf("prompt = %q, want short native resume continuation prompt", prompt)
+	if strings.Contains(prompt, "Continue the existing Looper reviewer review task") {
+		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)
 	}
-	if strings.Contains(prompt, "Review pull request") || strings.Contains(prompt, "Minimal PR seed") {
-		t.Fatalf("prompt = %q, want no full review prompt on native resume", prompt)
+	if !strings.Contains(prompt, "Review pull request") && !strings.Contains(prompt, "Minimal PR seed") {
+		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)
+	}
+	nativeResumePrompt := agent.starts[0].NativeResumePrompt
+	if !strings.Contains(nativeResumePrompt, "Continue the existing Looper reviewer review task") || !strings.Contains(nativeResumePrompt, "idempotency key: reviewer:loop_native_resume_prompt:abc123") {
+		t.Fatalf("native resume prompt = %q, want short native resume continuation prompt", nativeResumePrompt)
 	}
 }
 

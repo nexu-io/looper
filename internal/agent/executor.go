@@ -41,20 +41,21 @@ type ExecutorOptions struct {
 }
 
 type RunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	GracefulShutdown time.Duration
-	MaxOutputBytes   int
-	Metadata         map[string]any
-	IdempotencyKey   string
-	Env              map[string]string
-	NativeSessionID  string
+	ExecutionID        string
+	ProjectID          string
+	LoopID             string
+	RunID              string
+	Prompt             string
+	NativeResumePrompt string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	GracefulShutdown   time.Duration
+	MaxOutputBytes     int
+	Metadata           map[string]any
+	IdempotencyKey     string
+	Env                map[string]string
+	NativeSessionID    string
 }
 
 type Result struct {
@@ -195,7 +196,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if err != nil {
 		return nil, err
 	}
-	command, args := ResolveSpawnWithNativeResume(e.config, input.Prompt, resume.SessionID, resume.Enabled)
+	spawnPrompt := input.Prompt
+	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
+		spawnPrompt = input.NativeResumePrompt
+	}
+	command, args := ResolveSpawnWithNativeResume(e.config, spawnPrompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
@@ -208,7 +213,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	cmd.Env = append(cmd.Env,
-		"LOOPER_PROMPT="+input.Prompt,
+		"LOOPER_PROMPT="+spawnPrompt,
 		completionMarkerEnv+"="+CompletionMarkerPrefix,
 	)
 
