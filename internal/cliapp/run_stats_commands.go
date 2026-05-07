@@ -369,7 +369,9 @@ func queueItemHasRecentRetry(item storage.QueueItemRecord) bool {
 	if item.Attempts <= 0 || item.LastErrorKind == nil {
 		return false
 	}
-	if item.Status != "queued" && item.Status != "running" {
+	switch item.Status {
+	case "queued", "running", "completed", "failed":
+	default:
 		return false
 	}
 	errorKind := strings.ToLower(strings.TrimSpace(*item.LastErrorKind))
