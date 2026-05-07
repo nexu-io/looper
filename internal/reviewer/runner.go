@@ -523,8 +523,9 @@ type resumedRunContext struct {
 }
 
 type loopError struct {
-	message string
-	kind    QueueFailureKind
+	message     string
+	kind        QueueFailureKind
+	interrupted bool
 }
 
 func (e *loopError) Error() string { return e.message }
@@ -1076,12 +1077,24 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}
 			latest.ResumePolicy = resumePolicy
-			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+			runStatus := "failed"
+			stepEventType := "loop.step.failed"
+			runEventType := "run.failed"
+			if failure.interrupted {
+				runStatus = "interrupted"
+				stepEventType = "loop.step.interrupted"
+				runEventType = "run.interrupted"
+			}
+			if _, err := r.completeRun(ctx, run, runStatus, failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
-			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds}})
-			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
-			r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
+			r.appendEvent(ctx, eventInput{eventType: stepEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds}})
+			r.appendEvent(ctx, eventInput{eventType: runEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
+			if failure.interrupted {
+				r.logInfo("reviewer run interrupted", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
+			} else {
+				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
+			}
 			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
@@ -1089,11 +1102,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
-				metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.message)
-				if metaErr == nil {
-					updated.MetadataJSON = &metadataJSON
+				if !failure.interrupted {
+					metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.message)
+					if metaErr == nil {
+						updated.MetadataJSON = &metadataJSON
+					}
 				}
-				if terminalReviewerLoopReason(*updated) == "failed" {
+				if !failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
 					terminalFailure = true
 					updated.Status = "failed"
 					updated.NextRunAt = nil
@@ -1123,7 +1138,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if failedQueue == nil || failedQueue.Status != "queued" {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if step == stepClaim {
 			claimedLockKey = checkpoint.ClaimedLockKey
@@ -2104,7 +2119,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if headChangeReason != "" {
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "restart_from_discover"
-		return checkpoint, &loopError{message: headChangeReason, kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: headChangeReason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
@@ -3362,7 +3377,7 @@ func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSu
 	if failedStep != stepPublish && failedStep != stepReview && failedStep != stepThreadResolution {
 		return false
 	}
-	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish") || strings.Contains(failureSummary, "PR changed during thread reconciliation")
+	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "PR head changed while reviewer was running") || strings.Contains(failureSummary, "review request removed before publish") || strings.Contains(failureSummary, "PR changed during thread reconciliation")
 }
 
 func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {

@@ -2503,17 +2503,20 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed while reviewer was running") {
-		t.Fatalf("result = %#v, want retryable interruption for head change", result)
+	if result.Status != "interrupted" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed while reviewer was running") {
+		t.Fatalf("result = %#v, want interrupted retryable head change", result)
 	}
 	if len(agent.killedReasons) != 1 || !contains(agent.killedReasons[0], "new-head") {
 		t.Fatalf("killedReasons = %#v, want one head-change kill", agent.killedReasons)
 	}
-	failedRun, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
-	if err != nil || failedRun == nil {
-		t.Fatalf("Runs.GetByID() = (%#v, %v), want failed run", failedRun, err)
+	interruptedRun, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+	if err != nil || interruptedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want interrupted run", interruptedRun, err)
 	}
-	checkpoint := parseCheckpoint(failedRun.CheckpointJSON)
+	if interruptedRun.Status != "interrupted" {
+		t.Fatalf("run.Status = %q, want interrupted", interruptedRun.Status)
+	}
+	checkpoint := parseCheckpoint(interruptedRun.CheckpointJSON)
 	if checkpoint.ResumePolicy != "restart_from_discover" || checkpoint.PendingReview != nil {
 		t.Fatalf("checkpoint = %#v, want restart_from_discover without stale pending review", checkpoint)
 	}
