@@ -410,15 +410,17 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "run",
 				short:           "Run commands",
-				helpSubcommands: []helpSubcommand{{name: "list", description: "List runs"}},
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List runs"}, {name: "stats", description: "Show recent run stats"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{stringFlag("loop", "loopId", "Filter by loop id")},
 				exampleLines: []string{
 					"$ looper run list",
+					"$ looper run stats --since 24h",
 					"$ looper run list --loop loop_1",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List runs", runE: runtime.runList}),
+					newCommand(commandSpec{use: "stats", short: "Show recent run stats", args: cobra.NoArgs, runE: runtime.runStats, localFlags: []flagSpec{stringFlag("since", "duration", "Time window to aggregate (default 24h; supports h and d, for example 1h, 24h, 7d)"), stringFlag("role", "role", "Filter by role: planner, reviewer, worker, or fixer")}}),
 				},
 			}),
 		},

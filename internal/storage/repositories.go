@@ -353,6 +353,16 @@ func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRec
 	return scanEventLogs(rows)
 }
 
+func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE created_at >= ? ORDER BY created_at DESC`, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs since: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
 	if err != nil {
@@ -594,6 +604,16 @@ func (r *RunsRepository) List(ctx context.Context) ([]RunRecord, error) {
 	return scanRuns(rows)
 }
 
+func (r *RunsRepository) ListSince(ctx context.Context, sinceISO string) ([]RunRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at DESC, id DESC`, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("list runs since: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRuns(rows)
+}
+
 func (r *RunsRepository) ListByStatus(ctx context.Context, status string) ([]RunRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE status = ? ORDER BY started_at DESC, id DESC`, status)
 	if err != nil {
@@ -693,6 +713,26 @@ func (r *AgentExecutionsRepository) ListActive(ctx context.Context) ([]AgentExec
 	rows, err := r.q.QueryContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list active agent executions: %w", err)
+	}
+	defer rows.Close()
+
+	return scanAgentExecutions(rows)
+}
+
+func (r *AgentExecutionsRepository) List(ctx context.Context) ([]AgentExecutionRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions ORDER BY started_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list agent executions: %w", err)
+	}
+	defer rows.Close()
+
+	return scanAgentExecutions(rows)
+}
+
+func (r *AgentExecutionsRepository) ListSince(ctx context.Context, sinceISO string) ([]AgentExecutionRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE started_at >= ? ORDER BY started_at DESC, id DESC`, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("list agent executions since: %w", err)
 	}
 	defer rows.Close()
 

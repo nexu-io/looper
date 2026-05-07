@@ -66,7 +66,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
-		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},
+		{args: []string{"run", "--help"}, subcommands: []string{"list   List runs", "stats  Show recent run stats"}},
 	}
 
 	for _, testCase := range tests {
