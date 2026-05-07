@@ -380,6 +380,40 @@ func TestDiscoverPullRequestsReturnsCurrentUserLookupError(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsSkipsSelfAuthoredPullRequestsByDefault(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want self-authored PR skipped by default", result.QueueItems)
+	}
+	if result.Skipped == 0 {
+		t.Fatalf("Skipped = %d, want self-authored PR counted as skipped", result.Skipped)
+	}
+}
+
+func TestDiscoverPullRequestsAllowsSelfAuthoredPullRequestsWhenEnableSelfReviewTrue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}}}}
+	cfg := mustLoadReviewerRoleConfig(t, `{"roles":{"reviewer":{"triggers":{"enableSelfReview":true}}}}`)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want self-authored PR queued when enableSelfReview=true", result.QueueItems)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1206,6 +1240,26 @@ func TestRunFilterStepSkipsPullRequestAlreadyReviewedByCurrentUserForHead(t *tes
 	}
 }
 
+func TestRunFilterStepSkipsSelfAuthoredPullRequestByDefault(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "octocat", ReviewRequests: []string{"octocat"}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "self_authored" {
+		t.Fatalf("SkipKind = %q, want self_authored", checkpoint.SkipKind)
+	}
+	if !strings.Contains(strings.ToLower(checkpoint.SkipReason), "self-authored") {
+		t.Fatalf("SkipReason = %q, want self-authored skip reason", checkpoint.SkipReason)
+	}
+}
+
 func TestRunFilterStepRefreshesCurrentLoginBeforeAlreadyReviewedCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1533,6 +1587,92 @@ func TestDiscoverPullRequestsAllowsManualFollowUpAfterSkippedAutomaticLoopForSam
 	}
 	if result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != "loop_manual_follow_after_auto" {
 		t.Fatalf("queue loopID = %#v, want manual follow-up loop", result.QueueItems[0].LoopID)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsSelfAuthoredFollowUpLoopByDefault(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{author: "octocat", currentLogin: "octocat", reviewRequests: []string{"octocat"}, listOpenByLabel: map[string][]PullRequestSummary{"": {}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_self_follow", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want self-authored follow-up loop skipped by default", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsAllowsProjectOverrideForSelfReview(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}}}}
+	cfg := mustLoadReviewerRoleConfig(t, `{"roles":{"reviewer":{"triggers":{"enableSelfReview":false}}},"projects":[{"id":"project_1","name":"Demo","repoPath":"/tmp/repos/looper","roles":{"reviewer":{"triggers":{"enableSelfReview":true}}}}]}`)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want project override to allow self-review", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsAllowsSelfReviewAfterEnableSelfReviewFlipForExistingLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{author: "octocat", currentLogin: "octocat", reviewRequests: []string{"octocat"}}
+	cfg := mustLoadReviewerRoleConfig(t, `{"roles":{"reviewer":{"triggers":{"enableSelfReview":true}}}}`)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"self_authored","reason":"Skipped self-authored pull request acme/looper#42 for reviewer octocat","recordedAt":"2026-05-01T00:00:00Z","headSha":"abc123","authorLogin":"octocat","reviewerLogin":"octocat"}}`
+	loop := storage.LoopRecord{ID: "loop_self_flip", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want existing loop queued after enableSelfReview=true", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotSuppressStaleSelfAuthoredSkipForDifferentReviewer(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{author: "octocat", currentLogin: "alice", reviewRequests: []string{"alice"}, listOpenByLabel: map[string][]PullRequestSummary{"": {}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"self_authored","reason":"Skipped self-authored pull request acme/looper#42 for reviewer octocat","recordedAt":"2026-05-01T00:00:00Z","headSha":"abc123","authorLogin":"octocat","reviewerLogin":"octocat"}}`
+	loop := storage.LoopRecord{ID: "loop_self_other_reviewer", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want stale self_authored skip ignored for different reviewer", result.QueueItems)
 	}
 }
 
@@ -1955,6 +2095,41 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWhenReadyLabel(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemAllowsManualQueuedSelfAuthoredLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "octocat"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Manual self review", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"manual":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_self_authored", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want manual self-authored review to bypass skip", len(agent.starts))
+	}
+}
+
 func TestNormalizedFindingFingerprintIgnoresReviewMarkerMetadata(t *testing.T) {
 	t.Parallel()
 	oldHead := normalizedFindingFingerprint("same actionable finding <!-- looper:review loop=loop_1 head=old outcome=actionable -->")
@@ -2181,7 +2356,7 @@ func TestProcessClaimedItemRejectsCleanNoopWithoutApprovedMarkerForApprovePolicy
 func TestProcessClaimedItemAcceptsCleanNoopWithApprovedMarkerForApprovePolicy(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: strings.Join([]string{
+	github := &fakeGitHubGateway{author: "octocat", currentLogin: "reviewer", reviewRequests: []string{"reviewer"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: strings.Join([]string{
 		"@octocat Thanks for the thoughtful update — the changes are clear and well scoped.",
 		"Summary: this keeps the approval flow safe while preserving the intended reviewer behavior.",
 		"<!-- looper:review outcome=clean -->",
@@ -2258,7 +2433,7 @@ func TestCleanReviewMarkerSatisfiesCleanPolicyAllowsSelfAuthoredCommentFallback(
 func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForApprovePolicy(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: "@octocat <!-- hidden filler words should not count toward this approval body -->\n\n[hidden]:https://example.com\n  more hidden filler words that should not count here\n\n<!-- looper:review outcome=clean -->"}
+	github := &fakeGitHubGateway{author: "octocat", currentLogin: "reviewer", reviewRequests: []string{"reviewer"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: "@octocat <!-- hidden filler words should not count toward this approval body -->\n\n[hidden]:https://example.com\n  more hidden filler words that should not count here\n\n<!-- looper:review outcome=clean -->"}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig()})
 
@@ -2290,7 +2465,7 @@ func TestProcessClaimedItemRejectsCleanNoopResumeWithInvalidApprovedMarkerBodyFo
 	ctx := context.Background()
 	repo := "acme/looper"
 	prNumber := int64(42)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: "@octocat <!-- hidden filler words should not count toward this approval body --> <!-- looper:review outcome=clean -->"}
+	github := &fakeGitHubGateway{author: "octocat", reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove, reviewMarkerBody: "@octocat <!-- hidden filler words should not count toward this approval body --> <!-- looper:review outcome=clean -->"}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig()})
 	loopTarget := "pr:42"
@@ -6098,6 +6273,7 @@ type fakeGitHubGateway struct {
 	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
+	author                          string
 	labels                          []string
 	reviewDecision                  string
 	comments                        []map[string]any
@@ -6157,7 +6333,8 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	if headSHA == "" {
 		headSHA = "abc123"
 	}
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, ReviewRequests: reviewRequests, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", ReviewRequests: reviewRequests}}, nil
+	author := g.effectiveAuthor()
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, Author: author, ReviewRequests: reviewRequests, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", Author: author, ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
@@ -6204,7 +6381,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if state == "" {
 		state = "OPEN"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
 }
 
 func (g *fakeGitHubGateway) GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error) {
@@ -6241,6 +6418,13 @@ func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
 	return []string{"octocat"}
 }
 
+func (g *fakeGitHubGateway) effectiveAuthor() string {
+	if strings.TrimSpace(g.author) != "" {
+		return g.author
+	}
+	return "alice"
+}
+
 func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 	g.captureSnapshotCalls++
 	if len(g.captureSnapshotErrs) > 0 {
@@ -6254,7 +6438,7 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
-	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr("base123"), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr("octocat"), ChecksSummary: stringPtr("SUCCESS"), PayloadJSON: stringPtr(`{"diff":"diff --git a/a.ts b/a.ts"}`), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
+	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr("base123"), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr(g.effectiveAuthor()), ChecksSummary: stringPtr("SUCCESS"), PayloadJSON: stringPtr(`{"diff":"diff --git a/a.ts b/a.ts"}`), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
 }
 
 func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {
@@ -6279,7 +6463,7 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	body := g.reviewMarkerBody
 	if body == "" && !g.reviewMarkerBodyExplicit {
 		if outcome == "clean" && g.reviewMarkerEvent == ReviewEventApprove {
-			body = cleanApproveReviewBody("octocat", outcome)
+			body = cleanApproveReviewBody(g.effectiveAuthor(), outcome)
 		} else {
 			body = "review body <!-- looper:review outcome=" + outcome + " -->"
 		}
@@ -6300,6 +6484,20 @@ func (g *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCom
 
 func cleanApproveReviewBody(author string, outcome string) string {
 	return fmt.Sprintf("@%s Thanks for the thoughtful update — I verified the changes are clear, focused, and safe to approve. Nice work tightening this up; it should be easier to maintain going forward.\n\n<!-- looper:review id=abc head=abc123 outcome=%s -->", author, outcome)
+}
+
+func mustLoadReviewerRoleConfig(t *testing.T, contents string) config.Config {
+	t.Helper()
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: func(string) (string, bool) { return "", false }, LookPath: func(file string) (string, error) { return "/usr/bin/" + file, nil }})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	return loaded.Config
 }
 
 func (g *fakeGitHubGateway) AddPullRequestReaction(_ context.Context, input PullRequestReactionInput) error {

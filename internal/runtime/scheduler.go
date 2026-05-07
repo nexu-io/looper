@@ -803,6 +803,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			AutoDiscovery:             cfg.Roles.Reviewer.AutoDiscovery,
 			IncludeDrafts:             cfg.Roles.Reviewer.Triggers.IncludeDrafts,
 			RequireReviewRequest:      cfg.Roles.Reviewer.Triggers.RequireReviewRequest,
+			EnableSelfReview:          cfg.Roles.Reviewer.Triggers.EnableSelfReview,
 			Labels:                    append([]string(nil), cfg.Roles.Reviewer.Triggers.Labels...),
 			LabelMode:                 cfg.Roles.Reviewer.Triggers.LabelMode,
 			IncludeSpecReviewingLabel: cfg.Roles.Reviewer.SpecReview.IncludeReviewingLabel,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -68,6 +69,9 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	}
 	if got := cfg.Roles.Reviewer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || !got.Triggers.RequireReviewRequest || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 || !got.SpecReview.IncludeReviewingLabel || got.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
 		t.Fatalf("reviewer role defaults = %#v", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Triggers); got {
+		t.Fatalf("reviewer enableSelfReview default = %v, want false", got)
 	}
 	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
 		t.Fatalf("fixer role defaults = %#v", got)
@@ -222,6 +226,18 @@ func reflectStringSlicesEqual(left, right []string) bool {
 	return true
 }
 
+func reviewerEnableSelfReviewValue(t *testing.T, triggers any) bool {
+	t.Helper()
+	field := reflect.ValueOf(triggers).FieldByName("EnableSelfReview")
+	if !field.IsValid() {
+		t.Fatal("ReviewerRoleTriggersConfig.EnableSelfReview is missing")
+	}
+	if field.Kind() != reflect.Bool {
+		t.Fatalf("ReviewerRoleTriggersConfig.EnableSelfReview kind = %s, want bool", field.Kind())
+	}
+	return field.Bool()
+}
+
 func TestLoadFileResolvesRelativePathsAgainstCWD(t *testing.T) {
 	cwd := t.TempDir()
 	relativePath := filepath.Join("configs", "looper.json")
@@ -314,7 +330,7 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	contents := `{
 		"roles": {
 			"worker": {"autoDiscovery": false, "triggers": {"labels": ["global"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global worker guidance."},
-			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "labels": ["review"], "labelMode": "all"}}
+			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "enableSelfReview": false, "labels": ["review"], "labelMode": "all"}}
 		},
 		"projects": [{
 			"id": "demo",
@@ -322,7 +338,7 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 			"repoPath": "/repos/demo",
 			"roles": {
 				"worker": {"autoDiscovery": true, "triggers": {"labels": ["project"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project worker guidance."},
-				"reviewer": {"triggers": {"includeDrafts": true}}
+				"reviewer": {"triggers": {"includeDrafts": true, "enableSelfReview": true}}
 			}
 		}]
 	}`
@@ -346,6 +362,12 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	if !projectRoles.Reviewer.Triggers.IncludeDrafts || !projectRoles.Reviewer.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Triggers.Labels, []string{"review"}) {
 		t.Fatalf("project reviewer roles = %#v", projectRoles.Reviewer)
 	}
+	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Triggers); got {
+		t.Fatalf("global reviewer enableSelfReview = %v, want false", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, projectRoles.Reviewer.Triggers); !got {
+		t.Fatalf("project reviewer enableSelfReview = %v, want true", got)
+	}
 	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "worker") {
 		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(worker) = false, want true from project override")
 	}
@@ -353,6 +375,71 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
 	if strings.Contains(block.Text, "Global worker guidance.") || !strings.Contains(block.Text, "Project worker guidance.") {
 		t.Fatalf("custom instruction block did not use project role override: %s", block.Text)
+	}
+}
+
+func TestLoadFileSupportsReviewerEnableSelfReviewOverride(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {"reviewer": {"triggers": {"enableSelfReview": true}}},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"roles": {"reviewer": {"triggers": {"enableSelfReview": false}}}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); got {
+		t.Fatalf("project reviewer enableSelfReview = %v, want false", got)
+	}
+}
+
+func TestEnvOverrideReviewerEnableSelfReviewBeatsProjectConfig(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {"reviewer": {"triggers": {"enableSelfReview": false}}},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"roles": {"reviewer": {"triggers": {"enableSelfReview": false}}}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv: mapEnvLookup(map[string]string{
+			"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+		}),
+		LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); !got {
+		t.Fatalf("project reviewer enableSelfReview = %v, want true from env override", got)
 	}
 }
 

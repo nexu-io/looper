@@ -385,6 +385,7 @@ type DiscoveryPolicy struct {
 	AutoDiscovery             bool
 	IncludeDrafts             bool
 	RequireReviewRequest      bool
+	EnableSelfReview          bool
 	Labels                    []string
 	LabelMode                 config.LabelMode
 	IncludeSpecReviewingLabel bool
@@ -587,8 +588,8 @@ func New(options Options) *Runner {
 		reviewEvents.Clean = config.ReviewerReviewEventApprove
 	}
 	policy := options.DiscoveryPolicy
-	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
+	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && !policy.EnableSelfReview && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, EnableSelfReview: false, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
 	}
 	return &Runner{
 		db:                      options.DB,
@@ -649,7 +650,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	currentLogin := ""
-	if policy.RequireReviewRequest {
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
 		var err error
 		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
@@ -659,6 +660,20 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
+	resolveAuthor := func(pr PullRequestSummary) PullRequestSummary {
+		if policy.EnableSelfReview || strings.TrimSpace(pr.Author) != "" {
+			return pr
+		}
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+		if err != nil {
+			return pr
+		}
+		pr.Author = detail.Author
+		if pr.HeadSHA == "" {
+			pr.HeadSHA = detail.HeadSHA
+		}
+		return pr
+	}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
 		loopResult, loopErr := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, existing)
 		if loopErr != nil {
@@ -686,7 +701,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			return nil
 		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
 			result.Skipped++
 			return nil
 		}
@@ -697,7 +712,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			}
 			currentLogin = normalizeLogin(lookupLogin)
 		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
 			result.Skipped++
 			return nil
 		}
@@ -732,6 +747,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return enqueue(pr, nil)
 	}
 	for _, pr := range openPRs {
+		pr = resolveAuthor(pr)
 		if !prEligibleForDiscovery(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -741,6 +757,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	for _, pr := range specPRs {
+		pr = resolveAuthor(pr)
 		if !prEligibleForDiscovery(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -774,6 +791,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
 				return DiscoveryResult{}, err
 			}
+			result.Skipped++
+			continue
+		}
+		if !isManualReviewerLoop(loop) && isSelfAuthoredPR(detail.Author, currentLogin, policy) {
 			result.Skipped++
 			continue
 		}
@@ -852,6 +873,9 @@ func prEligibleForDiscovery(pr PullRequestSummary, currentLogin string, policy D
 	if normalizePRState(pr.State) != "open" {
 		return false
 	}
+	if isSelfAuthoredPR(pr.Author, currentLogin, policy) {
+		return false
+	}
 	if policy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 		return false
 	}
@@ -866,7 +890,14 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.AutoDiscovery, IncludeDrafts: roles.Reviewer.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Triggers.RequireReviewRequest, Labels: append([]string(nil), roles.Reviewer.Triggers.Labels...), LabelMode: roles.Reviewer.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.SpecReview.ReviewingLabel}
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.AutoDiscovery, IncludeDrafts: roles.Reviewer.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Triggers.Labels...), LabelMode: roles.Reviewer.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.SpecReview.ReviewingLabel}
+}
+
+func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {
+	if policy.EnableSelfReview {
+		return false
+	}
+	return normalizeLogin(author) != "" && normalizeLogin(author) == normalizeLogin(currentLogin)
 }
 
 func prQueryLabels(labels []string) []string {
@@ -1332,6 +1363,22 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logWarn("conflicted pull request notification failed; preserving skip", map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "headSha": checkpoint.Detail.HeadSHA, "error": err.Error()})
 		}
 		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) && !policy.EnableSelfReview {
+		if currentLogin == "" {
+			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+			checkpoint.Detail.CurrentLogin = currentLogin
+		}
+		if isSelfAuthoredPR(checkpoint.Detail.Author, currentLogin, policy) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped self-authored pull request %s#%d for reviewer %s", input.Repo, input.PRNumber, currentLogin)
+			checkpoint.SkipKind = "self_authored"
+			checkpoint.SkipReviewerLogin = currentLogin
+			return checkpoint, nil
+		}
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
 		if currentLogin == "" {
@@ -3741,7 +3788,7 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
-func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string) bool {
+func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
 	raw, _ := meta["lastFilterSkip"].(map[string]any)
 	if raw == nil {
 		return false
@@ -3763,6 +3810,18 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 	switch kind {
 	case "conflicted":
 		if !pr.HasConflicts {
+			return false
+		}
+	case "self_authored":
+		if policy.EnableSelfReview {
+			return false
+		}
+		authorLogin, _ := stringFromAny(raw["authorLogin"])
+		reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
+		if normalizeLogin(authorLogin) == "" || normalizeLogin(pr.Author) == "" || normalizeLogin(authorLogin) != normalizeLogin(pr.Author) {
+			return false
+		}
+		if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
 			return false
 		}
 	case "ready_label":
@@ -3787,7 +3846,7 @@ func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummar
 		return false
 	}
 	kind, _ := stringFromAny(raw["kind"])
-	if kind != "already_reviewed_by_current_user" {
+	if kind != "already_reviewed_by_current_user" && kind != "self_authored" {
 		return false
 	}
 	headSHA, _ := stringFromAny(raw["headSha"])
@@ -3796,7 +3855,7 @@ func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummar
 
 func isDiscoverySuppressingSkipKind(kind string) bool {
 	switch kind {
-	case "conflicted", "already_reviewed_by_current_user", "already_published_head", "draft", "approved", "ready_label":
+	case "conflicted", "already_reviewed_by_current_user", "already_published_head", "draft", "approved", "ready_label", "self_authored":
 		return true
 	default:
 		return false
@@ -4085,6 +4144,14 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 	}
 	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
 		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)
+	}
+	if checkpoint.SkipKind == "self_authored" {
+		if author := normalizeLogin(checkpoint.Detail.Author); author != "" {
+			metadata["authorLogin"] = author
+		}
+		if checkpoint.SkipReviewerLogin != "" {
+			metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)
+		}
 	}
 	return metadata
 }

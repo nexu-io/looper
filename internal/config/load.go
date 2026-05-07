@@ -100,6 +100,8 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	if err != nil {
 		return LoadedFileConfig{}, err
 	}
+	applyGlobalReviewerEnableSelfReviewOverride(&config, envOverrides)
+	applyGlobalReviewerEnableSelfReviewOverride(&config, parsedCLI.overrides)
 
 	toolDetection := DetectToolPaths(config.Tools, options.LookPath)
 	config.Tools = toolDetection.Paths
@@ -123,6 +125,26 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 			ToolDetection:     toolDetection.Detection,
 		},
 	}, nil
+}
+
+func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
+	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Triggers == nil || partial.Roles.Reviewer.Triggers.EnableSelfReview == nil {
+		return
+	}
+	value := *partial.Roles.Reviewer.Triggers.EnableSelfReview
+	config.Roles.Reviewer.Triggers.EnableSelfReview = value
+	for i := range config.Projects {
+		if config.Projects[i].Roles == nil {
+			continue
+		}
+		if config.Projects[i].Roles.Reviewer == nil {
+			continue
+		}
+		if config.Projects[i].Roles.Reviewer.Triggers == nil {
+			config.Projects[i].Roles.Reviewer.Triggers = &PartialReviewerRoleTriggersConfig{}
+		}
+		config.Projects[i].Roles.Reviewer.Triggers.EnableSelfReview = &value
+	}
 }
 
 func readConfigFile(path string) (PartialConfig, bool, error) {
@@ -377,6 +399,17 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--reviewer-enable-self-review"):
+			value, nextIndex, err := takeValue(index, "--reviewer-enable-self-review")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-enable-self-review: %q is not a boolean", value)
+			}
+			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
 			index = nextIndex
 		case matchesFlag(arg, "--reviewer-clean-review-event"):
 			value, nextIndex, err := takeValue(index, "--reviewer-clean-review-event")
@@ -811,6 +844,9 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 		return err
 	}
 	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).RequireReviewRequest = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).EnableSelfReview = v }); err != nil {
 		return err
 	}
 	if err := listEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(v *[]string) { ensureReviewerRoleTriggersConfig(overrides).Labels = v }); err != nil {

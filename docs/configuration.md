@@ -170,6 +170,7 @@ Example minimal `~/.looper/config.json`:
       "triggers": {
         "includeDrafts": false,
         "requireReviewRequest": true,
+        "enableSelfReview": false,
         "labels": [],
         "labelMode": "all"
       },
@@ -458,17 +459,19 @@ Defaults preserve Looper's historical behavior:
 
 - planner discovers open issues labeled `looper:plan` assigned to the current GitHub user
 - worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
-- reviewer discovers open non-draft PRs where the current user is requested for review, plus the `looper:spec-reviewing` follow-up path
+- reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
 - fixer discovers open non-draft PRs authored by the current user that have actionable review items
 
 Common fields:
 
 - `roles.<role>.autoDiscovery`: when `false`, the scheduler skips new discovery for that role only
 - issue roles (`planner`, `worker`): `triggers.labels`, `triggers.labelMode` (`all` or `any`), and `triggers.requireAssigneeCurrentUser`
-- reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
+- reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.enableSelfReview`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
 - fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
 
 Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+
+For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 
 Examples:
 
@@ -584,6 +587,7 @@ Supported environment overrides:
 - `LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY`
 - `LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS`
 - `LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST`
+- `LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW`
 - `LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS`
 - `LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE`
 - `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL`
@@ -640,6 +644,7 @@ Supported `looperd` flags:
 - `--allow-auto-commit`
 - `--allow-auto-push`
 - `--allow-auto-approve`
+- `--reviewer-enable-self-review`
 - `--reviewer-clean-review-event`
 - `--reviewer-blocking-review-event`
 

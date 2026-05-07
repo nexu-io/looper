@@ -177,6 +177,7 @@ func DefaultConfig(cwd string) (Config, error) {
 				Triggers: ReviewerRoleTriggersConfig{
 					IncludeDrafts:        false,
 					RequireReviewRequest: true,
+					EnableSelfReview:     false,
 					Labels:               []string{},
 					LabelMode:            LabelModeAll,
 				},

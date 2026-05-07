@@ -308,6 +308,7 @@ type PullRequestRoleTriggersConfig struct {
 type ReviewerRoleTriggersConfig struct {
 	IncludeDrafts        bool      `json:"includeDrafts"`
 	RequireReviewRequest bool      `json:"requireReviewRequest"`
+	EnableSelfReview     bool      `json:"enableSelfReview,omitempty"`
 	Labels               []string  `json:"labels"`
 	LabelMode            LabelMode `json:"labelMode"`
 }
@@ -562,6 +563,7 @@ type PartialPullRequestRoleTriggersConfig struct {
 type PartialReviewerRoleTriggersConfig struct {
 	IncludeDrafts        *bool      `json:"includeDrafts,omitempty"`
 	RequireReviewRequest *bool      `json:"requireReviewRequest,omitempty"`
+	EnableSelfReview     *bool      `json:"enableSelfReview,omitempty"`
 	Labels               *[]string  `json:"labels,omitempty"`
 	LabelMode            *LabelMode `json:"labelMode,omitempty"`
 }

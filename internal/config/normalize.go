@@ -599,6 +599,9 @@ func mergeReviewerRoleTriggersConfig(config *ReviewerRoleTriggersConfig, partial
 	if partial.RequireReviewRequest != nil {
 		config.RequireReviewRequest = *partial.RequireReviewRequest
 	}
+	if partial.EnableSelfReview != nil {
+		config.EnableSelfReview = *partial.EnableSelfReview
+	}
 	if partial.Labels != nil {
 		config.Labels = cloneStrings(*partial.Labels)
 	}
