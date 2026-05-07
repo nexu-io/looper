@@ -54,8 +54,12 @@ func TestRunStatsCommandOutputsJSONAndHuman(t *testing.T) {
 				t.Fatalf("reviewer outcomes = %#v, want approved=1 requested_changes=1", reviewer.Outcomes)
 			}
 			fixer := decoded.Roles["fixer"]
-			if fixer.Success != 1 || fixer.Failure != 1 || fixer.Retried != 4 || fixer.AgentExecutions.Success != 1 || fixer.AgentExecutions.Failure != 1 || fixer.AgentExecutions.Status["completed"] != 1 {
+			if fixer.Success != 1 || fixer.Failure != 1 || fixer.Retried != 1 || fixer.AgentExecutions.Success != 1 || fixer.AgentExecutions.Failure != 1 || fixer.AgentExecutions.Status["completed"] != 1 {
 				t.Fatalf("fixer stats = %#v, want run and agent breakdowns", fixer)
+			}
+			worker := decoded.Roles["worker"]
+			if worker.Retried != 2 {
+				t.Fatalf("worker retried = %d, want queue-only retries counted", worker.Retried)
 			}
 		}},
 		{name: "human", args: []string{"run", "stats", "--since", "1000d", "--role", "reviewer"}, assert: func(t *testing.T, output string) {
@@ -140,6 +144,7 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	loops := []storage.LoopRecord{
 		{ID: "loop_reviewer", Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "completed", CreatedAt: now, UpdatedAt: now},
 		{ID: "loop_fixer", Seq: 2, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", Status: "completed", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_worker", Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "completed", CreatedAt: now, UpdatedAt: now},
 	}
 	for _, loop := range loops {
 		if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
@@ -183,6 +188,9 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_retry", LoopID: stringPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "239", DedupeKey: "queue_fixer_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 5, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(retry) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_retry", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 2, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(worker retry) error = %v", err)
 	}
 	return configPath
 }

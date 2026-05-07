@@ -184,6 +184,7 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 	if err != nil {
 		return output, err
 	}
+	loopRetryEvents := map[string]struct{}{}
 	for _, event := range events {
 		createdAt, ok := parseRunStatsTime(event.CreatedAt)
 		if !ok || createdAt.Before(sinceAt) || event.LoopID == nil {
@@ -196,19 +197,25 @@ func buildRunStatsOutput(ctx context.Context, repos *storage.Repositories, since
 		stats := output.Roles[role]
 		addEventToStats(&stats, event)
 		output.Roles[role] = stats
+		if runStatsEventIsRetry(event.EventType) {
+			loopRetryEvents[*event.LoopID] = struct{}{}
+		}
 	}
 	queues, err := repos.Queue.List(ctx)
 	if err != nil {
 		return output, err
 	}
 	for _, item := range queues {
-		updatedAt, ok := parseRunStatsTime(item.UpdatedAt)
-		if !ok || updatedAt.Before(sinceAt) || item.Attempts <= 0 {
+		createdAt, ok := parseRunStatsTime(item.CreatedAt)
+		if !ok || createdAt.Before(sinceAt) || item.Attempts <= 0 {
 			continue
 		}
 		role := item.Type
 		if item.LoopID != nil {
 			if loopFilter != "" && *item.LoopID != loopFilter {
+				continue
+			}
+			if _, countedFromEvents := loopRetryEvents[*item.LoopID]; countedFromEvents {
 				continue
 			}
 			if mappedRole := loopRoles[*item.LoopID]; mappedRole != "" {
@@ -362,11 +369,15 @@ func addEventToStats(stats *runRoleStats, event storage.EventLogRecord) {
 	switch {
 	case strings.Contains(eventType, "requeued"):
 		stats.Requeued++
-	case strings.Contains(eventType, "retry"):
+	case runStatsEventIsRetry(eventType):
 		stats.Retried++
 	case strings.Contains(eventType, "interrupted"):
 		stats.Interrupted++
 	}
+}
+
+func runStatsEventIsRetry(eventType string) bool {
+	return strings.Contains(strings.ToLower(eventType), "retry")
 }
 
 func addRoleStats(total *runRoleStats, stats runRoleStats) {
