@@ -58,7 +58,7 @@ func TestRunStatsCommandOutputsJSONAndHuman(t *testing.T) {
 				t.Fatalf("fixer stats = %#v, want run and agent breakdowns", fixer)
 			}
 			worker := decoded.Roles["worker"]
-			if worker.Retried != 2 {
+			if worker.Retried != 1 {
 				t.Fatalf("worker retried = %d, want queue-only retries counted", worker.Retried)
 			}
 		}},
@@ -189,8 +189,12 @@ func writeRunStatsCommandFixture(t *testing.T) string {
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_retry", LoopID: stringPtr("loop_fixer"), Type: "fixer", TargetType: "pull_request", TargetID: "239", DedupeKey: "queue_fixer_retry", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 5, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(retry) error = %v", err)
 	}
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_retry", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 2, MaxAttempts: 5, CreatedAt: old, UpdatedAt: now}); err != nil {
+	retryableKind := "retryable_transient"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_retry", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 2, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(worker retry) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_claimed_after_retry", LoopID: stringPtr("loop_worker"), Type: "worker", TargetType: "project", TargetID: "project_run_stats_cli", DedupeKey: "queue_worker_claimed_after_retry", Priority: 1, Status: "running", AvailableAt: now, Attempts: 4, MaxAttempts: 5, LastErrorKind: &retryableKind, CreatedAt: old, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(worker claimed after retry) error = %v", err)
 	}
 	return configPath
 }
