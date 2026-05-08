@@ -1773,12 +1773,10 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				return checkpoint, err
 			}
 			if latestThread == nil {
-				skippedReason = "candidate_no_longer_eligible"
 				continue
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
-				skippedReason = "missing_objective_audit_comment"
 				continue
 			}
 			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: thread.ID, CWD: input.Project.RepoPath}); err != nil {
@@ -3141,8 +3139,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if latestRun == nil || latestRun.Status != "failed" {
 		return false, "", "latest_run_not_failed", nil
 	}
-	checkpoint := reviewerCheckpoint{}
-	checkpoint = parseCheckpoint(latestRun.CheckpointJSON)
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
 	queueKind := ""
 	if latestQueue.LastErrorKind != nil {
 		queueKind = *latestQueue.LastErrorKind

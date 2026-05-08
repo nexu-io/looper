@@ -3,9 +3,7 @@ package notify
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -262,17 +260,6 @@ func openNotifyCoordinator(t *testing.T, rootDir string) *storage.SQLiteCoordina
 	return coordinator
 }
 
-func writeExecutableScript(t *testing.T, path string, contents string) {
-	t.Helper()
-
-	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", path, err)
-	}
-	if err := os.Chmod(path, 0o755); err != nil {
-		t.Fatalf("Chmod(%q) error = %v", path, err)
-	}
-}
-
 func notificationStatus(records []storage.NotificationRecord, channel string) string {
 	for _, record := range records {
 		if record.Channel == channel {
@@ -283,9 +270,4 @@ func notificationStatus(records []storage.NotificationRecord, channel string) st
 	return ""
 }
 
-func assertContains(t *testing.T, got string, want string) {
-	t.Helper()
-	if !strings.Contains(got, want) {
-		t.Fatalf("string %q does not contain %q", got, want)
-	}
-}
+

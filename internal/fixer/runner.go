@@ -1789,7 +1789,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	for _, command := range input.Commands {
 		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD})
 		if err != nil {
-			output := "Unknown validation failure"
+			var output string
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
 				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))

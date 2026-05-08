@@ -623,7 +623,7 @@ func isStoppableExecutionStatus(status string) bool {
 }
 
 func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {
-	termSignaled := false
+	var termSignaled bool
 	if err := signalProcess(-pid, platform.SIGTERM); err != nil {
 		if !errors.Is(err, platform.ESRCH) {
 			return err

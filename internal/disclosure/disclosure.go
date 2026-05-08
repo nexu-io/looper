@@ -120,9 +120,7 @@ func (s Stamper) enabled(channel string) bool {
 
 func (s Stamper) markdownFooter(runner string) string {
 	parts := []string{Emoji + " Powered by " + RepoLinkHTML}
-	for _, attr := range s.attributes(runner) {
-		parts = append(parts, attr)
-	}
+	parts = append(parts, s.attributes(runner)...)
 	parts = append(parts, Slogan)
 	return "<sub>" + strings.Join(parts, " · ") + "</sub>"
 }

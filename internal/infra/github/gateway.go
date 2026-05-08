@@ -1063,10 +1063,6 @@ func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prN
 	return bodies, nil
 }
 
-func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
-	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "", false).Found
-}
-
 func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string, allowCleanComment bool) ReviewMarkerResult {
 	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
 	var rows []map[string]any
@@ -1155,13 +1151,6 @@ func normalizeReviewMarkerLogin(login string) string {
 	return strings.ToLower(strings.TrimSpace(login))
 }
 
-func reviewMarkerOutcome(body string, marker string) string {
-	if parsedMarker, ok := findReviewIdempotencyMarker(body, marker); ok {
-		return parsedMarker.Outcome
-	}
-	return ""
-}
-
 type reviewIdempotencyMarker struct {
 	ID      string
 	Head    string
@@ -1233,11 +1222,6 @@ func (m reviewIdempotencyMarker) matches(marker string) bool {
 		return false
 	}
 	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
-}
-
-func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
-	event := reviewEventFromStateString(raw)
-	return reviewEventAllowed(event, allowedReviewEvents)
 }
 
 func reviewEventFromStateString(raw any) string {

@@ -52,19 +52,12 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 	lastExecutionID := ""
 	lastRunID := ""
 	sawLogContent := false
-	sawEnd := false
 
 	for {
 		eventName, payload, err := readServerSentEvent(reader)
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
 				return nil
-			}
-			if sawEnd && errors.Is(err, io.EOF) {
-				return nil
-			}
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("log stream terminated unexpectedly")
 			}
 			return err
 		}
@@ -121,7 +114,6 @@ func (r *commandRuntime) followLoopLogs(cmd *cobra.Command, loopID string) error
 				sawLogContent = true
 			}
 		case "end":
-			sawEnd = true
 			if !sawLogContent {
 				payload, err := r.getJSON(cmd.Context(), "/api/v1/loops/"+url.PathEscape(loopID)+"/logs")
 				if err != nil {

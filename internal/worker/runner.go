@@ -1507,7 +1507,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, &loopError{message: "Worker create-pr requires a pull request number", kind: FailureRetryableAfterResume}
 	}
 	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
-	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
+	pr := checkpointPullPR(created)
 	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
 		return checkpoint, err
 	}
@@ -1758,7 +1758,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	for _, command := range input.Commands {
 		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD})
 		if err != nil {
-			output := "Unknown validation failure"
+			var output string
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
 				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
@@ -2531,7 +2531,7 @@ func readSpecBlock(projectRepoPath, specPath string) (string, error) {
 	}
 	content, err := os.ReadFile(resolved)
 	if err != nil {
-		return fmt.Sprintf("Spec path: %s", specPath), nil
+		return "", err
 	}
 	return fmt.Sprintf("Spec (%s):\n%s", specPath, string(content)), nil
 }

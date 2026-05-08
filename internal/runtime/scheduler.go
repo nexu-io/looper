@@ -957,11 +957,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		return nil
 	}
 
-	now := input.Now
-	if now == nil {
-		now = time.Now
-	}
-
 	errs := make([]error, 0)
 	appendErr := func(err error) {
 		if err != nil {

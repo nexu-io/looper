@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -96,10 +97,13 @@ func TestBootstrapLoadsConfigEnsuresPathsCreatesLoggerAndStartsRuntime(t *testin
 		t.Fatalf("result.Runtime = %#v, want %#v", result.Runtime, runtimeValue)
 	}
 
-	if len(logger.infoEntries) != 1 {
-		t.Fatalf("len(logger.infoEntries) = %d, want 1", len(logger.infoEntries))
+	logger.mu.Lock()
+	infoEntries := append([]logCall{}, logger.infoEntries...)
+	logger.mu.Unlock()
+	if len(infoEntries) != 1 {
+		t.Fatalf("len(logger.infoEntries) = %d, want 1", len(infoEntries))
 	}
-	entry := logger.infoEntries[0]
+	entry := infoEntries[0]
 	if entry.message != "looperd bootstrap initialized" {
 		t.Fatalf("logger.Info() message = %q, want %q", entry.message, "looperd bootstrap initialized")
 	}
@@ -221,21 +225,38 @@ func TestBootstrapWaitForShutdownRegistersSignalsAndStopsRuntime(t *testing.T) {
 		t.Fatal("Bootstrap() did not return after shutdown signal")
 	}
 
-	if !reflect.DeepEqual(runtime.stopReasons, []string{"SIGTERM"}) {
-		t.Fatalf("runtime.Stop() reasons = %#v, want %#v", runtime.stopReasons, []string{"SIGTERM"})
-	}
-	if notifier.stopCalls != 1 {
-		t.Fatalf("SignalNotifier.Stop() calls = %d, want 1", notifier.stopCalls)
+	runtime.mu.Lock()
+	stopReasons := runtime.stopReasons
+	runtime.mu.Unlock()
+	if !reflect.DeepEqual(stopReasons, []string{"SIGTERM"}) {
+		t.Fatalf("runtime.Stop() reasons = %#v, want %#v", stopReasons, []string{"SIGTERM"})
 	}
 
-	if len(logger.infoEntries) != 2 {
-		t.Fatalf("len(logger.infoEntries) = %d, want 2", len(logger.infoEntries))
+	notifier.mu.Lock()
+	stopCalls := notifier.stopCalls
+	notifier.mu.Unlock()
+	if stopCalls != 1 {
+		t.Fatalf("SignalNotifier.Stop() calls = %d, want 1", stopCalls)
 	}
-	if got := logger.infoEntries[1].message; got != "received shutdown signal" {
-		t.Fatalf("logger.Info() message = %q, want %q", got, "received shutdown signal")
+
+	logger.mu.Lock()
+	infoLen := len(logger.infoEntries)
+	lastInfo := ""
+	if infoLen > 1 {
+		lastInfo = logger.infoEntries[1].message
 	}
-	if got := logger.infoEntries[1].context["signal"]; got != "SIGTERM" {
-		t.Fatalf("logger.Info() context[signal] = %#v, want %#v", got, "SIGTERM")
+	logger.mu.Unlock()
+	if infoLen != 2 {
+		t.Fatalf("len(logger.infoEntries) = %d, want 2", infoLen)
+	}
+	if lastInfo != "received shutdown signal" {
+		t.Fatalf("logger.Info() message = %q, want %q", lastInfo, "received shutdown signal")
+	}
+	logger.mu.Lock()
+	signalContext := logger.infoEntries[1].context["signal"]
+	logger.mu.Unlock()
+	if signalContext != "SIGTERM" {
+		t.Fatalf("logger.Info() context[signal] = %#v, want %#v", signalContext, "SIGTERM")
 	}
 }
 
@@ -272,16 +293,20 @@ func TestBootstrapWaitForShutdownRequiresShutdownRuntime(t *testing.T) {
 }
 
 type recordingLogger struct {
+	mu          sync.Mutex
 	infoEntries []logCall
 }
 
 type stubShutdownRuntime struct {
+	mu          sync.Mutex
 	stopReasons []string
 	shutdown    chan struct{}
 }
 
 func (r *stubShutdownRuntime) Stop(reason string) {
+	r.mu.Lock()
 	r.stopReasons = append(r.stopReasons, reason)
+	r.mu.Unlock()
 	select {
 	case <-r.shutdown:
 	default:
@@ -294,6 +319,7 @@ func (r *stubShutdownRuntime) WaitForShutdown() {
 }
 
 type stubSignalNotifier struct {
+	mu         sync.Mutex
 	ch         chan<- os.Signal
 	signals    []os.Signal
 	registered chan struct{}
@@ -301,28 +327,38 @@ type stubSignalNotifier struct {
 }
 
 func (n *stubSignalNotifier) Notify(ch chan<- os.Signal, sig ...os.Signal) {
+	n.mu.Lock()
 	n.ch = ch
 	n.signals = append([]os.Signal(nil), sig...)
 	if n.registered == nil {
 		n.registered = make(chan struct{})
 	}
+	n.mu.Unlock()
 	close(n.registered)
 }
 
 func (n *stubSignalNotifier) Stop(chan<- os.Signal) {
+	n.mu.Lock()
 	n.stopCalls++
+	n.mu.Unlock()
 }
 
 func (n *stubSignalNotifier) waitForRegistration(t *testing.T) []os.Signal {
 	t.Helper()
 
+	n.mu.Lock()
 	if n.registered == nil {
 		n.registered = make(chan struct{})
 	}
+	registered := n.registered
+	n.mu.Unlock()
 
 	select {
-	case <-n.registered:
-		return append([]os.Signal(nil), n.signals...)
+	case <-registered:
+		n.mu.Lock()
+		result := append([]os.Signal(nil), n.signals...)
+		n.mu.Unlock()
+		return result
 	case <-time.After(time.Second):
 		t.Fatal("SignalNotifier.Notify() was not called")
 		return nil
@@ -341,7 +377,9 @@ type logCall struct {
 func (l *recordingLogger) Debug(string, map[string]any) {}
 
 func (l *recordingLogger) Info(message string, context map[string]any) {
+	l.mu.Lock()
 	l.infoEntries = append(l.infoEntries, logCall{message: message, context: context})
+	l.mu.Unlock()
 }
 
 func (l *recordingLogger) Warn(string, map[string]any) {}

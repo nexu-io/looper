@@ -1744,10 +1744,7 @@ func runtimeHasApprovedReviewByAuthorForHead(reviews []map[string]any, login str
 }
 
 func runtimeReviewerCheckpointApprovedForRecovery(reviews []map[string]any, login string, headSHA string, reviewDecision string) bool {
-	if runtimeHasApprovedReviewByAuthorForHead(reviews, login, headSHA) {
-		return true
-	}
-	return false
+	return runtimeHasApprovedReviewByAuthorForHead(reviews, login, headSHA)
 }
 
 func isDeprecatedReviewerLoopBudgetReason(reason string) bool {

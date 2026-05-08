@@ -188,7 +188,7 @@ func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (
 }
 
 func (r *commandRuntime) downloadChecksum(ctx context.Context, url string) (string, error) {
-	data, _, err := r.download(ctx, url, "text/plain", "", nil)
+	data, _, err := r.download(ctx, url, "text/plain", "", nil) //nolint:bodyclose
 	if err != nil {
 		return "", fmt.Errorf("Failed to download looperd checksum from %s (%v)", url, err)
 	}
@@ -231,7 +231,7 @@ func (r *commandRuntime) download(ctx context.Context, url string, accept string
 }
 
 func (r *commandRuntime) downloadBinary(ctx context.Context, url string, name string, progress io.Writer) ([]byte, error) {
-	data, _, err := r.download(ctx, url, "application/octet-stream", name, progress)
+	data, _, err := r.download(ctx, url, "application/octet-stream", name, progress) //nolint:bodyclose
 	if err != nil {
 		return nil, fmt.Errorf("Failed to download release binary from %s (%v)", url, err)
 	}

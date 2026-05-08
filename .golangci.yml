@@ -1,0 +1,88 @@
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - wastedassign
+    - nilerr
+    - bodyclose
+    - gosimple
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (*os.File).Close
+      - (io.Closer).Close
+      - (*database/sql.Rows).Close
+      - (*database/sql.Tx).Rollback
+      - (*net/http.ResponseWriter).Write
+      - net/http.Close
+      - io.PipeWriter.Close
+      - io.PipeReader.Close
+      - fmt.Fprintln
+      - fmt.Fprintf
+      - fmt.Fprint
+      - fmt.Fscan
+      - os.Remove
+      - (net.Listener).Close
+      - (*database/sql.Conn).Close
+      - (*gzip.Reader).Close
+  staticcheck:
+    checks:
+      - all
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude:
+    - "SA9003"
+    - "SA6006"
+    - "SA1006"
+    - "SA1016"
+    - "SA1017"
+    - "SA1011"
+    - "G301"
+    - "G302"
+    - "G304"
+    - "G306"
+    - "G401"
+    - "G505"
+    - "G204"
+  exclude-rules:
+    - linters:
+        - bodyclose
+      source: "defer (resp|response)\\.Body\\.Close"
+    - linters:
+        - unused
+      path: "_test.go"
+    - linters:
+        - errcheck
+      path: "_test.go"
+    - linters:
+        - wastedassign
+      path: "_test.go"
+    - linters:
+        - nilerr
+      path: "_test.go"
+    - linters:
+        - ineffassign
+      path: "_test.go"
+    - linters:
+        - bodyclose
+      path: "_test.go"
+    - linters:
+        - staticcheck
+      path: "_test.go"
+      text: "SA4006"
+    - linters:
+        - unused
+      source: "haveProcessGroups"
+    - linters:
+        - errcheck
+      source: "gzReader.Close"
+    - linters:
+        - errcheck
+      source: "\\(conn\\)\\.Close"

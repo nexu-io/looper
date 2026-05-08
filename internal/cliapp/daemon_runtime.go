@@ -845,7 +845,7 @@ func (r *commandRuntime) apiClient() (*DaemonAPIClient, error) {
 }
 
 func (r *commandRuntime) apiClientFromLoaded(loaded config.LoadedFileConfig) *DaemonAPIClient {
-	baseURL := ""
+	var baseURL string
 	if loaded.Config.Server.BaseURL != nil && strings.TrimSpace(*loaded.Config.Server.BaseURL) != "" {
 		baseURL = strings.TrimSpace(*loaded.Config.Server.BaseURL)
 	} else {
@@ -1120,7 +1120,7 @@ func (r *commandRuntime) readDaemonVersion(ctx context.Context, command string) 
 func (r *commandRuntime) runVersionCommand(ctx context.Context, command string) (string, error) {
 	version, err := r.runVersionCommandStrict(ctx, command)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	return version, nil
 }

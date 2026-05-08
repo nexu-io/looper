@@ -118,7 +118,7 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 	}
 	execPath, err := r.executablePath()
 	if err != nil {
-		return nil
+		return err
 	}
 	if detectCLIInstallSource(execPath) != cliInstallSourceRelease {
 		return nil
@@ -126,7 +126,7 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 
 	loaded, err := r.loadConfig()
 	if err != nil {
-		return nil
+		return err
 	}
 	if !loaded.Config.Package.AutoUpgradeEnabled {
 		return nil
@@ -134,7 +134,7 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 
 	statePath, err := r.resolveAutoUpgradeStatePath()
 	if err != nil {
-		return nil
+		return err
 	}
 	state, err := r.readAutoUpgradeState(statePath)
 	if err != nil {

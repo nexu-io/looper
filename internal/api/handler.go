@@ -2105,10 +2105,7 @@ func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.Loop
 	case string(domain.LoopTargetTypeProject):
 		projectID := ""
 		if loop.TargetID != nil {
-			projectID = strings.TrimSpace(*loop.TargetID)
-			if strings.HasPrefix(projectID, "project:") {
-				projectID = strings.TrimPrefix(projectID, "project:")
-			}
+			projectID = strings.TrimPrefix(strings.TrimSpace(*loop.TargetID), "project:")
 		}
 		if projectID == "" {
 			return activeRunTarget{}, false, nil
@@ -2127,7 +2124,10 @@ func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.Loop
 			return activeRunTarget{}, false, nil
 		}
 		issueNumber, err := parseIssueNumber(*loop.TargetID)
-		if err != nil || issueNumber <= 0 {
+		if err != nil {
+			return activeRunTarget{}, false, err
+		}
+		if issueNumber <= 0 {
 			return activeRunTarget{}, false, nil
 		}
 		repo := *loop.Repo
@@ -3669,7 +3669,7 @@ func buildLoopTarget(targetType string, body createLoopRequest) (domain.LoopTarg
 		if strings.TrimSpace(derefString(body.Repo)) == "" {
 			return domain.LoopTarget{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repo is required"}
 		}
-		issueNumber := int64(0)
+		var issueNumber int64
 		if body.IssueNumber != nil {
 			issueNumber = *body.IssueNumber
 		} else {
