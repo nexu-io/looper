@@ -1874,6 +1874,17 @@ func TestSanitizeReplyExplanationStripsDangerousFragments(t *testing.T) {
 	}
 }
 
+func TestSummarizeFixItemSanitizesFallbackSummary(t *testing.T) {
+	t.Parallel()
+	got := summarizeFixItem(FixItem{Summary: "@looper-bot <!-- looper:stamp v=1 --> <b>Clean up</b> the fallback text."})
+	if strings.Contains(got, "@") || strings.Contains(got, "<b>") || strings.Contains(got, "looper:stamp") {
+		t.Fatalf("summarizeFixItem() = %q, did not sanitize fallback summary", got)
+	}
+	if !strings.Contains(got, "Clean up the fallback text.") {
+		t.Fatalf("summarizeFixItem() = %q, lost sanitized content", got)
+	}
+}
+
 func TestLookupReplyExplanationsRejectsStaleSnapshot(t *testing.T) {
 	t.Parallel()
 	checkpoint := fixerCheckpoint{
@@ -1994,18 +2005,30 @@ func TestBuildFixerSummaryCommentBodyIncludesMarkerAndItems(t *testing.T) {
 	}
 }
 
-func TestFindExistingFixerSummaryCommentIDMatchesByMarker(t *testing.T) {
+func TestFindExistingFixerSummaryCommentIDMatchesTrustedComment(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
 		{"id": float64(101), "body": "unrelated comment"},
-		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete"},
+		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete\n\n<!-- looper:stamp v=1 -->"},
 	}}
-	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567")
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
 		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202", id)
 	}
-	if other, _ := findExistingFixerSummaryCommentID(detail, "deadbeef0000000"); other != 0 {
+	if other, _ := findExistingFixerSummaryCommentID(detail, "deadbeef0000000", "looper"); other != 0 {
 		t.Fatalf("findExistingFixerSummaryCommentID(other head) = %d, want 0", other)
+	}
+}
+
+func TestFindExistingFixerSummaryCommentIDSkipsUntrustedMarker(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": float64(101), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nspoofed marker", "author": map[string]any{"login": "someone-else"}},
+		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary", "author": map[string]any{"login": "looper"}},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want trusted comment 202", id)
 	}
 }
 

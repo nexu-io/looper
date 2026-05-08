@@ -1660,17 +1660,13 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 }
 
 func summarizeFixItem(item FixItem) string {
-	summary := strings.TrimSpace(item.Summary)
+	summary := sanitizeReplyExplanation(item.Summary)
 	if summary == "" {
 		return ""
 	}
-	summary = strings.ReplaceAll(summary, "<!-- looper:stamp v=1 -->", "")
-	summary = strings.TrimSpace(summary)
-	if summary == "" {
-		return ""
-	}
-	if len(summary) > 240 {
-		summary = strings.TrimSpace(summary[:240]) + "…"
+	if len([]rune(summary)) > 240 {
+		runes := []rune(summary)
+		summary = strings.TrimSpace(string(runes[:240])) + "…"
 	}
 	lines := strings.Split(summary, "\n")
 	for index, line := range lines {
@@ -1739,7 +1735,11 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 		checkpoint.SummaryComment.UpdatedAt = r.nowISO()
 		return
 	}
-	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA); existingID != 0 {
+	trustedLogin := ""
+	if login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath); err == nil {
+		trustedLogin = login
+	}
+	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA, trustedLogin); existingID != 0 {
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingID, Body: body, CWD: input.Project.RepoPath}); err != nil {
 			checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existingID, URL: existingURL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "update_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
 			return
@@ -1930,7 +1930,7 @@ func summaryStatusIcon(status string) string {
 // findExistingFixerSummaryCommentID scans the PR's issue comments for a prior
 // summary keyed by the same head SHA. Used for edit-on-retry when our local
 // checkpoint was wiped (resume across daemon restarts, scheduler re-claim).
-func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA string) (int64, string) {
+func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, trustedLogin string) (int64, string) {
 	if detail == nil || headSHA == "" {
 		return 0, ""
 	}
@@ -1941,6 +1941,9 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA string)
 	for _, comment := range detail.IssueComments {
 		body, _ := stringFromAny(comment["body"])
 		if !strings.Contains(body, marker) {
+			continue
+		}
+		if !isTrustedFixerSummaryComment(comment, trustedLogin, body) {
 			continue
 		}
 		idVal := comment["id"]
@@ -1960,6 +1963,22 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA string)
 		return id, url
 	}
 	return 0, ""
+}
+
+func isTrustedFixerSummaryComment(comment map[string]any, trustedLogin, body string) bool {
+	if strings.Contains(body, "looper:stamp") {
+		return true
+	}
+	if sameGitHubLogin(issueCommentAuthorLogin(comment), trustedLogin) {
+		return true
+	}
+	return false
+}
+
+func issueCommentAuthorLogin(comment map[string]any) string {
+	author, _ := comment["author"].(map[string]any)
+	login, _ := stringFromAny(author["login"])
+	return login
 }
 
 func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
