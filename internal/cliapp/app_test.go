@@ -1033,7 +1033,18 @@ func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 }
 
 func TestConfigValidateAndShowSource(t *testing.T) {
-	configPath := writeEditableCLIConfig(t)
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"allowRiskyFixes":    false,
+			"fixAllPullRequests": false,
+		},
+		"package": map[string]any{
+			"autoUpgradeEnabled": false,
+		},
+	})
 
 	exitCode, stdout, stderr := runApp(t, "config", "validate", "--config", configPath)
 	if exitCode != 0 {
@@ -1064,6 +1075,16 @@ func TestConfigValidateAndShowSource(t *testing.T) {
 	}
 	if got, want := allowRisky["value"], false; got != want {
 		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+	autoUpgrade, ok := fields["package.autoUpgradeEnabled"].(map[string]any)
+	if !ok {
+		t.Fatalf("package.autoUpgradeEnabled = %#v, want object", fields["package.autoUpgradeEnabled"])
+	}
+	if got, want := autoUpgrade["source"], "config-file"; got != want {
+		t.Fatalf("package.autoUpgradeEnabled source = %#v, want %#v", got, want)
+	}
+	if got, want := autoUpgrade["value"], false; got != want {
+		t.Fatalf("package.autoUpgradeEnabled value = %#v, want %#v", got, want)
 	}
 
 	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--no-custom-instructions=false", "--config", configPath)

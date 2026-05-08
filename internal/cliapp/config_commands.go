@@ -674,6 +674,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Defaults.OpenPRStrategy != nil
 	case "instructions.enabled":
 		return partial.Instructions != nil && partial.Instructions.Enabled != nil
+	case "package.autoUpgradeEnabled":
+		return partial.Package != nil && partial.Package.AutoUpgradeEnabled != nil
 	case "instructions.maxBytes":
 		return partial.Instructions != nil && partial.Instructions.MaxBytes != nil
 	case "reviewer.reviewEvents.clean":
