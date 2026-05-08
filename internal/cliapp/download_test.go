@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +35,45 @@ func buildTarGzArchive(t *testing.T, entryName string, contents []byte) []byte {
 	}
 	if err := tw.Close(); err != nil {
 		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func buildTarGzArchiveWithHeaderOnly(t *testing.T, entryName string, size int64) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	header := make([]byte, 512)
+	copy(header[0:100], []byte(entryName))
+	copy(header[100:108], []byte(fmt.Sprintf("%07o\x00", 0o755)))
+	copy(header[108:116], []byte("0000000\x00"))
+	copy(header[116:124], []byte("0000000\x00"))
+	copy(header[124:136], []byte(fmt.Sprintf("%011o\x00", size)))
+	copy(header[136:148], []byte("00000000000\x00"))
+	for i := 148; i < 156; i++ {
+		header[i] = ' '
+	}
+	header[156] = tar.TypeReg
+	copy(header[257:263], []byte("ustar\x00"))
+	copy(header[263:265], []byte("00"))
+	checksum := 0
+	for _, b := range header {
+		checksum += int(b)
+	}
+	copy(header[148:156], []byte(fmt.Sprintf("%06o\x00 ", checksum)))
+	if _, err := raw.Write(header); err != nil {
+		t.Fatalf("write tar header: %v", err)
+	}
+	if _, err := raw.Write(make([]byte, 1024)); err != nil {
+		t.Fatalf("write tar trailer: %v", err)
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(raw.Bytes()); err != nil {
+		t.Fatalf("gzip write: %v", err)
 	}
 	if err := gz.Close(); err != nil {
 		t.Fatalf("gzip close: %v", err)
@@ -79,6 +119,19 @@ func TestExtractBinaryFromTarGzReportsMissingEntry(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does not contain entry") {
 		t.Fatalf("error = %q, want missing-entry message", err.Error())
+	}
+}
+
+func TestExtractBinaryFromTarGzRejectsOversizedEntry(t *testing.T) {
+	t.Parallel()
+
+	archive := buildTarGzArchiveWithHeaderOnly(t, "looperd-darwin-arm64", maxArchiveBinaryBytes+1)
+	_, err := extractBinaryFromTarGz(archive, "looperd-darwin-arm64")
+	if err == nil {
+		t.Fatal("extractBinaryFromTarGz() error = nil, want oversized-entry error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %q, want oversized-entry message", err.Error())
 	}
 }
 

@@ -163,6 +163,9 @@ func extractBinaryFromTarGz(archiveBytes []byte, binaryName string) ([]byte, err
 		if path.Base(header.Name) != binaryName {
 			continue
 		}
+		if header.Size > maxArchiveBinaryBytes {
+			return nil, fmt.Errorf("archive entry %q exceeds %d-byte limit", header.Name, maxArchiveBinaryBytes)
+		}
 		data, err := io.ReadAll(io.LimitReader(tarReader, maxArchiveBinaryBytes))
 		if err != nil {
 			return nil, fmt.Errorf("read tar entry %q: %w", header.Name, err)
