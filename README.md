@@ -167,6 +167,16 @@ go test ./...
 
 Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 
+## Agent skill
+
+Looper includes an installable agent skill for setup, status, config, daemon lifecycle, and troubleshooting guidance:
+
+```bash
+npx skills add ./skills/looper
+```
+
+See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.
+
 ## Runtime notes
 
 - `looperd` fails fast on invalid config; runtime paths must be writable
