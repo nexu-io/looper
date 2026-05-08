@@ -48,6 +48,13 @@ type workerScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
 }
 
+type sweeperScheduler interface {
+	DiscoverIssues(context.Context, string, string) error
+	DiscoverPullRequests(context.Context, string, string) error
+	DiscoverReconcile(context.Context, string, string) error
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) error
+}
+
 type snapshotScheduler interface {
 	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 }
@@ -70,11 +77,13 @@ type defaultSchedulerTickInput struct {
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
 	Worker                   workerScheduler
+	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
 	PlannerDiscoveryEnabled  *bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	SweeperDiscoveryEnabled  *bool
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -742,6 +751,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
+	var sweeperRunner sweeperScheduler
 
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
@@ -904,11 +914,13 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
+			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			SweeperDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "sweeper")),
 		})
 	}
 }
@@ -1021,6 +1033,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		}
+		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, input.Sweeper.DiscoverIssues(ctx, project.ID, repo)))
+			appendErr(wrapSchedulerError("sweeper pull request discovery", project.ID, repo, input.Sweeper.DiscoverPullRequests(ctx, project.ID, repo)))
+			appendErr(wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, input.Sweeper.DiscoverReconcile(ctx, project.ID, repo)))
+		} else if input.Sweeper != nil && input.Logger != nil {
+			input.Logger.Debug("sweeper auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 	}
 
@@ -1150,6 +1169,13 @@ func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedule
 		return func(ctx context.Context) error {
 			_, err := input.Worker.ProcessClaimedQueueItem(ctx, item)
 			return wrapSchedulerQueueError(item.Type, err)
+		}, nil
+	case "sweeper", "sweeper:warn", "sweeper:close", "sweeper:reconcile":
+		if input.Sweeper == nil {
+			return nil, fmt.Errorf("sweeper runner is not configured")
+		}
+		return func(ctx context.Context) error {
+			return wrapSchedulerQueueError(item.Type, input.Sweeper.ProcessClaimedQueueItem(ctx, item))
 		}, nil
 	case "snapshot":
 		if input.Snapshotter == nil || input.Repos == nil || input.Repos.Queue == nil || input.Repos.PullRequestSnapshots == nil {
