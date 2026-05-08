@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -637,10 +638,30 @@ func extractCompletionMarkerPayload(combined string) string {
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if strings.HasPrefix(line, prefix) {
-			return strings.TrimPrefix(line, prefix)
+			payload := strings.TrimPrefix(line, prefix)
+			if isTemplateCompletionPayload(payload) {
+				continue
+			}
+			return payload
 		}
 	}
 	return ""
+}
+
+func isTemplateCompletionPayload(payload string) bool {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false
+	}
+	summary, _ := parsed["summary"].(string)
+	if strings.TrimSpace(summary) != "<one-sentence summary>" {
+		return false
+	}
+	if len(parsed) != 1 {
+		return false
+	}
+	_, ok := parsed["summary"]
+	return ok
 }
 
 func sanitizeReplyExplanation(raw string) string {
@@ -1946,16 +1967,7 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, truste
 		if !isTrustedFixerSummaryComment(comment, trustedLogin, body) {
 			continue
 		}
-		idVal := comment["id"]
-		var id int64
-		switch v := idVal.(type) {
-		case float64:
-			id = int64(v)
-		case int64:
-			id = v
-		case int:
-			id = int64(v)
-		}
+		id := int64FromAny(comment["id"])
 		if id == 0 {
 			continue
 		}
@@ -3097,6 +3109,23 @@ func stringFromAny(value any) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func int64FromAny(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err == nil {
+			return parsed
+		}
+	}
+	return 0
 }
 
 func optionalString(value string) *string {

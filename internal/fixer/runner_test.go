@@ -1837,6 +1837,18 @@ func TestParseReplyExplanationsReadsCompletionMarkerFromStderr(t *testing.T) {
 	}
 }
 
+func TestParseReplyExplanationsSkipsTemplateCompletionMarker(t *testing.T) {
+	t.Parallel()
+	stdout := strings.Join([]string{
+		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Kept scanning backward to the real completion."}]}`,
+		`__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`,
+	}, "\n")
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Explanation != "Kept scanning backward to the real completion." {
+		t.Fatalf("parseReplyExplanations() = %#v", got)
+	}
+}
+
 func TestParseReplyExplanationsDropsUnknownAndMismatchedThread(t *testing.T) {
 	t.Parallel()
 	stdout := `__LOOPER_RESULT__={"review_thread_replies":[` +
@@ -2029,6 +2041,17 @@ func TestFindExistingFixerSummaryCommentIDSkipsUntrustedMarker(t *testing.T) {
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
 		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want trusted comment 202", id)
+	}
+}
+
+func TestFindExistingFixerSummaryCommentIDParsesStringID(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": "202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->"},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202 from string id", id)
 	}
 }
 
