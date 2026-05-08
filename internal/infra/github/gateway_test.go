@@ -490,7 +490,7 @@ func TestSubmitReviewNormalizesLinkedHTMLInlineDisclosureWhenInlineVisibleDisabl
 	disclosureCfg := config.DefaultDisclosureConfig()
 	disclosureCfg.Channels.InlineCommentVisible = false
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<!-- looper:stamp v=1 -->\n<sub>Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
 	if err != nil {
 		t.Fatalf("SubmitReview() error = %v", err)
 	}

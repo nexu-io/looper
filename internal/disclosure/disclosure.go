@@ -16,6 +16,7 @@ const (
 	LegacyRepoURL = "https://github.com/powerformer/looper"
 	RepoLinkHTML  = `<a href="` + RepoURL + `">Looper</a>`
 	Slogan        = "An autonomous AI dev team for your GitHub repos."
+	Emoji         = "🔁"
 
 	ChannelGitCommit     = "gitCommit"
 	ChannelPullRequest   = "pullRequest"
@@ -24,7 +25,7 @@ const (
 )
 
 var (
-	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:Generated|Powered) by (?:looper|Looper|\[Looper\]\(https://github\.com/(?:nexu-io|powerformer)/looper\)|<a href="https://github\.com/nexu-io/looper">Looper</a>) .*?</sub>\s*`)
+	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:🔁 )?(?:Generated|Powered) by (?:looper|Looper|\[Looper\]\(https://github\.com/(?:nexu-io|powerformer)/looper\)|<a href="https://github\.com/nexu-io/looper">Looper</a>).*?</sub>\s*`)
 	markerOnlyPattern    = regexp.MustCompile(`(?m)\n*<!-- looper:stamp v=1 -->\s*`)
 	commitTrailerPattern = regexp.MustCompile(`(?m)^Generated-By: looper .*$`)
 )
@@ -118,7 +119,7 @@ func (s Stamper) enabled(channel string) bool {
 }
 
 func (s Stamper) markdownFooter(runner string) string {
-	parts := []string{"Powered by " + RepoLinkHTML}
+	parts := []string{Emoji + " Powered by " + RepoLinkHTML}
 	if runner = strings.TrimSpace(runner); runner != "" {
 		parts = append(parts, "runner="+runner)
 	}
