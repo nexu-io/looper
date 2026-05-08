@@ -29,6 +29,11 @@ type daemonInstallResult struct {
 	Skipped        bool    `json:"skipped"`
 }
 
+type preparedDaemonInstall struct {
+	result      daemonInstallResult
+	binaryBytes []byte
+}
+
 type githubReleasePayload struct {
 	TagName string               `json:"tag_name"`
 	Assets  []githubReleaseAsset `json:"assets"`
@@ -68,14 +73,25 @@ func (r *commandRuntime) daemonInstall(cmd *cobra.Command, args []string) error 
 }
 
 func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, tag string, progress io.Writer) (daemonInstallResult, error) {
-	homeDir, err := r.homeDir()
+	prepared, err := r.prepareManagedDaemonInstall(ctx, force, tag, progress)
 	if err != nil {
 		return daemonInstallResult{}, err
+	}
+	if err := commitPreparedDaemonInstall(prepared); err != nil {
+		return daemonInstallResult{}, err
+	}
+	return prepared.result, nil
+}
+
+func (r *commandRuntime) prepareManagedDaemonInstall(ctx context.Context, force bool, tag string, progress io.Writer) (preparedDaemonInstall, error) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return preparedDaemonInstall{}, err
 	}
 
 	target, err := resolveLooperdTarget(r.platform(), r.arch())
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
 	installDir := filepath.Join(homeDir, ".looper", "bin")
@@ -83,52 +99,62 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 	if !force {
 		state, err := r.checkManagedDaemonBinary(ctx)
 		if err != nil {
-			return daemonInstallResult{}, err
+			return preparedDaemonInstall{}, err
 		}
 		if state.Exists {
-			return daemonInstallResult{Target: target, InstallPath: installPath, Skipped: true}, nil
+			return preparedDaemonInstall{result: daemonInstallResult{Target: target, InstallPath: installPath, Skipped: true}}, nil
 		}
 	}
 
 	release, err := r.fetchReleaseMetadata(ctx, tag)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
 	asset, err := findReleaseAssetSet(release, looperdBinaryName+"-"+target)
 	if err != nil {
-		return daemonInstallResult{}, fmt.Errorf("looperd release: %w", err)
+		return preparedDaemonInstall{}, fmt.Errorf("looperd release: %w", err)
 	}
 
 	binaryBytes, err := r.fetchAndExtractBinary(ctx, asset, progress)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
+	return preparedDaemonInstall{
+		result: daemonInstallResult{
+			Target:         target,
+			InstallPath:    installPath,
+			DownloadedFrom: stringPtr(asset.PreferredURL),
+			Skipped:        false,
+		},
+		binaryBytes: binaryBytes,
+	}, nil
+}
+
+func commitPreparedDaemonInstall(prepared preparedDaemonInstall) error {
+	if prepared.result.Skipped {
+		return nil
+	}
+	installDir := filepath.Dir(prepared.result.InstallPath)
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
-		return daemonInstallResult{}, fmt.Errorf("create install directory: %w", err)
+		return fmt.Errorf("create install directory: %w", err)
 	}
 
-	tempInstallPath := installPath + ".new"
-	if err := os.WriteFile(tempInstallPath, binaryBytes, 0o755); err != nil {
+	tempInstallPath := prepared.result.InstallPath + ".new"
+	if err := os.WriteFile(tempInstallPath, prepared.binaryBytes, 0o755); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
 	if err := os.Chmod(tempInstallPath, 0o755); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
-	if err := os.Rename(tempInstallPath, installPath); err != nil {
+	if err := os.Rename(tempInstallPath, prepared.result.InstallPath); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
-
-	return daemonInstallResult{
-		Target:         target,
-		InstallPath:    installPath,
-		DownloadedFrom: stringPtr(asset.PreferredURL),
-		Skipped:        false,
-	}, nil
+	return nil
 }
 
 func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (githubReleasePayload, error) {

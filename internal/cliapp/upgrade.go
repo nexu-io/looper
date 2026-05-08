@@ -100,6 +100,13 @@ type cliUpgradeRefusedError struct {
 	message string
 }
 
+type preparedDaemonUpgrade struct {
+	output        daemonUpgradeOutput
+	managedDaemon *upgradeDaemonVersionState
+	pathDaemon    *upgradeDaemonVersionState
+	install       *preparedDaemonInstall
+}
+
 func (e *cliUpgradeRefusedError) Error() string {
 	return e.message
 }
@@ -388,23 +395,31 @@ func (r *commandRuntime) upgradeDaemon(cmd *cobra.Command) error {
 }
 
 func (r *commandRuntime) upgradeDaemonWithOutput(cmd *cobra.Command, emitOutput bool) (daemonUpgradeOutput, error) {
+	prepared, err := r.prepareDaemonUpgrade(cmd)
+	if err != nil {
+		return daemonUpgradeOutput{}, err
+	}
+	return r.finishPreparedDaemonUpgrade(cmd, prepared, emitOutput)
+}
+
+func (r *commandRuntime) prepareDaemonUpgrade(cmd *cobra.Command) (preparedDaemonUpgrade, error) {
 	ctx := cmd.Context()
 	statusPayload, err := r.currentDaemonStatusPayload(ctx)
 	if err != nil {
-		return daemonUpgradeOutput{}, err
+		return preparedDaemonUpgrade{}, err
 	}
 	managedDaemon, err := r.readManagedUpgradeDaemonVersion(ctx)
 	if err != nil {
-		return daemonUpgradeOutput{}, err
+		return preparedDaemonUpgrade{}, err
 	}
 	pathDaemon, err := r.readPathUpgradeDaemonVersion(ctx)
 	if err != nil {
-		return daemonUpgradeOutput{}, err
+		return preparedDaemonUpgrade{}, err
 	}
 	current := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
 	latestRelease, err := r.fetchLatestDaemonRelease(ctx)
 	if err != nil {
-		return daemonUpgradeOutput{}, err
+		return preparedDaemonUpgrade{}, err
 	}
 
 	var currentVersion *string
@@ -419,7 +434,7 @@ func (r *commandRuntime) upgradeDaemonWithOutput(cmd *cobra.Command, emitOutput 
 	if !needsUpgrade {
 		available, err := isSemverUpgradeAvailable(*currentVersion, latestRelease.Version)
 		if err != nil {
-			return daemonUpgradeOutput{}, fmt.Errorf("compare daemon versions: %w", err)
+			return preparedDaemonUpgrade{}, fmt.Errorf("compare daemon versions: %w", err)
 		}
 		needsUpgrade = available
 	}
@@ -434,65 +449,72 @@ func (r *commandRuntime) upgradeDaemonWithOutput(cmd *cobra.Command, emitOutput 
 		} else if current != nil {
 			output.BinaryPath = current.BinaryPath
 		}
-		if emitOutput && getBoolFlag(cmd, "json") {
-			return output, writeJSON(cmd.OutOrStdout(), output)
-		}
-		if !emitOutput {
-			return output, nil
-		}
-
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd is already up to date (%s)\n", *currentVersion); err != nil {
-			return daemonUpgradeOutput{}, err
-		}
-		if output.BinaryPath != nil {
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Managed binary: %s\n", *output.BinaryPath)
-			return output, err
-		}
-		return output, nil
+		return preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon}, nil
 	}
 
-	result, err := r.installManagedDaemon(ctx, true, latestRelease.Tag, cmd.ErrOrStderr())
+	result, err := r.prepareManagedDaemonInstall(ctx, true, latestRelease.Tag, cmd.ErrOrStderr())
 	if err != nil {
-		return daemonUpgradeOutput{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
+		return preparedDaemonUpgrade{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
 	}
 
 	output := daemonUpgradeOutput{
 		Changed:         true,
 		PreviousVersion: daemonVersionPointer(current),
 		LatestVersion:   latestRelease.Version,
-		InstallPath:     stringPtr(result.InstallPath),
-		DownloadedFrom:  result.DownloadedFrom,
-		Skipped:         boolPtr(result.Skipped),
+		InstallPath:     stringPtr(result.result.InstallPath),
+		DownloadedFrom:  result.result.DownloadedFrom,
+		Skipped:         boolPtr(result.result.Skipped),
 	}
+	return preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon, install: &result}, nil
+}
+
+func (r *commandRuntime) finishPreparedDaemonUpgrade(cmd *cobra.Command, prepared preparedDaemonUpgrade, emitOutput bool) (daemonUpgradeOutput, error) {
+	if prepared.install != nil {
+		if err := commitPreparedDaemonInstall(*prepared.install); err != nil {
+			return daemonUpgradeOutput{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
+		}
+	}
+	output := prepared.output
 	if emitOutput && getBoolFlag(cmd, "json") {
 		return output, writeJSON(cmd.OutOrStdout(), output)
 	}
 	if !emitOutput {
 		return output, nil
 	}
-
-	if managedDaemon == nil && pathDaemon != nil {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed managed looperd %s to %s (previously using %s)\n", latestRelease.Version, result.InstallPath, *pathDaemon.BinaryPath); err != nil {
+	if !output.Changed {
+		if output.CurrentVersion != nil {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd is already up to date (%s)\n", *output.CurrentVersion); err != nil {
+				return daemonUpgradeOutput{}, err
+			}
+		}
+		if output.BinaryPath != nil {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "Managed binary: %s\n", *output.BinaryPath)
+			return output, err
+		}
+		return output, nil
+	}
+	if prepared.managedDaemon == nil && prepared.pathDaemon != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed managed looperd %s to %s (previously using %s)\n", output.LatestVersion, *output.InstallPath, *prepared.pathDaemon.BinaryPath); err != nil {
 			return daemonUpgradeOutput{}, err
 		}
-	} else if managedDaemon == nil {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed looperd %s to %s\n", latestRelease.Version, result.InstallPath); err != nil {
+	} else if prepared.managedDaemon == nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed looperd %s to %s\n", output.LatestVersion, *output.InstallPath); err != nil {
 			return daemonUpgradeOutput{}, err
 		}
 	} else {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Upgraded looperd %s → %s at %s\n", managedDaemon.Version, latestRelease.Version, result.InstallPath); err != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Upgraded looperd %s → %s at %s\n", prepared.managedDaemon.Version, output.LatestVersion, *output.InstallPath); err != nil {
 			return daemonUpgradeOutput{}, err
 		}
 	}
-	if result.DownloadedFrom != nil {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", *result.DownloadedFrom); err != nil {
+	if output.DownloadedFrom != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", *output.DownloadedFrom); err != nil {
 			return daemonUpgradeOutput{}, err
 		}
 	}
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Restart the daemon to use the new version:"); err != nil {
 		return daemonUpgradeOutput{}, err
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), "  looper daemon restart")
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), "  looper daemon restart")
 	return output, err
 }
 
@@ -611,8 +633,8 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 		err    error
 	}
 	type daemonResult struct {
-		output daemonUpgradeOutput
-		err    error
+		prepared preparedDaemonUpgrade
+		err      error
 	}
 
 	cliCh := make(chan cliResult, 1)
@@ -623,8 +645,8 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 		cliCh <- cliResult{output: out, err: err}
 	}()
 	go func() {
-		out, err := r.upgradeDaemonWithOutput(daemonCmd, !jsonOutput)
-		daemonCh <- daemonResult{output: out, err: err}
+		prepared, err := r.prepareDaemonUpgrade(daemonCmd)
+		daemonCh <- daemonResult{prepared: prepared, err: err}
 	}()
 
 	cliRes := <-cliCh
@@ -664,6 +686,13 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 		}
 		return daemonRes.err
 	}
+	daemonOutput, err := r.finishPreparedDaemonUpgrade(daemonCmd, daemonRes.prepared, !jsonOutput)
+	if err != nil {
+		if _, copyErr := cmd.OutOrStdout().Write(daemonBuf.Bytes()); copyErr != nil {
+			return copyErr
+		}
+		return err
+	}
 	if !jsonOutput {
 		if _, err := cmd.OutOrStdout().Write(daemonBuf.Bytes()); err != nil {
 			return err
@@ -671,7 +700,7 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 	}
 
 	if jsonOutput {
-		return writeJSON(cmd.OutOrStdout(), unifiedUpgradeOutput{CLI: cliRes.output, Daemon: daemonRes.output})
+		return writeJSON(cmd.OutOrStdout(), unifiedUpgradeOutput{CLI: cliRes.output, Daemon: daemonOutput})
 	}
 	return nil
 }

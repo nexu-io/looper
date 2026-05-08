@@ -189,7 +189,9 @@ http_status_for() {
 }
 
 archive_status="$(http_status_for "$archive_url")"
-if [ "$archive_status" = "200" ] || [ "$archive_status" = "302" ]; then
+archive_checksum_status="$(http_status_for "$archive_checksum_url")"
+if { [ "$archive_status" = "200" ] || [ "$archive_status" = "302" ]; } &&
+   { [ "$archive_checksum_status" = "200" ] || [ "$archive_checksum_status" = "302" ]; }; then
   archive_path="$tmp_dir/$archive_asset"
   archive_checksum_path="$tmp_dir/$archive_asset.sha256"
 
@@ -205,7 +207,7 @@ if [ "$archive_status" = "200" ] || [ "$archive_status" = "302" ]; then
   [ -f "$tmp_dir/$asset" ] || fail "archive $archive_asset did not contain $asset"
   mv "$tmp_dir/$asset" "$tmp_binary"
 else
-  log "Archive unavailable (HTTP ${archive_status:-?}); using raw binary."
+  log "Archive or checksum unavailable (archive HTTP ${archive_status:-?}, checksum HTTP ${archive_checksum_status:-?}); using raw binary."
   tmp_checksum="$tmp_dir/$asset.sha256"
 
   log "Downloading $binary_url"
