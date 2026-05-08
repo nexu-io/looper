@@ -411,7 +411,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: detail.IssueComments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
@@ -421,6 +421,20 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
 	body := a.stamper.ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
+	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
+	if err != nil {
+		return fixer.IssueCommentResult{}, err
+	}
+	return fixer.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
+}
+
+func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
+	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {

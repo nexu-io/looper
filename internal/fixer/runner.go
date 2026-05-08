@@ -100,6 +100,7 @@ type PullRequestDetail struct {
 	BaseSHA        string
 	ReviewDecision string
 	Comments       []map[string]any
+	IssueComments  []map[string]any
 	Checks         []map[string]any
 	HasConflicts   bool
 	Author         string
@@ -133,6 +134,25 @@ type AddReviewThreadReplyInput struct {
 	CWD      string
 }
 
+type IssueCommentInput struct {
+	Repo        string
+	IssueNumber int64
+	Body        string
+	CWD         string
+}
+
+type IssueCommentResult struct {
+	ID  int64
+	URL string
+}
+
+type UpdateIssueCommentInput struct {
+	Repo      string
+	CommentID int64
+	Body      string
+	CWD       string
+}
+
 type PullRequestLabelsInput struct {
 	Repo     string
 	PRNumber int64
@@ -147,6 +167,8 @@ type GitHubGateway interface {
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
+	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
+	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 }
@@ -383,6 +405,7 @@ type fixerCheckpoint struct {
 	Validation       *ValidationResult           `json:"validation,omitempty"`
 	Push             *checkpointPush             `json:"push,omitempty"`
 	ResolvedComments *checkpointResolvedComments `json:"resolvedComments,omitempty"`
+	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
 	SkipReason       string                      `json:"skipReason,omitempty"`
 }
@@ -397,6 +420,7 @@ type checkpointDetail struct {
 	BaseSHA        string           `json:"baseSha,omitempty"`
 	ReviewDecision string           `json:"reviewDecision,omitempty"`
 	Comments       []map[string]any `json:"comments,omitempty"`
+	IssueComments  []map[string]any `json:"issueComments,omitempty"`
 	Checks         []map[string]any `json:"checks,omitempty"`
 	HasConflicts   bool             `json:"hasConflicts,omitempty"`
 }
@@ -469,6 +493,16 @@ type checkpointResolvedComment struct {
 	UpdatedAt  string `json:"updatedAt,omitempty"`
 	ReplyState string `json:"replyState,omitempty"`
 	ReplyError string `json:"replyError,omitempty"`
+}
+
+type checkpointSummaryComment struct {
+	CommentID    int64  `json:"commentId,omitempty"`
+	URL          string `json:"url,omitempty"`
+	HeadSHA      string `json:"headSha,omitempty"`
+	FixItemsHash string `json:"fixItemsHash,omitempty"`
+	State        string `json:"state,omitempty"`
+	Error        string `json:"error,omitempty"`
+	UpdatedAt    string `json:"updatedAt,omitempty"`
 }
 
 type checkpointRecheck struct {
@@ -1156,7 +1190,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -1543,6 +1577,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
+	if failedCount == 0 {
+		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, explanationByID)
+	}
 	if failedCount > 0 {
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s)", failedCount), kind: FailureRetryableAfterResume}
 	}
@@ -1648,6 +1685,281 @@ func shortCommitSHA(value string) string {
 		return value
 	}
 	return value[:7]
+}
+
+const fixerSummaryMarkerPrefix = "<!-- looper:fixer-round head="
+
+// fixerRoundSummaryMarker returns a hidden marker keyed by head SHA. The marker
+// lets future fixer runs find and edit the existing summary instead of posting
+// a duplicate when the same round retries (resume after transient failure,
+// scheduler re-claim, etc.).
+func fixerRoundSummaryMarker(headSHA string) string {
+	if headSHA == "" {
+		return ""
+	}
+	return fixerSummaryMarkerPrefix + headSHA + " -->"
+}
+
+// publishRoundSummaryComment posts (or edits) a single PR conversation comment
+// summarizing this fixer round: the commit, every fix item with its outcome,
+// agent explanations when present, and links to each thread. The summary is
+// best-effort and never blocks the resolve step.
+func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint, fixItems []FixItem, commitSHA string, explanationByID map[string]string) {
+	headSHA := commitSHA
+	if headSHA == "" && checkpoint.ReconcileCommits != nil {
+		headSHA = checkpoint.ReconcileCommits.FinalHeadSHA
+	}
+	if headSHA == "" {
+		headSHA = detailHeadSHA(checkpoint.Detail)
+	}
+	if headSHA == "" {
+		return
+	}
+	if checkpoint.Push == nil || !checkpoint.Push.Pushed {
+		return
+	}
+	if !roundProducedNewCommits(checkpoint) {
+		return
+	}
+	commentItems := summaryCommentItems(fixItems, checkpoint, explanationByID)
+	if len(commentItems) == 0 {
+		return
+	}
+	body := buildFixerSummaryCommentBody(input.Repo, input.PRNumber, headSHA, commitSHA, commentItems)
+	if checkpoint.SummaryComment != nil && checkpoint.SummaryComment.HeadSHA == headSHA && checkpoint.SummaryComment.CommentID != 0 {
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: checkpoint.SummaryComment.CommentID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+			checkpoint.SummaryComment.State = "update_failed"
+			checkpoint.SummaryComment.Error = err.Error()
+			checkpoint.SummaryComment.UpdatedAt = r.nowISO()
+			return
+		}
+		checkpoint.SummaryComment.State = "updated"
+		checkpoint.SummaryComment.Error = ""
+		checkpoint.SummaryComment.FixItemsHash = checkpoint.FixItemsHash
+		checkpoint.SummaryComment.UpdatedAt = r.nowISO()
+		return
+	}
+	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA); existingID != 0 {
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+			checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existingID, URL: existingURL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "update_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
+			return
+		}
+		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existingID, URL: existingURL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
+		return
+	}
+	created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+	if err != nil {
+		checkpoint.SummaryComment = &checkpointSummaryComment{HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "create_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
+		return
+	}
+	checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: created.ID, URL: created.URL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "created", UpdatedAt: r.nowISO()}
+	r.appendEvent(ctx, eventInput{eventType: "fixer.summary.posted", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"commentId": created.ID, "url": created.URL, "headSha": headSHA, "items": len(commentItems)}})
+}
+
+// roundProducedNewCommits returns true when the current fixer round actually
+// pushed at least one new commit. The summary is suppressed for no-op runs so
+// PR conversations aren't spammed with empty heartbeats.
+func roundProducedNewCommits(checkpoint *fixerCheckpoint) bool {
+	if checkpoint == nil || checkpoint.ReconcileCommits == nil {
+		return false
+	}
+	rc := checkpoint.ReconcileCommits
+	if len(rc.NewCommitSHAs) > 0 {
+		return true
+	}
+	if rc.FinalHeadSHA != "" && rc.BaseHeadSHA != "" && rc.FinalHeadSHA != rc.BaseHeadSHA {
+		return true
+	}
+	return false
+}
+
+// fixerSummaryItem is the per-fix-item view rendered into the summary body.
+// Resolved (or already-resolved) comments display as ✅; failed/conflict/check
+// items keep their outcome visible so reviewers can see what's still open.
+type fixerSummaryItem struct {
+	FixItem     FixItem
+	Status      string
+	Explanation string
+	ThreadURL   string
+	ReplyState  string
+}
+
+func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explanationByID map[string]string) []fixerSummaryItem {
+	resolvedByID := map[string]checkpointResolvedComment{}
+	resolvedByThread := map[string]checkpointResolvedComment{}
+	if checkpoint.ResolvedComments != nil {
+		for _, item := range checkpoint.ResolvedComments.Items {
+			if item.FixItemID != "" {
+				resolvedByID[item.FixItemID] = item
+			}
+			if item.ThreadID != "" {
+				resolvedByThread[item.ThreadID] = item
+			}
+		}
+	}
+	out := make([]fixerSummaryItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		entry := fixerSummaryItem{FixItem: item, ThreadURL: item.URL, Status: item.Type}
+		if item.Type == "comment" {
+			entry.Explanation = explanationByID[item.ID]
+			resolved, ok := resolvedByID[item.ID]
+			if !ok && item.ThreadID != "" {
+				resolved, ok = resolvedByThread[item.ThreadID]
+			}
+			if ok {
+				entry.Status = resolved.Status
+				entry.ReplyState = resolved.ReplyState
+			} else {
+				entry.Status = "pending"
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// buildFixerSummaryCommentBody renders the round summary body. The hidden
+// `<!-- looper:fixer-round head=… -->` marker on the first line is what
+// findExistingFixerSummaryCommentID looks up for edit-on-retry behavior; the
+// adapter still appends the disclosure stamp/footer on top.
+func buildFixerSummaryCommentBody(repo string, prNumber int64, headSHA, commitSHA string, items []fixerSummaryItem) string {
+	var b strings.Builder
+	if marker := fixerRoundSummaryMarker(headSHA); marker != "" {
+		b.WriteString(marker)
+		b.WriteString("\n")
+	}
+	b.WriteString("**Looper fixer round complete**")
+	if shortSHA := shortCommitSHA(commitSHA); shortSHA != "" {
+		b.WriteString(" — ")
+		b.WriteString(shortSHA)
+	}
+	b.WriteString("\n\n")
+	for _, item := range items {
+		b.WriteString(formatFixerSummaryBullet(item))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatFixerSummaryBullet(item fixerSummaryItem) string {
+	icon := summaryStatusIcon(item.Status)
+	label := summaryItemLabel(item.FixItem)
+	threadURL := item.ThreadURL
+	if threadURL == "" {
+		threadURL = item.FixItem.URL
+	}
+	var b strings.Builder
+	b.WriteString("- ")
+	b.WriteString(icon)
+	b.WriteString(" ")
+	b.WriteString(label)
+	if item.FixItem.Author != "" && item.FixItem.Type == "comment" {
+		b.WriteString(" (@")
+		b.WriteString(item.FixItem.Author)
+		b.WriteString(")")
+	}
+	if threadURL != "" && item.FixItem.Type == "comment" {
+		b.WriteString(" — [thread](")
+		b.WriteString(threadURL)
+		b.WriteString(")")
+	}
+	if explanation := strings.TrimSpace(item.Explanation); explanation != "" {
+		b.WriteString("\n  - ")
+		b.WriteString(strings.ReplaceAll(explanation, "\n", "\n    "))
+	} else if item.FixItem.Type == "comment" {
+		if summary := summarizeFixItem(item.FixItem); summary != "" {
+			// summarizeFixItem already prefixes lines with "> "; in the bullet
+			// context we want a plain nested bullet for readability.
+			plain := strings.ReplaceAll(summary, "> ", "")
+			plain = strings.TrimSpace(plain)
+			if plain != "" {
+				b.WriteString("\n  - ")
+				b.WriteString(strings.ReplaceAll(plain, "\n", " "))
+			}
+		}
+	}
+	if item.ReplyState != "" && item.ReplyState != "sent" {
+		b.WriteString("\n  - reply: ")
+		b.WriteString(item.ReplyState)
+	}
+	return b.String()
+}
+
+func summaryItemLabel(item FixItem) string {
+	switch item.Type {
+	case "comment":
+		if item.Path != "" {
+			if item.Line > 0 {
+				return fmt.Sprintf("Review comment on `%s:%d`", item.Path, item.Line)
+			}
+			return fmt.Sprintf("Review comment on `%s`", item.Path)
+		}
+		return "Review comment"
+	case "check":
+		if item.Name != "" {
+			return "Failing check `" + item.Name + "`"
+		}
+		return "Failing check"
+	case "conflict":
+		return "Merge conflict"
+	default:
+		if item.Name != "" {
+			return item.Name
+		}
+		return strings.TrimSpace(item.Type)
+	}
+}
+
+func summaryStatusIcon(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "resolved", "already_resolved":
+		return "✅"
+	case "failed":
+		return "⚠️"
+	case "pending":
+		return "🟡"
+	case "conflict":
+		return "🔀"
+	case "check":
+		return "🧪"
+	default:
+		return "•"
+	}
+}
+
+// findExistingFixerSummaryCommentID scans the PR's issue comments for a prior
+// summary keyed by the same head SHA. Used for edit-on-retry when our local
+// checkpoint was wiped (resume across daemon restarts, scheduler re-claim).
+func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA string) (int64, string) {
+	if detail == nil || headSHA == "" {
+		return 0, ""
+	}
+	marker := fixerRoundSummaryMarker(headSHA)
+	if marker == "" {
+		return 0, ""
+	}
+	for _, comment := range detail.IssueComments {
+		body, _ := stringFromAny(comment["body"])
+		if !strings.Contains(body, marker) {
+			continue
+		}
+		idVal := comment["id"]
+		var id int64
+		switch v := idVal.(type) {
+		case float64:
+			id = int64(v)
+		case int64:
+			id = v
+		case int:
+			id = int64(v)
+		}
+		if id == 0 {
+			continue
+		}
+		url, _ := stringFromAny(comment["url"])
+		return id, url
+	}
+	return 0, ""
 }
 
 func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -2660,7 +2972,7 @@ func detailLabels(detail *checkpointDetail) []string {
 }
 
 func mergeCheckpointDetailPreservingLabels(existing *checkpointDetail, live PullRequestDetail) *checkpointDetail {
-	merged := &checkpointDetail{State: live.State, IsDraft: live.IsDraft, Labels: cloneStrings(live.Labels), HeadSHA: live.HeadSHA, HeadRefName: live.HeadRefName, BaseRefName: live.BaseRefName, BaseSHA: live.BaseSHA, ReviewDecision: live.ReviewDecision, Comments: cloneObjectSlice(live.Comments), Checks: cloneObjectSlice(live.Checks), HasConflicts: live.HasConflicts}
+	merged := &checkpointDetail{State: live.State, IsDraft: live.IsDraft, Labels: cloneStrings(live.Labels), HeadSHA: live.HeadSHA, HeadRefName: live.HeadRefName, BaseRefName: live.BaseRefName, BaseSHA: live.BaseSHA, ReviewDecision: live.ReviewDecision, Comments: cloneObjectSlice(live.Comments), IssueComments: cloneObjectSlice(live.IssueComments), Checks: cloneObjectSlice(live.Checks), HasConflicts: live.HasConflicts}
 	if existing != nil {
 		merged.Labels = cloneStrings(existing.Labels)
 	}

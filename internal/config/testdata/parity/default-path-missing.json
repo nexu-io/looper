@@ -81,7 +81,7 @@
           "pullRequest": true,
           "issueComment": true,
           "reviewComment": true,
-          "inlineCommentVisible": false
+          "inlineCommentVisible": true
         }
       },
       "tools": {

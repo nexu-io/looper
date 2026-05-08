@@ -1508,17 +1508,22 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	currentUser      string
-	listOpen         []PullRequestSummary
-	listOpenByLabel  map[string][]PullRequestSummary
-	listCalls        []ListOpenPullRequestsInput
-	viewResponses    []PullRequestDetail
-	viewIndex        int
-	resolveCalls     []ResolveReviewThreadInput
-	addLabelCalls    []PullRequestLabelsInput
-	removeLabelCalls []PullRequestLabelsInput
-	replyCalls       []AddReviewThreadReplyInput
-	replyErr         error
+	currentUser           string
+	listOpen              []PullRequestSummary
+	listOpenByLabel       map[string][]PullRequestSummary
+	listCalls             []ListOpenPullRequestsInput
+	viewResponses         []PullRequestDetail
+	viewIndex             int
+	resolveCalls          []ResolveReviewThreadInput
+	addLabelCalls         []PullRequestLabelsInput
+	removeLabelCalls      []PullRequestLabelsInput
+	replyCalls            []AddReviewThreadReplyInput
+	replyErr              error
+	createIssueComments   []IssueCommentInput
+	updateIssueComments   []UpdateIssueCommentInput
+	createIssueCommentErr error
+	updateIssueCommentErr error
+	nextIssueCommentID    int64
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1575,6 +1580,24 @@ func (f *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input Resolve
 func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
 	f.replyCalls = append(f.replyCalls, input)
 	return f.replyErr
+}
+
+func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	f.createIssueComments = append(f.createIssueComments, input)
+	if f.createIssueCommentErr != nil {
+		return IssueCommentResult{}, f.createIssueCommentErr
+	}
+	if f.nextIssueCommentID == 0 {
+		f.nextIssueCommentID = 9000
+	}
+	id := f.nextIssueCommentID
+	f.nextIssueCommentID++
+	return IssueCommentResult{ID: id, URL: fmt.Sprintf("https://example.test/c/%d", id)}, nil
+}
+
+func (f *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIssueCommentInput) error {
+	f.updateIssueComments = append(f.updateIssueComments, input)
+	return f.updateIssueCommentErr
 }
 
 func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
@@ -1937,5 +1960,145 @@ func TestProcessClaimedItemUsesAgentExplanationInReplyBody(t *testing.T) {
 	}
 	if strings.Contains(reply.Body, "please fix off-by-one") {
 		t.Fatalf("reply body should drop original quote when explanation present: %q", reply.Body)
+	}
+}
+
+func TestBuildFixerSummaryCommentBodyIncludesMarkerAndItems(t *testing.T) {
+	t.Parallel()
+	items := []fixerSummaryItem{
+		{FixItem: FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Path: "internal/foo.go", Line: 12, URL: "https://example/threads/t1"}, Status: "resolved", Explanation: "Replaced strings.Title with cases.Title.", ReplyState: "sent"},
+		{FixItem: FixItem{Type: "comment", ID: "c2", ThreadID: "t2", Author: "bob", Path: "internal/bar.go", URL: "https://example/threads/t2"}, Status: "failed", ReplyState: "failed"},
+		{FixItem: FixItem{Type: "check", Name: "ci"}, Status: "check"},
+	}
+	got := buildFixerSummaryCommentBody("acme/looper", 42, "abcdef1234567", "abcdef1234567", items)
+	if !strings.Contains(got, fixerRoundSummaryMarker("abcdef1234567")) {
+		t.Fatalf("body missing round marker:\n%s", got)
+	}
+	if !strings.Contains(got, "abcdef1") {
+		t.Fatalf("body missing short SHA:\n%s", got)
+	}
+	if !strings.Contains(got, "✅") || !strings.Contains(got, "@alice") {
+		t.Fatalf("body missing resolved bullet for alice:\n%s", got)
+	}
+	if !strings.Contains(got, "⚠️") || !strings.Contains(got, "@bob") {
+		t.Fatalf("body missing failed bullet for bob:\n%s", got)
+	}
+	if !strings.Contains(got, "Replaced strings.Title with cases.Title.") {
+		t.Fatalf("body missing explanation:\n%s", got)
+	}
+	if !strings.Contains(got, "Failing check `ci`") {
+		t.Fatalf("body missing failing check item:\n%s", got)
+	}
+	if !strings.Contains(got, "[thread](https://example/threads/t1)") {
+		t.Fatalf("body missing thread link:\n%s", got)
+	}
+}
+
+func TestFindExistingFixerSummaryCommentIDMatchesByMarker(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": float64(101), "body": "unrelated comment"},
+		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete"},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202", id)
+	}
+	if other, _ := findExistingFixerSummaryCommentID(detail, "deadbeef0000000"); other != 0 {
+		t.Fatalf("findExistingFixerSummaryCommentID(other head) = %d, want 0", other)
+	}
+}
+
+func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+		},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "base-head"},
+			{HeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
+			{HeadSHA: "new-head"},
+		},
+	}
+	stdout := `__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Capped loop bound and added regression test."}]}` + "\n"
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.createIssueComments) != 1 {
+		t.Fatalf("createIssueComments calls = %d, want 1", len(github.createIssueComments))
+	}
+	if len(github.updateIssueComments) != 0 {
+		t.Fatalf("updateIssueComments calls = %d, want 0 on first round", len(github.updateIssueComments))
+	}
+	body := github.createIssueComments[0].Body
+	if !strings.Contains(body, "Looper fixer round complete") {
+		t.Fatalf("summary body missing header:\n%s", body)
+	}
+	if !strings.Contains(body, "Capped loop bound") {
+		t.Fatalf("summary body missing agent explanation:\n%s", body)
+	}
+	if !strings.Contains(body, fixerRoundSummaryMarker("new-head")) {
+		t.Fatalf("summary body missing round marker:\n%s", body)
+	}
+	if !strings.Contains(body, "@alice") {
+		t.Fatalf("summary body missing @author mention:\n%s", body)
+	}
+}
+
+func TestProcessClaimedItemSkipsSummaryWhenNoNewCommits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "base-head"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+		},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "base-head"},
+			{HeadSHA: "base-head"},
+			{HeadSHA: "base-head"},
+		},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "blocked before editing because gh could not validate PR metadata", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		// expected to fail in resolve-comments because no new commits; we don't care about the error here.
+		_ = err
+	}
+	if len(github.createIssueComments) != 0 {
+		t.Fatalf("createIssueComments calls = %d, want 0 when no new commits", len(github.createIssueComments))
 	}
 }

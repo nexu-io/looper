@@ -5271,7 +5271,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"wrapper rejects clean APPROVE reviews that do not start with an @mention",
 		"<!-- looper:stamp v=1 -->",
 		`<sub>🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=reviewer · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>`,
-		"Every inline review comment you post must include only the hidden looper stamp marker",
+		"Every inline review comment you post must also use looper's configured visible inline disclosure style",
 		"Do not write the footer as plain paragraph text",
 		"Minimal PR seed",
 		"\"repo\": \"acme/looper\"",

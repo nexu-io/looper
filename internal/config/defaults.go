@@ -219,7 +219,7 @@ func DefaultDisclosureConfig() DisclosureConfig {
 			PullRequest:          true,
 			IssueComment:         true,
 			ReviewComment:        true,
-			InlineCommentVisible: false,
+			InlineCommentVisible: true,
 		},
 	}
 }
