@@ -1982,20 +1982,19 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, truste
 	return 0, ""
 }
 
-func isTrustedFixerSummaryComment(comment map[string]any, trustedLogin, body string) bool {
-	if strings.Contains(body, "looper:stamp") {
-		return true
-	}
-	if sameGitHubLogin(issueCommentAuthorLogin(comment), trustedLogin) {
-		return true
-	}
-	return false
+func isTrustedFixerSummaryComment(comment map[string]any, trustedLogin, _ string) bool {
+	return sameGitHubLogin(issueCommentAuthorLogin(comment), trustedLogin)
 }
 
 func issueCommentAuthorLogin(comment map[string]any) string {
-	author, _ := comment["author"].(map[string]any)
-	login, _ := stringFromAny(author["login"])
-	return login
+	for _, key := range []string{"author", "user"} {
+		author, _ := comment[key].(map[string]any)
+		login, _ := stringFromAny(author["login"])
+		if strings.TrimSpace(login) != "" {
+			return login
+		}
+	}
+	return ""
 }
 
 func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {

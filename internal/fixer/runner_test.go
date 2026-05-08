@@ -2035,7 +2035,7 @@ func TestFindExistingFixerSummaryCommentIDMatchesTrustedComment(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
 		{"id": float64(101), "body": "unrelated comment"},
-		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete\n\n<!-- looper:stamp v=1 -->"},
+		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -2058,14 +2058,34 @@ func TestFindExistingFixerSummaryCommentIDSkipsUntrustedMarker(t *testing.T) {
 	}
 }
 
+func TestFindExistingFixerSummaryCommentIDSkipsStampedCommentFromOtherAuthor(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": float64(101), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nspoofed marker\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "someone-else"}},
+		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want trusted comment 202", id)
+	}
+}
+
 func TestFindExistingFixerSummaryCommentIDParsesStringID(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": "202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->"},
+		{"id": "202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
 		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202 from string id", id)
+	}
+}
+
+func TestIssueCommentAuthorLoginFallsBackToUser(t *testing.T) {
+	t.Parallel()
+	comment := map[string]any{"user": map[string]any{"login": "looper"}}
+	if got := issueCommentAuthorLogin(comment); got != "looper" {
+		t.Fatalf("issueCommentAuthorLogin() = %q, want looper", got)
 	}
 }
 
