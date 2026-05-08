@@ -7,9 +7,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/platform"
 )
 
 type Runtime any
@@ -147,7 +147,7 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 
 func waitForShutdownWithSignals(runtime ShutdownRuntime, logger Logger, notifier SignalNotifier) {
 	signals := make(chan os.Signal, 1)
-	notifier.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	notifier.Notify(signals, os.Interrupt, platform.SIGTERM)
 	defer notifier.Stop(signals)
 
 	listenerStopped := make(chan struct{})
@@ -178,7 +178,7 @@ func signalReason(sig os.Signal) string {
 	switch sig {
 	case os.Interrupt:
 		return "SIGINT"
-	case syscall.SIGTERM:
+	case platform.SIGTERM:
 		return "SIGTERM"
 	default:
 		return sig.String()

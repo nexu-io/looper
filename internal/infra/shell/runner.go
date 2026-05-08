@@ -8,8 +8,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"github.com/nexu-io/looper/internal/platform"
 )
 
 const (
@@ -95,7 +96,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			if cmd.Process == nil {
 				return
 			}
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !isProcessDone(err) {
+			if err := cmd.Process.Signal(platform.SIGTERM); err != nil && !isProcessDone(err) {
 				_ = cmd.Process.Kill()
 				return
 			}

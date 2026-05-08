@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/platform"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -204,7 +206,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = platform.ProcAttr()
 	cmd.Env = os.Environ()
 	for key, value := range e.config.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)
@@ -256,7 +258,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			command, args = ResolveSpawn(e.config, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.SysProcAttr = platform.ProcAttr()
 			cmd.Env = os.Environ()
 			for key, value := range e.config.Env {
 				cmd.Env = append(cmd.Env, key+"="+value)
@@ -359,8 +361,8 @@ func (x *execution) signalProcessGroup(signal syscall.Signal) error {
 	if pid <= 0 {
 		return x.process.Process.Signal(signal)
 	}
-	if err := syscall.Kill(-pid, signal); err != nil {
-		if err == syscall.ESRCH {
+	if err := platform.SignalProcessGroup(pid, signal); err != nil {
+		if errors.Is(err, platform.ESRCH) {
 			return os.ErrProcessDone
 		}
 		return err
@@ -374,7 +376,7 @@ func (x *execution) killProcessGroup() error {
 	}
 	pid := x.process.Process.Pid
 	if pid > 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
+		if err := platform.KillProcessGroup(pid); err == nil || errors.Is(err, platform.ESRCH) {
 			return nil
 		}
 	}
@@ -401,7 +403,7 @@ func (x *execution) run(ctx context.Context) {
 				if x.process.Process == nil {
 					return
 				}
-				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+				if err := x.signalProcessGroup(platform.SIGTERM); err != nil {
 					if err != os.ErrProcessDone {
 						_ = x.killProcessGroup()
 					}
@@ -609,7 +611,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	command, args := ResolveSpawn(x.executor.config, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = platform.ProcAttr()
 	cmd.Env = os.Environ()
 	for key, value := range x.executor.config.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)
@@ -680,7 +682,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		if cmd.Process == nil {
 			return
 		}
-		if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+		if err := x.signalProcessGroup(platform.SIGTERM); err != nil {
 			if err != os.ErrProcessDone {
 				_ = x.killProcessGroup()
 			}

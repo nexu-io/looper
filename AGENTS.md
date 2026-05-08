@@ -29,6 +29,30 @@
 - Build output lives in `dist/`; do not edit generated files.
 - CI (`.github/workflows/ci.yml`) runs on PR updates: `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`.
 - Commit messages and PR titles must use semantic prefixes, for example `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, or `ci:`.
+- Cross-compilation tested for linux/amd64, darwin/arm64, windows/amd64.
+
+## Key packages
+
+- `internal/platform/` — OS abstractions (process mgmt, signals, process info).
+- `internal/infra/notify/` — platform notification providers (darwin osascript, linux notify-send, windows powershell toast).
+- `internal/config/` — config loading, validation, types.
+- `internal/cliapp/` — CLI runtime, daemon supervision (launchd/systemd/windows-service).
+
+## Supervision modes
+
+- `DaemonModeLaunchd` — macOS only (runtime check).
+- `DaemonModeSystemd` — Linux only (runtime check).
+- `DaemonModeWindowsService` — Windows only (runtime check).
+- `DaemonModeForeground` — detached process, no supervision (all platforms).
+- All supervision methods have runtime `r.platform() != "..."` guards, so they compile on all platforms.
+
+## Platform-specific files
+
+- `internal/cliapp/daemon_supervision.go` — shared lifecycle types and launchd code (no build tag).
+- `internal/cliapp/supervisor_systemd.go` — systemd supervision (no build tag; runtime `platform() != "linux"` guard).
+- `internal/cliapp/supervisor_winsvc.go` — Windows Service supervision (no build tag; runtime `platform() != "windows"` guard).
+- Named `supervisor_winsvc.go` (not `_windows.go`) to avoid implicit Go build constraints.
+- `internal/config/access_unix.go` / `access_windows.go` — portable write-access check.
 
 ## Review guidelines
 

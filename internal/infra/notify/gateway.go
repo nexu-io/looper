@@ -13,13 +13,11 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-const osascriptTimeout = 35 * time.Second
-
 type RunCommandFunc func(context.Context, shell.Options) (shell.Result, error)
 
 type Options struct {
 	Config        config.NotificationConfig
-	OsascriptPath string
+	Providers     []Provider
 	LogFilePath   string
 	Repositories  *storage.Repositories
 	Now           func() time.Time
@@ -43,12 +41,12 @@ type SystemNotificationPayload struct {
 }
 
 type Gateway struct {
-	config        config.NotificationConfig
-	osascriptPath string
-	logFilePath   string
-	repositories  *storage.Repositories
-	now           func() time.Time
-	runCommand    RunCommandFunc
+	config       config.NotificationConfig
+	providers    []Provider
+	logFilePath  string
+	repositories *storage.Repositories
+	now          func() time.Time
+	runCommand   RunCommandFunc
 }
 
 func NewGateway(options Options) *Gateway {
@@ -62,13 +60,18 @@ func NewGateway(options Options) *Gateway {
 		runCommand = shell.Run
 	}
 
+	providers := options.Providers
+	if providers == nil {
+		providers = defaultPlatformProviders()
+	}
+
 	return &Gateway{
-		config:        options.Config,
-		osascriptPath: options.OsascriptPath,
-		logFilePath:   options.LogFilePath,
-		repositories:  options.Repositories,
-		now:           now,
-		runCommand:    runCommand,
+		config:       options.Config,
+		providers:    providers,
+		logFilePath:  options.LogFilePath,
+		repositories: options.Repositories,
+		now:          now,
+		runCommand:   runCommand,
 	}
 }
 
@@ -79,8 +82,10 @@ func (g *Gateway) Notify(ctx context.Context, payload SystemNotificationPayload)
 		records = append(records, record)
 	}
 
-	if record, ok := g.recordOsascript(ctx, payload); ok {
-		records = append(records, record)
+	for _, provider := range g.providers {
+		if record, ok := g.sendWithProvider(ctx, payload, provider); ok {
+			records = append(records, record)
+		}
 	}
 
 	return records
@@ -116,36 +121,19 @@ func (g *Gateway) recordInApp(ctx context.Context, payload SystemNotificationPay
 	return record, true
 }
 
-func (g *Gateway) recordOsascript(ctx context.Context, payload SystemNotificationPayload) (storage.NotificationRecord, bool) {
+func (g *Gateway) sendWithProvider(ctx context.Context, payload SystemNotificationPayload, provider Provider) (storage.NotificationRecord, bool) {
 	nowISO := eventlog.FormatJavaScriptISOString(g.now())
 	id := eventlog.NewEventID("notification")
+	channel := provider.Name()
 
 	if payload.DedupeKey != "" && g.repositories != nil && g.repositories.Notifications != nil {
-		dedupeRecord, err := g.repositories.Notifications.GetLatestByDedupe(ctx, "osascript", payload.DedupeKey)
+		dedupeRecord, err := g.repositories.Notifications.GetLatestByDedupe(ctx, channel, payload.DedupeKey)
 		if err == nil && dedupeRecord != nil {
 			createdAt, parseErr := time.Parse(time.RFC3339Nano, dedupeRecord.CreatedAt)
 			if parseErr == nil {
 				throttleWindow := time.Duration(g.config.Osascript.ThrottleWindowSeconds) * time.Second
 				if g.now().UTC().Sub(createdAt.UTC()) < throttleWindow {
-					record := storage.NotificationRecord{
-						ID:           id,
-						ProjectID:    nilIfEmpty(payload.ProjectID),
-						LoopID:       nilIfEmpty(payload.LoopID),
-						RunID:        nilIfEmpty(payload.RunID),
-						EntityType:   nilIfEmpty(payload.EntityType),
-						EntityID:     nilIfEmpty(payload.EntityID),
-						Channel:      "osascript",
-						Level:        payload.Level,
-						Title:        payload.Title,
-						Subtitle:     nilIfEmpty(payload.Subtitle),
-						Body:         payload.Body,
-						Status:       "skipped",
-						DedupeKey:    nilIfEmpty(payload.DedupeKey),
-						ErrorMessage: stringPointer("deduped"),
-						PayloadJSON:  stringPointer(mustMarshalPayload(payload)),
-						CreatedAt:    nowISO,
-						UpdatedAt:    nowISO,
-					}
+					record := buildRecord(payload, channel, id, nowISO, "skipped", "deduped")
 					if err := g.persistNotification(ctx, record); err != nil {
 						return storage.NotificationRecord{}, false
 					}
@@ -155,87 +143,53 @@ func (g *Gateway) recordOsascript(ctx context.Context, payload SystemNotificatio
 		}
 	}
 
-	if !g.config.Osascript.Enabled || strings.TrimSpace(g.osascriptPath) == "" {
-		record := storage.NotificationRecord{
-			ID:           id,
-			ProjectID:    nilIfEmpty(payload.ProjectID),
-			LoopID:       nilIfEmpty(payload.LoopID),
-			RunID:        nilIfEmpty(payload.RunID),
-			EntityType:   nilIfEmpty(payload.EntityType),
-			EntityID:     nilIfEmpty(payload.EntityID),
-			Channel:      "osascript",
-			Level:        payload.Level,
-			Title:        payload.Title,
-			Subtitle:     nilIfEmpty(payload.Subtitle),
-			Body:         payload.Body,
-			Status:       "skipped",
-			DedupeKey:    nilIfEmpty(payload.DedupeKey),
-			ErrorMessage: stringPointer("disabled"),
-			PayloadJSON:  stringPointer(mustMarshalPayload(payload)),
-			CreatedAt:    nowISO,
-			UpdatedAt:    nowISO,
-		}
+	if !provider.IsAvailable() {
+		record := buildRecord(payload, channel, id, nowISO, "skipped", "disabled")
 		if err := g.persistNotification(ctx, record); err != nil {
 			return storage.NotificationRecord{}, false
 		}
 		return record, true
 	}
 
-	_, err := g.runCommand(ctx, shell.Options{
-		Command: g.osascriptPath,
-		Args:    []string{"-e", buildAppleScript(payload, g.config, g.logFilePath)},
-		Timeout: osascriptTimeout,
-	})
-	if err != nil {
-		record := storage.NotificationRecord{
-			ID:           id,
-			ProjectID:    nilIfEmpty(payload.ProjectID),
-			LoopID:       nilIfEmpty(payload.LoopID),
-			RunID:        nilIfEmpty(payload.RunID),
-			EntityType:   nilIfEmpty(payload.EntityType),
-			EntityID:     nilIfEmpty(payload.EntityID),
-			Channel:      "osascript",
-			Level:        payload.Level,
-			Title:        payload.Title,
-			Subtitle:     nilIfEmpty(payload.Subtitle),
-			Body:         payload.Body,
-			Status:       "failed",
-			DedupeKey:    nilIfEmpty(payload.DedupeKey),
-			ErrorMessage: stringPointer(err.Error()),
-			PayloadJSON:  stringPointer(mustMarshalPayload(payload)),
-			CreatedAt:    nowISO,
-			UpdatedAt:    nowISO,
-		}
+	if err := provider.Send(ctx, payload); err != nil {
+		record := buildRecord(payload, channel, id, nowISO, "failed", err.Error())
 		if persistErr := g.persistNotification(ctx, record); persistErr != nil {
 			return storage.NotificationRecord{}, false
 		}
 		return record, true
 	}
 
-	record := storage.NotificationRecord{
+	record := buildRecord(payload, channel, id, nowISO, "success", "")
+	record.SentAt = stringPointer(nowISO)
+	if err := g.persistNotification(ctx, record); err != nil {
+		return storage.NotificationRecord{}, false
+	}
+	return record, true
+}
+
+func buildRecord(payload SystemNotificationPayload, channel, id, nowISO, status, errorMsg string) storage.NotificationRecord {
+	r := storage.NotificationRecord{
 		ID:          id,
 		ProjectID:   nilIfEmpty(payload.ProjectID),
 		LoopID:      nilIfEmpty(payload.LoopID),
 		RunID:       nilIfEmpty(payload.RunID),
 		EntityType:  nilIfEmpty(payload.EntityType),
 		EntityID:    nilIfEmpty(payload.EntityID),
-		Channel:     "osascript",
+		Channel:     channel,
 		Level:       payload.Level,
 		Title:       payload.Title,
 		Subtitle:    nilIfEmpty(payload.Subtitle),
 		Body:        payload.Body,
-		Status:      "success",
+		Status:      status,
 		DedupeKey:   nilIfEmpty(payload.DedupeKey),
 		PayloadJSON: stringPointer(mustMarshalPayload(payload)),
-		SentAt:      stringPointer(nowISO),
 		CreatedAt:   nowISO,
 		UpdatedAt:   nowISO,
 	}
-	if err := g.persistNotification(ctx, record); err != nil {
-		return storage.NotificationRecord{}, false
+	if errorMsg != "" {
+		r.ErrorMessage = stringPointer(errorMsg)
 	}
-
-	return record, true
+	return r
 }
 
 func (g *Gateway) persistNotification(ctx context.Context, record storage.NotificationRecord) error {
@@ -266,54 +220,11 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 	})
 }
 
-func buildAppleScript(payload SystemNotificationPayload, cfg config.NotificationConfig, logFilePath string) string {
-	body := escapeAppleScriptString(payload.Body)
-	title := escapeAppleScriptString(payload.Title)
-
-	if payload.Level == "failure" && strings.TrimSpace(logFilePath) != "" {
-		openLogPath := escapeAppleScriptString(logFilePath)
-		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30
-if gave up of dialogResult is false and button returned of dialogResult is "Open Log" then
-  do shell script "open " & quoted form of %q
-end if`, body, title, openLogPath)
-	}
-
-	subtitle := ""
-	if payload.Subtitle != "" {
-		subtitle = fmt.Sprintf(` subtitle %q`, escapeAppleScriptString(payload.Subtitle))
-	}
-
-	sound := ""
-	if payload.Sound != "" && isSoundEnabledForLevel(cfg, payload.Level) {
-		sound = fmt.Sprintf(` sound name %q`, escapeAppleScriptString(payload.Sound))
-	}
-
-	return fmt.Sprintf(`display notification %q with title %q%s%s`, body, title, subtitle, sound)
-}
-
-func escapeAppleScriptString(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `"`, `\"`)
-	value = strings.ReplaceAll(value, "\n", " ")
-	return value
-}
-
-func isSoundEnabledForLevel(cfg config.NotificationConfig, level string) bool {
-	for _, candidate := range cfg.Osascript.SoundForLevels {
-		if string(candidate) == level {
-			return true
-		}
-	}
-
-	return false
-}
-
 func mustMarshalPayload(payload SystemNotificationPayload) string {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return "{}"
 	}
-
 	return string(encoded)
 }
 
@@ -322,7 +233,6 @@ func mustParseJSISOString(value string) time.Time {
 	if err != nil {
 		return time.Now().UTC()
 	}
-
 	return parsed
 }
 
@@ -330,7 +240,6 @@ func nilIfEmpty(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
-
 	return &value
 }
 
@@ -339,22 +248,20 @@ func stringPointer(value string) *string {
 }
 
 func firstPointer(values ...*string) *string {
-	for _, value := range values {
-		if value != nil {
-			return value
+	for _, v := range values {
+		if v != nil {
+			return v
 		}
 	}
-
 	return nil
 }
 
 func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
 		}
 	}
-
 	return ""
 }
 
@@ -362,7 +269,6 @@ func ternaryString(condition bool, whenTrue, whenFalse string) string {
 	if condition {
 		return whenTrue
 	}
-
 	return whenFalse
 }
 
@@ -370,7 +276,6 @@ func ternaryPointer(condition bool, value string) *string {
 	if !condition {
 		return nil
 	}
-
 	return &value
 }
 
@@ -378,6 +283,5 @@ func ternaryTimePointer(condition bool, value string) *string {
 	if !condition {
 		return nil
 	}
-
 	return &value
 }

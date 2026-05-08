@@ -1,5 +1,5 @@
 package storage
 
-import _ "github.com/mattn/go-sqlite3"
+import _ "modernc.org/sqlite"
 
-const DriverName = "sqlite3"
+const DriverName = "sqlite"

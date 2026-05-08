@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -220,6 +221,56 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 		return r.startLaunchdDaemon(ctx, cmd.OutOrStdout(), loaded, binary, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD), client, apiURL)
 	}
 
+	if loaded.Config.Daemon.Mode == config.DaemonModeSystemd {
+		binary, err := r.resolveDaemonBinary(ctx)
+		if err != nil {
+			return err
+		}
+		env := os.Environ()
+		extractedArgs := ExtractConfigArgs(r.argv)
+		callerCWD, err := r.daemonSpawnCallerCWD(extractedArgs, env)
+		if err != nil {
+			return err
+		}
+		forwardedArgs := normalizeForwardedConfigPathArgs(extractedArgs, callerCWD)
+		cwd := loaded.Config.Daemon.WorkingDirectory
+		if strings.TrimSpace(callerCWD) == "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			callerCWD, err = r.getwd()
+			if err != nil {
+				return fmt.Errorf("resolve current working directory for systemd WorkingDirectory: %w", err)
+			}
+		}
+		if strings.TrimSpace(callerCWD) != "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(callerCWD, cwd)
+		}
+		return r.startSystemdDaemon(ctx, cmd.OutOrStdout(), loaded, binary, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD), client, apiURL)
+	}
+
+	if loaded.Config.Daemon.Mode == config.DaemonModeWindowsService {
+		binary, err := r.resolveDaemonBinary(ctx)
+		if err != nil {
+			return err
+		}
+		env := os.Environ()
+		extractedArgs := ExtractConfigArgs(r.argv)
+		callerCWD, err := r.daemonSpawnCallerCWD(extractedArgs, env)
+		if err != nil {
+			return err
+		}
+		forwardedArgs := normalizeForwardedConfigPathArgs(extractedArgs, callerCWD)
+		cwd := loaded.Config.Daemon.WorkingDirectory
+		if strings.TrimSpace(callerCWD) == "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			callerCWD, err = r.getwd()
+			if err != nil {
+				return fmt.Errorf("resolve current working directory for windows-service WorkingDirectory: %w", err)
+			}
+		}
+		if strings.TrimSpace(callerCWD) != "" && strings.TrimSpace(cwd) != "" && !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(callerCWD, cwd)
+		}
+		return r.startWindowsServiceDaemon(ctx, cmd.OutOrStdout(), loaded, binary, forwardedArgs, cwd, daemonSpawnEnv(env, loaded.Metadata.ConfigPath, callerCWD), client, apiURL)
+	}
+
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
 	if err != nil {
 		return err
@@ -312,7 +363,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	err = r.waitForDaemonReady(ctx, client, pid, startupLogPath, apiURL, r.daemonStartReadyTimeout(), daemonStartReadyPollPeriod)
 	if err != nil {
 		if r.isProcessAlive(pid) {
-			_ = r.killProcess(pid, int(syscall.SIGTERM))
+			_ = r.killProcess(pid, int(platform.SIGTERM))
 		}
 		r.removePIDFile(pidFilePath)
 		if statePath, stateErr := r.resolveDaemonStatePath(); stateErr == nil {
@@ -351,7 +402,7 @@ func (r *commandRuntime) daemonStart(cmd *cobra.Command, args []string) error {
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Startup log: %s\n", startupLogPath); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Detached mode does not restart after crashes or system reboot. Use --daemon-mode launchd on macOS for supervised lifecycle management.")
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Detached mode does not restart after crashes or system reboot. Use a supervised daemon mode (launchd on macOS, systemd on Linux, windows-service on Windows) for lifecycle management.")
 	return err
 }
 
@@ -521,12 +572,33 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 	if err != nil {
 		return false, err
 	}
-	if state != nil && state.Mode == config.DaemonModeLaunchd {
-		loaded, err := r.loadConfig()
-		if err != nil {
-			return false, err
+	if state != nil {
+		switch state.Mode {
+		case config.DaemonModeLaunchd:
+			loaded, err := r.loadConfig()
+			if err != nil {
+				return false, err
+			}
+			return r.stopLaunchdDaemon(ctx, out, loaded, state, startIfMissing)
+		case config.DaemonModeSystemd:
+			loaded, err := r.loadConfig()
+			if err != nil {
+				return false, err
+			}
+			if err := r.stopSystemdDaemon(ctx, loaded, state); err != nil {
+				return false, err
+			}
+			return true, nil
+		case config.DaemonModeWindowsService:
+			loaded, err := r.loadConfig()
+			if err != nil {
+				return false, err
+			}
+			if err := r.stopWindowsServiceDaemon(ctx, loaded, state); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
-		return r.stopLaunchdDaemon(ctx, out, loaded, state, startIfMissing)
 	}
 
 	pidFilePath, err := r.resolveDaemonPIDFilePath()
@@ -537,8 +609,21 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 	existingPID, ok := r.readPIDFile(pidFilePath)
 	if !ok {
 		loaded, loadErr := r.loadConfig()
-		if loadErr == nil && loaded.Config.Daemon.Mode == config.DaemonModeLaunchd {
-			return r.stopLaunchdDaemon(ctx, out, loaded, nil, startIfMissing)
+		if loadErr == nil {
+			switch loaded.Config.Daemon.Mode {
+			case config.DaemonModeLaunchd:
+				return r.stopLaunchdDaemon(ctx, out, loaded, nil, startIfMissing)
+			case config.DaemonModeSystemd:
+				if err := r.stopSystemdDaemon(ctx, loaded, nil); err != nil {
+					return false, err
+				}
+				return true, nil
+			case config.DaemonModeWindowsService:
+				if err := r.stopWindowsServiceDaemon(ctx, loaded, nil); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
 		}
 		if startIfMissing {
 			if _, err := fmt.Fprintln(out, "No daemon pid file found; starting daemon."); err != nil {
@@ -582,7 +667,7 @@ func (r *commandRuntime) stopDaemonProcess(ctx context.Context, out io.Writer, s
 		return false, nil
 	}
 
-	if err := r.killProcess(existingPID, int(syscall.SIGTERM)); err != nil {
+	if err := r.killProcess(existingPID, int(platform.SIGTERM)); err != nil {
 		return false, fmt.Errorf("stop looperd pid %d: %w", existingPID, err)
 	}
 	if err := r.waitForProcessExit(existingPID, 2*time.Second, 100*time.Millisecond); err != nil {
@@ -1255,7 +1340,7 @@ func (r *commandRuntime) spawnDetached(command string, args []string, cwd string
 	cmd.Stdin = devNull
 	cmd.Stdout = startupLog
 	cmd.Stderr = startupLog
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = platform.DaemonProcAttr()
 	if err := cmd.Start(); err != nil {
 		return 0, err
 	}

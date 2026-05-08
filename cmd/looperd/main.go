@@ -17,6 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/platform"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -115,10 +116,10 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		Config:  deps.Config,
 		Runtime: rt,
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
-			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, platform.SignalProcess, rt.ExecutionMatchesProcess)
 		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
-			return stopAllLoops(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return stopAllLoops(ctx, rt.Services(), reason, time.Now, platform.SignalProcess, rt.ExecutionMatchesProcess)
 		},
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
@@ -623,12 +624,12 @@ func isStoppableExecutionStatus(status string) bool {
 
 func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {
 	termSignaled := false
-	if err := signalProcess(-pid, syscall.SIGTERM); err != nil {
-		if !errors.Is(err, syscall.ESRCH) {
+	if err := signalProcess(-pid, platform.SIGTERM); err != nil {
+		if !errors.Is(err, platform.ESRCH) {
 			return err
 		}
-		if err := signalProcess(pid, syscall.SIGTERM); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
+		if err := signalProcess(pid, platform.SIGTERM); err != nil {
+			if errors.Is(err, platform.ESRCH) {
 				return nil
 			}
 			return err
@@ -642,8 +643,8 @@ func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace tim
 			timer := time.NewTimer(grace)
 			defer timer.Stop()
 			<-timer.C
-			if err := signalProcess(-pid, syscall.SIGKILL); errors.Is(err, syscall.ESRCH) {
-				_ = signalProcess(pid, syscall.SIGKILL)
+			if err := signalProcess(-pid, platform.SIGKILL); errors.Is(err, platform.ESRCH) {
+				_ = signalProcess(pid, platform.SIGKILL)
 			}
 		}()
 	}

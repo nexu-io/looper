@@ -28,8 +28,10 @@ const (
 type DaemonMode string
 
 const (
-	DaemonModeForeground DaemonMode = "foreground"
-	DaemonModeLaunchd    DaemonMode = "launchd"
+	DaemonModeForeground     DaemonMode = "foreground"
+	DaemonModeLaunchd        DaemonMode = "launchd"
+	DaemonModeSystemd        DaemonMode = "systemd"
+	DaemonModeWindowsService DaemonMode = "windows-service"
 )
 
 type DaemonRestartPolicy string

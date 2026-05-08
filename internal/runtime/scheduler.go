@@ -675,11 +675,10 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		return func(context.Context, Services) error { return nil }
 	}
 	notificationGateway := notify.NewGateway(notify.Options{
-		Config:        cfg.Notifications,
-		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		Repositories:  repos,
-		Now:           now,
+		Config:       cfg.Notifications,
+		LogFilePath:  filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		Repositories: repos,
+		Now:          now,
 	})
 	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
 		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{

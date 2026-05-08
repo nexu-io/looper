@@ -2,9 +2,11 @@ package notify
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,32 +14,71 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing.T) {
+type mockProvider struct {
+	name        string
+	available   bool
+	sendFn      func(context.Context, SystemNotificationPayload) error
+	called      []SystemNotificationPayload
+	mu          sync.Mutex
+}
+
+func (p *mockProvider) Name() string { return p.name }
+
+func (p *mockProvider) IsAvailable() bool { return p.available }
+
+func (p *mockProvider) Send(ctx context.Context, payload SystemNotificationPayload) error {
+	p.mu.Lock()
+	p.called = append(p.called, payload)
+	p.mu.Unlock()
+	if p.sendFn != nil {
+		return p.sendFn(ctx, payload)
+	}
+	return nil
+}
+
+type recordingProvider struct {
+	name     string
+	available bool
+	Calls    []string
+	mu       sync.Mutex
+}
+
+func (p *recordingProvider) Name() string { return p.name }
+
+func (p *recordingProvider) IsAvailable() bool { return p.available }
+
+func (p *recordingProvider) Send(ctx context.Context, payload SystemNotificationPayload) error {
+	p.mu.Lock()
+	p.Calls = append(p.Calls, fmt.Sprintf("%s|%s|%s|%s", payload.Level, payload.Title, payload.Body, payload.DedupeKey))
+	p.mu.Unlock()
+	return nil
+}
+
+func TestGatewayPersistsInAppNotificationsAndDedupesProviderDelivery(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	rootDir := t.TempDir()
-	capturePath := filepath.Join(rootDir, "osascript.log")
-	scriptPath := filepath.Join(rootDir, "osascript")
-	writeExecutableScript(t, scriptPath, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \""+capturePath+"\"\n")
 
 	coordinator := openNotifyCoordinator(t, rootDir)
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC)
 
+	prov := &mockProvider{
+		name:      "test-provider",
+		available: true,
+	}
+
 	gateway := NewGateway(Options{
 		Config: config.NotificationConfig{
 			InApp: true,
 			Osascript: config.OsascriptNotificationConfig{
-				Enabled:               true,
-				SoundForLevels:        []config.NotificationSoundLevel{config.NotificationSoundLevelFailure, config.NotificationSoundLevelActionRequired},
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		OsascriptPath: scriptPath,
-		LogFilePath:   filepath.Join(rootDir, "logs", "looperd.log"),
-		Repositories:  repos,
-		Now:           func() time.Time { return now },
+		Providers:    []Provider{prov},
+		Repositories: repos,
+		Now:          func() time.Time { return now },
 	})
 
 	first := gateway.Notify(ctx, SystemNotificationPayload{
@@ -61,11 +102,11 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 		DedupeKey:  "worker.blocked:task:task_1",
 	})
 
-	if got := notificationStatus(first, "osascript"); got != "success" {
-		t.Fatalf("first osascript status = %q, want success", got)
+	if got := notificationStatus(first, "test-provider"); got != "success" {
+		t.Fatalf("first provider status = %q, want success", got)
 	}
-	if got := notificationStatus(second, "osascript"); got != "skipped" {
-		t.Fatalf("second osascript status = %q, want skipped", got)
+	if got := notificationStatus(second, "test-provider"); got != "skipped" {
+		t.Fatalf("second provider status = %q, want skipped", got)
 	}
 
 	notifications, err := repos.Notifications.List(ctx, 10)
@@ -83,59 +124,118 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 	if len(events) != 4 {
 		t.Fatalf("Events.ListByEntity() len = %d, want 4", len(events))
 	}
-
-	osascriptCallsBytes, err := os.ReadFile(capturePath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
-	}
-	osascriptCalls := string(osascriptCallsBytes)
-	assertContains(t, osascriptCalls, "display dialog")
-	assertContains(t, osascriptCalls, "Open Log")
-	assertContains(t, osascriptCalls, "open ")
-	assertContains(t, osascriptCalls, filepath.Join(rootDir, "logs", "looperd.log"))
 }
 
-func TestGatewayUsesLightweightOsascriptNotificationForNonFailureLevels(t *testing.T) {
+func TestGatewaySkipsUnavailableProviders(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	rootDir := t.TempDir()
-	capturePath := filepath.Join(rootDir, "osascript.log")
-	scriptPath := filepath.Join(rootDir, "osascript")
-	writeExecutableScript(t, scriptPath, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \""+capturePath+"\"\n")
 
 	coordinator := openNotifyCoordinator(t, rootDir)
 	repos := storage.NewRepositories(coordinator.DB())
 
+	prov := &recordingProvider{
+		name:      "unavailable",
+		available: false,
+	}
+
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{
+			InApp: false,
+		},
+		Providers:    []Provider{prov},
+		Repositories: repos,
+	})
+
+	records := gateway.Notify(ctx, SystemNotificationPayload{
+		Level: "info",
+		Title: "Test",
+		Body:  "Body",
+	})
+
+	if len(prov.Calls) != 0 {
+		t.Fatalf("unavailable provider was called %d times, want 0", len(prov.Calls))
+	}
+
+	if got := notificationStatus(records, "unavailable"); got != "skipped" {
+		t.Fatalf("status = %q, want skipped", got)
+	}
+}
+
+func TestGatewayUsesMultipleProviders(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rootDir := t.TempDir()
+
+	coordinator := openNotifyCoordinator(t, rootDir)
+	repos := storage.NewRepositories(coordinator.DB())
+
+	provA := &recordingProvider{name: "provider-a", available: true}
+	provB := &recordingProvider{name: "provider-b", available: true}
+
 	gateway := NewGateway(Options{
 		Config: config.NotificationConfig{
 			InApp: true,
-			Osascript: config.OsascriptNotificationConfig{
-				Enabled:               true,
-				SoundForLevels:        []config.NotificationSoundLevel{config.NotificationSoundLevelFailure, config.NotificationSoundLevelActionRequired},
-				ThrottleWindowSeconds: 60,
-			},
 		},
-		OsascriptPath: scriptPath,
-		Repositories:  repos,
+		Providers:    []Provider{provA, provB},
+		Repositories: repos,
 	})
 
-	gateway.Notify(ctx, SystemNotificationPayload{
-		Level:    "success",
-		Title:    "Loop completed",
-		Subtitle: "loop_1",
-		Body:     "All good",
-		Sound:    "Funk",
+	records := gateway.Notify(ctx, SystemNotificationPayload{
+		Level: "success",
+		Title: "Multi test",
+		Body:  "Multiple providers",
 	})
 
-	osascriptCallsBytes, err := os.ReadFile(capturePath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
+	if len(provA.Calls) != 1 {
+		t.Fatalf("provider-a calls = %d, want 1", len(provA.Calls))
 	}
-	osascriptCalls := string(osascriptCallsBytes)
-	assertContains(t, osascriptCalls, "display notification")
-	if strings.Contains(osascriptCalls, "display dialog") {
-		t.Fatalf("osascript calls = %q, want no display dialog", osascriptCalls)
+	if len(provB.Calls) != 1 {
+		t.Fatalf("provider-b calls = %d, want 1", len(provB.Calls))
+	}
+
+	if got := notificationStatus(records, "provider-a"); got != "success" {
+		t.Fatalf("provider-a status = %q, want success", got)
+	}
+	if got := notificationStatus(records, "provider-b"); got != "success" {
+		t.Fatalf("provider-b status = %q, want success", got)
+	}
+}
+
+func TestGatewayHandlesProviderFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rootDir := t.TempDir()
+
+	coordinator := openNotifyCoordinator(t, rootDir)
+	repos := storage.NewRepositories(coordinator.DB())
+
+	prov := &mockProvider{
+		name:      "failing",
+		available: true,
+		sendFn: func(ctx context.Context, payload SystemNotificationPayload) error {
+			return fmt.Errorf("provider error")
+		},
+	}
+
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{
+			InApp: false,
+		},
+		Providers:    []Provider{prov},
+		Repositories: repos,
+	})
+
+	records := gateway.Notify(ctx, SystemNotificationPayload{
+		Level: "info",
+		Title: "Failure test",
+	})
+
+	if got := notificationStatus(records, "failing"); got != "failed" {
+		t.Fatalf("status = %q, want failed", got)
 	}
 }
 

@@ -118,6 +118,17 @@ func (r *commandRuntime) resolveLaunchdPlistPathForState(loaded config.LoadedFil
 	return r.resolveLaunchdPlistPath(loaded)
 }
 
+func looperdArgsForMode(loaded config.LoadedFileConfig, mode config.DaemonMode) []string {
+	var args []string
+	if mode != "" {
+		args = append(args, "--daemon-mode="+string(mode))
+	}
+	if path := loaded.Metadata.ConfigPath; path != "" {
+		args = append(args, "--config="+path)
+	}
+	return args
+}
+
 func daemonLogState(loaded config.LoadedFileConfig) daemonLifecycleLogState {
 	logDir := loaded.Config.Daemon.LogDir
 	return daemonLifecycleLogState{
@@ -184,12 +195,29 @@ func (r *commandRuntime) daemonLifecycleStatus(ctx context.Context, loaded confi
 		return daemonLifecycleStatus{}, err
 	}
 	status := daemonLifecycleStatus{State: state, StatePath: statePath, PIDPath: pidPath, Process: "unknown"}
-	if state != nil && state.Mode == config.DaemonModeLaunchd {
-		if refreshed, err := r.refreshLaunchdLifecycleState(ctx, loaded, statePath, state); err != nil {
-			state.LastError = err.Error()
-		} else if refreshed != nil {
-			state = refreshed
-			status.State = refreshed
+	if state != nil {
+		switch state.Mode {
+		case config.DaemonModeLaunchd:
+			if refreshed, err := r.refreshLaunchdLifecycleState(ctx, loaded, statePath, state); err != nil {
+				state.LastError = err.Error()
+			} else if refreshed != nil {
+				state = refreshed
+				status.State = refreshed
+			}
+		case config.DaemonModeSystemd:
+			if refreshed, err := r.refreshSystemdLifecycleState(ctx, statePath, state); err != nil {
+				state.LastError = err.Error()
+			} else if refreshed != nil {
+				state = refreshed
+				status.State = refreshed
+			}
+		case config.DaemonModeWindowsService:
+			if refreshed, err := r.refreshWindowsServiceLifecycleState(ctx, statePath, state); err != nil {
+				state.LastError = err.Error()
+			} else if refreshed != nil {
+				state = refreshed
+				status.State = refreshed
+			}
 		}
 	}
 	pid := 0

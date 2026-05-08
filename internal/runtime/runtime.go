@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/platform"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
@@ -1461,20 +1461,15 @@ func splitProcessCommand(command string) []string {
 }
 
 func defaultReadProcessCommand(ctx context.Context, pid int) (string, error) {
-	cmd := exec.CommandContext(ctx, "ps", "-p", fmt.Sprintf("%d", pid), "-o", "command=")
-	output, err := cmd.Output()
+	command, err := platform.ProcessCommand(pid)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return "", nil
-		}
-		return "", fmt.Errorf("inspect process %d with ps: %w", pid, err)
+		return "", fmt.Errorf("read process %d command: %w", pid, err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	return command, nil
 }
 
 func defaultSignalProcess(pid int, signal syscall.Signal) error {
-	return syscall.Kill(pid, signal)
+	return platform.SignalProcess(pid, signal)
 }
 
 func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error {
@@ -1482,7 +1477,7 @@ func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error 
 		return nil
 	}
 	if err := r.signalProcess(-pid, signal); err != nil {
-		if !errors.Is(err, syscall.ESRCH) {
+		if !errors.Is(err, platform.ESRCH) {
 			return err
 		}
 		return r.signalProcess(pid, signal)

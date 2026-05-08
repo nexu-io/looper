@@ -1,14 +1,25 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
+
+// checkWriteAccess reports whether the caller can write to the given path.
+// Implemented per platform since syscall.Access is not available on Windows.
+var checkWriteAccess = func(path string) error {
+	_, err := os.Stat(path)
+	return err
+}
+
+// isNotDirError checks whether err means a path component was not a directory.
+// Implemented per platform since syscall.ENOTDIR may not exist on all targets.
+var isNotDirError = func(err error) bool {
+	return false
+}
 
 type ValidationIssue struct {
 	Path    string
@@ -111,7 +122,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	if !isValidDaemonMode(config.Daemon.Mode) {
-		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
+		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd, DaemonModeWindowsService)})
 	}
 
 	if !isValidDaemonRestartPolicy(config.Daemon.RestartPolicy) {
@@ -461,7 +472,7 @@ func ensureWritablePath(path string, kind writablePathKind, issues *[]Validation
 			break
 		}
 
-		if errors.Is(err, syscall.ENOTDIR) {
+		if isNotDirError(err) {
 			parent := filepath.Dir(writableAnchor)
 			if parent == writableAnchor {
 				*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s cannot be created because no existing parent was found", target)})
@@ -490,7 +501,7 @@ func ensureWritablePath(path string, kind writablePathKind, issues *[]Validation
 		return
 	}
 
-	if err := syscall.Access(writableAnchor, writePermissionMode); err != nil {
+	if err := checkWriteAccess(writableAnchor); err != nil {
 		*issues = append(*issues, ValidationIssue{Path: field, Message: fmt.Sprintf("%s is not writable", writableAnchor)})
 	}
 }
@@ -533,7 +544,7 @@ func isValidAuthMode(mode AuthMode) bool {
 
 func isValidDaemonMode(mode DaemonMode) bool {
 	switch mode {
-	case DaemonModeForeground, DaemonModeLaunchd:
+	case DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd, DaemonModeWindowsService:
 		return true
 	default:
 		return false
