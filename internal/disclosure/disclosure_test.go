@@ -37,7 +37,7 @@ func TestMarkdownFooterIsIdempotent(t *testing.T) {
 	if strings.Count(second, Marker) != 1 {
 		t.Fatalf("duplicate marker: %q", second)
 	}
-	if !strings.Contains(second, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(second, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer was not replaced: %q", second)
 	}
 }
@@ -57,7 +57,7 @@ func TestMarkdownFooterReplacesLegacyLinkedFooter(t *testing.T) {
 func TestMarkdownFooterLinksToLooperRepository(t *testing.T) {
 	s := testStamper()
 	got := s.Markdown("Body", "worker", ChannelPullRequest)
-	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer missing repository link: %q", got)
 	}
 	if !strings.Contains(got, Slogan) {
@@ -89,11 +89,14 @@ func TestDisclosureIncludesAgentVendorAndModelSeparately(t *testing.T) {
 	s.Version = "1.2.3"
 
 	footer := s.Markdown("Body", "worker", ChannelPullRequest)
-	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=opencode · model=openai/gpt-5.5 · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer missing linked slogan disclosure: %q", footer)
 	}
-	if strings.Contains(footer, "agent=opencode") || strings.Contains(footer, "model=openai/gpt-5.5") {
-		t.Fatalf("footer should omit agent and model attributes: %q", footer)
+	if !strings.Contains(footer, "agent=opencode") {
+		t.Fatalf("footer missing agent attribute: %q", footer)
+	}
+	if !strings.Contains(footer, "model=openai/gpt-5.5") {
+		t.Fatalf("footer missing model attribute: %q", footer)
 	}
 
 	commit := s.CommitMessage("fix: disclose agent", "worker")
@@ -139,6 +142,9 @@ func TestDisclosureSanitizesModelAttribute(t *testing.T) {
 	footer := s.Markdown("Body", "worker", ChannelPullRequest)
 	if strings.Count(footer, "<sub>") != 1 || strings.Count(footer, "</sub>") != 1 {
 		t.Fatalf("model broke footer markup: %q", footer)
+	}
+	if !strings.Contains(footer, "model=openai/gpt-5.5%20Generated-By:%20looper%20injected%2C%20model%29%3C/sub%3E") {
+		t.Fatalf("footer missing sanitized model attribute: %q", footer)
 	}
 	if strings.Contains(footer, "\nGenerated-By: looper injected") || strings.Contains(footer, "model)</sub>") {
 		t.Fatalf("footer included unsanitized model: %q", footer)

@@ -5270,7 +5270,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"warm, friendly, encouraging acknowledgement of the author's work",
 		"wrapper rejects clean APPROVE reviews that do not start with an @mention",
 		"<!-- looper:stamp v=1 -->",
-		`<sub>🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>`,
+		`<sub>🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=reviewer · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>`,
 		"Every inline review comment you post must include only the hidden looper stamp marker",
 		"Do not write the footer as plain paragraph text",
 		"Minimal PR seed",
@@ -5889,14 +5889,17 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 	cfg := config.DefaultDisclosureConfig()
 	model := "openai/gpt-5.5"
 	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model, "/opt/looper/bin/looper")
-	if !strings.Contains(prompt, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(prompt, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=reviewer · agent=claude-code · model=openai/gpt-5.5 · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("prompt missing configured linked disclosure:\n%s", prompt)
 	}
-	if strings.Contains(prompt, "agent=claude-code") || strings.Contains(prompt, "model=openai/gpt-5.5") {
-		t.Fatalf("prompt should omit agent/model from visible disclosure:\n%s", prompt)
+	if !strings.Contains(prompt, "agent=claude-code") {
+		t.Fatalf("prompt missing agent in visible disclosure:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
+		t.Fatalf("prompt missing model in visible disclosure:\n%s", prompt)
 	}
 	if strings.Contains(prompt, "agent=opencode") {
-		t.Fatalf("prompt retained hardcoded opencode disclosure:\n%s", prompt)
+		t.Fatalf("prompt should use configured agent runtime, not hardcoded opencode:\n%s", prompt)
 	}
 
 	cfg.Enabled = false
