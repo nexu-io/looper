@@ -105,10 +105,7 @@ func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
 	var managedVersion *daemonVersionState
 	managedPath, managedPathErr := r.managedDaemonBinaryPath()
 	if managedPathErr == nil && (versionState == nil || (versionState.BinaryPath != nil && *versionState.BinaryPath == managedPath)) {
-		managedVersion, err = r.readManagedDaemonVersion(cmd.Context())
-		if err != nil {
-			return err
-		}
+		managedVersion, _ = r.readManagedDaemonVersion(cmd.Context())
 	}
 
 	output := daemonStatusOutput{
