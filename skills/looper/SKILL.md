@@ -74,15 +74,15 @@ Auto-detect installed agent CLIs in parallel before asking:
 | `claude-code` | `command -v claude` |
 | `codex` | `command -v codex` |
 | `opencode` | `command -v opencode` |
-| `cursor-cli` | `command -v cursor-agent` |
+| `cursor-cli` | `command -v agent` |
 
 Use the `question` tool to let the user pick one. List detected vendors first, marked `(installed)`, with undetected ones appended as `(not installed — needs setup)`. If multiple are installed, do not impose an opinionated default — present them in detection order and let the user choose.
 
 If none are installed, ask the user which one they want to install before continuing; do not proceed to bootstrap with a vendor whose CLI is missing.
 
-After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `cursor-agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
+After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
 
-Looper inherits the vendor's own authentication (e.g. `claude login`, `cursor-agent login`, or env vars in the user's shell). **Do not** store agent credentials in `~/.looper/config.json`.
+Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). **Do not** store agent credentials in `~/.looper/config.json`.
 
 ### Step 2 — Pick the first project to watch
 

@@ -453,7 +453,7 @@ The `roles` section controls scheduler auto-discovery for planner, reviewer, fix
 Default discovery:
 
 - planner: open issues labeled `looper:plan` assigned to current GitHub user.
-- worker: open issues labeled `looper:worker-ready` assigned to current GitHub user, plus open PRs labeled `looper:spec-ready` (the reviewer promotes spec PRs to this state when the spec review is clean; worker continues implementation on the same PR).
+- worker: open issues labeled `looper:worker-ready` assigned to current GitHub user.
 - reviewer: open non-draft PRs where current user is requested for review, plus spec-review follow-up.
 - fixer: open non-draft PRs authored by current user that have actionable review items.
 
