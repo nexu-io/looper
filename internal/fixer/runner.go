@@ -521,15 +521,16 @@ func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentRe
 // limits prompt-injection blast radius if a malicious reviewer plants payload.
 const maxReplyExplanationLength = 500
 
-// parseReplyExplanationsFromStdout extracts the optional review_thread_replies
-// array from the final __LOOPER_RESULT__ JSON line. Failure to parse is not an
-// error: the runner falls back to the generic reply body. Entries are filtered
-// against the current fixItems snapshot (keyed by fixItemId, with a defensive
-// threadId cross-check), deduplicated keeping the first valid occurrence, and
-// truncated. Disclosure markers, @mentions, and HTML tags are stripped so the
-// adapter remains the only path that stamps and templates the reply.
-func parseReplyExplanationsFromStdout(stdout string, fixItems []FixItem) []replyExplanationEntry {
-	if strings.TrimSpace(stdout) == "" {
+// parseReplyExplanations extracts the optional review_thread_replies array from
+// the final __LOOPER_RESULT__ JSON line. Failure to parse is not an error: the
+// runner falls back to the generic reply body. Entries are filtered against the
+// current fixItems snapshot (keyed by fixItemId, with a defensive threadId
+// cross-check), deduplicated keeping the first valid occurrence, and truncated.
+// Disclosure markers, @mentions, and HTML tags are stripped so the adapter
+// remains the only path that stamps and templates the reply.
+func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyExplanationEntry {
+	combined := stdout + "\n" + stderr
+	if strings.TrimSpace(combined) == "" {
 		return nil
 	}
 	itemsByID := make(map[string]FixItem, len(fixItems))
@@ -545,7 +546,7 @@ func parseReplyExplanationsFromStdout(stdout string, fixItems []FixItem) []reply
 	if len(itemsByID) == 0 {
 		return nil
 	}
-	payload := extractCompletionMarkerPayload(stdout)
+	payload := extractCompletionMarkerPayload(combined)
 	if payload == "" {
 		return nil
 	}
@@ -632,7 +633,7 @@ func sanitizeReplyExplanation(raw string) string {
 }
 
 var (
-	leadingMentionPattern = regexp.MustCompile(`(?m)^(?:@[A-Za-z0-9][A-Za-z0-9-]{0,38}\s+)+`)
+	leadingMentionPattern = regexp.MustCompile(`(?m)^(?:@[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:[,:;]+)?\s*)+`)
 	htmlTagPattern        = regexp.MustCompile(`</?[A-Za-z][^>]*>`)
 )
 
@@ -1330,7 +1331,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
-	checkpoint.Repair.ReplyExplanations = parseReplyExplanationsFromStdout(result.Stdout, checkpoint.FixItems)
+	checkpoint.Repair.ReplyExplanations = parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems)
 	checkpoint.Repair.FixItemsHash = checkpoint.FixItemsHash
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {

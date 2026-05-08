@@ -1790,19 +1790,31 @@ func TestProcessClaimedItemRepliesToAuthorBeforeResolving(t *testing.T) {
 	}
 }
 
-func TestParseReplyExplanationsFromStdoutValid(t *testing.T) {
+func TestParseReplyExplanationsValid(t *testing.T) {
 	t.Parallel()
 	stdout := strings.Join([]string{
 		"some agent log line",
 		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Replaced strings.Title with cases.Title."}]}`,
 	}, "\n")
-	got := parseReplyExplanationsFromStdout(stdout, []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
 	if len(got) != 1 || got[0].FixItemID != "c1" || !strings.Contains(got[0].Explanation, "cases.Title") {
-		t.Fatalf("parseReplyExplanationsFromStdout() = %#v", got)
+		t.Fatalf("parseReplyExplanations() = %#v", got)
 	}
 }
 
-func TestParseReplyExplanationsFromStdoutDropsUnknownAndMismatchedThread(t *testing.T) {
+func TestParseReplyExplanationsReadsCompletionMarkerFromStderr(t *testing.T) {
+	t.Parallel()
+	stderr := strings.Join([]string{
+		"runtime warning",
+		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Preserved stderr completion markers."}]}`,
+	}, "\n")
+	got := parseReplyExplanations("", stderr, []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Explanation != "Preserved stderr completion markers." {
+		t.Fatalf("parseReplyExplanations() = %#v", got)
+	}
+}
+
+func TestParseReplyExplanationsDropsUnknownAndMismatchedThread(t *testing.T) {
 	t.Parallel()
 	stdout := `__LOOPER_RESULT__={"review_thread_replies":[` +
 		`{"fixItemId":"c-unknown","explanation":"hi"},` +
@@ -1811,25 +1823,25 @@ func TestParseReplyExplanationsFromStdoutDropsUnknownAndMismatchedThread(t *test
 		`{"fixItemId":"c1","threadId":"t1","explanation":"good"},` +
 		`{"fixItemId":"c1","threadId":"t1","explanation":"duplicate, must drop"}` +
 		`]}`
-	got := parseReplyExplanationsFromStdout(stdout, []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
 	if len(got) != 1 || got[0].Explanation != "good" {
-		t.Fatalf("parseReplyExplanationsFromStdout() = %#v, want only the first valid entry", got)
+		t.Fatalf("parseReplyExplanations() = %#v, want only the first valid entry", got)
 	}
 }
 
-func TestParseReplyExplanationsFromStdoutMalformedFallsBack(t *testing.T) {
+func TestParseReplyExplanationsMalformedFallsBack(t *testing.T) {
 	t.Parallel()
-	if got := parseReplyExplanationsFromStdout("__LOOPER_RESULT__={bad json}", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}); got != nil {
-		t.Fatalf("parseReplyExplanationsFromStdout() = %#v, want nil on bad JSON", got)
+	if got := parseReplyExplanations("__LOOPER_RESULT__={bad json}", "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}); got != nil {
+		t.Fatalf("parseReplyExplanations() = %#v, want nil on bad JSON", got)
 	}
-	if got := parseReplyExplanationsFromStdout("no marker here", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}); got != nil {
-		t.Fatalf("parseReplyExplanationsFromStdout() = %#v, want nil when marker missing", got)
+	if got := parseReplyExplanations("no marker here", "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}); got != nil {
+		t.Fatalf("parseReplyExplanations() = %#v, want nil when marker missing", got)
 	}
 }
 
 func TestSanitizeReplyExplanationStripsDangerousFragments(t *testing.T) {
 	t.Parallel()
-	input := "@looper-bot @another <!-- looper:stamp v=1 --> <script>alert(1)</script>Replaced foo with bar."
+	input := "@looper-bot, @another: <!-- looper:stamp v=1 --> <script>alert(1)</script>Replaced foo with bar."
 	got := sanitizeReplyExplanation(input)
 	if strings.Contains(got, "@") || strings.Contains(got, "<script") || strings.Contains(got, "looper:stamp") {
 		t.Fatalf("sanitizeReplyExplanation() = %q, did not strip", got)
@@ -1896,7 +1908,7 @@ func TestProcessClaimedItemUsesAgentExplanationInReplyBody(t *testing.T) {
 		},
 	}
 	stdout := `__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Switched the loop bound to len(items)-1 and added a regression test in foo_test.go."}]}` + "\n"
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: "runtime log", Stderr: stdout}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
