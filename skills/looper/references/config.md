@@ -88,10 +88,10 @@ Use this as a map of supported sections, not as a template to paste wholesale:
       "enabled": true
     },
     "timeouts": {
-      "plannerSeconds": 1800,
-      "workerSeconds": 3600,
-      "reviewerSeconds": 1800,
-      "fixerSeconds": 1800
+      "plannerSeconds": 3600,
+      "workerSeconds": 10800,
+      "reviewerSeconds": 5400,
+      "fixerSeconds": 7200
     }
   },
   "logging": {
@@ -287,7 +287,7 @@ Use `looper daemon status`, `looper daemon status --json`, `looper daemon logs`,
 - `params`: free-form vendor-specific parameters.
 - `env`: environment variables passed to the agent process. Redact secrets.
 - `nativeResume.enabled`: local-machine native session resume after daemon restart, default `true`.
-- `timeouts`: role-specific agent execution timeout seconds. Defaults: planner `1800`, worker `3600`, reviewer `1800`, fixer `1800`.
+- `timeouts`: role-specific agent execution timeout seconds. Defaults: planner `3600`, worker `10800`, reviewer `5400`, fixer `7200`.
 
 `vendor` is required for agent-driven loops. Without it, the daemon can run but planner/reviewer/fixer/worker loops cannot be created or started.
 
