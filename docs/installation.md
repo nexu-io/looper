@@ -4,18 +4,28 @@ This document contains the detailed install, upgrade, uninstall, and source-buil
 
 ## Requirements
 
-For the default supported install path:
+### Platform support
 
-- macOS (`darwin-arm64`)
+| Platform | Architecture | Install | Daemon supervision |
+|---|---|---|---|
+| macOS | arm64, amd64 | install.sh / manual | launchd |
+| Linux | amd64, arm64 | install.sh / manual | systemd (user unit) |
+| Windows | amd64, arm64 | manual | Windows Service (`sc.exe`) |
+
+### Common dependencies
+
 - `git`
-- `gh`
+- `gh` (GitHub CLI, authenticated)
 
-For source development:
+### Platform-specific
+
+- **macOS**: `osascript` if macOS notifications stay enabled
+- **Linux**: `notify-send` (libnotify) for desktop notifications; `systemctl --user` for systemd supervision
+- **Windows**: PowerShell (for toast notifications); `sc.exe` for Windows Service supervision
+
+### Source development
 
 - Go `1.22`
-- `git`
-- `gh`
-- `osascript` if macOS notifications stay enabled
 
 `looperd` auto-detects tool paths from `PATH`, but startup validation fails if required tools cannot be resolved.
 
@@ -34,13 +44,11 @@ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 
 ### Install the CLI manually
 
-1. Download the matching `looper` release artifact for your macOS architecture from GitHub Releases.
-2. Rename it to `looper` if needed.
+1. Download the matching `looper` release artifact for your platform from GitHub Releases.
+2. Rename it to `looper` (or `looper.exe` on Windows) if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64`.
-
-Linux is not currently supported for the managed daemon flow.
+GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on all supported platforms.
 
 ### Install the daemon manually
 
@@ -54,11 +62,11 @@ looper status
 
 This flow:
 
-- detects the current macOS architecture
+- detects the current platform and architecture
 - downloads the matching GitHub Release artifact
-- installs it to `~/.looper/bin/looperd`
+- installs it to `~/.looper/bin/looperd` (Unix) or `%APPDATA%\Looper\bin\looperd.exe` (Windows)
 
-Current release binaries are unsigned. If macOS Gatekeeper blocks the first launch, you may need to allow the binary manually in System Settings.
+Current release binaries are unsigned. On macOS, if Gatekeeper blocks the first launch, you may need to allow the binary manually in System Settings.
 
 Manual fallback:
 
@@ -90,7 +98,48 @@ Launchd mode:
 - uses `daemon.restartThrottleSeconds` as the launchd `ThrottleInterval`
 - may recover after login/system restart when launchd loads the user agent
 
-Supported restart policies are `never`, `on-failure`, and `always`; the default is `on-failure` with a 10 second throttle. Linux/systemd supervision is not implemented yet; on unsupported platforms, `--daemon-mode launchd` returns an actionable error instead of silently falling back.
+Supported restart policies are `never`, `on-failure`, and `always`; the default is `on-failure` with a 10 second throttle.
+
+### Supervised daemon mode on Linux
+
+For actively supervised `looperd` lifecycle management on Linux, use systemd user mode:
+
+```bash
+looper daemon start --daemon-mode systemd
+looper daemon status
+looper daemon status --json
+```
+
+Systemd mode:
+
+- creates a user systemd unit at `~/.config/systemd/user/looperd.service`
+- stores lifecycle state in `~/.looper/looperd.state.json`
+- maps `daemon.restartPolicy` to systemd `Restart=` behavior
+- may recover after login when the user manager is available
+- uses `systemctl --user` for install, start, stop, and status queries
+
+Supported restart policies are `never`, `on-failure`, and `always`; the default is `on-failure` with a 10 second throttle.
+
+### Supervised daemon mode on Windows
+
+For actively supervised `looperd` lifecycle management on Windows, use the Windows Service mode (requires Administrator privileges):
+
+```powershell
+looper daemon start --daemon-mode windows-service
+looper daemon status
+looper daemon status --json
+```
+
+Windows Service mode:
+
+- registers `looperd` as a Windows Service named `looperd` via `sc.exe`
+- stores lifecycle state in `%APPDATA%\Looper\looperd.state.json`
+- uses `sc.exe` for install, start, stop, and status queries
+- may recover after reboot when the service auto-start is configured
+
+Supported restart policies are `never`, `on-failure`, and `always`; the default is `on-failure` with a 10 second throttle.
+
+On unsupported platforms, platform-specific daemon modes return an actionable error instead of silently falling back.
 
 Troubleshooting commands:
 
@@ -143,11 +192,22 @@ Current behavior:
 
 ## Uninstall
 
+### Unix (macOS / Linux)
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.sh | sh
 ```
 
 The uninstall script removes the CLI binary, the managed daemon binary, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees.
+
+### Windows
+
+Remove the CLI binary, daemon binary under `%APPDATA%\Looper\bin\`, and the `%APPDATA%\Looper` directory. If the daemon is running as a Windows Service, stop and remove it first:
+
+```powershell
+looper daemon stop --daemon-mode windows-service
+sc.exe delete looperd
+```
 
 ## From source
 

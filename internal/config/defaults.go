@@ -109,7 +109,7 @@ func DefaultConfig(cwd string) (Config, error) {
 		Disclosure: DefaultDisclosureConfig(),
 		Tools:      ToolPathsConfig{},
 		Daemon: DaemonConfig{
-			Mode:                   DaemonModeForeground,
+			Mode:                   defaultDaemonMode(),
 			RestartPolicy:          DaemonRestartOnFailure,
 			RestartThrottleSeconds: 10,
 			LogDir:                 logDir,
@@ -222,6 +222,10 @@ func DefaultDisclosureConfig() DisclosureConfig {
 			InlineCommentVisible: false,
 		},
 	}
+}
+
+func defaultDaemonMode() DaemonMode {
+	return DaemonModeForeground
 }
 
 func stringPtr(value string) *string {

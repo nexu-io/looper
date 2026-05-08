@@ -14,7 +14,8 @@
       "LOOPER_ALLOW_AUTO_APPROVE": "true",
       "LOOPER_GIT_PATH": "/envonly/git",
       "LOOPER_GH_PATH": "/envonly/gh",
-      "LOOPER_OSASCRIPT_PATH": "/envonly/osascript"
+      "LOOPER_OSASCRIPT_PATH": "/envonly/osascript",
+      "LOOPER_DAEMON_MODE": "foreground"
     }
   },
   "expected": {

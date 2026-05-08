@@ -151,6 +151,31 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact-name: looper-darwin-arm64
+          - target: darwin-amd64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+            artifact-name: looper-darwin-amd64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looper-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            artifact-name: looper-linux-arm64
+          - target: windows-amd64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            artifact-name: looper-windows-amd64
+          - target: windows-arm64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            artifact-name: looper-windows-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -226,12 +251,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Phase 1 intentionally publishes macOS artifacts only.
           - target: darwin-arm64
             runner: macos-14
             goos: darwin
             goarch: arm64
             artifact-name: looperd-darwin-arm64
+          - target: darwin-amd64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+            artifact-name: looperd-darwin-amd64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looperd-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            artifact-name: looperd-linux-arm64
+          - target: windows-amd64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            artifact-name: looperd-windows-amd64
+          - target: windows-arm64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            artifact-name: looperd-windows-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -320,24 +369,23 @@ jobs:
 
       - name: Verify predictable asset names
         run: |
-          test -f release-assets/looper-darwin-arm64
-          test -f release-assets/looper-darwin-arm64.sha256
-          test -f release-assets/looper-darwin-arm64.tar.gz
-          test -f release-assets/looper-darwin-arm64.tar.gz.sha256
-          test -f release-assets/looperd-darwin-arm64
-          test -f release-assets/looperd-darwin-arm64.sha256
-          test -f release-assets/looperd-darwin-arm64.tar.gz
-          test -f release-assets/looperd-darwin-arm64.tar.gz.sha256
-
-      - name: Verify Linux artifacts are not published in Phase 1
-        run: |
-          if find release-assets -maxdepth 1 \( -name '*linux*' -o -name '*.AppImage' \) | grep -q .; then
-            echo "Phase 1 release workflow must not publish Linux artifacts." >&2
-            exit 1
-          fi
+          for bin in looper looperd; do
+            for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
+              test -f "release-assets/${bin}-${target}"
+              test -f "release-assets/${bin}-${target}.sha256"
+              test -f "release-assets/${bin}-${target}.tar.gz"
+              test -f "release-assets/${bin}-${target}.tar.gz.sha256"
+            done
+          done
 
       - name: Generate release manifest
         run: |
+          required_assets=""
+          for bin in looper looperd; do
+            for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
+              required_assets="${required_assets}${required_assets:+,}${bin}-${target},${bin}-${target}.tar.gz"
+            done
+          done
           go run ./tools/release-manifest \
             -tag "${{ needs.prepare-go-release.outputs.release-tag }}" \
             -version "${{ needs.prepare-go-release.outputs.release-version }}" \
@@ -347,7 +395,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64,looper-darwin-arm64.tar.gz,looperd-darwin-arm64,looperd-darwin-arm64.tar.gz" \
+            -required-assets "$required_assets" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -373,13 +421,12 @@ jobs:
           assert m["schemaVersion"] == expected_schema_version, f"schemaVersion mismatch: {m['schemaVersion']}"
           assert m["minCliForDaemon"], "minCliForDaemon missing"
           assert m["minDaemonForCli"], "minDaemonForCli missing"
-          required = {
-              "looper-darwin-arm64",
-              "looper-darwin-arm64.tar.gz",
-              "looperd-darwin-arm64",
-              "looperd-darwin-arm64.tar.gz",
-          }
-          assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
+          required = set()
+          for bin in ["looper", "looperd"]:
+              for target in ["darwin-arm64", "darwin-amd64", "linux-amd64", "linux-arm64", "windows-amd64", "windows-arm64"]:
+                  required.add(f"{bin}-{target}")
+                  required.add(f"{bin}-{target}.tar.gz")
+          assert required.issubset(set(m["artifacts"].keys())), f"manifest missing artifacts: {required - set(m['artifacts'].keys())}"
           for name in required:
               artifact = m["artifacts"][name]
               assert artifact["url"].endswith(f"/{os.environ['EXPECTED_TAG']}/{name}"), f"artifact URL mismatch for {name}: {artifact['url']}"
@@ -394,13 +441,4 @@ jobs:
           name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
           draft: false
           prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
-          files: |
-            release-assets/looper-darwin-arm64
-            release-assets/looper-darwin-arm64.sha256
-            release-assets/looper-darwin-arm64.tar.gz
-            release-assets/looper-darwin-arm64.tar.gz.sha256
-            release-assets/looperd-darwin-arm64
-            release-assets/looperd-darwin-arm64.sha256
-            release-assets/looperd-darwin-arm64.tar.gz
-            release-assets/looperd-darwin-arm64.tar.gz.sha256
-            release-assets/manifest.json
+          files: release-assets/*

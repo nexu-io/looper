@@ -52,7 +52,7 @@ It contains a one-shot, step-by-step flow (preflight → install → bootstrap �
 
 ### For humans
 
-Fast path (macOS, `darwin-arm64`):
+Fast path (macOS / Linux):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
@@ -205,7 +205,10 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 ## Runtime notes
 
 - `looperd` fails fast on invalid config; runtime paths must be writable
-- The managed daemon binary lives at `~/.looper/bin/looperd`
+- The managed daemon binary lives at `~/.looper/bin/looperd` (Unix) or `%APPDATA%\Looper\bin\looperd.exe` (Windows)
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
-- When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
+- Default daemon mode is `foreground` on all platforms; set `--daemon-mode systemd` (Linux), `--daemon-mode launchd` (macOS), or `--daemon-mode windows-service` (Windows) for supervised lifecycle
+- macOS: `notifications.osascript.enabled` defaults to `true`; `osascript` must resolve on startup
+- Linux: `notifications.notify-send` is auto-detected; `systemctl --user` is required for systemd supervision
+- Windows: PowerShell toast notifications; `sc.exe` is required for Windows Service supervision
 - Automation is poll-driven, not webhook-driven — keep `looperd` running and `gh` installed and authenticated for the loop to fire

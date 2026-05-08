@@ -15,11 +15,11 @@ import (
 )
 
 type mockProvider struct {
-	name        string
-	available   bool
-	sendFn      func(context.Context, SystemNotificationPayload) error
-	called      []SystemNotificationPayload
-	mu          sync.Mutex
+	name      string
+	available bool
+	sendFn    func(context.Context, SystemNotificationPayload) error
+	called    []SystemNotificationPayload
+	mu        sync.Mutex
 }
 
 func (p *mockProvider) Name() string { return p.name }
@@ -37,10 +37,10 @@ func (p *mockProvider) Send(ctx context.Context, payload SystemNotificationPaylo
 }
 
 type recordingProvider struct {
-	name     string
+	name      string
 	available bool
-	Calls    []string
-	mu       sync.Mutex
+	Calls     []string
+	mu        sync.Mutex
 }
 
 func (p *recordingProvider) Name() string { return p.name }

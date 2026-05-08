@@ -8,6 +8,8 @@
       "7000",
       "--git-path",
       "/cli/git",
+      "--daemon-mode",
+      "foreground",
       "--allow-auto-commit",
       "false",
       "--allow-auto-push",

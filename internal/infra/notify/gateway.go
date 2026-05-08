@@ -16,12 +16,12 @@ import (
 type RunCommandFunc func(context.Context, shell.Options) (shell.Result, error)
 
 type Options struct {
-	Config        config.NotificationConfig
-	Providers     []Provider
-	LogFilePath   string
-	Repositories  *storage.Repositories
-	Now           func() time.Time
-	RunCommand    RunCommandFunc
+	Config       config.NotificationConfig
+	Providers    []Provider
+	LogFilePath  string
+	Repositories *storage.Repositories
+	Now          func() time.Time
+	RunCommand   RunCommandFunc
 }
 
 type SystemNotificationPayload struct {
