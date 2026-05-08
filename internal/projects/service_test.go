@@ -506,7 +506,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	}
 }
 
-func TestServiceSyncConfiguredClearsRepoMetadataWhenDetectionReturnsEmpty(t *testing.T) {
+func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionReturnsEmpty(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -540,8 +540,47 @@ func TestServiceSyncConfiguredClearsRepoMetadataWhenDetectionReturnsEmpty(t *tes
 	if err != nil {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
-	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"config"}` {
-		t.Fatalf("project.MetadataJSON = %#v, want cleared repo metadata", project)
+	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != metadata {
+		t.Fatalf("project.MetadataJSON = %#v, want preserved repo metadata", project)
+	}
+}
+
+func TestServiceSyncConfiguredLeavesRepoMetadataNilWhenDetectionReturnsEmptyWithoutExistingRepo(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.May, 8, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	repoPath := "/tmp/looper"
+	baseBranch := "main"
+	metadata := `{"repo":null,"worktreeRoot":null,"source":"config"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		DetectRepo: func(context.Context, string) (string, error) {
+			return "", nil
+		},
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch}}
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	project, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != metadata {
+		t.Fatalf("project.MetadataJSON = %#v, want nil repo metadata", project)
 	}
 }
 

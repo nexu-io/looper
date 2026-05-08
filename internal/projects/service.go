@@ -376,6 +376,11 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 		}
 		detected = strings.TrimSpace(detected)
 		if detected == "" {
+			if existing != nil && existing.RepoPath == project.RepoPath {
+				if repo := stringMetadataPtr(existing.MetadataJSON, "repo"); repo != nil {
+					return repo, nil
+				}
+			}
 			return nil, nil
 		}
 		return &detected, nil
