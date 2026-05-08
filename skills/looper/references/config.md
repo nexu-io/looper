@@ -679,7 +679,7 @@ If `server.authMode=local-token`, export `LOOPER_TOKEN` before using the CLI.
 After config or path changes, validate in this order:
 
 ```bash
-bash skills/looper/scripts/check.sh
+bash scripts/check.sh
 looper daemon status
 looper daemon logs --startup
 ```

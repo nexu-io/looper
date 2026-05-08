@@ -24,7 +24,7 @@ Use this skill when an agent needs to configure, start, check, operate, or troub
 3. For local environment diagnostics, run the bundled read-only helper:
 
    ```bash
-   bash skills/looper/scripts/check.sh
+   bash scripts/check.sh
    ```
 
 ## Quick reference
