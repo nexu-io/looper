@@ -522,6 +522,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Worker != nil {
 		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
 	}
+	if partial.Sweeper != nil {
+		mergeSweeperRoleConfig(&config.Sweeper, *partial.Sweeper)
+	}
 }
 
 func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRoleConfig) {
@@ -569,6 +572,36 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	}
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeSweeperRoleConfig(config *SweeperRoleConfig, partial PartialSweeperRoleConfig) {
+	if partial.AutoDiscovery != nil {
+		config.AutoDiscovery = *partial.AutoDiscovery
+	}
+	if partial.DryRun != nil {
+		config.DryRun = *partial.DryRun
+	}
+	if partial.Triggers != nil {
+		mergeSweeperTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Lifecycle != nil {
+		mergeSweeperLifecycleConfig(&config.Lifecycle, *partial.Lifecycle)
+	}
+	if partial.Limits != nil {
+		mergeSweeperLimitsConfig(&config.Limits, *partial.Limits)
+	}
+	if partial.Categories != nil {
+		mergeSweeperCategoriesConfig(&config.Categories, *partial.Categories)
+	}
+	if partial.Security != nil {
+		mergeSweeperSecurityConfig(&config.Security, *partial.Security)
+	}
+	if partial.Reporting != nil {
+		mergeSweeperReportingConfig(&config.Reporting, *partial.Reporting)
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
@@ -635,6 +668,108 @@ func mergeFixerRoleTriggersConfig(config *FixerRoleTriggersConfig, partial Parti
 	}
 	if partial.LabelMode != nil {
 		config.LabelMode = *partial.LabelMode
+	}
+}
+
+func mergeSweeperCategoryConfig(config *SweeperCategoryConfig, partial PartialSweeperCategoryConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.InactivityDays != nil {
+		config.InactivityDays = *partial.InactivityDays
+	}
+	if partial.GracePeriodDays != nil {
+		config.GracePeriodDays = *partial.GracePeriodDays
+	}
+	if partial.MinConfidence != nil {
+		config.MinConfidence = *partial.MinConfidence
+	}
+}
+
+func mergeSweeperTriggersConfig(config *SweeperTriggersConfig, partial PartialSweeperTriggersConfig) {
+	if partial.IncludeIssues != nil {
+		config.IncludeIssues = *partial.IncludeIssues
+	}
+	if partial.IncludePullRequests != nil {
+		config.IncludePullRequests = *partial.IncludePullRequests
+	}
+	if partial.IncludeDrafts != nil {
+		config.IncludeDrafts = *partial.IncludeDrafts
+	}
+	if partial.ExcludeLabels != nil {
+		config.ExcludeLabels = cloneStrings(*partial.ExcludeLabels)
+	}
+	if partial.ExcludeAuthors != nil {
+		config.ExcludeAuthors = cloneStrings(*partial.ExcludeAuthors)
+	}
+	if partial.ExcludeAuthorAssociations != nil {
+		config.ExcludeAuthorAssociations = cloneStrings(*partial.ExcludeAuthorAssociations)
+	}
+	if partial.LooperInternalLabels != nil {
+		config.LooperInternalLabels = cloneStrings(*partial.LooperInternalLabels)
+	}
+	if partial.ReopenCooldownDays != nil {
+		config.ReopenCooldownDays = *partial.ReopenCooldownDays
+	}
+	if partial.MaxPerTick != nil {
+		config.MaxPerTick = *partial.MaxPerTick
+	}
+}
+
+func mergeSweeperLimitsConfig(config *SweeperLimitsConfig, partial PartialSweeperLimitsConfig) {
+	if partial.MaxWarningsPerRepoPerDay != nil {
+		config.MaxWarningsPerRepoPerDay = *partial.MaxWarningsPerRepoPerDay
+	}
+	if partial.MaxClosesPerRepoPerDay != nil {
+		config.MaxClosesPerRepoPerDay = *partial.MaxClosesPerRepoPerDay
+	}
+	if partial.GlobalKillSwitch != nil {
+		config.GlobalKillSwitch = *partial.GlobalKillSwitch
+	}
+}
+
+func mergeSweeperSecurityConfig(config *SweeperSecurityConfig, partial PartialSweeperSecurityConfig) {
+	if partial.QuarantineLabel != nil {
+		config.QuarantineLabel = *partial.QuarantineLabel
+	}
+	if partial.NotifyAssignees != nil {
+		config.NotifyAssignees = cloneStrings(*partial.NotifyAssignees)
+	}
+}
+
+func mergeSweeperReportingConfig(config *SweeperReportingConfig, partial PartialSweeperReportingConfig) {
+	if partial.DurableReportsDir != nil {
+		config.DurableReportsDir = *partial.DurableReportsDir
+	}
+}
+
+func mergeSweeperLifecycleConfig(config *SweeperLifecycleConfig, partial PartialSweeperLifecycleConfig) {
+	if partial.PendingLabel != nil {
+		config.PendingLabel = *partial.PendingLabel
+	}
+	if partial.ClosedLabel != nil {
+		config.ClosedLabel = *partial.ClosedLabel
+	}
+	if partial.KeepLabel != nil {
+		config.KeepLabel = *partial.KeepLabel
+	}
+}
+
+func mergeSweeperCategoriesConfig(config *SweeperCategoriesConfig, partial PartialSweeperCategoriesConfig) {
+	if partial.Stale != nil {
+		mergeSweeperCategoryConfig(&config.Stale, *partial.Stale)
+	}
+	if partial.AlreadyFixed != nil {
+		mergeSweeperCategoryConfig(&config.AlreadyFixed, *partial.AlreadyFixed)
+	}
+	if partial.Unrelated != nil {
+		mergeSweeperCategoryConfig(&config.Unrelated, *partial.Unrelated)
+	}
+	if partial.Superseded != nil {
+		mergeSweeperCategoryConfig(&config.Superseded, *partial.Superseded)
+	}
+	if partial.AbandonedPR != nil {
+		mergeSweeperCategoryConfig(&config.AbandonedPR, *partial.AbandonedPR)
 	}
 }
 
@@ -798,6 +933,66 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			fixer.Triggers = &triggers
 		}
 		cloned.Fixer = &fixer
+	}
+	if configs.Sweeper != nil {
+		sweeper := *configs.Sweeper
+		if configs.Sweeper.Triggers != nil {
+			triggers := *configs.Sweeper.Triggers
+			if triggers.ExcludeLabels != nil {
+				labels := cloneStrings(*triggers.ExcludeLabels)
+				triggers.ExcludeLabels = &labels
+			}
+			if triggers.ExcludeAuthors != nil {
+				authors := cloneStrings(*triggers.ExcludeAuthors)
+				triggers.ExcludeAuthors = &authors
+			}
+			if triggers.ExcludeAuthorAssociations != nil {
+				associations := cloneStrings(*triggers.ExcludeAuthorAssociations)
+				triggers.ExcludeAuthorAssociations = &associations
+			}
+			if triggers.LooperInternalLabels != nil {
+				labels := cloneStrings(*triggers.LooperInternalLabels)
+				triggers.LooperInternalLabels = &labels
+			}
+			sweeper.Triggers = &triggers
+		}
+		if configs.Sweeper.Lifecycle != nil {
+			lifecycle := *configs.Sweeper.Lifecycle
+			sweeper.Lifecycle = &lifecycle
+		}
+		if configs.Sweeper.Limits != nil {
+			limits := *configs.Sweeper.Limits
+			sweeper.Limits = &limits
+		}
+		if configs.Sweeper.Categories != nil {
+			categories := *configs.Sweeper.Categories
+			copyCategory := func(category *PartialSweeperCategoryConfig) *PartialSweeperCategoryConfig {
+				if category == nil {
+					return nil
+				}
+				clonedCategory := *category
+				return &clonedCategory
+			}
+			categories.Stale = copyCategory(configs.Sweeper.Categories.Stale)
+			categories.AlreadyFixed = copyCategory(configs.Sweeper.Categories.AlreadyFixed)
+			categories.Unrelated = copyCategory(configs.Sweeper.Categories.Unrelated)
+			categories.Superseded = copyCategory(configs.Sweeper.Categories.Superseded)
+			categories.AbandonedPR = copyCategory(configs.Sweeper.Categories.AbandonedPR)
+			sweeper.Categories = &categories
+		}
+		if configs.Sweeper.Security != nil {
+			security := *configs.Sweeper.Security
+			if security.NotifyAssignees != nil {
+				assignees := cloneStrings(*security.NotifyAssignees)
+				security.NotifyAssignees = &assignees
+			}
+			sweeper.Security = &security
+		}
+		if configs.Sweeper.Reporting != nil {
+			reporting := *configs.Sweeper.Reporting
+			sweeper.Reporting = &reporting
+		}
+		cloned.Sweeper = &sweeper
 	}
 	return &cloned
 }

@@ -204,6 +204,43 @@ func DefaultConfig(cwd string) (Config, error) {
 					RequireAssigneeCurrentUser: true,
 				},
 			},
+			Sweeper: SweeperRoleConfig{
+				AutoDiscovery: false,
+				DryRun:        true,
+				Triggers: SweeperTriggersConfig{
+					IncludeIssues:             true,
+					IncludePullRequests:       true,
+					IncludeDrafts:             false,
+					ExcludeLabels:             []string{"pinned", "security", "looper:sweep-keep"},
+					ExcludeAuthors:            []string{},
+					ExcludeAuthorAssociations: []string{"OWNER", "MEMBER", "COLLABORATOR"},
+					LooperInternalLabels:      []string{"looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"},
+					ReopenCooldownDays:        30,
+					MaxPerTick:                10,
+				},
+				Lifecycle: SweeperLifecycleConfig{
+					PendingLabel: "looper:sweep-pending",
+					ClosedLabel:  "looper:swept",
+					KeepLabel:    "looper:sweep-keep",
+				},
+				Limits: SweeperLimitsConfig{
+					MaxWarningsPerRepoPerDay: 25,
+					MaxClosesPerRepoPerDay:   25,
+					GlobalKillSwitch:         false,
+				},
+				Categories: SweeperCategoriesConfig{
+					Stale:        SweeperCategoryConfig{Enabled: true, InactivityDays: 90, GracePeriodDays: 7, MinConfidence: 70},
+					AlreadyFixed: SweeperCategoryConfig{Enabled: true, GracePeriodDays: 7, MinConfidence: 80},
+					Unrelated:    SweeperCategoryConfig{Enabled: false, GracePeriodDays: 7, MinConfidence: 90},
+					Superseded:   SweeperCategoryConfig{Enabled: true, GracePeriodDays: 7, MinConfidence: 85},
+					AbandonedPR:  SweeperCategoryConfig{Enabled: true, InactivityDays: 30, GracePeriodDays: 7, MinConfidence: 75},
+				},
+				Security: SweeperSecurityConfig{
+					QuarantineLabel: "looper:sweeper-route-security",
+					NotifyAssignees: []string{},
+				},
+				Reporting: SweeperReportingConfig{DurableReportsDir: ""},
+			},
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

@@ -351,11 +351,72 @@ type FixerRoleConfig struct {
 	Instructions  string                  `json:"instructions,omitempty"`
 }
 
+type SweeperCategoryConfig struct {
+	Enabled         bool `json:"enabled"`
+	InactivityDays  int  `json:"inactivityDays,omitempty"`
+	GracePeriodDays int  `json:"gracePeriodDays"`
+	MinConfidence   int  `json:"minConfidence"`
+}
+
+type SweeperTriggersConfig struct {
+	IncludeIssues             bool     `json:"includeIssues"`
+	IncludePullRequests       bool     `json:"includePullRequests"`
+	IncludeDrafts             bool     `json:"includeDrafts"`
+	ExcludeLabels             []string `json:"excludeLabels"`
+	ExcludeAuthors            []string `json:"excludeAuthors"`
+	ExcludeAuthorAssociations []string `json:"excludeAuthorAssociations"`
+	LooperInternalLabels      []string `json:"looperInternalLabels"`
+	ReopenCooldownDays        int      `json:"reopenCooldownDays"`
+	MaxPerTick                int      `json:"maxPerTick"`
+}
+
+type SweeperLimitsConfig struct {
+	MaxWarningsPerRepoPerDay int  `json:"maxWarningsPerRepoPerDay"`
+	MaxClosesPerRepoPerDay   int  `json:"maxClosesPerRepoPerDay"`
+	GlobalKillSwitch         bool `json:"globalKillSwitch"`
+}
+
+type SweeperSecurityConfig struct {
+	QuarantineLabel string   `json:"quarantineLabel"`
+	NotifyAssignees []string `json:"notifyAssignees"`
+}
+
+type SweeperReportingConfig struct {
+	DurableReportsDir string `json:"durableReportsDir"`
+}
+
+type SweeperLifecycleConfig struct {
+	PendingLabel string `json:"pendingLabel"`
+	ClosedLabel  string `json:"closedLabel"`
+	KeepLabel    string `json:"keepLabel"`
+}
+
+type SweeperCategoriesConfig struct {
+	Stale        SweeperCategoryConfig `json:"stale"`
+	AlreadyFixed SweeperCategoryConfig `json:"alreadyFixed"`
+	Unrelated    SweeperCategoryConfig `json:"unrelated"`
+	Superseded   SweeperCategoryConfig `json:"superseded"`
+	AbandonedPR  SweeperCategoryConfig `json:"abandonedPR"`
+}
+
+type SweeperRoleConfig struct {
+	AutoDiscovery bool                    `json:"autoDiscovery"`
+	DryRun        bool                    `json:"dryRun"`
+	Triggers      SweeperTriggersConfig   `json:"triggers"`
+	Lifecycle     SweeperLifecycleConfig  `json:"lifecycle"`
+	Limits        SweeperLimitsConfig     `json:"limits"`
+	Categories    SweeperCategoriesConfig `json:"categories"`
+	Security      SweeperSecurityConfig   `json:"security"`
+	Reporting     SweeperReportingConfig  `json:"reporting"`
+	Instructions  string                  `json:"instructions,omitempty"`
+}
+
 type RoleConfigs struct {
 	Planner  PlannerRoleConfig  `json:"planner"`
 	Reviewer ReviewerRoleConfig `json:"reviewer"`
 	Fixer    FixerRoleConfig    `json:"fixer"`
 	Worker   WorkerRoleConfig   `json:"worker"`
+	Sweeper  SweeperRoleConfig  `json:"sweeper"`
 }
 
 type ProjectRefConfig struct {
@@ -582,6 +643,54 @@ type PartialFixerRoleTriggersConfig struct {
 	LabelMode     *LabelMode         `json:"labelMode,omitempty"`
 }
 
+type PartialSweeperCategoryConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	InactivityDays  *int  `json:"inactivityDays,omitempty"`
+	GracePeriodDays *int  `json:"gracePeriodDays,omitempty"`
+	MinConfidence   *int  `json:"minConfidence,omitempty"`
+}
+
+type PartialSweeperTriggersConfig struct {
+	IncludeIssues             *bool     `json:"includeIssues,omitempty"`
+	IncludePullRequests       *bool     `json:"includePullRequests,omitempty"`
+	IncludeDrafts             *bool     `json:"includeDrafts,omitempty"`
+	ExcludeLabels             *[]string `json:"excludeLabels,omitempty"`
+	ExcludeAuthors            *[]string `json:"excludeAuthors,omitempty"`
+	ExcludeAuthorAssociations *[]string `json:"excludeAuthorAssociations,omitempty"`
+	LooperInternalLabels      *[]string `json:"looperInternalLabels,omitempty"`
+	ReopenCooldownDays        *int      `json:"reopenCooldownDays,omitempty"`
+	MaxPerTick                *int      `json:"maxPerTick,omitempty"`
+}
+
+type PartialSweeperLimitsConfig struct {
+	MaxWarningsPerRepoPerDay *int  `json:"maxWarningsPerRepoPerDay,omitempty"`
+	MaxClosesPerRepoPerDay   *int  `json:"maxClosesPerRepoPerDay,omitempty"`
+	GlobalKillSwitch         *bool `json:"globalKillSwitch,omitempty"`
+}
+
+type PartialSweeperSecurityConfig struct {
+	QuarantineLabel *string   `json:"quarantineLabel,omitempty"`
+	NotifyAssignees *[]string `json:"notifyAssignees,omitempty"`
+}
+
+type PartialSweeperReportingConfig struct {
+	DurableReportsDir *string `json:"durableReportsDir,omitempty"`
+}
+
+type PartialSweeperLifecycleConfig struct {
+	PendingLabel *string `json:"pendingLabel,omitempty"`
+	ClosedLabel  *string `json:"closedLabel,omitempty"`
+	KeepLabel    *string `json:"keepLabel,omitempty"`
+}
+
+type PartialSweeperCategoriesConfig struct {
+	Stale        *PartialSweeperCategoryConfig `json:"stale,omitempty"`
+	AlreadyFixed *PartialSweeperCategoryConfig `json:"alreadyFixed,omitempty"`
+	Unrelated    *PartialSweeperCategoryConfig `json:"unrelated,omitempty"`
+	Superseded   *PartialSweeperCategoryConfig `json:"superseded,omitempty"`
+	AbandonedPR  *PartialSweeperCategoryConfig `json:"abandonedPR,omitempty"`
+}
+
 type PartialPlannerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
@@ -607,11 +716,24 @@ type PartialFixerRoleConfig struct {
 	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
+type PartialSweeperRoleConfig struct {
+	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
+	DryRun        *bool                           `json:"dryRun,omitempty"`
+	Triggers      *PartialSweeperTriggersConfig   `json:"triggers,omitempty"`
+	Lifecycle     *PartialSweeperLifecycleConfig  `json:"lifecycle,omitempty"`
+	Limits        *PartialSweeperLimitsConfig     `json:"limits,omitempty"`
+	Categories    *PartialSweeperCategoriesConfig `json:"categories,omitempty"`
+	Security      *PartialSweeperSecurityConfig   `json:"security,omitempty"`
+	Reporting     *PartialSweeperReportingConfig  `json:"reporting,omitempty"`
+	Instructions  *string                         `json:"instructions,omitempty"`
+}
+
 type PartialRoleConfigs struct {
 	Planner  *PartialPlannerRoleConfig  `json:"planner,omitempty"`
 	Reviewer *PartialReviewerRoleConfig `json:"reviewer,omitempty"`
 	Fixer    *PartialFixerRoleConfig    `json:"fixer,omitempty"`
 	Worker   *PartialWorkerRoleConfig   `json:"worker,omitempty"`
+	Sweeper  *PartialSweeperRoleConfig  `json:"sweeper,omitempty"`
 }
 
 type PartialConfig struct {

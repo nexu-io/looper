@@ -247,6 +247,80 @@
             "authorFilter": "current_user"
           }
         },
+        "sweeper": {
+          "autoDiscovery": false,
+          "dryRun": true,
+          "triggers": {
+            "includeIssues": true,
+            "includePullRequests": true,
+            "includeDrafts": false,
+            "excludeLabels": [
+              "pinned",
+              "security",
+              "looper:sweep-keep"
+            ],
+            "excludeAuthors": [],
+            "excludeAuthorAssociations": [
+              "OWNER",
+              "MEMBER",
+              "COLLABORATOR"
+            ],
+            "looperInternalLabels": [
+              "looper:plan",
+              "looper:worker-ready",
+              "looper:spec-reviewing",
+              "looper:swept"
+            ],
+            "reopenCooldownDays": 30,
+            "maxPerTick": 10
+          },
+          "lifecycle": {
+            "pendingLabel": "looper:sweep-pending",
+            "closedLabel": "looper:swept",
+            "keepLabel": "looper:sweep-keep"
+          },
+          "limits": {
+            "maxWarningsPerRepoPerDay": 25,
+            "maxClosesPerRepoPerDay": 25,
+            "globalKillSwitch": false
+          },
+          "categories": {
+            "stale": {
+              "enabled": true,
+              "inactivityDays": 90,
+              "gracePeriodDays": 7,
+              "minConfidence": 70
+            },
+            "alreadyFixed": {
+              "enabled": true,
+              "gracePeriodDays": 7,
+              "minConfidence": 80
+            },
+            "unrelated": {
+              "enabled": false,
+              "gracePeriodDays": 7,
+              "minConfidence": 90
+            },
+            "superseded": {
+              "enabled": true,
+              "gracePeriodDays": 7,
+              "minConfidence": 85
+            },
+            "abandonedPR": {
+              "enabled": true,
+              "inactivityDays": 30,
+              "gracePeriodDays": 7,
+              "minConfidence": 75
+            }
+          },
+          "security": {
+            "quarantineLabel": "looper:sweeper-route-security",
+            "notifyAssignees": []
+          },
+          "reporting": {
+            "durableReportsDir": ""
+          }
+        },
         "worker": {
           "autoDiscovery": true,
           "triggers": {

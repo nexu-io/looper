@@ -189,6 +189,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	validateSweeperRoleConfig(config.Roles.Sweeper, "roles.sweeper", &issues)
 	if config.Roles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 	} else if config.Roles.Reviewer.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) {
@@ -238,6 +239,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if effectiveProjectRoles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+		}
+		if project.Roles != nil && project.Roles.Sweeper != nil {
+			validateSweeperRoleConfig(effectiveProjectRoles.Sweeper, prefix+".roles.sweeper", &issues)
 		}
 	}
 
@@ -329,6 +333,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
 		}
 	}
+	if roles.Sweeper != nil {
+		validateProjectRoleInstruction(prefix+".sweeper.instructions", "sweeper", roles.Sweeper.Instructions, maxInstructionBytes, issues)
+	}
 }
 
 func validateProjectRoleInstruction(path, role string, text *string, maxBytes int, issues *[]ValidationIssue) {
@@ -377,6 +384,7 @@ func roleInstructions(roles RoleConfigs) []roleInstruction {
 		{role: "worker", text: roles.Worker.Instructions},
 		{role: "reviewer", text: roles.Reviewer.Instructions},
 		{role: "fixer", text: roles.Fixer.Instructions},
+		{role: "sweeper", text: roles.Sweeper.Instructions},
 	}
 }
 
@@ -390,6 +398,8 @@ func roleInstructionText(roles RoleConfigs, role string) string {
 		return roles.Reviewer.Instructions
 	case "fixer":
 		return roles.Fixer.Instructions
+	case "sweeper":
+		return roles.Sweeper.Instructions
 	default:
 		return ""
 	}
@@ -397,7 +407,7 @@ func roleInstructionText(roles RoleConfigs, role string) string {
 
 func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
 	if !isValidInstructionRole(role) {
-		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer, sweeper"})
 	}
 	if maxBytes > 0 && len([]byte(text)) > maxBytes {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
@@ -419,7 +429,7 @@ func validateAggregateInstructionBytes(path, globalText, projectText string, max
 
 func isValidInstructionRole(role string) bool {
 	switch role {
-	case "planner", "worker", "reviewer", "fixer":
+	case "planner", "worker", "reviewer", "fixer", "sweeper":
 		return true
 	default:
 		return false
@@ -615,6 +625,168 @@ func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, is
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
 		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]ValidationIssue) {
+	validateStringList(config.Triggers.ExcludeLabels, path+".triggers.excludeLabels", issues)
+	validateStringList(config.Triggers.ExcludeAuthors, path+".triggers.excludeAuthors", issues)
+	validateStringList(config.Triggers.LooperInternalLabels, path+".triggers.looperInternalLabels", issues)
+	validateStringList(config.Security.NotifyAssignees, path+".security.notifyAssignees", issues)
+	validateSweeperAssociations(config.Triggers.ExcludeAuthorAssociations, path+".triggers.excludeAuthorAssociations", issues)
+
+	if config.Triggers.MaxPerTick <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.maxPerTick", Message: "must be a positive integer"})
+	}
+	if config.Triggers.ReopenCooldownDays <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.reopenCooldownDays", Message: "must be a positive integer"})
+	}
+	if config.AutoDiscovery && !config.Triggers.IncludeIssues && !config.Triggers.IncludePullRequests {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.includeIssues", Message: "includeIssues and includePullRequests cannot both be false when sweeper autoDiscovery is enabled"})
+	}
+	if config.Limits.MaxWarningsPerRepoPerDay < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".limits.maxWarningsPerRepoPerDay", Message: "must be greater than or equal to 0"})
+	}
+	if config.Limits.MaxClosesPerRepoPerDay < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".limits.maxClosesPerRepoPerDay", Message: "must be greater than or equal to 0"})
+	}
+
+	validateSweeperLabel(config.Lifecycle.PendingLabel, path+".lifecycle.pendingLabel", issues)
+	validateSweeperLabel(config.Lifecycle.ClosedLabel, path+".lifecycle.closedLabel", issues)
+	validateSweeperLabel(config.Lifecycle.KeepLabel, path+".lifecycle.keepLabel", issues)
+	validateSweeperLabel(config.Security.QuarantineLabel, path+".security.quarantineLabel", issues)
+	validateDistinctLabels([]labelPathValue{
+		{Path: path + ".lifecycle.pendingLabel", Value: config.Lifecycle.PendingLabel},
+		{Path: path + ".lifecycle.closedLabel", Value: config.Lifecycle.ClosedLabel},
+		{Path: path + ".lifecycle.keepLabel", Value: config.Lifecycle.KeepLabel},
+		{Path: path + ".security.quarantineLabel", Value: config.Security.QuarantineLabel},
+	}, issues)
+	validateNoLabelOverlap(
+		[]labelPathValue{
+			{Path: path + ".lifecycle.pendingLabel", Value: config.Lifecycle.PendingLabel},
+			{Path: path + ".lifecycle.closedLabel", Value: config.Lifecycle.ClosedLabel},
+			{Path: path + ".security.quarantineLabel", Value: config.Security.QuarantineLabel},
+		},
+		config.Triggers.ExcludeLabels,
+		path+".triggers.excludeLabels",
+		issues,
+	)
+
+	validateSweeperCategory(config.Categories.Stale, path+".categories.stale", true, issues)
+	validateSweeperCategory(config.Categories.AlreadyFixed, path+".categories.alreadyFixed", false, issues)
+	validateSweeperCategory(config.Categories.Unrelated, path+".categories.unrelated", false, issues)
+	validateSweeperCategory(config.Categories.Superseded, path+".categories.superseded", false, issues)
+	validateSweeperCategory(config.Categories.AbandonedPR, path+".categories.abandonedPR", true, issues)
+}
+
+type labelPathValue struct {
+	Path  string
+	Value string
+}
+
+func validateSweeperCategory(config SweeperCategoryConfig, path string, requiresInactivity bool, issues *[]ValidationIssue) {
+	if requiresInactivity && config.Enabled && config.InactivityDays <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".inactivityDays", Message: "must be a positive integer when category is enabled"})
+	}
+	if config.GracePeriodDays <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".gracePeriodDays", Message: "must be a positive integer"})
+	}
+	if config.MinConfidence < 0 || config.MinConfidence > 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minConfidence", Message: "must be between 0 and 100"})
+	}
+}
+
+func validateSweeperLabel(value, path string, issues *[]ValidationIssue) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a non-empty string"})
+		return
+	}
+	if value != trimmed {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
+	}
+}
+
+func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) {
+	seen := map[string]string{}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label.Value)
+		if trimmed == "" {
+			continue
+		}
+		if firstPath, ok := seen[trimmed]; ok {
+			*issues = append(*issues, ValidationIssue{Path: label.Path, Message: fmt.Sprintf("duplicates %s", firstPath)})
+			continue
+		}
+		seen[trimmed] = label.Path
+	}
+}
+
+func validateNoLabelOverlap(labels []labelPathValue, excluded []string, excludePath string, issues *[]ValidationIssue) {
+	excludedSet := map[string]struct{}{}
+	for _, label := range excluded {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		excludedSet[trimmed] = struct{}{}
+	}
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label.Value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := excludedSet[trimmed]; ok {
+			*issues = append(*issues, ValidationIssue{Path: excludePath, Message: fmt.Sprintf("must not contain lifecycle/security label %q configured at %s", trimmed, label.Path)})
+		}
+	}
+}
+
+func validateSweeperAssociations(values []string, path string, issues *[]ValidationIssue) {
+	allowed := map[string]struct{}{
+		"OWNER": {}, "MEMBER": {}, "COLLABORATOR": {}, "CONTRIBUTOR": {},
+		"FIRST_TIME_CONTRIBUTOR": {}, "FIRST_TIMER": {}, "MANNEQUIN": {}, "NONE": {},
+	}
+	seen := map[string]struct{}{}
+	for index, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must be a non-empty string"})
+			continue
+		}
+		if value != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
+			continue
+		}
+		if _, ok := allowed[value]; !ok {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must be one of: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN, NONE"})
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("contains duplicate value: %s", value)})
+			continue
+		}
+		seen[value] = struct{}{}
+	}
+}
+
+func validateStringList(values []string, path string, issues *[]ValidationIssue) {
+	seen := map[string]struct{}{}
+	for index, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must be a non-empty string"})
+			continue
+		}
+		if value != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("contains duplicate value: %s", value)})
+			continue
+		}
+		seen[value] = struct{}{}
 	}
 }
 
