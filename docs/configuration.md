@@ -225,6 +225,8 @@ Supervision applies only to the `looperd` daemon lifecycle. Looper does not supe
 
 - `foreground` (default): starts `looperd` as a detached background process. This mode writes `~/.looper/looperd.pid` and `~/.looper/looperd.state.json`, but it is not actively supervised and will not automatically restart after a crash, logout, or reboot.
 - `launchd`: on macOS, installs and bootstraps a user LaunchAgent for `looperd`. This mode can restart according to `daemon.restartPolicy` and can start again at login through launchd. On non-macOS platforms it returns an actionable unsupported-platform error.
+- `systemd`: on Linux, creates `~/.config/systemd/user/looperd.service` and manages lifecycle via `systemctl --user`. On non-Linux platforms it returns an actionable error.
+- `windows-service`: on Windows, registers `looperd` as a Windows Service via `sc.exe`. On non-Windows platforms it returns an actionable error.
 
 Restart options:
 
@@ -333,8 +335,8 @@ If these are omitted, `looperd` tries to detect them from `PATH`. Startup valida
 
 ### `daemon`
 
-- `mode`: `foreground` or `launchd`
-- `restartPolicy`: `never`, `on-failure`, or `always`; applies to supervised modes such as `launchd`
+- `mode`: `foreground`, `launchd` (macOS), `systemd` (Linux), or `windows-service` (Windows)
+- `restartPolicy`: `never`, `on-failure`, or `always`; applies to supervised modes
 - `restartThrottleSeconds`: positive supervisor restart throttle in seconds
 - `plistPath`: optional macOS user LaunchAgent plist path for `launchd` mode
 - `logDir`: daemon log directory
@@ -342,7 +344,7 @@ If these are omitted, `looperd` tries to detect them from `PATH`. Startup valida
 - `workingDirectory`: working directory used by the daemon
 - `environment`: reserved daemon environment map; currently part of the config surface, but not a primary user-facing runtime control in the documented flow
 
-`foreground` starts a detached process only and does not survive crashes or reboot. `launchd` is the supported supervised mode on macOS; unsupported platforms return an actionable error instead of silently falling back.
+`foreground` starts a detached process only and does not survive crashes or reboot. Supervised modes (`launchd`, `systemd`, `windows-service`) provide automatic restart and lifecycle management on their respective platforms; unsupported platforms return an actionable error instead of silently falling back.
 
 Defaults:
 

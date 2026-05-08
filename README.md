@@ -52,7 +52,7 @@ It contains a one-shot, step-by-step flow (preflight → install → bootstrap �
 
 ### For humans
 
-Fast path (macOS / Linux):
+#### macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
@@ -62,12 +62,37 @@ looper project add /path/to/your/local/repo
 
 `bootstrap` interactively writes your config, installs the managed daemon, and starts `looperd`. Use `--yes` only for scripts or other non-interactive installs.
 
+#### Windows
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.ps1 | iex
+looper bootstrap
+looper project add C:\path\to\your\local\repo
+```
+
+#### Manual (any platform)
+
+Download the matching binaries from the [latest GitHub release](https://github.com/nexu-io/looper/releases/latest):
+
+| Binary | File pattern |
+|---|---|
+| `looper` CLI | `looper-{goos}-{goarch}` (or `.tar.gz`) |
+| `looperd` daemon | `looperd-{goos}-{goarch}` (or `.tar.gz`) |
+
+Supported targets: `darwin-arm64`, `darwin-amd64`, `linux-amd64`, `linux-arm64`, `windows-amd64`, `windows-arm64`.
+
+Place both binaries on your `PATH` (`/usr/local/bin`, `~/.local/bin`, or a directory of your choice), then run:
+
+```bash
+looper bootstrap
+```
+
 `/path/to/your/local/repo` means the local git checkout you want Looper to watch — the directory that contains that repo's `.git` folder, not a GitHub URL. For example:
 
 ```bash
-looper project add ~/src/my-app
-# or, from inside the repo:
-looper project add .
+looper project add ~/src/my-app          # macOS / Linux
+looper project add C:\Users\me\src\my-app # Windows
 ```
 
 Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
@@ -207,8 +232,8 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 - `looperd` fails fast on invalid config; runtime paths must be writable
 - The managed daemon binary lives at `~/.looper/bin/looperd` (Unix) or `%APPDATA%\Looper\bin\looperd.exe` (Windows)
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
-- Default daemon mode is `foreground` on all platforms; set `--daemon-mode systemd` (Linux), `--daemon-mode launchd` (macOS), or `--daemon-mode windows-service` (Windows) for supervised lifecycle
-- macOS: `notifications.osascript.enabled` defaults to `true`; `osascript` must resolve on startup
-- Linux: `notifications.notify-send` is auto-detected; `systemctl --user` is required for systemd supervision
-- Windows: PowerShell toast notifications; `sc.exe` is required for Windows Service supervision
+- Default daemon mode is `foreground` on all platforms; set `--daemon-mode launchd` (macOS), `--daemon-mode systemd` (Linux), or `--daemon-mode windows-service` (Windows) for supervised lifecycle
+- macOS notifications use `osascript` (enabled by default); Linux uses `notify-send` (auto-detected); Windows uses PowerShell toast notifications
+- Linux: `systemctl --user` is required for systemd supervision
+- Windows: `sc.exe` is required for Windows Service supervision
 - Automation is poll-driven, not webhook-driven — keep `looperd` running and `gh` installed and authenticated for the loop to fire

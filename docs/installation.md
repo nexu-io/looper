@@ -33,22 +33,64 @@ This document contains the detailed install, upgrade, uninstall, and source-buil
 
 Looper uses Go binaries as the default supported implementation.
 
-The quickest first-time setup is:
+### Quick install
+
+Pick your platform:
+
+#### macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 ```
 
+#### Windows
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.ps1 | iex
+looper bootstrap --yes --project-path C:\path\to\repo --agent-vendor opencode
+```
+
 `looper bootstrap` creates an initial config, installs or reuses the managed daemon, optionally registers a project, and starts the daemon.
 
 ### Install the CLI manually
 
-1. Download the matching `looper` release artifact for your platform from GitHub Releases.
-2. Rename it to `looper` (or `looper.exe` on Windows) if needed.
-3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
+GitHub Releases publish standalone Go binaries (and `.tar.gz` archives with SHA-256 checksums) for both `looper` and `looperd` on all supported platforms.
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on all supported platforms.
+**Download URLs** (replace `vX.Y.Z` with the desired tag or `latest`):
+
+```
+https://github.com/nexu-io/looper/releases/download/vX.Y.Z/looper-{target}
+https://github.com/nexu-io/looper/releases/download/vX.Y.Z/looper-{target}.sha256
+https://github.com/nexu-io/looper/releases/download/vX.Y.Z/looper-{target}.tar.gz
+https://github.com/nexu-io/looper/releases/download/vX.Y.Z/looper-{target}.tar.gz.sha256
+```
+
+Same pattern for `looperd-{target}`.
+
+Supported `{target}` values:
+
+| Target | OS | Architecture |
+|---|---|---|
+| `darwin-arm64` | macOS | Apple Silicon (M1+) |
+| `darwin-amd64` | macOS | Intel |
+| `linux-amd64` | Linux | x86_64 |
+| `linux-arm64` | Linux | ARM64 |
+| `windows-amd64` | Windows | x86_64 |
+| `windows-arm64` | Windows | ARM64 |
+
+**Steps:**
+
+1. Download the matching `looper` and `looperd` artifacts (raw binary or `.tar.gz`) for your platform from [GitHub Releases](https://github.com/nexu-io/looper/releases/latest).
+2. Verify the SHA-256 checksum:
+   ```bash
+   shasum -a 256 -c looper-{target}.sha256    # macOS / Linux
+   certutil -hashfile looper-{target} SHA256   # Windows
+   ```
+3. Place both binaries on your `PATH`:
+   - macOS / Linux: `/usr/local/bin/looper` or `~/.local/bin/looper`
+   - Windows: `%APPDATA%\Looper\bin\looper.exe` (or any directory in `PATH`)
 
 ### Install the daemon manually
 
@@ -202,12 +244,19 @@ The uninstall script removes the CLI binary, the managed daemon binary, and upda
 
 ### Windows
 
-Remove the CLI binary, daemon binary under `%APPDATA%\Looper\bin\`, and the `%APPDATA%\Looper` directory. If the daemon is running as a Windows Service, stop and remove it first:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.ps1 | iex
+```
+
+The uninstall script removes the CLI and daemon binaries, updater state, and asks before deleting config, the SQLite DB, backups, logs, and worktrees. If the daemon is running as a Windows Service, stop and remove it first:
 
 ```powershell
 looper daemon stop --daemon-mode windows-service
 sc.exe delete looperd
 ```
+
+Manual fallback: remove the CLI binary and daemon binary under `%APPDATA%\Looper\bin\`, then delete `%APPDATA%\Looper`.
 
 ## From source
 

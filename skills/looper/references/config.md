@@ -240,13 +240,15 @@ Supervision applies only to `looperd` lifecycle. Looper does not supervise arbit
 `daemon.mode` values:
 
 - `foreground` (default): starts `looperd` as a detached background process. It writes pid/state files but is not actively supervised and will not automatically restart after crash, logout, or reboot.
-- `launchd`: on macOS, installs and bootstraps a user LaunchAgent. It can restart according to `daemon.restartPolicy` and start at login. Unsupported platforms return an actionable error.
+- `launchd`: on macOS, installs and bootstraps a user LaunchAgent. It can restart according to `daemon.restartPolicy` and start at login. Non-macOS platforms return an actionable error.
+- `systemd`: on Linux, creates `~/.config/systemd/user/looperd.service` and uses `systemctl --user` for lifecycle management. Non-Linux platforms return an actionable error.
+- `windows-service`: on Windows, registers `looperd` as a Windows Service via `sc.exe`. Non-Windows platforms return an actionable error.
 
 Restart options:
 
 - `daemon.restartPolicy`: `never`, `on-failure`, or `always` (default `on-failure`).
 - `daemon.restartThrottleSeconds`: positive integer throttle, default `10`.
-- `daemon.plistPath`: optional macOS LaunchAgent plist path. Default: `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist`.
+- `daemon.plistPath`: optional macOS LaunchAgent plist path. Default: `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist`. Only applies to `launchd` mode.
 
 Runtime diagnostics:
 

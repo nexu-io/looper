@@ -4,19 +4,33 @@ This skill is for end-user Looper operation. Prefer the installed `looper` CLI a
 
 ## Install and uninstall
 
-Install Looper with the script shown in the project README:
+Pick the install command for the detected platform:
 
+**macOS / Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 ```
 
-Uninstall Looper with:
+**Windows (PowerShell):**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.ps1 | iex
+```
 
+Uninstall:
+
+**macOS / Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.sh | sh
 ```
 
-The uninstall script removes the CLI binary, managed daemon binary, and updater state. It asks before deleting config, database, backups, logs, and worktrees.
+**Windows (PowerShell):**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.ps1 | iex
+```
+
+The uninstall scripts remove the CLI binary, managed daemon binary, and updater state. They ask before deleting config, database, backups, logs, and worktrees.
 
 ## Installed CLI checks
 
@@ -38,7 +52,11 @@ Before bootstrap:
 - Confirm the target repo path is absolute and points to a Git repository.
 - Confirm the intended `agent.vendor` (for example `opencode`).
 - Check `gh auth status` and ensure `git`/`gh` resolve in the environment that will run `looperd`.
-- If `git` or `gh` are missing, ask before installing them. On macOS with Homebrew, the usual repair is `brew install git gh`; otherwise use the user's OS/package manager.
+- If `git` or `gh` are missing, ask before installing them. Common install commands:
+  - **macOS**: `brew install git gh`
+  - **Linux (Debian/Ubuntu)**: `sudo apt install git gh`
+  - **Linux (Fedora)**: `sudo dnf install git gh`
+  - **Windows**: `winget install Git.Git GitHub.cli`
 - Ask before using `--yes`; bootstrap may create config, install or reuse the managed daemon, register a project, and start the daemon.
 - If `~/.looper/config.json` already exists, inspect targeted fields first and avoid overwriting user configuration.
 

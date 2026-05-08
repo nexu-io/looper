@@ -37,12 +37,15 @@ Use this when the user wants Looper installed, configured, and running end-to-en
 
 ### Step 0 — Preflight (read-only)
 
-Looper currently supports macOS (`darwin-arm64`) only. Stop and ask the user how to proceed if the host is not macOS:
+Looper supports macOS (`darwin-arm64`, `darwin-amd64`), Linux (`linux-amd64`, `linux-arm64`), and Windows (`windows-amd64`, `windows-arm64`).
+
+Detect the platform to pick the correct install path:
 
 ```bash
 case "$(uname -s)" in
-  Darwin) ;;
-  *) echo "Looper supports macOS only; stop and confirm with the user before continuing." >&2 ;;
+  Darwin)  platform="macos" ;;
+  Linux)   platform="linux" ;;
+  *)       platform="windows" ;;
 esac
 ```
 
@@ -52,14 +55,13 @@ Then check required tools:
 command -v git
 command -v gh
 gh auth status
-command -v osascript   # required if osascript notifications stay enabled
 ```
 
-If `git` or `gh` are missing, ask the user before installing them. On macOS with Homebrew:
+If `git` or `gh` are missing, ask the user before installing them:
 
-```bash
-brew install git gh
-```
+- **macOS** (Homebrew): `brew install git gh`
+- **Linux** (apt): `sudo apt install git gh`
+- **Windows** (winget): `winget install Git.Git GitHub.cli`
 
 If `gh auth status` is not authenticated, ask the user to run `gh auth login`.
 
@@ -102,12 +104,22 @@ Save the resolved absolute path (if any) for Step 4. See [`references/cli.md`](r
 
 ### Step 3 — Install the `looper` CLI
 
+Pick the install command for the detected platform:
+
+**macOS / Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 looper --version
 ```
 
-If `looper --version` fails, do not guess a new install location. The installer controls placement; the typical fix is a `PATH` problem in the user's shell. Determine where `install.sh` placed the binary, then ask the user whether to add that directory to their shell's `PATH` (e.g. by editing `~/.zshrc`).
+**Windows (PowerShell):**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+irm https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.ps1 | iex
+looper --version
+```
+
+If `looper --version` fails, do not guess a new install location. The installer controls placement; the typical fix is a `PATH` problem in the user's shell. Determine where the installer placed the binary, then ask the user whether to add that directory to their shell's `PATH` (e.g. by editing `~/.zshrc` on Unix, or restarting the shell on Windows).
 
 ### Step 4 — Bootstrap config, daemon, and first project
 
@@ -196,7 +208,7 @@ looper logs <id> --follow
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `tools.gitPath` or `tools.ghPath` could not be resolved | `looperd` cannot find binaries in its env | Set explicit `tools.gitPath` / `tools.ghPath` in config |
-| `tools.osascriptPath is required when osascript notifications are enabled` | macOS notifications enabled but `osascript` not resolvable | Set `tools.osascriptPath`, or disable `notifications.osascript.enabled` after confirming |
+| `notifications.osascript.enabled` is true but `osascript` not found | macOS notifications enabled but `osascript` not resolvable | Set `tools.osascriptPath`, or disable `notifications.osascript.enabled` after confirming |
 | `authMode=local-token requires server.localToken` | Token mode without token | Add `server.localToken` and export `LOOPER_TOKEN` for the CLI |
 | `agent.vendor` missing | No agent configured | Set `agent.vendor` to a supported vendor whose CLI is installed locally |
 | Runtime path not writable | `~/.looper/`, `logs/`, `backups/`, or worktree root not writable | Fix ownership/permissions, do not delete data without explicit confirmation |
@@ -209,8 +221,8 @@ For deeper detail, consult these bundled docs before acting:
 
 - [`references/cli.md`](references/cli.md) — installed `looper` CLI commands, install/uninstall scripts, `looper bootstrap`, `looper project add`, daemon lifecycle, loop inspection.
 - [`references/config.md`](references/config.md) — full `~/.looper/config.json` shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
-- [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd integration, log locations, startup-failure triage.
-- [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
+- [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd (macOS) / systemd (Linux) / Windows Service integration, log locations, startup-failure triage.
+- [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, notification tool (`osascript` on macOS, `notify-send` on Linux), `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
 
 When in doubt, prefer read-only checks first:
 
@@ -226,7 +238,7 @@ looper config show
 - Do not overwrite or rewrite `~/.looper/config.json` without explicit user confirmation. Prefer targeted edits.
 - Do not delete runtime artifacts (`~/.looper/looper.sqlite`, `backups/`, `logs/`, `worktrees/`) unless the user explicitly asks and understands the impact.
 - Starting or restarting `looperd` can launch background automation against configured GitHub repositories — confirm intent before doing so.
-- Do not toggle `daemon.mode` (foreground ↔ launchd) without confirming; supervised mode persists across login/reboot.
+- Do not toggle `daemon.mode` (foreground ↔ launchd / systemd / windows-service) without confirming; supervised mode persists across login/reboot.
 - Do not change `reviewer.reviewEvents.clean` from `COMMENT` to `APPROVE` (or `blocking` to `REQUEST_CHANGES`) without explicit user opt-in — this changes how Looper's reviews land on real PRs.
 - Do not overwrite or delete existing `looper:*` labels in user repos without confirmation; they may have local customizations.
 - Never print secrets from config or environment. Redact tokens and API keys as `***` in summaries.
@@ -236,7 +248,7 @@ looper config show
 
 - `cat ~/.looper/config.json` as a first move: use `looper config show` instead and redact secrets.
 - Restarting the daemon under pressure: check status/logs first; restart can re-trigger automation.
-- Disabling `notifications.osascript.enabled` silently: confirm the change or set an explicit `tools.osascriptPath`.
+- Disabling `notifications.osascript.enabled` (macOS) silently: confirm the change or set an explicit `tools.osascriptPath`. On Linux, `notify-send` is auto-detected; on Windows, PowerShell toast notifications are used.
 - Rewriting the whole config for one fix: make targeted edits and preserve existing settings.
 - Treating a missing `~/.looper/` directory as permission to create or delete data: explain impact and ask first.
 - Running smoke tests against production repos: pick low-risk issues only.
