@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -152,6 +153,11 @@ func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
 	}
 	if cmd.Name() == "help" {
 		return true
+	}
+	if cmd.RunE != nil {
+		if reflect.ValueOf(cmd.RunE).Pointer() == reflect.ValueOf(helpCommand).Pointer() {
+			return true
+		}
 	}
 	path := strings.TrimSpace(cmd.CommandPath())
 	return path == "looper" || path == "looper upgrade"

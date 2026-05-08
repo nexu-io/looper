@@ -118,6 +118,35 @@ func TestRootPreRunSkipsAutoUpgradeForBareRootHelp(t *testing.T) {
 	}
 }
 
+func TestRootPreRunSkipsAutoUpgradeForHelpOnlySubcommand(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"daemon"})
+	if exitCode != 0 {
+		t.Fatalf("Run([daemon]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([daemon]) stderr = %q, want empty string", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Usage:\n  looper daemon") {
+		t.Fatalf("Run([daemon]) stdout = %q, want daemon help output", stdout.String())
+	}
+}
+
 func TestVersionNoAutoUpgradeFlagDisablesAutoUpgrade(t *testing.T) {
 	t.Parallel()
 
