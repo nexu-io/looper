@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/powerformer/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/diffanchor"
 )
 
 func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) {

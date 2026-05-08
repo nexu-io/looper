@@ -13,14 +13,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/agent"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/fixer"
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/planner"
-	"github.com/powerformer/looper/internal/reviewer"
-	"github.com/powerformer/looper/internal/storage"
-	"github.com/powerformer/looper/internal/worker"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/fixer"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/reviewer"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worker"
 )
 
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
@@ -50,17 +50,17 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
-	projectMetadata := `{"repo":"powerformer/looper"}`
+	projectMetadata := `{"repo":"nexu-io/looper"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	projectTarget := "project:looper"
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "looper", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("powerformer/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "looper", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("nexu-io/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "looper"
 	loopID := "loop_worker_1"
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("powerformer/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("nexu-io/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
@@ -81,16 +81,16 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	if err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
-	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "looper" || plannerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "looper" || plannerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("planner discover calls = %#v, want stored project discovery", plannerRunner.discoverCalls)
 	}
-	if len(reviewerRunner.discoverCalls) != 1 || reviewerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+	if len(reviewerRunner.discoverCalls) != 1 || reviewerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("reviewer discover calls = %#v, want stored project repo", reviewerRunner.discoverCalls)
 	}
-	if len(fixerRunner.discoverCalls) != 1 || fixerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+	if len(fixerRunner.discoverCalls) != 1 || fixerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("fixer discover calls = %#v, want stored project repo", fixerRunner.discoverCalls)
 	}
-	if len(workerRunner.discoverCalls) != 1 || workerRunner.discoverCalls[0].Repo != "powerformer/looper" {
+	if len(workerRunner.discoverCalls) != 1 || workerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("worker discover calls = %#v, want stored project repo", workerRunner.discoverCalls)
 	}
 	waitForSchedulerCondition(t, func() bool {
@@ -111,17 +111,17 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
-	projectMetadata := `{"repo":"powerformer/looper"}`
+	projectMetadata := `{"repo":"nexu-io/looper"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	projectID := "looper"
 	loopTarget := "project:looper"
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_claim_first", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("powerformer/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_claim_first", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("nexu-io/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	loopID := "loop_worker_claim_first"
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_claim_first", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("powerformer/looper"), DedupeKey: "worker:loop_worker_claim_first", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_claim_first", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("nexu-io/looper"), DedupeKey: "worker:loop_worker_claim_first", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
@@ -287,12 +287,12 @@ func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	projectID := "looper"
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(109)
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -330,12 +330,12 @@ func TestProcessSnapshotQueueItemRetriesTransientPersistenceFailure(t *testing.T
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	projectID := "looper"
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(109)
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_upsert_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_upsert_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -374,12 +374,12 @@ func TestProcessSnapshotQueueItemRetriesTransientProjectLookupFailure(t *testing
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	projectID := "looper"
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(109)
 	if err := setupRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_project_lookup_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_project_lookup_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := setupRepos.Queue.Upsert(context.Background(), queueItem); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -418,12 +418,12 @@ func TestProcessSnapshotQueueItemRetriesTransientCompletionFailure(t *testing.T)
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	projectID := "looper"
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(109)
 	if err := setupRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_complete_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "powerformer/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:powerformer/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_complete_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := setupRepos.Queue.Upsert(context.Background(), queueItem); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -461,12 +461,12 @@ func TestSchedulerAvailableSlotsAccountsForRunningQueueItems(t *testing.T) {
 	baseBranch := "main"
 	projectID := "looper"
 	loopID := "loop_worker_running"
-	projectMetadata := `{"repo":"powerformer/looper"}`
+	projectMetadata := `{"repo":"nexu-io/looper"}`
 	projectTarget := "project:looper"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("powerformer/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("nexu-io/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_running", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project:looper", DedupeKey: "worker:running", Priority: 1, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -492,17 +492,17 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
-	projectMetadata := `{"repo":"powerformer/looper"}`
+	projectMetadata := `{"repo":"nexu-io/looper"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	projectTarget := "project:looper"
 	projectID := "looper"
 	loopID := "loop_worker_1"
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("powerformer/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("nexu-io/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("powerformer/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("nexu-io/looper"), DedupeKey: "worker:loop_worker_1", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
@@ -557,13 +557,13 @@ esac
 	authenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: authenticatedPath, CWD: rootDir})
 	unauthenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: unauthenticatedPath, CWD: rootDir})
 
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for authenticated gh cli")
 	}
-	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "powerformer/looper", rootDir) {
+	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
 	}
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true when gateway can recheck authenticated gh cli without configured path")
 	}
 }
@@ -588,7 +588,7 @@ esac
 
 	logger := &testLogger{}
 	gateway := githubinfra.New(githubinfra.Options{GHPath: scriptPath, CWD: rootDir})
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &scriptPath}}, gateway, logger, "github.example.com/powerformer/looper", rootDir) {
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &scriptPath}}, gateway, logger, "github.example.com/nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for repo host auth")
 	}
 	logBytes, err := os.ReadFile(logPath)

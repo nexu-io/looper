@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestQueueStatsCommandOutputsJSONAndHuman(t *testing.T) {

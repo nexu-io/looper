@@ -12,14 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	looperdapi "github.com/powerformer/looper/internal/api"
-	"github.com/powerformer/looper/internal/bootstrap"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/domain"
-	"github.com/powerformer/looper/internal/eventlog"
-	looperdruntime "github.com/powerformer/looper/internal/runtime"
-	"github.com/powerformer/looper/internal/storage"
-	"github.com/powerformer/looper/internal/version"
+	looperdapi "github.com/nexu-io/looper/internal/api"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func main() {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 const ManifestVersion = 1

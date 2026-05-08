@@ -7,13 +7,13 @@ This skill is for end-user Looper operation. Prefer the installed `looper` CLI a
 Install Looper with the script shown in the project README:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 ```
 
 Uninstall Looper with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.sh | sh
 ```
 
 The uninstall script removes the CLI binary, managed daemon binary, and updater state. It asks before deleting config, database, backups, logs, and worktrees.

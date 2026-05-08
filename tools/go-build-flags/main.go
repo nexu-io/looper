@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func main() {

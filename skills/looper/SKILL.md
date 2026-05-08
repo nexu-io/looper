@@ -47,7 +47,7 @@ npx skills add ./skills/looper
 Or directly from the repository path supported by the skill installer:
 
 ```bash
-npx skills add https://github.com/powerformer/looper/tree/main/skills/looper
+npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
 ```
 
 Verify installation by confirming `looper` appears in the skill installer's list output, then ask the agent to “check looper status” and ensure it invokes this skill.

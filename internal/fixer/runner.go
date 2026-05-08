@@ -13,15 +13,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/agent"
-	"github.com/powerformer/looper/internal/bootstrap"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/eventlog"
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/infra/specpr"
-	"github.com/powerformer/looper/internal/lifecycle"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 const (

@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
+	"github.com/nexu-io/looper/internal/config"
 )
 
 const (
 	daemonStateSchemaVersion = 1
-	launchdLooperdLabel      = "com.powerformer.looper.looperd"
+	launchdLooperdLabel      = "com.nexu-io.looper.looperd"
 )
 
 type daemonLifecycleState struct {

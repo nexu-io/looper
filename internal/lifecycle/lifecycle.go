@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/disclosure"
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 const (

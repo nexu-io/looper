@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/powerformer/looper/internal/agent"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/spf13/cobra"
 )
 

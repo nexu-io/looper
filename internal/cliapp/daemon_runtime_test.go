@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	pkgapi "github.com/powerformer/looper/pkg/api"
+	"github.com/nexu-io/looper/internal/config"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 func TestDaemonStatusJSONFallsBackToBinaryVersion(t *testing.T) {

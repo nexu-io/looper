@@ -5,8 +5,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/powerformer/looper/internal/cliapp"
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/cliapp"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 type contextKey struct{}

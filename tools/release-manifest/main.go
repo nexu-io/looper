@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/release"
+	"github.com/nexu-io/looper/internal/release"
 )
 
 func main() {
@@ -20,7 +20,7 @@ func main() {
 		schemaVersion   = flag.String("schema-version", release.CurrentSchemaVersion(), "storage schema version")
 		minCliForDaemon = flag.String("min-cli-for-daemon", "", "minimum CLI required by daemon")
 		minDaemonForCli = flag.String("min-daemon-for-cli", "", "minimum daemon required by CLI")
-		repo            = flag.String("repo", "powerformer/looper", "GitHub repo owner/name")
+		repo            = flag.String("repo", "nexu-io/looper", "GitHub repo owner/name")
 		assetsDir       = flag.String("assets-dir", "", "release assets directory")
 		output          = flag.String("output", "", "output manifest path")
 		requiredAssets  = flag.String("required-assets", "", "comma-separated required artifact names")

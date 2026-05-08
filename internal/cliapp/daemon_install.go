@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	defaultReleaseOwner = "powerformer"
+	defaultReleaseOwner = "nexu-io"
 	defaultReleaseRepo  = "looper"
 	looperdBinaryName   = "looperd"
 	looperdUserAgent    = "looper-cli"

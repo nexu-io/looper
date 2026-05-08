@@ -246,7 +246,7 @@ Restart options:
 
 - `daemon.restartPolicy`: `never`, `on-failure`, or `always` (default `on-failure`).
 - `daemon.restartThrottleSeconds`: positive integer throttle, default `10`.
-- `daemon.plistPath`: optional macOS LaunchAgent plist path. Default: `~/Library/LaunchAgents/com.powerformer.looper.looperd.plist`.
+- `daemon.plistPath`: optional macOS LaunchAgent plist path. Default: `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist`.
 
 Runtime diagnostics:
 

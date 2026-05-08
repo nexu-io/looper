@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
@@ -80,7 +80,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		DB:         coordinator.DB(),
 		Repos:      repos,
 		Now:        func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) { return "powerformer/looper", nil },
+		DetectRepo: func(context.Context, string) (string, error) { return "nexu-io/looper", nil },
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
 		},
@@ -89,7 +89,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		},
 		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 			capturedAt := now.UTC().Format(time.RFC3339Nano)
-			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: "powerformer/looper", PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
+			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: "nexu-io/looper", PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
 		},
 	}
 
@@ -97,8 +97,8 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.Repo == nil || *result.Repo != "powerformer/looper" {
-		t.Fatalf("AddProject().Repo = %v, want powerformer/looper", result.Repo)
+	if result.Repo == nil || *result.Repo != "nexu-io/looper" {
+		t.Fatalf("AddProject().Repo = %v, want nexu-io/looper", result.Repo)
 	}
 	if result.DiscoveredWorktrees != 2 {
 		t.Fatalf("AddProject().DiscoveredWorktrees = %d, want 2", result.DiscoveredWorktrees)
@@ -117,7 +117,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	if len(worktrees) != 2 {
 		t.Fatalf("len(worktrees) = %d, want 2", len(worktrees))
 	}
-	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, "powerformer/looper", 1)
+	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, "nexu-io/looper", 1)
 	if err != nil {
 		t.Fatalf("PullRequestSnapshots.GetLatest() error = %v", err)
 	}
@@ -133,7 +133,7 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
 	captured := false
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	service := &Service{
 		DB:    coordinator.DB(),
 		Repos: repos,
@@ -175,7 +175,7 @@ func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {
 	coordinator := openCoordinator(t)
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
 		DB:    coordinator.DB(),
@@ -224,7 +224,7 @@ func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T)
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
 	listed := false
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	service := &Service{DB: coordinator.DB(), Repos: repos, Now: time.Now, ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 		listed = true
 		return nil, nil
@@ -260,7 +260,7 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 			return storage.PullRequestSnapshotRecord{}, nil
 		},
 	}
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 
 	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if err != nil {
@@ -301,7 +301,7 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 			return storage.PullRequestSnapshotRecord{}, errors.New("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)")
 		},
 	}
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 
 	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if err != nil {
@@ -351,7 +351,7 @@ func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T
 			return storage.PullRequestSnapshotRecord{}, context.Canceled
 		},
 	}
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 
 	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
@@ -378,7 +378,7 @@ func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.
 			return storage.PullRequestSnapshotRecord{}, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1}}
 		},
 	}
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 
 	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
@@ -475,7 +475,7 @@ func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
 	now := time.Date(2026, time.April, 21, 7, 46, 20, 0, time.UTC)
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	baseBranch := "main"
-	metadata := `{"repo":"powerformer/looper","source":"api"}`
+	metadata := `{"repo":"nexu-io/looper","source":"api"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}

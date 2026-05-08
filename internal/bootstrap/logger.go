@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
+	"github.com/nexu-io/looper/internal/config"
 )
 
 const logFileName = "looperd.log"

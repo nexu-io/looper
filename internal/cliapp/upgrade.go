@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
 

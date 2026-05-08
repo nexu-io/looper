@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/infra/shell"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
 )
 

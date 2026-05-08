@@ -36,7 +36,7 @@ For non-trivial changes, please open an issue first so we can align on scope bef
 ## Getting started
 
 ```bash
-git clone https://github.com/powerformer/looper.git
+git clone https://github.com/nexu-io/looper.git
 cd looper
 go build ./...
 go test ./...

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestResolveSpawnVendorParity(t *testing.T) {
@@ -487,7 +487,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/powerformer/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
 		Repos:  repos,
 		Now: func() time.Time {
 			now = now.Add(10 * time.Millisecond)

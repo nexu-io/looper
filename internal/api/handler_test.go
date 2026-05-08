@@ -18,12 +18,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/bootstrap"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/domain"
-	"github.com/powerformer/looper/internal/projects"
-	looperdruntime "github.com/powerformer/looper/internal/runtime"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/projects"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
@@ -4049,7 +4049,7 @@ func TestActiveRunsDefaultExcludesOlderRunningRunWhenLatestCompleted(t *testing.
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	loopID := "loop_stale_older_running"
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 18, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:powerformer/looper:184"), Repo: stringPtr("powerformer/looper"), PRNumber: int64Ptr(184), Status: "completed", LastRunAt: stringPtr(completedAt), CreatedAt: oldHeartbeat, UpdatedAt: completedAt}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 18, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "completed", LastRunAt: stringPtr(completedAt), CreatedAt: oldHeartbeat, UpdatedAt: completedAt}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_old", LoopID: loopID, Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -4097,7 +4097,7 @@ func TestActiveRunsDefaultFallsBackToRunningLoopWhenRunIsStale(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_no_activity", Seq: 19, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:powerformer/looper:184"), Repo: stringPtr("powerformer/looper"), PRNumber: int64Ptr(184), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_no_activity", Seq: 19, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_no_activity", LoopID: "loop_stale_no_activity", Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -4130,7 +4130,7 @@ func TestActiveRunsDefaultExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_stale", Seq: 20, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:powerformer/looper:184"), Repo: stringPtr("powerformer/looper"), PRNumber: int64Ptr(184), Status: "paused", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_stale", Seq: 20, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "paused", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_stale", LoopID: "loop_paused_stale", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {

@@ -26,7 +26,7 @@ Looper uses Go binaries as the default supported implementation.
 The quickest first-time setup is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 ```
 
@@ -82,7 +82,7 @@ looper daemon logs
 
 Launchd mode:
 
-- creates a user LaunchAgent plist at `~/Library/LaunchAgents/com.powerformer.looper.looperd.plist` unless `daemon.plistPath` is set
+- creates a user LaunchAgent plist at `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist` unless `daemon.plistPath` is set
 - stores launchd stdout/stderr logs under `~/.looper/logs/launchd/`
 - stores startup logs under `~/.looper/logs/startup/`
 - stores lifecycle state in `~/.looper/looperd.state.json`
@@ -144,7 +144,7 @@ Current behavior:
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.sh | sh
 ```
 
 The uninstall script removes the CLI binary, the managed daemon binary, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees.
@@ -154,7 +154,7 @@ The uninstall script removes the CLI binary, the managed daemon binary, and upda
 Clone the repo:
 
 ```bash
-git clone https://github.com/powerformer/looper.git
+git clone https://github.com/nexu-io/looper.git
 cd looper
 ```
 

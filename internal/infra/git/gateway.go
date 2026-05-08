@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"

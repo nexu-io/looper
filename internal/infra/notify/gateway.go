@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/eventlog"
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 const osascriptTimeout = 35 * time.Second

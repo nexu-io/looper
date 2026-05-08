@@ -3,7 +3,7 @@ package version
 import "strings"
 
 const (
-	packageImportPath          = "github.com/powerformer/looper/internal/version"
+	packageImportPath          = "github.com/nexu-io/looper/internal/version"
 	buildVersionEnvVar         = "LOOPER_BUILD_VERSION"
 	buildVersionSourceEnvVar   = "LOOPER_BUILD_VERSION_SOURCE"
 	buildChannelEnvVar         = "LOOPER_BUILD_CHANNEL"

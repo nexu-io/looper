@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/eventlog"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 

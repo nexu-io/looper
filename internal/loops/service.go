@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/domain"
-	"github.com/powerformer/looper/internal/eventlog"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 type Service struct {

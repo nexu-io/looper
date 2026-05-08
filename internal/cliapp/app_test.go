@@ -16,14 +16,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/agent"
-	"github.com/powerformer/looper/internal/api"
-	"github.com/powerformer/looper/internal/config"
-	gitinfra "github.com/powerformer/looper/internal/infra/git"
-	looperdruntime "github.com/powerformer/looper/internal/runtime"
-	"github.com/powerformer/looper/internal/version"
-	"github.com/powerformer/looper/internal/worker"
-	pkgapi "github.com/powerformer/looper/pkg/api"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/api"
+	"github.com/nexu-io/looper/internal/config"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/worker"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 func runApp(t *testing.T, args ...string) (int, string, string) {
@@ -303,8 +303,8 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 	script := strings.Join([]string{
 		"#!/bin/sh",
 		"printf 'agent started\\n'",
-		"printf 'https://github.com/powerformer/looper/issues/42\\n'",
-		"printf 'https://github.com/powerformer/looper/issues/321\\n'",
+		"printf 'https://github.com/nexu-io/looper/issues/42\\n'",
+		"printf 'https://github.com/nexu-io/looper/issues/321\\n'",
 		"printf '%s{\"summary\":\"created issue\"}\\n' \"$LOOPER_COMPLETION_MARKER\"",
 	}, "\n")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
@@ -320,7 +320,7 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([feedback ...]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "https://github.com/powerformer/looper/issues/321\n"; got != want {
+	if got, want := stdout, "https://github.com/nexu-io/looper/issues/321\n"; got != want {
 		t.Fatalf("Run([feedback ...]) stdout = %q, want %q", got, want)
 	}
 
@@ -331,10 +331,10 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([feedback ... --json]) stderr = %q, want empty string", stderr)
 	}
-	assertJSONContains(t, stdout, "repo", "powerformer/looper")
+	assertJSONContains(t, stdout, "repo", "nexu-io/looper")
 	assertJSONContains(t, stdout, "titleHint", "CLI Feedback")
 	assertJSONContains(t, stdout, "message", "Great tool")
-	assertJSONContains(t, stdout, "issueUrl", "https://github.com/powerformer/looper/issues/321")
+	assertJSONContains(t, stdout, "issueUrl", "https://github.com/nexu-io/looper/issues/321")
 	assertJSONContains(t, stdout, "summary", "created issue")
 }
 

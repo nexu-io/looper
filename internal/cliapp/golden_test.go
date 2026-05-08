@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	pkgapi "github.com/powerformer/looper/pkg/api"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 var updateGolden = flag.Bool("update", false, "update CLI golden fixtures")
@@ -130,7 +130,7 @@ func TestCLIGoldenOutputs(t *testing.T) {
 						switch req.URL.String() {
 						case "http://127.0.0.1:4321/api/v1/status":
 							return nil, os.ErrNotExist
-						case "https://api.github.com/repos/powerformer/looper/releases/latest":
+						case "https://api.github.com/repos/nexu-io/looper/releases/latest":
 							return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
 						default:
 							t.Fatalf("unexpected request URL %q", req.URL.String())

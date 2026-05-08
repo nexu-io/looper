@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/powerformer/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/diffanchor"
 )
 
 const nearestReviewAnchorMaxDistance int64 = 3

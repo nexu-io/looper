@@ -1,4 +1,4 @@
-module github.com/powerformer/looper
+module github.com/nexu-io/looper
 
 go 1.22
 

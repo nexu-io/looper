@@ -707,7 +707,7 @@
           "repoPath": "/tmp/repos/looper",
           "baseBranch": "main",
           "archived": false,
-          "repo": "powerformer/looper",
+          "repo": "nexu-io/looper",
           "worktreeRoot": null,
           "createdAt": "2026-04-11T12:00:00.000Z",
           "updatedAt": "2026-04-11T12:00:00.000Z",

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/powerformer/looper/pkg/api"
+	"github.com/nexu-io/looper/pkg/api"
 )
 
 func TestDaemonAPIClientPostSuccessSendsHeadersAndBody(t *testing.T) {

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/powerformer/looper/internal/config"
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
 )
 

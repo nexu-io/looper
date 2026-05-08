@@ -22,7 +22,7 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 		SchemaVersion:     "12",
 		MinCliForDaemon:   "0.2.0",
 		MinDaemonForCli:   "0.2.0",
-		Repo:              "powerformer/looper",
+		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looperd-darwin-arm64"},
 	})
@@ -39,7 +39,7 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 	if manifest.Artifacts["looper-darwin-arm64"].SHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("looper sha = %q, want %q", manifest.Artifacts["looper-darwin-arm64"].SHA256, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	}
-	if manifest.Artifacts["looperd-darwin-arm64"].URL != "https://github.com/powerformer/looper/releases/download/v1.2.3-rc.1/looperd-darwin-arm64" {
+	if manifest.Artifacts["looperd-darwin-arm64"].URL != "https://github.com/nexu-io/looper/releases/download/v1.2.3-rc.1/looperd-darwin-arm64" {
 		t.Fatalf("looperd URL = %q", manifest.Artifacts["looperd-darwin-arm64"].URL)
 	}
 }
@@ -54,7 +54,7 @@ func TestBuildManifestFailsWhenRequiredArtifactMissing(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		Repo:              "powerformer/looper",
+		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looperd-darwin-arm64"},
 	})
@@ -75,7 +75,7 @@ func TestBuildManifestRejectsInvalidTag(t *testing.T) {
 		SchemaVersion:     "0007_agent_execution_run_index",
 		MinCliForDaemon:   "0.2.0",
 		MinDaemonForCli:   "0.2.0",
-		Repo:              "powerformer/looper",
+		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
 	})
@@ -96,7 +96,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 		SchemaVersion:     "0007_agent_execution_run_index",
 		MinCliForDaemon:   "0.2.0",
 		MinDaemonForCli:   "0.2.0",
-		Repo:              "powerformer/looper",
+		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
 	})

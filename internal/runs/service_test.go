@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/domain"
-	loopsvc "github.com/powerformer/looper/internal/loops"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/domain"
+	loopsvc "github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestServiceStartRecordAndCompleteRun(t *testing.T) {

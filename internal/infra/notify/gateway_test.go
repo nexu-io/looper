@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"slices"
 	"syscall"
 
-	"github.com/powerformer/looper/internal/cliapp"
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/cliapp"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func main() {

@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/bootstrap"
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/loops"
-	looperdruntime "github.com/powerformer/looper/internal/runtime"
-	"github.com/powerformer/looper/internal/storage"
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/loops"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {

@@ -9,11 +9,11 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/diffanchor"
-	"github.com/powerformer/looper/internal/disclosure"
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/disclosure"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
 )
 

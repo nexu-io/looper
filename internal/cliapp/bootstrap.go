@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/version"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
 

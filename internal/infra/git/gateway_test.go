@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing.T) {

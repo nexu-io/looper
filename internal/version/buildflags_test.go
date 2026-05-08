@@ -113,7 +113,7 @@ func TestLDFlagsMatchesVersionVariables(t *testing.T) {
 		BuildTimestamp:  "2026-04-17T00:00:00Z",
 	})
 
-	const want = "-X github.com/powerformer/looper/internal/version.Value=1.2.3 -X github.com/powerformer/looper/internal/version.VersionSource=internal/version/version.go -X github.com/powerformer/looper/internal/version.Channel=stable -X github.com/powerformer/looper/internal/version.APIVersion=v1 -X github.com/powerformer/looper/internal/version.MinCliForDaemon=0.2.0 -X github.com/powerformer/looper/internal/version.MinDaemonForCli=0.2.0 -X github.com/powerformer/looper/internal/version.GitCommitSHA=abc123 -X github.com/powerformer/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
+	const want = "-X github.com/nexu-io/looper/internal/version.Value=1.2.3 -X github.com/nexu-io/looper/internal/version.VersionSource=internal/version/version.go -X github.com/nexu-io/looper/internal/version.Channel=stable -X github.com/nexu-io/looper/internal/version.APIVersion=v1 -X github.com/nexu-io/looper/internal/version.MinCliForDaemon=0.2.0 -X github.com/nexu-io/looper/internal/version.MinDaemonForCli=0.2.0 -X github.com/nexu-io/looper/internal/version.GitCommitSHA=abc123 -X github.com/nexu-io/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
 	if ldflags != want {
 		t.Fatalf("LDFlags(...) = %q, want %q", ldflags, want)
 	}

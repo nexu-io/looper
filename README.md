@@ -1,6 +1,6 @@
 # Looper
 
-[![CI](https://github.com/powerformer/looper/actions/workflows/ci.yml/badge.svg)](https://github.com/powerformer/looper/actions/workflows/ci.yml)
+[![CI](https://github.com/nexu-io/looper/actions/workflows/ci.yml/badge.svg)](https://github.com/nexu-io/looper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
 
@@ -70,7 +70,7 @@ Looper is poll-driven, not webhook-driven: keep `looperd` running and `gh` authe
 Fast path (macOS, `darwin-arm64`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powerformer/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
 looper bootstrap
 looper project add /path/to/your/local/repo
 ```
@@ -189,7 +189,7 @@ npx skills add ./skills/looper
 Or install it directly from GitHub:
 
 ```bash
-npx skills add https://github.com/powerformer/looper/tree/main/skills/looper
+npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
 ```
 
 See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/domain"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestServiceCreateAndPauseResumeLoop(t *testing.T) {

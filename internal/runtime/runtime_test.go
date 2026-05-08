@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	githubinfra "github.com/powerformer/looper/internal/infra/github"
-	"github.com/powerformer/looper/internal/infra/shell"
-	"github.com/powerformer/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
@@ -1029,9 +1029,9 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(186)
-	targetID := "pr:powerformer/looper:186"
+	targetID := "pr:nexu-io/looper:186"
 	loopID := "loop_mismatched_agent_running"
 	runID := "run_mismatched_agent_running"
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1121,9 +1121,9 @@ func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(186)
-	targetID := "pr:powerformer/looper:186"
+	targetID := "pr:nexu-io/looper:186"
 	loopID := "loop_active_agent_running"
 	runID := "run_active_agent_running"
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1510,7 +1510,7 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	repoPath := workingDir + "/repo"
-	existingMetadata := `{"repo":"powerformer/looper","worktreeRoot":"/tmp/old","source":"config"}`
+	existingMetadata := `{"repo":"nexu-io/looper","worktreeRoot":"/tmp/old","source":"config"}`
 	baseBranch := "main"
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
 		ID:           "project_1",
@@ -1543,7 +1543,7 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 	if project == nil || project.MetadataJSON == nil {
 		t.Fatal("project metadata missing after sync")
 	}
-	const want = `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	const want = `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}`
 	if *project.MetadataJSON != want {
 		t.Fatalf("project.MetadataJSON = %q, want %q", *project.MetadataJSON, want)
 	}
@@ -1643,9 +1643,9 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "powerformer/looper"
+	repo := "nexu-io/looper"
 	prNumber := int64(184)
-	targetID := "pr:powerformer/looper:184"
+	targetID := "pr:nexu-io/looper:184"
 	loopID := "loop_recovery_old_running"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 184, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: oldISO, UpdatedAt: completedISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1710,9 +1710,9 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 			if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
 			}
-			repo := "powerformer/looper"
+			repo := "nexu-io/looper"
 			prNumber := int64(184)
-			targetID := "pr:powerformer/looper:184"
+			targetID := "pr:nexu-io/looper:184"
 			loopID := "loop_recovery_stale_latest"
 			if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 185, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: tt.loopStatus, CreatedAt: oldISO, UpdatedAt: heartbeatISO}); err != nil {
 				t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1721,7 +1721,7 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 				t.Fatalf("Runs.Upsert() error = %v", err)
 			}
 			if tt.hasActiveQueue {
-				if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_stale_latest", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_recovery_stale_latest:powerformer/looper:184", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_stale_latest", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_recovery_stale_latest:nexu-io/looper:184", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 					t.Fatalf("Queue.Upsert() error = %v", err)
 				}
 			}
@@ -2200,7 +2200,7 @@ func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.
 	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
-	existingMetadata := `{"extra":"value","repo":"powerformer/looper","worktreeRoot":"/tmp/old","source":"config"}`
+	existingMetadata := `{"extra":"value","repo":"nexu-io/looper","worktreeRoot":"/tmp/old","source":"config"}`
 	repoPath := "/tmp/repo"
 	project := config.ProjectRefConfig{ID: "project_1", Name: "Looper", RepoPath: repoPath}
 	createdAt := "2026-04-16T12:00:00.000Z"
@@ -2225,7 +2225,7 @@ func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.
 		t.Fatalf("Projects.GetByID() = %#v, want metadata", stored)
 	}
 
-	const want = `{"extra":"value","repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	const want = `{"extra":"value","repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}`
 	if *stored.MetadataJSON != want {
 		t.Fatalf("project.MetadataJSON = %q, want %q", *stored.MetadataJSON, want)
 	}

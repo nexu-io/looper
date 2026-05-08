@@ -20,14 +20,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/powerformer/looper/internal/config"
-	"github.com/powerformer/looper/internal/domain"
-	"github.com/powerformer/looper/internal/eventlog"
-	"github.com/powerformer/looper/internal/projects"
-	looperdruntime "github.com/powerformer/looper/internal/runtime"
-	"github.com/powerformer/looper/internal/storage"
-	"github.com/powerformer/looper/internal/version"
-	pkgapi "github.com/powerformer/looper/pkg/api"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/projects"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 const (

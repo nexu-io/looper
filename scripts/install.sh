@@ -2,7 +2,7 @@
 
 set -eu
 
-OWNER="${LOOPER_GITHUB_OWNER:-powerformer}"
+OWNER="${LOOPER_GITHUB_OWNER:-nexu-io}"
 REPO="${LOOPER_GITHUB_REPO:-looper}"
 VERSION="${LOOPER_VERSION:-latest}"
 
