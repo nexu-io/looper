@@ -38,6 +38,74 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
 - 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI to drive it. `looper ps`, `looper logs`, `looper stop` — no hosted control plane.
 
+## Quick start
+
+### For agents
+
+If you're an AI coding agent (Claude Code, OpenCode, Codex, Cursor, etc.) helping a user set up Looper, fetch and follow the install + configure tutorial in the bundled skill:
+
+```
+https://github.com/nexu-io/looper/blob/main/skills/looper/SKILL.md
+```
+
+It contains a one-shot, step-by-step flow (preflight → install → bootstrap → vendor credentials → verify → first loop) plus a troubleshooting matrix. Confirm destructive steps with the user before running them.
+
+### For humans
+
+Fast path (macOS, `darwin-arm64`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+looper bootstrap
+looper project add /path/to/your/local/repo
+```
+
+`bootstrap` interactively writes your config, installs the managed daemon, and starts `looperd`. Use `--yes` only for scripts or other non-interactive installs.
+
+`/path/to/your/local/repo` means the local git checkout you want Looper to watch — the directory that contains that repo's `.git` folder, not a GitHub URL. For example:
+
+```bash
+looper project add ~/src/my-app
+# or, from inside the repo:
+looper project add .
+```
+
+Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
+
+Once `looper status` succeeds and `gh auth status` shows an authenticated account, drive loops manually:
+
+```bash
+# plan a spec from an issue
+looper plan --project <id> --issue <num>
+
+# review a PR — one-shot, or keep looping as new commits land
+looper review <owner>/<repo>#<pr>
+looper review <owner>/<repo>#<pr> --loop
+
+# implement from an issue (reuses planner's spec PR if one exists)
+looper work --project <id> --issue <num>
+```
+
+Inside a registered repo, `--project` is usually optional for `review` and `work`, and you can drop the `<owner>/<repo>` prefix on PR refs. Pass them explicitly from outside the repo or when multiple projects could match.
+
+The full workflow — label conventions, assignment rules, how planner / reviewer / fixer / worker hand off — is in **[docs/users-guide.md](docs/users-guide.md)**.
+
+## Agent skill
+
+Looper includes an installable agent skill for setup, status, config, daemon lifecycle, and troubleshooting guidance:
+
+```bash
+npx skills add ./skills/looper
+```
+
+Or install it directly from GitHub:
+
+```bash
+npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
+```
+
+See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.
+
 ## How it works
 
 The four loops above are the conceptual model. Here's the GitHub label state machine `looperd` actually drives:
@@ -64,50 +132,6 @@ issue (looper:plan, assigned)
 Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
 Looper is poll-driven, not webhook-driven: keep `looperd` running and `gh` authenticated for the loop to fire. Everything runs locally — no hosted control plane required.
-
-## Install
-
-Fast path (macOS, `darwin-arm64`):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
-looper bootstrap
-looper project add /path/to/your/local/repo
-```
-
-`bootstrap` interactively writes your config, installs the managed daemon, and starts `looperd`. Use `--yes` only for scripts or other non-interactive installs.
-
-`/path/to/your/local/repo` means the local git checkout you want Looper to watch — the directory that contains that repo's `.git` folder, not a GitHub URL. For example:
-
-```bash
-looper project add ~/src/my-app
-# or, from inside the repo:
-looper project add .
-```
-
-Add each repo you want Looper to watch after bootstrap.
-
-Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
-
-## Quick start
-
-Once `looper status` succeeds and `gh auth status` shows an authenticated account:
-
-```bash
-# plan a spec from an issue
-looper plan --project <id> --issue <num>
-
-# review a PR — one-shot, or keep looping as new commits land
-looper review <owner>/<repo>#<pr>
-looper review <owner>/<repo>#<pr> --loop
-
-# implement from an issue (reuses planner's spec PR if one exists)
-looper work --project <id> --issue <num>
-```
-
-Inside a registered repo, `--project` is usually optional for `review` and `work`, and you can drop the `<owner>/<repo>` prefix on PR refs. Pass them explicitly from outside the repo or when multiple projects could match.
-
-The full workflow — label conventions, assignment rules, how planner / reviewer / fixer / worker hand off — is in **[docs/users-guide.md](docs/users-guide.md)**.
 
 ## Command cheatsheet
 
@@ -177,22 +201,6 @@ go test ./...
 ```
 
 Build artifacts go to `dist/` and are gitignored — don't edit generated files.
-
-## Agent skill
-
-Looper includes an installable agent skill for setup, status, config, daemon lifecycle, and troubleshooting guidance:
-
-```bash
-npx skills add ./skills/looper
-```
-
-Or install it directly from GitHub:
-
-```bash
-npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
-```
-
-See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.
 
 ## Runtime notes
 

@@ -1,82 +1,242 @@
 ---
 name: looper
-description: Use when configuring, starting, checking, or troubleshooting looper, looperd, ~/.looper config, or runtime paths; when setting up Looper for agents; or when diagnosing status, logs, osascript, git, gh, writable path, or daemon startup issues.
+description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, or cursor-cli; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
 ---
 
 # Looper
 
-Use this skill when an agent needs to configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).
+Use this skill when an agent needs to install, configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).
 
-## Quick start for agents
+**When NOT to use this skill:** developing on the Looper codebase itself (Go sources at `cmd/`, `internal/`, `pkg/`). For that, follow `AGENTS.md` and standard Go tooling.
 
-1. Read the relevant reference before acting:
-   - `references/cli.md` for installation, uninstall, and installed CLI workflows.
-   - `references/config.md` before reading or changing `~/.looper/config.json`.
-   - `references/daemon.md` before starting, stopping, or debugging `looperd`.
-2. Prefer read-only checks first:
+## Looper in one paragraph
 
-   ```bash
-   looper status
-   looper daemon status
-   looper daemon status --json
-   ```
+Looper is a local daemon (`looperd`) that polls GitHub and runs four agent loops in their own git worktrees. Each loop is gated by GitHub labels:
 
-3. For local environment diagnostics, run the bundled read-only helper:
+| Role | Default discovery | Hands off via |
+| --- | --- | --- |
+| 🧭 **Planner** | Open issues with `looper:plan`, assigned to current user | Opens spec PR labeled `looper:spec-reviewing` |
+| 🔍 **Reviewer** | PRs where current user is review-requested, plus `looper:spec-reviewing` follow-up | A clean review on a `looper:spec-reviewing` PR promotes it to `looper:spec-ready` |
+| 🔧 **Fixer** | Open non-draft PRs authored by current user with actionable threads | Pushes fixes; reviewer re-runs |
+| 🚢 **Worker** | Open issues with `looper:worker-ready` (assigned), or PRs labeled `looper:spec-ready` | Implements on the same PR until checks pass |
 
-   ```bash
-   bash scripts/check.sh
-   ```
+All trigger fields combine with logical AND; empty label lists mean "no label constraint." Triggers are customizable per role and per project — see [`references/config.md`](references/config.md) for the full schema, validation rules, and override examples.
 
-## Quick reference
+Manual loop starts always work, even when `roles.<role>.autoDiscovery=false`:
 
-| Situation | Use |
+```bash
+looper plan   --project <id> --issue <num>
+looper review <owner>/<repo>#<pr> [--loop]
+looper work   --project <id> --issue <num>
+looper loop start --type fixer --pr <owner>/<repo>#<pr>
+```
+
+## One-shot install and configuration
+
+Use this when the user wants Looper installed, configured, and running end-to-end. Confirm each destructive step before running it (config writes, daemon start, project add).
+
+### Step 0 — Preflight (read-only)
+
+Looper currently supports macOS (`darwin-arm64`) only. Stop and ask the user how to proceed if the host is not macOS:
+
+```bash
+case "$(uname -s)" in
+  Darwin) ;;
+  *) echo "Looper supports macOS only; stop and confirm with the user before continuing." >&2 ;;
+esac
+```
+
+Then check required tools:
+
+```bash
+command -v git
+command -v gh
+gh auth status
+command -v osascript   # required if osascript notifications stay enabled
+```
+
+If `git` or `gh` are missing, ask the user before installing them. On macOS with Homebrew:
+
+```bash
+brew install git gh
+```
+
+If `gh auth status` is not authenticated, ask the user to run `gh auth login`.
+
+For deeper preflight detail, see [`references/daemon.md`](references/daemon.md).
+
+### Step 1 — Detect available agent vendors
+
+Auto-detect installed agent CLIs in parallel before asking:
+
+| `agent.vendor` | Detect with |
 | --- | --- |
-| Need install, uninstall, bootstrap, project registration, or CLI commands | `references/cli.md` |
-| Need to inspect or edit config | `references/config.md` |
-| Need daemon startup, status, logs, or restart help | `references/daemon.md` |
-| Need read-only local diagnostics | `scripts/check.sh` |
+| `claude-code` | `command -v claude` |
+| `codex` | `command -v codex` |
+| `opencode` | `command -v opencode` |
+| `cursor-cli` | `command -v cursor-agent` |
 
-## Install this skill
+Use the `question` tool to let the user pick one. List detected vendors first, marked `(installed)`, with undetected ones appended as `(not installed — needs setup)`. If multiple are installed, do not impose an opinionated default — present them in detection order and let the user choose.
 
-From a checkout of this repository, users can add the skill with:
+If none are installed, ask the user which one they want to install before continuing; do not proceed to bootstrap with a vendor whose CLI is missing.
+
+After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `cursor-agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
+
+Looper inherits the vendor's own authentication (e.g. `claude login`, `cursor-agent login`, or env vars in the user's shell). **Do not** store agent credentials in `~/.looper/config.json`.
+
+### Step 2 — Pick the first project to watch
+
+Use the `question` tool with exactly these three options:
+
+1. **Use the current directory** — "Register the repo at the current working directory (must be a git checkout)."
+2. **Enter a project path** — "Provide an absolute path to a local git repository on disk."
+3. **Skip for now** — "Bootstrap Looper without a project; add one later with `looper project add`."
+
+Resolution rules per choice — bind the user-provided path to a shell variable (e.g. `REPO=...`) so it does not collide with `$PATH`:
+
+- **Current directory**: `REPO="$(git -C "$PWD" rev-parse --show-toplevel)"`. If `git` errors, the directory is not a git repo — fall back to asking for an explicit path.
+- **Project path**: validate the path is absolute and contains a `.git` entry: `test -d "$REPO/.git" || test -f "$REPO/.git"` (the file form supports git worktrees). Reject relative paths and ask again.
+- **Skip for now**: continue to Step 3 with no `--project-path` flag.
+
+Save the resolved absolute path (if any) for Step 4. See [`references/cli.md`](references/cli.md) for `looper project add` semantics.
+
+### Step 3 — Install the `looper` CLI
 
 ```bash
-npx skills add ./skills/looper
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+looper --version
 ```
 
-Or directly from the repository path supported by the skill installer:
+If `looper --version` fails, do not guess a new install location. The installer controls placement; the typical fix is a `PATH` problem in the user's shell. Determine where `install.sh` placed the binary, then ask the user whether to add that directory to their shell's `PATH` (e.g. by editing `~/.zshrc`).
+
+### Step 4 — Bootstrap config, daemon, and first project
+
+`looper bootstrap` writes `~/.looper/config.json`, installs the managed daemon to `~/.looper/bin/looperd`, optionally registers a project, and starts `looperd`.
+
+**If `~/.looper/config.json` already exists, do NOT pass `--yes`.** Inspect first with `looper config show`, then triage by what is missing or wrong:
+
+| Existing-config state | Action |
+| --- | --- |
+| Config exists, daemon healthy, no projects yet | Run `looper project add` for the chosen path; skip bootstrap |
+| Config exists with wrong/missing `agent.vendor` | Targeted edit to `agent.vendor` after confirming with the user |
+| Config exists, daemon unhealthy | Triage with `looper daemon status` and `looper daemon logs --startup` first; do not re-bootstrap blindly |
+| Config exists and is correct | Skip bootstrap; go to Step 5 verification |
+
+When the config does not yet exist and you have the user's selections from Steps 1–2:
 
 ```bash
-npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
+# With a project path from Step 2
+looper bootstrap --yes \
+  --project-path "$REPO" \
+  --agent-vendor "<selected-vendor>"
+
+# Skipped project in Step 2
+looper bootstrap --yes \
+  --agent-vendor "<selected-vendor>"
 ```
 
-Verify installation by confirming `looper` appears in the skill installer's list output, then ask the agent to “check looper status” and ensure it invokes this skill.
+If the user prefers to drive bootstrap themselves: `looper bootstrap` (interactive). See [`references/cli.md`](references/cli.md) for every supported flag.
+
+### Step 5 — Verify the install
+
+Run all of these and report the results. Do not restart the daemon if status is healthy.
+
+```bash
+looper status
+looper daemon status
+looper daemon logs --startup
+looper config show
+looper project list
+```
+
+The bundled diagnostic helper is read-only and safe to run; invoke it via its absolute skill path (it is not on `PATH`):
+
+```bash
+bash <skill-bundle>/scripts/check.sh
+```
+
+Replace `<skill-bundle>` with the actual install location of this skill (commonly under `~/.claude/skills/looper/` or wherever the skill installer placed it). If the path is unknown, skip the helper and rely on the `looper`/`gh` checks above.
+
+A healthy install shows:
+
+- `looper status` reports daemon running and config valid.
+- `looper daemon status` shows a PID, recent start time, no `last error`.
+- `looper config show` lists the expected `agent.vendor` and projects.
+- `looper project list` lists every repo the user expects.
+- `gh auth status` is authenticated for those repos.
+
+If `server.authMode` is `local-token`, the user needs to export the token in their shell before running CLI commands:
+
+```bash
+export LOOPER_TOKEN="<value-of-server.localToken>"
+```
+
+For daemon log layout and supervised vs detached mode, see [`references/daemon.md`](references/daemon.md).
+
+### Step 6 — Add additional projects (optional)
+
+```bash
+looper project add /absolute/path/to/repo --id <stable-id> --repo <owner>/<repo>
+```
+
+Always prefer absolute paths and confirm the GitHub slug (`owner/repo`) before running.
+
+### Step 7 — First loop (smoke test)
+
+Suggest a smoke test only after explicit confirmation, since this triggers automation against the user's GitHub repo. **Pick a non-production repo and a low-risk issue the user is happy to plan.** Do not run smoke tests against critical production workflows.
+
+```bash
+looper plan --project <id> --issue <num>
+looper ps
+looper logs <id> --follow
+```
+
+### Common install failures
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `tools.gitPath` or `tools.ghPath` could not be resolved | `looperd` cannot find binaries in its env | Set explicit `tools.gitPath` / `tools.ghPath` in config |
+| `tools.osascriptPath is required when osascript notifications are enabled` | macOS notifications enabled but `osascript` not resolvable | Set `tools.osascriptPath`, or disable `notifications.osascript.enabled` after confirming |
+| `authMode=local-token requires server.localToken` | Token mode without token | Add `server.localToken` and export `LOOPER_TOKEN` for the CLI |
+| `agent.vendor` missing | No agent configured | Set `agent.vendor` to a supported vendor whose CLI is installed locally |
+| Runtime path not writable | `~/.looper/`, `logs/`, `backups/`, or worktree root not writable | Fix ownership/permissions, do not delete data without explicit confirmation |
+| Daemon binary missing | `~/.looper/bin/looperd` not installed | `looper daemon install --force`, then `looper daemon start` |
+| `looper --version` not found | Installer placed binary outside `PATH` | Identify install dir, ask user to add it to shell `PATH` |
+
+## References
+
+For deeper detail, consult these bundled docs before acting:
+
+- [`references/cli.md`](references/cli.md) — installed `looper` CLI commands, install/uninstall scripts, `looper bootstrap`, `looper project add`, daemon lifecycle, loop inspection.
+- [`references/config.md`](references/config.md) — full `~/.looper/config.json` shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
+- [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd integration, log locations, startup-failure triage.
+- [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
+
+When in doubt, prefer read-only checks first:
+
+```bash
+looper status
+looper daemon status --json
+looper daemon logs --startup
+looper config show
+```
 
 ## Safety rules
 
-- Do not overwrite or rewrite `~/.looper/config.json` without explicit user confirmation.
+- Do not overwrite or rewrite `~/.looper/config.json` without explicit user confirmation. Prefer targeted edits.
 - Do not delete runtime artifacts (`~/.looper/looper.sqlite`, `backups/`, `logs/`, `worktrees/`) unless the user explicitly asks and understands the impact.
-- Starting or restarting `looperd` can launch background automation against configured GitHub repositories; confirm intent before doing so.
-- Prefer `looper daemon status`, `looper daemon logs`, and `scripts/check.sh` before making changes.
-- Never print secrets from config or environment. Redact tokens and API keys in summaries.
+- Starting or restarting `looperd` can launch background automation against configured GitHub repositories — confirm intent before doing so.
+- Do not toggle `daemon.mode` (foreground ↔ launchd) without confirming; supervised mode persists across login/reboot.
+- Do not change `reviewer.reviewEvents.clean` from `COMMENT` to `APPROVE` (or `blocking` to `REQUEST_CHANGES`) without explicit user opt-in — this changes how Looper's reviews land on real PRs.
+- Do not overwrite or delete existing `looper:*` labels in user repos without confirmation; they may have local customizations.
+- Never print secrets from config or environment. Redact tokens and API keys as `***` in summaries.
+- Prefer `looper daemon status`, `looper daemon logs`, and the read-only checks above before making changes.
 
 ## Common mistakes
 
-- Starting with `cat ~/.looper/config.json`: use targeted inspection and redact secrets instead.
-- Restarting immediately under pressure: check status/logs first and confirm because automation may run.
+- `cat ~/.looper/config.json` as a first move: use `looper config show` instead and redact secrets.
+- Restarting the daemon under pressure: check status/logs first; restart can re-trigger automation.
 - Disabling `notifications.osascript.enabled` silently: confirm the change or set an explicit `tools.osascriptPath`.
 - Rewriting the whole config for one fix: make targeted edits and preserve existing settings.
-- Treating missing `~/.looper/` as permission to create/delete data: explain the impact and ask first.
-
-## Core facts
-
-- Default config path: `~/.looper/config.json`.
-- Config precedence: defaults → config file → environment → CLI flags.
-- Default runtime artifacts live under `~/.looper/`.
-- `looperd` fails fast on config-validation errors and requires writable runtime paths.
-- Tool paths for `git`, `gh`, and `osascript` are auto-detected unless explicitly configured.
-- If `notifications.osascript.enabled` is true, `osascript` must resolve or startup fails.
-
-## Diagnostic helper
-
-`scripts/check.sh` is read-only and deterministic. It checks required tools (`git`, `gh`), `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. It exits nonzero only for missing required tools, an unset `HOME`, or unwritable runtime paths.
+- Treating a missing `~/.looper/` directory as permission to create or delete data: explain impact and ask first.
+- Running smoke tests against production repos: pick low-risk issues only.
