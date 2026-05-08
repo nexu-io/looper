@@ -134,6 +134,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 
+	if strings.TrimSpace(config.Package.Distribution) == "" {
+		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
+	}
+
 	if config.Defaults.BaseBranch == "" {
 		issues = append(issues, ValidationIssue{Path: "defaults.baseBranch", Message: "must be a non-empty string"})
 	}

@@ -41,6 +41,7 @@ Flags:
   --json                      Emit JSON output
   --log-dir <path>            Daemon log directory
   --looper-path <path>        Looper CLI path
+  --no-auto-upgrade           Disable automatic upgrade checks for this command
   --no-custom-instructions    Disable custom instructions for debugging
   --osascript-path <path>     osascript binary path
   --planner-agent-timeout-seconds <seconds> Planner agent execution timeout

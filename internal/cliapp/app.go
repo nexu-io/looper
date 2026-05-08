@@ -427,6 +427,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	})
 
 	addFlags(root.PersistentFlags(), globalFlags())
+	root.PersistentPreRunE = runtime.maybeRunAutoUpgrade
 	root.SetOut(a.stdout())
 	root.SetErr(a.stderr())
 	if a.deps.Stdin != nil {
@@ -577,6 +578,7 @@ func collectFlags(flagSet *pflag.FlagSet) []string {
 func globalFlags() []flagSpec {
 	return []flagSpec{
 		boolFlag("json", "Emit JSON output"),
+		boolFlag("no-auto-upgrade", "Disable automatic upgrade checks for this command"),
 		stringFlag("config", "path", "Config path"),
 		stringFlag("host", "host", "Server host"),
 		stringFlag("port", "port", "Server port"),
@@ -648,6 +650,7 @@ func (a *App) stderr() io.Writer {
 
 var configFlagNames = map[string]struct{}{
 	"config":                                {},
+	"no-auto-upgrade":                       {},
 	"host":                                  {},
 	"port":                                  {},
 	"db-path":                               {},
@@ -674,6 +677,7 @@ var configFlagNames = map[string]struct{}{
 }
 
 var configBoolFlagNames = map[string]struct{}{
+	"no-auto-upgrade":        {},
 	"no-custom-instructions": {},
 }
 

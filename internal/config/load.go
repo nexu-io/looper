@@ -221,6 +221,21 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				}
 			}
 			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+		case matchesFlag(arg, "--no-auto-upgrade"):
+			disable := true
+			if _, value, ok := strings.Cut(arg, "="); ok {
+				parsedValue, err := parseBoolean(value)
+				if err != nil {
+					return parsedCLIArgs{}, fmt.Errorf("invalid value for --no-auto-upgrade: %q is not a boolean", value)
+				}
+				disable = *parsedValue
+			} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+				if parsedValue, err := parseBoolean(args[index+1]); err == nil {
+					disable = *parsedValue
+					index++
+				}
+			}
+			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
 		case matchesFlag(arg, "--host"):
 			value, nextIndex, err := takeValue(index, "--host")
 			if err != nil {
@@ -602,6 +617,13 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_AUTO_UPGRADE_ENABLED"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_AUTO_UPGRADE_ENABLED: %q is not a boolean", value)
+		}
+		ensurePackageConfig(&overrides).AutoUpgradeEnabled = parsed
+	}
 	if err := applyAgentTimeoutEnvOverrides(&overrides, lookupEnv); err != nil {
 		return PartialConfig{}, err
 	}
@@ -957,6 +979,14 @@ func ensureDaemonConfig(partial *PartialConfig) *PartialDaemonConfig {
 	}
 
 	return partial.Daemon
+}
+
+func ensurePackageConfig(partial *PartialConfig) *PartialPackageConfig {
+	if partial.Package == nil {
+		partial.Package = &PartialPackageConfig{}
+	}
+
+	return partial.Package
 }
 
 func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {

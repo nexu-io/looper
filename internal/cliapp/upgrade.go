@@ -11,10 +11,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
+
+const (
+	autoUpgradeStateSchemaVersion = 1
+	autoUpgradeCheckInterval      = 24 * time.Hour
+)
+
+type autoUpgradeState struct {
+	SchemaVersion int        `json:"schemaVersion"`
+	LastCheckedAt *time.Time `json:"lastCheckedAt,omitempty"`
+}
 
 type upgradeCheckSummary struct {
 	CLI    upgradeCLISummary    `json:"cli"`
@@ -91,6 +102,180 @@ type cliUpgradeRefusedError struct {
 
 func (e *cliUpgradeRefusedError) Error() string {
 	return e.message
+}
+
+func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) error {
+	_ = args
+	if shouldSkipAutoUpgrade(cmd) {
+		return nil
+	}
+	execPath, err := r.executablePath()
+	if err != nil {
+		return nil
+	}
+	if detectCLIInstallSource(execPath) != cliInstallSourceRelease {
+		return nil
+	}
+
+	loaded, err := r.loadConfig()
+	if err != nil {
+		return nil
+	}
+	if !loaded.Config.Package.AutoUpgradeEnabled {
+		return nil
+	}
+
+	statePath, err := r.resolveAutoUpgradeStatePath()
+	if err != nil {
+		return nil
+	}
+	state, err := r.readAutoUpgradeState(statePath)
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade skipped: read state: %v\n", err)
+		return nil
+	}
+	if !shouldRunAutoUpgradeCheck(state, time.Now()) {
+		return nil
+	}
+
+	autoCmd := newAutoUpgradeCommand(cmd)
+	r.runAutoUpgrade(autoCmd)
+	if err := r.writeAutoUpgradeState(statePath, autoUpgradeState{LastCheckedAt: timePtr(time.Now())}); err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+	}
+	return nil
+}
+
+func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return true
+	}
+	if cmd.Name() == "help" {
+		return true
+	}
+	path := strings.TrimSpace(cmd.CommandPath())
+	return path == "looper upgrade"
+}
+
+func newAutoUpgradeCommand(parent *cobra.Command) *cobra.Command {
+	cmd := &cobra.Command{}
+	if parent != nil {
+		cmd.SetContext(parent.Context())
+		cmd.SetOut(parent.ErrOrStderr())
+		cmd.SetErr(parent.ErrOrStderr())
+	}
+	return cmd
+}
+
+func (r *commandRuntime) runAutoUpgrade(cmd *cobra.Command) {
+	cliOutput, cliErr := r.upgradeCLIWithOutput(cmd, false)
+	if cliErr != nil {
+		var refused *cliUpgradeRefusedError
+		if errors.As(cliErr, &refused) {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: CLI skipped: %s\n", refused.message)
+		} else {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: CLI check failed: %v\n", cliErr)
+		}
+	} else if cliOutput.Changed {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: upgraded looper %s → %s\n", cliOutput.CurrentVersion, cliOutput.LatestVersion)
+	}
+
+	managedDaemon, err := r.readManagedUpgradeDaemonVersion(cmd.Context())
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon check failed: %v\n", err)
+		return
+	}
+	if managedDaemon == nil {
+		return
+	}
+
+	statusPayload, statusErr := r.currentDaemonStatusPayload(cmd.Context())
+	if statusErr != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon status check failed: %v\n", statusErr)
+		return
+	}
+	pathDaemon, pathErr := r.readPathUpgradeDaemonVersion(cmd.Context())
+	if pathErr != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon path version check failed: %v\n", pathErr)
+		return
+	}
+	runningDaemon := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
+
+	daemonOutput, daemonErr := r.upgradeDaemonWithOutput(cmd, false)
+	if daemonErr != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon check failed: %v\n", daemonErr)
+		return
+	}
+	if !daemonOutput.Changed {
+		return
+	}
+
+	if daemonOutput.PreviousVersion != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: installed looperd %s → %s\n", *daemonOutput.PreviousVersion, daemonOutput.LatestVersion)
+	} else {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: installed looperd %s\n", daemonOutput.LatestVersion)
+	}
+	if len(statusPayload) > 0 && runningDaemon != nil && runningDaemon.Source == "installed-binary" && runningDaemon.Version != daemonOutput.LatestVersion {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: looperd %s is installed on disk, but the running daemon is still %s. Run `looper daemon restart`.\n", daemonOutput.LatestVersion, runningDaemon.Version)
+	}
+}
+
+func (r *commandRuntime) resolveAutoUpgradeStatePath() (string, error) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".looper", "auto-upgrade.state.json"), nil
+}
+
+func (r *commandRuntime) readAutoUpgradeState(path string) (*autoUpgradeState, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var state autoUpgradeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, fmt.Errorf("decode auto-upgrade state: %w", err)
+	}
+	if state.SchemaVersion != 0 && state.SchemaVersion != autoUpgradeStateSchemaVersion {
+		return nil, fmt.Errorf("unsupported auto-upgrade state schemaVersion %d", state.SchemaVersion)
+	}
+	return &state, nil
+}
+
+func (r *commandRuntime) writeAutoUpgradeState(path string, state autoUpgradeState) error {
+	state.SchemaVersion = autoUpgradeStateSchemaVersion
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func shouldRunAutoUpgradeCheck(state *autoUpgradeState, now time.Time) bool {
+	if state == nil || state.LastCheckedAt == nil {
+		return true
+	}
+	return now.Sub(*state.LastCheckedAt) >= autoUpgradeCheckInterval
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
 }
 
 func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {

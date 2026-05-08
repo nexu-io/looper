@@ -124,6 +124,63 @@ func TestDaemonStatusJSONUsesAPIVersionAndBinaryPath(t *testing.T) {
 	assertJSONContains(t, stdout.String(), "daemonBinaryPath", "/opt/looper/bin/looperd")
 }
 
+func TestDaemonUpgradePendingRestart(t *testing.T) {
+	t.Parallel()
+
+	managedPath := "/tmp/.looper/bin/looperd"
+	otherPath := "/usr/local/bin/looperd"
+	for _, tc := range []struct {
+		name        string
+		lifecycle   daemonLifecycleStatus
+		running     *daemonVersionState
+		managed     *daemonVersionState
+		wantPending bool
+		wantVersion string
+	}{
+		{
+			name:        "running with different managed version",
+			lifecycle:   daemonLifecycleStatus{Process: "running"},
+			running:     &daemonVersionState{Version: "0.2.0", BinaryPath: stringPtr(managedPath)},
+			managed:     &daemonVersionState{Version: "0.3.0", BinaryPath: stringPtr(managedPath)},
+			wantPending: true,
+			wantVersion: "0.3.0",
+		},
+		{
+			name:        "stopped process",
+			lifecycle:   daemonLifecycleStatus{Process: "stopped"},
+			running:     &daemonVersionState{Version: "0.2.0", BinaryPath: stringPtr(managedPath)},
+			managed:     &daemonVersionState{Version: "0.3.0", BinaryPath: stringPtr(managedPath)},
+			wantPending: false,
+		},
+		{
+			name:        "mismatched binary paths",
+			lifecycle:   daemonLifecycleStatus{Process: "running"},
+			running:     &daemonVersionState{Version: "0.2.0", BinaryPath: stringPtr(otherPath)},
+			managed:     &daemonVersionState{Version: "0.3.0", BinaryPath: stringPtr(managedPath)},
+			wantPending: false,
+		},
+		{
+			name:        "same version",
+			lifecycle:   daemonLifecycleStatus{Process: "running"},
+			running:     &daemonVersionState{Version: "0.3.0", BinaryPath: stringPtr(managedPath)},
+			managed:     &daemonVersionState{Version: "0.3.0", BinaryPath: stringPtr(managedPath)},
+			wantPending: false,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotPending, gotVersion := daemonUpgradePendingRestart(tc.lifecycle, tc.running, tc.managed)
+			if gotPending != tc.wantPending {
+				t.Fatalf("daemonUpgradePendingRestart() pending = %v, want %v", gotPending, tc.wantPending)
+			}
+			if got := derefString(gotVersion); got != tc.wantVersion {
+				t.Fatalf("daemonUpgradePendingRestart() version = %q, want %q", got, tc.wantVersion)
+			}
+		})
+	}
+}
+
 func TestDaemonStartWritesPIDFileAndPassesConfigArgs(t *testing.T) {
 	t.Parallel()
 

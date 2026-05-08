@@ -35,6 +35,202 @@ func TestResolveLooperTarget(t *testing.T) {
 	}
 }
 
+func TestShouldRunAutoUpgradeCheck(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-autoUpgradeCheckInterval + time.Minute)
+	old := now.Add(-autoUpgradeCheckInterval - time.Minute)
+
+	for _, tc := range []struct {
+		name  string
+		state *autoUpgradeState
+		want  bool
+	}{
+		{name: "nil state", state: nil, want: true},
+		{name: "missing timestamp", state: &autoUpgradeState{}, want: true},
+		{name: "recent timestamp", state: &autoUpgradeState{LastCheckedAt: &recent}, want: false},
+		{name: "expired timestamp", state: &autoUpgradeState{LastCheckedAt: &old}, want: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldRunAutoUpgradeCheck(tc.state, now); got != tc.want {
+				t.Fatalf("shouldRunAutoUpgradeCheck() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRootPreRunSkipsAutoUpgradeForUnsupportedInstallSource(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version"})
+	if exitCode != 0 {
+		t.Fatalf("Run([version]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([version]) stderr = %q, want empty string", stderr.String())
+	}
+	if got, want := stdout.String(), "0.0.0-dev\n"; got != want {
+		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestVersionNoAutoUpgradeFlagDisablesAutoUpgrade(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--no-auto-upgrade", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --no-auto-upgrade]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([version --no-auto-upgrade]) stderr = %q, want empty string", stderr.String())
+	}
+}
+
+func TestEnvDisablesAutoUpgrade(t *testing.T) {
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	t.Setenv("LOOPER_AUTO_UPGRADE_ENABLED", "false")
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --config]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("Run([version --config]) stderr = %q, want empty string", stderr.String())
+	}
+}
+
+func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
+	var latestCalls int
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				latestCalls++
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.0.0-dev","assets":[]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		stdout.Reset()
+		stderr.Reset()
+		exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})
+		if exitCode != 0 {
+			t.Fatalf("run %d Run([version --config]) exit code = %d, want 0; stderr=%q", i+1, exitCode, stderr.String())
+		}
+	}
+	if latestCalls != 1 {
+		t.Fatalf("latest release calls = %d, want 1", latestCalls)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("Stat(auto-upgrade state) error = %v, want file to exist", err)
+	}
+}
+
+func TestCorruptAutoUpgradeStateSkipsNetworkAndPreservesFile(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(state dir) error = %v", err)
+	}
+	const corrupt = "{invalid json\n"
+	if err := os.WriteFile(statePath, []byte(corrupt), 0o644); err != nil {
+		t.Fatalf("WriteFile(statePath) error = %v", err)
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --config]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Auto-upgrade skipped: read state") {
+		t.Fatalf("stderr = %q, want corrupt state warning", stderr.String())
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(statePath) error = %v", err)
+	}
+	if string(raw) != corrupt {
+		t.Fatalf("state file content = %q, want %q", string(raw), corrupt)
+	}
+}
+
 func TestUpgradeCheckPrintsSummary(t *testing.T) {
 	t.Parallel()
 

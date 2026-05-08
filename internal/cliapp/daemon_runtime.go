@@ -48,20 +48,24 @@ type daemonVersionState struct {
 }
 
 type daemonStatusOutput struct {
-	Mode                   config.DaemonMode          `json:"mode"`
-	ConfiguredMode         config.DaemonMode          `json:"configuredMode"`
-	RunningMode            *config.DaemonMode         `json:"runningMode,omitempty"`
-	RestartPolicy          config.DaemonRestartPolicy `json:"restartPolicy"`
-	RestartThrottleSeconds int                        `json:"restartThrottleSeconds"`
-	ConfigPath             string                     `json:"configPath"`
-	LogDir                 string                     `json:"logDir"`
-	APIReachable           bool                       `json:"apiReachable"`
-	DaemonVersion          *string                    `json:"daemonVersion"`
-	DaemonVersionSource    *string                    `json:"daemonVersionSource"`
-	DaemonBinaryPath       *string                    `json:"daemonBinaryPath"`
-	Lifecycle              daemonLifecycleStatus      `json:"lifecycle"`
-	Status                 json.RawMessage            `json:"status"`
-	Health                 json.RawMessage            `json:"health"`
+	Mode                        config.DaemonMode          `json:"mode"`
+	ConfiguredMode              config.DaemonMode          `json:"configuredMode"`
+	RunningMode                 *config.DaemonMode         `json:"runningMode,omitempty"`
+	RestartPolicy               config.DaemonRestartPolicy `json:"restartPolicy"`
+	RestartThrottleSeconds      int                        `json:"restartThrottleSeconds"`
+	ConfigPath                  string                     `json:"configPath"`
+	LogDir                      string                     `json:"logDir"`
+	APIReachable                bool                       `json:"apiReachable"`
+	DaemonVersion               *string                    `json:"daemonVersion"`
+	DaemonVersionSource         *string                    `json:"daemonVersionSource"`
+	DaemonBinaryPath            *string                    `json:"daemonBinaryPath"`
+	ManagedDaemonVersion        *string                    `json:"managedDaemonVersion,omitempty"`
+	ManagedDaemonBinaryPath     *string                    `json:"managedDaemonBinaryPath,omitempty"`
+	DaemonUpgradePendingRestart bool                       `json:"daemonUpgradePendingRestart"`
+	PendingDaemonVersion        *string                    `json:"pendingDaemonVersion,omitempty"`
+	Lifecycle                   daemonLifecycleStatus      `json:"lifecycle"`
+	Status                      json.RawMessage            `json:"status"`
+	Health                      json.RawMessage            `json:"health"`
 }
 
 type daemonLogsOutput struct {
@@ -98,6 +102,14 @@ func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	var managedVersion *daemonVersionState
+	managedPath, managedPathErr := r.managedDaemonBinaryPath()
+	if managedPathErr == nil && (versionState == nil || (versionState.BinaryPath != nil && *versionState.BinaryPath == managedPath)) {
+		managedVersion, err = r.readManagedDaemonVersion(cmd.Context())
+		if err != nil {
+			return err
+		}
+	}
 
 	output := daemonStatusOutput{
 		Mode:                   loaded.Config.Daemon.Mode,
@@ -119,6 +131,14 @@ func (r *commandRuntime) daemonStatus(cmd *cobra.Command, args []string) error {
 		output.DaemonVersion = &versionState.Version
 		output.DaemonVersionSource = &versionState.Source
 		output.DaemonBinaryPath = versionState.BinaryPath
+	}
+	if managedVersion != nil {
+		output.ManagedDaemonVersion = &managedVersion.Version
+		output.ManagedDaemonBinaryPath = managedVersion.BinaryPath
+	}
+	if pending, pendingVersion := daemonUpgradePendingRestart(lifecycle, versionState, managedVersion); pending {
+		output.DaemonUpgradePendingRestart = true
+		output.PendingDaemonVersion = pendingVersion
 	}
 
 	if getBoolFlag(cmd, "json") {
@@ -1319,6 +1339,7 @@ func tailLines(content string, count int) []string {
 
 func writeHumanDaemonStatus(w io.Writer, payload daemonStatusOutput) error {
 	entries := [][2]any{{"configuredMode", payload.ConfiguredMode}, {"runningMode", payload.RunningMode}, {"restartPolicy", payload.RestartPolicy}, {"restartThrottleSeconds", payload.RestartThrottleSeconds}, {"configPath", payload.ConfigPath}, {"logDir", payload.LogDir}, {"apiReachable", payload.APIReachable}, {"daemonVersion", payload.DaemonVersion}, {"daemonVersionSource", payload.DaemonVersionSource}, {"daemonBinaryPath", payload.DaemonBinaryPath}}
+	entries = append(entries, [2]any{"managedDaemonVersion", payload.ManagedDaemonVersion}, [2]any{"managedDaemonBinaryPath", payload.ManagedDaemonBinaryPath}, [2]any{"daemonUpgradePendingRestart", payload.DaemonUpgradePendingRestart}, [2]any{"pendingDaemonVersion", payload.PendingDaemonVersion})
 	if payload.ConfiguredMode == config.DaemonModeForeground {
 		entries = append(entries, [2]any{"restartBehavior", "not supervised; detached mode does not restart after crashes or reboot"})
 	}
@@ -1360,4 +1381,17 @@ func writeHumanDaemonStatus(w io.Writer, payload daemonStatusOutput) error {
 		return err
 	}
 	return writeJSON(w, selected)
+}
+
+func daemonUpgradePendingRestart(lifecycle daemonLifecycleStatus, running *daemonVersionState, managed *daemonVersionState) (bool, *string) {
+	if lifecycle.Process != "running" || running == nil || managed == nil {
+		return false, nil
+	}
+	if running.BinaryPath == nil || managed.BinaryPath == nil || *running.BinaryPath != *managed.BinaryPath {
+		return false, nil
+	}
+	if running.Version == managed.Version {
+		return false, nil
+	}
+	return true, stringPtr(managed.Version)
 }
