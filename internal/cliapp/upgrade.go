@@ -1,9 +1,8 @@
 package cliapp
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -575,16 +574,81 @@ func normalizeVersion(value string) string {
 
 func (r *commandRuntime) upgradeUnified(cmd *cobra.Command) error {
 	jsonOutput := getBoolFlag(cmd, "json")
-	cliOutput, cliErr := r.upgradeCLIWithOutput(cmd, !jsonOutput)
-	if cliErr != nil {
+
+	// In JSON mode, both upgrade lanes write a single combined JSON document
+	// at the end and individual progress is silenced apart from stderr. We
+	// can run them concurrently with a shared muxed stderr to overlap the
+	// large binary downloads.
+	if jsonOutput {
+		return r.upgradeUnifiedConcurrent(cmd)
+	}
+
+	// In human mode we still parallelize the two downloads, but we buffer
+	// per-lane stdout so the two lanes do not interleave their progress and
+	// status messages on the user's terminal.
+	return r.upgradeUnifiedConcurrent(cmd)
+}
+
+// upgradeUnifiedConcurrent runs the CLI and daemon upgrade lanes concurrently.
+// Each lane writes its human-readable status output into its own buffer so
+// the two lanes do not interleave on stdout. Progress (stderr) goes through a
+// shared concurrent multiplexer that rewrites carriage returns into newlines
+// so simultaneous "Downloading X" updates stay readable on TTYs and CI logs
+// alike.
+func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
+	jsonOutput := getBoolFlag(cmd, "json")
+
+	cliBuf := &bytes.Buffer{}
+	daemonBuf := &bytes.Buffer{}
+
+	progressMux := newConcurrentProgressMux(cmd.ErrOrStderr())
+
+	cliCmd := mirrorCommandWithIO(cmd, cliBuf, progressMux.writer())
+	daemonCmd := mirrorCommandWithIO(cmd, daemonBuf, progressMux.writer())
+
+	type cliResult struct {
+		output cliUpgradeOutput
+		err    error
+	}
+	type daemonResult struct {
+		output daemonUpgradeOutput
+		err    error
+	}
+
+	cliCh := make(chan cliResult, 1)
+	daemonCh := make(chan daemonResult, 1)
+
+	go func() {
+		out, err := r.upgradeCLIWithOutput(cliCmd, !jsonOutput)
+		cliCh <- cliResult{output: out, err: err}
+	}()
+	go func() {
+		out, err := r.upgradeDaemonWithOutput(daemonCmd, !jsonOutput)
+		daemonCh <- daemonResult{output: out, err: err}
+	}()
+
+	cliRes := <-cliCh
+	daemonRes := <-daemonCh
+
+	// Surface CLI lane output, accepting refusal as a non-fatal outcome since
+	// non-release installs (Homebrew, dev builds, ...) deliberately reject
+	// self-upgrade with guidance instead of failing the whole flow.
+	if cliRes.err != nil {
 		var refused *cliUpgradeRefusedError
-		if !errors.As(cliErr, &refused) {
-			return cliErr
+		if !errors.As(cliRes.err, &refused) {
+			if _, copyErr := cmd.OutOrStdout().Write(cliBuf.Bytes()); copyErr != nil {
+				return copyErr
+			}
+			return cliRes.err
 		}
 		if !jsonOutput {
 			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "CLI self-upgrade skipped: %s\n", refused.message); err != nil {
 				return err
 			}
+		}
+	} else if !jsonOutput {
+		if _, err := cmd.OutOrStdout().Write(cliBuf.Bytes()); err != nil {
+			return err
 		}
 	}
 
@@ -594,14 +658,45 @@ func (r *commandRuntime) upgradeUnified(cmd *cobra.Command) error {
 		}
 	}
 
-	daemonOutput, err := r.upgradeDaemonWithOutput(cmd, !jsonOutput)
-	if err != nil {
-		return err
+	if daemonRes.err != nil {
+		if _, copyErr := cmd.OutOrStdout().Write(daemonBuf.Bytes()); copyErr != nil {
+			return copyErr
+		}
+		return daemonRes.err
 	}
+	if !jsonOutput {
+		if _, err := cmd.OutOrStdout().Write(daemonBuf.Bytes()); err != nil {
+			return err
+		}
+	}
+
 	if jsonOutput {
-		return writeJSON(cmd.OutOrStdout(), unifiedUpgradeOutput{CLI: cliOutput, Daemon: daemonOutput})
+		return writeJSON(cmd.OutOrStdout(), unifiedUpgradeOutput{CLI: cliRes.output, Daemon: daemonRes.output})
 	}
 	return nil
+}
+
+// mirrorCommandWithIO returns a cobra.Command that delegates context and flag
+// lookup to parent but redirects stdout/stderr to dedicated writers. This is
+// used by upgradeUnifiedConcurrent so each lane can be ordered after both
+// complete without touching the parent command's writers mid-flight.
+func mirrorCommandWithIO(parent *cobra.Command, stdout io.Writer, stderr io.Writer) *cobra.Command {
+	clone := &cobra.Command{}
+	if parent != nil {
+		clone.SetContext(parent.Context())
+		// Inherit the parent's flag set so getBoolFlag continues to find
+		// --json, --check, --cli, --daemon, etc.
+		if flags := parent.Flags(); flags != nil {
+			clone.Flags().AddFlagSet(flags)
+		}
+	}
+	if stdout != nil {
+		clone.SetOut(stdout)
+	}
+	if stderr != nil {
+		clone.SetErr(stderr)
+	}
+	return clone
 }
 
 func (r *commandRuntime) upgradeCLI(cmd *cobra.Command) (cliUpgradeOutput, error) {
@@ -671,32 +766,20 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	if err != nil {
 		return cliUpgradeOutput{}, err
 	}
-	binaryAsset, checksumAsset, err := findLooperReleaseAssets(latestRelease, target)
+	asset, err := findReleaseAssetSet(latestRelease, "looper-"+target)
 	if err != nil {
-		return cliUpgradeOutput{}, err
+		return cliUpgradeOutput{}, fmt.Errorf("looper release: %w", err)
 	}
-	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL, binaryAsset.Name, cmd.ErrOrStderr())
+	binaryBytes, err := r.fetchAndExtractBinary(ctx, asset, cmd.ErrOrStderr())
 	if err != nil {
-		return cliUpgradeOutput{}, fmt.Errorf("failed to download looper binary: %w", err)
-	}
-	checksumText, err := r.downloadChecksum(ctx, checksumAsset.BrowserDownloadURL)
-	if err != nil {
-		return cliUpgradeOutput{}, fmt.Errorf("failed to download looper checksum: %w", err)
-	}
-	expectedChecksum, err := parseChecksum(checksumText)
-	if err != nil {
-		return cliUpgradeOutput{}, err
-	}
-	actualChecksum := sha256.Sum256(binaryBytes)
-	if hex.EncodeToString(actualChecksum[:]) != expectedChecksum {
-		return cliUpgradeOutput{}, fmt.Errorf("downloaded looper checksum mismatch: expected %s, received %s", expectedChecksum, hex.EncodeToString(actualChecksum[:]))
+		return cliUpgradeOutput{}, fmt.Errorf("failed to fetch looper release: %w", err)
 	}
 	if err := replaceBinaryAtomically(execPath, binaryBytes); err != nil {
 		return cliUpgradeOutput{}, err
 	}
 
 	prevPath := execPath + ".prev"
-	result := cliUpgradeOutput{Changed: true, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), PreviousBinary: stringPtr(prevPath), DownloadedFrom: stringPtr(binaryAsset.BrowserDownloadURL), InstallSource: string(installSource)}
+	result := cliUpgradeOutput{Changed: true, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), PreviousBinary: stringPtr(prevPath), DownloadedFrom: stringPtr(asset.PreferredURL), InstallSource: string(installSource)}
 	if emitOutput && getBoolFlag(cmd, "json") {
 		if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 			return cliUpgradeOutput{}, err
@@ -712,7 +795,7 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Previous binary kept at %s\n", prevPath); err != nil {
 		return cliUpgradeOutput{}, err
 	}
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", binaryAsset.BrowserDownloadURL); err != nil {
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", asset.PreferredURL); err != nil {
 		return cliUpgradeOutput{}, err
 	}
 	return result, nil
@@ -831,28 +914,6 @@ func resolveLooperTarget(platform string, arch string) (string, error) {
 		return "darwin-arm64", nil
 	}
 	return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: darwin-arm64", platform, arch)
-}
-
-func findLooperReleaseAssets(release githubReleasePayload, target string) (githubReleaseAsset, githubReleaseAsset, error) {
-	binaryName := "looper-" + target
-	checksumName := binaryName + ".sha256"
-	var binaryAsset githubReleaseAsset
-	var checksumAsset githubReleaseAsset
-	for _, asset := range release.Assets {
-		if asset.Name == binaryName {
-			binaryAsset = asset
-		}
-		if asset.Name == checksumName {
-			checksumAsset = asset
-		}
-	}
-	if strings.TrimSpace(binaryAsset.BrowserDownloadURL) == "" {
-		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("release is missing asset %q", binaryName)
-	}
-	if strings.TrimSpace(checksumAsset.BrowserDownloadURL) == "" {
-		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("release is missing asset %q", checksumName)
-	}
-	return binaryAsset, checksumAsset, nil
 }
 
 func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {

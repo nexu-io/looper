@@ -149,6 +149,46 @@ func TestEncodeManifestProducesStableJSONShape(t *testing.T) {
 	}
 }
 
+func TestBuildManifestIncludesTarGzArchives(t *testing.T) {
+	assetsDir := t.TempDir()
+	writeFile(t, filepath.Join(assetsDir, "looper-darwin-arm64"), []byte("looper"))
+	writeFile(t, filepath.Join(assetsDir, "looper-darwin-arm64.sha256"), []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  looper-darwin-arm64\n"))
+	writeFile(t, filepath.Join(assetsDir, "looper-darwin-arm64.tar.gz"), []byte("looper-archive"))
+	writeFile(t, filepath.Join(assetsDir, "looper-darwin-arm64.tar.gz.sha256"), []byte("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  looper-darwin-arm64.tar.gz\n"))
+	writeFile(t, filepath.Join(assetsDir, "looperd-darwin-arm64"), []byte("looperd"))
+	writeFile(t, filepath.Join(assetsDir, "looperd-darwin-arm64.sha256"), []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  looperd-darwin-arm64\n"))
+	writeFile(t, filepath.Join(assetsDir, "looperd-darwin-arm64.tar.gz"), []byte("looperd-archive"))
+	writeFile(t, filepath.Join(assetsDir, "looperd-darwin-arm64.tar.gz.sha256"), []byte("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  looperd-darwin-arm64.tar.gz\n"))
+
+	manifest, err := BuildManifest(BuildManifestInput{
+		Tag:               "v1.2.3",
+		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
+		APIVersion:        "v1",
+		SchemaVersion:     "12",
+		MinCliForDaemon:   "0.2.0",
+		MinDaemonForCli:   "0.2.0",
+		Repo:              "nexu-io/looper",
+		AssetsDir:         assetsDir,
+		RequiredArtifacts: []string{"looper-darwin-arm64", "looper-darwin-arm64.tar.gz", "looperd-darwin-arm64", "looperd-darwin-arm64.tar.gz"},
+	})
+	if err != nil {
+		t.Fatalf("BuildManifest(...) error = %v", err)
+	}
+
+	for _, name := range []string{"looper-darwin-arm64.tar.gz", "looperd-darwin-arm64.tar.gz"} {
+		artifact, ok := manifest.Artifacts[name]
+		if !ok {
+			t.Fatalf("manifest missing archive artifact %q", name)
+		}
+		if artifact.URL != "https://github.com/nexu-io/looper/releases/download/v1.2.3/"+name {
+			t.Fatalf("archive %s URL = %q", name, artifact.URL)
+		}
+		if len(artifact.SHA256) != 64 {
+			t.Fatalf("archive %s sha = %q, want 64-hex", name, artifact.SHA256)
+		}
+	}
+}
+
 func writeFile(t *testing.T, path string, content []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, content, 0o644); err != nil {

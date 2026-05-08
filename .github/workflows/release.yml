@@ -198,6 +198,16 @@ jobs:
           shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
           shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
 
+      - name: Create release archive
+        working-directory: dist/release
+        run: |
+          # Tar with -C so the binary lives at the archive root with its
+          # platform-suffixed name. Compressed downloads are roughly 30-40% of
+          # the raw binary size, which speeds up first install and self-upgrade.
+          tar -czf "${{ matrix.artifact-name }}.tar.gz" "${{ matrix.artifact-name }}"
+          shasum -a 256 "${{ matrix.artifact-name }}.tar.gz" > "${{ matrix.artifact-name }}.tar.gz.sha256"
+          shasum -a 256 -c "${{ matrix.artifact-name }}.tar.gz.sha256"
+
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
@@ -205,6 +215,8 @@ jobs:
           path: |
             dist/release/${{ matrix.artifact-name }}
             dist/release/${{ matrix.artifact-name }}.sha256
+            dist/release/${{ matrix.artifact-name }}.tar.gz
+            dist/release/${{ matrix.artifact-name }}.tar.gz.sha256
 
   build-looperd:
     needs:
@@ -264,6 +276,13 @@ jobs:
           shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
           shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
 
+      - name: Create release archive
+        working-directory: dist/release
+        run: |
+          tar -czf "${{ matrix.artifact-name }}.tar.gz" "${{ matrix.artifact-name }}"
+          shasum -a 256 "${{ matrix.artifact-name }}.tar.gz" > "${{ matrix.artifact-name }}.tar.gz.sha256"
+          shasum -a 256 -c "${{ matrix.artifact-name }}.tar.gz.sha256"
+
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
@@ -271,6 +290,8 @@ jobs:
           path: |
             dist/release/${{ matrix.artifact-name }}
             dist/release/${{ matrix.artifact-name }}.sha256
+            dist/release/${{ matrix.artifact-name }}.tar.gz
+            dist/release/${{ matrix.artifact-name }}.tar.gz.sha256
 
   publish-release:
     needs:
@@ -301,8 +322,12 @@ jobs:
         run: |
           test -f release-assets/looper-darwin-arm64
           test -f release-assets/looper-darwin-arm64.sha256
+          test -f release-assets/looper-darwin-arm64.tar.gz
+          test -f release-assets/looper-darwin-arm64.tar.gz.sha256
           test -f release-assets/looperd-darwin-arm64
           test -f release-assets/looperd-darwin-arm64.sha256
+          test -f release-assets/looperd-darwin-arm64.tar.gz
+          test -f release-assets/looperd-darwin-arm64.tar.gz.sha256
 
       - name: Verify Linux artifacts are not published in Phase 1
         run: |
@@ -322,7 +347,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64,looperd-darwin-arm64" \
+            -required-assets "looper-darwin-arm64,looper-darwin-arm64.tar.gz,looperd-darwin-arm64,looperd-darwin-arm64.tar.gz" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -350,7 +375,9 @@ jobs:
           assert m["minDaemonForCli"], "minDaemonForCli missing"
           required = {
               "looper-darwin-arm64",
+              "looper-darwin-arm64.tar.gz",
               "looperd-darwin-arm64",
+              "looperd-darwin-arm64.tar.gz",
           }
           assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
           for name in required:
@@ -370,6 +397,10 @@ jobs:
           files: |
             release-assets/looper-darwin-arm64
             release-assets/looper-darwin-arm64.sha256
+            release-assets/looper-darwin-arm64.tar.gz
+            release-assets/looper-darwin-arm64.tar.gz.sha256
             release-assets/looperd-darwin-arm64
             release-assets/looperd-darwin-arm64.sha256
+            release-assets/looperd-darwin-arm64.tar.gz
+            release-assets/looperd-darwin-arm64.tar.gz.sha256
             release-assets/manifest.json

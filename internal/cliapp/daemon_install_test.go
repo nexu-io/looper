@@ -239,7 +239,7 @@ func TestDaemonInstallCommandPrintsHumanOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon install]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 3 B / 3 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 3 B / 3 B (100%)") {
 		t.Fatalf("Run([daemon install]) stderr = %q, want download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Installed looperd (darwin-arm64) to ") {

@@ -2,8 +2,6 @@ package cliapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -97,28 +95,14 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 		return daemonInstallResult{}, err
 	}
 
-	binaryAsset, checksumAsset, err := findLooperdReleaseAssets(release, target)
+	asset, err := findReleaseAssetSet(release, looperdBinaryName+"-"+target)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return daemonInstallResult{}, fmt.Errorf("looperd release: %w", err)
 	}
 
-	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL, binaryAsset.Name, progress)
+	binaryBytes, err := r.fetchAndExtractBinary(ctx, asset, progress)
 	if err != nil {
 		return daemonInstallResult{}, err
-	}
-
-	checksumText, err := r.downloadChecksum(ctx, checksumAsset.BrowserDownloadURL)
-	if err != nil {
-		return daemonInstallResult{}, err
-	}
-
-	expectedChecksum, err := parseChecksum(checksumText)
-	if err != nil {
-		return daemonInstallResult{}, err
-	}
-	actualChecksum := sha256.Sum256(binaryBytes)
-	if hex.EncodeToString(actualChecksum[:]) != expectedChecksum {
-		return daemonInstallResult{}, fmt.Errorf("Downloaded looperd checksum mismatch: expected %s, received %s", expectedChecksum, hex.EncodeToString(actualChecksum[:]))
 	}
 
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
@@ -142,7 +126,7 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 	return daemonInstallResult{
 		Target:         target,
 		InstallPath:    installPath,
-		DownloadedFrom: stringPtr(binaryAsset.BrowserDownloadURL),
+		DownloadedFrom: stringPtr(asset.PreferredURL),
 		Skipped:        false,
 	}, nil
 }
@@ -268,7 +252,7 @@ func (p *downloadProgress) print(initial bool) {
 		if p.total > 0 {
 			percent = int((p.read * 100) / p.total)
 		}
-		line = fmt.Sprintf("Downloading %s: %s / %s (%d%%)", p.name, formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
+		line = fmt.Sprintf("Downloading %s: %s%s / %s (%d%%)", p.name, renderProgressBar(percent, downloadProgressBarWidth), formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
 	} else if p.read > 0 {
 		line = fmt.Sprintf("Downloading %s: %s downloaded", p.name, formatDownloadBytes(p.read))
 	} else {
@@ -279,6 +263,42 @@ func (p *downloadProgress) print(initial bool) {
 		return
 	}
 	_, _ = fmt.Fprintf(p.w, "\r%s", line)
+}
+
+// downloadProgressBarWidth is the inner width of the textual progress bar
+// printed alongside byte counters. A small fixed width keeps output readable
+// on narrow terminals and stable in non-TTY logs.
+const downloadProgressBarWidth = 20
+
+// renderProgressBar returns a "[####------] " style bar string for the given
+// percentage. An empty string is returned when width is non-positive so the
+// renderer can be disabled by callers without conditional logic at the call
+// site.
+func renderProgressBar(percent int, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := (percent * width) / 100
+	if filled > width {
+		filled = width
+	}
+	var builder strings.Builder
+	builder.Grow(width + 3)
+	builder.WriteByte('[')
+	for i := 0; i < filled; i++ {
+		builder.WriteByte('#')
+	}
+	for i := filled; i < width; i++ {
+		builder.WriteByte('-')
+	}
+	builder.WriteString("] ")
+	return builder.String()
 }
 
 func formatDownloadBytes(value int64) string {
@@ -338,35 +358,6 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 		return base + "/tags/" + tag
 	}
 	return base + "/latest"
-}
-
-func findLooperdReleaseAssets(release githubReleasePayload, target string) (githubReleaseAsset, githubReleaseAsset, error) {
-	binaryName := looperdBinaryName + "-" + target
-	checksumName := binaryName + ".sha256"
-
-	var binary githubReleaseAsset
-	var checksum githubReleaseAsset
-	for _, asset := range release.Assets {
-		switch asset.Name {
-		case binaryName:
-			binary = asset
-		case checksumName:
-			checksum = asset
-		}
-	}
-
-	missing := make([]string, 0, 2)
-	if strings.TrimSpace(binary.Name) == "" {
-		missing = append(missing, binaryName)
-	}
-	if strings.TrimSpace(checksum.Name) == "" {
-		missing = append(missing, checksumName)
-	}
-	if len(missing) > 0 {
-		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("GitHub release is missing required looperd asset(s): %s", strings.Join(missing, ", "))
-	}
-
-	return binary, checksum, nil
 }
 
 func parseChecksum(value string) (string, error) {

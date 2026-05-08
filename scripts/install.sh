@@ -149,12 +149,16 @@ download_file() {
 
 need_cmd curl
 need_cmd grep
+need_cmd tar
 
 target="$(detect_target)"
 asset="looper-$target"
+archive_asset="$asset.tar.gz"
 download_base="$(build_download_base "$VERSION")"
 binary_url="$download_base/$asset"
 checksum_url="$download_base/$asset.sha256"
+archive_url="$download_base/$archive_asset"
+archive_checksum_url="$download_base/$archive_asset.sha256"
 
 install_dir="$(pick_install_dir)"
 mkdir -p "$install_dir"
@@ -174,16 +178,45 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM HUP
 
 tmp_binary="$tmp_dir/looper"
-tmp_checksum="$tmp_dir/$asset.sha256"
 
-log "Downloading $binary_url"
-download_file "$binary_url" "$tmp_binary"
-download_file "$checksum_url" "$tmp_checksum"
+# Prefer the gzipped tarball when the release publishes one. It is roughly a
+# third of the size of the raw binary on macOS arm64, so first install and
+# self-upgrade both transfer dramatically less data. The script falls back to
+# the raw binary asset only when the archive returns 404, which keeps users
+# on pinned older releases unaffected.
+http_status_for() {
+  curl -fsSLI -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true
+}
 
-expected_checksum="$(awk '{print $1}' "$tmp_checksum")"
-[ -n "$expected_checksum" ] || fail "invalid checksum file: $checksum_url"
+archive_status="$(http_status_for "$archive_url")"
+if [ "$archive_status" = "200" ] || [ "$archive_status" = "302" ]; then
+  archive_path="$tmp_dir/$archive_asset"
+  archive_checksum_path="$tmp_dir/$archive_asset.sha256"
 
-verify_checksum "$tmp_binary" "$expected_checksum"
+  log "Downloading $archive_url"
+  download_file "$archive_url" "$archive_path"
+  download_file "$archive_checksum_url" "$archive_checksum_path"
+
+  expected_checksum="$(awk '{print $1}' "$archive_checksum_path")"
+  [ -n "$expected_checksum" ] || fail "invalid checksum file: $archive_checksum_url"
+  verify_checksum "$archive_path" "$expected_checksum"
+
+  tar -xzf "$archive_path" -C "$tmp_dir"
+  [ -f "$tmp_dir/$asset" ] || fail "archive $archive_asset did not contain $asset"
+  mv "$tmp_dir/$asset" "$tmp_binary"
+else
+  log "Archive unavailable (HTTP ${archive_status:-?}); using raw binary."
+  tmp_checksum="$tmp_dir/$asset.sha256"
+
+  log "Downloading $binary_url"
+  download_file "$binary_url" "$tmp_binary"
+  download_file "$checksum_url" "$tmp_checksum"
+
+  expected_checksum="$(awk '{print $1}' "$tmp_checksum")"
+  [ -n "$expected_checksum" ] || fail "invalid checksum file: $checksum_url"
+
+  verify_checksum "$tmp_binary" "$expected_checksum"
+fi
 
 chmod 0755 "$tmp_binary"
 install_path="$install_dir/looper"
