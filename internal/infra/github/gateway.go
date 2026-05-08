@@ -1577,8 +1577,10 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"        nodes {",
 		"          id",
 		"          isResolved",
+		"          path",
+		"          line",
 		"          comments(first: 1) {",
-		"            nodes { id body }",
+		"            nodes { id body url path line author { login } }",
 		"          }",
 		"        }",
 		"        pageInfo { hasNextPage endCursor }",
@@ -1845,6 +1847,22 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	}
 	if body := asString(first["body"]); body != "" {
 		out["body"] = body
+	}
+	if author := extractAuthor(first["author"]); author != "" {
+		out["author"] = author
+	}
+	if url := asString(first["url"]); url != "" {
+		out["url"] = url
+	}
+	if path := asString(first["path"]); path != "" {
+		out["path"] = path
+	} else if path := asString(row["path"]); path != "" {
+		out["path"] = path
+	}
+	if line := asInt64(first["line"]); line > 0 {
+		out["line"] = line
+	} else if line := asInt64(row["line"]); line > 0 {
+		out["line"] = line
 	}
 	return out, true
 }

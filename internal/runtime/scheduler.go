@@ -381,7 +381,10 @@ func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+type fixerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author, Label: input.Label, Labels: input.Labels})
@@ -413,6 +416,11 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
+	body := a.stamper.ReviewComment(input.Body, "fixer")
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
@@ -828,7 +836,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	fixerRunner = fixer.New(fixer.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway},
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,

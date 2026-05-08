@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -73,6 +74,10 @@ type FixItem struct {
 	Name     string   `json:"name,omitempty"`
 	Summary  string   `json:"summary,omitempty"`
 	Files    []string `json:"files,omitempty"`
+	Author   string   `json:"author,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Path     string   `json:"path,omitempty"`
+	Line     int64    `json:"line,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -121,6 +126,13 @@ type ResolveReviewThreadInput struct {
 	CWD      string
 }
 
+type AddReviewThreadReplyInput struct {
+	Repo     string
+	ThreadID string
+	Body     string
+	CWD      string
+}
+
 type PullRequestLabelsInput struct {
 	Repo     string
 	PRNumber int64
@@ -134,6 +146,7 @@ type GitHubGateway interface {
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
+	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 }
@@ -399,18 +412,30 @@ type checkpointWorktree struct {
 }
 
 type checkpointRepair struct {
-	AgentExecutionID             string           `json:"agentExecutionId,omitempty"`
-	Summary                      string           `json:"summary,omitempty"`
-	HeadSHA                      string           `json:"headSha,omitempty"`
-	ParseStatus                  string           `json:"parseStatus,omitempty"`
-	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	CompletedAt                  string           `json:"completedAt,omitempty"`
-	Status                       string           `json:"status,omitempty"`
-	TimeoutType                  string           `json:"timeoutType,omitempty"`
-	ConfiguredIdleTimeoutSeconds int64            `json:"configuredIdleTimeoutSeconds,omitempty"`
-	ConfiguredMaxRuntimeSeconds  int64            `json:"configuredMaxRuntimeSeconds,omitempty"`
-	ElapsedRuntimeSeconds        int64            `json:"elapsedRuntimeSeconds,omitempty"`
-	LastProgressAt               string           `json:"lastProgressAt,omitempty"`
+	AgentExecutionID             string                  `json:"agentExecutionId,omitempty"`
+	Summary                      string                  `json:"summary,omitempty"`
+	HeadSHA                      string                  `json:"headSha,omitempty"`
+	ParseStatus                  string                  `json:"parseStatus,omitempty"`
+	Lifecycle                    *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
+	CompletedAt                  string                  `json:"completedAt,omitempty"`
+	Status                       string                  `json:"status,omitempty"`
+	TimeoutType                  string                  `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64                   `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64                   `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64                   `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string                  `json:"lastProgressAt,omitempty"`
+	ReplyExplanations            []replyExplanationEntry `json:"replyExplanations,omitempty"`
+	FixItemsHash                 string                  `json:"fixItemsHash,omitempty"`
+}
+
+// replyExplanationEntry holds the agent's per-fix-item explanation for the
+// auto-reply posted before resolving the review thread. Stored on the repair
+// checkpoint so resume/retry reuses the same explanation if it still maps to
+// the current fix items snapshot.
+type replyExplanationEntry struct {
+	FixItemID   string `json:"fixItemId"`
+	ThreadID    string `json:"threadId,omitempty"`
+	Explanation string `json:"explanation"`
 }
 
 type checkpointReconcileCommits struct {
@@ -437,11 +462,13 @@ type checkpointResolvedComments struct {
 }
 
 type checkpointResolvedComment struct {
-	FixItemID string `json:"fixItemId,omitempty"`
-	ThreadID  string `json:"threadId,omitempty"`
-	Status    string `json:"status,omitempty"`
-	Message   string `json:"message,omitempty"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
+	FixItemID  string `json:"fixItemId,omitempty"`
+	ThreadID   string `json:"threadId,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Message    string `json:"message,omitempty"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+	ReplyState string `json:"replyState,omitempty"`
+	ReplyError string `json:"replyError,omitempty"`
 }
 
 type checkpointRecheck struct {
@@ -488,6 +515,126 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
 	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
 }
+
+// maxReplyExplanationLength caps each agent-supplied explanation. Replies are
+// posted on review threads where verbose bodies create noise; the cap also
+// limits prompt-injection blast radius if a malicious reviewer plants payload.
+const maxReplyExplanationLength = 500
+
+// parseReplyExplanationsFromStdout extracts the optional review_thread_replies
+// array from the final __LOOPER_RESULT__ JSON line. Failure to parse is not an
+// error: the runner falls back to the generic reply body. Entries are filtered
+// against the current fixItems snapshot (keyed by fixItemId, with a defensive
+// threadId cross-check), deduplicated keeping the first valid occurrence, and
+// truncated. Disclosure markers, @mentions, and HTML tags are stripped so the
+// adapter remains the only path that stamps and templates the reply.
+func parseReplyExplanationsFromStdout(stdout string, fixItems []FixItem) []replyExplanationEntry {
+	if strings.TrimSpace(stdout) == "" {
+		return nil
+	}
+	itemsByID := make(map[string]FixItem, len(fixItems))
+	for _, item := range fixItems {
+		if item.Type != "comment" {
+			continue
+		}
+		if item.ID == "" {
+			continue
+		}
+		itemsByID[item.ID] = item
+	}
+	if len(itemsByID) == 0 {
+		return nil
+	}
+	payload := extractCompletionMarkerPayload(stdout)
+	if payload == "" {
+		return nil
+	}
+	var parsed struct {
+		ReviewThreadReplies []struct {
+			FixItemID   string `json:"fixItemId"`
+			ThreadID    string `json:"threadId"`
+			Explanation string `json:"explanation"`
+		} `json:"review_thread_replies"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return nil
+	}
+	if len(parsed.ReviewThreadReplies) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(parsed.ReviewThreadReplies))
+	out := make([]replyExplanationEntry, 0, len(parsed.ReviewThreadReplies))
+	for _, raw := range parsed.ReviewThreadReplies {
+		fixItemID := strings.TrimSpace(raw.FixItemID)
+		if fixItemID == "" {
+			continue
+		}
+		item, ok := itemsByID[fixItemID]
+		if !ok {
+			continue
+		}
+		threadID := strings.TrimSpace(raw.ThreadID)
+		if threadID != "" && item.ThreadID != "" && threadID != item.ThreadID {
+			continue
+		}
+		explanation := sanitizeReplyExplanation(raw.Explanation)
+		if explanation == "" {
+			continue
+		}
+		if _, dup := seen[fixItemID]; dup {
+			continue
+		}
+		seen[fixItemID] = struct{}{}
+		out = append(out, replyExplanationEntry{FixItemID: fixItemID, ThreadID: item.ThreadID, Explanation: explanation})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// extractCompletionMarkerPayload mirrors the agent core's last-line scan but
+// without coupling fixer code to internal/agent's parser. It returns the JSON
+// payload after the final __LOOPER_RESULT__= line, or "" if absent.
+func extractCompletionMarkerPayload(combined string) string {
+	prefix := agent.CompletionMarkerPrefix
+	lines := strings.Split(combined, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
+}
+
+func sanitizeReplyExplanation(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	if cleaned == "" {
+		return ""
+	}
+	// Drop any disclosure marker the agent might have echoed; the adapter is
+	// the only place allowed to stamp.
+	cleaned = strings.ReplaceAll(cleaned, "<!-- looper:stamp v=1 -->", "")
+	// Strip leading @mentions; runner controls whom to ping.
+	cleaned = leadingMentionPattern.ReplaceAllString(cleaned, "")
+	// Strip HTML tags conservatively; review thread bodies are markdown.
+	cleaned = htmlTagPattern.ReplaceAllString(cleaned, "")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		return ""
+	}
+	if len([]rune(cleaned)) > maxReplyExplanationLength {
+		runes := []rune(cleaned)
+		cleaned = strings.TrimSpace(string(runes[:maxReplyExplanationLength])) + "…"
+	}
+	return cleaned
+}
+
+var (
+	leadingMentionPattern = regexp.MustCompile(`(?m)^(?:@[A-Za-z0-9][A-Za-z0-9-]{0,38}\s+)+`)
+	htmlTagPattern        = regexp.MustCompile(`</?[A-Za-z][^>]*>`)
+)
 
 func New(options Options) *Runner {
 	now := options.Now
@@ -1183,6 +1330,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+	checkpoint.Repair.ReplyExplanations = parseReplyExplanationsFromStdout(result.Stdout, checkpoint.FixItems)
+	checkpoint.Repair.FixItemsHash = checkpoint.FixItemsHash
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1361,7 +1510,16 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
+	commitSHA := ""
+	if checkpoint.ReconcileCommits != nil {
+		if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
+			commitSHA = checkpoint.ReconcileCommits.NewCommitSHAs[len(checkpoint.ReconcileCommits.NewCommitSHAs)-1]
+		} else {
+			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
+		}
+	}
 	failedCount := 0
+	explanationByID := lookupReplyExplanations(checkpoint)
 	for _, item := range fixItems {
 		if item.Type != "comment" {
 			continue
@@ -1369,6 +1527,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
 		}
+		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanationByID[item.ID], checkpoint.ResolvedComments.Items)
 		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
 			message := err.Error()
 			status := "failed"
@@ -1377,10 +1536,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			} else {
 				failedCount++
 			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: status, Message: message, UpdatedAt: r.nowISO()})
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: status, Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			continue
 		}
-		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO()})
+		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
 	if failedCount > 0 {
@@ -1388,6 +1547,106 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// replyToFixedComment posts a reply on the review thread acknowledging the fix
+// before the thread is resolved. Replies are best-effort: failures are recorded
+// in the checkpoint but never block the resolve step. The disclosure stamper
+// applied by the GitHub adapter ensures every reply carries the looper exposure
+// marker, so automated replies can be filtered downstream.
+func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item FixItem, commitSHA, explanation string, existing []checkpointResolvedComment) (string, string) {
+	if item.ThreadID == "" {
+		return "skipped_no_thread", ""
+	}
+	for _, entry := range existing {
+		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+				return entry.ReplyState, entry.ReplyError
+			}
+		}
+	}
+	body := buildFixerReplyBody(item, commitSHA, explanation)
+	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+		return "failed", err.Error()
+	}
+	return "sent", ""
+}
+
+// lookupReplyExplanations returns a map of fixItemId → sanitized agent
+// explanation, but only when the explanations were captured against the same
+// fix-items snapshot represented by the current checkpoint. If the snapshot
+// changed (e.g. PR rebased, new comments arrived), the agent's explanations no
+// longer describe the threads we are about to reply to and we fall back to the
+// generic body.
+func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
+	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
+		return nil
+	}
+	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
+		return nil
+	}
+	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
+	for _, entry := range checkpoint.Repair.ReplyExplanations {
+		if entry.FixItemID == "" || entry.Explanation == "" {
+			continue
+		}
+		out[entry.FixItemID] = entry.Explanation
+	}
+	return out
+}
+
+func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
+	var b strings.Builder
+	mention := strings.TrimSpace(item.Author)
+	if mention != "" {
+		b.WriteString("@")
+		b.WriteString(mention)
+		b.WriteString(" ")
+	}
+	b.WriteString("This has been fixed")
+	if shortSHA := shortCommitSHA(commitSHA); shortSHA != "" {
+		b.WriteString(" in ")
+		b.WriteString(shortSHA)
+	}
+	b.WriteString(".")
+	if explanation = strings.TrimSpace(explanation); explanation != "" {
+		b.WriteString("\n\n")
+		b.WriteString(explanation)
+		return b.String()
+	}
+	if summary := summarizeFixItem(item); summary != "" {
+		b.WriteString("\n\n")
+		b.WriteString(summary)
+	}
+	return b.String()
+}
+
+func summarizeFixItem(item FixItem) string {
+	summary := strings.TrimSpace(item.Summary)
+	if summary == "" {
+		return ""
+	}
+	summary = strings.ReplaceAll(summary, "<!-- looper:stamp v=1 -->", "")
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return ""
+	}
+	if len(summary) > 240 {
+		summary = strings.TrimSpace(summary[:240]) + "…"
+	}
+	lines := strings.Split(summary, "\n")
+	for index, line := range lines {
+		lines[index] = "> " + strings.TrimSpace(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func shortCommitSHA(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 7 {
+		return value
+	}
+	return value[:7]
 }
 
 func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -1971,7 +2230,19 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		if summary == "" {
 			summary = "Unresolved review comment"
 		}
-		result = append(result, FixItem{Type: "comment", ID: id, ThreadID: threadID, Summary: summary})
+		author, _ := stringFromAny(comment["author"])
+		url, _ := stringFromAny(comment["url"])
+		path, _ := stringFromAny(comment["path"])
+		var line int64
+		switch v := comment["line"].(type) {
+		case float64:
+			line = int64(v)
+		case int64:
+			line = v
+		case int:
+			line = int64(v)
+		}
+		result = append(result, FixItem{Type: "comment", ID: id, ThreadID: threadID, Summary: summary, Author: author, URL: url, Path: path, Line: line})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
@@ -2127,6 +2398,9 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
 	)
+	if instruction := buildFixerReplyExplanationInstruction(fixItems); instruction != "" {
+		parts = append(parts, instruction)
+	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "fixer")
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
@@ -2148,6 +2422,31 @@ func customInstructionConfig(value *config.Config) config.Config {
 		return cfg
 	}
 	return *value
+}
+
+// buildFixerReplyExplanationInstruction returns the prompt fragment that asks
+// the agent to provide per-fix-item explanations Looper will use as the body of
+// the auto-reply posted before resolving the review thread. The agent supplies
+// only the explanation; Looper owns the @mention, commit reference, and
+// disclosure stamping.
+func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
+	hasComment := false
+	for _, item := range fixItems {
+		if item.Type == "comment" && item.ID != "" && item.ThreadID != "" {
+			hasComment = true
+			break
+		}
+	}
+	if !hasComment {
+		return ""
+	}
+	return strings.Join([]string{
+		"For each comment-type fix item you actually addressed, include an entry in a top-level `review_thread_replies` array on the final " + agent.CompletionMarker + " JSON line. Each entry must be an object with these fields:",
+		`  - "fixItemId": the exact "id" of the fix item you addressed`,
+		`  - "threadId": the exact "threadId" of the same fix item`,
+		`  - "explanation": one or two sentences (max ~500 chars) describing what you changed and, when relevant, which file(s) or test(s) cover it. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+		"Looper posts the reply itself; do not call any GitHub API or invent URLs. Omit `review_thread_replies` (or any individual entry) if you cannot truthfully describe the fix for that item.",
+	}, "\n")
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
