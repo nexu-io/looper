@@ -2081,6 +2081,28 @@ func TestFindExistingFixerSummaryCommentIDParsesStringID(t *testing.T) {
 	}
 }
 
+func TestFindExistingFixerSummaryCommentIDParsesGraphQLIDFromURL(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202 from issue comment URL", id)
+	}
+}
+
+func TestFindExistingFixerSummaryCommentIDUsesDatabaseID(t *testing.T) {
+	t.Parallel()
+	detail := &checkpointDetail{IssueComments: []map[string]any{
+		{"id": "IC_kwDOExample", "databaseId": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+	}}
+	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
+	if id != 202 {
+		t.Fatalf("findExistingFixerSummaryCommentID() = %d, want 202 from databaseId", id)
+	}
+}
+
 func TestIssueCommentAuthorLoginFallsBackToUser(t *testing.T) {
 	t.Parallel()
 	comment := map[string]any{"user": map[string]any{"login": "looper"}}
@@ -2143,6 +2165,33 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "@alice") {
 		t.Fatalf("summary body missing @author mention:\n%s", body)
+	}
+}
+
+func TestPublishRoundSummaryCommentUpdatesExistingSummaryFromGraphQLID(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := fixerCheckpoint{
+		Detail:           &checkpointDetail{IssueComments: []map[string]any{{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": fixerRoundSummaryMarker("new-head") + "\nold summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}}}},
+		Push:             &checkpointPush{Pushed: true},
+		ReconcileCommits: &checkpointReconcileCommits{FinalHeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "resolved", ReplyState: "sent"}}},
+		FixItemsHash:     "fix-items-hash",
+	}
+	fixItems := []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1", Author: "alice", URL: "https://example/threads/t1", Path: "foo.go", Line: 7}}
+
+	runner.publishRoundSummaryComment(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42, Project: storage.ProjectRecord{RepoPath: t.TempDir()}}, &checkpoint, fixItems, "new-head", map[string]string{"c1": "Capped loop bound and added regression test."})
+
+	if len(github.createIssueComments) != 0 {
+		t.Fatalf("createIssueComments calls = %d, want 0 when reusing prior summary", len(github.createIssueComments))
+	}
+	if len(github.updateIssueComments) != 1 {
+		t.Fatalf("updateIssueComments calls = %d, want 1", len(github.updateIssueComments))
+	}
+	if github.updateIssueComments[0].CommentID != 202 {
+		t.Fatalf("updateIssueComments[0].CommentID = %d, want 202", github.updateIssueComments[0].CommentID)
 	}
 }
 

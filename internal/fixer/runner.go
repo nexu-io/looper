@@ -1972,7 +1972,7 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, truste
 		if !isTrustedFixerSummaryComment(comment, trustedLogin, body) {
 			continue
 		}
-		id := int64FromAny(comment["id"])
+		id := issueCommentDatabaseID(comment)
 		if id == 0 {
 			continue
 		}
@@ -1995,6 +1995,45 @@ func issueCommentAuthorLogin(comment map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func issueCommentDatabaseID(comment map[string]any) int64 {
+	if id := int64FromAny(comment["id"]); id != 0 {
+		return id
+	}
+	for _, key := range []string{"databaseId", "databaseID", "database_id"} {
+		if id := int64FromAny(comment[key]); id != 0 {
+			return id
+		}
+	}
+	for _, key := range []string{"url", "html_url", "htmlUrl"} {
+		raw, _ := stringFromAny(comment[key])
+		if id := issueCommentIDFromURL(raw); id != 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+func issueCommentIDFromURL(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	if fragment := strings.TrimSpace(parsed.Fragment); fragment != "" {
+		if id := int64FromAny(strings.TrimPrefix(fragment, "issuecomment-")); id != 0 {
+			return id
+		}
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) >= 3 && parts[len(parts)-3] == "issues" && parts[len(parts)-2] == "comments" {
+		return int64FromAny(parts[len(parts)-1])
+	}
+	return 0
 }
 
 func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
