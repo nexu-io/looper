@@ -175,6 +175,12 @@ Looper includes an installable agent skill for setup, status, config, daemon lif
 npx skills add ./skills/looper
 ```
 
+Or install it directly from GitHub:
+
+```bash
+npx skills add https://github.com/powerformer/looper/tree/main/skills/looper
+```
+
 See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.
 
 ## Runtime notes
