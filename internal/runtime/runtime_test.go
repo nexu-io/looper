@@ -16,6 +16,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1532,7 +1533,8 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 	}}
 
 	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
-	if err := defaultSyncConfiguredProjects(context.Background(), repositories, cfg, now); err != nil {
+	service := &projects.Service{Repos: repositories, Now: func() time.Time { return now }}
+	if err := defaultSyncConfiguredProjects(context.Background(), service, cfg, now); err != nil {
 		t.Fatalf("defaultSyncConfiguredProjects() error = %v", err)
 	}
 
@@ -2214,7 +2216,8 @@ func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.
 	}
 	cfg.Projects = []config.ProjectRefConfig{project}
 	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
-	if err := defaultSyncConfiguredProjects(ctx, repos, cfg, now); err != nil {
+	service := &projects.Service{Repos: repos, Now: func() time.Time { return now }}
+	if err := defaultSyncConfiguredProjects(ctx, service, cfg, now); err != nil {
 		t.Fatalf("defaultSyncConfiguredProjects() error = %v", err)
 	}
 	stored, err := repos.Projects.GetByID(ctx, project.ID)

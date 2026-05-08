@@ -319,7 +319,12 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			return err
 		}
 
-		metadataJSONValue, err := buildProjectMetadataJSON(existing, project)
+		repo, err := s.detectConfiguredProjectRepo(ctx, existing, project)
+		if err != nil {
+			return fmt.Errorf("detect repo for %s: %w", project.ID, err)
+		}
+
+		metadataJSONValue, err := buildProjectMetadataJSON(existing, project, repo)
 		if err != nil {
 			return fmt.Errorf("build project metadata for %s: %w", project.ID, err)
 		}
@@ -350,6 +355,36 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 
 	return nil
+}
+
+func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *storage.ProjectRecord, project config.ProjectRefConfig) (*string, error) {
+	if s.DetectRepo != nil {
+		detected, err := s.DetectRepo(ctx, project.RepoPath)
+		if err != nil {
+			if existing != nil && existing.RepoPath == project.RepoPath {
+				if repo := stringMetadataPtr(existing.MetadataJSON, "repo"); repo != nil {
+					if s.Logger != nil {
+						s.Logger.Warn("preserving existing project repo metadata after detection failure", map[string]any{"projectId": project.ID, "repoPath": project.RepoPath, "error": err.Error()})
+					}
+					return repo, nil
+				}
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("skipping configured project repo detection after failure", map[string]any{"projectId": project.ID, "repoPath": project.RepoPath, "error": err.Error()})
+			}
+			return nil, nil
+		}
+		detected = strings.TrimSpace(detected)
+		if detected == "" {
+			return nil, nil
+		}
+		return &detected, nil
+	}
+
+	if existing != nil && existing.RepoPath == project.RepoPath {
+		return stringMetadataPtr(existing.MetadataJSON, "repo"), nil
+	}
+	return nil, nil
 }
 
 func normalizeProjectID(input AddInput) string {
@@ -421,7 +456,7 @@ func parseMetadata(metadataJSON *string) map[string]any {
 	return metadata
 }
 
-func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.ProjectRefConfig) (string, error) {
+func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.ProjectRefConfig, repo *string) (string, error) {
 	extras := map[string]json.RawMessage{}
 	repoRaw := json.RawMessage("null")
 
@@ -430,15 +465,7 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		for key, value := range existingMetadata {
 			switch key {
 			case "repo":
-				if existing.RepoPath == project.RepoPath {
-					if repo, ok := value.(string); ok && repo != "" {
-						encoded, err := json.Marshal(repo)
-						if err != nil {
-							return "", err
-						}
-						repoRaw = encoded
-					}
-				}
+				continue
 			case "worktreeRoot", "source":
 				continue
 			default:
@@ -449,6 +476,13 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 				extras[key] = encoded
 			}
 		}
+	}
+	if repo != nil && strings.TrimSpace(*repo) != "" {
+		encoded, err := json.Marshal(strings.TrimSpace(*repo))
+		if err != nil {
+			return "", err
+		}
+		repoRaw = encoded
 	}
 
 	entries := make([]orderedJSONEntry, 0, len(extras)+3)
@@ -548,6 +582,16 @@ func currentISO(now func() time.Time) string {
 		now = time.Now
 	}
 	return eventlog.FormatJavaScriptISOString(now())
+}
+
+func stringMetadataPtr(metadataJSON *string, key string) *string {
+	metadata := parseMetadata(metadataJSON)
+	value, _ := metadata[key].(string)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func stringPointer(value string) *string {
