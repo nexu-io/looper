@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
@@ -669,11 +670,14 @@ func sanitizeReplyExplanation(raw string) string {
 	if cleaned == "" {
 		return ""
 	}
-	// Drop any disclosure marker the agent might have echoed; the adapter is
-	// the only place allowed to stamp.
-	cleaned = strings.ReplaceAll(cleaned, "<!-- looper:stamp v=1 -->", "")
-	// Strip leading @mentions; runner controls whom to ping.
+	// Drop any disclosure marker/footer the agent might have echoed; the adapter
+	// is the only place allowed to stamp.
+	cleaned = disclosure.StripMarkdownStamp(cleaned)
+	// Strip leading mention clusters first so leftover punctuation from copied
+	// greetings does not dominate the sanitized explanation.
 	cleaned = leadingMentionPattern.ReplaceAllString(cleaned, "")
+	// Strip @mentions anywhere; runner controls whom to ping.
+	cleaned = inlineMentionPattern.ReplaceAllString(cleaned, `${1}${2}`)
 	// Strip HTML tags conservatively; review thread bodies are markdown.
 	cleaned = htmlTagPattern.ReplaceAllString(cleaned, "")
 	cleaned = strings.TrimSpace(cleaned)
@@ -689,6 +693,7 @@ func sanitizeReplyExplanation(raw string) string {
 
 var (
 	leadingMentionPattern = regexp.MustCompile(`(?m)^(?:@[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:[,:;]+)?\s*)+`)
+	inlineMentionPattern  = regexp.MustCompile(`(^|[^[:alnum:]])@[A-Za-z0-9][A-Za-z0-9-]{0,38}([^[:alnum:]-]|$)`)
 	htmlTagPattern        = regexp.MustCompile(`</?[A-Za-z][^>]*>`)
 )
 

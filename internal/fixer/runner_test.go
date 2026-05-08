@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
@@ -1876,21 +1877,34 @@ func TestParseReplyExplanationsMalformedFallsBack(t *testing.T) {
 
 func TestSanitizeReplyExplanationStripsDangerousFragments(t *testing.T) {
 	t.Parallel()
-	input := "@looper-bot, @another: <!-- looper:stamp v=1 --> <script>alert(1)</script>Replaced foo with bar."
+	input := "@looper-bot, @another: <!-- looper:stamp v=1 --> <script>alert(1)</script>Replaced foo with bar as requested by @octocat."
 	got := sanitizeReplyExplanation(input)
 	if strings.Contains(got, "@") || strings.Contains(got, "<script") || strings.Contains(got, "looper:stamp") {
 		t.Fatalf("sanitizeReplyExplanation() = %q, did not strip", got)
 	}
-	if !strings.Contains(got, "Replaced foo with bar.") {
+	if !strings.Contains(got, "Replaced foo with bar") {
 		t.Fatalf("sanitizeReplyExplanation() = %q, lost real content", got)
+	}
+}
+
+func TestSanitizeReplyExplanationStripsVisibleDisclosureFooter(t *testing.T) {
+	t.Parallel()
+	stamp := disclosure.Stamper{Config: config.DefaultDisclosureConfig(), Agent: "opencode"}.MarkdownStamp("fixer")
+	input := "Kept the real fix summary.\n\n" + stamp
+	if got := sanitizeReplyExplanation(input); got != "Kept the real fix summary." {
+		t.Fatalf("sanitizeReplyExplanation() = %q, want disclosure-free summary", got)
 	}
 }
 
 func TestSummarizeFixItemSanitizesFallbackSummary(t *testing.T) {
 	t.Parallel()
-	got := summarizeFixItem(FixItem{Summary: "@looper-bot <!-- looper:stamp v=1 --> <b>Clean up</b> the fallback text."})
+	stamp := disclosure.Stamper{Config: config.DefaultDisclosureConfig(), Agent: "opencode"}.MarkdownStamp("fixer")
+	got := summarizeFixItem(FixItem{Summary: "@looper-bot <b>Clean up</b> the fallback text.\n\n" + stamp})
 	if strings.Contains(got, "@") || strings.Contains(got, "<b>") || strings.Contains(got, "looper:stamp") {
 		t.Fatalf("summarizeFixItem() = %q, did not sanitize fallback summary", got)
+	}
+	if strings.Contains(got, "Powered by Looper") || strings.Contains(got, disclosure.Slogan) {
+		t.Fatalf("summarizeFixItem() = %q, leaked disclosure footer", got)
 	}
 	if !strings.Contains(got, "Clean up the fallback text.") {
 		t.Fatalf("summarizeFixItem() = %q, lost sanitized content", got)
