@@ -1375,6 +1375,99 @@ func TestGatewayDetectsCurrentEnterpriseRepository(t *testing.T) {
 	}
 }
 
+func TestGatewayCloseIssueUsesTypedReasonAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api repos/acme/looper/issues/8 --jq .state":
+			return shell.Result{Stdout: "open\n"}, nil
+		case "issue close 8 --repo acme/looper --reason completed":
+			return shell.Result{Stdout: ""}, nil
+		case "api repos/acme/looper/issues/9 --jq .state":
+			return shell.Result{Stdout: "closed\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.CloseIssue(context.Background(), CloseIssueInput{Repo: "acme/looper", IssueNumber: 8, StateReason: " completed "}); err != nil {
+		t.Fatalf("CloseIssue(open) error = %v", err)
+	}
+	if err := gateway.CloseIssue(context.Background(), CloseIssueInput{Repo: "acme/looper", IssueNumber: 9, StateReason: "not_planned"}); err != nil {
+		t.Fatalf("CloseIssue(closed) error = %v", err)
+	}
+	log := strings.Join(runner.calls, "\n")
+	if !strings.Contains(log, "issue close 8 --repo acme/looper --reason completed") {
+		t.Fatalf("gh log missing close issue command\n%s", log)
+	}
+	if strings.Contains(log, "issue close 9 --repo acme/looper") {
+		t.Fatalf("gh log unexpectedly closed an already-closed issue\n%s", log)
+	}
+}
+
+func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr view 42 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "OPEN\n"}, nil
+		case "pr close 42 --repo acme/looper":
+			return shell.Result{Stdout: ""}, nil
+		case "pr view 43 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "CLOSED\n"}, nil
+		case "pr view 44 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "MERGED\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("ClosePullRequest(open) error = %v", err)
+	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 43}); err != nil {
+		t.Fatalf("ClosePullRequest(closed) error = %v", err)
+	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
+		t.Fatalf("ClosePullRequest(merged) error = %v", err)
+	}
+	log := strings.Join(runner.calls, "\n")
+	if !strings.Contains(log, "pr close 42 --repo acme/looper") {
+		t.Fatalf("gh log missing close pr command\n%s", log)
+	}
+	if strings.Contains(log, "pr close 43 --repo acme/looper") {
+		t.Fatalf("gh log unexpectedly closed an already-closed pr\n%s", log)
+	}
+	if strings.Contains(log, "pr close 44 --repo acme/looper") {
+		t.Fatalf("gh log unexpectedly closed an already-merged pr\n%s", log)
+	}
+	if strings.Contains(log, "--delete-branch") {
+		t.Fatalf("gh log unexpectedly included destructive flags\n%s", log)
+	}
+}
+
+func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.CloseIssue(context.Background(), CloseIssueInput{Repo: "acme/looper", IssueNumber: 8, StateReason: "bogus"})
+	if err == nil || !strings.Contains(err.Error(), "invalid issue close reason") {
+		t.Fatalf("CloseIssue() error = %v, want invalid reason error", err)
+	}
+}
+
 func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

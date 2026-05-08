@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -49,10 +50,10 @@ type workerScheduler interface {
 }
 
 type sweeperScheduler interface {
-	DiscoverIssues(context.Context, string, string) error
-	DiscoverPullRequests(context.Context, string, string) error
-	DiscoverReconcile(context.Context, string, string) error
-	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) error
+	DiscoverIssues(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	DiscoverPullRequests(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	DiscoverReconcile(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*sweeper.ProcessResult, error)
 }
 
 type snapshotScheduler interface {
@@ -898,6 +899,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, Logger: logger, Now: now, Config: &cfg})
 
 	return func(ctx context.Context, services Services) error {
 		var runner schedulerAsyncRunner
@@ -1035,9 +1037,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
-			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, input.Sweeper.DiscoverIssues(ctx, project.ID, repo)))
-			appendErr(wrapSchedulerError("sweeper pull request discovery", project.ID, repo, input.Sweeper.DiscoverPullRequests(ctx, project.ID, repo)))
-			appendErr(wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, input.Sweeper.DiscoverReconcile(ctx, project.ID, repo)))
+			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, err))
+			_, err = input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper pull request discovery", project.ID, repo, err))
+			_, err = input.Sweeper.DiscoverReconcile(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, err))
 		} else if input.Sweeper != nil && input.Logger != nil {
 			input.Logger.Debug("sweeper auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
@@ -1175,7 +1180,8 @@ func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedule
 			return nil, fmt.Errorf("sweeper runner is not configured")
 		}
 		return func(ctx context.Context) error {
-			return wrapSchedulerQueueError(item.Type, input.Sweeper.ProcessClaimedQueueItem(ctx, item))
+			_, err := input.Sweeper.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	case "snapshot":
 		if input.Snapshotter == nil || input.Repos == nil || input.Repos.Queue == nil || input.Repos.PullRequestSnapshots == nil {

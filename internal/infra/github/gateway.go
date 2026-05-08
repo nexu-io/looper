@@ -133,6 +133,19 @@ type UpdateIssueCommentInput struct {
 	CWD       string
 }
 
+type CloseIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	StateReason string
+	CWD         string
+}
+
+type ClosePullRequestInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
 type SubmitReviewInput struct {
 	Repo       string
 	PRNumber   int64
@@ -556,6 +569,29 @@ func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueComme
 	return err
 }
 
+func (g *Gateway) CloseIssue(ctx context.Context, input CloseIssueInput) error {
+	reason, err := validateCloseIssueStateReason(input.StateReason)
+	if err != nil {
+		return err
+	}
+	state, err := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if err != nil {
+		return err
+	}
+	if state == "closed" {
+		return nil
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "issue", "close", strconv.FormatInt(input.IssueNumber, 10), "--repo", input.Repo, "--reason", reason)
+	if err == nil {
+		return nil
+	}
+	state, stateErr := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if stateErr == nil && state == "closed" {
+		return nil
+	}
+	return err
+}
+
 func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
 	assignees := compactIssueAssignees(input.Assignees)
 	if len(assignees) == 0 {
@@ -614,6 +650,25 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Reviews:        toObjectSlice(row["reviews"]),
 		Checks:         toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestInput) error {
+	state, err := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
+	if err != nil {
+		return err
+	}
+	if state == "closed" || state == "merged" {
+		return nil
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	state, stateErr := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
+	if stateErr == nil && (state == "closed" || state == "merged") {
+		return nil
+	}
+	return err
 }
 
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
@@ -1847,6 +1902,32 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 		out["body"] = body
 	}
 	return out, true
+}
+
+func validateCloseIssueStateReason(value string) (string, error) {
+	normalized := strings.TrimSpace(value)
+	switch normalized {
+	case "completed", "not_planned":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("invalid issue close reason %q", value)
+	}
+}
+
+func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber int64, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "api", fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber), "--jq", ".state")
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
+}
+
+func (g *Gateway) viewPullRequestState(ctx context.Context, repo string, prNumber int64, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "pr", "view", strconv.FormatInt(prNumber, 10), "--repo", repo, "--json", "state", "--jq", ".state")
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
 }
 
 func normalizeReaction(value any) (githubReaction, bool) {

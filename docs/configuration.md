@@ -195,6 +195,35 @@ Example minimal `~/.looper/config.json`:
         "labelMode": "all",
         "requireAssigneeCurrentUser": true
       }
+    },
+    "sweeper": {
+      "autoDiscovery": false,
+      "dryRun": true,
+      "triggers": {
+        "includeIssues": true,
+        "includePullRequests": true,
+        "includeDrafts": false,
+        "excludeLabels": ["pinned", "security", "looper:sweep-keep"],
+        "excludeAuthors": [],
+        "excludeAuthorAssociations": ["OWNER", "MEMBER", "COLLABORATOR"],
+        "looperInternalLabels": ["looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"],
+        "reopenCooldownDays": 30,
+        "maxPerTick": 10
+      },
+      "lifecycle": {
+        "pendingLabel": "looper:sweep-pending",
+        "closedLabel": "looper:swept",
+        "keepLabel": "looper:sweep-keep"
+      },
+      "limits": {
+        "maxWarningsPerRepoPerDay": 25,
+        "maxClosesPerRepoPerDay": 25,
+        "globalKillSwitch": false
+      },
+      "security": {
+        "quarantineLabel": "looper:sweeper-route-security",
+        "notifyAssignees": []
+      }
     }
   },
   "projects": [
@@ -216,6 +245,8 @@ Example minimal `~/.looper/config.json`:
   ]
 }
 ```
+
+`roles.sweeper.autoDiscovery` defaults to `false` and `roles.sweeper.dryRun` defaults to `true`, so the sweeper role stays opt-in and observe-only until you explicitly enable it.
 
 ## Daemon supervision
 
@@ -453,7 +484,7 @@ To restore it by default for all project additions:
 
 ### `roles`
 
-The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
+The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, worker, and sweeper. It does not block manual commands, direct processing, retries, or already queued work.
 
 Defaults preserve Looper's historical behavior:
 
@@ -461,6 +492,7 @@ Defaults preserve Looper's historical behavior:
 - worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
 - reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
 - fixer discovers open non-draft PRs authored by the current user that have actionable review items
+- sweeper is opt-in (`autoDiscovery=false`) and dry-run by default; the current implementation wires the runner skeleton and config surface, while the full warn/close lifecycle lands in a later task
 
 Common fields:
 
@@ -508,7 +540,7 @@ Examples:
 
 Project entries can override supported role settings with `projects[].roles`. Looper resolves these values as built-in defaults → global config/env/CLI `roles` → matching `projects[].roles`; fields omitted from a project role fall back to the effective global role value. Set a project role `instructions` value to an empty string to clear inherited global role instructions for that project.
 
-Supported project role keys match the global role keys for the built-in roles: `planner`, `worker`, `reviewer`, and `fixer`. Unknown role keys are rejected during config loading. The initially role-overridable settings are auto-discovery, trigger settings, reviewer spec-review label settings, and role instructions. Project role overrides affect scheduler auto-discovery and the role-specific eligibility checks that use those same trigger settings for the matching project.
+Supported project role keys match the global role keys for the built-in roles: `planner`, `worker`, `reviewer`, `fixer`, and `sweeper`. Unknown role keys are rejected during config loading. The initially role-overridable settings are auto-discovery, trigger settings, reviewer spec-review label settings, and role instructions. Project role overrides affect scheduler auto-discovery and the role-specific eligibility checks that use those same trigger settings for the matching project.
 
 ### `projects`
 
@@ -519,7 +551,7 @@ Each entry registers a repo that `looper` can target.
 - `repoPath`: absolute repository path
 - `baseBranch`: optional per-project override
 - `worktreeRoot`: optional per-project worktree root
-- `roles`: optional per-project role overrides for `planner`, `worker`, `reviewer`, and `fixer`; absent fields fall back to global `roles`
+- `roles`: optional per-project role overrides for `planner`, `worker`, `reviewer`, `fixer`, and `sweeper`; absent fields fall back to global `roles`
 
 Example:
 

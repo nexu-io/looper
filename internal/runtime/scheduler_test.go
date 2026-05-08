@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -840,32 +841,32 @@ type stubSweeperScheduler struct {
 	processErr               error
 }
 
-func (s *stubSweeperScheduler) DiscoverIssues(_ context.Context, projectID, repo string) error {
+func (s *stubSweeperScheduler) DiscoverIssues(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
 	s.mu.Lock()
-	s.issueDiscoverCalls = append(s.issueDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: projectID, Repo: repo})
+	s.issueDiscoverCalls = append(s.issueDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
 	s.mu.Unlock()
-	return s.discoverErr
+	return sweeper.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubSweeperScheduler) DiscoverPullRequests(_ context.Context, projectID, repo string) error {
+func (s *stubSweeperScheduler) DiscoverPullRequests(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
 	s.mu.Lock()
-	s.pullRequestDiscoverCalls = append(s.pullRequestDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: projectID, Repo: repo})
+	s.pullRequestDiscoverCalls = append(s.pullRequestDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
 	s.mu.Unlock()
-	return s.discoverErr
+	return sweeper.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubSweeperScheduler) DiscoverReconcile(_ context.Context, projectID, repo string) error {
+func (s *stubSweeperScheduler) DiscoverReconcile(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
 	s.mu.Lock()
-	s.reconcileDiscoverCalls = append(s.reconcileDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: projectID, Repo: repo})
+	s.reconcileDiscoverCalls = append(s.reconcileDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
 	s.mu.Unlock()
-	return s.discoverErr
+	return sweeper.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubSweeperScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) error {
+func (s *stubSweeperScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*sweeper.ProcessResult, error) {
 	s.mu.Lock()
 	s.processedItems = append(s.processedItems, queueItem.ID)
 	s.mu.Unlock()
-	return s.processErr
+	return &sweeper.ProcessResult{QueueItemID: queueItem.ID, Status: "skipped"}, s.processErr
 }
 
 func (s *stubSweeperScheduler) processItemCount() int {
