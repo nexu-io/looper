@@ -23,11 +23,11 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			runner.stdin = options.Stdin
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr list"):
-			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
+			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"authorAssociation":"MEMBER","reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
 		case strings.HasPrefix(args, "issue list"):
-			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
+			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"authorAssociation":"OWNER","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
-			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","user":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -35,7 +35,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"authorAssociation":"CONTRIBUTOR","reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.ts b/a.ts\n"}, nil
 		case strings.HasPrefix(args, "api user"):
@@ -150,6 +150,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if got := prs[0].ReviewRequests; len(got) != 1 || got[0] != "OctoCat" {
 		t.Fatalf("prs[0].ReviewRequests = %#v, want [OctoCat]", got)
 	}
+	if prs[0].AuthorAssociation != "MEMBER" {
+		t.Fatalf("prs[0].AuthorAssociation = %q, want MEMBER", prs[0].AuthorAssociation)
+	}
 	if prs[0].BaseSHA != "def456" || !prs[0].HasConflicts {
 		t.Fatalf("prs[0] = %#v, want base sha and conflict state", prs[0])
 	}
@@ -159,11 +162,17 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if got := issues[0].Labels; len(got) != 2 || got[0] != "phase-1" || got[1] != "gateway" {
 		t.Fatalf("issues[0].Labels = %#v, want [phase-1 gateway]", got)
 	}
+	if issues[0].AuthorAssociation != "OWNER" {
+		t.Fatalf("issues[0].AuthorAssociation = %q, want OWNER", issues[0].AuthorAssociation)
+	}
 	if issueDetail.Number != 8 {
 		t.Fatalf("issueDetail.Number = %d, want 8", issueDetail.Number)
 	}
 	if issueDetail.State != "open" || issueDetail.IsPullRequest {
 		t.Fatalf("issueDetail = %#v, want open issue not pull request", issueDetail)
+	}
+	if issueDetail.AuthorAssociation != "COLLABORATOR" {
+		t.Fatalf("issueDetail.AuthorAssociation = %q, want COLLABORATOR", issueDetail.AuthorAssociation)
 	}
 	if comment.ID != 91 || comment.URL != "https://example.test/issues/8#issuecomment-91" {
 		t.Fatalf("comment = %#v, want parsed issue comment metadata", comment)
@@ -176,6 +185,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	}
 	if got := detail.ReviewRequests; len(got) != 1 || got[0] != "reviewer" {
 		t.Fatalf("detail.ReviewRequests = %#v, want [reviewer]", got)
+	}
+	if detail.AuthorAssociation != "CONTRIBUTOR" {
+		t.Fatalf("detail.AuthorAssociation = %q, want CONTRIBUTOR", detail.AuthorAssociation)
 	}
 	if !detail.HasConflicts {
 		t.Fatal("detail.HasConflicts = false, want true")
@@ -1473,7 +1485,7 @@ func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,reviews,mergeStateStatus" {
+		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,authorAssociation,reviewRequests,reviews,mergeStateStatus" {
 			t.Fatalf("gh args = %q, want repeated label filters", args)
 		}
 		return shell.Result{Stdout: `[]`}, nil
@@ -1490,7 +1502,7 @@ func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label bug --label priority --json number,title,body,url,state,author,assignees,labels" {
+		if args != "issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label bug --label priority --json number,title,body,url,state,author,authorAssociation,assignees,labels" {
 			t.Fatalf("gh args = %q, want repeated label filters", args)
 		}
 		return shell.Result{Stdout: `[]`}, nil

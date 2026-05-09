@@ -64,6 +64,77 @@ func TestDiscoverIssuesEnqueuesWarnAndCloseCandidates(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsWhenIssueLaneDisabled(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.IncludeIssues = false
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Skipped != 1 || len(result.QueueItems) != 0 {
+		t.Fatalf("DiscoverIssues() = %#v, want one skipped result with no queue items", result)
+	}
+	if fixture.github.listIssuesCalls != 0 {
+		t.Fatalf("ListOpenIssues() calls = %d, want 0", fixture.github.listIssuesCalls)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsWhenPRLaneDisabled(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.IncludePullRequests = false
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo"}}
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if result.Skipped != 1 || len(result.QueueItems) != 0 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want one skipped result with no queue items", result)
+	}
+	if fixture.github.listPRCalls != 0 {
+		t.Fatalf("ListOpenPullRequests() calls = %d, want 0", fixture.github.listPRCalls)
+	}
+}
+
+func TestDiscoverIssuesHonorsDailyWarnAndCloseLimits(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Limits.MaxWarningsPerRepoPerDay = 1
+	fixture.cfg.Roles.Sweeper.Limits.MaxClosesPerRepoPerDay = 1
+	fixture.github.issues = []githubinfra.IssueSummary{
+		{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: nil},
+		{Number: 2, Title: "pending bug", Body: "already warned", Author: "octo", Labels: []string{"looper:sweep-pending"}},
+	}
+	priorWarn := mustMarshalPayload(sweeperPayload{Phase: "warn", Outcome: outcomePending, Repo: "acme/looper", TargetType: "issue", TargetNumber: 9})
+	priorClose := mustMarshalPayload(sweeperPayload{Phase: "close", Outcome: outcomeClosed, Repo: "acme/looper", TargetType: "issue", TargetNumber: 10})
+	closeState := mustMarshalPayload(sweeperPayload{Phase: "warn", Outcome: outcomePending, Repo: "acme/looper", TargetType: "issue", TargetNumber: 2, CloseBy: fixture.now.Add(-24 * time.Hour).Format(javaScriptISOStringUTC)})
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "prior-warn", ProjectID: stringPtr(fixture.projectID), Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#9", Repo: stringPtr("acme/looper"), DedupeKey: "done:warn:9", Priority: 1, Status: "completed", AvailableAt: fixture.nowISO, PayloadJSON: &priorWarn, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO},
+		{ID: "prior-close", ProjectID: stringPtr(fixture.projectID), Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#10", Repo: stringPtr("acme/looper"), DedupeKey: "done:close:10", Priority: 1, Status: "completed", AvailableAt: fixture.nowISO, PayloadJSON: &priorClose, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO},
+		{ID: "close-state", ProjectID: stringPtr(fixture.projectID), Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#2", Repo: stringPtr("acme/looper"), DedupeKey: "done:warn:2", Priority: 1, Status: "completed", AvailableAt: fixture.nowISO, PayloadJSON: &closeState, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO},
+	} {
+		item := item
+		if err := fixture.repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert() error = %v", err)
+		}
+	}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none after daily budgets exhausted", result.QueueItems)
+	}
+}
+
 func TestProcessWarnPostsWarningAndMarksPending(t *testing.T) {
 	t.Parallel()
 
@@ -153,6 +224,52 @@ func TestProcessReconcileCancelsWhenPendingLabelRemoved(t *testing.T) {
 	}
 }
 
+func TestProcessReconcileKeepsWarnPhaseWhilePendingLabelRemains(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	payloadJSON := mustMarshalPayload(sweeperPayload{Phase: "warn", Outcome: outcomePending, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, WarningCommentID: 123, CommentBody: "warning"})
+	fixture.github.issueDetails["acme/looper#7"] = githubinfra.IssueDetail{Number: 7, Title: "Bug", Body: "stale", State: "open", Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	queueID := "queue_sweeper_reconcile_pending"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeReconcile, TargetType: "issue", TargetID: "acme/looper#7", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:reconcile:acme/looper#7", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeReconcile})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want skipped result", result)
+	}
+	stored, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if payload := fixture.runner.readPayload(*stored); payload.Phase != "warn" || payload.Outcome != outcomePending {
+		t.Fatalf("payload = %#v, want warn phase with pending outcome preserved", payload)
+	}
+	if len(fixture.github.updatedComments) != 0 {
+		t.Fatalf("updatedComments = %#v, want none while pending label remains", fixture.github.updatedComments)
+	}
+}
+
+func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", AuthorAssociation: "OWNER"}}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want excluded association to be skipped", result)
+	}
+}
+
 func TestProcessClaimedQueueItemRejectsUnsupportedQueueType(t *testing.T) {
 	t.Parallel()
 
@@ -217,6 +334,8 @@ type stubGitHub struct {
 	prs             []githubinfra.PullRequestSummary
 	issueDetails    map[string]githubinfra.IssueDetail
 	prDetails       map[string]githubinfra.PullRequestDetail
+	listIssuesCalls int
+	listPRCalls     int
 	createdComments []githubinfra.IssueCommentInput
 	updatedComments []githubinfra.UpdateIssueCommentInput
 	closedIssues    []githubinfra.CloseIssueInput
@@ -226,10 +345,12 @@ type stubGitHub struct {
 }
 
 func (g *stubGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+	g.listIssuesCalls++
 	return append([]githubinfra.IssueSummary(nil), g.issues...), nil
 }
 
 func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	g.listPRCalls++
 	return append([]githubinfra.PullRequestSummary(nil), g.prs...), nil
 }
 

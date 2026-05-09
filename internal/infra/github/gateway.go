@@ -49,43 +49,45 @@ type Gateway struct {
 }
 
 type PullRequestSummary struct {
-	Number         int64
-	Title          string
-	URL            string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadRefName    string
-	BaseRefName    string
-	HeadSHA        string
-	BaseSHA        string
-	HasConflicts   bool
-	Author         string
-	ReviewRequests []string
-	Reviews        []map[string]any
+	Number            int64
+	Title             string
+	URL               string
+	State             string
+	IsDraft           bool
+	ReviewDecision    string
+	Labels            []string
+	HeadRefName       string
+	BaseRefName       string
+	HeadSHA           string
+	BaseSHA           string
+	HasConflicts      bool
+	Author            string
+	AuthorAssociation string
+	ReviewRequests    []string
+	Reviews           []map[string]any
 }
 
 type PullRequestDetail struct {
-	Number         int64
-	Title          string
-	Body           string
-	URL            string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadRefName    string
-	BaseRefName    string
-	HeadSHA        string
-	BaseSHA        string
-	Author         string
-	ReviewRequests []string
-	HasConflicts   bool
-	Comments       []map[string]any
-	IssueComments  []map[string]any
-	Reviews        []map[string]any
-	Checks         []map[string]any
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	IsDraft           bool
+	ReviewDecision    string
+	Labels            []string
+	HeadRefName       string
+	BaseRefName       string
+	HeadSHA           string
+	BaseSHA           string
+	Author            string
+	AuthorAssociation string
+	ReviewRequests    []string
+	HasConflicts      bool
+	Comments          []map[string]any
+	IssueComments     []map[string]any
+	Reviews           []map[string]any
+	Checks            []map[string]any
 }
 
 type PullRequestHeadAndAuthor struct {
@@ -94,15 +96,16 @@ type PullRequestHeadAndAuthor struct {
 }
 
 type IssueSummary struct {
-	Number        int64
-	Title         string
-	Body          string
-	URL           string
-	State         string
-	Author        string
-	Assignees     []string
-	Labels        []string
-	IsPullRequest bool
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	Author            string
+	AuthorAssociation string
+	Assignees         []string
+	Labels            []string
+	IsPullRequest     bool
 }
 
 type IssueDetail = IssueSummary
@@ -398,7 +401,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -415,21 +418,22 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	out := make([]PullRequestSummary, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, PullRequestSummary{
-			Number:         asInt64(row["number"]),
-			Title:          asString(row["title"]),
-			URL:            asString(row["url"]),
-			State:          asString(row["state"]),
-			IsDraft:        asBool(row["isDraft"]),
-			ReviewDecision: asString(row["reviewDecision"]),
-			Labels:         extractLabelNames(row["labels"]),
-			HeadRefName:    asString(row["headRefName"]),
-			BaseRefName:    asString(row["baseRefName"]),
-			HeadSHA:        asString(row["headRefOid"]),
-			BaseSHA:        asString(row["baseRefOid"]),
-			HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
-			Author:         extractAuthor(row["author"]),
-			ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
-			Reviews:        toObjectSlice(row["reviews"]),
+			Number:            asInt64(row["number"]),
+			Title:             asString(row["title"]),
+			URL:               asString(row["url"]),
+			State:             asString(row["state"]),
+			IsDraft:           asBool(row["isDraft"]),
+			ReviewDecision:    asString(row["reviewDecision"]),
+			Labels:            extractLabelNames(row["labels"]),
+			HeadRefName:       asString(row["headRefName"]),
+			BaseRefName:       asString(row["baseRefName"]),
+			HeadSHA:           asString(row["headRefOid"]),
+			BaseSHA:           asString(row["baseRefOid"]),
+			HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
+			Author:            extractAuthor(row["author"]),
+			AuthorAssociation: asString(row["authorAssociation"]),
+			ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
+			Reviews:           toObjectSlice(row["reviews"]),
 		})
 	}
 	return out, nil
@@ -489,7 +493,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "authorAssociation", "assignees", "labels"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
@@ -502,14 +506,15 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	out := make([]IssueSummary, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IssueSummary{
-			Number:    asInt64(row["number"]),
-			Title:     asString(row["title"]),
-			Body:      asString(row["body"]),
-			URL:       asString(row["url"]),
-			State:     asString(row["state"]),
-			Author:    extractAuthor(row["author"]),
-			Assignees: extractActorLogins(row["assignees"]),
-			Labels:    extractLabelNames(row["labels"]),
+			Number:            asInt64(row["number"]),
+			Title:             asString(row["title"]),
+			Body:              asString(row["body"]),
+			URL:               asString(row["url"]),
+			State:             asString(row["state"]),
+			Author:            extractAuthor(row["author"]),
+			AuthorAssociation: asString(row["authorAssociation"]),
+			Assignees:         extractActorLogins(row["assignees"]),
+			Labels:            extractLabelNames(row["labels"]),
 		})
 	}
 	return out, nil
@@ -547,15 +552,16 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		return IssueDetail{}, err
 	}
 	return IssueDetail{
-		Number:        asInt64(row["number"]),
-		Title:         asString(row["title"]),
-		Body:          asString(row["body"]),
-		URL:           firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
-		State:         asString(row["state"]),
-		Author:        extractAuthor(firstNonNil(row["user"], row["author"])),
-		Assignees:     extractActorLogins(row["assignees"]),
-		Labels:        extractLabelNames(row["labels"]),
-		IsPullRequest: row["pull_request"] != nil,
+		Number:            asInt64(row["number"]),
+		Title:             asString(row["title"]),
+		Body:              asString(row["body"]),
+		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
+		State:             asString(row["state"]),
+		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
+		AuthorAssociation: asString(row["author_association"]),
+		Assignees:         extractActorLogins(row["assignees"]),
+		Labels:            extractLabelNames(row["labels"]),
+		IsPullRequest:     row["pull_request"] != nil,
 	}, nil
 }
 
@@ -656,7 +662,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -669,25 +675,26 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		return PullRequestDetail{}, err
 	}
 	return PullRequestDetail{
-		Number:         asInt64(row["number"]),
-		Title:          asString(row["title"]),
-		Body:           asString(row["body"]),
-		URL:            asString(row["url"]),
-		State:          asString(row["state"]),
-		IsDraft:        asBool(row["isDraft"]),
-		ReviewDecision: asString(row["reviewDecision"]),
-		Labels:         extractLabelNames(row["labels"]),
-		HeadRefName:    asString(row["headRefName"]),
-		BaseRefName:    asString(row["baseRefName"]),
-		HeadSHA:        asString(row["headRefOid"]),
-		BaseSHA:        asString(row["baseRefOid"]),
-		Author:         extractAuthor(row["author"]),
-		ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
-		HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
-		Comments:       threads,
-		IssueComments:  toObjectSlice(row["comments"]),
-		Reviews:        toObjectSlice(row["reviews"]),
-		Checks:         toObjectSlice(row["statusCheckRollup"]),
+		Number:            asInt64(row["number"]),
+		Title:             asString(row["title"]),
+		Body:              asString(row["body"]),
+		URL:               asString(row["url"]),
+		State:             asString(row["state"]),
+		IsDraft:           asBool(row["isDraft"]),
+		ReviewDecision:    asString(row["reviewDecision"]),
+		Labels:            extractLabelNames(row["labels"]),
+		HeadRefName:       asString(row["headRefName"]),
+		BaseRefName:       asString(row["baseRefName"]),
+		HeadSHA:           asString(row["headRefOid"]),
+		BaseSHA:           asString(row["baseRefOid"]),
+		Author:            extractAuthor(row["author"]),
+		AuthorAssociation: asString(row["authorAssociation"]),
+		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
+		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
+		Comments:          threads,
+		IssueComments:     toObjectSlice(row["comments"]),
+		Reviews:           toObjectSlice(row["reviews"]),
+		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
 }
 

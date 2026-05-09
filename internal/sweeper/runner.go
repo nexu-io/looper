@@ -257,6 +257,9 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 	if project.Archived || !roleCfg.AutoDiscovery {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	if !roleCfg.Triggers.IncludeIssues {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	if r.github == nil {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
@@ -268,8 +271,10 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	warnLimit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
-	closeLimit := warnLimit * 3
+	warnLimit, closeLimit, err := r.discoveryBudgets(ctx, input, roleCfg)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{QueueItems: make([]storage.QueueItemRecord, 0, warnLimit+closeLimit)}
 	warnCount := 0
 	closeCount := 0
@@ -278,7 +283,7 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			continue
 		}
 		targetID := buildTargetID(input.Repo, issue.Number)
-		if r.shouldSkipSummary(issue.Labels, issue.Author, roleCfg) {
+		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -320,6 +325,9 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 	if project.Archived || !roleCfg.AutoDiscovery {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	if !roleCfg.Triggers.IncludePullRequests {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	if r.github == nil {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
@@ -331,8 +339,10 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	warnLimit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
-	closeLimit := warnLimit * 3
+	warnLimit, closeLimit, err := r.discoveryBudgets(ctx, input, roleCfg)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{QueueItems: make([]storage.QueueItemRecord, 0, warnLimit+closeLimit)}
 	warnCount := 0
 	closeCount := 0
@@ -342,7 +352,7 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			continue
 		}
 		targetID := buildTargetID(input.Repo, pr.Number)
-		if r.shouldSkipSummary(pr.Labels, pr.Author, roleCfg) {
+		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -577,11 +587,11 @@ func (r *Runner) processReconcile(ctx context.Context, queueItem storage.QueueIt
 	if err != nil {
 		return payload, "failed", "", err
 	}
-	payload.Phase = "reconcile"
 	if hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
 		payload.Summary = "sweeper reconcile: still pending"
 		return payload, "skipped", payload.Summary, nil
 	}
+	payload.Phase = "reconcile"
 	if payload.WarningCommentID > 0 && !roleCfg.DryRun {
 		_ = r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: derefString(queueItem.Repo), CommentID: payload.WarningCommentID, Body: payload.CommentBody + "\n\nCancellation acknowledged because the pending label was removed."})
 	}
@@ -659,7 +669,7 @@ func gracePeriodForCategory(category string, roleCfg config.SweeperRoleConfig) i
 	}
 }
 
-func (r *Runner) shouldSkipSummary(labels []string, author string, roleCfg config.SweeperRoleConfig) bool {
+func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, roleCfg config.SweeperRoleConfig) bool {
 	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabel(labels, roleCfg.Triggers.LooperInternalLabels) || hasLabel(labels, roleCfg.Security.QuarantineLabel) || hasLabel(labels, roleCfg.Lifecycle.ClosedLabel) {
 		return true
 	}
@@ -668,7 +678,67 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, roleCfg confi
 			return true
 		}
 	}
+	for _, excluded := range roleCfg.Triggers.ExcludeAuthorAssociations {
+		if strings.EqualFold(strings.TrimSpace(excluded), strings.TrimSpace(authorAssociation)) {
+			return true
+		}
+	}
 	return false
+}
+
+func (r *Runner) discoveryBudgets(ctx context.Context, input DiscoveryInput, roleCfg config.SweeperRoleConfig) (int, int, error) {
+	warnLimit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
+	closeLimit := warnLimit * 3
+	remainingWarn, remainingClose, err := r.remainingDailyDiscoveryBudget(ctx, input.Repo, roleCfg)
+	if err != nil {
+		return 0, 0, err
+	}
+	if warnLimit > remainingWarn {
+		warnLimit = remainingWarn
+	}
+	if closeLimit > remainingClose {
+		closeLimit = remainingClose
+	}
+	if warnLimit < 0 {
+		warnLimit = 0
+	}
+	if closeLimit < 0 {
+		closeLimit = 0
+	}
+	return warnLimit, closeLimit, nil
+}
+
+func (r *Runner) remainingDailyDiscoveryBudget(ctx context.Context, repo string, roleCfg config.SweeperRoleConfig) (int, int, error) {
+	if r.repos == nil || r.repos.Queue == nil {
+		return 0, 0, fmt.Errorf("sweeper queue repository is not configured")
+	}
+	items, err := r.repos.Queue.List(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	today := r.now().UTC().Format("2006-01-02")
+	warnUsed := 0
+	closeUsed := 0
+	for _, item := range items {
+		if derefString(item.Repo) != repo || !strings.HasPrefix(item.CreatedAt, today) {
+			continue
+		}
+		switch item.Type {
+		case QueueTypeWarn:
+			warnUsed++
+		case QueueTypeClose:
+			closeUsed++
+		}
+	}
+	return remainingCount(roleCfg.Limits.MaxWarningsPerRepoPerDay, warnUsed), remainingCount(roleCfg.Limits.MaxClosesPerRepoPerDay, closeUsed), nil
+}
+
+func remainingCount(limit, used int) int {
+	remaining := limit - used
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func (r *Runner) latestSweeperState(ctx context.Context) (map[string]sweeperPayload, error) {
