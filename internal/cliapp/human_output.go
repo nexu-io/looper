@@ -470,9 +470,6 @@ func shouldDefaultLoopLogsToStderr(data loopLogsOutput) bool {
 	if data.Agent == nil {
 		return false
 	}
-	if strings.TrimSpace(data.Agent.Vendor) != "codex" {
-		return false
-	}
 	return strings.TrimSpace(data.Agent.Stdout) == "" && strings.TrimSpace(data.Agent.Stderr) != ""
 }
 

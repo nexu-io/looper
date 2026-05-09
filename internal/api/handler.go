@@ -2442,9 +2442,6 @@ func shouldDefaultLoopLogsStreamToStderr(resp loopLogsResponse) bool {
 	if resp.Agent == nil {
 		return false
 	}
-	if strings.TrimSpace(resp.Agent.Vendor) != "codex" {
-		return false
-	}
 	return strings.TrimSpace(resp.Agent.Stdout) == "" && strings.TrimSpace(resp.Agent.Stderr) != ""
 }
 
