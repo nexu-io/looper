@@ -1624,7 +1624,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	}
 	branch := reviewerWorktreeBranch(input.PRNumber, checkpoint)
 	baseBranch := firstNonEmpty(strings.TrimSpace(checkpoint.Detail.BaseRefName), derefString(input.Project.BaseBranch), "main")
-	prRef := pullRequestHeadRef(input.PRNumber)
+	headSHA := checkpoint.Snapshot.HeadSHA
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
 	if worktreeRoot == "" {
@@ -1655,7 +1655,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 	}
-	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: headSHA, ExpectedHeadSHA: headSHA})
 	if err != nil {
 		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 		if errors.As(err, &remoteHeadChanged) {
@@ -4631,10 +4631,6 @@ func reviewerWorktreeBranch(prNumber int64, checkpoint reviewerCheckpoint) strin
 		}
 	}
 	return fmt.Sprintf("pr-%d-head", prNumber)
-}
-
-func pullRequestHeadRef(prNumber int64) string {
-	return fmt.Sprintf("refs/pull/%d/head", prNumber)
 }
 
 func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {

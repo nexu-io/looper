@@ -4013,8 +4013,11 @@ func TestProcessClaimedItemRunsReviewerInDedicatedWorktree(t *testing.T) {
 	if git.prepareCalls[0].Branch != "pr-42-head" {
 		t.Fatalf("prepare branch = %q, want PR-scoped branch", git.prepareCalls[0].Branch)
 	}
-	if git.prepareCalls[0].Ref != "refs/pull/42/head" {
-		t.Fatalf("prepare ref = %q, want PR head ref", git.prepareCalls[0].Ref)
+	if git.prepareCalls[0].Ref != "abc123" {
+		t.Fatalf("prepare ref = %q, want head SHA from snapshot", git.prepareCalls[0].Ref)
+	}
+	if git.prepareCalls[0].ExpectedHeadSHA != "abc123" {
+		t.Fatalf("prepare expectedHeadSHA = %q, want head SHA from snapshot", git.prepareCalls[0].ExpectedHeadSHA)
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
@@ -4069,8 +4072,8 @@ func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T)
 	if len(git.prepareCalls) != 1 {
 		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
 	}
-	if git.prepareCalls[0].Ref != "refs/pull/42/head" {
-		t.Fatalf("prepare ref = %q, want PR head ref", git.prepareCalls[0].Ref)
+	if git.prepareCalls[0].Ref != "abc123" {
+		t.Fatalf("prepare ref = %q, want head SHA from snapshot", git.prepareCalls[0].Ref)
 	}
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Branch != "pr-42-head" {
 		t.Fatalf("checkpoint worktree = %#v, want fallback branch", checkpoint.Worktree)
