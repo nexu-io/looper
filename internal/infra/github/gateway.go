@@ -121,6 +121,13 @@ type IssueAssigneesInput struct {
 	CWD         string
 }
 
+type IssueLabelsInput struct {
+	Repo        string
+	IssueNumber int64
+	Labels      []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -603,6 +610,38 @@ func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInp
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
+}
+
+func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) error {
+	if len(input.Labels) == 0 {
+		return nil
+	}
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+		return err
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.IssueNumber), "--method", "POST"}
+	for _, label := range input.Labels {
+		args = append(args, "-f", "labels[]="+label)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput) error {
+	if len(input.Labels) == 0 {
+		return nil
+	}
+	for _, label := range input.Labels {
+		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE")
+		if err == nil {
+			continue
+		}
+		if isMissingPullRequestLabelDelete(err) {
+			continue
+		}
+		return err
+	}
+	return nil
 }
 
 func compactIssueAssignees(values []string) []string {

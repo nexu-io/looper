@@ -899,7 +899,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
-	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, Logger: logger, Now: now, Config: &cfg})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Logger: logger, Now: now, Config: &cfg})
 
 	return func(ctx context.Context, services Services) error {
 		var runner schedulerAsyncRunner
