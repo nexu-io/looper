@@ -53,6 +53,7 @@ type PullRequestSummary struct {
 	Title             string
 	URL               string
 	State             string
+	UpdatedAt         string
 	IsDraft           bool
 	ReviewDecision    string
 	Labels            []string
@@ -73,6 +74,7 @@ type PullRequestDetail struct {
 	Body              string
 	URL               string
 	State             string
+	UpdatedAt         string
 	IsDraft           bool
 	ReviewDecision    string
 	Labels            []string
@@ -101,6 +103,7 @@ type IssueSummary struct {
 	Body              string
 	URL               string
 	State             string
+	UpdatedAt         string
 	Author            string
 	AuthorAssociation string
 	Assignees         []string
@@ -401,7 +404,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -422,6 +425,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 			Title:             asString(row["title"]),
 			URL:               asString(row["url"]),
 			State:             asString(row["state"]),
+			UpdatedAt:         asString(row["updatedAt"]),
 			IsDraft:           asBool(row["isDraft"]),
 			ReviewDecision:    asString(row["reviewDecision"]),
 			Labels:            extractLabelNames(row["labels"]),
@@ -493,7 +497,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "authorAssociation", "assignees", "labels"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "authorAssociation", "assignees", "labels"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
@@ -511,6 +515,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 			Body:              asString(row["body"]),
 			URL:               asString(row["url"]),
 			State:             asString(row["state"]),
+			UpdatedAt:         asString(row["updatedAt"]),
 			Author:            extractAuthor(row["author"]),
 			AuthorAssociation: asString(row["authorAssociation"]),
 			Assignees:         extractActorLogins(row["assignees"]),
@@ -557,6 +562,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
 		Assignees:         extractActorLogins(row["assignees"]),
@@ -662,7 +668,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -680,6 +686,7 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Body:              asString(row["body"]),
 		URL:               asString(row["url"]),
 		State:             asString(row["state"]),
+		UpdatedAt:         asString(row["updatedAt"]),
 		IsDraft:           asBool(row["isDraft"]),
 		ReviewDecision:    asString(row["reviewDecision"]),
 		Labels:            extractLabelNames(row["labels"]),

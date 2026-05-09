@@ -43,7 +43,7 @@ func TestDiscoverIssuesEnqueuesWarnAndCloseCandidates(t *testing.T) {
 
 	fixture := newRunnerFixture(t)
 	fixture.github.issues = []githubinfra.IssueSummary{
-		{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: nil},
+		{Number: 1, Title: "stale bug", Body: "needs cleanup", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: nil},
 		{Number: 2, Title: "pending bug", Body: "already warned", Author: "octo", Labels: []string{"looper:sweep-pending"}},
 	}
 	payload := mustMarshalPayload(sweeperPayload{Phase: "warn", Outcome: outcomePending, Repo: "acme/looper", TargetType: "issue", TargetNumber: 2, CloseBy: fixture.now.Add(-24 * time.Hour).Format(javaScriptISOStringUTC)})
@@ -61,6 +61,29 @@ func TestDiscoverIssuesEnqueuesWarnAndCloseCandidates(t *testing.T) {
 	types := []string{result.QueueItems[0].Type, result.QueueItems[1].Type}
 	if !(containsString(types, QueueTypeWarn) && containsString(types, QueueTypeClose)) {
 		t.Fatalf("queue types = %v, want warn and close", types)
+	}
+}
+
+func TestProcessWarnSkipsFreshStaleIssueCandidates(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, Title: "fresh bug", Body: "needs cleanup", State: "open", UpdatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+	queueID := "queue_sweeper_warn_fresh_issue"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#1", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#1", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want skipped result", result)
+	}
+	if len(fixture.github.createdComments) != 0 {
+		t.Fatalf("createdComments = %#v, want no warning comment for a recently updated issue", fixture.github.createdComments)
 	}
 }
 
@@ -99,6 +122,29 @@ func TestDiscoverPullRequestsSkipsWhenPRLaneDisabled(t *testing.T) {
 	}
 	if fixture.github.listPRCalls != 0 {
 		t.Fatalf("ListOpenPullRequests() calls = %d, want 0", fixture.github.listPRCalls)
+	}
+}
+
+func TestProcessWarnSkipsFreshAbandonedPRCandidates(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.github.prDetails["acme/looper#1"] = githubinfra.PullRequestDetail{Number: 1, Title: "fresh pr", Body: "work in progress", State: "open", UpdatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+	queueID := "queue_sweeper_warn_fresh_pr"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "pull_request", TargetID: "acme/looper#1", Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(1), DedupeKey: "sweeper:warn:acme/looper#1", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want skipped result", result)
+	}
+	if len(fixture.github.createdComments) != 0 {
+		t.Fatalf("createdComments = %#v, want no warning comment for a recently updated pull request", fixture.github.createdComments)
 	}
 }
 
@@ -176,7 +222,7 @@ func TestProcessCloseClosesAndReconcilesLabels(t *testing.T) {
 	fixture.cfg.Roles.Sweeper.DryRun = false
 	payload := sweeperPayload{Phase: "warn", Outcome: outcomePending, Category: categoryAlreadyFixed, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, WarningCommentID: 99, WarningMarkerUUID: "marker", CommentBody: "warning", PendingLabel: "looper:sweep-pending"}
 	payloadJSON := mustMarshalPayload(payload)
-	fixture.github.issueDetails["acme/looper#42"] = githubinfra.IssueDetail{Number: 42, Title: "Bug", Body: "already fixed by #9", State: "open", Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	fixture.github.issueDetails["acme/looper#42"] = githubinfra.IssueDetail{Number: 42, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
 	queueID := "queue_sweeper_close_1"
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#42", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#42", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
@@ -197,6 +243,34 @@ func TestProcessCloseClosesAndReconcilesLabels(t *testing.T) {
 	}
 	if !containsString(fixture.github.addedLabels["acme/looper#42"], "looper:swept") {
 		t.Fatalf("added labels = %#v, want swept label", fixture.github.addedLabels)
+	}
+}
+
+func TestProcessCloseRemovesPendingLabelWhenKeepLabelCancelsClose(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	payload := sweeperPayload{Phase: "warn", Outcome: outcomePending, Category: categoryStale, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, WarningCommentID: 99, WarningMarkerUUID: "marker", CommentBody: "warning", PendingLabel: "looper:sweep-pending"}
+	payloadJSON := mustMarshalPayload(payload)
+	fixture.github.issueDetails["acme/looper#42"] = githubinfra.IssueDetail{Number: 42, Title: "Bug", Body: "stale", State: "open", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending", fixture.cfg.Roles.Sweeper.Lifecycle.KeepLabel}}
+	queueID := "queue_sweeper_close_keep"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#42", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#42", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
+	}
+	if !containsString(fixture.github.removedLabels["acme/looper#42"], "looper:sweep-pending") {
+		t.Fatalf("removed labels = %#v, want pending removed when keep label cancels close", fixture.github.removedLabels)
+	}
+	if len(fixture.github.closedIssues) != 0 {
+		t.Fatalf("closedIssues = %#v, want no close when keep label is present", fixture.github.closedIssues)
 	}
 }
 
@@ -405,4 +479,8 @@ func containsString(values []string, want string) bool {
 
 func itoa(value int64) string {
 	return strings.TrimSpace(strconv.FormatInt(value, 10))
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
 }

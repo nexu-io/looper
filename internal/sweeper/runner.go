@@ -118,14 +118,15 @@ type sweeperPayload struct {
 }
 
 type liveTarget struct {
-	Number int64
-	State  string
-	Title  string
-	Body   string
-	Author string
-	Labels []string
-	IsPR   bool
-	Draft  bool
+	Number    int64
+	State     string
+	Title     string
+	Body      string
+	UpdatedAt string
+	Author    string
+	Labels    []string
+	IsPR      bool
+	Draft     bool
 }
 
 func New(options Options) *Runner {
@@ -443,7 +444,7 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	if err != nil {
 		return payload, "failed", "", err
 	}
-	category, confidence, rationale := classifyTarget(target, roleCfg)
+	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	payload.Phase = "warn"
 	payload.Outcome = outcomeNoAction
 	payload.Category = category
@@ -515,7 +516,7 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		payload.Summary = "target already closed"
 		return payload, "completed", payload.Summary, nil
 	}
-	if !hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) || hasLabel(target.Labels, roleCfg.Lifecycle.KeepLabel) {
+	if !hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
 		payload.Outcome = outcomeCancelled
 		payload.Summary = "sweeper warning cancelled"
 		if payload.WarningCommentID > 0 && r.github != nil && !roleCfg.DryRun {
@@ -523,7 +524,20 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		}
 		return payload, "completed", payload.Summary, nil
 	}
-	category, _, rationale := classifyTarget(target, roleCfg)
+	if hasLabel(target.Labels, roleCfg.Lifecycle.KeepLabel) {
+		payload.Outcome = outcomeCancelled
+		payload.Summary = "sweeper warning cancelled"
+		if r.github != nil && !roleCfg.DryRun {
+			if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
+				return payload, "failed", "", err
+			}
+		}
+		if payload.WarningCommentID > 0 && r.github != nil && !roleCfg.DryRun {
+			_ = r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: payload.Repo, CommentID: payload.WarningCommentID, Body: payload.CommentBody + "\n\nCancellation noted by sweeper."})
+		}
+		return payload, "completed", payload.Summary, nil
+	}
+	category, _, rationale := classifyTarget(target, roleCfg, r.now())
 	if category == categoryRouteSecurity {
 		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
 			payload.Outcome = outcomeDryRun
@@ -614,16 +628,16 @@ func (r *Runner) loadTarget(ctx context.Context, item storage.QueueItemRecord) (
 		if err != nil {
 			return liveTarget{}, err
 		}
-		return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, Author: detail.Author, Labels: append([]string(nil), detail.Labels...), IsPR: true, Draft: detail.IsDraft}, nil
+		return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, UpdatedAt: detail.UpdatedAt, Author: detail.Author, Labels: append([]string(nil), detail.Labels...), IsPR: true, Draft: detail.IsDraft}, nil
 	}
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: number})
 	if err != nil {
 		return liveTarget{}, err
 	}
-	return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, Author: detail.Author, Labels: append([]string(nil), detail.Labels...)}, nil
+	return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, UpdatedAt: detail.UpdatedAt, Author: detail.Author, Labels: append([]string(nil), detail.Labels...)}, nil
 }
 
-func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig) (string, int, string) {
+func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now time.Time) (string, int, string) {
 	text := strings.ToLower(target.Title + "\n" + target.Body)
 	if strings.Contains(text, "security") {
 		return categoryRouteSecurity, 100, "security-sensitive content detected"
@@ -637,10 +651,10 @@ func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig) (string
 	if !target.IsPR && roleCfg.Categories.Unrelated.Enabled && (strings.Contains(text, "support") || strings.Contains(text, "question")) {
 		return categoryUnrelated, maxConfidence(roleCfg.Categories.Unrelated.MinConfidence), "target appears unrelated to repository work"
 	}
-	if target.IsPR && roleCfg.Categories.AbandonedPR.Enabled {
+	if target.IsPR && roleCfg.Categories.AbandonedPR.Enabled && inactiveLongEnough(target.UpdatedAt, roleCfg.Categories.AbandonedPR.InactivityDays, now) {
 		return categoryAbandonedPR, maxConfidence(roleCfg.Categories.AbandonedPR.MinConfidence), "open pull request matched sweeper abandoned-pr heuristics"
 	}
-	if roleCfg.Categories.Stale.Enabled {
+	if roleCfg.Categories.Stale.Enabled && inactiveLongEnough(target.UpdatedAt, roleCfg.Categories.Stale.InactivityDays, now) {
 		return categoryStale, maxConfidence(roleCfg.Categories.Stale.MinConfidence), "open item matched stale sweeper heuristics"
 	}
 	return categoryNone, 0, "no enabled sweeper category matched"
@@ -856,14 +870,38 @@ func dueForClose(closeBy string, now time.Time) bool {
 	if strings.TrimSpace(closeBy) == "" {
 		return false
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, closeBy)
-	if err != nil {
-		parsed, err = time.Parse(javaScriptISOStringUTC, closeBy)
-		if err != nil {
-			return false
-		}
+	parsed, ok := parseGitHubTimestamp(closeBy)
+	if !ok {
+		return false
 	}
 	return !parsed.After(now.UTC())
+}
+
+func inactiveLongEnough(updatedAt string, inactivityDays int, now time.Time) bool {
+	if inactivityDays <= 0 {
+		return false
+	}
+	parsed, ok := parseGitHubTimestamp(updatedAt)
+	if !ok {
+		return false
+	}
+	threshold := now.UTC().Add(-time.Duration(inactivityDays) * 24 * time.Hour)
+	return !parsed.After(threshold)
+}
+
+func parseGitHubTimestamp(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		parsed, err = time.Parse(javaScriptISOStringUTC, value)
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+	return parsed.UTC(), true
 }
 
 func hasLabel(labels []string, want string) bool {
