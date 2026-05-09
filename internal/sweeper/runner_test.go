@@ -274,6 +274,62 @@ func TestProcessCloseRemovesPendingLabelWhenKeepLabelCancelsClose(t *testing.T) 
 	}
 }
 
+func TestProcessCloseRemovesPendingLabelWhenTargetAlreadyClosed(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	payload := sweeperPayload{Phase: "warn", Outcome: outcomePending, Category: categoryStale, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, WarningCommentID: 99, WarningMarkerUUID: "marker", CommentBody: "warning", PendingLabel: "looper:sweep-pending"}
+	payloadJSON := mustMarshalPayload(payload)
+	fixture.github.issueDetails["acme/looper#42"] = githubinfra.IssueDetail{Number: 42, Title: "Bug", Body: "stale", State: "closed", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	queueID := "queue_sweeper_close_already_closed"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#42", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#42", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
+	}
+	if !containsString(fixture.github.removedLabels["acme/looper#42"], "looper:sweep-pending") {
+		t.Fatalf("removed labels = %#v, want pending removed for already closed target", fixture.github.removedLabels)
+	}
+	if len(fixture.github.closedIssues) != 0 {
+		t.Fatalf("closedIssues = %#v, want no close when target is already closed", fixture.github.closedIssues)
+	}
+}
+
+func TestProcessCloseRemovesPendingLabelWhenReclassificationCancelsClose(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	payload := sweeperPayload{Phase: "warn", Outcome: outcomePending, Category: categoryStale, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, WarningCommentID: 99, WarningMarkerUUID: "marker", CommentBody: "warning", PendingLabel: "looper:sweep-pending"}
+	payloadJSON := mustMarshalPayload(payload)
+	fixture.github.issueDetails["acme/looper#42"] = githubinfra.IssueDetail{Number: 42, Title: "Bug", Body: "fresh activity", State: "open", UpdatedAt: fixture.now.Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	queueID := "queue_sweeper_close_reclassified"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#42", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#42", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
+	}
+	if !containsString(fixture.github.removedLabels["acme/looper#42"], "looper:sweep-pending") {
+		t.Fatalf("removed labels = %#v, want pending removed when close is cancelled", fixture.github.removedLabels)
+	}
+	if len(fixture.github.closedIssues) != 0 {
+		t.Fatalf("closedIssues = %#v, want no close when classification changes", fixture.github.closedIssues)
+	}
+}
+
 func TestProcessReconcileCancelsWhenPendingLabelRemoved(t *testing.T) {
 	t.Parallel()
 
@@ -341,6 +397,49 @@ func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || result.Skipped != 1 {
 		t.Fatalf("DiscoverIssues() = %#v, want excluded association to be skipped", result)
+	}
+}
+
+func TestDiscoverIssuesSkipsReopenedSweptItemWithinCooldown(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: []string{fixture.cfg.Roles.Sweeper.Lifecycle.ClosedLabel}}}
+	closedAt := fixture.now.Add(-10 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	payloadJSON := mustMarshalPayload(sweeperPayload{Phase: "close", Outcome: outcomeClosed, Repo: "acme/looper", TargetType: "issue", TargetNumber: 1, ClosedLabel: fixture.cfg.Roles.Sweeper.Lifecycle.ClosedLabel})
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_sweeper_closed_recent", ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#1", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#1", Priority: 1, Status: "completed", AvailableAt: closedAt, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: closedAt, UpdatedAt: closedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want reopened swept item skipped within cooldown", result)
+	}
+}
+
+func TestDiscoverIssuesAllowsReopenedSweptItemAfterCooldown(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: []string{fixture.cfg.Roles.Sweeper.Lifecycle.ClosedLabel}}}
+	closedAt := fixture.now.Add(-31 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	payloadJSON := mustMarshalPayload(sweeperPayload{Phase: "close", Outcome: outcomeClosed, Repo: "acme/looper", TargetType: "issue", TargetNumber: 1, ClosedLabel: fixture.cfg.Roles.Sweeper.Lifecycle.ClosedLabel})
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_sweeper_closed_old", ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#1", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#1", Priority: 1, Status: "completed", AvailableAt: closedAt, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: closedAt, UpdatedAt: closedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("DiscoverIssues() queue items = %#v, want reopened swept item re-queued after cooldown", result.QueueItems)
+	}
+	if result.QueueItems[0].Type != QueueTypeWarn {
+		t.Fatalf("QueueItems[0].Type = %q, want %q", result.QueueItems[0].Type, QueueTypeWarn)
 	}
 }
 

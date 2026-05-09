@@ -117,6 +117,11 @@ type sweeperPayload struct {
 	QuarantineLabel   string `json:"quarantine_label,omitempty"`
 }
 
+type sweeperStateRecord struct {
+	item    storage.QueueItemRecord
+	payload sweeperPayload
+}
+
 type liveTarget struct {
 	Number    int64
 	State     string
@@ -156,7 +161,7 @@ func (r *Runner) DiscoverReconcile(ctx context.Context, input DiscoveryInput) (D
 	if project.Archived || !roleCfg.AutoDiscovery {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	states, err := r.latestSweeperState(ctx)
+	states, err := r.latestSweeperRecords(ctx)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -166,10 +171,10 @@ func (r *Runner) DiscoverReconcile(ctx context.Context, input DiscoveryInput) (D
 		if len(items) >= limit {
 			break
 		}
-		if state.Repo != input.Repo || state.Outcome != outcomePending || state.Phase != "warn" {
+		if state.payload.Repo != input.Repo || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" {
 			continue
 		}
-		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeReconcile, TargetType: state.TargetType, TargetID: targetID, Number: state.TargetNumber, Payload: state})
+		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeReconcile, TargetType: state.payload.TargetType, TargetID: targetID, Number: state.payload.TargetNumber, Payload: state.payload})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -268,7 +273,7 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	states, err := r.latestSweeperState(ctx)
+	states, err := r.latestSweeperRecords(ctx)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -284,16 +289,16 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			continue
 		}
 		targetID := buildTargetID(input.Repo, issue.Number)
-		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, roleCfg) {
+		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, states[targetID], roleCfg) {
 			result.Skipped++
 			continue
 		}
 		if hasLabel(issue.Labels, roleCfg.Lifecycle.PendingLabel) {
 			state, ok := states[targetID]
-			if !ok || state.Outcome != outcomePending || state.Phase != "warn" || !dueForClose(state.CloseBy, r.now()) || closeCount >= closeLimit {
+			if !ok || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" || !dueForClose(state.payload.CloseBy, r.now()) || closeCount >= closeLimit {
 				continue
 			}
-			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: state})
+			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: state.payload})
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -336,7 +341,7 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	states, err := r.latestSweeperState(ctx)
+	states, err := r.latestSweeperRecords(ctx)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -353,16 +358,16 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			continue
 		}
 		targetID := buildTargetID(input.Repo, pr.Number)
-		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, roleCfg) {
+		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, states[targetID], roleCfg) {
 			result.Skipped++
 			continue
 		}
 		if hasLabel(pr.Labels, roleCfg.Lifecycle.PendingLabel) {
 			state, ok := states[targetID]
-			if !ok || state.Outcome != outcomePending || state.Phase != "warn" || !dueForClose(state.CloseBy, r.now()) || closeCount >= closeLimit {
+			if !ok || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" || !dueForClose(state.payload.CloseBy, r.now()) || closeCount >= closeLimit {
 				continue
 			}
-			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: state})
+			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: state.payload})
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -512,6 +517,9 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	payload.KeepLabel = roleCfg.Lifecycle.KeepLabel
 	payload.QuarantineLabel = roleCfg.Security.QuarantineLabel
 	if strings.EqualFold(target.State, "closed") {
+		if err := r.removePendingLabel(ctx, roleCfg, payload.Repo, target.Number); err != nil {
+			return payload, "failed", "", err
+		}
 		payload.Outcome = outcomeAlreadyClosedByHuman
 		payload.Summary = "target already closed"
 		return payload, "completed", payload.Summary, nil
@@ -553,6 +561,9 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		return payload, "completed", payload.Summary, nil
 	}
 	if category == categoryNone || (payload.Category != "" && category != payload.Category) {
+		if err := r.removePendingLabel(ctx, roleCfg, payload.Repo, target.Number); err != nil {
+			return payload, "failed", "", err
+		}
 		payload.Outcome = outcomeCancelled
 		payload.Summary = "sweeper close cancelled"
 		return payload, "completed", payload.Summary, nil
@@ -683,8 +694,11 @@ func gracePeriodForCategory(category string, roleCfg config.SweeperRoleConfig) i
 	}
 }
 
-func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, roleCfg config.SweeperRoleConfig) bool {
-	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabel(labels, roleCfg.Triggers.LooperInternalLabels) || hasLabel(labels, roleCfg.Security.QuarantineLabel) || hasLabel(labels, roleCfg.Lifecycle.ClosedLabel) {
+func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabelExcept(labels, roleCfg.Triggers.LooperInternalLabels, roleCfg.Lifecycle.ClosedLabel) || hasLabel(labels, roleCfg.Security.QuarantineLabel) {
+		return true
+	}
+	if hasLabel(labels, roleCfg.Lifecycle.ClosedLabel) && r.reopenCooldownActive(state, roleCfg) {
 		return true
 	}
 	for _, excluded := range roleCfg.Triggers.ExcludeAuthors {
@@ -698,6 +712,18 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 		}
 	}
 	return false
+}
+
+func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+	if state.payload.Outcome != outcomeClosed {
+		return true
+	}
+	closedAt, ok := parseGitHubTimestamp(firstNonEmpty(state.item.UpdatedAt, state.item.CreatedAt))
+	if !ok {
+		return true
+	}
+	threshold := closedAt.Add(time.Duration(roleCfg.Triggers.ReopenCooldownDays) * 24 * time.Hour)
+	return r.now().UTC().Before(threshold)
 }
 
 func (r *Runner) discoveryBudgets(ctx context.Context, input DiscoveryInput, roleCfg config.SweeperRoleConfig) (int, int, error) {
@@ -755,12 +781,12 @@ func remainingCount(limit, used int) int {
 	return remaining
 }
 
-func (r *Runner) latestSweeperState(ctx context.Context) (map[string]sweeperPayload, error) {
+func (r *Runner) latestSweeperRecords(ctx context.Context) (map[string]sweeperStateRecord, error) {
 	items, err := r.repos.Queue.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]sweeperPayload{}
+	out := map[string]sweeperStateRecord{}
 	for _, item := range items {
 		if !strings.HasPrefix(item.Type, "sweeper") {
 			continue
@@ -779,7 +805,19 @@ func (r *Runner) latestSweeperState(ctx context.Context) (map[string]sweeperPayl
 		if _, exists := out[key]; exists {
 			continue
 		}
-		out[key] = payload
+		out[key] = sweeperStateRecord{item: item, payload: payload}
+	}
+	return out, nil
+}
+
+func (r *Runner) latestSweeperState(ctx context.Context) (map[string]sweeperPayload, error) {
+	records, err := r.latestSweeperRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]sweeperPayload, len(records))
+	for key, record := range records {
+		out[key] = record.payload
 	}
 	return out, nil
 }
@@ -866,6 +904,13 @@ func parseTargetNumber(item storage.QueueItemRecord) (int64, error) {
 	return strconv.ParseInt(parts[1], 10, 64)
 }
 
+func (r *Runner) removePendingLabel(ctx context.Context, roleCfg config.SweeperRoleConfig, repo string, issueNumber int64) error {
+	if roleCfg.DryRun || r.github == nil {
+		return nil
+	}
+	return r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issueNumber, Labels: []string{roleCfg.Lifecycle.PendingLabel}})
+}
+
 func dueForClose(closeBy string, now time.Time) bool {
 	if strings.TrimSpace(closeBy) == "" {
 		return false
@@ -902,6 +947,27 @@ func parseGitHubTimestamp(value string) (time.Time, bool) {
 		}
 	}
 	return parsed.UTC(), true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func hasAnyLabelExcept(labels []string, candidates []string, except string) bool {
+	for _, candidate := range candidates {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(except)) {
+			continue
+		}
+		if hasLabel(labels, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasLabel(labels []string, want string) bool {
