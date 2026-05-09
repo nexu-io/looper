@@ -23,7 +23,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			runner.stdin = options.Stdin
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr list"):
-			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
+			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"__typename":"User","login":"OctoCat"},{"__typename":"Team","slug":"platform"}]}]`}, nil
 		case strings.HasPrefix(args, "issue list"):
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
@@ -34,8 +34,10 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
+		case strings.Contains(args, "baseRefOid"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.ts b/a.ts\n"}, nil
 		case strings.HasPrefix(args, "api user"):
@@ -150,8 +152,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if got := prs[0].ReviewRequests; len(got) != 1 || got[0] != "OctoCat" {
 		t.Fatalf("prs[0].ReviewRequests = %#v, want [OctoCat]", got)
 	}
-	if prs[0].BaseSHA != "def456" || !prs[0].HasConflicts {
-		t.Fatalf("prs[0] = %#v, want base sha and conflict state", prs[0])
+	if !prs[0].HasConflicts {
+		t.Fatalf("prs[0] = %#v, want conflict state", prs[0])
 	}
 	if got := issues[0].Assignees; len(got) != 1 || got[0] != "reviewer" {
 		t.Fatalf("issues[0].Assignees = %#v, want [reviewer]", got)
@@ -703,8 +705,10 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
+		case strings.Contains(args, "baseRefOid"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
@@ -1089,8 +1093,10 @@ func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
+		case strings.Contains(args, "baseRefOid"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.Contains(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}`}, nil
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
 		default:
@@ -1152,6 +1158,8 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
+		case strings.Contains(args, "baseRefOid"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view"):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
 		case strings.Contains(args, "reviewThreads"):
@@ -1380,7 +1388,7 @@ func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,reviews,mergeStateStatus" {
+		if args != "pr list --repo acme/looper --state open --limit 30 --label bug --label priority --json number,title,url,state,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,author,reviewRequests,reviews,mergeStateStatus" {
 			t.Fatalf("gh args = %q, want repeated label filters", args)
 		}
 		return shell.Result{Stdout: `[]`}, nil

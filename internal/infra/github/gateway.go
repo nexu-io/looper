@@ -378,7 +378,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -405,12 +405,11 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 			HeadRefName:    asString(row["headRefName"]),
 			BaseRefName:    asString(row["baseRefName"]),
 			HeadSHA:        asString(row["headRefOid"]),
-			BaseSHA:        asString(row["baseRefOid"]),
-			HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
 			Author:         extractAuthor(row["author"]),
 			ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
 			Reviews:        toObjectSlice(row["reviews"]),
 		})
+		out[len(out)-1].HasConflicts = asString(row["mergeStateStatus"]) == "DIRTY"
 	}
 	return out, nil
 }
@@ -581,7 +580,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -589,6 +588,7 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
+	baseSHA := g.fetchBaseRefOid(ctx, input)
 	threads, err := g.fetchReviewThreads(ctx, input.Repo, input.PRNumber, input.CWD)
 	if err != nil {
 		return PullRequestDetail{}, err
@@ -605,7 +605,7 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		HeadRefName:    asString(row["headRefName"]),
 		BaseRefName:    asString(row["baseRefName"]),
 		HeadSHA:        asString(row["headRefOid"]),
-		BaseSHA:        asString(row["baseRefOid"]),
+		BaseSHA:        baseSHA,
 		Author:         extractAuthor(row["author"]),
 		ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
 		HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
@@ -614,6 +614,31 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Reviews:        toObjectSlice(row["reviews"]),
 		Checks:         toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) fetchBaseRefOid(ctx context.Context, input ViewPullRequestInput) string {
+	owner, name, err := parseRepo(input.Repo)
+	if err != nil {
+		return ""
+	}
+	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+		"query($owner: String!, $repo: String!, $number: Int!) {",
+		"  repository(owner: $owner, name: $repo) {",
+		"    pullRequest(number: $number) { baseRefOid }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "owner="+owner, "-F", "repo="+name, "-F", fmt.Sprintf("number=%d", input.PRNumber))
+	if err != nil {
+		return ""
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return ""
+	}
+	data, _ := row["data"].(map[string]any)
+	repo, _ := data["repository"].(map[string]any)
+	pr, _ := repo["pullRequest"].(map[string]any)
+	return asString(pr["baseRefOid"])
 }
 
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
