@@ -1621,7 +1621,7 @@ func TestLogsWithoutJSONPrintsRunSummaryWhenAgentOutputEmpty(t *testing.T) {
 	}
 }
 
-func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+func TestLogsWithoutJSONDefaultsToStderrWhenStdoutEmpty(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1635,11 +1635,11 @@ func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 			"loopStatus": "running",
 			"run":        map[string]any{"runId": "run_1", "currentStep": "review"},
 			"agent": map[string]any{
-				"vendor": "codex",
+				"vendor": "opencode",
 				"pid":    1234,
 				"status": "running",
 				"stdout": "",
-				"stderr": "codex line1\ncodex line2\n",
+				"stderr": "stderr line1\nstderr line2\n",
 			},
 		}))
 	}))
@@ -1653,7 +1653,7 @@ func TestLogsWithoutJSONDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([logs loop_1 --tail 2]) stderr = %q, want empty string", stderr)
 	}
-	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: codex · pid 1234 · running", "codex line1", "codex line2"} {
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: opencode · pid 1234 · running", "stderr line1", "stderr line2"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([logs loop_1 --tail 2]) stdout = %q, want to contain %q", stdout, want)
 		}
@@ -1695,7 +1695,7 @@ func TestLogsFollowStreamsNewOutput(t *testing.T) {
 	}
 }
 
-func TestLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+func TestLogsFollowDefaultsToStderrWhenStdoutEmpty(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1710,9 +1710,9 @@ func TestLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: snapshot\n")
-		_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"codex\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"\",\"stderr\":\"codex line1\\n\"}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"seq\":12,\"loopType\":\"reviewer\",\"loopStatus\":\"running\",\"run\":{\"runId\":\"run_1\",\"status\":\"running\",\"currentStep\":\"review\"},\"agent\":{\"executionId\":\"exec_1\",\"vendor\":\"opencode\",\"pid\":1234,\"status\":\"running\",\"stdout\":\"\",\"stderr\":\"stderr line1\\n\"}}\n\n")
 		_, _ = io.WriteString(w, "event: chunk\n")
-		_, _ = io.WriteString(w, "data: {\"runId\":\"run_1\",\"currentStep\":\"review\",\"executionId\":\"exec_1\",\"vendor\":\"codex\",\"pid\":1234,\"status\":\"running\",\"content\":\"codex line2\\n\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"runId\":\"run_1\",\"currentStep\":\"review\",\"executionId\":\"exec_1\",\"vendor\":\"opencode\",\"pid\":1234,\"status\":\"running\",\"content\":\"stderr line2\\n\"}\n\n")
 		_, _ = io.WriteString(w, "event: end\n")
 		_, _ = io.WriteString(w, "data: {\"reason\":\"run_completed\"}\n\n")
 	}))
@@ -1726,7 +1726,7 @@ func TestLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([logs loop_1 --follow]) stderr = %q, want empty string", stderr)
 	}
-	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: codex · pid 1234 · running", "codex line1", "codex line2"} {
+	for _, want := range []string{"Loop #12 · reviewer · running", "Run run_1 · step: review", "Agent: opencode · pid 1234 · running", "stderr line1", "stderr line2"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want to contain %q", stdout, want)
 		}

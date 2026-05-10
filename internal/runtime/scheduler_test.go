@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -68,6 +69,7 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	reviewerRunner := &stubReviewerScheduler{}
 	fixerRunner := &stubFixerScheduler{}
 	workerRunner := &stubWorkerScheduler{}
+	sweeperRunner := &stubSweeperScheduler{}
 
 	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
 		Repos:             repos,
@@ -77,6 +79,7 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 		Reviewer:          reviewerRunner,
 		Fixer:             fixerRunner,
 		Worker:            workerRunner,
+		Sweeper:           sweeperRunner,
 	})
 	if err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
@@ -92,6 +95,15 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 	if len(workerRunner.discoverCalls) != 1 || workerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("worker discover calls = %#v, want stored project repo", workerRunner.discoverCalls)
+	}
+	if len(sweeperRunner.issueDiscoverCalls) != 1 || sweeperRunner.issueDiscoverCalls[0].Repo != "nexu-io/looper" {
+		t.Fatalf("sweeper issue discovery calls = %#v, want stored project repo", sweeperRunner.issueDiscoverCalls)
+	}
+	if len(sweeperRunner.pullRequestDiscoverCalls) != 1 || sweeperRunner.pullRequestDiscoverCalls[0].Repo != "nexu-io/looper" {
+		t.Fatalf("sweeper pull request discovery calls = %#v, want stored project repo", sweeperRunner.pullRequestDiscoverCalls)
+	}
+	if len(sweeperRunner.reconcileDiscoverCalls) != 1 || sweeperRunner.reconcileDiscoverCalls[0].Repo != "nexu-io/looper" {
+		t.Fatalf("sweeper reconcile discovery calls = %#v, want stored project repo", sweeperRunner.reconcileDiscoverCalls)
 	}
 	waitForSchedulerCondition(t, func() bool {
 		return workerRunner.processItemCount() == 1
@@ -144,26 +156,28 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	t.Parallel()
 
-	queueItems := []storage.QueueItemRecord{{Type: "planner"}, {Type: "reviewer"}, {Type: "fixer"}, {Type: "worker"}}
+	queueItems := []storage.QueueItemRecord{{ID: "planner-item", Type: "planner"}, {ID: "reviewer-item", Type: "reviewer"}, {ID: "fixer-item", Type: "fixer"}, {ID: "worker-item", Type: "worker"}, {ID: "sweeper-warn-item", Type: "sweeper:warn"}, {ID: "sweeper-close-item", Type: "sweeper:close"}, {ID: "sweeper-reconcile-item", Type: "sweeper:reconcile"}}
 	plannerRunner := &stubPlannerScheduler{}
 	reviewerRunner := &stubReviewerScheduler{}
 	fixerRunner := &stubFixerScheduler{}
 	workerRunner := &stubWorkerScheduler{}
+	sweeperRunner := &stubSweeperScheduler{}
 
 	err := runScheduledQueueItems(context.Background(), queueItems, defaultSchedulerTickInput{
 		Planner:  plannerRunner,
 		Reviewer: reviewerRunner,
 		Fixer:    fixerRunner,
 		Worker:   workerRunner,
+		Sweeper:  sweeperRunner,
 	})
 	if err != nil {
 		t.Fatalf("runScheduledQueueItems() error = %v", err)
 	}
 	waitForSchedulerCondition(t, func() bool {
-		return plannerRunner.processItemCount() == 1 && reviewerRunner.processItemCount() == 1 && fixerRunner.processItemCount() == 1 && workerRunner.processItemCount() == 1
+		return plannerRunner.processItemCount() == 1 && reviewerRunner.processItemCount() == 1 && fixerRunner.processItemCount() == 1 && workerRunner.processItemCount() == 1 && sweeperRunner.processItemCount() == 3
 	})
-	if plannerRunner.processItemCount() != 1 || reviewerRunner.processItemCount() != 1 || fixerRunner.processItemCount() != 1 || workerRunner.processItemCount() != 1 {
-		t.Fatalf("processed items = planner:%#v reviewer:%#v fixer:%#v worker:%#v, want one each", plannerRunner.processedItems, reviewerRunner.processedItems, fixerRunner.processedItems, workerRunner.processedItems)
+	if plannerRunner.processItemCount() != 1 || reviewerRunner.processItemCount() != 1 || fixerRunner.processItemCount() != 1 || workerRunner.processItemCount() != 1 || sweeperRunner.processItemCount() != 3 {
+		t.Fatalf("processed items = planner:%#v reviewer:%#v fixer:%#v worker:%#v sweeper:%#v, want planner/reviewer/fixer/worker once and sweeper three times", plannerRunner.processedItems, reviewerRunner.processedItems, fixerRunner.processedItems, workerRunner.processedItems, sweeperRunner.processedItems)
 	}
 }
 
@@ -274,6 +288,15 @@ func TestRunScheduledQueueItemsErrorsWhenRunnerMissing(t *testing.T) {
 	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{Type: "worker"}}, defaultSchedulerTickInput{})
 	if err == nil || !strings.Contains(err.Error(), "worker runner is not configured") {
 		t.Fatalf("runScheduledQueueItems() error = %v, want missing worker runner error", err)
+	}
+}
+
+func TestRunScheduledQueueItemsErrorsWhenSweeperRunnerMissing(t *testing.T) {
+	t.Parallel()
+
+	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{Type: "sweeper:warn"}}, defaultSchedulerTickInput{})
+	if err == nil || !strings.Contains(err.Error(), "sweeper runner is not configured") {
+		t.Fatalf("runScheduledQueueItems() error = %v, want missing sweeper runner error", err)
 	}
 }
 
@@ -798,6 +821,55 @@ func (s *stubWorkerScheduler) processClaimCount() int {
 }
 
 func (s *stubWorkerScheduler) processItemCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processedItems)
+}
+
+type stubSweeperDiscoveryCall struct {
+	ProjectID string
+	Repo      string
+}
+
+type stubSweeperScheduler struct {
+	mu                       sync.Mutex
+	issueDiscoverCalls       []stubSweeperDiscoveryCall
+	pullRequestDiscoverCalls []stubSweeperDiscoveryCall
+	reconcileDiscoverCalls   []stubSweeperDiscoveryCall
+	processedItems           []string
+	discoverErr              error
+	processErr               error
+}
+
+func (s *stubSweeperScheduler) DiscoverIssues(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.issueDiscoverCalls = append(s.issueDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
+	s.mu.Unlock()
+	return sweeper.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubSweeperScheduler) DiscoverPullRequests(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.pullRequestDiscoverCalls = append(s.pullRequestDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
+	s.mu.Unlock()
+	return sweeper.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubSweeperScheduler) DiscoverReconcile(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.reconcileDiscoverCalls = append(s.reconcileDiscoverCalls, stubSweeperDiscoveryCall{ProjectID: input.ProjectID, Repo: input.Repo})
+	s.mu.Unlock()
+	return sweeper.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubSweeperScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*sweeper.ProcessResult, error) {
+	s.mu.Lock()
+	s.processedItems = append(s.processedItems, queueItem.ID)
+	s.mu.Unlock()
+	return &sweeper.ProcessResult{QueueItemID: queueItem.ID, Status: "skipped"}, s.processErr
+}
+
+func (s *stubSweeperScheduler) processItemCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.processedItems)

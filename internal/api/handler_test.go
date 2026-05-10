@@ -3357,7 +3357,7 @@ func TestHandlerLoopLogsReturnsPersistedHistoricalAgentOutput(t *testing.T) {
 	assertEqual(t, agent["stderr"], fullStderr)
 }
 
-func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
+func TestHandlerLoopLogsFollowDefaultsToStderrWhenStdoutEmpty(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedRunRouteData(t, fixture.runtime)
 
@@ -3367,13 +3367,13 @@ func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T)
 		ProjectID:       stringPtr("project_1"),
 		LoopID:          stringPtr("loop_1"),
 		RunID:           stringPtr("run_1"),
-		Vendor:          "codex",
+		Vendor:          "opencode",
 		Status:          "running",
 		PID:             int64Ptr(1234),
 		HeartbeatCount:  1,
 		LastHeartbeatAt: stringPtr(nowISO),
 		StartedAt:       nowISO,
-		OutputJSON:      stringPtr(`{"stdout":"","stderr":"codex line1\n"}`),
+		OutputJSON:      stringPtr(`{"stdout":"","stderr":"stderr line1\n"}`),
 		CreatedAt:       nowISO,
 		UpdatedAt:       nowISO,
 	}); err != nil {
@@ -3409,7 +3409,7 @@ func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T)
 		exec := *updatedExec
 		exec.Status = "completed"
 		exec.EndedAt = &completedAt
-		exec.OutputJSON = stringPtr(`{"stdout":"","stderr":"codex line1\ncodex line2\n"}`)
+		exec.OutputJSON = stringPtr(`{"stdout":"","stderr":"stderr line1\nstderr line2\n"}`)
 		exec.UpdatedAt = completedAt
 		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), exec)
 	}()
@@ -3441,11 +3441,11 @@ func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T)
 	if !strings.Contains(text, "event: snapshot") {
 		t.Fatalf("stream body = %q, want snapshot event", text)
 	}
-	if !strings.Contains(text, "\"stderr\":\"codex line1\\n\"") {
-		t.Fatalf("stream body = %q, want codex stderr in snapshot", text)
+	if !strings.Contains(text, "\"stderr\":\"stderr line1\\n\"") {
+		t.Fatalf("stream body = %q, want stderr in snapshot", text)
 	}
-	if !strings.Contains(text, "event: chunk") || !strings.Contains(text, "\"content\":\"codex line2\\n\"") {
-		t.Fatalf("stream body = %q, want chunk with appended codex stderr output", text)
+	if !strings.Contains(text, "event: chunk") || !strings.Contains(text, "\"content\":\"stderr line2\\n\"") {
+		t.Fatalf("stream body = %q, want chunk with appended stderr output", text)
 	}
 	if !strings.Contains(text, "event: end") {
 		t.Fatalf("stream body = %q, want end event", text)

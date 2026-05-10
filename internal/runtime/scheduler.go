@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -48,6 +49,13 @@ type workerScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
 }
 
+type sweeperScheduler interface {
+	DiscoverIssues(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	DiscoverPullRequests(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	DiscoverReconcile(context.Context, sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*sweeper.ProcessResult, error)
+}
+
 type snapshotScheduler interface {
 	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 }
@@ -70,11 +78,13 @@ type defaultSchedulerTickInput struct {
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
 	Worker                   workerScheduler
+	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
 	PlannerDiscoveryEnabled  *bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	SweeperDiscoveryEnabled  *bool
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -381,7 +391,10 @@ func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
+type fixerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+}
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author, Label: input.Label, Labels: input.Labels})
@@ -408,11 +421,30 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: detail.IssueComments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
+	body := a.stamper.ReviewComment(input.Body, "fixer")
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
+	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
+	if err != nil {
+		return fixer.IssueCommentResult{}, err
+	}
+	return fixer.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
+}
+
+func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
+	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
@@ -741,6 +773,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
+	var sweeperRunner sweeperScheduler
 
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
@@ -827,7 +860,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	fixerRunner = fixer.New(fixer.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway},
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -887,6 +920,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Logger: logger, Now: now, Config: &cfg})
 
 	return func(ctx context.Context, services Services) error {
 		var runner schedulerAsyncRunner
@@ -903,11 +937,13 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
+			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			SweeperDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "sweeper")),
 		})
 	}
 }
@@ -1015,6 +1051,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		}
+		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, err))
+			_, err = input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper pull request discovery", project.ID, repo, err))
+			_, err = input.Sweeper.DiscoverReconcile(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, err))
+		} else if input.Sweeper != nil && input.Logger != nil {
+			input.Logger.Debug("sweeper auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 	}
 
@@ -1143,6 +1189,14 @@ func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedule
 		}
 		return func(ctx context.Context) error {
 			_, err := input.Worker.ProcessClaimedQueueItem(ctx, item)
+			return wrapSchedulerQueueError(item.Type, err)
+		}, nil
+	case "sweeper", "sweeper:warn", "sweeper:close", "sweeper:reconcile":
+		if input.Sweeper == nil {
+			return nil, fmt.Errorf("sweeper runner is not configured")
+		}
+		return func(ctx context.Context) error {
+			_, err := input.Sweeper.ProcessClaimedQueueItem(ctx, item)
 			return wrapSchedulerQueueError(item.Type, err)
 		}, nil
 	case "snapshot":

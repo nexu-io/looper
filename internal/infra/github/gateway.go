@@ -50,43 +50,47 @@ type Gateway struct {
 }
 
 type PullRequestSummary struct {
-	Number         int64
-	Title          string
-	URL            string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadRefName    string
-	BaseRefName    string
-	HeadSHA        string
-	BaseSHA        string
-	HasConflicts   bool
-	Author         string
-	ReviewRequests []string
-	Reviews        []map[string]any
+	Number            int64
+	Title             string
+	URL               string
+	State             string
+	UpdatedAt         string
+	IsDraft           bool
+	ReviewDecision    string
+	Labels            []string
+	HeadRefName       string
+	BaseRefName       string
+	HeadSHA           string
+	BaseSHA           string
+	HasConflicts      bool
+	Author            string
+	AuthorAssociation string
+	ReviewRequests    []string
+	Reviews           []map[string]any
 }
 
 type PullRequestDetail struct {
-	Number         int64
-	Title          string
-	Body           string
-	URL            string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadRefName    string
-	BaseRefName    string
-	HeadSHA        string
-	BaseSHA        string
-	Author         string
-	ReviewRequests []string
-	HasConflicts   bool
-	Comments       []map[string]any
-	IssueComments  []map[string]any
-	Reviews        []map[string]any
-	Checks         []map[string]any
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	UpdatedAt         string
+	IsDraft           bool
+	ReviewDecision    string
+	Labels            []string
+	HeadRefName       string
+	BaseRefName       string
+	HeadSHA           string
+	BaseSHA           string
+	Author            string
+	AuthorAssociation string
+	ReviewRequests    []string
+	HasConflicts      bool
+	Comments          []map[string]any
+	IssueComments     []map[string]any
+	Reviews           []map[string]any
+	Checks            []map[string]any
 }
 
 type PullRequestHeadAndAuthor struct {
@@ -95,15 +99,17 @@ type PullRequestHeadAndAuthor struct {
 }
 
 type IssueSummary struct {
-	Number        int64
-	Title         string
-	Body          string
-	URL           string
-	State         string
-	Author        string
-	Assignees     []string
-	Labels        []string
-	IsPullRequest bool
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	UpdatedAt         string
+	Author            string
+	AuthorAssociation string
+	Assignees         []string
+	Labels            []string
+	IsPullRequest     bool
 }
 
 type IssueDetail = IssueSummary
@@ -122,6 +128,13 @@ type IssueAssigneesInput struct {
 	CWD         string
 }
 
+type IssueLabelsInput struct {
+	Repo        string
+	IssueNumber int64
+	Labels      []string
+	CWD         string
+}
+
 type IssueCommentResult struct {
 	ID  int64
 	URL string
@@ -132,6 +145,19 @@ type UpdateIssueCommentInput struct {
 	CommentID int64
 	Body      string
 	CWD       string
+}
+
+type CloseIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	StateReason string
+	CWD         string
+}
+
+type ClosePullRequestInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
 }
 
 type SubmitReviewInput struct {
@@ -379,7 +405,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -396,19 +422,23 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	out := make([]PullRequestSummary, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, PullRequestSummary{
-			Number:         asInt64(row["number"]),
-			Title:          asString(row["title"]),
-			URL:            asString(row["url"]),
-			State:          asString(row["state"]),
-			IsDraft:        asBool(row["isDraft"]),
-			ReviewDecision: asString(row["reviewDecision"]),
-			Labels:         extractLabelNames(row["labels"]),
-			HeadRefName:    asString(row["headRefName"]),
-			BaseRefName:    asString(row["baseRefName"]),
-			HeadSHA:        asString(row["headRefOid"]),
-			Author:         extractAuthor(row["author"]),
-			ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
-			Reviews:        toObjectSlice(row["reviews"]),
+			Number:            asInt64(row["number"]),
+			Title:             asString(row["title"]),
+			URL:               asString(row["url"]),
+			State:             asString(row["state"]),
+			UpdatedAt:         asString(row["updatedAt"]),
+			IsDraft:           asBool(row["isDraft"]),
+			ReviewDecision:    asString(row["reviewDecision"]),
+			Labels:            extractLabelNames(row["labels"]),
+			HeadRefName:       asString(row["headRefName"]),
+			BaseRefName:       asString(row["baseRefName"]),
+			HeadSHA:           asString(row["headRefOid"]),
+			BaseSHA:           asString(row["baseRefOid"]),
+			HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
+			Author:            extractAuthor(row["author"]),
+			AuthorAssociation: asString(row["authorAssociation"]),
+			ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
+			Reviews:           toObjectSlice(row["reviews"]),
 		})
 		out[len(out)-1].HasConflicts = asString(row["mergeStateStatus"]) == "DIRTY"
 	}
@@ -469,7 +499,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "author", "assignees", "labels"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "authorAssociation", "assignees", "labels"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
@@ -482,14 +512,16 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	out := make([]IssueSummary, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IssueSummary{
-			Number:    asInt64(row["number"]),
-			Title:     asString(row["title"]),
-			Body:      asString(row["body"]),
-			URL:       asString(row["url"]),
-			State:     asString(row["state"]),
-			Author:    extractAuthor(row["author"]),
-			Assignees: extractActorLogins(row["assignees"]),
-			Labels:    extractLabelNames(row["labels"]),
+			Number:            asInt64(row["number"]),
+			Title:             asString(row["title"]),
+			Body:              asString(row["body"]),
+			URL:               asString(row["url"]),
+			State:             asString(row["state"]),
+			UpdatedAt:         asString(row["updatedAt"]),
+			Author:            extractAuthor(row["author"]),
+			AuthorAssociation: asString(row["authorAssociation"]),
+			Assignees:         extractActorLogins(row["assignees"]),
+			Labels:            extractLabelNames(row["labels"]),
 		})
 	}
 	return out, nil
@@ -527,15 +559,17 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		return IssueDetail{}, err
 	}
 	return IssueDetail{
-		Number:        asInt64(row["number"]),
-		Title:         asString(row["title"]),
-		Body:          asString(row["body"]),
-		URL:           firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
-		State:         asString(row["state"]),
-		Author:        extractAuthor(firstNonNil(row["user"], row["author"])),
-		Assignees:     extractActorLogins(row["assignees"]),
-		Labels:        extractLabelNames(row["labels"]),
-		IsPullRequest: row["pull_request"] != nil,
+		Number:            asInt64(row["number"]),
+		Title:             asString(row["title"]),
+		Body:              asString(row["body"]),
+		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
+		State:             asString(row["state"]),
+		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
+		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
+		AuthorAssociation: asString(row["author_association"]),
+		Assignees:         extractActorLogins(row["assignees"]),
+		Labels:            extractLabelNames(row["labels"]),
+		IsPullRequest:     row["pull_request"] != nil,
 	}, nil
 }
 
@@ -556,6 +590,29 @@ func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueComme
 	return err
 }
 
+func (g *Gateway) CloseIssue(ctx context.Context, input CloseIssueInput) error {
+	reason, err := validateCloseIssueStateReason(input.StateReason)
+	if err != nil {
+		return err
+	}
+	state, err := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if err != nil {
+		return err
+	}
+	if state == "closed" {
+		return nil
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "issue", "close", strconv.FormatInt(input.IssueNumber, 10), "--repo", input.Repo, "--reason", reason)
+	if err == nil {
+		return nil
+	}
+	state, stateErr := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if stateErr == nil && state == "closed" {
+		return nil
+	}
+	return err
+}
+
 func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
 	assignees := compactIssueAssignees(input.Assignees)
 	if len(assignees) == 0 {
@@ -567,6 +624,38 @@ func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInp
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
+}
+
+func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) error {
+	if len(input.Labels) == 0 {
+		return nil
+	}
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+		return err
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.IssueNumber), "--method", "POST"}
+	for _, label := range input.Labels {
+		args = append(args, "-f", "labels[]="+label)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput) error {
+	if len(input.Labels) == 0 {
+		return nil
+	}
+	for _, label := range input.Labels {
+		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE")
+		if err == nil {
+			continue
+		}
+		if isMissingPullRequestLabelDelete(err) {
+			continue
+		}
+		return err
+	}
+	return nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -581,7 +670,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -595,51 +684,47 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		return PullRequestDetail{}, err
 	}
 	return PullRequestDetail{
-		Number:         asInt64(row["number"]),
-		Title:          asString(row["title"]),
-		Body:           asString(row["body"]),
-		URL:            asString(row["url"]),
-		State:          asString(row["state"]),
-		IsDraft:        asBool(row["isDraft"]),
-		ReviewDecision: asString(row["reviewDecision"]),
-		Labels:         extractLabelNames(row["labels"]),
-		HeadRefName:    asString(row["headRefName"]),
-		BaseRefName:    asString(row["baseRefName"]),
-		HeadSHA:        asString(row["headRefOid"]),
-		BaseSHA:        baseSHA,
-		Author:         extractAuthor(row["author"]),
-		ReviewRequests: extractReviewRequestLogins(row["reviewRequests"]),
-		HasConflicts:   asString(row["mergeStateStatus"]) == "DIRTY",
-		Comments:       threads,
-		IssueComments:  toObjectSlice(row["comments"]),
-		Reviews:        toObjectSlice(row["reviews"]),
-		Checks:         toObjectSlice(row["statusCheckRollup"]),
+		Number:            asInt64(row["number"]),
+		Title:             asString(row["title"]),
+		Body:              asString(row["body"]),
+		URL:               asString(row["url"]),
+		State:             asString(row["state"]),
+		UpdatedAt:         asString(row["updatedAt"]),
+		IsDraft:           asBool(row["isDraft"]),
+		ReviewDecision:    asString(row["reviewDecision"]),
+		Labels:            extractLabelNames(row["labels"]),
+		HeadRefName:       asString(row["headRefName"]),
+		BaseRefName:       asString(row["baseRefName"]),
+		HeadSHA:           asString(row["headRefOid"]),
+		BaseSHA:           asString(row["baseRefOid"]),
+		Author:            extractAuthor(row["author"]),
+		AuthorAssociation: asString(row["authorAssociation"]),
+		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
+		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
+		Comments:          threads,
+		IssueComments:     toObjectSlice(row["comments"]),
+		Reviews:           toObjectSlice(row["reviews"]),
+		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
 }
 
-func (g *Gateway) fetchBaseRefOid(ctx context.Context, input ViewPullRequestInput) string {
-	owner, name, err := parseRepo(input.Repo)
+func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestInput) error {
+	state, err := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
 	if err != nil {
-		return ""
+		return err
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
-		"query($owner: String!, $repo: String!, $number: Int!) {",
-		"  repository(owner: $owner, name: $repo) {",
-		"    pullRequest(number: $number) { baseRefOid }",
-		"  }",
-		"}",
-	}, "\n"), "-F", "owner="+owner, "-F", "repo="+name, "-F", fmt.Sprintf("number=%d", input.PRNumber))
-	if err != nil {
-		return ""
+	if state == "closed" || state == "merged" {
+		return nil
 	}
-	row, err := decodeJSONObject(result.Stdout)
-	if err != nil {
-		return ""
+	_, err = g.runGh(ctx, input.CWD, "", "pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
 	}
-	data, _ := row["data"].(map[string]any)
-	repo, _ := data["repository"].(map[string]any)
-	pr, _ := repo["pullRequest"].(map[string]any)
-	return asString(pr["baseRefOid"])
+	state, stateErr := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
+	if stateErr == nil && (state == "closed" || state == "merged") {
+		return nil
+	}
+	return err
 }
 
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
@@ -1596,8 +1681,10 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"        nodes {",
 		"          id",
 		"          isResolved",
+		"          path",
+		"          line",
 		"          comments(first: 1) {",
-		"            nodes { id body }",
+		"            nodes { id body url path line author { login } }",
 		"          }",
 		"        }",
 		"        pageInfo { hasNextPage endCursor }",
@@ -1865,7 +1952,49 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	if body := asString(first["body"]); body != "" {
 		out["body"] = body
 	}
+	if author := extractAuthor(first["author"]); author != "" {
+		out["author"] = author
+	}
+	if url := asString(first["url"]); url != "" {
+		out["url"] = url
+	}
+	if path := asString(first["path"]); path != "" {
+		out["path"] = path
+	} else if path := asString(row["path"]); path != "" {
+		out["path"] = path
+	}
+	if line := asInt64(first["line"]); line > 0 {
+		out["line"] = line
+	} else if line := asInt64(row["line"]); line > 0 {
+		out["line"] = line
+	}
 	return out, true
+}
+
+func validateCloseIssueStateReason(value string) (string, error) {
+	normalized := strings.TrimSpace(value)
+	switch normalized {
+	case "completed", "not_planned":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("invalid issue close reason %q", value)
+	}
+}
+
+func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber int64, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "api", fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber), "--jq", ".state")
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
+}
+
+func (g *Gateway) viewPullRequestState(ctx context.Context, repo string, prNumber int64, cwd string) (string, error) {
+	result, err := g.runGh(ctx, cwd, "", "pr", "view", strconv.FormatInt(prNumber, 10), "--repo", repo, "--json", "state", "--jq", ".state")
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
 }
 
 func normalizeReaction(value any) (githubReaction, bool) {

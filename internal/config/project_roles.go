@@ -26,6 +26,8 @@ func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 		return roles.Fixer.AutoDiscovery
 	case "worker":
 		return roles.Worker.AutoDiscovery
+	case "sweeper":
+		return roles.Sweeper.AutoDiscovery
 	default:
 		return false
 	}

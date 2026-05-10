@@ -73,6 +73,8 @@ func projectRoleInstructionsConfigured(roles *PartialRoleConfigs, role string) b
 		return roles.Reviewer != nil && roles.Reviewer.Instructions != nil
 	case "fixer":
 		return roles.Fixer != nil && roles.Fixer.Instructions != nil
+	case "sweeper":
+		return roles.Sweeper != nil && roles.Sweeper.Instructions != nil
 	default:
 		return false
 	}
