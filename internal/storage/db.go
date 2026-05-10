@@ -34,7 +34,7 @@ func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoo
 	}
 
 	coordinator := &SQLiteCoordinator{
-		db: db,
+		db:     db,
 		runner: NewMigrationRunner(db, MigrationRunnerOptions(options)),
 	}
 

@@ -1147,6 +1147,9 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
+		if githubinfra.IsPullRequestNotFoundError(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	if detail.State != "" && !strings.EqualFold(strings.TrimSpace(detail.State), "open") {

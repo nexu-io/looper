@@ -563,7 +563,7 @@ func TestPublishResumeDoesNotRerunPriorSteps(t *testing.T) {
 func TestValidatedLifecyclePullRequestTreatsLookupErrorAsNonAdoptable(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{GitHub: &fakeGitHubGateway{viewPRErr: fmt.Errorf("not found")}})
+	runner := New(Options{GitHub: &fakeGitHubGateway{viewPRErr: fmt.Errorf("could not resolve to a PullRequest")}})
 	state := &lifecycle.State{PRNumber: 84, PRURL: "https://example/pr/84"}
 	adopted, err := runner.validatedLifecyclePullRequest(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}}, checkpointIssue{Repo: "acme/looper"}, checkpointWorktree{Branch: "looper/test", BaseBranch: "main"}, state)
 	if err != nil {

@@ -582,7 +582,7 @@ func (r *commandRuntime) readPathUpgradeDaemonVersion(ctx context.Context) (*upg
 func (r *commandRuntime) readUpgradeDaemonVersion(ctx context.Context, command string, source string) (*upgradeDaemonVersionState, error) {
 	versionText, err := r.runVersionCommand(ctx, command)
 	if err != nil {
-		return nil, err
+		return nil, nil
 	}
 	if versionText == "" {
 		return nil, nil

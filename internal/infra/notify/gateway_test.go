@@ -269,5 +269,3 @@ func notificationStatus(records []storage.NotificationRecord, channel string) st
 
 	return ""
 }
-
-

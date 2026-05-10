@@ -678,7 +678,6 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
-	baseSHA := g.fetchBaseRefOid(ctx, input)
 	threads, err := g.fetchReviewThreads(ctx, input.Repo, input.PRNumber, input.CWD)
 	if err != nil {
 		return PullRequestDetail{}, err

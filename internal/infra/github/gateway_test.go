@@ -34,8 +34,6 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
-		case strings.Contains(args, "baseRefOid"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view"):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","updatedAt":"2026-05-04T12:00:00Z","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"authorAssociation":"CONTRIBUTOR","reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
@@ -729,8 +727,6 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case strings.Contains(args, "baseRefOid"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
@@ -1117,8 +1113,6 @@ func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case strings.Contains(args, "baseRefOid"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.Contains(args, "pr view"):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","author":{"login":"octocat"},"reviewRequests":[],"comments":[{"id":"IC_comment","body":"@codex review"}],"reviews":[],"statusCheckRollup":[]}`}, nil
 		case strings.Contains(args, "reviewThreads"):
@@ -1182,8 +1176,6 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case strings.Contains(args, "baseRefOid"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"baseRefOid":"def456"}}}}`}, nil
 		case strings.HasPrefix(args, "pr view"):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
 		case strings.Contains(args, "reviewThreads"):
