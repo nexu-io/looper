@@ -2215,7 +2215,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if isGitHubSelfApprovalFailure(message) {
 			kind = FailureNonRetryable
 		} else if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
+			kind = FailureRetryableTransient
 		}
 		if kind == FailureRetryableTransient {
 			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)

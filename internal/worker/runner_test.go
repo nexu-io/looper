@@ -176,6 +176,62 @@ func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T
 	}
 }
 
+func TestDiscoverIssuesSkipsFailedWorkerLoopWhenFingerprintUnchanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	issue := IssueSummary{Number: 91, Title: "Implement worker-ready", Body: "same body", URL: "https://github.com/acme/looper/issues/91", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint(repo, "main", issue)
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildIssueTargetID(repo, issue.Number)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_failed_same_fp", Seq: 99, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{issue}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for unchanged failed fingerprint", result.QueueItems)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_failed_same_fp")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "failed" {
+		t.Fatalf("loop = %#v, want failed loop preserved", loop)
+	}
+}
+
+func TestDiscoverIssuesRequeuesFailedWorkerLoopWhenFingerprintChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	oldIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "old body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
+	newIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "new body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint(repo, "main", oldIssue)
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildIssueTargetID(repo, newIssue.Number)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_failed_changed_fp", Seq: 100, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{newIssue}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one queue item after fingerprint change", result.QueueItems)
+	}
+}
+
 func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1532,11 +1588,12 @@ func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyD
 		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
 	}
 	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
-	loopResult, err := runner.ensureLoopForDiscoveredIssue(context.Background(), *project, "acme/looper", issue)
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(context.Background(), *project, "acme/looper", issue, fingerprint)
 	if err != nil {
 		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
 	}
-	queueItem, err := runner.enqueueDiscoveredIssue(context.Background(), *project, loopResult.record, "acme/looper", issue)
+	queueItem, err := runner.enqueueDiscoveredIssue(context.Background(), *project, loopResult.record, "acme/looper", issue, fingerprint)
 	if err != nil {
 		t.Fatalf("enqueueDiscoveredIssue() error = %v", err)
 	}

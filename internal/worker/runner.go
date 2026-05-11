@@ -705,18 +705,19 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue)
+		fingerprint := buildWorkerDiscoveryFingerprint(input.Repo, firstNonEmpty(derefString(project.BaseBranch), "main"), issue)
+		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
 			result.Skipped++
 			continue
 		}
-		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue)
+		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -790,6 +791,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
+				stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 			}
 			updated.NextRunAt = nil
 		}
@@ -895,6 +897,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "paused"
 				} else {
 					updated.Status = "failed"
+					stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 				}
 				updated.NextRunAt = nil
 			}
@@ -936,6 +939,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
+						stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 					}
 					updated.NextRunAt = nil
 				}
@@ -1940,22 +1944,23 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	})
 }
 
-func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
 	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
-	loops, err := r.repos.Loops.List(ctx)
+	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	for _, existing := range loops {
+	for _, existing := range existingLoops {
 		if existing.Type == "worker" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
 			updated := existing
 			updated.Repo = &repo
-			if !pausedOrCompleted && updated.Status != "running" {
+			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
+			if !pausedOrCompleted && !suppressFailedRevival && updated.Status != "running" {
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
@@ -1982,7 +1987,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	return loopUpsertResult{record: loop, created: true}, nil
 }
 
-func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary) (storage.QueueItemRecord, error) {
+func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary, fingerprint string) (storage.QueueItemRecord, error) {
 	dedupeKey := buildWorkerIssueDedupeKey(project.ID, repo, issue.Number)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
@@ -1993,7 +1998,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true})
+	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID
@@ -2768,6 +2773,33 @@ func buildIssueTargetID(repo string, issueNumber int64) string {
 
 func buildWorkerIssueDedupeKey(projectID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("worker:%s:%s:%d", projectID, repo, issueNumber)
+}
+
+func buildWorkerDiscoveryFingerprint(repo, baseBranch string, issue IssueSummary) string {
+	return loops.ComputeDiscoveryFingerprint(
+		"worker",
+		repo,
+		fmt.Sprintf("%d", issue.Number),
+		strings.TrimSpace(baseBranch),
+		strings.TrimSpace(issue.Title),
+		strings.TrimSpace(issue.Body),
+		strings.TrimSpace(issue.URL),
+		strings.Join(loops.CanonicalSortedStrings(issue.Labels), ","),
+		strings.Join(loops.CanonicalSortedStrings(issue.Assignees), ","),
+	)
+}
+
+func stampWorkerFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueItem storage.QueueItemRecord) {
+	metadata := parseJSONObject(queueItem.PayloadJSON)
+	fingerprint := stringFromAnyDefault(metadata["discoveryFingerprint"])
+	if strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	merged, err := loops.MergeLastFailedDiscoveryFingerprint(updated.MetadataJSON, fingerprint)
+	if err != nil {
+		return
+	}
+	updated.MetadataJSON = stringPtr(merged)
 }
 
 func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }

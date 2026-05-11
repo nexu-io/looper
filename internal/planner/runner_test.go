@@ -81,7 +81,7 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	if err != nil || project1Loop != nil {
 		t.Fatalf("Loops.GetByID(missing) = (%#v, %v), want (nil, nil)", project1Loop, err)
 	}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue(project_1) error = %v", err)
 	}
@@ -152,11 +152,60 @@ func TestDiscoverIssuesQueriesEachServerSideLabelWhenConfiguredWithAnyLabelMode(
 	}
 }
 
+func TestDiscoverIssuesSkipsFailedPlannerLoopWhenFingerprintUnchanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	issue := IssueSummary{Number: 77, Title: "Plan this", Body: "same body", URL: "https://github.com/acme/looper/issues/77", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	fingerprint := buildPlannerDiscoveryFingerprint(repo, fixture.now(), issue)
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildIssueTargetID(repo, issue.Number)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_planner_failed_same_fp", Seq: 88, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issues: []IssueSummary{issue}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for unchanged failed fingerprint", result.QueueItems)
+	}
+}
+
+func TestDiscoverIssuesRequeuesFailedPlannerLoopWhenFingerprintChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	oldIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "old body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	newIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "new body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	fingerprint := buildPlannerDiscoveryFingerprint(repo, fixture.now(), oldIssue)
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildIssueTargetID(repo, newIssue.Number)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_planner_failed_changed_fp", Seq: 89, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issues: []IssueSummary{newIssue}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one queue item after fingerprint change", result.QueueItems)
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}
@@ -196,7 +245,7 @@ func TestProcessClaimedItemPlannerSkipsWhenNotManualAndIneligible(t *testing.T) 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}
@@ -235,7 +284,7 @@ func TestProcessClaimedItemDiscoveryQueueIgnoresManualLoopMetadata(t *testing.T)
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}
@@ -376,7 +425,7 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}
@@ -411,7 +460,7 @@ func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}
@@ -618,7 +667,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
-	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue)
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
 	}

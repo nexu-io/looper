@@ -824,7 +824,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.record.Status == "paused" || loopResult.skipped {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
 			result.Skipped++
 			continue
 		}
@@ -962,6 +962,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
+				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 			}
 			updated.NextRunAt = nil
 		}
@@ -1054,6 +1055,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "paused"
 				} else {
 					updated.Status = "failed"
+					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 				}
 				updated.NextRunAt = nil
 			}
@@ -1122,6 +1124,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
+						stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 					}
 					updated.NextRunAt = nil
 				}
@@ -2227,16 +2230,16 @@ type loopUpsertResult struct {
 
 func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
-	loops, err := r.repos.Loops.List(ctx)
+	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	for _, existing := range loops {
+	for _, existing := range existingLoops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
 			if existing.Status == "paused" {
 				return loopUpsertResult{record: existing, created: false}, nil
 			}
-			if shouldSkipRediscoveryAfterNoopResolve(existing.MetadataJSON, headSHA, fixItemsHash) {
+			if loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsHash)) || shouldSkipRediscoveryAfterNoopResolve(existing.MetadataJSON, headSHA, fixItemsHash) {
 				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
 			}
 			updated := existing
@@ -2301,7 +2304,8 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
-	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
+	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)})
+	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
@@ -3126,6 +3130,26 @@ func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fi
 	lastHeadSHA, _ := stringFromAny(metadata["lastNoopResolveHeadSha"])
 	lastFixItemsHash, _ := stringFromAny(metadata["lastNoopResolveFixItemsHash"])
 	return lastHeadSHA != "" && lastHeadSHA == headSHA && lastFixItemsHash != "" && lastFixItemsHash == fixItemsHash
+}
+
+func buildFixerDiscoveryFingerprint(repo string, prNumber int64, headSHA, fixItemsHash string) string {
+	if headSHA == "" {
+		headSHA = "unknown"
+	}
+	return loops.ComputeDiscoveryFingerprint("fixer", repo, fmt.Sprintf("%d", prNumber), headSHA, fixItemsHash)
+}
+
+func stampFixerFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueItem storage.QueueItemRecord) {
+	metadata := parseJSONObject(queueItem.PayloadJSON)
+	fingerprint, _ := stringFromAny(metadata["discoveryFingerprint"])
+	if strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	merged, err := loops.MergeLastFailedDiscoveryFingerprint(updated.MetadataJSON, fingerprint)
+	if err != nil {
+		return
+	}
+	updated.MetadataJSON = stringPtr(merged)
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {
