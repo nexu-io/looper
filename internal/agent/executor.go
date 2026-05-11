@@ -1127,10 +1127,13 @@ func resolveArgs(cfg ExecutorConfig, prompt string) []string {
 
 func resolveClaudeArgs(cfg ExecutorConfig, args []string, prompt string) []string {
 	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
-	if hasAnyFlag(resolved, []string{"-p", "--print"}) {
-		return resolved
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		resolved = append(resolved, "--print", prompt)
 	}
-	return append(resolved, "--print", prompt)
+	if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
+		resolved = append(resolved, "--dangerously-skip-permissions")
+	}
+	return resolved
 }
 
 func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string {
@@ -1174,6 +1177,9 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, args []string, sessionID string
 		}
 		if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
 			resolved = append(resolved, "--print", prompt)
+		}
+		if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
+			resolved = append(resolved, "--dangerously-skip-permissions")
 		}
 		return resolved
 	case config.AgentVendorCodex:
