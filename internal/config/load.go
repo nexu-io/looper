@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 )
@@ -273,7 +272,7 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 	return nil
 }
 
-func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target *T) error {
+func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target **T) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -281,11 +280,9 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	decodeTarget := any(target)
-	targetValue := reflect.ValueOf(target)
-	if targetValue.Kind() == reflect.Ptr && !targetValue.IsNil() {
-		elem := targetValue.Elem()
-		if elem.Kind() == reflect.Ptr && !elem.IsNil() {
-			decodeTarget = elem.Interface()
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if target != nil && *target != nil {
+			decodeTarget = *target
 		}
 	}
 	if err := decoder.Decode(decodeTarget); err != nil {

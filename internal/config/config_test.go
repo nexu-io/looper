@@ -139,6 +139,25 @@ func TestReadConfigFileMergesDuplicateTopLevelSectionsInEncounterOrder(t *testin
 	}
 }
 
+func TestReadConfigFileLaterNullClearsDuplicateKnownSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"server":{"host":"0.0.0.0"},"server":null}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server != nil {
+		t.Fatalf("readConfigFile() server = %#v, want nil", partial.Server)
+	}
+}
+
 func TestReadConfigFileRejectsInvalidEarlierDuplicateKnownSection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	contents := `{"SERVER":{"bad":1},"Server":{"host":"127.0.0.2"}}`
