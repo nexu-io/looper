@@ -244,17 +244,37 @@ type downloadProgress struct {
 	total    int64
 	read     int64
 	last     time.Time
+	mode     downloadProgressMode
 	finished bool
 }
 
+type downloadProgressMode uint8
+
+const (
+	downloadProgressModeLive downloadProgressMode = iota
+	downloadProgressModeSummary
+)
+
+type downloadProgressModeWriter interface {
+	io.Writer
+	downloadProgressMode() downloadProgressMode
+}
+
 func newDownloadProgress(w io.Writer, name string, total int64) *downloadProgress {
-	p := &downloadProgress{w: w, name: name, total: total}
+	mode := downloadProgressModeLive
+	if writer, ok := w.(downloadProgressModeWriter); ok {
+		mode = writer.downloadProgressMode()
+	}
+	p := &downloadProgress{w: w, name: name, total: total, mode: mode}
 	p.print(true)
 	return p
 }
 
 func (p *downloadProgress) Write(data []byte) (int, error) {
 	p.read += int64(len(data))
+	if p.mode == downloadProgressModeSummary {
+		return len(data), nil
+	}
 	if time.Since(p.last) >= 200*time.Millisecond {
 		p.print(false)
 	}
@@ -267,6 +287,9 @@ func (p *downloadProgress) finish() {
 	}
 	p.finished = true
 	p.print(false)
+	if p.mode == downloadProgressModeSummary {
+		return
+	}
 	_, _ = fmt.Fprintln(p.w)
 }
 
@@ -285,7 +308,15 @@ func (p *downloadProgress) print(initial bool) {
 		line = fmt.Sprintf("Downloading %s...", p.name)
 	}
 	if initial {
+		if p.mode == downloadProgressModeSummary {
+			_, _ = fmt.Fprintln(p.w, line)
+			return
+		}
 		_, _ = fmt.Fprint(p.w, line)
+		return
+	}
+	if p.mode == downloadProgressModeSummary {
+		_, _ = fmt.Fprintln(p.w, line)
 		return
 	}
 	_, _ = fmt.Fprintf(p.w, "\r%s", line)

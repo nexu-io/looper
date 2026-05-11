@@ -359,6 +359,12 @@ func TestUpgradeUnifiedDownloadsCLIAndDaemonConcurrently(t *testing.T) {
 		!strings.Contains(stdout.String(), "looperd 9.9.9") {
 		t.Fatalf("stdout = %q, want daemon install confirmation", stdout.String())
 	}
+	if got := strings.Count(stderr.String(), "Downloading "); got != 4 {
+		t.Fatalf("stderr download line count = %d, want 4 compact summary lines; stderr=%q", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "\r") {
+		t.Fatalf("stderr = %q, did not expect carriage-return progress spam", stderr.String())
+	}
 }
 
 // errDaemonOffline mimics the real "daemon offline" error returned by the

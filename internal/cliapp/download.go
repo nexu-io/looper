@@ -176,9 +176,10 @@ func extractBinaryFromTarGz(archiveBytes []byte, binaryName string) ([]byte, err
 }
 
 // concurrentProgressMux serializes progress writes from multiple goroutines
-// onto a single underlying writer. Carriage returns are rewritten to newlines
-// so concurrent artifact updates do not stomp each other on the same physical
-// line, which keeps both human output and test substring checks reliable.
+// onto a single underlying writer. It also tells download progress emitters to
+// use compact summary mode so concurrent artifact downloads produce a small,
+// readable set of whole-line updates instead of noisy interleaved carriage-
+// return animations.
 type concurrentProgressMux struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -197,6 +198,10 @@ func (m *concurrentProgressMux) writer() io.Writer {
 
 type concurrentLineWriter struct {
 	parent *concurrentProgressMux
+}
+
+func (c *concurrentLineWriter) downloadProgressMode() downloadProgressMode {
+	return downloadProgressModeSummary
 }
 
 func (c *concurrentLineWriter) Write(p []byte) (int, error) {
