@@ -388,6 +388,11 @@ func (r *Runner) persistReplayHeuristicProposal(ctx context.Context, projectID s
 	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
 		return nil, err
 	}
+	if project, roleCfg, err := r.projectConfig(ctx, projectID); err == nil && project != nil {
+		if writeErr := r.writeDurableReport(projectID, target, sweeperPayload{Repo: caseRecord.Repo, TargetType: targetTypeFromBool(target.IsPR), TargetNumber: target.Number, Category: category, Confidence: confidence, Summary: summary, Rationale: rationale}, caseRecord, &record, roleCfg); writeErr != nil {
+			return nil, writeErr
+		}
+	}
 	return &record, nil
 }
 
@@ -450,6 +455,11 @@ func (r *Runner) persistReplayAgentProposal(ctx context.Context, projectID strin
 	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
 		return nil, err
 	}
+	if project, roleCfg, err := r.projectConfig(ctx, projectID); err == nil && project != nil {
+		if writeErr := r.writeDurableReport(projectID, liveTarget{Number: caseRecord.TargetNumber, Title: bundle.Title, Body: bundle.Body, State: bundle.State, UpdatedAt: bundle.UpdatedAt, Author: bundle.Author, IsPR: targetType == "pull_request"}, sweeperPayload{Repo: caseRecord.Repo, TargetType: targetType, TargetNumber: caseRecord.TargetNumber, Category: proposal.Category, Confidence: proposal.Confidence, Summary: proposal.Summary, Rationale: proposal.Rationale}, caseRecord, &record, roleCfg); writeErr != nil {
+			return nil, writeErr
+		}
+	}
 	return &record, nil
 }
 
@@ -480,5 +490,13 @@ func (r *Runner) persistInvalidReplayAgentProposal(ctx context.Context, projectI
 		ValidationError:  &validationError,
 		CreatedAt:        r.nowISO(),
 	}
-	return r.repos.SweeperProposals.Insert(ctx, record)
+	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
+		return err
+	}
+	if project, roleCfg, err := r.projectConfig(ctx, projectID); err == nil && project != nil {
+		if writeErr := r.writeDurableReport(projectID, liveTarget{Number: caseRecord.TargetNumber, Title: bundle.Title, Body: bundle.Body, State: bundle.State, UpdatedAt: bundle.UpdatedAt, Author: bundle.Author, IsPR: targetType == "pull_request"}, sweeperPayload{Repo: caseRecord.Repo, TargetType: targetType, TargetNumber: caseRecord.TargetNumber, Category: categoryNone, Summary: validationErr.Error()}, caseRecord, &record, roleCfg); writeErr != nil {
+			return writeErr
+		}
+	}
+	return nil
 }

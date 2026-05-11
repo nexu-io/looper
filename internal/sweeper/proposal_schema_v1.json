@@ -19,7 +19,7 @@
     },
     "decision": {
       "type": "string",
-      "enum": ["no_action", "warn", "close", "cancel", "quarantine", "stale_proposal"]
+      "enum": ["no_action", "warn", "close", "cancel", "stale_proposal"]
     },
     "category": {
       "type": "string",

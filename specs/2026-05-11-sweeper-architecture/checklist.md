@@ -57,6 +57,6 @@
 
 ## Phase 4 — Subjective categories and reporting polish
 
-- [ ] Decide whether `unrelated` should exist in apply mode
-- [ ] Optional markdown exports / durable human-readable reports
-- [ ] Reconsider `quarantine` as agent-selectable decision
+- [x] Decide whether `unrelated` should exist in apply mode
+- [x] Optional markdown exports / durable human-readable reports
+- [x] Reconsider `quarantine` as agent-selectable decision

@@ -528,7 +528,7 @@ Sweeper-specific config fields:
 - `roles.sweeper.proposer.mode`: `agent_apply` for agent-backed canonical proposals on live categories, or `heuristic_fallback` as a break-glass fallback
 - `roles.sweeper.proposer.model`: optional sweeper-specific agent model override
 - `roles.sweeper.proposer.timeoutSeconds`: proposer agent timeout budget per review attempt
-- `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `1`
+- `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `2`
 - `roles.sweeper.proposer.diagnosticMode`: when `true`, persist fresh heuristic shadow proposals alongside agent-backed reviews for offline comparison
 - `roles.sweeper.proposer.timeoutRateDryRunThreshold`: auto-backpressure threshold from `0..1`; when the observed agent timeout rate meets or exceeds it, the scheduler flips that repo to sweeper dry-run
 - `roles.sweeper.proposer.timeoutRateDryRunMinSamples`: minimum agent proposal sample size required before timeout-rate backpressure can auto-flip a repo
@@ -543,7 +543,7 @@ Sweeper-specific config fields:
 - `roles.sweeper.security.notifyAssignees`: assignee logins to notify on security-routing outcomes
 - `roles.sweeper.reporting.durableReportsDir`: optional durable report export directory; the canonical audit store remains the sweeper case/proposal ledger
 
-Sweeper categories currently exposed in config are `stale`, `alreadyFixed`, `superseded`, `unrelated`, and `abandonedPR`. Queue items remain triggers only; canonical sweeper state lives in `sweeper_cases` and `sweeper_proposals`.
+Sweeper categories currently exposed in config are `stale`, `alreadyFixed`, `superseded`, `unrelated`, and `abandonedPR`. `unrelated` remains report-only/dry-run for now, and `route_security` remains deterministic prefilter-only with dry-run apply until maintainers confirm the operating model; canonical live apply stays focused on higher-confidence maintenance categories while `sweeper_cases` and `sweeper_proposals` remain the source of truth.
 
 For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 

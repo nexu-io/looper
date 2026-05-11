@@ -109,7 +109,7 @@ func buildProposalPrompt(bundle FactBundle, phase, heuristicCategory, heuristicR
 Rules:
 - Use decision=warn or decision=close conservatively.
 - Use decision=no_action only with category=none.
-- Use decision=quarantine only with category=route_security.
+- Do not use decision=quarantine; route_security remains deterministic prefilter-only for now.
 - Prefer linked PR and timeline evidence for already_fixed and superseded when available.
 - Include evidence[] references with bundlePath pointers when using non-trivial evidence.
 - confidenceScore must be 0..100.
@@ -177,9 +177,7 @@ func validateNormalizedProposal(proposal normalizedProposal, phase string) error
 			return fmt.Errorf("decision close requires supported close category")
 		}
 	case "quarantine":
-		if category != categoryRouteSecurity {
-			return fmt.Errorf("decision quarantine requires category route_security")
-		}
+		return fmt.Errorf("decision quarantine is not accepted from proposer output; route_security remains prefilter-only")
 	case "cancel":
 		if phase != "reconcile" {
 			return fmt.Errorf("decision cancel requires phase reconcile")
@@ -260,6 +258,9 @@ func (r *Runner) persistAgentProposal(ctx context.Context, projectID string, tar
 	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
 		return nil, "", err
 	}
+	if err := r.writeDurableReport(projectID, target, payload, caseRecord, &record, roleCfg); err != nil {
+		return nil, "", err
+	}
 	_ = phase
 	_ = heuristicCategory
 	_ = heuristicRationale
@@ -301,5 +302,8 @@ func (r *Runner) persistInvalidAgentProposal(ctx context.Context, projectID stri
 		ValidationError:  &validationError,
 		CreatedAt:        r.nowISO(),
 	}
-	return r.repos.SweeperProposals.Insert(ctx, record)
+	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
+		return err
+	}
+	return r.writeDurableReport(projectID, target, sweeperPayload{Repo: caseRecord.Repo, TargetType: targetTypeFromBool(target.IsPR), TargetNumber: target.Number, Category: categoryNone, Summary: validationErr.Error()}, caseRecord, &record, roleCfg)
 }

@@ -1310,6 +1310,9 @@ func (r *Runner) persistProposal(ctx context.Context, projectID string, target l
 	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
 		return nil, "", err
 	}
+	if err := r.writeDurableReport(projectID, target, payload, caseRecord, &record, roleCfg); err != nil {
+		return nil, "", err
+	}
 	return &record, fingerprintJSON, nil
 }
 
@@ -1354,7 +1357,20 @@ func (r *Runner) syncCase(ctx context.Context, projectID string, target liveTarg
 		record.TerminalAt = stringPtr(r.nowISO())
 	}
 	record.UpdatedAt = r.nowISO()
-	return r.repos.SweeperCases.Upsert(ctx, record)
+	if err := r.repos.SweeperCases.Upsert(ctx, record); err != nil {
+		return err
+	}
+	reportProposal := proposal
+	if r.repos != nil && r.repos.SweeperProposals != nil && strings.TrimSpace(payload.ProposalID) != "" {
+		latestProposal, err := r.repos.SweeperProposals.GetByID(ctx, strings.TrimSpace(payload.ProposalID))
+		if err != nil {
+			return err
+		}
+		if latestProposal != nil {
+			reportProposal = latestProposal
+		}
+	}
+	return r.writeDurableReport(projectID, target, payload, &record, reportProposal, roleCfg)
 }
 
 func (r *Runner) loadProposalForApply(ctx context.Context, payload sweeperPayload, caseRecord *storage.SweeperCaseRecord) (*storage.SweeperProposalRecord, error) {
@@ -1488,11 +1504,10 @@ func agentEligibleCategory(category string) bool {
 }
 
 func forcedDryRunCategory(roleCfg config.SweeperRoleConfig, category string) bool {
-	if roleCfg.Proposer.Mode != config.SweeperProposerModeAgentApply {
-		return false
-	}
 	switch category {
-	case categoryUnrelated, categoryRouteSecurity:
+	case categoryUnrelated:
+		return true
+	case categoryRouteSecurity:
 		return true
 	default:
 		return false

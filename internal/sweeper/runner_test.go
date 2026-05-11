@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -283,6 +284,75 @@ func TestProcessWarnPostsWarningAndMarksPending(t *testing.T) {
 	}
 }
 
+func TestProcessWarnKeepsUnrelatedDryRunOnly(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.cfg.Roles.Sweeper.Categories.Unrelated.Enabled = true
+	fixture.github.issueDetails["acme/looper#63"] = githubinfra.IssueDetail{Number: 63, Title: "Support question", Body: "question about setup", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+	queueID := "queue_sweeper_warn_unrelated_63"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#63", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#63", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" || result.Summary != "sweeper dry-run warning" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want unrelated dry-run skip", result)
+	}
+	if len(fixture.github.createdComments) != 0 {
+		t.Fatalf("createdComments = %#v, want no live warning for unrelated category", fixture.github.createdComments)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 63)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil || caseRecord.CurrentCategory == nil || *caseRecord.CurrentCategory != categoryUnrelated || caseRecord.Status != "open" {
+		t.Fatalf("caseRecord = %#v, want unrelated open case", caseRecord)
+	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), *caseRecord.LastProposalID)
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	if proposal == nil || proposal.ApplyStatus == nil || *proposal.ApplyStatus != "skipped_dry_run" {
+		t.Fatalf("proposal = %#v, want skipped dry-run apply receipt", proposal)
+	}
+}
+
+func TestProcessWarnKeepsRouteSecurityDryRunOnlyInHeuristicMode(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeHeuristicFallback
+	fixture.github.issueDetails["acme/looper#65"] = githubinfra.IssueDetail{Number: 65, Title: "Security issue", Body: "security incident details", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+	queueID := "queue_sweeper_warn_route_security_65"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#65", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#65", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" || result.Summary != "sweeper dry-run quarantine" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want route_security dry-run skip", result)
+	}
+	if got := fixture.github.addedLabels["acme/looper#65"]; len(got) != 0 {
+		t.Fatalf("addedLabels = %#v, want no live quarantine label application", fixture.github.addedLabels)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 65)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil || caseRecord.CurrentCategory == nil || *caseRecord.CurrentCategory != categoryRouteSecurity {
+		t.Fatalf("caseRecord = %#v, want route_security case record", caseRecord)
+	}
+}
+
 func TestProcessWarnAgentApplyUsesAgentProposalAndPersistsRawResult(t *testing.T) {
 	t.Parallel()
 
@@ -425,6 +495,76 @@ func TestReplayCaseProposalDryRunPersistsValidatedAgentProposalWithoutMutatingCa
 	}
 	if len(proposals) != 2 || proposals[0].ID != proposal.ID || proposals[1].ID != "proposal_replay_base_agent" {
 		t.Fatalf("ListByCaseID() = %#v, want new replay proposal followed by base proposal", proposals)
+	}
+}
+
+func TestProcessWarnWritesDurableMarkdownReport(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	reportDir := t.TempDir()
+	fixture.cfg.Roles.Sweeper.Reporting.DurableReportsDir = reportDir
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.github.issueDetails["acme/looper#64"] = githubinfra.IssueDetail{Number: 64, Title: "Bug", Body: "already fixed by #9", State: "open", Author: "octo", Labels: nil}
+	queueID := "queue_sweeper_warn_report_64"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#64", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#64", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	if _, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn}); err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	reportPath := filepath.Join(reportDir, fixture.projectID, "acme", "looper", "issue-64.md")
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", reportPath, err)
+	}
+	report := string(reportBytes)
+	if !strings.Contains(report, "# Sweeper Report") || !strings.Contains(report, "Repo: acme/looper") || !strings.Contains(report, "Apply status: completed_warned") || !strings.Contains(report, "already_fixed") {
+		t.Fatalf("report = %q, want durable markdown summary", report)
+	}
+}
+
+func TestReplayCaseProposalDryRunWritesDurableMarkdownReport(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	reportDir := t.TempDir()
+	fixture.cfg.Roles.Sweeper.Reporting.DurableReportsDir = reportDir
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
+	caseRecord := seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_replay_report",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 74,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{
+		proposalID:     "proposal_replay_base_report",
+		decision:       "warn",
+		category:       categoryStale,
+		proposerKind:   "heuristic_v1",
+		factBundle:     replayFactBundle("acme/looper", "issue", 74, fixture.now.Add(-100*24*time.Hour)),
+		createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
+		lastProposalID: true,
+	})
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent replay warning","rationale":"agent replay rationale","markerUUID":"marker-replay-74"}`}}
+
+	proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
+	if err != nil {
+		t.Fatalf("ReplayCaseProposalDryRun() error = %v", err)
+	}
+	reportPath := filepath.Join(reportDir, fixture.projectID, "acme", "looper", "issue-74.md")
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", reportPath, err)
+	}
+	report := string(reportBytes)
+	if proposal == nil || !strings.Contains(report, "Proposal ID: "+proposal.ID) || !strings.Contains(report, "Validation status: passed") || !strings.Contains(report, "agent replay rationale") {
+		t.Fatalf("report = %q, want replay proposal durable report", report)
 	}
 }
 
