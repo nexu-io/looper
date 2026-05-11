@@ -819,11 +819,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number)
+		fixItemsHash := hashFixItems(fixItems)
+		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.record.Status == "paused" {
+		if loopResult.record.Status == "paused" || loopResult.skipped {
 			result.Skipped++
 			continue
 		}
@@ -840,7 +841,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			Repo:         input.Repo,
 			PRNumber:     pr.Number,
 			HeadSHA:      headSHA,
-			FixItemsHash: hashFixItems(fixItems),
+			FixItemsHash: fixItemsHash,
 		})
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -1569,6 +1570,13 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedNoPushHeadSHA != "" && verifiedNoPushHeadSHA == detailHeadSHA(checkpoint.Detail)) {
+		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveAt": r.nowISO()})
+		if err != nil {
+			return checkpoint, err
+		}
+		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+			return checkpoint, err
+		}
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureRetryableAfterResume}
 	}
@@ -2214,9 +2222,10 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 type loopUpsertResult struct {
 	record  storage.LoopRecord
 	created bool
+	skipped bool
 }
 
-func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -2226,6 +2235,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
 			if existing.Status == "paused" {
 				return loopUpsertResult{record: existing, created: false}, nil
+			}
+			if shouldSkipRediscoveryAfterNoopResolve(existing.MetadataJSON, headSHA, fixItemsHash) {
+				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
 			}
 			updated := existing
 			if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
@@ -3104,6 +3116,16 @@ func resolveCommentsVerifiedNoPushHeadSHA(push *checkpointPush, loopMetadataJSON
 		return ""
 	}
 	return lastFixHeadSHA
+}
+
+func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsHash string) bool {
+	if headSHA == "" || fixItemsHash == "" {
+		return false
+	}
+	metadata := parseJSONObject(loopMetadataJSON)
+	lastHeadSHA, _ := stringFromAny(metadata["lastNoopResolveHeadSha"])
+	lastFixItemsHash, _ := stringFromAny(metadata["lastNoopResolveFixItemsHash"])
+	return lastHeadSHA != "" && lastHeadSHA == headSHA && lastFixItemsHash != "" && lastFixItemsHash == fixItemsHash
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {
