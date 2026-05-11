@@ -2,6 +2,7 @@ package sweeper
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -417,6 +418,38 @@ func TestDiscoverPullRequestsSkipsExcludedAuthorAssociations(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsWhenAuthorAssociationLookupFails(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 3, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want lookup failure to fail closed", result)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsWhenAuthorAssociationLookupFails(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 4, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want lookup failure to fail closed", result)
+	}
+}
+
 func TestDiscoverIssuesSkipsReopenedSweptItemWithinCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -524,6 +557,7 @@ type stubGitHub struct {
 	prs             []githubinfra.PullRequestSummary
 	issueDetails    map[string]githubinfra.IssueDetail
 	prDetails       map[string]githubinfra.PullRequestDetail
+	viewIssueErr    error
 	listIssuesCalls int
 	listPRCalls     int
 	createdComments []githubinfra.IssueCommentInput
@@ -545,6 +579,9 @@ func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenP
 }
 
 func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if g.viewIssueErr != nil {
+		return githubinfra.IssueDetail{}, g.viewIssueErr
+	}
 	return g.issueDetails[input.Repo+"#"+itoa(input.IssueNumber)], nil
 }
 
