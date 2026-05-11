@@ -1,0 +1,62 @@
+# Sweeper architecture optimization checklist
+
+## Phase 0 — Documentation deltas
+
+- [ ] Land this spec under `specs/2026-05-11-sweeper-architecture/`
+- [ ] Update `docs/sweeper.md` and `roles.sweeper` config reference to the target model
+- [ ] Align CLI help / debug output with canonical vocabulary (case, proposal, fact bundle, apply receipt, stale proposal, marker UUID)
+- [ ] Define metric names for `sweeper.proposals.*` and `sweeper.apply.*`
+
+## Phase 1a — Persisted ledger (no agent surface change)
+
+- [ ] Add `sweeper_cases` table, repository, and required indexes
+- [ ] Add `sweeper_proposals` table, repository, and required indexes
+- [ ] Migrate runner internals to read/write the new tables
+- [ ] Reduce queue payload to orchestration metadata only
+- [ ] Extract deterministic prefilter stage from current runner
+- [ ] Build Phase 1 fact bundle per §5.1 (no new gateway methods)
+- [ ] Widen `ViewIssue` / `ViewPullRequest` return shape to expose comment timestamps if missing
+- [ ] Implement fingerprint algorithm and persist on case + proposal rows
+- [ ] Implement marker pre-check using `markerUUID`
+- [ ] Implement per-step apply protocol with `partial:*` receipts
+- [ ] Implement stale-proposal detection on apply
+- [ ] Expand reconcile to cover the full triggers table (event-driven path)
+- [ ] Add maintenance reconcile entry point
+- [ ] Move daily ceilings to applied-side accounting (soft + hard budget split)
+- [ ] Wire heuristic classifier as `proposer_kind=heuristic_v1` writing real proposals
+
+## Phase 1b — Agent proposer on the same ledger
+
+- [ ] Add sweeper proposal schema file (`schemaVersion: 1`)
+- [ ] Add prompt builder + agent execution wrapper
+- [ ] Persist raw agent transcripts alongside normalized proposal JSON
+- [ ] Validate every agent proposal against schema and decision×category matrix
+- [ ] Wire `roles.sweeper.proposer.mode = agent_apply | heuristic_fallback`
+- [ ] Enforce shadow-only heuristic proposals under `agent_apply`
+- [ ] Switch `stale` and `abandoned_pr` apply to consume agent proposals
+- [ ] Keep `already_fixed`, `superseded`, `unrelated`, `route_security` gated to dry-run
+- [ ] Surface filtered-out vs agent-reviewed counts in CLI/debug output
+- [ ] Apply the failure & retry matrix uniformly across propose and apply
+
+## Phase 2 — Hardening and operator surface
+
+- [ ] Operator inspection commands (list cases, show proposal+receipt, replay propose)
+- [ ] Metrics/dashboards for proposals, apply outcomes, stale rate, agent timeout rate
+- [ ] Backpressure: auto-flip repo to dry-run on agent timeout-rate threshold
+- [ ] Schema version 2 design review (no implementation)
+- [ ] Diagnostic mode: heuristic + agent in parallel for offline accuracy comparison
+
+## Phase 3 — Richer fact bundle and deterministic evidence categories
+
+- [ ] Add gateway methods: `ListIssueComments`, `ListIssueTimeline`, `ListIssueReactions`, `ListLinkedPullRequests`, `ListPullRequestReviewState`
+- [ ] Extend fact bundle with §5.3 field groups
+- [ ] Decide per-field whether any new field enters the fingerprint; amend §7 if so
+- [ ] Stronger evidence extraction for `already_fixed` and `superseded`
+- [ ] Bump proposal schema to `schemaVersion: 2` for linked-evidence references
+- [ ] Enable `already_fixed` and `superseded` for live apply after dry-run validation
+
+## Phase 4 — Subjective categories and reporting polish
+
+- [ ] Decide whether `unrelated` should exist in apply mode
+- [ ] Optional markdown exports / durable human-readable reports
+- [ ] Reconsider `quarantine` as agent-selectable decision
