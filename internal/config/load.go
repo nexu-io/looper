@@ -227,6 +227,9 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 	if err != nil {
 		return err
 	}
+	if token == nil {
+		return nil
+	}
 	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
 		return fmt.Errorf("invalid JSON value for config: expected object")
 	}

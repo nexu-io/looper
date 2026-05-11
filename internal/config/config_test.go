@@ -54,6 +54,33 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(`null`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if loaded.Partial != (PartialConfig{}) {
+		t.Fatalf("LoadFile().Partial = %#v, want empty config", loaded.Partial)
+	}
+	if loaded.Config.Server.Host != "127.0.0.1" {
+		t.Fatalf("LoadFile().Config.Server.Host = %q, want default %q", loaded.Config.Server.Host, "127.0.0.1")
+	}
+}
+
 func TestReadConfigFileIgnoresUnknownTopLevelKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	contents := `{"futureSection":{"enabled":true},"server":{"host":"0.0.0.0"}}`
@@ -73,6 +100,24 @@ func TestReadConfigFileIgnoresUnknownTopLevelKeys(t *testing.T) {
 	}
 	if partial.Scheduler != nil {
 		t.Fatalf("readConfigFile() scheduler = %#v, want nil", partial.Scheduler)
+	}
+}
+
+func TestReadConfigFileAcceptsTopLevelNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`null`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial != (PartialConfig{}) {
+		t.Fatalf("readConfigFile() partial = %#v, want empty config", partial)
 	}
 }
 
