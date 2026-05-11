@@ -479,8 +479,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "produced no new commits") {
-		t.Fatalf("result = %#v, want manual intervention failure for no-op repair", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "produced no new commits") {
+		t.Fatalf("result = %#v, want retryable-after-resume failure for no-op repair", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
 		t.Fatalf("commit calls=%d push calls=%d resolve calls=%d, want 0/0/0 after no-op repair", len(git.commitCalls), len(git.pushCalls), len(github.resolveCalls))
@@ -496,8 +496,25 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if checkpoint.Push == nil || checkpoint.Push.Pushed || checkpoint.Push.SkippedReason == "" {
 		t.Fatalf("checkpoint.Push = %#v, want recorded no-op push", checkpoint.Push)
 	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
 	if checkpoint.ResolvedComments != nil {
 		t.Fatalf("checkpoint.ResolvedComments = %#v, want unresolved comments left untouched", checkpoint.ResolvedComments)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+		t.Fatalf("queue = %#v, want queued retryable-after-resume failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop scheduled for rediscovery retry", loop)
 	}
 }
 
@@ -577,24 +594,27 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 		},
 	}
 
-	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
 		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: checkpoint,
 	})
 	if err == nil {
-		t.Fatal("runResolveCommentsStep() error = nil, want manual intervention")
+		t.Fatal("runResolveCommentsStep() error = nil, want rediscoverable retry")
 	}
 	var loopErr *loopError
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != FailureRetryableAfterResume {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableAfterResume)
 	}
 	if !contains(loopErr.Error(), "produced no new commits") {
 		t.Fatalf("error = %q, want no-new-commits message", loopErr.Error())
+	}
+	if updated.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
 	}
 }
 
@@ -934,7 +954,7 @@ func TestProcessClaimedItemPersistsCheckpointWhenRepairReturnsNonCompleted(t *te
 	}
 }
 
-func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testing.T) {
+func TestProcessClaimedItemTreatsAgentSetupFailureAsRetryableTransient(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
@@ -961,15 +981,22 @@ func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "requires a newer version") {
-		t.Fatalf("result = %#v, want manual_intervention with real agent error", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
+		t.Fatalf("result = %#v, want retryable_transient with real agent error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention failure", queue)
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want queued retryable_transient failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop awaiting retry", loop)
 	}
 }
 
@@ -1085,7 +1112,7 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 	}
 }
 
-func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
+func TestCreateRunContextRestartsFromDiscoverForRediscoverableCheckpoint(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -1109,7 +1136,7 @@ func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
-		ResumePolicy: "manual_intervention",
+		ResumePolicy: "restart_from_discover",
 		Detail: &checkpointDetail{
 			State:       "OPEN",
 			HeadSHA:     "head-1",

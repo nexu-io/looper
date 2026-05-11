@@ -956,7 +956,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if shouldPauseLoopAfterFailure(failureKind, failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -1100,13 +1100,17 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
 			failure := r.classifyFailure(err)
-			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+			latest := checkpoint
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
+				if strings.TrimSpace(resumePolicy) == "" {
+					resumePolicy = "advance_from_checkpoint"
+				}
 			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
+				if strings.TrimSpace(resumePolicy) == "" {
+					resumePolicy = "manual_intervention"
+				}
 			default:
 				if resumePolicy == "" {
 					resumePolicy = "replay_step"
@@ -1129,7 +1133,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if shouldPauseLoopAfterFailure(failure.kind, failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
@@ -1382,11 +1386,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
-		kind := FailureRetryableTransient
-		if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
-		}
-		return checkpoint, &loopError{message: message, kind: kind}
+		return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
@@ -1571,7 +1571,8 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
-		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
+		checkpoint.ResumePolicy = "restart_from_discover"
+		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureRetryableAfterResume}
 	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
@@ -2085,7 +2086,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || shouldRestartManualInterventionFromDiscover(latestRun.Status, checkpoint)
+		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || shouldRestartFromDiscoverByResumePolicy(latestRun.Status, checkpoint)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
@@ -2915,11 +2916,26 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 	return strings.Contains(failureSummary, "PR head changed before resolving comments")
 }
 
-func shouldRestartManualInterventionFromDiscover(status string, checkpoint fixerCheckpoint) bool {
+func shouldRestartFromDiscoverByResumePolicy(status string, checkpoint fixerCheckpoint) bool {
 	if status != "failed" && status != "interrupted" {
 		return false
 	}
-	return checkpoint.ResumePolicy == "manual_intervention"
+	switch checkpoint.ResumePolicy {
+	case "manual_intervention", "restart_from_discover":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldPauseLoopAfterFailure(failureKind QueueFailureKind, failedQueue *storage.QueueItemRecord, resumePolicy string) bool {
+	if failedQueue != nil && failedQueue.Status == "cancelled" {
+		return true
+	}
+	if strings.TrimSpace(resumePolicy) != "" {
+		return resumePolicy == "manual_intervention"
+	}
+	return failureKind == FailureManualIntervention
 }
 
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {
