@@ -288,14 +288,18 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 		if issue.IsPullRequest {
 			continue
 		}
+		targetID := buildTargetID(input.Repo, issue.Number)
+		if r.shouldSkipSummary(issue.Labels, issue.Author, states[targetID], roleCfg) {
+			result.Skipped++
+			continue
+		}
 		var associationOK bool
 		issue.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, issue.Number, issue.AuthorAssociation, roleCfg)
 		if !associationOK {
 			result.Skipped++
 			continue
 		}
-		targetID := buildTargetID(input.Repo, issue.Number)
-		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, states[targetID], roleCfg) {
+		if authorAssociationExcluded(issue.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -363,14 +367,18 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			result.Skipped++
 			continue
 		}
+		targetID := buildTargetID(input.Repo, pr.Number)
+		if r.shouldSkipSummary(pr.Labels, pr.Author, states[targetID], roleCfg) {
+			result.Skipped++
+			continue
+		}
 		var associationOK bool
 		pr.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, pr.Number, pr.AuthorAssociation, roleCfg)
 		if !associationOK {
 			result.Skipped++
 			continue
 		}
-		targetID := buildTargetID(input.Repo, pr.Number)
-		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, states[targetID], roleCfg) {
+		if authorAssociationExcluded(pr.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -706,7 +714,7 @@ func gracePeriodForCategory(category string, roleCfg config.SweeperRoleConfig) i
 	}
 }
 
-func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+func (r *Runner) shouldSkipSummary(labels []string, author string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
 	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabelExcept(labels, roleCfg.Triggers.LooperInternalLabels, roleCfg.Lifecycle.ClosedLabel) || hasLabel(labels, roleCfg.Security.QuarantineLabel) {
 		return true
 	}
@@ -718,6 +726,10 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 			return true
 		}
 	}
+	return false
+}
+
+func authorAssociationExcluded(authorAssociation string, roleCfg config.SweeperRoleConfig) bool {
 	for _, excluded := range roleCfg.Triggers.ExcludeAuthorAssociations {
 		if strings.EqualFold(strings.TrimSpace(excluded), strings.TrimSpace(authorAssociation)) {
 			return true

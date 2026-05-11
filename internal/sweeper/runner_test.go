@@ -126,6 +126,46 @@ func TestDiscoverPullRequestsSkipsWhenPRLaneDisabled(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsExcludedLabelBeforeAuthorAssociationLookup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeLabels = []string{"skip-me"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: []string{"skip-me"}}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want excluded label to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 0 {
+		t.Fatalf("ViewIssue() calls = %d, want 0", fixture.github.viewIssueCalls)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsExcludedAuthorBeforeAuthorAssociationLookup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthors = []string{"octo"}
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded author to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 0 {
+		t.Fatalf("ViewIssue() calls = %d, want 0", fixture.github.viewIssueCalls)
+	}
+}
+
 func TestProcessWarnSkipsFreshAbandonedPRCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -558,6 +598,7 @@ type stubGitHub struct {
 	issueDetails    map[string]githubinfra.IssueDetail
 	prDetails       map[string]githubinfra.PullRequestDetail
 	viewIssueErr    error
+	viewIssueCalls  int
 	listIssuesCalls int
 	listPRCalls     int
 	createdComments []githubinfra.IssueCommentInput
@@ -579,6 +620,7 @@ func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenP
 }
 
 func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	g.viewIssueCalls++
 	if g.viewIssueErr != nil {
 		return githubinfra.IssueDetail{}, g.viewIssueErr
 	}
