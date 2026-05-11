@@ -349,6 +349,9 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
+type sweeperAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type sweeperAgentExecutionAdapter struct{ execution agent.Execution }
+
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
@@ -388,6 +391,26 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 }
 
 func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
+}
+
+func (a sweeperAgentExecutorAdapter) Start(ctx context.Context, input sweeper.AgentRunInput) (sweeper.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return sweeperAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Wait(ctx context.Context) (sweeper.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return sweeper.AgentResult{}, err
+	}
+	return sweeper.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
@@ -804,6 +827,22 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		LogDir: cfg.Daemon.LogDir,
 		Now:    now,
 	})
+	sweeperAgentModel := cfg.Roles.Sweeper.Proposer.Model
+	if sweeperAgentModel == nil || strings.TrimSpace(*sweeperAgentModel) == "" {
+		sweeperAgentModel = cfg.Agent.Model
+	}
+	sweeperAgentExecutor := agent.New(agent.ExecutorOptions{
+		Config: agent.ExecutorConfig{
+			Vendor:              *cfg.Agent.Vendor,
+			Model:               sweeperAgentModel,
+			Params:              cfg.Agent.Params,
+			Env:                 cfg.Agent.Env,
+			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+		},
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
+	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
 	agentRuntime := ""
@@ -937,7 +976,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
-	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Logger: logger, Now: now, Config: &cfg})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Agent: sweeperAgentExecutorAdapter{executor: sweeperAgentExecutor}, Logger: logger, Now: now, Config: &cfg, AgentRuntime: agentRuntime, AgentModel: sweeperAgentModel})
 
 	return func(ctx context.Context, services Services) error {
 		var runner schedulerAsyncRunner

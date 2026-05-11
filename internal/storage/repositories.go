@@ -226,6 +226,7 @@ type SweeperProposalRecord struct {
 	FactBundleJSON   string
 	FingerprintJSON  string
 	ProposalJSON     string
+	RawResultJSON    *string
 	Decision         string
 	Category         string
 	ConfidenceScore  int64
@@ -831,12 +832,12 @@ func (r *SweeperProposalsRepository) Insert(ctx context.Context, record SweeperP
 		INSERT INTO sweeper_proposals (
 			id, case_id, project_id, repo, target_type, target_number,
 			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, decision, category, confidence_score, summary,
+			proposal_json, raw_result_json, decision, category, confidence_score, summary,
 			rationale, marker_uuid, validation_status, validation_error,
 			apply_status, apply_summary, apply_error, applied_at, created_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, record.ID, record.CaseID, record.ProjectID, record.Repo, record.TargetType, record.TargetNumber, record.SchemaVersion, record.ProposerKind, record.FactBundleJSON, record.FingerprintJSON, record.ProposalJSON, record.Decision, record.Category, record.ConfidenceScore, record.Summary, record.Rationale, record.MarkerUUID, record.ValidationStatus, record.ValidationError, record.ApplyStatus, record.ApplySummary, record.ApplyError, record.AppliedAt, record.CreatedAt)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.CaseID, record.ProjectID, record.Repo, record.TargetType, record.TargetNumber, record.SchemaVersion, record.ProposerKind, record.FactBundleJSON, record.FingerprintJSON, record.ProposalJSON, record.RawResultJSON, record.Decision, record.Category, record.ConfidenceScore, record.Summary, record.Rationale, record.MarkerUUID, record.ValidationStatus, record.ValidationError, record.ApplyStatus, record.ApplySummary, record.ApplyError, record.AppliedAt, record.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("insert sweeper proposal: %w", err)
 	}
@@ -845,7 +846,15 @@ func (r *SweeperProposalsRepository) Insert(ctx context.Context, record SweeperP
 }
 
 func (r *SweeperProposalsRepository) GetByID(ctx context.Context, id string) (*SweeperProposalRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM sweeper_proposals WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `
+		SELECT id, case_id, project_id, repo, target_type, target_number,
+			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
+			proposal_json, raw_result_json, decision, category, confidence_score,
+			summary, rationale, marker_uuid, validation_status, validation_error,
+			apply_status, apply_summary, apply_error, applied_at, created_at
+		FROM sweeper_proposals
+		WHERE id = ?
+	`, id)
 	record, err := scanSweeperProposal(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -859,7 +868,11 @@ func (r *SweeperProposalsRepository) GetByID(ctx context.Context, id string) (*S
 
 func (r *SweeperProposalsRepository) GetLatestByCaseID(ctx context.Context, caseID string) (*SweeperProposalRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
-		SELECT *
+		SELECT id, case_id, project_id, repo, target_type, target_number,
+			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
+			proposal_json, raw_result_json, decision, category, confidence_score,
+			summary, rationale, marker_uuid, validation_status, validation_error,
+			apply_status, apply_summary, apply_error, applied_at, created_at
 		FROM sweeper_proposals
 		WHERE case_id = ?
 		ORDER BY created_at DESC, id DESC
@@ -878,7 +891,11 @@ func (r *SweeperProposalsRepository) GetLatestByCaseID(ctx context.Context, case
 
 func (r *SweeperProposalsRepository) ListByCaseID(ctx context.Context, caseID string) ([]SweeperProposalRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
+		SELECT id, case_id, project_id, repo, target_type, target_number,
+			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
+			proposal_json, raw_result_json, decision, category, confidence_score,
+			summary, rationale, marker_uuid, validation_status, validation_error,
+			apply_status, apply_summary, apply_error, applied_at, created_at
 		FROM sweeper_proposals
 		WHERE case_id = ?
 		ORDER BY created_at DESC, id DESC
@@ -2453,6 +2470,7 @@ func scanSweeperProposals(rows *sql.Rows) ([]SweeperProposalRecord, error) {
 func scanSweeperProposal(row interface{ Scan(...any) error }) (SweeperProposalRecord, error) {
 	var (
 		record           SweeperProposalRecord
+		rawResultJSON    sql.NullString
 		summary          sql.NullString
 		rationale        sql.NullString
 		markerUUID       sql.NullString
@@ -2476,6 +2494,7 @@ func scanSweeperProposal(row interface{ Scan(...any) error }) (SweeperProposalRe
 		&record.FactBundleJSON,
 		&record.FingerprintJSON,
 		&record.ProposalJSON,
+		&rawResultJSON,
 		&record.Decision,
 		&record.Category,
 		&record.ConfidenceScore,
@@ -2496,6 +2515,7 @@ func scanSweeperProposal(row interface{ Scan(...any) error }) (SweeperProposalRe
 
 	record.Summary = nullableString(summary)
 	record.Rationale = nullableString(rationale)
+	record.RawResultJSON = nullableString(rawResultJSON)
 	record.MarkerUUID = nullableString(markerUUID)
 	record.ValidationStatus = nullableString(validationStatus)
 	record.ValidationError = nullableString(validationError)

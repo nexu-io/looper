@@ -399,10 +399,36 @@ type SweeperCategoriesConfig struct {
 	AbandonedPR  SweeperCategoryConfig `json:"abandonedPR"`
 }
 
+type SweeperProposerMode string
+
+const (
+	SweeperProposerModeAgentApply        SweeperProposerMode = "agent_apply"
+	SweeperProposerModeHeuristicFallback SweeperProposerMode = "heuristic_fallback"
+)
+
+type SweeperFilterMode string
+
+const (
+	SweeperFilterModeDeterministic SweeperFilterMode = "deterministic"
+)
+
+type SweeperProposerConfig struct {
+	Mode           SweeperProposerMode `json:"mode"`
+	Model          *string             `json:"model,omitempty"`
+	TimeoutSeconds int                 `json:"timeoutSeconds"`
+	SchemaVersion  int                 `json:"schemaVersion"`
+}
+
+type SweeperFilterConfig struct {
+	Mode SweeperFilterMode `json:"mode"`
+}
+
 type SweeperRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	DryRun        bool                    `json:"dryRun"`
 	Triggers      SweeperTriggersConfig   `json:"triggers"`
+	Filter        SweeperFilterConfig     `json:"filter"`
+	Proposer      SweeperProposerConfig   `json:"proposer"`
 	Lifecycle     SweeperLifecycleConfig  `json:"lifecycle"`
 	Limits        SweeperLimitsConfig     `json:"limits"`
 	Categories    SweeperCategoriesConfig `json:"categories"`
@@ -677,6 +703,17 @@ type PartialSweeperReportingConfig struct {
 	DurableReportsDir *string `json:"durableReportsDir,omitempty"`
 }
 
+type PartialSweeperProposerConfig struct {
+	Mode           *SweeperProposerMode `json:"mode,omitempty"`
+	Model          *string              `json:"model,omitempty"`
+	TimeoutSeconds *int                 `json:"timeoutSeconds,omitempty"`
+	SchemaVersion  *int                 `json:"schemaVersion,omitempty"`
+}
+
+type PartialSweeperFilterConfig struct {
+	Mode *SweeperFilterMode `json:"mode,omitempty"`
+}
+
 type PartialSweeperLifecycleConfig struct {
 	PendingLabel *string `json:"pendingLabel,omitempty"`
 	ClosedLabel  *string `json:"closedLabel,omitempty"`
@@ -720,6 +757,8 @@ type PartialSweeperRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	DryRun        *bool                           `json:"dryRun,omitempty"`
 	Triggers      *PartialSweeperTriggersConfig   `json:"triggers,omitempty"`
+	Filter        *PartialSweeperFilterConfig     `json:"filter,omitempty"`
+	Proposer      *PartialSweeperProposerConfig   `json:"proposer,omitempty"`
 	Lifecycle     *PartialSweeperLifecycleConfig  `json:"lifecycle,omitempty"`
 	Limits        *PartialSweeperLimitsConfig     `json:"limits,omitempty"`
 	Categories    *PartialSweeperCategoriesConfig `json:"categories,omitempty"`

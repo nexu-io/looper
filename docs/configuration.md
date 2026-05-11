@@ -524,6 +524,11 @@ Sweeper-specific config fields:
 - `roles.sweeper.triggers.looperInternalLabels`: labels treated as Looper-owned/policy-relevant for filtering and fingerprinting
 - `roles.sweeper.triggers.reopenCooldownDays`: skip recently reopened targets for this cooldown window
 - `roles.sweeper.triggers.maxPerTick`: soft per-discovery budget before proposal/apply
+- `roles.sweeper.filter.mode`: deterministic prefilter mode used before any agent review; currently `deterministic`
+- `roles.sweeper.proposer.mode`: `agent_apply` for agent-backed canonical proposals on live categories, or `heuristic_fallback` as a break-glass fallback
+- `roles.sweeper.proposer.model`: optional sweeper-specific agent model override
+- `roles.sweeper.proposer.timeoutSeconds`: proposer agent timeout budget per review attempt
+- `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `1`
 - `roles.sweeper.lifecycle.pendingLabel`: label used while a case is in warned/pending-close state
 - `roles.sweeper.lifecycle.closedLabel`: label added when sweeper completes a close action
 - `roles.sweeper.lifecycle.keepLabel`: label that suppresses sweeper action and can cancel a pending case

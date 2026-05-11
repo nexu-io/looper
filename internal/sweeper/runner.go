@@ -75,21 +75,27 @@ type GitHubGateway interface {
 }
 
 type Options struct {
-	Repos  *storage.Repositories
-	GitHub GitHubGateway
-	Logger bootstrap.Logger
-	Now    func() time.Time
-	Config *config.Config
+	Repos        *storage.Repositories
+	GitHub       GitHubGateway
+	Agent        AgentExecutor
+	Logger       bootstrap.Logger
+	Now          func() time.Time
+	Config       *config.Config
+	AgentRuntime string
+	AgentModel   *string
 }
 
 type Runner struct {
-	repos   *storage.Repositories
-	github  GitHubGateway
-	logger  bootstrap.Logger
-	now     func() time.Time
-	config  *config.Config
-	claimer string
-	maxTry  int64
+	repos        *storage.Repositories
+	github       GitHubGateway
+	agent        AgentExecutor
+	logger       bootstrap.Logger
+	now          func() time.Time
+	config       *config.Config
+	agentRuntime string
+	agentModel   *string
+	claimer      string
+	maxTry       int64
 }
 
 type payloadEnvelope struct {
@@ -173,7 +179,7 @@ func New(options Options) *Runner {
 	if now == nil {
 		now = time.Now
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, logger: options.Logger, now: now, config: options.Config, claimer: defaultClaimedBy, maxTry: defaultRetryMax}
+	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -415,6 +421,9 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			warnCount++
 		}
 	}
+	if r.logger != nil {
+		r.logger.Debug("sweeper issue discovery summary", map[string]any{"repo": input.Repo, "filteredOut": result.Skipped, "queued": len(result.QueueItems), "agentReviewed": 0})
+	}
 	return result, nil
 }
 
@@ -498,6 +507,9 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			warnCount++
 		}
 	}
+	if r.logger != nil {
+		r.logger.Debug("sweeper pull request discovery summary", map[string]any{"repo": input.Repo, "filteredOut": result.Skipped, "queued": len(result.QueueItems), "agentReviewed": 0})
+	}
 	return result, nil
 }
 
@@ -553,7 +565,10 @@ func (r *Runner) buildQueueItem(ctx context.Context, seed queueSeed) (storage.Qu
 }
 
 func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRecord, payload sweeperPayload) (sweeperPayload, string, string, error) {
-	roleCfg := r.roleConfig(derefString(queueItem.ProjectID))
+	project, roleCfg, err := r.projectConfig(ctx, derefString(queueItem.ProjectID))
+	if err != nil {
+		return payload, "failed", "", err
+	}
 	target, err := r.loadTarget(ctx, queueItem)
 	if err != nil {
 		return payload, "failed", "", err
@@ -577,6 +592,10 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 			payload.CloseBy = derefString(caseRecord.CloseDueAt)
 		}
 	}
+	existingProposal, err := r.loadProposalForApply(ctx, payload, caseRecord)
+	if err != nil {
+		return payload, "failed", "", err
+	}
 	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	payload.Phase = "warn"
 	payload.Outcome = outcomeNoAction
@@ -595,6 +614,33 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	if r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
+		if validAgentApplyProposal(existingProposal, "warn", roleCfg.Proposer.SchemaVersion) {
+			proposal = existingProposal
+			fingerprintJSON = existingProposal.FingerprintJSON
+			payload = hydratePayloadFromProposal(payload, proposal)
+			decision = proposal.Decision
+			category = proposal.Category
+			confidence = int(proposal.ConfidenceScore)
+			rationale = derefString(proposal.Rationale)
+			payload.Category = category
+			payload.Confidence = confidence
+			payload.Rationale = rationale
+		} else {
+			proposal, fingerprintJSON, err = r.proposeAgentDecision(ctx, project, queueItem, target, caseRecord, payload, roleCfg, "warn", category, rationale)
+			if err != nil {
+				return payload, "failed", "", err
+			}
+			payload = hydratePayloadFromProposal(payload, proposal)
+			decision = proposal.Decision
+			category = proposal.Category
+			confidence = int(proposal.ConfidenceScore)
+			rationale = derefString(proposal.Rationale)
+			payload.Category = category
+			payload.Confidence = confidence
+			payload.Rationale = rationale
+		}
+	}
 	if proposal != nil {
 		payload.ProposalID = proposal.ID
 	}
@@ -609,7 +655,7 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 		return payload, "skipped", defaultSkippedSummary, nil
 	}
 	if category == categoryRouteSecurity {
-		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
+		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil || forcedDryRunCategory(roleCfg, category) {
 			payload.Outcome = outcomeDryRun
 			payload.Summary = "sweeper dry-run quarantine"
 			if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
@@ -670,7 +716,7 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 			return payload, "completed", payload.Summary, nil
 		}
 	}
-	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
+	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil || forcedDryRunCategory(roleCfg, category) {
 		payload.Outcome = outcomeDryRun
 		payload.Summary = "sweeper dry-run warning"
 		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
@@ -717,7 +763,10 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 }
 
 func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRecord, payload sweeperPayload) (sweeperPayload, string, string, error) {
-	roleCfg := r.roleConfig(derefString(queueItem.ProjectID))
+	project, roleCfg, err := r.projectConfig(ctx, derefString(queueItem.ProjectID))
+	if err != nil {
+		return payload, "failed", "", err
+	}
 	target, err := r.loadTarget(ctx, queueItem)
 	if err != nil {
 		return payload, "failed", "", err
@@ -783,9 +832,39 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	}
 	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	decision := categoryDecisionForPhase("close", category)
-	proposal, fingerprintJSON, err := r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale)
-	if err != nil {
-		return payload, "failed", "", err
+	var proposal *storage.SweeperProposalRecord
+	if r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
+		if applyProposal != nil && applyProposal.Decision == "close" {
+			if !validAgentApplyProposal(applyProposal, "close", roleCfg.Proposer.SchemaVersion) {
+				payload.Outcome = outcomeNoAction
+				payload.Summary = "sweeper agent proposal required"
+				_ = r.updateProposalApplyReceipt(ctx, applyProposal.ID, "skipped_schema_obsolete", payload.Summary, nil, false)
+				return payload, "skipped", payload.Summary, nil
+			}
+			proposal = applyProposal
+			fingerprintJSON = applyProposal.FingerprintJSON
+		} else {
+			if _, _, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale); err != nil {
+				return payload, "failed", "", err
+			}
+			proposal, fingerprintJSON, err = r.proposeAgentDecision(ctx, project, queueItem, target, caseRecord, payload, roleCfg, "close", category, rationale)
+			if err != nil {
+				return payload, "failed", "", err
+			}
+			payload = hydratePayloadFromProposal(payload, proposal)
+			decision = proposal.Decision
+			category = proposal.Category
+			confidence = int(proposal.ConfidenceScore)
+			rationale = derefString(proposal.Rationale)
+			payload.Category = category
+			payload.Confidence = confidence
+			payload.Rationale = rationale
+		}
+	} else {
+		proposal, fingerprintJSON, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale)
+		if err != nil {
+			return payload, "failed", "", err
+		}
 	}
 	if proposal != nil {
 		payload.ProposalID = proposal.ID
@@ -838,7 +917,7 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		return payload, "completed", payload.Summary, nil
 	}
 	if category == categoryRouteSecurity {
-		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
+		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil || forcedDryRunCategory(roleCfg, category) {
 			payload.Outcome = outcomeDryRun
 			payload.Summary = "sweeper dry-run quarantine"
 			if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
@@ -878,7 +957,7 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		return payload, "completed", payload.Summary, nil
 	}
 	closeComment := buildCloseComment(target, payload, rationale)
-	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
+	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil || forcedDryRunCategory(roleCfg, category) {
 		payload.Outcome = outcomeDryRun
 		payload.Summary = "sweeper dry-run close"
 		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
@@ -1236,9 +1315,22 @@ func (r *Runner) loadProposalForApply(ctx context.Context, payload sweeperPayloa
 		return r.repos.SweeperProposals.GetByID(ctx, proposalID)
 	}
 	if caseRecord != nil {
-		return r.repos.SweeperProposals.GetLatestByCaseID(ctx, caseRecord.ID)
+		if caseRecord.LastProposalID != nil && strings.TrimSpace(*caseRecord.LastProposalID) != "" {
+			return r.repos.SweeperProposals.GetByID(ctx, strings.TrimSpace(*caseRecord.LastProposalID))
+		}
+		return nil, nil
 	}
 	return nil, nil
+}
+
+func validAgentApplyProposal(proposal *storage.SweeperProposalRecord, expectedDecision string, schemaVersion int) bool {
+	if proposal == nil || proposal.ProposerKind != proposerKindAgentV1 || proposal.Decision != expectedDecision {
+		return false
+	}
+	if proposal.SchemaVersion != int64(schemaVersion) {
+		return false
+	}
+	return proposal.ValidationStatus != nil && strings.TrimSpace(*proposal.ValidationStatus) == "passed"
 }
 
 func (r *Runner) staleProposalStatusForApply(target liveTarget, caseRecord *storage.SweeperCaseRecord, roleCfg config.SweeperRoleConfig, proposal *storage.SweeperProposalRecord) (bool, *storage.SweeperProposalRecord, string, error) {
@@ -1324,6 +1416,93 @@ func (r *Runner) buildFactBundle(target liveTarget, caseRecord *storage.SweeperC
 		}
 	}
 	return bundle
+}
+
+func (r *Runner) agentApplyEnabled(roleCfg config.SweeperRoleConfig) bool {
+	return roleCfg.Proposer.Mode == config.SweeperProposerModeAgentApply
+}
+
+func agentEligibleCategory(category string) bool {
+	switch category {
+	case categoryStale, categoryAbandonedPR:
+		return true
+	default:
+		return false
+	}
+}
+
+func forcedDryRunCategory(roleCfg config.SweeperRoleConfig, category string) bool {
+	if roleCfg.Proposer.Mode != config.SweeperProposerModeAgentApply {
+		return false
+	}
+	switch category {
+	case categoryAlreadyFixed, categorySuperseded, categoryUnrelated, categoryRouteSecurity:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Runner) proposeAgentDecision(ctx context.Context, project *storage.ProjectRecord, queueItem storage.QueueItemRecord, target liveTarget, caseRecord *storage.SweeperCaseRecord, payload sweeperPayload, roleCfg config.SweeperRoleConfig, phase, heuristicCategory, heuristicRationale string) (*storage.SweeperProposalRecord, string, error) {
+	if r.agent == nil {
+		return nil, "", fmt.Errorf("sweeper agent proposer is not configured")
+	}
+	prompt, err := buildProposalPrompt(r.buildFactBundle(target, caseRecord, roleCfg), phase, heuristicCategory, heuristicRationale, roleCfg, r.agentRuntime, modelOrOverride(roleCfg.Proposer.Model, r.agentModel))
+	if err != nil {
+		return nil, "", err
+	}
+	executionID := eventlog.NewEventID("agent_execution")
+	execution, err := r.agent.Start(ctx, AgentRunInput{
+		ExecutionID:      executionID,
+		ProjectID:        derefString(queueItem.ProjectID),
+		LoopID:           derefString(queueItem.LoopID),
+		RunID:            executionID,
+		Prompt:           prompt,
+		WorkingDirectory: project.RepoPath,
+		Timeout:          time.Duration(roleCfg.Proposer.TimeoutSeconds) * time.Second,
+		HeartbeatTimeout: time.Duration(roleCfg.Proposer.TimeoutSeconds) * time.Second,
+		Metadata: map[string]any{
+			"role":              "sweeper",
+			"sweeperPhase":      phase,
+			"heuristicCategory": heuristicCategory,
+			"repo":              payload.Repo,
+			"targetType":        payload.TargetType,
+			"targetNumber":      payload.TargetNumber,
+		},
+		IdempotencyKey: fmt.Sprintf("sweeper:%s:%s:%s", phase, payload.Repo, buildTargetID(payload.Repo, payload.TargetNumber)),
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("start sweeper proposer agent: %w", err)
+	}
+	result, err := execution.Wait(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("wait for sweeper proposer agent: %w", err)
+	}
+	if r.logger != nil {
+		r.logger.Debug("sweeper proposer reviewed candidate", map[string]any{"repo": payload.Repo, "phase": phase, "targetType": payload.TargetType, "targetNumber": payload.TargetNumber, "filteredOut": 0, "agentReviewed": 1})
+	}
+	if result.Status != "completed" {
+		statusErr := fmt.Errorf("sweeper proposer execution status %q", result.Status)
+		_ = r.persistInvalidAgentProposal(ctx, derefString(queueItem.ProjectID), target, caseRecord, roleCfg, executionID, prompt, result, statusErr)
+		return nil, "", statusErr
+	}
+	proposal, parseErr := parseNormalizedProposal(firstNonEmpty(result.Stdout, result.Summary))
+	if parseErr != nil {
+		_ = r.persistInvalidAgentProposal(ctx, derefString(queueItem.ProjectID), target, caseRecord, roleCfg, executionID, prompt, result, parseErr)
+		return nil, "", parseErr
+	}
+	if validateErr := validateNormalizedProposal(proposal, phase); validateErr != nil {
+		_ = r.persistInvalidAgentProposal(ctx, derefString(queueItem.ProjectID), target, caseRecord, roleCfg, executionID, prompt, result, validateErr)
+		return nil, "", validateErr
+	}
+	return r.persistAgentProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, phase, heuristicCategory, heuristicRationale, executionID, prompt, result, proposal)
+}
+
+func modelOrOverride(primary, fallback *string) *string {
+	if primary != nil && strings.TrimSpace(*primary) != "" {
+		return primary
+	}
+	return fallback
 }
 
 func categoryDecisionForPhase(phase, category string) string {
@@ -1610,6 +1789,9 @@ func hydratePayloadFromProposal(payload sweeperPayload, proposal *storage.Sweepe
 	}
 	if strings.TrimSpace(payload.WarningMarkerUUID) == "" {
 		payload.WarningMarkerUUID = derefString(proposal.MarkerUUID)
+	}
+	if strings.TrimSpace(payload.Summary) == "" {
+		payload.Summary = derefString(proposal.Summary)
 	}
 	return payload
 }

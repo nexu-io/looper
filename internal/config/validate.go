@@ -638,6 +638,21 @@ func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]
 	if config.Triggers.MaxPerTick <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.maxPerTick", Message: "must be a positive integer"})
 	}
+	if config.Filter.Mode != SweeperFilterModeDeterministic {
+		*issues = append(*issues, ValidationIssue{Path: path + ".filter.mode", Message: fmt.Sprintf("must be %q", SweeperFilterModeDeterministic)})
+	}
+	if config.Proposer.Mode != SweeperProposerModeAgentApply && config.Proposer.Mode != SweeperProposerModeHeuristicFallback {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.mode", Message: fmt.Sprintf("must be one of: %s, %s", SweeperProposerModeAgentApply, SweeperProposerModeHeuristicFallback)})
+	}
+	if config.Proposer.TimeoutSeconds <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutSeconds", Message: "must be a positive integer"})
+	}
+	if config.Proposer.SchemaVersion != 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.schemaVersion", Message: "must be 1"})
+	}
+	if config.Proposer.Model != nil && strings.TrimSpace(*config.Proposer.Model) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.model", Message: "must be a non-empty string when set"})
+	}
 	if config.Triggers.ReopenCooldownDays <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.reopenCooldownDays", Message: "must be a positive integer"})
 	}

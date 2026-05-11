@@ -218,6 +218,12 @@ func DefaultConfig(cwd string) (Config, error) {
 					ReopenCooldownDays:        30,
 					MaxPerTick:                10,
 				},
+				Filter: SweeperFilterConfig{Mode: SweeperFilterModeDeterministic},
+				Proposer: SweeperProposerConfig{
+					Mode:           SweeperProposerModeAgentApply,
+					TimeoutSeconds: 180,
+					SchemaVersion:  1,
+				},
 				Lifecycle: SweeperLifecycleConfig{
 					PendingLabel: "looper:sweep-pending",
 					ClosedLabel:  "looper:swept",

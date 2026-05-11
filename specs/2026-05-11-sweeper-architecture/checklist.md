@@ -27,16 +27,16 @@
 
 ## Phase 1b — Agent proposer on the same ledger
 
-- [ ] Add sweeper proposal schema file (`schemaVersion: 1`)
-- [ ] Add prompt builder + agent execution wrapper
-- [ ] Persist raw agent transcripts alongside normalized proposal JSON
-- [ ] Validate every agent proposal against schema and decision×category matrix
-- [ ] Wire `roles.sweeper.proposer.mode = agent_apply | heuristic_fallback`
-- [ ] Enforce shadow-only heuristic proposals under `agent_apply`
-- [ ] Switch `stale` and `abandoned_pr` apply to consume agent proposals
-- [ ] Keep `already_fixed`, `superseded`, `unrelated`, `route_security` gated to dry-run
-- [ ] Surface filtered-out vs agent-reviewed counts in CLI/debug output
-- [ ] Apply the failure & retry matrix uniformly across propose and apply
+- [x] Add sweeper proposal schema file (`schemaVersion: 1`)
+- [x] Add prompt builder + agent execution wrapper
+- [x] Persist raw agent transcripts alongside normalized proposal JSON
+- [x] Validate every agent proposal against schema and decision×category matrix
+- [x] Wire `roles.sweeper.proposer.mode = agent_apply | heuristic_fallback`
+- [x] Enforce shadow-only heuristic proposals under `agent_apply`
+- [x] Switch `stale` and `abandoned_pr` apply to consume agent proposals
+- [x] Keep `already_fixed`, `superseded`, `unrelated`, `route_security` gated to dry-run
+- [x] Surface filtered-out vs agent-reviewed counts in CLI/debug output
+- [x] Apply the failure & retry matrix uniformly across propose and apply
 
 ## Phase 2 — Hardening and operator surface
 

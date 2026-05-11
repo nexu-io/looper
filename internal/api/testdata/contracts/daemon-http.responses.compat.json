@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0011_sweeper_cases_proposals",
-              "latestAppliedId": "0011_sweeper_cases_proposals",
+              "latestAvailableId": "0012_sweeper_proposal_raw_result",
+              "latestAppliedId": "0012_sweeper_proposal_raw_result",
               "pendingCount": 0
             }
           }
@@ -79,7 +79,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0011_sweeper_cases_proposals",
+            "schemaVersion": "0012_sweeper_proposal_raw_result",
             "pendingMigrations": [],
             "healthy": true
           },
@@ -333,6 +333,14 @@
                 ],
                 "reopenCooldownDays": 30,
                 "maxPerTick": 10
+              },
+              "filter": {
+                "mode": "deterministic"
+              },
+              "proposer": {
+                "mode": "agent_apply",
+                "timeoutSeconds": 180,
+                "schemaVersion": 1
               },
               "lifecycle": {
                 "pendingLabel": "looper:sweep-pending",

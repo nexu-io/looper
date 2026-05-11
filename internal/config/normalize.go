@@ -588,6 +588,12 @@ func mergeSweeperRoleConfig(config *SweeperRoleConfig, partial PartialSweeperRol
 	if partial.Triggers != nil {
 		mergeSweeperTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Filter != nil {
+		mergeSweeperFilterConfig(&config.Filter, *partial.Filter)
+	}
+	if partial.Proposer != nil {
+		mergeSweeperProposerConfig(&config.Proposer, *partial.Proposer)
+	}
 	if partial.Lifecycle != nil {
 		mergeSweeperLifecycleConfig(&config.Lifecycle, *partial.Lifecycle)
 	}
@@ -740,6 +746,27 @@ func mergeSweeperSecurityConfig(config *SweeperSecurityConfig, partial PartialSw
 func mergeSweeperReportingConfig(config *SweeperReportingConfig, partial PartialSweeperReportingConfig) {
 	if partial.DurableReportsDir != nil {
 		config.DurableReportsDir = *partial.DurableReportsDir
+	}
+}
+
+func mergeSweeperFilterConfig(config *SweeperFilterConfig, partial PartialSweeperFilterConfig) {
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+}
+
+func mergeSweeperProposerConfig(config *SweeperProposerConfig, partial PartialSweeperProposerConfig) {
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+	if partial.Model != nil {
+		config.Model = partial.Model
+	}
+	if partial.TimeoutSeconds != nil {
+		config.TimeoutSeconds = *partial.TimeoutSeconds
+	}
+	if partial.SchemaVersion != nil {
+		config.SchemaVersion = *partial.SchemaVersion
 	}
 }
 
@@ -955,6 +982,18 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				triggers.LooperInternalLabels = &labels
 			}
 			sweeper.Triggers = &triggers
+		}
+		if configs.Sweeper.Filter != nil {
+			filter := *configs.Sweeper.Filter
+			sweeper.Filter = &filter
+		}
+		if configs.Sweeper.Proposer != nil {
+			proposer := *configs.Sweeper.Proposer
+			if configs.Sweeper.Proposer.Model != nil {
+				model := *configs.Sweeper.Proposer.Model
+				proposer.Model = &model
+			}
+			sweeper.Proposer = &proposer
 		}
 		if configs.Sweeper.Lifecycle != nil {
 			lifecycle := *configs.Sweeper.Lifecycle
