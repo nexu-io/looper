@@ -166,6 +166,52 @@ func TestDiscoverPullRequestsSkipsExcludedAuthorBeforeAuthorAssociationLookup(t 
 	}
 }
 
+func TestDiscoverIssuesBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"OWNER"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want excluded owner issue to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 1 {
+		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
+	}
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
+	}
+}
+
+func TestDiscoverPullRequestsBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"MEMBER"}
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "MEMBER"}
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded member PR to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 1 {
+		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
+	}
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
+	}
+}
+
 func TestProcessWarnSkipsFreshAbandonedPRCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -599,6 +645,7 @@ type stubGitHub struct {
 	prDetails       map[string]githubinfra.PullRequestDetail
 	viewIssueErr    error
 	viewIssueCalls  int
+	viewIssueRepos  []string
 	listIssuesCalls int
 	listPRCalls     int
 	createdComments []githubinfra.IssueCommentInput
@@ -621,6 +668,7 @@ func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenP
 
 func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	g.viewIssueCalls++
+	g.viewIssueRepos = append(g.viewIssueRepos, input.Repo)
 	if g.viewIssueErr != nil {
 		return githubinfra.IssueDetail{}, g.viewIssueErr
 	}
