@@ -187,6 +187,9 @@ func TestDiscoverIssuesBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
 	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
 		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
 	}
+	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
+		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)
+	}
 }
 
 func TestDiscoverPullRequestsBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
@@ -209,6 +212,9 @@ func TestDiscoverPullRequestsBackfillsAssociationUsingOwnerRepoPath(t *testing.T
 	}
 	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
 		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
+	}
+	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
+		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)
 	}
 }
 
@@ -646,6 +652,7 @@ type stubGitHub struct {
 	viewIssueErr    error
 	viewIssueCalls  int
 	viewIssueRepos  []string
+	viewIssueCWDs   []string
 	listIssuesCalls int
 	listPRCalls     int
 	createdComments []githubinfra.IssueCommentInput
@@ -669,6 +676,7 @@ func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenP
 func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	g.viewIssueCalls++
 	g.viewIssueRepos = append(g.viewIssueRepos, input.Repo)
+	g.viewIssueCWDs = append(g.viewIssueCWDs, input.CWD)
 	if g.viewIssueErr != nil {
 		return githubinfra.IssueDetail{}, g.viewIssueErr
 	}

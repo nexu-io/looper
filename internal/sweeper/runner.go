@@ -294,7 +294,7 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			continue
 		}
 		var associationOK bool
-		issue.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, issue.Number, issue.AuthorAssociation, roleCfg)
+		issue.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, issue.Number, issue.AuthorAssociation, roleCfg)
 		if !associationOK {
 			result.Skipped++
 			continue
@@ -373,7 +373,7 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			continue
 		}
 		var associationOK bool
-		pr.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, pr.Number, pr.AuthorAssociation, roleCfg)
+		pr.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, pr.Number, pr.AuthorAssociation, roleCfg)
 		if !associationOK {
 			result.Skipped++
 			continue
@@ -746,11 +746,11 @@ func issueDetailLookupRepo(repo string) string {
 	return strings.TrimSpace(repo)
 }
 
-func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, number int64, current string, roleCfg config.SweeperRoleConfig) (string, bool) {
+func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, cwd string, number int64, current string, roleCfg config.SweeperRoleConfig) (string, bool) {
 	if strings.TrimSpace(current) != "" || len(roleCfg.Triggers.ExcludeAuthorAssociations) == 0 || r.github == nil {
 		return current, true
 	}
-	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueDetailLookupRepo(repo), IssueNumber: number})
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueDetailLookupRepo(repo), IssueNumber: number, CWD: cwd})
 	if err != nil {
 		return "", false
 	}
