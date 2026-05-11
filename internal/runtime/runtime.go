@@ -421,12 +421,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
 			return
 		}
-		if err := r.appendStartedEvent(context.Background(), *startedAt); err != nil {
+		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
+		if err != nil {
 			r.startupReadyErr = err
 			return
 		}
-		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
-		if err != nil {
+		if err := r.appendStartedEvent(context.Background(), *startedAt, recoverySummary); err != nil {
 			r.startupReadyErr = err
 			return
 		}
@@ -1144,7 +1144,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	return requeued, nil
 }
 
-func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) error {
+func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time, recoverySummary RecoverySummary) error {
 	services := r.Services()
 	if services.Repositories == nil {
 		return nil
@@ -1159,9 +1159,9 @@ func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) e
 			"daemonMode": r.config.Daemon.Mode,
 			"host":       r.config.Server.Host,
 			"port":       r.config.Server.Port,
-			"recovery":   r.RecoverySummary(),
+			"recovery":   recoverySummary,
 		}),
-		CreatedAt: formatJavaScriptISOString(startedAt),
+		CreatedAt: formatJavaScriptISOString(startedAt.Add(time.Millisecond)),
 	})
 }
 

@@ -180,6 +180,24 @@ func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
 	if rt.startupReadyErr == nil {
 		t.Fatal("startupReadyErr = nil, want completion failure recorded")
 	}
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: storage.EmbeddedMigrations,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() reopen error = %v", err)
+	}
+	defer func() { _ = coordinator.Close() }()
+	reopenedRepos := storage.NewRepositories(coordinator.DB())
+	events, err := reopenedRepos.Events.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("Events.List() = %#v, want no startup event after failed completion", events)
+	}
+
 	rt.Stop("cleanup after failed startup")
 }
 
@@ -372,6 +390,21 @@ func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	}
 	if !containsEventType(allEvents, "looperd.started") {
 		t.Fatalf("all events = %#v, want looperd.started", allEvents)
+	}
+	if len(allEvents) == 0 || allEvents[0].EventType != "looperd.started" {
+		t.Fatalf("all events = %#v, want looperd.started listed after recovery events", allEvents)
+	}
+	if allEvents[0].PayloadJSON == "" {
+		t.Fatal("looperd.started payload = nil, want recovery summary")
+	}
+	var startedPayload struct {
+		Recovery RecoverySummary `json:"recovery"`
+	}
+	if err := json.Unmarshal([]byte(allEvents[0].PayloadJSON), &startedPayload); err != nil {
+		t.Fatalf("json.Unmarshal(looperd.started payload) error = %v", err)
+	}
+	if startedPayload.Recovery != recovery {
+		t.Fatalf("started event recovery = %#v, want %#v", startedPayload.Recovery, recovery)
 	}
 }
 

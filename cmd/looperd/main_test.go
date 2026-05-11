@@ -270,6 +270,30 @@ func TestStartRuntimeWithAPIDoesNotRunRecoveryBeforeServerOwnership(t *testing.T
 	}
 }
 
+func TestStopServerWithTimeoutUsesDeadline(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 25 * time.Millisecond
+	started := make(chan struct{})
+	err := stopServerWithTimeout(func(ctx context.Context) error {
+		close(started)
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("stop context missing deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > timeout {
+			t.Fatalf("stop context remaining = %v, want within (0,%v]", remaining, timeout)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}, timeout)
+	<-started
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stopServerWithTimeout() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
 func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})

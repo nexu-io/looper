@@ -132,16 +132,17 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		rt.WaitForShutdown()
 		return nil, err
 	}
-	if err := rt.CompleteStartup(ctx); err != nil {
-		_ = server.Stop(context.Background())
-		rt.Stop("runtime startup failed after api server ownership")
-		rt.WaitForShutdown()
-		return nil, err
-	}
 
 	shutdownTimeout := time.Duration(deps.Config.Daemon.ShutdownTimeoutMS) * time.Millisecond
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = time.Second
+	}
+
+	if err := rt.CompleteStartup(ctx); err != nil {
+		_ = stopServerWithTimeout(server.Stop, shutdownTimeout)
+		rt.Stop("runtime startup failed after api server ownership")
+		rt.WaitForShutdown()
+		return nil, err
 	}
 
 	return &daemonRuntime{
@@ -149,6 +150,12 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return stop(ctx)
 }
 
 func (d *daemonRuntime) Stop(reason string) {
