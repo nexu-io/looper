@@ -1208,14 +1208,14 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	}
 }
 
-func TestCommandPrefixMatchesTruncatedPromptTail(t *testing.T) {
+func TestCommandPrefixMatchesRejectsTruncatedPromptTail(t *testing.T) {
 	t.Parallel()
 
-	if !commandPrefixMatches(
+	if commandPrefixMatches(
 		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
 		[]string{"codex", "exec", "very long reviewer prompt"},
 	) {
-		t.Fatal("commandPrefixMatches() = false, want true for truncated prompt tail")
+		t.Fatal("commandPrefixMatches() = true, want false for truncated prompt tail")
 	}
 }
 

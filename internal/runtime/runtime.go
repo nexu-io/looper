@@ -1503,7 +1503,7 @@ func commandPrefixMatches(expected, actual []string) bool {
 	}
 	actualTail := strings.Join(actual[len(expected)-1:], " ")
 	expectedTail := expected[len(expected)-1]
-	return actualTail == expectedTail || (actualTail != "" && strings.HasPrefix(expectedTail, actualTail))
+	return actualTail == expectedTail
 }
 
 func splitProcessCommand(command string) []string {
