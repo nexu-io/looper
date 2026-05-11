@@ -105,6 +105,46 @@ type CommentInfo struct {
 	URL               string
 }
 
+type IssueTimelineInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type IssueReactionInput struct {
+	Repo        string
+	IssueNumber int64
+	CommentID   int64
+	CWD         string
+}
+type LinkedPullRequestsInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type PullRequestReviewStateInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type IssueReaction struct {
+	ID        int64
+	Content   string
+	UserLogin string
+}
+type LinkedPullRequest struct {
+	Number         int64
+	State          string
+	Merged         bool
+	MergedAt       string
+	MergeCommitSHA string
+}
+type PullRequestReviewState struct {
+	RequestedReviewers  []string
+	LatestReviewPerUser map[string]string
+	LastReviewAt        string
+}
+
 type PullRequestHeadAndAuthor struct {
 	HeadSHA string
 	Author  string
@@ -612,6 +652,48 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 	}, nil
 }
 
+func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber))
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
+func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", input.Repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSONArrayOrPages(result.Stdout)
+}
+
+func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.IssueNumber)
+	if input.CommentID > 0 {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", input.Repo, input.CommentID)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", endpoint, "-H", "Accept: application/vnd.github+json")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueReaction, 0, len(rows))
+	for _, row := range rows {
+		if reaction, ok := normalizeReaction(row); ok {
+			out = append(out, IssueReaction{ID: reaction.ID, Content: reaction.Content, UserLogin: reaction.UserLogin})
+		}
+	}
+	return out, nil
+}
+
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber), "--method", "POST", "-f", "body="+input.Body)
 	if err != nil {
@@ -747,6 +829,48 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Reviews:           toObjectSlice(row["reviews"]),
 		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
+	owner, repoName := splitRepoOwnerName(input.Repo)
+	query := "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { closedByPullRequestsReferences(first: 20) { nodes { number state mergedAt mergeCommit { oid } } } } } }"
+	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "repo="+repoName, "-F", fmt.Sprintf("number=%d", input.IssueNumber))
+	if err != nil {
+		return nil, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	nodes := digNodes(row, "data", "repository", "issue", "closedByPullRequestsReferences")
+	out := make([]LinkedPullRequest, 0, len(nodes))
+	for _, node := range nodes {
+		mergeCommit, _ := node["mergeCommit"].(map[string]any)
+		out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+	}
+	return out, nil
+}
+
+func (g *Gateway) ListPullRequestReviewState(ctx context.Context, input PullRequestReviewStateInput) (PullRequestReviewState, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--json", "reviewRequests,reviews")
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	latest := map[string]string{}
+	last := ""
+	for _, review := range toObjectSlice(row["reviews"]) {
+		if user := extractAuthor(review["author"]); user != "" {
+			latest[user] = asString(review["state"])
+		}
+		if at := firstNonEmpty(asString(review["submittedAt"]), asString(review["updatedAt"])); at > last {
+			last = at
+		}
+	}
+	return PullRequestReviewState{RequestedReviewers: extractReviewRequestLogins(row["reviewRequests"]), LatestReviewPerUser: latest, LastReviewAt: last}, nil
 }
 
 func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestInput) error {
@@ -2193,6 +2317,24 @@ func extractCommentInfos(value any) []CommentInfo {
 		})
 	}
 	return out
+}
+
+func splitRepoOwnerName(repo string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(repo), "/", 2)
+	if len(parts) != 2 {
+		return strings.TrimSpace(repo), ""
+	}
+	return parts[0], parts[1]
+}
+
+func digNodes(row map[string]any, path ...string) []map[string]any {
+	current := any(row)
+	for _, key := range path {
+		object, _ := current.(map[string]any)
+		current = object[key]
+	}
+	object, _ := current.(map[string]any)
+	return toObjectSlice(object["nodes"])
 }
 
 func extractAuthor(value any) string {

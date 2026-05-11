@@ -222,7 +222,7 @@ func DefaultConfig(cwd string) (Config, error) {
 				Proposer: SweeperProposerConfig{
 					Mode:                        SweeperProposerModeAgentApply,
 					TimeoutSeconds:              180,
-					SchemaVersion:               1,
+					SchemaVersion:               2,
 					DiagnosticMode:              false,
 					TimeoutRateDryRunThreshold:  0.5,
 					TimeoutRateDryRunMinSamples: 3,

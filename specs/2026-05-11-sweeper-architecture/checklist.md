@@ -48,12 +48,12 @@
 
 ## Phase 3 — Richer fact bundle and deterministic evidence categories
 
-- [ ] Add gateway methods: `ListIssueComments`, `ListIssueTimeline`, `ListIssueReactions`, `ListLinkedPullRequests`, `ListPullRequestReviewState`
-- [ ] Extend fact bundle with §5.3 field groups
+- [x] Add gateway methods: `ListIssueComments`, `ListIssueTimeline`, `ListIssueReactions`, `ListLinkedPullRequests`, `ListPullRequestReviewState`
+- [x] Extend fact bundle with §5.3 field groups
 - [ ] Decide per-field whether any new field enters the fingerprint; amend §7 if so
-- [ ] Stronger evidence extraction for `already_fixed` and `superseded`
-- [ ] Bump proposal schema to `schemaVersion: 2` for linked-evidence references
-- [ ] Enable `already_fixed` and `superseded` for live apply after dry-run validation
+- [x] Stronger evidence extraction for `already_fixed` and `superseded`
+- [x] Bump proposal schema to `schemaVersion: 2` for linked-evidence references
+- [x] Enable `already_fixed` and `superseded` for live apply after dry-run validation
 
 ## Phase 4 — Subjective categories and reporting polish
 

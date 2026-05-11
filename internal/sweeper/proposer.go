@@ -16,8 +16,8 @@ import (
 
 const proposerKindAgentV1 = "agent_v1"
 
-//go:embed proposal_schema_v1.json
-var proposalSchemaV1 string
+//go:embed proposal_schema_v2.json
+var proposalSchemaV2 string
 
 type AgentExecutor interface {
 	Start(context.Context, AgentRunInput) (AgentExecution, error)
@@ -55,13 +55,14 @@ type AgentResult struct {
 }
 
 type normalizedProposal struct {
-	SchemaVersion int    `json:"schemaVersion"`
-	Decision      string `json:"decision"`
-	Category      string `json:"category"`
-	Confidence    int    `json:"confidenceScore"`
-	Summary       string `json:"summary"`
-	Rationale     string `json:"rationale"`
-	MarkerUUID    string `json:"markerUUID,omitempty"`
+	SchemaVersion int              `json:"schemaVersion"`
+	Decision      string           `json:"decision"`
+	Category      string           `json:"category"`
+	Confidence    int              `json:"confidenceScore"`
+	Summary       string           `json:"summary"`
+	Rationale     string           `json:"rationale"`
+	Evidence      []map[string]any `json:"evidence,omitempty"`
+	MarkerUUID    string           `json:"markerUUID,omitempty"`
 }
 
 type persistedRawAgentResult struct {
@@ -87,7 +88,7 @@ func buildProposalPrompt(bundle FactBundle, phase, heuristicCategory, heuristicR
 	var out strings.Builder
 	out.WriteString("Return exactly one JSON object matching the sweeper proposal schema. Do not wrap it in markdown.\n\n")
 	out.WriteString("Schema:\n")
-	out.WriteString(proposalSchemaV1)
+	out.WriteString(proposalSchemaV2)
 	out.WriteString("\n\n")
 	out.WriteString(fmt.Sprintf("Phase: %s\n", strings.TrimSpace(phase)))
 	if runtime = strings.TrimSpace(runtime); runtime != "" {
@@ -106,10 +107,11 @@ func buildProposalPrompt(bundle FactBundle, phase, heuristicCategory, heuristicR
 	}
 	out.WriteString(`
 Rules:
-- Only use decision=warn or decision=close for categories stale and abandoned_pr.
+- Use decision=warn or decision=close conservatively.
 - Use decision=no_action only with category=none.
 - Use decision=quarantine only with category=route_security.
-- Keep already_fixed, superseded, unrelated, and route_security conservative.
+- Prefer linked PR and timeline evidence for already_fixed and superseded when available.
+- Include evidence[] references with bundlePath pointers when using non-trivial evidence.
 - confidenceScore must be 0..100.
 - summary and rationale must be concise but specific.
 - markerUUID is optional and should only be set for warn decisions.
@@ -141,8 +143,8 @@ func parseNormalizedProposal(raw string) (normalizedProposal, error) {
 }
 
 func validateNormalizedProposal(proposal normalizedProposal, phase string) error {
-	if proposal.SchemaVersion != 1 {
-		return fmt.Errorf("schemaVersion must be 1")
+	if proposal.SchemaVersion != 2 {
+		return fmt.Errorf("schemaVersion must be 2")
 	}
 	if proposal.Confidence < 0 || proposal.Confidence > 100 {
 		return fmt.Errorf("confidenceScore must be between 0 and 100")
@@ -164,15 +166,15 @@ func validateNormalizedProposal(proposal normalizedProposal, phase string) error
 		if phase != "warn" {
 			return fmt.Errorf("decision warn requires phase warn")
 		}
-		if category != categoryStale && category != categoryAbandonedPR {
-			return fmt.Errorf("decision warn requires category stale or abandoned_pr")
+		if category != categoryStale && category != categoryAbandonedPR && category != categoryAlreadyFixed && category != categorySuperseded {
+			return fmt.Errorf("decision warn requires supported warn category")
 		}
 	case "close":
 		if phase != "close" {
 			return fmt.Errorf("decision close requires phase close")
 		}
-		if category != categoryStale && category != categoryAbandonedPR {
-			return fmt.Errorf("decision close requires category stale or abandoned_pr")
+		if category != categoryStale && category != categoryAbandonedPR && category != categoryAlreadyFixed && category != categorySuperseded {
+			return fmt.Errorf("decision close requires supported close category")
 		}
 	case "quarantine":
 		if category != categoryRouteSecurity {
@@ -286,7 +288,7 @@ func (r *Runner) persistInvalidAgentProposal(ctx context.Context, projectID stri
 		Repo:             caseRecord.Repo,
 		TargetType:       targetTypeFromBool(target.IsPR),
 		TargetNumber:     target.Number,
-		SchemaVersion:    1,
+		SchemaVersion:    2,
 		ProposerKind:     proposerKindAgentV1,
 		FactBundleJSON:   string(factBundleJSON),
 		FingerprintJSON:  fingerprintJSON,

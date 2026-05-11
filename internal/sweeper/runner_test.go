@@ -172,9 +172,9 @@ func TestDiscoverIssuesHonorsDailyWarnAndCloseLimits(t *testing.T) {
 	}
 	validation := "passed"
 	for _, proposal := range []storage.SweeperProposalRecord{
-		{ID: "proposal_warn_done", CaseID: "case_warn", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 9, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &fixture.nowISO, CreatedAt: fixture.nowISO},
-		{ID: "proposal_close_done", CaseID: "case_close", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 10, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"close"}`, ProposalJSON: `{"decision":"close"}`, Decision: "close", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_closed"), AppliedAt: &fixture.nowISO, CreatedAt: fixture.nowISO},
-		{ID: "proposal_close_inflight", CaseID: "case_pending", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 2, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"pending"}`, ProposalJSON: `{"decision":"close"}`, Decision: "close", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("partial:commented"), CreatedAt: fixture.nowISO},
+		{ID: "proposal_warn_done", CaseID: "case_warn", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 9, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &fixture.nowISO, CreatedAt: fixture.nowISO},
+		{ID: "proposal_close_done", CaseID: "case_close", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 10, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"close"}`, ProposalJSON: `{"decision":"close"}`, Decision: "close", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_closed"), AppliedAt: &fixture.nowISO, CreatedAt: fixture.nowISO},
+		{ID: "proposal_close_inflight", CaseID: "case_pending", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 2, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"pending"}`, ProposalJSON: `{"decision":"close"}`, Decision: "close", Category: "stale", ConfidenceScore: 80, ValidationStatus: &validation, ApplyStatus: stringPtr("partial:commented"), CreatedAt: fixture.nowISO},
 	} {
 		proposal := proposal
 		if err := fixture.repos.SweeperProposals.Insert(context.Background(), proposal); err != nil {
@@ -290,7 +290,7 @@ func TestProcessWarnAgentApplyUsesAgentProposalAndPersistsRawResult(t *testing.T
 	fixture.cfg.Roles.Sweeper.DryRun = false
 	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
 	fixture.github.issueDetails["acme/looper#61"] = githubinfra.IssueDetail{Number: 61, Title: "Stale bug", Body: "needs cleanup", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent warning","rationale":"agent determined stale inactivity","markerUUID":"marker-agent-61"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent warning","rationale":"agent determined stale inactivity","markerUUID":"marker-agent-61"}`}}
 	queueID := "queue_sweeper_warn_agent_61"
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#61", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#61", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
@@ -339,7 +339,7 @@ func TestProcessWarnAgentApplyRetryReusesExistingAgentProposal(t *testing.T) {
 	fixture.cfg.Roles.Sweeper.DryRun = false
 	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
 	fixture.github.issueDetails["acme/looper#62"] = githubinfra.IssueDetail{Number: 62, Title: "Stale bug", Body: "needs cleanup", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent warning","rationale":"agent determined stale inactivity","markerUUID":"marker-agent-62"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent warning","rationale":"agent determined stale inactivity","markerUUID":"marker-agent-62"}`}}
 	fixture.github.addIssueLabelsErr = errors.New("temporary label failure")
 	queueID := "queue_sweeper_warn_agent_62"
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#62", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#62", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
@@ -395,7 +395,7 @@ func TestReplayCaseProposalDryRunPersistsValidatedAgentProposalWithoutMutatingCa
 		createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
 		lastProposalID: true,
 	})
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent replay warning","rationale":"agent replay rationale","markerUUID":"marker-replay-71"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent replay warning","rationale":"agent replay rationale","markerUUID":"marker-replay-71"}`}}
 
 	proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
 	if err != nil {
@@ -507,7 +507,7 @@ func TestReplayCaseProposalDryRunPersistsFailedValidationProposalForInvalidAgent
 		createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
 		lastProposalID: true,
 	})
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"missing marker","rationale":"invalid replay validation"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"missing marker","rationale":"invalid replay validation"}`}}
 
 	proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
 	if err == nil {
@@ -619,7 +619,7 @@ func TestRepoOperatorStatsSummarizesProposalAndTimeoutData(t *testing.T) {
 		ProposerKind:     proposerKindAgentV1,
 		FactBundleJSON:   mustMarshalJSON(replayFactBundle("acme/looper", "issue", 91, fixture.now.Add(-90*24*time.Hour))),
 		FingerprintJSON:  `{"hash":"stats-timeout"}`,
-		ProposalJSON:     `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":80,"summary":"timeout replay","rationale":"timeout replay rationale","markerUUID":"marker-timeout"}`,
+		ProposalJSON:     `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":80,"summary":"timeout replay","rationale":"timeout replay rationale","markerUUID":"marker-timeout"}`,
 		RawResultJSON:    &timeoutRaw,
 		Decision:         "warn",
 		Category:         categoryStale,
@@ -706,7 +706,7 @@ func TestProcessWarnDiagnosticModePersistsFreshShadowAndAgentProposal(t *testing
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
 	fixture.github.issueDetails["acme/looper#96"] = githubinfra.IssueDetail{Number: 96, Title: "Old stale issue", Body: "still stale", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: nil}
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":90,"summary":"diagnostic agent warning","rationale":"diagnostic rationale","markerUUID":"marker-diagnostic-96"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":90,"summary":"diagnostic agent warning","rationale":"diagnostic rationale","markerUUID":"marker-diagnostic-96"}`}}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: caseRecord.ID})
 	queueID := "queue_sweeper_warn_diagnostic"
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#96", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#96", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
@@ -771,7 +771,7 @@ func TestProcessCloseClosesAndReconcilesLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFingerprint() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_42", CaseID: "case_close_42", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: warnFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_42", CaseID: "case_close_42", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: warnFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_close_42"})
@@ -842,10 +842,10 @@ func TestProcessCloseAgentApplyConsumesAgentCloseProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFingerprint() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_agent", CaseID: "case_close_agent", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 63, SchemaVersion: 1, ProposerKind: proposerKindAgentV1, FactBundleJSON: "{}", FingerprintJSON: warnFingerprint, ProposalJSON: `{"schemaVersion":1,"decision":"warn"}`, RawResultJSON: stringPtr(`{"stdout":"warn"}`), Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_agent", CaseID: "case_close_agent", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 63, SchemaVersion: 2, ProposerKind: proposerKindAgentV1, FactBundleJSON: "{}", FingerprintJSON: warnFingerprint, ProposalJSON: `{"schemaVersion":2,"decision":"warn"}`, RawResultJSON: stringPtr(`{"stdout":"warn"}`), Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
-	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"close","category":"stale","confidenceScore":91,"summary":"agent close","rationale":"agent confirmed long-running stale inactivity"}`}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"close","category":"stale","confidenceScore":91,"summary":"agent close","rationale":"agent confirmed long-running stale inactivity"}`}}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_close_agent"})
 	fixture.github.issueDetails["acme/looper#63"] = githubinfra.IssueDetail{Number: 63, Title: "stale bug", Body: "needs cleanup", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
 	queueID := "queue_sweeper_close_agent"
@@ -904,7 +904,7 @@ func TestProcessWarnResumesFromMarkerWithoutDuplicateComment(t *testing.T) {
 	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_resume", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 44, Status: "open", CurrentPhase: "warn", CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_resume", CaseID: "case_resume", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 44, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"resume"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, MarkerUUID: &marker, ValidationStatus: &validation, CreatedAt: fixture.nowISO}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_resume", CaseID: "case_resume", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 44, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"resume"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, MarkerUUID: &marker, ValidationStatus: &validation, CreatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_resume", ProposalID: "proposal_resume"})
@@ -1054,7 +1054,7 @@ func TestProcessCloseLegacyProposalIDCreatesNewCloseProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFingerprint() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_legacy_close", CaseID: "case_legacy_close", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 46, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: fingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_legacy_close", CaseID: "case_legacy_close", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 46, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: fingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalLegacyPayload(sweeperPayload{CaseID: "case_legacy_close", ProposalID: "proposal_warn_legacy_close", Phase: "close", Repo: "acme/looper", TargetType: "issue", TargetNumber: 46})
@@ -1153,7 +1153,7 @@ func TestProcessCloseSkipsStaleProposal(t *testing.T) {
 	validation := "passed"
 	applyStatus := "pending"
 	rationale := "target appears already fixed"
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_stale", CaseID: caseRecord.ID, ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 52, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: oldFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: "already_fixed", ConfidenceScore: 90, Rationale: &rationale, ValidationStatus: &validation, ApplyStatus: &applyStatus, CreatedAt: fixture.nowISO}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_stale", CaseID: caseRecord.ID, ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 52, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: oldFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: "already_fixed", ConfidenceScore: 90, Rationale: &rationale, ValidationStatus: &validation, ApplyStatus: &applyStatus, CreatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	caseRecord.LastProposalID = stringPtr("proposal_stale")
@@ -1203,7 +1203,7 @@ func TestProcessReconcileCancelsWhenPendingLabelRemoved(t *testing.T) {
 	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_reconcile_7", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_warn_7"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_7", CaseID: "case_reconcile_7", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn7"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_7", CaseID: "case_reconcile_7", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn7"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_reconcile_7"})
@@ -1241,7 +1241,7 @@ func TestProcessReconcileKeepsWarnPhaseWhilePendingLabelRemains(t *testing.T) {
 	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_reconcile_pending", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_warn_pending"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_pending", CaseID: "case_reconcile_pending", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn-pending"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_pending", CaseID: "case_reconcile_pending", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 7, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn-pending"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_reconcile_pending"})
@@ -1286,7 +1286,7 @@ func TestProcessReconcileLegacyProposalIDCreatesNewCancelProposal(t *testing.T) 
 	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_legacy_reconcile", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 17, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_warn_legacy_reconcile"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_legacy_reconcile", CaseID: "case_legacy_reconcile", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 17, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"legacy-reconcile"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_legacy_reconcile", CaseID: "case_legacy_reconcile", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 17, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"legacy-reconcile"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	payloadJSON := mustMarshalLegacyPayload(sweeperPayload{CaseID: "case_legacy_reconcile", ProposalID: "proposal_warn_legacy_reconcile", Phase: "reconcile", Repo: "acme/looper", TargetType: "issue", TargetNumber: 17})
@@ -1445,6 +1445,10 @@ type stubGitHub struct {
 	addedLabels       map[string][]string
 	removedLabels     map[string][]string
 	addIssueLabelsErr error
+	issueComments     []githubinfra.CommentInfo
+	timeline          []map[string]any
+	linkedPRs         []githubinfra.LinkedPullRequest
+	prReviewState     githubinfra.PullRequestReviewState
 }
 
 type stubAgentExecutor struct {
@@ -1483,6 +1487,26 @@ func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInp
 
 func (g *stubGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	return g.prDetails[input.Repo+"#"+itoa(input.PRNumber)], nil
+}
+
+func (g *stubGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	return append([]githubinfra.CommentInfo(nil), g.issueComments...), nil
+}
+
+func (g *stubGitHub) ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	return append([]map[string]any(nil), g.timeline...), nil
+}
+
+func (g *stubGitHub) ListIssueReactions(context.Context, githubinfra.IssueReactionInput) ([]githubinfra.IssueReaction, error) {
+	return nil, nil
+}
+
+func (g *stubGitHub) ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error) {
+	return append([]githubinfra.LinkedPullRequest(nil), g.linkedPRs...), nil
+}
+
+func (g *stubGitHub) ListPullRequestReviewState(context.Context, githubinfra.PullRequestReviewStateInput) (githubinfra.PullRequestReviewState, error) {
+	return g.prReviewState, nil
 }
 
 func (g *stubGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
@@ -1564,7 +1588,7 @@ func seedReplayCase(t *testing.T, fixture runnerFixture, record storage.SweeperC
 		t.Fatalf("BuildFingerprint() error = %v", err)
 	}
 	validation := "passed"
-	proposalJSON := `{"schemaVersion":1,"decision":"` + proposal.decision + `","category":"` + proposal.category + `","confidenceScore":80,"summary":"base proposal","rationale":"base rationale"`
+	proposalJSON := `{"schemaVersion":2,"decision":"` + proposal.decision + `","category":"` + proposal.category + `","confidenceScore":80,"summary":"base proposal","rationale":"base rationale"`
 	if proposal.decision == "warn" {
 		proposalJSON += `,"markerUUID":"marker-base"`
 	}

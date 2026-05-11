@@ -15,27 +15,68 @@ import (
 const phase1BodyCapBytes = 8 * 1024
 
 type FactBundle struct {
-	Repo                       string         `json:"repo"`
-	TargetType                 string         `json:"target_type"`
-	Number                     int64          `json:"number"`
-	State                      string         `json:"state"`
-	IsDraft                    bool           `json:"is_draft,omitempty"`
-	HeadSHA                    string         `json:"head_sha,omitempty"`
-	CreatedAt                  string         `json:"created_at,omitempty"`
-	UpdatedAt                  string         `json:"updated_at,omitempty"`
-	ClosedAt                   string         `json:"closed_at,omitempty"`
-	Title                      string         `json:"title,omitempty"`
-	Body                       string         `json:"body,omitempty"`
-	BodyTruncated              bool           `json:"body_truncated,omitempty"`
-	Author                     string         `json:"author,omitempty"`
-	AuthorAssociation          string         `json:"author_association,omitempty"`
-	Labels                     []string       `json:"labels,omitempty"`
-	PolicyLabelsPresent        []string       `json:"policy_labels_present,omitempty"`
-	CommentCount               int            `json:"comment_count,omitempty"`
-	Case                       FactBundleCase `json:"case"`
-	PolicySnapshot             any            `json:"policy_snapshot,omitempty"`
-	LastHumanCommentAt         string         `json:"last_human_comment_at,omitempty"`
-	HumanCommentCountSinceOpen int            `json:"human_comment_count_since_open,omitempty"`
+	Repo                       string              `json:"repo"`
+	TargetType                 string              `json:"target_type"`
+	Number                     int64               `json:"number"`
+	State                      string              `json:"state"`
+	IsDraft                    bool                `json:"is_draft,omitempty"`
+	HeadSHA                    string              `json:"head_sha,omitempty"`
+	CreatedAt                  string              `json:"created_at,omitempty"`
+	UpdatedAt                  string              `json:"updated_at,omitempty"`
+	ClosedAt                   string              `json:"closed_at,omitempty"`
+	Title                      string              `json:"title,omitempty"`
+	Body                       string              `json:"body,omitempty"`
+	BodyTruncated              bool                `json:"body_truncated,omitempty"`
+	Author                     string              `json:"author,omitempty"`
+	AuthorAssociation          string              `json:"author_association,omitempty"`
+	Labels                     []string            `json:"labels,omitempty"`
+	PolicyLabelsPresent        []string            `json:"policy_labels_present,omitempty"`
+	CommentCount               int                 `json:"comment_count,omitempty"`
+	Case                       FactBundleCase      `json:"case"`
+	PolicySnapshot             any                 `json:"policy_snapshot,omitempty"`
+	LastHumanCommentAt         string              `json:"last_human_comment_at,omitempty"`
+	HumanCommentCountSinceOpen int                 `json:"human_comment_count_since_open,omitempty"`
+	RecentHumanComments        []FactComment       `json:"recent_human_comments,omitempty"`
+	WarningComment             *FactWarningComment `json:"warning_comment,omitempty"`
+	Timeline                   FactTimeline        `json:"timeline,omitempty"`
+	LinkedPRs                  []FactLinkedPR      `json:"linked_prs,omitempty"`
+	PRReviewState              *FactPRReviewState  `json:"pr_review_state,omitempty"`
+}
+
+type FactComment struct {
+	Author       string `json:"author,omitempty"`
+	Association  string `json:"association,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
+	Body         string `json:"body,omitempty"`
+	IsMaintainer bool   `json:"is_maintainer,omitempty"`
+}
+
+type FactWarningComment struct {
+	ID               int64          `json:"id"`
+	Body             string         `json:"body,omitempty"`
+	CreatedAt        string         `json:"created_at,omitempty"`
+	Edited           bool           `json:"edited,omitempty"`
+	ReactionsSummary map[string]int `json:"reactions_summary,omitempty"`
+}
+
+type FactTimeline struct {
+	CrossReferences []map[string]any `json:"cross_references,omitempty"`
+	Closures        []map[string]any `json:"closures,omitempty"`
+	Duplicates      []map[string]any `json:"duplicates,omitempty"`
+}
+
+type FactLinkedPR struct {
+	Number         int64  `json:"number"`
+	State          string `json:"state,omitempty"`
+	Merged         bool   `json:"merged,omitempty"`
+	MergedAt       string `json:"merged_at,omitempty"`
+	MergeCommitSHA string `json:"merge_commit_sha,omitempty"`
+}
+
+type FactPRReviewState struct {
+	RequestedReviewers  []string          `json:"requested_reviewers,omitempty"`
+	LatestReviewPerUser map[string]string `json:"latest_review_per_user,omitempty"`
+	LastReviewAt        string            `json:"last_review_at,omitempty"`
 }
 
 type FactBundleCase struct {

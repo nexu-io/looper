@@ -347,7 +347,7 @@ func (r *Runner) persistReplayHeuristicProposal(ctx context.Context, projectID s
 		markerUUID = NewMarkerUUID()
 	}
 	proposalBody, err := json.Marshal(map[string]any{
-		"schemaVersion":   1,
+		"schemaVersion":   2,
 		"decision":        decision,
 		"category":        category,
 		"confidenceScore": confidence,
@@ -371,7 +371,7 @@ func (r *Runner) persistReplayHeuristicProposal(ctx context.Context, projectID s
 		Repo:             caseRecord.Repo,
 		TargetType:       targetTypeFromBool(target.IsPR),
 		TargetNumber:     target.Number,
-		SchemaVersion:    1,
+		SchemaVersion:    2,
 		ProposerKind:     "heuristic_v1",
 		FactBundleJSON:   factBundleJSON,
 		FingerprintJSON:  fingerprintJSON,
@@ -467,7 +467,7 @@ func (r *Runner) persistInvalidReplayAgentProposal(ctx context.Context, projectI
 		Repo:             caseRecord.Repo,
 		TargetType:       targetType,
 		TargetNumber:     caseRecord.TargetNumber,
-		SchemaVersion:    1,
+		SchemaVersion:    2,
 		ProposerKind:     proposerKindAgentV1,
 		FactBundleJSON:   factBundleJSON,
 		FingerprintJSON:  fingerprintJSON,

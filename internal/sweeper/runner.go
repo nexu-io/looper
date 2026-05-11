@@ -66,6 +66,11 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
+	ListIssueReactions(context.Context, githubinfra.IssueReactionInput) ([]githubinfra.IssueReaction, error)
+	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
+	ListPullRequestReviewState(context.Context, githubinfra.PullRequestReviewStateInput) (githubinfra.PullRequestReviewState, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	CloseIssue(context.Context, githubinfra.CloseIssueInput) error
@@ -136,21 +141,26 @@ type sweeperStateRecord struct {
 }
 
 type liveTarget struct {
-	Number            int64
-	State             string
-	Title             string
-	Body              string
-	CreatedAt         string
-	UpdatedAt         string
-	ClosedAt          string
-	Author            string
-	AuthorAssociation string
-	Labels            []string
-	CommentCount      int
-	IssueComments     []githubinfra.CommentInfo
-	HeadSHA           string
-	IsPR              bool
-	Draft             bool
+	Number              int64
+	State               string
+	Title               string
+	Body                string
+	CreatedAt           string
+	UpdatedAt           string
+	ClosedAt            string
+	Author              string
+	AuthorAssociation   string
+	Labels              []string
+	CommentCount        int
+	IssueComments       []githubinfra.CommentInfo
+	HeadSHA             string
+	IsPR                bool
+	Draft               bool
+	RecentHumanComments []FactComment
+	WarningComment      *FactWarningComment
+	Timeline            FactTimeline
+	LinkedPRs           []FactLinkedPR
+	PRReviewState       *FactPRReviewState
 }
 
 type caseDiscoveryState struct {
@@ -1122,13 +1132,45 @@ func (r *Runner) loadTarget(ctx context.Context, item storage.QueueItemRecord) (
 		if err != nil {
 			return liveTarget{}, err
 		}
-		return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.IssueComments...), HeadSHA: detail.HeadSHA, IsPR: true, Draft: detail.IsDraft}, nil
+		return r.enrichTargetFacts(ctx, repo, liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.IssueComments...), HeadSHA: detail.HeadSHA, IsPR: true, Draft: detail.IsDraft})
 	}
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: number})
 	if err != nil {
 		return liveTarget{}, err
 	}
-	return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.Comments...)}, nil
+	return r.enrichTargetFacts(ctx, repo, liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.Comments...)})
+}
+
+func (r *Runner) enrichTargetFacts(ctx context.Context, repo string, target liveTarget) (liveTarget, error) {
+	comments, _ := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: target.Number})
+	for _, comment := range comments {
+		body, _ := TruncateFactBody(comment.Body)
+		target.RecentHumanComments = append(target.RecentHumanComments, FactComment{Author: comment.Author, Association: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, Body: body, IsMaintainer: comment.AuthorAssociation == "OWNER" || comment.AuthorAssociation == "MEMBER"})
+	}
+	if len(target.RecentHumanComments) > 5 {
+		target.RecentHumanComments = target.RecentHumanComments[len(target.RecentHumanComments)-5:]
+	}
+	timeline, _ := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: target.Number})
+	for _, row := range timeline {
+		payload := mustMarshalJSONValue(row)
+		switch {
+		case strings.Contains(payload, "cross-referenced") || strings.Contains(payload, "referenced"):
+			target.Timeline.CrossReferences = append(target.Timeline.CrossReferences, row)
+		case strings.Contains(payload, "marked-as-duplicate"):
+			target.Timeline.Duplicates = append(target.Timeline.Duplicates, row)
+		case strings.Contains(payload, "closed"):
+			target.Timeline.Closures = append(target.Timeline.Closures, row)
+		}
+	}
+	linkedPRs, _ := r.github.ListLinkedPullRequests(ctx, githubinfra.LinkedPullRequestsInput{Repo: repo, IssueNumber: target.Number})
+	for _, pr := range linkedPRs {
+		target.LinkedPRs = append(target.LinkedPRs, FactLinkedPR{Number: pr.Number, State: pr.State, Merged: pr.Merged, MergedAt: pr.MergedAt, MergeCommitSHA: pr.MergeCommitSHA})
+	}
+	if target.IsPR {
+		reviewState, _ := r.github.ListPullRequestReviewState(ctx, githubinfra.PullRequestReviewStateInput{Repo: repo, PRNumber: target.Number})
+		target.PRReviewState = &FactPRReviewState{RequestedReviewers: reviewState.RequestedReviewers, LatestReviewPerUser: reviewState.LatestReviewPerUser, LastReviewAt: reviewState.LastReviewAt}
+	}
+	return target, nil
 }
 
 func (r *Runner) getCaseDiscoveryState(ctx context.Context, projectID, repo, targetType string, targetNumber int64, legacy map[string]sweeperStateRecord) (caseDiscoveryState, error) {
@@ -1227,7 +1269,7 @@ func (r *Runner) persistProposal(ctx context.Context, projectID string, target l
 		markerUUID = NewMarkerUUID()
 	}
 	proposalBody, err := json.Marshal(map[string]any{
-		"schemaVersion":   1,
+		"schemaVersion":   2,
 		"decision":        decision,
 		"category":        category,
 		"confidenceScore": confidence,
@@ -1251,7 +1293,7 @@ func (r *Runner) persistProposal(ctx context.Context, projectID string, target l
 		Repo:             repo,
 		TargetType:       targetTypeFromBool(target.IsPR),
 		TargetNumber:     target.Number,
-		SchemaVersion:    1,
+		SchemaVersion:    2,
 		ProposerKind:     "heuristic_v1",
 		FactBundleJSON:   string(factBundleJSON),
 		FingerprintJSON:  fingerprintJSON,
@@ -1414,6 +1456,11 @@ func (r *Runner) buildFactBundle(target liveTarget, caseRecord *storage.SweeperC
 		PolicySnapshot:             roleCfg,
 		LastHumanCommentAt:         lastHumanCommentAt,
 		HumanCommentCountSinceOpen: humanCommentCount,
+		RecentHumanComments:        append([]FactComment(nil), target.RecentHumanComments...),
+		WarningComment:             target.WarningComment,
+		Timeline:                   target.Timeline,
+		LinkedPRs:                  append([]FactLinkedPR(nil), target.LinkedPRs...),
+		PRReviewState:              target.PRReviewState,
 	}
 	if caseRecord != nil {
 		bundle.Case = FactBundleCase{
@@ -1433,7 +1480,7 @@ func (r *Runner) agentApplyEnabled(roleCfg config.SweeperRoleConfig) bool {
 
 func agentEligibleCategory(category string) bool {
 	switch category {
-	case categoryStale, categoryAbandonedPR:
+	case categoryStale, categoryAbandonedPR, categoryAlreadyFixed, categorySuperseded:
 		return true
 	default:
 		return false
@@ -1445,7 +1492,7 @@ func forcedDryRunCategory(roleCfg config.SweeperRoleConfig, category string) boo
 		return false
 	}
 	switch category {
-	case categoryAlreadyFixed, categorySuperseded, categoryUnrelated, categoryRouteSecurity:
+	case categoryUnrelated, categoryRouteSecurity:
 		return true
 	default:
 		return false
@@ -1588,15 +1635,20 @@ func optionalInt64(value int64) *int64 {
 	return &value
 }
 
+func mustMarshalJSONValue(value any) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
 func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now time.Time) (string, int, string) {
 	text := strings.ToLower(target.Title + "\n" + target.Body)
 	if strings.Contains(text, "security") {
 		return categoryRouteSecurity, 100, "security-sensitive content detected"
 	}
-	if roleCfg.Categories.Superseded.Enabled && (strings.Contains(text, "duplicate of #") || strings.Contains(text, "superseded by #")) {
+	if roleCfg.Categories.Superseded.Enabled && (hasSupersededEvidence(target) || strings.Contains(text, "duplicate of #") || strings.Contains(text, "superseded by #")) {
 		return categorySuperseded, maxConfidence(roleCfg.Categories.Superseded.MinConfidence), "target appears superseded by another issue or pull request"
 	}
-	if roleCfg.Categories.AlreadyFixed.Enabled && (strings.Contains(text, "fixed by #") || strings.Contains(text, "already fixed")) {
+	if roleCfg.Categories.AlreadyFixed.Enabled && (hasAlreadyFixedEvidence(target) || strings.Contains(text, "fixed by #") || strings.Contains(text, "already fixed")) {
 		return categoryAlreadyFixed, maxConfidence(roleCfg.Categories.AlreadyFixed.MinConfidence), "target appears already fixed"
 	}
 	if !target.IsPR && roleCfg.Categories.Unrelated.Enabled && (strings.Contains(text, "support") || strings.Contains(text, "question")) {
@@ -1609,6 +1661,27 @@ func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now tim
 		return categoryStale, maxConfidence(roleCfg.Categories.Stale.MinConfidence), "open item matched stale sweeper heuristics"
 	}
 	return categoryNone, 0, "no enabled sweeper category matched"
+}
+
+func hasAlreadyFixedEvidence(target liveTarget) bool {
+	for _, pr := range target.LinkedPRs {
+		if pr.Merged {
+			return true
+		}
+	}
+	for _, closure := range target.Timeline.Closures {
+		if strings.Contains(strings.ToLower(mustMarshalJSONValue(closure)), "pull") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSupersededEvidence(target liveTarget) bool {
+	if len(target.Timeline.Duplicates) > 0 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(mustMarshalJSONValue(target.Timeline.CrossReferences)), "supersed")
 }
 
 func buildWarningComment(target liveTarget, payload sweeperPayload, graceDays int) string {

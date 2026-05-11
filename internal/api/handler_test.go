@@ -213,7 +213,7 @@ func TestHandlerSweeperCaseShowAndReplayRoutes(t *testing.T) {
 	seedSweeperOperatorData(t, rt, repoPath)
 	vendor := config.AgentVendor("custom")
 	cfg.Agent.Vendor = &vendor
-	cfg.Agent.Params = map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"api replay warning","rationale":"api replay rationale","markerUUID":"marker-api-replay"}'`}}
+	cfg.Agent.Params = map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"api replay warning","rationale":"api replay rationale","markerUUID":"marker-api-replay","evidence":[]}'`}}
 	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time { return time.Date(2026, time.May, 9, 12, 0, 0, 0, time.UTC) }})
 
 	showReq := httptest.NewRequest(http.MethodGet, "/api/v1/sweeper/cases/case_api_warn", nil)

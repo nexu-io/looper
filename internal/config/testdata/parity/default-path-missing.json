@@ -220,7 +220,7 @@
             "timeoutRateDryRunMinSamples": 3,
             "timeoutRateDryRunThreshold": 0.5,
             "timeoutSeconds": 180,
-            "schemaVersion": 1
+            "schemaVersion": 2
           },
           "lifecycle": {
             "pendingLabel": "looper:sweep-pending",
