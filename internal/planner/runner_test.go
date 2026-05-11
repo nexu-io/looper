@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
@@ -476,6 +477,42 @@ func TestProcessClaimedItemAdoptsOpenBranchPRWithoutRewritingHumanBody(t *testin
 	}
 	if loop == nil || loop.PRNumber == nil || *loop.PRNumber != 202 || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"prNumber":202`) {
 		t.Fatalf("loop = %#v, want adopted PR persisted", loop)
+	}
+}
+
+func TestProcessClaimedItemAdoptsLifecyclePRAndStampsMissingDisclosure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	branch := "looper/planner/42-plan-this"
+	github := &fakeGitHubGateway{
+		issues:      []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}},
+		issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}},
+		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Body: "## Summary\n\nLifecycle-created body"},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec", Lifecycle: &lifecycle.State{Branch: branch, BaseBranch: "main", PRNumber: 202, PRURL: "https://example/pr/202", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 202 {
+		t.Fatalf("result = %#v, want success with adopted PR 202", result)
+	}
+	if len(github.updatePRBodyCalls) != 1 {
+		t.Fatalf("updatePRBodyCalls = %#v, want one disclosure rewrite", github.updatePRBodyCalls)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, disclosure.Marker) {
+		t.Fatalf("updated body = %q, want disclosure marker", github.updatePRBodyCalls[0].Body)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, "runner=planner") {
+		t.Fatalf("updated body = %q, want planner disclosure footer", github.updatePRBodyCalls[0].Body)
 	}
 }
 

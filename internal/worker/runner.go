@@ -1440,7 +1440,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			pushedByFallback = true
 		}
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, false); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
