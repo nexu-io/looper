@@ -598,14 +598,14 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 	}
 }
 
-func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
+func TestRunResolveCommentsStepRefreshesVerifiedNoPushHeadBeforeResolve(t *testing.T) {
 	t.Parallel()
 
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
 		{
 			Number:      42,
 			State:       "OPEN",
-			HeadSHA:     "base-head",
+			HeadSHA:     "old-head",
 			HeadRefName: "feature/fix-42",
 			BaseRefName: "main",
 			BaseSHA:     "base-1",
@@ -630,10 +630,14 @@ func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
 		},
 	}}
 	runner := New(Options{GitHub: github, Sleep: func(time.Duration) {}})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"new-head\",\"lastFixItemsHash\":\"%s\"}", fixItemsHash)
 	checkpoint := fixerCheckpoint{
-		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
-		Validation: &ValidationResult{Passed: true, Summary: "ok"},
-		Push:       &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		FixItems:     fixItems,
+		FixItemsHash: fixItemsHash,
+		Validation:   &ValidationResult{Passed: true, Summary: "ok"},
+		Push:         &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
 		ReconcileCommits: &checkpointReconcileCommits{
 			BaseHeadSHA:      "base-head",
 			FinalHeadSHA:     "base-head",
@@ -642,8 +646,82 @@ func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
 		},
 	}
 
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{MetadataJSON: &loopMetadata},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if github.viewIndex < 2 {
+		t.Fatalf("github.viewIndex = %d, want live refresh plus head check", github.viewIndex)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 after refreshing verified head", len(github.resolveCalls))
+	}
+	if updated.Detail == nil || updated.Detail.HeadSHA != "new-head" {
+		t.Fatalf("updated.Detail = %#v, want refreshed new-head detail", updated.Detail)
+	}
+	if updated.ReconcileCommits == nil || updated.ReconcileCommits.FinalHeadSHA != "base-head" {
+		t.Fatalf("updated.ReconcileCommits = %#v, want stale reconcile head preserved", updated.ReconcileCommits)
+	}
+	if len(github.replyCalls) != 1 || !contains(github.replyCalls[0].Body, "new-hea") {
+		t.Fatalf("reply calls = %#v, want reply referencing verified head", github.replyCalls)
+	}
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepFailsWhenHeadChangesAfterVerifiedNoPushRefresh(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
+		{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "new-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments: []map[string]any{{
+				"id":       "c1",
+				"threadId": "t1",
+				"body":     "please fix",
+			}},
+		},
+		{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "newer-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments: []map[string]any{{
+				"id":       "c1",
+				"threadId": "t1",
+				"body":     "please fix",
+			}},
+		},
+	}}
+	runner := New(Options{GitHub: github, Sleep: func(time.Duration) {}})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"new-head\",\"lastFixItemsHash\":\"%s\"}", fixItemsHash)
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     fixItemsHash,
+		Validation:       &ValidationResult{Passed: true, Summary: "ok"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
 	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
 		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{MetadataJSON: &loopMetadata},
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: checkpoint,
@@ -661,11 +739,84 @@ func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
 	if !contains(loopErr.Error(), "PR head changed before resolving comments") {
 		t.Fatalf("error = %q, want stale-head message", loopErr.Error())
 	}
-	if github.viewIndex < 2 {
-		t.Fatalf("github.viewIndex = %d, want live refresh plus head check before no-fix block", github.viewIndex)
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want none on concurrent head change", len(github.resolveCalls))
+	}
+}
+
+func TestRunResolveCommentsStepFailsWhenLiveFixItemsDriftFromVerifiedNoPushSnapshot(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
+		{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "new-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments: []map[string]any{{
+				"id":       "c1",
+				"threadId": "t1",
+				"body":     "please fix",
+			}, {
+				"id":       "c2",
+				"threadId": "t2",
+				"body":     "new feedback",
+			}},
+		},
+		{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "new-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments: []map[string]any{{
+				"id":       "c1",
+				"threadId": "t1",
+				"body":     "please fix",
+			}, {
+				"id":       "c2",
+				"threadId": "t2",
+				"body":     "new feedback",
+			}},
+		},
+	}}
+	runner := New(Options{GitHub: github, Sleep: func(time.Duration) {}})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"new-head\",\"lastFixItemsHash\":\"%s\"}", fixItemsHash)
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     fixItemsHash,
+		Validation:       &ValidationResult{Passed: true, Summary: "ok"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{MetadataJSON: &loopMetadata},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err == nil {
+		t.Fatal("runResolveCommentsStep() error = nil, want stale-head retry")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureRetryableAfterResume {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableAfterResume)
+	}
+	if !contains(loopErr.Error(), "PR head changed before resolving comments") {
+		t.Fatalf("error = %q, want stale-head message when verified snapshot no longer matches live comments", loopErr.Error())
 	}
 	if len(github.resolveCalls) != 0 {
-		t.Fatalf("resolve calls = %d, want none on stale head", len(github.resolveCalls))
+		t.Fatalf("resolve calls = %d, want none when live fix items drift", len(github.resolveCalls))
 	}
 }
 

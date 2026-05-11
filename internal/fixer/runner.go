@@ -1554,23 +1554,37 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
 	}
 	fixItems := checkpoint.FixItems
+	currentFixItemsHash := checkpoint.FixItemsHash
+	verifiedNoPushHeadSHA := ""
 	if checkpoint.Push != nil && !checkpoint.Push.Pushed {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, err
 		}
 		fixItems = collectFixItems(detail)
+		currentFixItemsHash = hashFixItems(fixItems)
 		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
+		verifiedNoPushHeadSHA = resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, currentFixItemsHash)
 	}
 	expectedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
+	if verifiedNoPushHeadSHA != "" {
+		expectedHeadSHA = verifiedNoPushHeadSHA
+	}
 	if expectedHeadSHA != "" {
-		if _, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: expectedHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
+		liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: expectedHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
 			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", expectedHeadSHA, firstNonEmpty(actual, "unknown"))
-		}}); err != nil {
+		}})
+		if err != nil {
 			return checkpoint, err
 		}
+		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
+		if checkpoint.Push != nil && !checkpoint.Push.Pushed {
+			fixItems = collectFixItems(liveDetail)
+			currentFixItemsHash = hashFixItems(fixItems)
+			verifiedNoPushHeadSHA = resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, currentFixItemsHash)
+		}
 	}
-	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
+	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedNoPushHeadSHA != "" && verifiedNoPushHeadSHA == detailHeadSHA(checkpoint.Detail)) {
 		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
 	}
 	if checkpoint.ResolvedComments == nil {
@@ -1583,6 +1597,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		} else {
 			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
 		}
+	}
+	if commitSHA == "" || (verifiedNoPushHeadSHA != "" && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+		commitSHA = firstNonEmpty(verifiedNoPushHeadSHA, commitSHA)
 	}
 	failedCount := 0
 	explanationByID := lookupReplyExplanations(checkpoint)
@@ -2926,7 +2943,10 @@ func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {
 	return checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.PreparedAt == ""
 }
 
-func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem) bool {
+func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem, hasVerifiedNoPushHead bool) bool {
+	if hasVerifiedNoPushHead {
+		return false
+	}
 	if checkpoint.Push == nil || checkpoint.Push.Pushed {
 		return false
 	}
@@ -3092,6 +3112,19 @@ func resolveCommentsExpectedHeadSHA(checkpoint fixerCheckpoint) string {
 		return checkpoint.ReconcileCommits.FinalHeadSHA
 	}
 	return detailHeadSHA(checkpoint.Detail)
+}
+
+func resolveCommentsVerifiedNoPushHeadSHA(push *checkpointPush, loopMetadataJSON *string, fixItemsHash string) string {
+	if push == nil || push.Pushed || fixItemsHash == "" {
+		return ""
+	}
+	metadata := parseJSONObject(loopMetadataJSON)
+	lastFixHeadSHA, _ := stringFromAny(metadata["lastFixHeadSha"])
+	lastFixItemsHash, _ := stringFromAny(metadata["lastFixItemsHash"])
+	if lastFixHeadSHA == "" || lastFixItemsHash == "" || lastFixItemsHash != fixItemsHash {
+		return ""
+	}
+	return lastFixHeadSHA
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {
