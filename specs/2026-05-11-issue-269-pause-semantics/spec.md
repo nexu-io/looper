@@ -228,6 +228,13 @@ Required semantics:
 - risky conflict states requiring explicit human approval
 - auto-commit-disabled cases only when the repo is left in a genuinely unsafe/manual state
 
+Current Phase 2 implementation decision for `allowAutoCommit=false`:
+
+- fixer has no separate safe policy-blocked `allowAutoCommit=false` path today
+- `allowAutoCommit` is only consulted when reconcile detects uncommitted changes
+- that case is treated as an unsafe/manual hold because Looper cannot safely infer whether to commit, amend, discard, or wait for human inspection
+- any future safe `allowAutoCommit=false` semantics require an explicit autonomous re-entry model and are deferred beyond fixer Phase 2
+
 ### Policy blockers
 
 `allowAutoPush=false` should not disappear into a hidden permanent pause.

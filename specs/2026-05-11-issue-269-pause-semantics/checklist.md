@@ -33,24 +33,24 @@
 - [x] Preserve explicit `restart_from_discover` semantics through run failure handling
 - [x] Keep dirty worktree / unsafe repo states paused
 - [x] Keep risky conflict gates paused when explicit human approval is required
-- [ ] Split auto-commit-disabled cases into:
-  - [ ] safe policy-blocked states
-  - [x] genuinely unsafe manual-hold states
+- [x] Clarify fixer `allowAutoCommit=false` semantics:
+  - [x] no separate safe policy-blocked state exists in current fixer behavior
+  - [x] genuinely unsafe manual-hold states stay paused
 - [x] Decide v1 semantics for `allowAutoPush=false`
 - [x] If `allowAutoPush=false` remains a hard hold in v1, document it as an explicit temporary exception
-- [ ] For fixer safe policy blockers, specify:
-  - [ ] expected loop status
-  - [ ] expected failure kind
-  - [ ] expected resume policy
-  - [ ] expected re-entry trigger
-  - [ ] expected user-facing summary/message
+- [x] For the current fixer v1 policy-blocker exception (`allowAutoPush=false`), specify:
+  - [x] expected loop status
+  - [x] expected failure kind
+  - [x] expected resume policy
+  - [x] expected re-entry trigger
+  - [x] expected user-facing summary/message
 - [x] Ensure fixer discover still skips genuinely paused loops
-- [ ] Add/update fixer tests for:
+- [x] Add/update fixer tests for:
   - [x] agent setup failure
   - [x] no-new-commit resolve-comments path
   - [x] dirty worktree unsafe hold
   - [x] risky conflict gate
-  - [ ] auto-commit-disabled safe vs unsafe split
+  - [x] auto-commit-disabled semantics are documented as unsafe/manual only
   - [x] auto-push-disabled behavior
 
 ## Phase 3 - Worker
