@@ -225,6 +225,11 @@ func TestHasMarkdownStampRequiresFooter(t *testing.T) {
 		t.Fatalf("HasMarkdownStamp() = true, want false for bare marker")
 	}
 
+	generic := "Body\n\n<sub>Powered by Looper metrics for this benchmark.</sub>"
+	if HasMarkdownStamp(generic) {
+		t.Fatalf("HasMarkdownStamp() = true, want false for generic subtext")
+	}
+
 	stamped := body + "\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.</sub>"
 	if !HasMarkdownStamp(stamped) {
 		t.Fatalf("HasMarkdownStamp() = false, want true for stamped footer")

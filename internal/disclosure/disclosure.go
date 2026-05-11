@@ -25,7 +25,7 @@ const (
 )
 
 var (
-	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:🔁 )?(?:Generated|Powered) by (?:Looper(?: [0-9A-Za-z.-]+)?|\[Looper\]\(https://github\.com/(?:nexu-io|powerformer)/looper\)|<a href=\\?"https://github\.com/nexu-io/looper\\?">Looper</a>).*?</sub>\s*`)
+	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:🔁 )?(?:Generated|Powered) by (?:Looper|\[Looper\]\(https://github\.com/(?:nexu-io|powerformer)/looper\)|<a href=\\?"https://github\.com/nexu-io/looper\\?">Looper</a>)(?: [0-9A-Za-z.-]+)?\s*· .*?</sub>\s*`)
 	markerOnlyPattern    = regexp.MustCompile(`(?m)\n*<!-- looper:stamp v=1 -->\s*`)
 	commitTrailerPattern = regexp.MustCompile(`(?m)^Generated-By: looper .*$`)
 )
