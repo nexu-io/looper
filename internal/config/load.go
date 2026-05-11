@@ -157,16 +157,89 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 		return PartialConfig{}, false, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 
-	var partialConfig PartialConfig
+	var topLevel map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decoder.Decode(&partialConfig); err != nil {
+	if err := decoder.Decode(&topLevel); err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: trailing JSON value", path)
 	}
 
+	var partialConfig PartialConfig
+	if err := decodeTopLevelConfigSections(topLevel, &partialConfig); err != nil {
+		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
+	}
+
 	return partialConfig, true, nil
+}
+
+func decodeTopLevelConfigSections(topLevel map[string]json.RawMessage, partialConfig *PartialConfig) error {
+	if err := decodeTopLevelConfigSection(topLevel, "server", &partialConfig.Server); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "storage", &partialConfig.Storage); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "scheduler", &partialConfig.Scheduler); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "agent", &partialConfig.Agent); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "logging", &partialConfig.Logging); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "notifications", &partialConfig.Notifications); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "disclosure", &partialConfig.Disclosure); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "tools", &partialConfig.Tools); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "daemon", &partialConfig.Daemon); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "package", &partialConfig.Package); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "defaults", &partialConfig.Defaults); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "reviewer", &partialConfig.Reviewer); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "instructions", &partialConfig.Instructions); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "roles", &partialConfig.Roles); err != nil {
+		return err
+	}
+	if err := decodeTopLevelConfigSection(topLevel, "projects", &partialConfig.Projects); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func decodeTopLevelConfigSection[T any](topLevel map[string]json.RawMessage, key string, target *T) error {
+	raw, ok := topLevel[key]
+	if !ok {
+		return nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid JSON value for %q", key)
+	}
+
+	return nil
 }
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {

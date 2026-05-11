@@ -54,6 +54,47 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestReadConfigFileIgnoresUnknownTopLevelKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"futureSection":{"enabled":true},"server":{"host":"0.0.0.0"}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Scheduler != nil {
+		t.Fatalf("readConfigFile() scheduler = %#v, want nil", partial.Scheduler)
+	}
+}
+
+func TestReadConfigFileRejectsUnknownNestedKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"scheduler":{"pollIntervalSecond":5}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, present, err := readConfigFile(path)
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if err == nil {
+		t.Fatal("readConfigFile() error = nil, want unknown field error")
+	}
+	if !strings.Contains(err.Error(), `json: unknown field "pollIntervalSecond"`) {
+		t.Fatalf("readConfigFile() error = %v, want unknown field pollIntervalSecond", err)
+	}
+}
+
 func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	cfg, err := Normalize(t.TempDir())
 	if err != nil {
