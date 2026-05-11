@@ -1434,7 +1434,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
+		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || shouldRestartManualInterventionFromDiscover(latestRun.Status, checkpoint)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
@@ -2219,6 +2219,13 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 		return true
 	}
 	return strings.Contains(failureSummary, "PR head changed before resolving comments")
+}
+
+func shouldRestartManualInterventionFromDiscover(status string, checkpoint fixerCheckpoint) bool {
+	if status != "failed" && status != "interrupted" {
+		return false
+	}
+	return checkpoint.ResumePolicy == "manual_intervention"
 }
 
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {

@@ -1028,6 +1028,84 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 	}
 }
 
+func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_manual_restart",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &loopTarget,
+		Repo:       &repo,
+		PRNumber:   &prNumber,
+		Status:     "running",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: "manual_intervention",
+		Detail: &checkpointDetail{
+			State:       "OPEN",
+			HeadSHA:     "head-1",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}},
+		},
+		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "head-1", PreparedAt: nowISO},
+		Repair:     &checkpointRepair{Status: "completed", Summary: "nothing to change", CompletedAt: nowISO},
+		Validation: &ValidationResult{Passed: true, Summary: "passed"},
+		Push:       &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+	})
+	manualReason := "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_manual_intervention",
+		LoopID:            "loop_fixer_manual_restart",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepResolveComments)),
+		LastCompletedStep: stringPtr(string(stepPush)),
+		CheckpointJSON:    &checkpointJSON,
+		Summary:           &manualReason,
+		ErrorMessage:      &manualReason,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_manual_restart")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil, want fixer loop")
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Resumed || resumed.StartStep != stepDiscoverPR {
+		t.Fatalf("resumed = %#v, want fresh discover run", resumed)
+	}
+	if resumed.Checkpoint.Detail != nil || len(resumed.Checkpoint.FixItems) != 0 || resumed.Checkpoint.Worktree != nil || resumed.Checkpoint.Push != nil {
+		t.Fatalf("checkpoint = %#v, want cleared manual-intervention checkpoint", resumed.Checkpoint)
+	}
+	if resumed.Checkpoint.ResumePolicy != "replay_step" {
+		t.Fatalf("ResumePolicy = %q, want replay_step", resumed.Checkpoint.ResumePolicy)
+	}
+}
+
 func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testing.T) {
 	t.Parallel()
 
