@@ -396,6 +396,31 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestLoadFileIgnoresUnknownConfigFields(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"futureFeature": {"enabled": true},
+		"server": {"port": 6123}
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Config.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6123)
+	}
+
+	if loaded.Partial.Server == nil || loaded.Partial.Server.Port == nil || *loaded.Partial.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Partial.Server.Port = %#v, want 6123", loaded.Partial.Server)
+	}
+}
+
 func TestLoadFileSupportsCustomInstructions(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

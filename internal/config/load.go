@@ -159,7 +159,6 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 
 	var partialConfig PartialConfig
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&partialConfig); err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
