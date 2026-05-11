@@ -4,7 +4,7 @@
 
 - [x] Document `paused` as “explicit operator hold or unsafe autonomous continuation only”
 - [x] Document that `manual_intervention` does not automatically imply discovery suppression
-- [ ] Document the allowed re-entry modes:
+- [x] Document the allowed re-entry modes:
   - [x] `advance_from_checkpoint`
   - [x] `replay_step`
   - [x] `restart_from_discover`
@@ -23,7 +23,7 @@
 - [x] Remove duplicated ad hoc `FailureManualIntervention => paused` logic where practical
 - [x] Ensure helper behavior can inspect queue outcome + resume policy together
 - [x] Audit all `createRunContext` / resume-gating logic for `manual_intervention`
-- [ ] Audit all rediscovery/recovery filters that exclude loops by `paused`, `failed`, or `manual_intervention`
+- [x] Audit all rediscovery/recovery filters that exclude loops by `paused`, `failed`, or `manual_intervention`
 - [x] Centralize hard-hold vs safe-blocked semantics in one shared policy path
 
 ## Phase 2 - Fixer
@@ -59,27 +59,27 @@
 - [x] Reclassify transient setup / env / tooling failures to retryable states
 - [x] Reclassify worker validation failure away from default permanent pause
 - [x] Add bounded autonomous retry / resume semantics for validation failures
-- [ ] Split worker validation failures into:
+- [x] Split worker validation failures into:
   - [x] transient/tooling/transport
   - [x] stale checkpoint / stale repo-context
   - [x] unsafe repo ambiguity
   - [x] deterministic policy/spec/content
-- [ ] Define for each worker validation subtype:
+- [x] Define for each worker validation subtype:
   - [x] retry from checkpoint vs replay step vs restart from discover vs hard hold
   - [x] re-entry trigger
 - [x] Reclassify safe policy blockers (`auto-push`, manual PR creation, external action required) away from unsafe pause semantics
 - [x] Decide v1 semantics for manual PR opening mode
-- [ ] For each worker safe policy blocker, specify:
+- [x] For each worker safe policy blocker, specify:
   - [x] hard hold vs safe blocked
   - [x] resume policy
   - [x] recovery trigger
   - [x] expected loop status
   - [x] expected user-facing summary/message
 - [x] Keep truly unsafe repo/worktree states paused
-- [ ] Add/update worker tests for:
+- [x] Add/update worker tests for:
   - [x] validation failure no longer permanently pausing by default
   - [x] retryable transient setup failure
-  - [ ] safe policy blocker behavior
+  - [x] safe policy blocker behavior
   - [x] unsafe repo-state hold
   - [x] stale validation rediscovery behavior
 
@@ -89,50 +89,50 @@
 - [x] Reclassify planner transient setup / env failures to retryable states
 - [x] Keep explicit human-gated unsafe states paused
 - [x] Ensure planner `createRunContext` only treats true hard holds as non-autonomous
-- [ ] For planner safe blocked states, specify:
+- [x] For planner safe blocked states, specify:
   - [x] expected loop status
   - [x] expected failure kind
   - [x] expected resume policy
   - [x] expected re-entry trigger
-- [ ] Add/update planner tests for:
+- [x] Add/update planner tests for:
   - [x] transient agent/setup failure
-  - [ ] hard manual hold behavior
+  - [x] hard manual hold behavior
   - [x] safe re-entry behavior after non-paused failure
 
 ## Phase 5 - Runtime / reviewer recovery
 
-- [ ] Keep `paused` loops excluded from runtime requeue
-- [ ] Keep reviewer auto-recovery blocked on true hard holds (`manual_intervention` policy/kind)
-- [ ] Ensure reviewer/runtime paths do not depend on over-broad upstream use of `manual_intervention`
-- [ ] Audit reviewer follow-up loop selection for over-broad exclusion of failed loops
-- [ ] Audit reviewer recovery gating for `manual_intervention` assumptions
-- [ ] Add reviewer tests distinguishing hard hold vs safe retryable blocked states
-- [ ] Add/update runtime tests for:
-  - [ ] paused loops never requeue
-  - [ ] reviewer hard-hold states do not auto-recover
-  - [ ] safe retryable reviewer states can still auto-recover when eligible
+- [x] Keep `paused` loops excluded from runtime requeue
+- [x] Keep reviewer auto-recovery blocked on true hard holds (`manual_intervention` policy/kind)
+- [x] Ensure reviewer/runtime paths do not depend on over-broad upstream use of `manual_intervention`
+- [x] Audit reviewer follow-up loop selection for over-broad exclusion of failed loops
+- [x] Audit reviewer recovery gating for `manual_intervention` assumptions
+- [x] Add reviewer tests distinguishing hard hold vs safe retryable blocked states
+- [x] Add/update runtime tests for:
+  - [x] paused loops never requeue
+  - [x] reviewer hard-hold states do not auto-recover
+  - [x] safe retryable reviewer states can still auto-recover when eligible
 
 ## Phase 6 - Anti-thrash and recovery safety
 
-- [ ] Confirm retry budgets still bound newly retryable states
-- [ ] Confirm exponential backoff still applies where queue retries are used
-- [ ] Confirm rediscoverable states have a concrete state-change boundary or dedupe guard
-- [ ] Verify no hot-loop regression in the newly rediscoverable fixer/worker/planner paths
+- [x] Confirm retry budgets still bound newly retryable states
+- [x] Confirm exponential backoff still applies where queue retries are used
+- [x] Confirm rediscoverable states have a concrete state-change boundary or dedupe guard
+- [x] Verify no hot-loop regression in the newly rediscoverable fixer/worker/planner paths
 
 ## Phase 7 - Migration and follow-up policy
 
-- [ ] Confirm this issue only changes new-write semantics by default
-- [ ] Define cancellation semantics:
-  - [ ] operator/human stop implying `paused`
-  - [ ] terminal stop without pause
-  - [ ] retry suppression without unsafe-pause semantics
-- [ ] Decide whether a separate reconciliation pass is needed for old paused loops
-- [ ] If reconciliation is added later, define how to distinguish safe old pauses from unsafe old pauses
+- [x] Confirm this issue only changes new-write semantics by default
+- [x] Define cancellation semantics:
+  - [x] operator/human stop implying `paused`
+  - [x] terminal stop without pause
+  - [x] retry suppression without unsafe-pause semantics
+- [x] Decide whether a separate reconciliation pass is needed for old paused loops
+- [x] If reconciliation is added later, define how to distinguish safe old pauses from unsafe old pauses
 
 ## Phase 8 - Verification
 
-- [ ] Verify CLI/API/user-facing outputs do not label safe blocked states as “paused”
-- [ ] Verify notifications/comments distinguish hard hold vs retryable/safe blocked failures
+- [x] Verify CLI/API/user-facing outputs do not label safe blocked states as “paused”
+- [x] Verify notifications/comments distinguish hard hold vs retryable/safe blocked failures
 - [x] Run fixer tests
 - [x] Run worker tests
 - [x] Run planner tests

@@ -1895,6 +1895,12 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 			q.LastErrorKind = &kind
 			return q
 		}()},
+		{name: "manual intervention resume policy", loop: baseLoop, run: func() storage.RunRecord {
+			r := baseRun
+			checkpointJSON := `{"resumePolicy":"manual_intervention","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+			r.CheckpointJSON = &checkpointJSON
+			return r
+		}(), queue: baseQueue},
 		{name: "closed checkpoint", loop: baseLoop, run: func() storage.RunRecord {
 			r := baseRun
 			r.CheckpointJSON = checkpoint(`"detail":{"state":"CLOSED","reviewDecision":"","labels":[]}`)
@@ -1964,6 +1970,14 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 				t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false")
 			}
 		})
+	}
+}
+
+func TestShouldRequeueLoopKeepsPausedLoopsExcluded(t *testing.T) {
+	t.Parallel()
+
+	if shouldRequeueLoop(storage.LoopRecord{Status: "paused"}, &storage.RunRecord{Status: "interrupted"}, false) {
+		t.Fatal("shouldRequeueLoop() = true, want false for paused loop")
 	}
 }
 

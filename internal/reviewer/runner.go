@@ -26,6 +26,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 )
@@ -987,7 +988,7 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -1098,14 +1099,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				if resumePolicy != "restart_from_discover" && resumePolicy != "rerun_review" {
-					resumePolicy = "advance_from_checkpoint"
+				if resumePolicy != loops.ResumePolicyRestartFromDiscover && resumePolicy != "rerun_review" {
+					resumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 				}
 			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
+				resumePolicy = loops.ResumePolicyManualIntervention
 			default:
 				if resumePolicy == "" {
-					resumePolicy = "replay_step"
+					resumePolicy = loops.ResumePolicyReplayStep
 				}
 			}
 			latest.ResumePolicy = resumePolicy
@@ -1150,7 +1151,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
@@ -3147,7 +3148,8 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if latestQueue.LastErrorKind != nil {
 		queueKind = *latestQueue.LastErrorKind
 	}
-	if queueKind == string(FailureManualIntervention) || checkpoint.ResumePolicy == "manual_intervention" {
+	resumePolicy := loops.NormalizeResumePolicy(queueKind, checkpoint.ResumePolicy)
+	if loops.SuppressesAutonomousRecovery(queueKind, resumePolicy) {
 		return false, "", "manual_intervention", nil
 	}
 	approvedByCurrentUser := func() (bool, error) {
@@ -3160,7 +3162,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		}
 		return hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA), nil
 	}
-	if queueKind == string(FailureRetryableAfterResume) && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review") {
+	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review") {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
 			return false, "", "", err

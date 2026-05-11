@@ -346,6 +346,14 @@ Reviewer-side logic must also be audited for over-broad suppression outside loop
 
 No safe blocked state should remain effectively treated as a hard hold just because one of these secondary gates still assumes `manual_intervention` means “no autonomy forever”.
 
+Current implementation slice:
+
+- runtime reviewer auto-recovery now uses the shared loop policy helper to determine whether a failed reviewer loop is a true hard hold
+- reviewer failed-loop recovery gating now normalizes resume policy before deciding whether autonomy is suppressed
+- reviewer failure finalization now uses the shared pause helper, so only true hard holds and cancelled queue items settle into `paused`
+- runtime `shouldRequeueLoop(...)` remains strict: paused loops are still excluded from requeue, and the fix is entirely upstream classification rather than redefining `paused`
+- reviewer follow-up discovery still intentionally excludes failed loops, because failed reviewer loops recover through the dedicated failed-loop recovery path rather than generic follow-up rediscovery
+
 ## 7.5 Cancellation semantics
 
 Current code sometimes treats cancelled queue items as pause-adjacent, but this issue needs an explicit rule.
@@ -357,6 +365,12 @@ The implementation must define when cancellation means:
 3. retry suppression without redefining the loop as unsafe
 
 Cancellation semantics should not remain an implicit side effect of existing queue-state checks.
+
+Current implementation decision:
+
+- cancelling active queue items as part of an explicit operator/human stop remains pause-adjacent and leaves the loop `paused`
+- terminal non-paused stops continue to use the existing lifecycle states (`completed`, `failed`, `terminated`) rather than queue cancellation
+- retry suppression without unsafe-pause semantics continues to use non-paused failed states plus retry-budget/whitelist gating, not queue cancellation
 
 ---
 
@@ -387,6 +401,12 @@ If a reconciliation pass is added later, it must distinguish:
 
 - unsafe historical pauses that must remain paused
 - safe historical pauses that can be reintroduced into discovery/recovery
+
+Current implementation decision:
+
+- this issue changes only new writes and new recovery decisions
+- no automatic reconciliation pass is added in this issue
+- any later reconciliation pass must distinguish explicit/manual or unsafe historical pauses from safe historical pauses using persisted failure kind, resume policy, and contextual loop metadata rather than blindly unpausing all paused loops
 
 ---
 

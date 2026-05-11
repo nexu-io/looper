@@ -1686,7 +1686,8 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
 	queueKind := derefString(latestQueue.LastErrorKind)
 	queueMessage := derefString(latestQueue.LastError)
-	if loops.SuppressesAutonomousRecovery(queueKind, checkpoint.ResumePolicy) {
+	resumePolicy := loops.NormalizeResumePolicy(queueKind, checkpoint.ResumePolicy)
+	if loops.SuppressesAutonomousRecovery(queueKind, resumePolicy) {
 		return false
 	}
 	if checkpoint.Detail == nil {
@@ -1709,7 +1710,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)
-	return (queueKind == "retryable_after_resume" && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+	return (queueKind == loops.FailureKindRetryableAfterResume && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
 }
 
 func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories *storage.Repositories, loopID string, latestQueue *storage.QueueItemRecord, queuedAt string) (int64, error) {
