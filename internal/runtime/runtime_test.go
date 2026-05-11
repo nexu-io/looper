@@ -1003,16 +1003,19 @@ func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
 	if containsEventType(events, "agent.killed") {
 		t.Fatalf("agent_execution events = %#v, want no agent.killed for mismatched pid", events)
 	}
+	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
+	}
 	recovery := rt.RecoverySummary()
 	if recovery.OrphanAgentCleanup.CleanedCount != 0 {
 		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want cleanedCount=0", recovery.OrphanAgentCleanup)
 	}
-	if !logger.containsMessage("skipped orphan agent cleanup for mismatched pid") {
-		t.Fatalf("logger entries = %#v, want mismatched pid warning", logger.messages())
+	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
+		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
 	}
 }
 
-func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testing.T) {
+func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -1066,9 +1069,10 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 		t.Fatalf("seed coordinator close error = %v", err)
 	}
 
+	logger := &testLogger{}
 	rt := New(Options{
 		Config: cfg,
-		Logger: &testLogger{},
+		Logger: logger,
 		Now: func() time.Time {
 			return startedAt
 		},
@@ -1089,8 +1093,15 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
-	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
-		t.Fatalf("Runs.GetByID(%s) = %#v, want interrupted with ended_at", runID, run)
+	if run == nil || run.Status != "running" || run.EndedAt != nil {
+		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", runID, run)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loopID, loop)
 	}
 	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_mismatched_running_run")
 	if err != nil {
@@ -1099,8 +1110,29 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 	if agentExecution == nil || agentExecution.Status != "running" {
 		t.Fatalf("AgentExecutions.GetByID(agent_mismatched_running_run) = %#v, want still running stale row", agentExecution)
 	}
-	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 1 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
-		t.Fatalf("RecoverySummary() = %#v, want interrupted run without cleaned orphan agent", recovery)
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_mismatched_running_run")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(agent_mismatched_running_run) error = %v", err)
+	}
+	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
+	}
+	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary() = %#v, want preserved run and loop for uncertain live execution", recovery)
+	}
+	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
+		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
+	}
+}
+
+func TestCommandPrefixMatchesTruncatedPromptTail(t *testing.T) {
+	t.Parallel()
+
+	if !commandPrefixMatches(
+		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
+		[]string{"codex", "exec", "very long reviewer prompt"},
+	) {
+		t.Fatal("commandPrefixMatches() = false, want true for truncated prompt tail")
 	}
 }
 
