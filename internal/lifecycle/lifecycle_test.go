@@ -108,3 +108,13 @@ func TestPromptInstructionRespectsDisclosureChannelOptOuts(t *testing.T) {
 		t.Fatalf("PromptInstruction should still mention enabled issue-comment disclosure:\n%s", prompt)
 	}
 }
+
+func TestPromptInstructionLeavesPRDisclosureStampingToLooper(t *testing.T) {
+	prompt := PromptInstruction("worker", "looper/test", "main", true, true, config.DefaultDisclosureConfig(), "opencode", "")
+	if !strings.Contains(prompt, "For PR bodies, do not add looper Markdown disclosure footers yourself; Looper will append or normalize the PR disclosure footer during PR creation or update.") {
+		t.Fatalf("PromptInstruction missing PR stamping guidance:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "For generated issue bodies or normal comments, add this Markdown footer") {
+		t.Fatalf("PromptInstruction should preserve issue comment disclosure guidance:\n%s", prompt)
+	}
+}

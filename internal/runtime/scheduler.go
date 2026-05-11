@@ -174,7 +174,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 	if err != nil {
 		return planner.PullRequestDetail{}, err
 	}
-	return planner.PullRequestDetail{Number: pr.Number, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
 }
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
@@ -184,6 +184,11 @@ func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input plann
 		return planner.CreatePullRequestResult{}, err
 	}
 	return planner.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input planner.UpdatePullRequestBodyInput) error {
+	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
 }
 
 func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input planner.PullRequestLabelsInput) error {
@@ -594,6 +599,11 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 		return worker.CreatePullRequestResult{}, err
 	}
 	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
+	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {

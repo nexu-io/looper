@@ -1897,11 +1897,14 @@ func TestProcessClaimedItemPreservesPRTitleEditedDuringTakeover(t *testing.T) {
 	if result.Status != "success" || result.PullRequestNumber != 42 {
 		t.Fatalf("result = %#v, want success with PR 42", result)
 	}
-	if len(github.viewPRCalls) != 2 {
-		t.Fatalf("len(github.viewPRCalls) = %d, want re-fetch before rename", len(github.viewPRCalls))
+	if len(github.viewPRCalls) != 3 {
+		t.Fatalf("len(github.viewPRCalls) = %d, want re-fetch before rename plus disclosure normalization", len(github.viewPRCalls))
 	}
 	if len(github.updatePRTitleCalls) != 0 {
 		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 0", len(github.updatePRTitleCalls))
+	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no body rewrite for human-authored PR", github.updatePRBodyCalls)
 	}
 }
 
@@ -2198,6 +2201,9 @@ func TestProcessClaimedItemPushExistingReconcilesDirtyWorktreeBeforePush(t *test
 	if len(git.pushCalls) != 1 {
 		t.Fatalf("len(git.pushCalls) = %d, want push after fallback commit", len(git.pushCalls))
 	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no body rewrite for existing PR without disclosure footer", github.updatePRBodyCalls)
+	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil || run == nil {
 		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", run, err)
@@ -2350,6 +2356,7 @@ type fakeGitHubGateway struct {
 	createPRErrors          []error
 	createPRCalls           []CreatePullRequestInput
 	updatePRTitleCalls      []UpdatePullRequestTitleInput
+	updatePRBodyCalls       []UpdatePullRequestBodyInput
 	updatePRTitleErrors     []error
 	updatePRTitleIndex      int
 	removeLabels            []PullRequestLabelsInput
@@ -2453,6 +2460,11 @@ func (f *fakeGitHubGateway) UpdatePullRequestTitle(_ context.Context, input Upda
 		f.updatePRTitleIndex++
 		return err
 	}
+	return nil
+}
+
+func (f *fakeGitHubGateway) UpdatePullRequestBody(_ context.Context, input UpdatePullRequestBodyInput) error {
+	f.updatePRBodyCalls = append(f.updatePRBodyCalls, input)
 	return nil
 }
 

@@ -250,6 +250,13 @@ type UpdatePullRequestTitleInput struct {
 	CWD      string
 }
 
+type UpdatePullRequestBodyInput struct {
+	Repo     string
+	PRNumber int64
+	Body     string
+	CWD      string
+}
+
 type ListOpenPullRequestsInput struct {
 	Repo    string
 	CWD     string
@@ -1477,6 +1484,11 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
+	return err
+}
+
+func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullRequestBodyInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--body", input.Body)
 	return err
 }
 

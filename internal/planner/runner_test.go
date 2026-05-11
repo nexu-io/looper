@@ -464,6 +464,9 @@ func TestProcessClaimedItemAdoptsOpenBranchPRWhenLifecycleLacksPRNumber(t *testi
 	if len(github.createPRCalls) != 0 {
 		t.Fatalf("createPRCalls = %#v, want no fallback CreatePullRequest", github.createPRCalls)
 	}
+	if len(github.updatePRBodyCalls) != 1 {
+		t.Fatalf("updatePRBodyCalls = %#v, want disclosure normalization", github.updatePRBodyCalls)
+	}
 	if len(github.listOpenPRCalls) != 1 {
 		t.Fatalf("listOpenPRCalls = %d, want 1", len(github.listOpenPRCalls))
 	}
@@ -901,6 +904,7 @@ type fakeGitHubGateway struct {
 	createPRIndex      int
 	listOpenPRCalls    []ListOpenPullRequestsInput
 	createPRCalls      []CreatePullRequestInput
+	updatePRBodyCalls  []UpdatePullRequestBodyInput
 	addLabelCalls      []PullRequestLabelsInput
 	addReviewerCalls   []PullRequestReviewersInput
 	addAssigneeCalls   []IssueAssigneesInput
@@ -967,6 +971,11 @@ func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePul
 	}
 	f.createPRIndex++
 	return f.createPRResult, nil
+}
+
+func (f *fakeGitHubGateway) UpdatePullRequestBody(_ context.Context, input UpdatePullRequestBodyInput) error {
+	f.updatePRBodyCalls = append(f.updatePRBodyCalls, input)
+	return nil
 }
 
 func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {

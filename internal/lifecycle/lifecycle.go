@@ -239,20 +239,14 @@ func disclosurePromptInstruction(runner string, cfg config.DisclosureConfig, age
 	} else {
 		parts = append(parts, "Do not add looper Generated-By trailers to commit messages.")
 	}
-	if cfg.Channels.PullRequest || cfg.Channels.IssueComment {
-		channels := []string{}
-		if cfg.Channels.PullRequest {
-			channels = append(channels, "PR bodies")
-		}
-		if cfg.Channels.IssueComment {
-			channels = append(channels, "issue bodies or normal comments")
-		}
-		parts = append(parts, "For generated "+strings.Join(channels, " and ")+", add this Markdown footer: `<!-- looper:stamp v=1 -->` followed by `"+markdownFooter+"`.")
-	}
-	if !cfg.Channels.PullRequest {
+	if cfg.Channels.PullRequest {
+		parts = append(parts, "For PR bodies, do not add looper Markdown disclosure footers yourself; Looper will append or normalize the PR disclosure footer during PR creation or update.")
+	} else {
 		parts = append(parts, "Do not add looper Markdown disclosure footers to PR bodies.")
 	}
-	if !cfg.Channels.IssueComment {
+	if cfg.Channels.IssueComment {
+		parts = append(parts, "For generated issue bodies or normal comments, add this Markdown footer: `<!-- looper:stamp v=1 -->` followed by `"+markdownFooter+"`.")
+	} else {
 		parts = append(parts, "Do not add looper Markdown disclosure footers to issue bodies or normal comments.")
 	}
 	if cfg.Channels.ReviewComment {
