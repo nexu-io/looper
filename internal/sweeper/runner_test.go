@@ -128,6 +128,98 @@ func TestDiscoverPullRequestsSkipsWhenPRLaneDisabled(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsExcludedLabelBeforeAuthorAssociationLookup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeLabels = []string{"skip-me"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: []string{"skip-me"}}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want excluded label to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 0 {
+		t.Fatalf("ViewIssue() calls = %d, want 0", fixture.github.viewIssueCalls)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsExcludedAuthorBeforeAuthorAssociationLookup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthors = []string{"octo"}
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded author to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 0 {
+		t.Fatalf("ViewIssue() calls = %d, want 0", fixture.github.viewIssueCalls)
+	}
+}
+
+func TestDiscoverIssuesBackfillsAssociationUsingHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"OWNER"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.issueDetails["github.example.com/acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want excluded owner issue to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 1 {
+		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
+	}
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "github.example.com/acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [github.example.com/acme/looper]", got)
+	}
+	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
+		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)
+	}
+}
+
+func TestDiscoverPullRequestsBackfillsAssociationUsingHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"MEMBER"}
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.issueDetails["github.example.com/acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "MEMBER"}
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded member PR to be skipped", result)
+	}
+	if fixture.github.viewIssueCalls != 1 {
+		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
+	}
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "github.example.com/acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [github.example.com/acme/looper]", got)
+	}
+	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
+		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)
+	}
+}
+
 func TestProcessWarnSkipsFreshAbandonedPRCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -1455,7 +1547,8 @@ func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", AuthorAssociation: "OWNER"}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
 
 	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
 	if err != nil {
@@ -1463,6 +1556,54 @@ func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || result.Skipped != 1 {
 		t.Fatalf("DiscoverIssues() = %#v, want excluded association to be skipped", result)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsExcludedAuthorAssociations(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 2, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.issueDetails["acme/looper#2"] = githubinfra.IssueDetail{Number: 2, AuthorAssociation: "OWNER", IsPullRequest: true}
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded association to be skipped", result)
+	}
+}
+
+func TestDiscoverIssuesSkipsWhenAuthorAssociationLookupFails(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 3, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want lookup failure to fail closed", result)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsWhenAuthorAssociationLookupFails(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 4, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.viewIssueErr = errors.New("transient gh failure")
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want lookup failure to fail closed", result)
 	}
 }
 
@@ -1576,6 +1717,10 @@ type stubGitHub struct {
 	prs               []githubinfra.PullRequestSummary
 	issueDetails      map[string]githubinfra.IssueDetail
 	prDetails         map[string]githubinfra.PullRequestDetail
+	viewIssueErr      error
+	viewIssueCalls    int
+	viewIssueRepos    []string
+	viewIssueCWDs     []string
 	listIssuesCalls   int
 	listPRCalls       int
 	createdComments   []githubinfra.IssueCommentInput
@@ -1622,6 +1767,12 @@ func (g *stubGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenP
 }
 
 func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	g.viewIssueCalls++
+	g.viewIssueRepos = append(g.viewIssueRepos, input.Repo)
+	g.viewIssueCWDs = append(g.viewIssueCWDs, input.CWD)
+	if g.viewIssueErr != nil {
+		return githubinfra.IssueDetail{}, g.viewIssueErr
+	}
 	return g.issueDetails[input.Repo+"#"+itoa(input.IssueNumber)], nil
 }
 

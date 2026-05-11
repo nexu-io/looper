@@ -387,9 +387,19 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 		}
 		targetID := buildTargetID(input.Repo, issue.Number)
 		legacyState := states[targetID]
+		if r.shouldSkipSummary(issue.Labels, issue.Author, legacyState, roleCfg) {
+			result.Skipped++
+			continue
+		}
 		caseState, err := r.getCaseDiscoveryState(ctx, input.ProjectID, input.Repo, "issue", issue.Number, states)
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		var associationOK bool
+		issue.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, issue.Number, issue.AuthorAssociation, roleCfg)
+		if !associationOK {
+			result.Skipped++
+			continue
 		}
 		candidate := prefilterCandidate{TargetID: targetID, TargetType: "issue", TargetNumber: issue.Number, Labels: issue.Labels, Author: issue.Author, Association: issue.AuthorAssociation, State: caseState, DefaultPayload: sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}}
 		if r.prefilterSkipCandidate(candidate, legacyState, roleCfg) {
@@ -473,9 +483,19 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 		}
 		targetID := buildTargetID(input.Repo, pr.Number)
 		legacyState := states[targetID]
+		if r.shouldSkipSummary(pr.Labels, pr.Author, legacyState, roleCfg) {
+			result.Skipped++
+			continue
+		}
 		caseState, err := r.getCaseDiscoveryState(ctx, input.ProjectID, input.Repo, "pull_request", pr.Number, states)
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		var associationOK bool
+		pr.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, pr.Number, pr.AuthorAssociation, roleCfg)
+		if !associationOK {
+			result.Skipped++
+			continue
 		}
 		candidate := prefilterCandidate{TargetID: targetID, TargetType: "pull_request", TargetNumber: pr.Number, Labels: pr.Labels, Author: pr.Author, Association: pr.AuthorAssociation, State: caseState, DefaultPayload: sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}}
 		if r.prefilterSkipCandidate(candidate, legacyState, roleCfg) {
@@ -1722,7 +1742,7 @@ func gracePeriodForCategory(category string, roleCfg config.SweeperRoleConfig) i
 	}
 }
 
-func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+func (r *Runner) shouldSkipSummary(labels []string, author string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
 	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabelExcept(labels, roleCfg.Triggers.LooperInternalLabels, roleCfg.Lifecycle.ClosedLabel) || hasLabel(labels, roleCfg.Security.QuarantineLabel) {
 		return true
 	}
@@ -1734,6 +1754,10 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 			return true
 		}
 	}
+	return false
+}
+
+func authorAssociationExcluded(authorAssociation string, roleCfg config.SweeperRoleConfig) bool {
 	for _, excluded := range roleCfg.Triggers.ExcludeAuthorAssociations {
 		if strings.EqualFold(strings.TrimSpace(excluded), strings.TrimSpace(authorAssociation)) {
 			return true
@@ -1743,7 +1767,22 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 }
 
 func (r *Runner) prefilterSkipCandidate(candidate prefilterCandidate, legacyState sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
-	return r.shouldSkipSummary(candidate.Labels, candidate.Author, candidate.Association, legacyState, roleCfg)
+	return r.shouldSkipSummary(candidate.Labels, candidate.Author, legacyState, roleCfg) || authorAssociationExcluded(candidate.Association, roleCfg)
+}
+
+func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, cwd string, number int64, current string, roleCfg config.SweeperRoleConfig) (string, bool) {
+	if strings.TrimSpace(current) != "" || len(roleCfg.Triggers.ExcludeAuthorAssociations) == 0 || r.github == nil {
+		return current, true
+	}
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: strings.TrimSpace(repo), IssueNumber: number, CWD: cwd})
+	if err != nil {
+		return "", false
+	}
+	association := strings.TrimSpace(detail.AuthorAssociation)
+	if association == "" {
+		return current, true
+	}
+	return association, true
 }
 
 func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {

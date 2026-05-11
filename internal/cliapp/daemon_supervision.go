@@ -19,7 +19,15 @@ import (
 
 const (
 	daemonStateSchemaVersion = 1
-	launchdLooperdLabel      = "com.nexu-io.looper.looperd"
+	// launchdLooperdLabel is the reverse-DNS LaunchAgent label for the
+	// looperd daemon supervised by launchd on macOS. The nexu.io domain
+	// maps to "io.nexu" in reverse-DNS form.
+	launchdLooperdLabel = "io.nexu.looper.looperd"
+	// launchdLooperdLegacyLabel is the prior, malformed label used before
+	// the reverse-DNS fix. Kept so that fresh `daemon start --daemon-mode
+	// launchd` invocations can clean up any leftover plist installed by an
+	// older Looper build.
+	launchdLooperdLegacyLabel = "com.nexu-io.looper.looperd"
 )
 
 type daemonLifecycleState struct {
@@ -285,6 +293,24 @@ func (r *commandRuntime) refreshLaunchdLifecycleState(ctx context.Context, loade
 	return &updated, nil
 }
 
+// migrateLegacyLaunchdPlist removes any LaunchAgent installed under the
+// previous, malformed label so the new install does not race with a leftover
+// daemon under the legacy name. The previous label was
+// "com.nexu-io.looper.looperd"; the corrected reverse-DNS form is
+// "io.nexu.looper.looperd". Best effort — failures do not block start.
+func (r *commandRuntime) migrateLegacyLaunchdPlist(ctx context.Context, launchctlPath, domain string) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return
+	}
+	legacyPlistPath := filepath.Join(homeDir, "Library", "LaunchAgents", launchdLooperdLegacyLabel+".plist")
+	if _, readErr := r.readFile(legacyPlistPath); readErr != nil {
+		return
+	}
+	_, _ = r.runCommand(ctx, launchctlPath, []string{"bootout", domain, legacyPlistPath}, daemonCommandTimeout)
+	_ = r.removeFile(legacyPlistPath)
+}
+
 func (r *commandRuntime) startLaunchdDaemon(ctx context.Context, out io.Writer, loaded config.LoadedFileConfig, binary *resolvedDaemonBinary, args []string, cwd string, env []string, client *DaemonAPIClient, apiURL string) error {
 	if r.platform() != "darwin" {
 		return fmt.Errorf("daemon.mode=launchd is only supported on macOS. Use daemon.mode=foreground for detached-only mode on this platform, or configure a platform supervisor when support is added")
@@ -317,6 +343,7 @@ func (r *commandRuntime) startLaunchdDaemon(ctx context.Context, out io.Writer, 
 		return fmt.Errorf("write launchd plist: %w", err)
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	r.migrateLegacyLaunchdPlist(ctx, launchctlPath, domain)
 	_, _ = r.runCommand(ctx, launchctlPath, []string{"bootout", domain, plistPath}, daemonCommandTimeout)
 	result, err := r.runCommand(ctx, launchctlPath, []string{"bootstrap", domain, plistPath}, daemonCommandTimeout)
 	if err != nil {

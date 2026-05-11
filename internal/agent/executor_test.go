@@ -94,7 +94,7 @@ func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
 		vendor config.AgentVendor
 		want   string
 	}{
-		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello"},
+		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello --dangerously-skip-permissions"},
 		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
 		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --session session-123 hello"},
 		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},

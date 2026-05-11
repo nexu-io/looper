@@ -15,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -121,6 +122,8 @@ type ViewPullRequestInput struct {
 
 type PullRequestDetail struct {
 	Number      int64
+	Title       string
+	Body        string
 	URL         string
 	State       string
 	HeadRefName string
@@ -141,6 +144,13 @@ type PullRequestReviewersInput struct {
 	CWD       string
 }
 
+type UpdatePullRequestBodyInput struct {
+	Repo     string
+	PRNumber int64
+	Body     string
+	CWD      string
+}
+
 type IssueAssigneesInput struct {
 	Repo        string
 	IssueNumber int64
@@ -156,6 +166,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
+	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
 }
@@ -1021,6 +1032,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if adopted != nil {
+				if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
+					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				}
 				checkpoint.Publish.PullRequest = adopted
 				checkpoint.Lifecycle.PRNumber = adopted.Number
 				checkpoint.Lifecycle.PRURL = adopted.URL
@@ -1046,6 +1060,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if adopted != nil {
+			if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
 			checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: adopted.Number, URL: adopted.URL, Body: ""}
 			checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 			checkpoint.Lifecycle.PRNumber = adopted.Number
@@ -1160,6 +1177,25 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 		prNumber = state.PRNumber
 	}
 	return &checkpointPullRequest{Number: prNumber, URL: firstNonEmpty(detail.URL, state.PRURL), Body: ""}, nil
+}
+
+func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string, prNumber int64, cwd string, force bool) error {
+	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
+		return nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return err
+	}
+	if !force && !disclosure.HasMarkdownStamp(detail.Body) {
+		return nil
+	}
+	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
+	body := stamper.Markdown(detail.Body, "planner", disclosure.ChannelPullRequest)
+	if body == detail.Body {
+		return nil
+	}
+	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
 }
 
 func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, pr checkpointPullRequest) error {
@@ -1604,6 +1640,7 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
 		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
+		"Because remote PR actions are disabled for this run, do not create or update PR bodies; any PR disclosure stamping can only happen during a later Looper-managed remote reconciliation step.",
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")

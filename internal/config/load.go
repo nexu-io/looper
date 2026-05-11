@@ -159,8 +159,7 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 
 	var partialConfig PartialConfig
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&partialConfig); err != nil {
+	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
@@ -168,6 +167,135 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 	}
 
 	return partialConfig, true, nil
+}
+
+func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {
+	type topLevelConfigSection struct {
+		key    string
+		decode func(json.RawMessage) error
+	}
+
+	sections := []topLevelConfigSection{
+		{key: "server", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "server", &partialConfig.Server)
+		}},
+		{key: "storage", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "storage", &partialConfig.Storage)
+		}},
+		{key: "scheduler", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "scheduler", &partialConfig.Scheduler)
+		}},
+		{key: "agent", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "agent", &partialConfig.Agent)
+		}},
+		{key: "logging", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "logging", &partialConfig.Logging)
+		}},
+		{key: "notifications", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "notifications", &partialConfig.Notifications)
+		}},
+		{key: "disclosure", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "disclosure", &partialConfig.Disclosure)
+		}},
+		{key: "tools", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "tools", &partialConfig.Tools)
+		}},
+		{key: "daemon", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "daemon", &partialConfig.Daemon)
+		}},
+		{key: "package", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "package", &partialConfig.Package)
+		}},
+		{key: "defaults", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "defaults", &partialConfig.Defaults)
+		}},
+		{key: "reviewer", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "reviewer", &partialConfig.Reviewer)
+		}},
+		{key: "instructions", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "instructions", &partialConfig.Instructions)
+		}},
+		{key: "roles", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "roles", &partialConfig.Roles)
+		}},
+		{key: "projects", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "projects", &partialConfig.Projects)
+		}},
+	}
+
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		return nil
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("invalid JSON value for config: expected object")
+	}
+
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+
+		key, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("invalid JSON value for config: expected object key")
+		}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+
+		matched := false
+		for index := range sections {
+			if strings.EqualFold(key, sections[index].key) {
+				if err := sections[index].decode(value); err != nil {
+					return err
+				}
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			continue
+		}
+	}
+
+	if token, err = decoder.Token(); err != nil {
+		return err
+	} else if delimiter, ok := token.(json.Delim); !ok || delimiter != '}' {
+		return fmt.Errorf("invalid JSON value for config: expected object terminator")
+	}
+
+	return nil
+}
+
+func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target **T) error {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	decodeTarget := any(target)
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if target != nil && *target != nil {
+			decodeTarget = *target
+		}
+	}
+	if err := decoder.Decode(decodeTarget); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid JSON value for %q", key)
+	}
+
+	return nil
 }
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {

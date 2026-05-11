@@ -62,6 +62,7 @@ type Options struct {
 	RunSchedulerTick       RunSchedulerTickFunc
 	ReadProcessCommand     ReadProcessCommandFunc
 	SignalProcess          SignalProcessFunc
+	DeferRecovery          bool
 }
 
 type Services struct {
@@ -86,24 +87,30 @@ type Runtime struct {
 	readProcessCommand     ReadProcessCommandFunc
 	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
+	deferRecovery          bool
 
-	mu               sync.RWMutex
-	startedAt        *time.Time
-	recovery         RecoverySummary
-	stopped          bool
-	services         Services
-	startErr         error
-	startOnce        sync.Once
-	shutdownOnce     sync.Once
-	shutdownCh       chan struct{}
-	schedulerStop    chan struct{}
-	schedulerDone    chan struct{}
-	schedulerWake    chan struct{}
-	schedulerCancel  context.CancelFunc
-	schedulerTasks   *schedulerTaskTracker
-	recoveryCancel   context.CancelFunc
-	recoveryDone     chan struct{}
-	activeExecutions *ActiveExecutionRegistry
+	mu                sync.RWMutex
+	startedAt         *time.Time
+	recovery          RecoverySummary
+	stopped           bool
+	services          Services
+	startErr          error
+	startOnce         sync.Once
+	shutdownOnce      sync.Once
+	shutdownCh        chan struct{}
+	schedulerStop     chan struct{}
+	schedulerDone     chan struct{}
+	schedulerWake     chan struct{}
+	schedulerCancel   context.CancelFunc
+	schedulerTasks    *schedulerTaskTracker
+	recoveryCancel    context.CancelFunc
+	recoveryDone      chan struct{}
+	activeExecutions  *ActiveExecutionRegistry
+	githubGateway     *githubinfra.Gateway
+	schedulerDisabled bool
+	startupReadyOnce  sync.Once
+	startupReadyErr   error
+	ownershipAcquired bool
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -156,6 +163,7 @@ func New(options Options) *Runtime {
 		readProcessCommand:     readProcessCommand,
 		signalProcess:          signalProcess,
 		shutdownTimeout:        shutdownTimeout,
+		deferRecovery:          options.DeferRecovery,
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 		activeExecutions:       NewActiveExecutionRegistry(),
@@ -199,9 +207,10 @@ func (r *Runtime) Stop(reason string) {
 		r.stopped = true
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
+		ownershipAcquired := r.ownershipAcquired
 		r.mu.Unlock()
 
-		if repositories != nil {
+		if ownershipAcquired && repositories != nil {
 			if err := r.appendStoppedEvent(context.Background(), repositories, reason); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime stop event failed", map[string]any{"error": err.Error()})
 			}
@@ -351,18 +360,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
 	}
-	recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, nil, startedAt)
-	if err != nil {
-		return err
-	}
-
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
 		return fmt.Errorf("runtime already stopped")
 	}
 	r.startedAt = &startedAt
-	r.recovery = recoverySummary
 	r.services = Services{
 		Coordinator:      coordinator,
 		Repositories:     repositories,
@@ -380,33 +383,80 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.now)
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
+	r.githubGateway = githubGateway
+	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
-	if schedulerDisabled && r.logger != nil {
-		r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+
+	if r.deferRecovery {
+		started = true
+		return nil
 	}
 
-	if err := r.appendStartedEvent(context.Background(), startedAt); err != nil {
+	if err := r.CompleteStartup(ctx); err != nil {
 		return err
 	}
-	if !schedulerDisabled {
-		r.startSchedulerLoop()
-	}
-	r.startDeferredReviewerRecovery(githubGateway)
-
 	started = true
-
-	if r.logger != nil {
-		r.logger.Info("looperd runtime assembled", map[string]any{
-			"dbPath":                 r.config.Storage.DBPath,
-			"projectCount":           len(r.config.Projects),
-			"autoMigrate":            r.config.Package.AutoMigrateOnStartup,
-			"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
-			"recoverySummary":        recoverySummary,
-			"schedulerDefaultActive": !r.customSchedulerTick && !schedulerDisabled,
-		})
-	}
-
 	return nil
+}
+
+func (r *Runtime) CompleteStartup(ctx context.Context) error {
+	r.startupReadyOnce.Do(func() {
+		r.mu.RLock()
+		if r.stopped {
+			r.mu.RUnlock()
+			r.startupReadyErr = fmt.Errorf("runtime already stopped")
+			return
+		}
+		startedAt := r.startedAt
+		repositories := r.services.Repositories
+		githubGateway := r.githubGateway
+		schedulerDisabled := r.schedulerDisabled
+		r.mu.RUnlock()
+
+		if startedAt == nil {
+			r.startupReadyErr = fmt.Errorf("runtime has not been started")
+			return
+		}
+		if repositories == nil {
+			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
+			return
+		}
+		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
+		if err != nil {
+			r.startupReadyErr = err
+			return
+		}
+		if err := r.appendStartedEvent(context.Background(), *startedAt, recoverySummary); err != nil {
+			r.startupReadyErr = err
+			return
+		}
+
+		r.mu.Lock()
+		r.recovery = recoverySummary
+		r.ownershipAcquired = true
+		r.mu.Unlock()
+
+		if schedulerDisabled && r.logger != nil {
+			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+		}
+		if !schedulerDisabled {
+			r.startSchedulerLoop()
+		}
+		r.startDeferredReviewerRecovery(githubGateway)
+
+		if r.logger != nil {
+			r.logger.Info("looperd runtime assembled", map[string]any{
+				"dbPath":                 r.config.Storage.DBPath,
+				"projectCount":           len(r.config.Projects),
+				"autoMigrate":            r.config.Package.AutoMigrateOnStartup,
+				"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
+				"recoverySummary":        recoverySummary,
+				"schedulerDefaultActive": !r.customSchedulerTick && !schedulerDisabled,
+			})
+		}
+	})
+
+	return r.startupReadyErr
 }
 
 func (r *Runtime) startSchedulerLoop() {
@@ -608,6 +658,39 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary := createEmptyRecoverySummary()
 	summary.StartedAt = nowISO
 	summary.OrphanAgentCleanup.Attempted = true
+	uncertainAgentRunIDs := make(map[string]struct{})
+	uncertainExecutionIDs := make(map[string]struct{})
+	recordUncertainExecution := func(execution storage.AgentExecutionRecord, pid int, scope string) error {
+		if _, ok := uncertainExecutionIDs[execution.ID]; ok {
+			return nil
+		}
+		uncertainExecutionIDs[execution.ID] = struct{}{}
+		if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+			uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+		}
+		if r.logger != nil {
+			r.logger.Warn("recovery skipped due to uncertain process identity", map[string]any{"executionId": execution.ID, "pid": pid, "scope": scope})
+		}
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.process_identity_uncertain",
+			ProjectID:  execution.ProjectID,
+			LoopID:     execution.LoopID,
+			RunID:      execution.RunID,
+			EntityType: stringPtr("agent_execution"),
+			EntityID:   stringPtr(execution.ID),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"pid":    pid,
+				"reason": "command_mismatch",
+				"scope":  scope,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return err
+		}
+		eventsWritten += 1
+		return nil
+	}
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
@@ -626,8 +709,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				continue
 			}
 			if running && !matches {
-				if r.logger != nil {
-					r.logger.Warn("skipped orphan agent cleanup for mismatched pid", map[string]any{"executionId": execution.ID, "pid": pid})
+				if err := recordUncertainExecution(execution, pid, "orphan_cleanup"); err != nil {
+					return RecoverySummary{}, err
 				}
 				continue
 			}
@@ -742,10 +825,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
 					continue
 				}
-				matches, running, err := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+				pid := int(*execution.PID)
+				matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
 				if err != nil {
 					if r.logger != nil {
 						r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+					}
+					continue
+				}
+				if running && !matches {
+					if err := recordUncertainExecution(execution, pid, "active_run_detection"); err != nil {
+						return RecoverySummary{}, err
 					}
 					continue
 				}
@@ -764,7 +854,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			_, hasActiveAgent := activeAgentRunIDs[run.ID]
-			if !shouldInterruptStaleRunningRun(run, latestRun, hasActiveAgent) {
+			_, hasUncertainAgent := uncertainAgentRunIDs[run.ID]
+			if !shouldInterruptStaleRunningRun(run, latestRun, hasActiveAgent, hasUncertainAgent) {
 				continue
 			}
 			if err := interruptRecoveryRun(ctx, repositories, run, loop, nowISO, "Interrupted stale/orphaned running run during looperd recovery"); err != nil {
@@ -832,7 +923,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 
 		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
-		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent) {
+		_, latestRunHasUncertainAgent := uncertainAgentRunIDs[derefRunID(latestRun)]
+		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent || latestRunHasUncertainAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
 			requeuedLoop.NextRunAt = stringPtr(nowISO)
@@ -1052,7 +1144,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	return requeued, nil
 }
 
-func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) error {
+func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time, recoverySummary RecoverySummary) error {
 	services := r.Services()
 	if services.Repositories == nil {
 		return nil
@@ -1067,9 +1159,9 @@ func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time) e
 			"daemonMode": r.config.Daemon.Mode,
 			"host":       r.config.Server.Host,
 			"port":       r.config.Server.Port,
-			"recovery":   r.RecoverySummary(),
+			"recovery":   recoverySummary,
 		}),
-		CreatedAt: formatJavaScriptISOString(startedAt),
+		CreatedAt: formatJavaScriptISOString(startedAt.Add(time.Millisecond)),
 	})
 }
 
@@ -1147,14 +1239,14 @@ func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Reposito
 	return repositories.Queue.Upsert(ctx, queueRecord)
 }
 
-func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool) bool {
+func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool, hasUncertainAgent bool) bool {
 	if run.Status != string(domain.RunStatusRunning) {
 		return false
 	}
 	if latestRun == nil || latestRun.ID != run.ID {
 		return true
 	}
-	if hasActiveAgent {
+	if hasActiveAgent || hasUncertainAgent {
 		return false
 	}
 	// Recovery runs during daemon startup, so a persisted running run without an
@@ -1409,7 +1501,9 @@ func commandPrefixMatches(expected, actual []string) bool {
 			return false
 		}
 	}
-	return strings.Join(actual[len(expected)-1:], " ") == expected[len(expected)-1]
+	actualTail := strings.Join(actual[len(expected)-1:], " ")
+	expectedTail := expected[len(expected)-1]
+	return actualTail == expectedTail
 }
 
 func splitProcessCommand(command string) []string {
@@ -1803,7 +1897,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasActiveAgent bool) bool {
+func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool) bool {
 	if loop.Status == "paused" {
 		return false
 	}
@@ -1813,7 +1907,7 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, la
 	if latestRun == nil {
 		return loop.Status == "running"
 	}
-	if latestRun.Status == string(domain.RunStatusRunning) && latestRunHasActiveAgent {
+	if latestRun.Status == string(domain.RunStatusRunning) && latestRunHasLiveAgent {
 		return false
 	}
 

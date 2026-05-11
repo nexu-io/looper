@@ -319,6 +319,13 @@ type UpdatePullRequestTitleInput struct {
 	CWD      string
 }
 
+type UpdatePullRequestBodyInput struct {
+	Repo     string
+	PRNumber int64
+	Body     string
+	CWD      string
+}
+
 type ListOpenPullRequestsInput struct {
 	Repo    string
 	CWD     string
@@ -473,7 +480,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -566,7 +573,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "authorAssociation", "assignees", "labels"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
@@ -617,7 +624,12 @@ func issueListLabels(input ListOpenIssuesInput) []string {
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d", input.Repo, input.IssueNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return IssueDetail{}, err
 	}
@@ -625,11 +637,15 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 	if err != nil {
 		return IssueDetail{}, err
 	}
-	commentsResult, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber))
+	commentArgs := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		commentArgs = append(commentArgs, "--hostname", hostname)
+	}
+	commentsResult, err := g.runGh(ctx, input.CWD, "", commentArgs...)
 	if err != nil {
 		return IssueDetail{}, err
 	}
-	commentRows, err := decodeJSONArray(commentsResult.Stdout)
+	commentRows, err := decodeJSONArrayOrPages(commentsResult.Stdout)
 	if err != nil {
 		return IssueDetail{}, err
 	}
@@ -653,11 +669,16 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 }
 
 func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := decodeJSONArray(result.Stdout)
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
 	if err != nil {
 		return nil, err
 	}
@@ -1643,6 +1664,11 @@ func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRe
 	return err
 }
 
+func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullRequestBodyInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--body", input.Body)
+	return err
+}
+
 func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bool, error) {
 	args := []string{"auth", "status"}
 	if strings.TrimSpace(hostname) != "" {
@@ -2059,6 +2085,14 @@ func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 		return repo
 	}
 	return parsed.Hostname() + "/" + repo
+}
+
+func splitRepoHostname(repo string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]) + "/" + strings.TrimSpace(parts[2])
+	}
+	return "", strings.TrimSpace(repo)
 }
 
 func summarizeChecks(checks []map[string]any) string {

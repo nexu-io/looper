@@ -41,6 +41,22 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	}
 }
 
+func TestCommentInfosToObjectsPreservesNestedAuthorLogin(t *testing.T) {
+	t.Parallel()
+
+	comments := commentInfosToObjects([]githubinfra.CommentInfo{{ID: 1, Author: "looper", AuthorAssociation: "MEMBER", Body: "summary", URL: "https://example.test/comment/1"}})
+	if len(comments) != 1 {
+		t.Fatalf("len(comments) = %d, want 1", len(comments))
+	}
+	author, ok := comments[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("author = %#v, want nested map", comments[0]["author"])
+	}
+	if author["login"] != "looper" {
+		t.Fatalf("author login = %#v, want looper", author["login"])
+	}
+}
+
 func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *testing.T) {
 	t.Parallel()
 

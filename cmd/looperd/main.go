@@ -101,14 +101,13 @@ type signalProcessFunc func(int, syscall.Signal) error
 type executionMatchesProcessFunc func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
 
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
-	runtimeValue, err := looperdruntime.Start(ctx, deps)
-	if err != nil {
+	rt := looperdruntime.New(looperdruntime.Options{
+		Config:        deps.Config,
+		Logger:        deps.Logger,
+		DeferRecovery: true,
+	})
+	if err := rt.Start(ctx); err != nil {
 		return nil, err
-	}
-
-	rt, ok := runtimeValue.(*looperdruntime.Runtime)
-	if !ok {
-		return nil, fmt.Errorf("unexpected runtime type %T", runtimeValue)
 	}
 
 	handler := looperdapi.NewHandler(looperdapi.Context{
@@ -126,6 +125,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	})
 	server := looperdapi.NewServer(deps.Config, handler)
 	if err := server.Start(); err != nil {
+		if deps.Logger != nil {
+			deps.Logger.Warn("looperd recovery aborted because instance did not acquire ownership", map[string]any{"error": err.Error()})
+		}
 		rt.Stop("api server failed to start")
 		rt.WaitForShutdown()
 		return nil, err
@@ -136,11 +138,24 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		shutdownTimeout = time.Second
 	}
 
+	if err := rt.CompleteStartup(ctx); err != nil {
+		_ = stopServerWithTimeout(server.Stop, shutdownTimeout)
+		rt.Stop("runtime startup failed after api server ownership")
+		rt.WaitForShutdown()
+		return nil, err
+	}
+
 	return &daemonRuntime{
 		runtime:         rt,
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return stop(ctx)
 }
 
 func (d *daemonRuntime) Stop(reason string) {

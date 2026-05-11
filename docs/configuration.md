@@ -261,7 +261,7 @@ Restart options:
 
 - `daemon.restartPolicy`: `never`, `on-failure`, or `always` (default `on-failure`). For launchd, `on-failure` maps to `KeepAlive` with unsuccessful-exit semantics, and `always` maps to `KeepAlive=true`.
 - `daemon.restartThrottleSeconds`: positive integer throttle passed to the supervisor to avoid tight crash loops (default `10`).
-- `daemon.plistPath`: optional macOS LaunchAgent plist path. If omitted, Looper uses `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist`.
+- `daemon.plistPath`: optional macOS LaunchAgent plist path. If omitted, Looper uses `~/Library/LaunchAgents/io.nexu.looper.looperd.plist`.
 
 Runtime diagnostics are discoverable from `looper daemon status` and `looper daemon status --json`:
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -184,6 +185,112 @@ func TestRunPrintsBootstrapErrors(t *testing.T) {
 	}
 	if got := stdout.String(); got != "" {
 		t.Fatalf("runWithDeps([]) stdout = %q, want empty string", got)
+	}
+}
+
+func TestStartRuntimeWithAPIDoesNotRunRecoveryBeforeServerOwnership(t *testing.T) {
+	ctx := context.Background()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	addr := listener.Addr().(*net.TCPAddr)
+	cfg.Server.Host = "127.0.0.1"
+	cfg.Server.Port = addr.Port
+
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{BackupDir: backupDir, Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := "2026-05-01T10:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: workingDir, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "nexu-io/looper"
+	prNumber := int64(266)
+	targetID := "pr:nexu-io/looper:266"
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 266, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+
+	_, err = startRuntimeWithAPI(ctx, bootstrap.RuntimeDependencies{Config: cfg})
+	if err == nil {
+		t.Fatal("startRuntimeWithAPI() error = nil, want listen failure")
+	}
+
+	coordinator, err = storage.OpenSQLiteCoordinator(ctx, cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{BackupDir: backupDir, Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() reopen error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos = storage.NewRepositories(coordinator.DB())
+	restoredLoop, err := repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if restoredLoop == nil || restoredLoop.Status != "running" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loop.ID, restoredLoop)
+	}
+	restoredRun, err := repos.Runs.GetByID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if restoredRun == nil || restoredRun.Status != "running" || restoredRun.EndedAt != nil {
+		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", run.ID, restoredRun)
+	}
+	events, err := repos.Events.List(ctx, 10)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("Events.List() = %#v, want no startup or recovery mutations after ownership loss", events)
+	}
+}
+
+func TestStopServerWithTimeoutUsesDeadline(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 25 * time.Millisecond
+	started := make(chan struct{})
+	err := stopServerWithTimeout(func(ctx context.Context) error {
+		close(started)
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("stop context missing deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > timeout {
+			t.Fatalf("stop context remaining = %v, want within (0,%v]", remaining, timeout)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}, timeout)
+	<-started
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stopServerWithTimeout() error = %v, want %v", err, context.DeadlineExceeded)
 	}
 }
 

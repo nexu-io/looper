@@ -68,6 +68,24 @@ func TestMarkdownFooterLinksToLooperRepository(t *testing.T) {
 	}
 }
 
+func TestMarkdownFooterReplacesEscapedAgentAuthoredFooter(t *testing.T) {
+	s := testStamper()
+	body := "Body\n\n" + Marker + "\n<sub>🔁 Powered by <a href=\\\"https://github.com/nexu-io/looper\\\">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>"
+	got := s.Markdown(body, "worker", ChannelPullRequest)
+	if strings.Count(got, Marker) != 1 {
+		t.Fatalf("duplicate marker: %q", got)
+	}
+	if strings.Contains(got, `href=\"https://github.com/nexu-io/looper\"`) {
+		t.Fatalf("escaped footer was not removed: %q", got)
+	}
+	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
+		t.Fatalf("footer was not normalized: %q", got)
+	}
+	if strings.Count(got, `<sub>`) != 1 {
+		t.Fatalf("duplicate footer markup: %q", got)
+	}
+}
+
 func TestDisclosureIncludesAgentVendorAndModelSeparately(t *testing.T) {
 	vendor := config.AgentVendorOpenCode
 	model := "openai/gpt-5.5"
@@ -191,6 +209,30 @@ func TestDisclosureUsesAllowlistedMachineDetails(t *testing.T) {
 	}
 	if strings.Contains(got, "darwin") || strings.Contains(got, "linux") || strings.Contains(got, "windows") {
 		t.Fatalf("disclosure included raw GOOS instead of OS family: %q", got)
+	}
+}
+
+func TestStripMarkdownStampDoesNotRemoveUnrelatedSubtext(t *testing.T) {
+	body := "Body\n\n<sub>Powered by looper metrics for this benchmark.</sub>"
+	if got := StripMarkdownStamp(body); got != body {
+		t.Fatalf("StripMarkdownStamp() = %q, want unrelated subtext preserved", got)
+	}
+}
+
+func TestHasMarkdownStampRequiresFooter(t *testing.T) {
+	body := "Body\n\n" + Marker
+	if HasMarkdownStamp(body) {
+		t.Fatalf("HasMarkdownStamp() = true, want false for bare marker")
+	}
+
+	generic := "Body\n\n<sub>Powered by Looper metrics for this benchmark.</sub>"
+	if HasMarkdownStamp(generic) {
+		t.Fatalf("HasMarkdownStamp() = true, want false for generic subtext")
+	}
+
+	stamped := body + "\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.</sub>"
+	if !HasMarkdownStamp(stamped) {
+		t.Fatalf("HasMarkdownStamp() = false, want true for stamped footer")
 	}
 }
 

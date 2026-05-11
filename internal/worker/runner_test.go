@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -1897,11 +1898,14 @@ func TestProcessClaimedItemPreservesPRTitleEditedDuringTakeover(t *testing.T) {
 	if result.Status != "success" || result.PullRequestNumber != 42 {
 		t.Fatalf("result = %#v, want success with PR 42", result)
 	}
-	if len(github.viewPRCalls) != 2 {
-		t.Fatalf("len(github.viewPRCalls) = %d, want re-fetch before rename", len(github.viewPRCalls))
+	if len(github.viewPRCalls) != 3 {
+		t.Fatalf("len(github.viewPRCalls) = %d, want re-fetch before rename plus disclosure normalization", len(github.viewPRCalls))
 	}
 	if len(github.updatePRTitleCalls) != 0 {
 		t.Fatalf("len(github.updatePRTitleCalls) = %d, want 0", len(github.updatePRTitleCalls))
+	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no body rewrite for human-authored PR", github.updatePRBodyCalls)
 	}
 }
 
@@ -2198,6 +2202,9 @@ func TestProcessClaimedItemPushExistingReconcilesDirtyWorktreeBeforePush(t *test
 	if len(git.pushCalls) != 1 {
 		t.Fatalf("len(git.pushCalls) = %d, want push after fallback commit", len(git.pushCalls))
 	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no body rewrite for existing PR without disclosure footer", github.updatePRBodyCalls)
+	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil || run == nil {
 		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", run, err)
@@ -2281,6 +2288,56 @@ func TestRunOpenPRStepPushesWhenFallbackCommitCreatedAndLifecycleAlreadyPushed(t
 	}
 }
 
+func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(555)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/555", Body: "## Summary\n\nLifecycle-created body", BaseRefName: "main", HeadRefName: "feature/pr-555"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:        &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
+		Worktree:    &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Validation:  &ValidationResult{Passed: true, Summary: "ok"},
+		PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/555"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-555",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/555",
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1"}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.updatePRBodyCalls) != 1 {
+		t.Fatalf("updatePRBodyCalls = %#v, want one disclosure rewrite", github.updatePRBodyCalls)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, disclosure.Marker) {
+		t.Fatalf("updated body = %q, want disclosure marker", github.updatePRBodyCalls[0].Body)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, "runner=worker") {
+		t.Fatalf("updated body = %q, want worker disclosure footer", github.updatePRBodyCalls[0].Body)
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want preserved PR", checkpointAfter.PullRequest)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
@@ -2350,6 +2407,7 @@ type fakeGitHubGateway struct {
 	createPRErrors          []error
 	createPRCalls           []CreatePullRequestInput
 	updatePRTitleCalls      []UpdatePullRequestTitleInput
+	updatePRBodyCalls       []UpdatePullRequestBodyInput
 	updatePRTitleErrors     []error
 	updatePRTitleIndex      int
 	removeLabels            []PullRequestLabelsInput
@@ -2453,6 +2511,11 @@ func (f *fakeGitHubGateway) UpdatePullRequestTitle(_ context.Context, input Upda
 		f.updatePRTitleIndex++
 		return err
 	}
+	return nil
+}
+
+func (f *fakeGitHubGateway) UpdatePullRequestBody(_ context.Context, input UpdatePullRequestBodyInput) error {
+	f.updatePRBodyCalls = append(f.updatePRBodyCalls, input)
 	return nil
 }
 

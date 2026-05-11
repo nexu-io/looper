@@ -54,6 +54,174 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(`null`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if loaded.Partial != (PartialConfig{}) {
+		t.Fatalf("LoadFile().Partial = %#v, want empty config", loaded.Partial)
+	}
+	if loaded.Config.Server.Host != "127.0.0.1" {
+		t.Fatalf("LoadFile().Config.Server.Host = %q, want default %q", loaded.Config.Server.Host, "127.0.0.1")
+	}
+}
+
+func TestReadConfigFileIgnoresUnknownTopLevelKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"futureSection":{"enabled":true},"server":{"host":"0.0.0.0"}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Scheduler != nil {
+		t.Fatalf("readConfigFile() scheduler = %#v, want nil", partial.Scheduler)
+	}
+}
+
+func TestReadConfigFileAcceptsTopLevelNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`null`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial != (PartialConfig{}) {
+		t.Fatalf("readConfigFile() partial = %#v, want empty config", partial)
+	}
+}
+
+func TestReadConfigFileRejectsUnknownNestedKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"scheduler":{"pollIntervalSecond":5}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, present, err := readConfigFile(path)
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if err == nil {
+		t.Fatal("readConfigFile() error = nil, want unknown field error")
+	}
+	if !strings.Contains(err.Error(), `json: unknown field "pollIntervalSecond"`) {
+		t.Fatalf("readConfigFile() error = %v, want unknown field pollIntervalSecond", err)
+	}
+}
+
+func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"Server":{"host":"0.0.0.0"},"SCHEDULER":{"pollIntervalSeconds":7}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Scheduler == nil || partial.Scheduler.PollIntervalSeconds == nil || *partial.Scheduler.PollIntervalSeconds != 7 {
+		t.Fatalf("readConfigFile() scheduler = %#v, want pollIntervalSeconds 7", partial.Scheduler)
+	}
+}
+
+func TestReadConfigFileMergesDuplicateTopLevelSectionsInEncounterOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"SERVER":{"host":"0.0.0.0"},"Server":{"port":8123}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Server.Port == nil || *partial.Server.Port != 8123 {
+		t.Fatalf("readConfigFile() server port = %#v, want 8123", partial.Server)
+	}
+}
+
+func TestReadConfigFileLaterNullClearsDuplicateKnownSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"server":{"host":"0.0.0.0"},"server":null}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server != nil {
+		t.Fatalf("readConfigFile() server = %#v, want nil", partial.Server)
+	}
+}
+
+func TestReadConfigFileRejectsInvalidEarlierDuplicateKnownSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"SERVER":{"bad":1},"Server":{"host":"127.0.0.2"}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, present, err := readConfigFile(path)
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if err == nil {
+		t.Fatal("readConfigFile() error = nil, want unknown field error")
+	}
+	if !strings.Contains(err.Error(), `json: unknown field "bad"`) {
+		t.Fatalf("readConfigFile() error = %v, want unknown field bad", err)
+	}
+}
+
 func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	cfg, err := Normalize(t.TempDir())
 	if err != nil {
@@ -393,6 +561,31 @@ func TestLoadFileReturnsClearErrorForInvalidJSON(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "failed to read config file at "+configPath) {
 		t.Fatalf("LoadFile() error = %q, want path context", err)
+	}
+}
+
+func TestLoadFileIgnoresUnknownConfigFields(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"futureFeature": {"enabled": true},
+		"server": {"port": 6123}
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if loaded.Config.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6123)
+	}
+
+	if loaded.Partial.Server == nil || loaded.Partial.Server.Port == nil || *loaded.Partial.Server.Port != 6123 {
+		t.Fatalf("LoadFile().Partial.Server.Port = %#v, want 6123", loaded.Partial.Server)
 	}
 }
 

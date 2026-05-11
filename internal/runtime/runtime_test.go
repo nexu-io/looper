@@ -133,6 +133,74 @@ func TestRuntimeStartIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	startCtx, cancel := context.WithCancel(context.Background())
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		SyncConfiguredProjects: func(ctx context.Context, service *projects.Service, cfg config.Config, now time.Time) error {
+			cancel()
+			return nil
+		},
+	})
+
+	err = rt.Start(startCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want %v", err, context.Canceled)
+	}
+
+	services := rt.Services()
+	if services.Coordinator == nil {
+		t.Fatal("Services().Coordinator = nil, want closed coordinator for failed startup")
+	}
+	if err := services.Coordinator.DB().PingContext(context.Background()); err == nil {
+		t.Fatal("Services().Coordinator.DB().PingContext() error = nil, want closed database after startup failure")
+	}
+	if _, ok := rt.StartedAt(); !ok {
+		t.Fatal("StartedAt() ok = false, want startup timestamp recorded before completion failure")
+	}
+	if recovery := rt.RecoverySummary(); recovery != createEmptyRecoverySummary() {
+		t.Fatalf("RecoverySummary() = %#v, want empty recovery summary after failed completion", recovery)
+	}
+	if rt.ownershipAcquired {
+		t.Fatal("ownershipAcquired = true, want false after failed CompleteStartup")
+	}
+	if rt.startupReadyErr == nil {
+		t.Fatal("startupReadyErr = nil, want completion failure recorded")
+	}
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: storage.EmbeddedMigrations,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() reopen error = %v", err)
+	}
+	defer func() { _ = coordinator.Close() }()
+	reopenedRepos := storage.NewRepositories(coordinator.DB())
+	events, err := reopenedRepos.Events.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("Events.List() = %#v, want no startup event after failed completion", events)
+	}
+
+	rt.Stop("cleanup after failed startup")
+}
+
 func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	t.Parallel()
 
@@ -322,6 +390,21 @@ func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	}
 	if !containsEventType(allEvents, "looperd.started") {
 		t.Fatalf("all events = %#v, want looperd.started", allEvents)
+	}
+	if len(allEvents) == 0 || allEvents[0].EventType != "looperd.started" {
+		t.Fatalf("all events = %#v, want looperd.started listed after recovery events", allEvents)
+	}
+	if allEvents[0].PayloadJSON == "" {
+		t.Fatal("looperd.started payload = nil, want recovery summary")
+	}
+	var startedPayload struct {
+		Recovery RecoverySummary `json:"recovery"`
+	}
+	if err := json.Unmarshal([]byte(allEvents[0].PayloadJSON), &startedPayload); err != nil {
+		t.Fatalf("json.Unmarshal(looperd.started payload) error = %v", err)
+	}
+	if startedPayload.Recovery != recovery {
+		t.Fatalf("started event recovery = %#v, want %#v", startedPayload.Recovery, recovery)
 	}
 }
 
@@ -1003,16 +1086,19 @@ func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
 	if containsEventType(events, "agent.killed") {
 		t.Fatalf("agent_execution events = %#v, want no agent.killed for mismatched pid", events)
 	}
+	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
+	}
 	recovery := rt.RecoverySummary()
 	if recovery.OrphanAgentCleanup.CleanedCount != 0 {
 		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want cleanedCount=0", recovery.OrphanAgentCleanup)
 	}
-	if !logger.containsMessage("skipped orphan agent cleanup for mismatched pid") {
-		t.Fatalf("logger entries = %#v, want mismatched pid warning", logger.messages())
+	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
+		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
 	}
 }
 
-func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testing.T) {
+func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -1066,9 +1152,10 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 		t.Fatalf("seed coordinator close error = %v", err)
 	}
 
+	logger := &testLogger{}
 	rt := New(Options{
 		Config: cfg,
-		Logger: &testLogger{},
+		Logger: logger,
 		Now: func() time.Time {
 			return startedAt
 		},
@@ -1089,8 +1176,15 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
-	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
-		t.Fatalf("Runs.GetByID(%s) = %#v, want interrupted with ended_at", runID, run)
+	if run == nil || run.Status != "running" || run.EndedAt != nil {
+		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", runID, run)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loopID, loop)
 	}
 	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_mismatched_running_run")
 	if err != nil {
@@ -1099,8 +1193,40 @@ func TestRuntimeRecoveryInterruptsRunWithMismatchedActiveAgentExecution(t *testi
 	if agentExecution == nil || agentExecution.Status != "running" {
 		t.Fatalf("AgentExecutions.GetByID(agent_mismatched_running_run) = %#v, want still running stale row", agentExecution)
 	}
-	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 1 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
-		t.Fatalf("RecoverySummary() = %#v, want interrupted run without cleaned orphan agent", recovery)
+	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_mismatched_running_run")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(agent_mismatched_running_run) error = %v", err)
+	}
+	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
+	}
+	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary() = %#v, want preserved run and loop for uncertain live execution", recovery)
+	}
+	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
+		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
+	}
+}
+
+func TestCommandPrefixMatchesRejectsTruncatedPromptTail(t *testing.T) {
+	t.Parallel()
+
+	if commandPrefixMatches(
+		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
+		[]string{"codex", "exec", "very long reviewer prompt"},
+	) {
+		t.Fatal("commandPrefixMatches() = true, want false for truncated prompt tail")
+	}
+}
+
+func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
+	t.Parallel()
+
+	if commandPrefixMatches(
+		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
+		[]string{"codex", "exec"},
+	) {
+		t.Fatal("commandPrefixMatches() = true, want false when actual command is missing the trailing token")
 	}
 }
 

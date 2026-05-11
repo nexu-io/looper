@@ -500,6 +500,95 @@ func TestStopLaunchdDaemonUsesPersistedStatePlistPath(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyLaunchdPlistBootsOutAndRemovesWhenLegacyPresent(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	legacyDir := filepath.Join(homeDir, "Library", "LaunchAgents")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(legacyDir) error = %v", err)
+	}
+	legacyPath := filepath.Join(legacyDir, launchdLooperdLegacyLabel+".plist")
+	if err := os.WriteFile(legacyPath, []byte("<plist/>\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(legacy plist) error = %v", err)
+	}
+
+	var bootoutArgs []string
+	var removed []string
+	runtime := newCommandRuntime(New(Deps{
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		LookPath: func(file string) (string, error) {
+			if file == "launchctl" {
+				return "/bin/launchctl", nil
+			}
+			return "", os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = timeout
+			bootoutArgs = append([]string{}, args...)
+			return commandExecutionResult{ExitCode: 0}, nil
+		},
+		RemoveFile: func(path string) error {
+			removed = append(removed, path)
+			return nil
+		},
+	}), nil)
+
+	runtime.migrateLegacyLaunchdPlist(context.Background(), "/bin/launchctl", "gui/1000")
+
+	if len(bootoutArgs) != 3 || bootoutArgs[0] != "bootout" || bootoutArgs[1] != "gui/1000" || bootoutArgs[2] != legacyPath {
+		t.Fatalf("launchctl args = %#v, want bootout of legacy plist %q in domain gui/1000", bootoutArgs, legacyPath)
+	}
+	if len(removed) != 1 || removed[0] != legacyPath {
+		t.Fatalf("removed files = %#v, want exactly the legacy plist %q", removed, legacyPath)
+	}
+}
+
+func TestMigrateLegacyLaunchdPlistNoopWhenLegacyAbsent(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	// Intentionally do not create the legacy plist on disk.
+
+	var runCommandCalls int
+	var removeCalls int
+	runtime := newCommandRuntime(New(Deps{
+		HomeDir:  homeDir,
+		Platform: "darwin",
+		LookPath: func(file string) (string, error) {
+			if file == "launchctl" {
+				return "/bin/launchctl", nil
+			}
+			return "", os.ErrNotExist
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = args
+			_ = timeout
+			runCommandCalls++
+			return commandExecutionResult{ExitCode: 0}, nil
+		},
+		RemoveFile: func(path string) error {
+			_ = path
+			removeCalls++
+			return nil
+		},
+	}), nil)
+
+	runtime.migrateLegacyLaunchdPlist(context.Background(), "/bin/launchctl", "gui/1000")
+
+	if runCommandCalls != 0 {
+		t.Fatalf("runCommand invocations = %d, want 0 (no legacy plist to migrate)", runCommandCalls)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removeFile invocations = %d, want 0 (no legacy plist to migrate)", removeCalls)
+	}
+}
+
 func TestRefreshLaunchdLifecycleStateClearsStalePIDWhenServiceAbsent(t *testing.T) {
 	t.Parallel()
 
@@ -1298,6 +1387,7 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 	t.Parallel()
 
 	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
@@ -1396,7 +1486,7 @@ func TestDaemonRestartStopsExistingPIDAndStartsReplacement(t *testing.T) {
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"daemon", "restart"})
+	exitCode := app.Run(context.Background(), []string{"daemon", "restart", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon restart]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
@@ -1505,17 +1595,19 @@ func TestDaemonStopStopsExistingPIDAndRemovesPIDFile(t *testing.T) {
 func TestDaemonStopWithoutPIDFileReportsNothingToStop(t *testing.T) {
 	t.Parallel()
 
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: t.TempDir(),
 		ReadFile: func(path string) ([]byte, error) {
 			return nil, os.ErrNotExist
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"daemon", "stop"})
+	exitCode := app.Run(context.Background(), []string{"daemon", "stop", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon stop]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
