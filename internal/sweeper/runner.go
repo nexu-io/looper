@@ -288,6 +288,7 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 		if issue.IsPullRequest {
 			continue
 		}
+		issue.AuthorAssociation = r.summaryAuthorAssociation(ctx, input.Repo, issue.Number, issue.AuthorAssociation, roleCfg)
 		targetID := buildTargetID(input.Repo, issue.Number)
 		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, states[targetID], roleCfg) {
 			result.Skipped++
@@ -357,6 +358,7 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			result.Skipped++
 			continue
 		}
+		pr.AuthorAssociation = r.summaryAuthorAssociation(ctx, input.Repo, pr.Number, pr.AuthorAssociation, roleCfg)
 		targetID := buildTargetID(input.Repo, pr.Number)
 		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, states[targetID], roleCfg) {
 			result.Skipped++
@@ -712,6 +714,17 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 		}
 	}
 	return false
+}
+
+func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, number int64, current string, roleCfg config.SweeperRoleConfig) string {
+	if strings.TrimSpace(current) != "" || len(roleCfg.Triggers.ExcludeAuthorAssociations) == 0 || r.github == nil {
+		return current
+	}
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: number})
+	if err != nil {
+		return current
+	}
+	return detail.AuthorAssociation
 }
 
 func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {

@@ -389,7 +389,8 @@ func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", AuthorAssociation: "OWNER"}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
+	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
 
 	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
 	if err != nil {
@@ -397,6 +398,22 @@ func TestDiscoverIssuesSkipsExcludedAuthorAssociations(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || result.Skipped != 1 {
 		t.Fatalf("DiscoverIssues() = %#v, want excluded association to be skipped", result)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsExcludedAuthorAssociations(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 2, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
+	fixture.github.issueDetails["acme/looper#2"] = githubinfra.IssueDetail{Number: 2, AuthorAssociation: "OWNER", IsPullRequest: true}
+
+	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverPullRequests() = %#v, want excluded association to be skipped", result)
 	}
 }
 
