@@ -295,6 +295,7 @@ func TestUpgradeUnifiedDownloadsCLIAndDaemonConcurrently(t *testing.T) {
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "http://daemon.test/api/v1/status":

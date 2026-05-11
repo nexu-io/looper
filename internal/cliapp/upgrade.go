@@ -96,6 +96,11 @@ const (
 	cliInstallSourceUnknown  cliInstallSource = "unknown"
 )
 
+// cliInstallChannelStable is the value of version.Channel for tagged release
+// builds; anything else (notably the "dev" default) must be treated as a
+// non-upgradable local build.
+const cliInstallChannelStable = "stable"
+
 type cliUpgradeRefusedError struct {
 	message string
 }
@@ -120,7 +125,7 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 	if err != nil {
 		return nil
 	}
-	if detectCLIInstallSource(execPath) != cliInstallSourceRelease {
+	if r.detectCLIInstallSource(execPath) != cliInstallSourceRelease {
 		return nil
 	}
 
@@ -738,7 +743,7 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	if err != nil {
 		return cliUpgradeOutput{}, fmt.Errorf("resolve current looper path: %w", err)
 	}
-	installSource := detectCLIInstallSource(execPath)
+	installSource := r.detectCLIInstallSource(execPath)
 	guidance := cliRefusalGuidance(installSource, execPath)
 	if installSource != cliInstallSourceRelease {
 		refused := true
@@ -830,7 +835,28 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 	return result, nil
 }
 
-func detectCLIInstallSource(execPath string) cliInstallSource {
+func (r *commandRuntime) cliChannel() string {
+	if c := strings.TrimSpace(r.app.deps.CLIChannel); c != "" {
+		return c
+	}
+	return version.Channel
+}
+
+func (r *commandRuntime) detectCLIInstallSource(execPath string) cliInstallSource {
+	return detectCLIInstallSourceForChannel(execPath, r.cliChannel())
+}
+
+// detectCLIInstallSourceForChannel returns the install source for a CLI
+// binary, short-circuiting to dev whenever the binary itself reports a
+// non-stable channel. Without this guard a locally-built `go build -o
+// ~/.local/bin/looper` — the same path the public installer uses — is
+// classified by path alone as release-binary and auto-upgrade silently
+// replaces it with the latest release, which is a downgrade for any source
+// build that is ahead of the most recent tag.
+func detectCLIInstallSourceForChannel(execPath, channel string) cliInstallSource {
+	if channel != cliInstallChannelStable {
+		return cliInstallSourceDev
+	}
 	path := strings.ToLower(execPath)
 	if strings.Contains(path, "/cellar/") || strings.Contains(path, "/homebrew/") {
 		return cliInstallSourceHomebrew

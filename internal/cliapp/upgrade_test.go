@@ -71,6 +71,7 @@ func TestRootPreRunSkipsAutoUpgradeForUnsupportedInstallSource(t *testing.T) {
 		Stdout:         stdout,
 		Stderr:         stderr,
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -100,6 +101,7 @@ func TestRootPreRunSkipsAutoUpgradeForBareRootHelp(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -129,6 +131,7 @@ func TestRootPreRunSkipsAutoUpgradeForHelpOnlySubcommand(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -159,6 +162,7 @@ func TestVersionNoAutoUpgradeFlagDisablesAutoUpgrade(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -185,6 +189,7 @@ func TestEnvDisablesAutoUpgrade(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -214,6 +219,7 @@ func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
@@ -267,6 +273,7 @@ func TestCorruptAutoUpgradeStateSkipsNetworkAndPreservesFile(t *testing.T) {
 		Stderr:         stderr,
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
 			return nil, nil
@@ -494,6 +501,7 @@ func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *test
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
@@ -570,6 +578,7 @@ func TestUpgradeWithoutFlagsDoesNotInstallDaemonWhenCLIUpgradeFails(t *testing.T
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
@@ -628,6 +637,7 @@ func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
@@ -690,6 +700,7 @@ func TestUpgradeCLIRefusesHomebrewInstallWithGuidance(t *testing.T) {
 		Stdout:         stdout,
 		Stderr:         stderr,
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected request before Homebrew refusal: %q", req.URL.String())
 			return nil, nil
@@ -731,6 +742,7 @@ func TestUpgradeCLIRefusesHomebrewSymlinkWithGuidance(t *testing.T) {
 		Stdout:         stdout,
 		Stderr:         stderr,
 		ExecutablePath: symlinkPath,
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("unexpected request before Homebrew refusal: %q", req.URL.String())
 			return nil, nil
@@ -762,6 +774,7 @@ func TestUpgradeCLIPreflightsInstallPathBeforeDownload(t *testing.T) {
 		Stdout:         stdout,
 		Stderr:         stderr,
 		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
@@ -808,6 +821,7 @@ func TestUpgradeCLIPrintsDownloadProgressToStderr(t *testing.T) {
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
@@ -843,9 +857,9 @@ func TestDetectCLIInstallSourceTreatsInstallerSelectedUserBinAsRelease(t *testin
 	userBin := filepath.Join(homeDir, "bin")
 	t.Setenv("PATH", userBin)
 
-	got := detectCLIInstallSource(filepath.Join(userBin, "looper"))
+	got := detectCLIInstallSourceForChannel(filepath.Join(userBin, "looper"), cliInstallChannelStable)
 	if got != cliInstallSourceRelease {
-		t.Fatalf("detectCLIInstallSource(user PATH bin) = %q, want %q", got, cliInstallSourceRelease)
+		t.Fatalf("detectCLIInstallSourceForChannel(user PATH bin, stable) = %q, want %q", got, cliInstallSourceRelease)
 	}
 }
 
@@ -857,9 +871,39 @@ func TestDetectCLIInstallSourceTreatsGoBinAsDevBeforeUserBinRelease(t *testing.T
 	goBin := filepath.Join(homeDir, "go", "bin")
 	t.Setenv("PATH", goBin)
 
-	got := detectCLIInstallSource(filepath.Join(goBin, "looper"))
+	got := detectCLIInstallSourceForChannel(filepath.Join(goBin, "looper"), cliInstallChannelStable)
 	if got != cliInstallSourceDev {
-		t.Fatalf("detectCLIInstallSource(go PATH bin) = %q, want %q", got, cliInstallSourceDev)
+		t.Fatalf("detectCLIInstallSourceForChannel(go PATH bin, stable) = %q, want %q", got, cliInstallSourceDev)
+	}
+}
+
+func TestDetectCLIInstallSourceTreatsDevChannelAsDevRegardlessOfPath(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		t.Skipf("cannot resolve user home directory: %v", err)
+	}
+	// Paths that would normally be classified as release binaries.
+	releasePaths := []string{
+		filepath.Join(homeDir, ".local", "bin", "looper"),
+		"/usr/local/bin/looper",
+		filepath.Join(homeDir, ".looper", "bin", "looper"),
+		"/opt/homebrew/Cellar/looper/1.0.0/bin/looper",
+	}
+	for _, p := range releasePaths {
+		if got := detectCLIInstallSourceForChannel(p, "dev"); got != cliInstallSourceDev {
+			t.Errorf("detectCLIInstallSourceForChannel(%q, dev) = %q, want %q", p, got, cliInstallSourceDev)
+		}
+	}
+}
+
+func TestDetectCLIInstallSourceTreatsUnknownChannelAsDev(t *testing.T) {
+	// Any non-stable channel (rc, nightly, custom builds) must opt out of
+	// auto-upgrade by default; auto-upgrade is gated on release-binary so
+	// returning dev for unknown channels is the safe choice.
+	for _, channel := range []string{"", "rc", "nightly", "unknown"} {
+		if got := detectCLIInstallSourceForChannel("/usr/local/bin/looper", channel); got != cliInstallSourceDev {
+			t.Errorf("detectCLIInstallSourceForChannel(release path, %q) = %q, want %q", channel, got, cliInstallSourceDev)
+		}
 	}
 }
 

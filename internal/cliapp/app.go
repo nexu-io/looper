@@ -39,6 +39,12 @@ type Deps struct {
 	// spawned looperd process to become API-ready. It is primarily intended for
 	// tests; production uses the CLI default.
 	DaemonStartTimeout time.Duration
+
+	// CLIChannel overrides the install-source channel used to decide whether
+	// auto-upgrade may run. Defaults to version.Channel when empty. Tests that
+	// need to exercise the upgrade path with mock binaries inject "stable"
+	// here so the dev-build channel guard does not short-circuit them.
+	CLIChannel string
 }
 
 type App struct {
