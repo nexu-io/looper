@@ -387,12 +387,16 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
-	started = true
 	if r.deferRecovery {
+		started = true
 		return nil
 	}
 
-	return r.CompleteStartup(ctx)
+	if err := r.CompleteStartup(ctx); err != nil {
+		return err
+	}
+	started = true
+	return nil
 }
 
 func (r *Runtime) CompleteStartup(ctx context.Context) error {
@@ -1499,7 +1503,7 @@ func commandPrefixMatches(expected, actual []string) bool {
 	}
 	actualTail := strings.Join(actual[len(expected)-1:], " ")
 	expectedTail := expected[len(expected)-1]
-	return actualTail == expectedTail || strings.HasPrefix(expectedTail, actualTail)
+	return actualTail == expectedTail || (actualTail != "" && strings.HasPrefix(expectedTail, actualTail))
 }
 
 func splitProcessCommand(command string) []string {

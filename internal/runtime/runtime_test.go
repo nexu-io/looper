@@ -133,6 +133,56 @@ func TestRuntimeStartIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	startCtx, cancel := context.WithCancel(context.Background())
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		SyncConfiguredProjects: func(ctx context.Context, service *projects.Service, cfg config.Config, now time.Time) error {
+			cancel()
+			return nil
+		},
+	})
+
+	err = rt.Start(startCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want %v", err, context.Canceled)
+	}
+
+	services := rt.Services()
+	if services.Coordinator == nil {
+		t.Fatal("Services().Coordinator = nil, want closed coordinator for failed startup")
+	}
+	if err := services.Coordinator.DB().PingContext(context.Background()); err == nil {
+		t.Fatal("Services().Coordinator.DB().PingContext() error = nil, want closed database after startup failure")
+	}
+	if _, ok := rt.StartedAt(); !ok {
+		t.Fatal("StartedAt() ok = false, want startup timestamp recorded before completion failure")
+	}
+	if recovery := rt.RecoverySummary(); recovery != createEmptyRecoverySummary() {
+		t.Fatalf("RecoverySummary() = %#v, want empty recovery summary after failed completion", recovery)
+	}
+	if rt.ownershipAcquired {
+		t.Fatal("ownershipAcquired = true, want false after failed CompleteStartup")
+	}
+	if rt.startupReadyErr == nil {
+		t.Fatal("startupReadyErr = nil, want completion failure recorded")
+	}
+	rt.Stop("cleanup after failed startup")
+}
+
 func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	t.Parallel()
 
@@ -1133,6 +1183,17 @@ func TestCommandPrefixMatchesTruncatedPromptTail(t *testing.T) {
 		[]string{"codex", "exec", "very long reviewer prompt"},
 	) {
 		t.Fatal("commandPrefixMatches() = false, want true for truncated prompt tail")
+	}
+}
+
+func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
+	t.Parallel()
+
+	if commandPrefixMatches(
+		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
+		[]string{"codex", "exec"},
+	) {
+		t.Fatal("commandPrefixMatches() = true, want false when actual command is missing the trailing token")
 	}
 }
 
