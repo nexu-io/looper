@@ -87,7 +87,7 @@ func StripMarkdownStamp(body string) string {
 }
 
 func HasMarkdownStamp(body string) bool {
-	return markerOnlyPattern.MatchString(body) || markdownStampPattern.MatchString(body)
+	return markdownStampPattern.MatchString(body)
 }
 
 func (s Stamper) ReviewComment(body, runner string) string {

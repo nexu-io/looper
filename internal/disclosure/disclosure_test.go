@@ -219,6 +219,18 @@ func TestStripMarkdownStampDoesNotRemoveUnrelatedSubtext(t *testing.T) {
 	}
 }
 
+func TestHasMarkdownStampRequiresFooter(t *testing.T) {
+	body := "Body\n\n" + Marker
+	if HasMarkdownStamp(body) {
+		t.Fatalf("HasMarkdownStamp() = true, want false for bare marker")
+	}
+
+	stamped := body + "\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.</sub>"
+	if !HasMarkdownStamp(stamped) {
+		t.Fatalf("HasMarkdownStamp() = false, want true for stamped footer")
+	}
+}
+
 func testStamper() Stamper {
 	return Stamper{
 		Version: "1.2.3",
