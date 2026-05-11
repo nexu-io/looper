@@ -440,7 +440,7 @@ func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemAdoptsOpenBranchPRWhenLifecycleLacksPRNumber(t *testing.T) {
+func TestProcessClaimedItemAdoptsOpenBranchPRWithoutRewritingHumanBody(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	branch := "looper/planner/42-plan-this"
@@ -464,8 +464,8 @@ func TestProcessClaimedItemAdoptsOpenBranchPRWhenLifecycleLacksPRNumber(t *testi
 	if len(github.createPRCalls) != 0 {
 		t.Fatalf("createPRCalls = %#v, want no fallback CreatePullRequest", github.createPRCalls)
 	}
-	if len(github.updatePRBodyCalls) != 1 {
-		t.Fatalf("updatePRBodyCalls = %#v, want disclosure normalization", github.updatePRBodyCalls)
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no body rewrite for human-authored PR", github.updatePRBodyCalls)
 	}
 	if len(github.listOpenPRCalls) != 1 {
 		t.Fatalf("listOpenPRCalls = %d, want 1", len(github.listOpenPRCalls))
