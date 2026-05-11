@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -172,7 +173,6 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {
 	type topLevelConfigSection struct {
 		key    string
-		raw    json.RawMessage
 		decode func(json.RawMessage) error
 	}
 
@@ -248,11 +248,19 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 			return err
 		}
 
+		matched := false
 		for index := range sections {
 			if strings.EqualFold(key, sections[index].key) {
-				sections[index].raw = value
+				if err := sections[index].decode(value); err != nil {
+					return err
+				}
+				matched = true
 				break
 			}
+		}
+
+		if !matched {
+			continue
 		}
 	}
 
@@ -260,12 +268,6 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 		return err
 	} else if delimiter, ok := token.(json.Delim); !ok || delimiter != '}' {
 		return fmt.Errorf("invalid JSON value for config: expected object terminator")
-	}
-
-	for _, section := range sections {
-		if err := section.decode(section.raw); err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -278,7 +280,15 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	decodeTarget := any(target)
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() == reflect.Ptr && !targetValue.IsNil() {
+		elem := targetValue.Elem()
+		if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+			decodeTarget = elem.Interface()
+		}
+	}
+	if err := decoder.Decode(decodeTarget); err != nil {
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {

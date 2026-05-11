@@ -117,9 +117,9 @@ func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestReadConfigFileLastMatchingTopLevelKeyWinsAcrossCaseVariants(t *testing.T) {
+func TestReadConfigFileMergesDuplicateTopLevelSectionsInEncounterOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	contents := `{"SERVER":{"host":"0.0.0.0"},"Server":{"host":"127.0.0.2"}}`
+	contents := `{"SERVER":{"host":"0.0.0.0"},"Server":{"port":8123}}`
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
@@ -131,27 +131,30 @@ func TestReadConfigFileLastMatchingTopLevelKeyWinsAcrossCaseVariants(t *testing.
 	if !present {
 		t.Fatal("readConfigFile() present = false, want true")
 	}
-	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "127.0.0.2" {
-		t.Fatalf("readConfigFile() server host = %#v, want 127.0.0.2", partial.Server)
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Server.Port == nil || *partial.Server.Port != 8123 {
+		t.Fatalf("readConfigFile() server port = %#v, want 8123", partial.Server)
 	}
 }
 
-func TestReadConfigFileLastMatchingTopLevelKeyCanOverrideInvalidEarlierCaseVariant(t *testing.T) {
+func TestReadConfigFileRejectsInvalidEarlierDuplicateKnownSection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	contents := `{"SERVER":{"bad":1},"Server":{"host":"127.0.0.2"}}`
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	partial, present, err := readConfigFile(path)
-	if err != nil {
-		t.Fatalf("readConfigFile() error = %v", err)
-	}
+	_, present, err := readConfigFile(path)
 	if !present {
 		t.Fatal("readConfigFile() present = false, want true")
 	}
-	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "127.0.0.2" {
-		t.Fatalf("readConfigFile() server host = %#v, want 127.0.0.2", partial.Server)
+	if err == nil {
+		t.Fatal("readConfigFile() error = nil, want unknown field error")
+	}
+	if !strings.Contains(err.Error(), `json: unknown field "bad"`) {
+		t.Fatalf("readConfigFile() error = %v, want unknown field bad", err)
 	}
 }
 
