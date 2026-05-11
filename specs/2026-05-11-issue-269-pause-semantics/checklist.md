@@ -55,48 +55,49 @@
 
 ## Phase 3 - Worker
 
-- [ ] Audit all worker `FailureManualIntervention` mappings
-- [ ] Reclassify transient setup / env / tooling failures to retryable states
-- [ ] Reclassify worker validation failure away from default permanent pause
-- [ ] Add bounded autonomous retry / resume semantics for validation failures
+- [x] Audit all worker `FailureManualIntervention` mappings
+- [x] Reclassify transient setup / env / tooling failures to retryable states
+- [x] Reclassify worker validation failure away from default permanent pause
+- [x] Add bounded autonomous retry / resume semantics for validation failures
 - [ ] Split worker validation failures into:
-  - [ ] transient/tooling/transport
-  - [ ] stale checkpoint / stale repo-context
-  - [ ] unsafe repo ambiguity
-  - [ ] deterministic policy/spec/content
+  - [x] transient/tooling/transport
+  - [x] stale checkpoint / stale repo-context
+  - [x] unsafe repo ambiguity
+  - [x] deterministic policy/spec/content
 - [ ] Define for each worker validation subtype:
-  - [ ] retry from checkpoint vs replay step vs restart from discover vs hard hold
-  - [ ] re-entry trigger
-- [ ] Reclassify safe policy blockers (`auto-push`, manual PR creation, external action required) away from unsafe pause semantics
-- [ ] Decide v1 semantics for manual PR opening mode
+  - [x] retry from checkpoint vs replay step vs restart from discover vs hard hold
+  - [x] re-entry trigger
+- [x] Reclassify safe policy blockers (`auto-push`, manual PR creation, external action required) away from unsafe pause semantics
+- [x] Decide v1 semantics for manual PR opening mode
 - [ ] For each worker safe policy blocker, specify:
-  - [ ] hard hold vs safe blocked
-  - [ ] resume policy
-  - [ ] recovery trigger
-  - [ ] expected loop status
-  - [ ] expected user-facing summary/message
-- [ ] Keep truly unsafe repo/worktree states paused
+  - [x] hard hold vs safe blocked
+  - [x] resume policy
+  - [x] recovery trigger
+  - [x] expected loop status
+  - [x] expected user-facing summary/message
+- [x] Keep truly unsafe repo/worktree states paused
 - [ ] Add/update worker tests for:
-  - [ ] validation failure no longer permanently pausing by default
-  - [ ] retryable transient setup failure
+  - [x] validation failure no longer permanently pausing by default
+  - [x] retryable transient setup failure
   - [ ] safe policy blocker behavior
-  - [ ] unsafe repo-state hold
+  - [x] unsafe repo-state hold
+  - [x] stale validation rediscovery behavior
 
 ## Phase 4 - Planner
 
-- [ ] Audit planner `manual_intervention` / paused mappings
-- [ ] Reclassify planner transient setup / env failures to retryable states
-- [ ] Keep explicit human-gated unsafe states paused
-- [ ] Ensure planner `createRunContext` only treats true hard holds as non-autonomous
+- [x] Audit planner `manual_intervention` / paused mappings
+- [x] Reclassify planner transient setup / env failures to retryable states
+- [x] Keep explicit human-gated unsafe states paused
+- [x] Ensure planner `createRunContext` only treats true hard holds as non-autonomous
 - [ ] For planner safe blocked states, specify:
-  - [ ] expected loop status
-  - [ ] expected failure kind
-  - [ ] expected resume policy
-  - [ ] expected re-entry trigger
+  - [x] expected loop status
+  - [x] expected failure kind
+  - [x] expected resume policy
+  - [x] expected re-entry trigger
 - [ ] Add/update planner tests for:
-  - [ ] transient agent/setup failure
+  - [x] transient agent/setup failure
   - [ ] hard manual hold behavior
-  - [ ] safe re-entry behavior after non-paused failure
+  - [x] safe re-entry behavior after non-paused failure
 
 ## Phase 5 - Runtime / reviewer recovery
 

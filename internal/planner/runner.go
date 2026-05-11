@@ -20,6 +20,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -599,7 +600,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -679,18 +680,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			resumePolicy := latest.ResumePolicy
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
-			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
-			default:
-				if resumePolicy == "" {
-					resumePolicy = "replay_step"
-				}
-			}
-			latest.ResumePolicy = resumePolicy
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -708,7 +698,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
@@ -943,7 +933,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
-				kind = FailureManualIntervention
+				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
@@ -992,9 +982,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		return checkpoint, nil
 	}
 	if !r.allowAutoPush {
-		checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		message := fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
+		checkpoint.SkipReason = message
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
@@ -1245,7 +1236,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		check = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
-	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && check.ResumePolicy != "manual_intervention" && lastCompleted != ""
+	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
 	if shouldResume {
 		if next := nextPlannerStep(lastCompleted); next != "" {

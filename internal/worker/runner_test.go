@@ -1348,17 +1348,49 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("result = %#v, want retryable_after_resume validation failure", result)
+	}
+	if len(completed) != 0 {
+		t.Fatalf("len(completed) = %d, want 0 for queued retry", len(completed))
+	}
+	if len(github.updateIssueCommentCalls) > 0 {
+		body := github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body
+		if strings.Contains(body, "paused work") || strings.Contains(body, "stopped work") {
+			t.Fatalf("issue comment updates = %#v, want no paused/stopped marker while queued retry is pending", github.updateIssueCommentCalls)
+		}
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue = %#v, want queued retry item", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued", loop)
+	}
+}
+
+func TestProcessClaimedItemKeepsUnsafeValidationFailurePaused(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Unsafe repo ambiguity", Output: "dirty worktree detected"}, nil
+	}})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
 	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
-		t.Fatalf("result = %#v, want manual_intervention failure", result)
-	}
-	if len(completed) != 1 {
-		t.Fatalf("len(completed) = %d, want 1", len(completed))
-	}
-	if completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || completed[0].Summary != "Validation failed" {
-		t.Fatalf("completed[0] = %#v, want manual intervention completion notice", completed[0])
-	}
-	if len(github.updateIssueCommentCalls) == 0 || !strings.Contains(github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body, "paused work") {
-		t.Fatalf("terminal issue comment updates = %#v, want paused marker body", github.updateIssueCommentCalls)
+		t.Fatalf("result = %#v, want manual_intervention unsafe validation failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
@@ -1373,6 +1405,97 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "paused" {
 		t.Fatalf("loop = %#v, want paused", loop)
+	}
+}
+
+func TestProcessClaimedItemTreatsWorkerSetupFailureAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent setup: unsupported model for codex agent configuration"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable_transient setup failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue = %#v, want queued retry", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued", loop)
+	}
+}
+
+func TestProcessClaimedItemRestartsFromDiscoverAfterStaleValidationFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}, {Status: "completed", Summary: "done again", Stdout: "ok", ParseStatus: "parsed"}}}
+	validationCalls := 0
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		validationCalls++
+		if validationCalls == 1 {
+			return ValidationResult{Passed: false, Summary: "Stale repo context", Output: "head changed while validation was pending"}, nil
+		}
+		return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+	}})
+
+	firstClaim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	first, err := runner.ProcessClaimedItem(context.Background(), *firstClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable_after_resume stale validation failure", first)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), first.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID(first) error = %v", err)
+	}
+	if run == nil {
+		t.Fatal("run = nil, want failed run")
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint(first) error = %v", err)
+	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+	fixture.advance(5 * time.Second)
+	secondClaim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	second, err := runner.ProcessClaimedItem(context.Background(), *secondClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(second) error = %v", err)
+	}
+	if second.Status != "success" || second.PullRequestNumber != 101 {
+		t.Fatalf("second = %#v, want success after rediscovery-style restart", second)
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("len(agent.starts) = %d, want 2 after restarting from discover", len(agent.starts))
+	}
+	if len(git.createCalls) != 2 {
+		t.Fatalf("len(git.createCalls) = %d, want 2 after restarting from discover", len(git.createCalls))
+	}
+	latestRun, err := fixture.repos.Runs.GetByID(context.Background(), second.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID(second) error = %v", err)
+	}
+	if latestRun == nil || latestRun.LastCompletedStep == nil || *latestRun.LastCompletedStep != string(stepOpenPR) {
+		t.Fatalf("latestRun = %#v, want successful rerun through open-pr", latestRun)
 	}
 }
 
@@ -1651,11 +1774,25 @@ func TestProcessClaimedItemSkippedFlowEmitsCompletionNotification(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" || !strings.Contains(result.Summary, "manual PR opening required") {
-		t.Fatalf("result = %#v, want skipped manual intervention summary", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "manual PR opening required") {
+		t.Fatalf("result = %#v, want manual_intervention summary", result)
 	}
-	if len(completed) != 1 || completed[0].Status != "skipped" || !strings.Contains(completed[0].Summary, "manual PR opening required") {
-		t.Fatalf("completed = %#v, want skipped completion notification", completed)
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || !strings.Contains(completed[0].Summary, "manual PR opening required") {
+		t.Fatalf("completed = %#v, want manual_intervention completion notification", completed)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
 	}
 }
 
@@ -1689,14 +1826,28 @@ func TestProcessClaimedItemSkipsAutoPROpenWhenGitHubCLIUnavailable(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" || !strings.Contains(result.Summary, "GitHub CLI unavailable") {
-		t.Fatalf("result = %#v, want skipped GitHub CLI unavailable summary", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "GitHub CLI unavailable") {
+		t.Fatalf("result = %#v, want manual_intervention GitHub CLI unavailable failure", result)
 	}
 	if len(git.pushCalls) != 0 {
 		t.Fatalf("len(git.pushCalls) = %d, want 0 when PR opening is gated before push", len(git.pushCalls))
 	}
-	if len(completed) != 1 || completed[0].Status != "skipped" || !strings.Contains(completed[0].Summary, "GitHub CLI unavailable") {
-		t.Fatalf("completed = %#v, want skipped completion notification for missing GitHub CLI", completed)
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || !strings.Contains(completed[0].Summary, "GitHub CLI unavailable") {
+		t.Fatalf("completed = %#v, want manual_intervention completion notification for missing GitHub CLI", completed)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
 	}
 }
 
@@ -2054,8 +2205,8 @@ func TestProcessClaimedItemUsesIssueScopedLockForIssueWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" {
-		t.Fatalf("result = %#v, want skipped after manual PR gating", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want manual_intervention after manual PR gating", result)
 	}
 	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:27")
 	if err != nil {

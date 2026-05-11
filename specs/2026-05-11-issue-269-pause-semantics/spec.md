@@ -274,6 +274,15 @@ Validation failures must be split at least into:
 
 These categories should not all map to the same resume policy or loop status.
 
+Current implementation slice:
+
+- transient worker agent setup failures are retryable rather than hard-held
+- generic validation failures no longer default to `manual_intervention`
+- transient/tooling-style validation failures now stay autonomous with retry semantics
+- stale worker validation failures now restart from discovery rather than pausing
+- unsafe repo-ambiguity validation failures still hard-hold and pause
+- safe policy-blocker refinements are still pending follow-up work
+
 ### Still pause
 
 - stale/inconsistent repo state that is unsafe to continue
@@ -283,6 +292,13 @@ These categories should not all map to the same resume policy or loop status.
 
 - auto-push / manual-PR / safe policy blockers away from “unsafe pause” semantics
 - transient GitHub/tooling/setup failures to retryable states
+
+Current implementation slice for worker policy blockers:
+
+- `openPRStrategy=manual` is treated as an intentional terminal handoff, not a blocked autonomous failure
+- worker `allowAutoPush=false` remains a temporary v1 hard-hold exception
+- worker GitHub CLI unavailable remains a temporary v1 hard-hold exception
+- the `allowAutoPush=false` / missing-CLI exceptions should only be relaxed once there is a concrete trigger model for config/tool/manual-completion changes that does not cause rediscovery thrash
 
 For each worker blocker moved out of `paused`, the implementation must define:
 
@@ -301,6 +317,12 @@ Planner should follow the same rule:
 - `manual_intervention` should only mean actual hard hold
 
 Planner `createRunContext` should only suppress automatic continuation when the prior run truly represents a hard hold, not just any blocked state.
+
+Current implementation slice:
+
+- transient planner agent setup failures now stay retryable
+- planner pause/recovery updates now use the shared hard-hold semantics instead of ad hoc `manual_intervention` checks
+- planner `allowAutoPush=false` remains a temporary v1 hard-hold exception until there is a concrete non-thrashing re-entry trigger
 
 ## 7.4 Reviewer / runtime auto-recovery
 
