@@ -529,6 +529,9 @@ Sweeper-specific config fields:
 - `roles.sweeper.proposer.model`: optional sweeper-specific agent model override
 - `roles.sweeper.proposer.timeoutSeconds`: proposer agent timeout budget per review attempt
 - `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `1`
+- `roles.sweeper.proposer.diagnosticMode`: when `true`, persist fresh heuristic shadow proposals alongside agent-backed reviews for offline comparison
+- `roles.sweeper.proposer.timeoutRateDryRunThreshold`: auto-backpressure threshold from `0..1`; when the observed agent timeout rate meets or exceeds it, the scheduler flips that repo to sweeper dry-run
+- `roles.sweeper.proposer.timeoutRateDryRunMinSamples`: minimum agent proposal sample size required before timeout-rate backpressure can auto-flip a repo
 - `roles.sweeper.lifecycle.pendingLabel`: label used while a case is in warned/pending-close state
 - `roles.sweeper.lifecycle.closedLabel`: label added when sweeper completes a close action
 - `roles.sweeper.lifecycle.keepLabel`: label that suppresses sweeper action and can cancel a pending case

@@ -549,6 +549,62 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	}
 }
 
+func TestRunDefaultSchedulerTickAutoFlipsSweeperRepoToDryRunOnTimeoutThreshold(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "sweeper-backpressure.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	projectMetadata := `{"repo":"nexu-io/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Sweeper.DryRun = false
+	cfg.Roles.Sweeper.Proposer.TimeoutRateDryRunThreshold = 0.5
+	cfg.Roles.Sweeper.Proposer.TimeoutRateDryRunMinSamples = 3
+	sweeperRunner := &stubSweeperScheduler{stats: sweeper.RepoStats{ProjectID: "looper", Repo: "nexu-io/looper", AgentProposalCount: 3, AgentTimeoutRate: 2.0 / 3.0, AgentTimeouts: 2}}
+
+	err = runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                    repos,
+		Now:                      func() time.Time { return now },
+		Sweeper:                  sweeperRunner,
+		Config:                   &cfg,
+		SweeperDiscoveryEnabled:  boolPtr(true),
+		PlannerDiscoveryEnabled:  boolPtr(false),
+		ReviewerDiscoveryEnabled: boolPtr(false),
+		FixerDiscoveryEnabled:    boolPtr(false),
+		WorkerDiscoveryEnabled:   boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil || !strings.Contains(*stored.MetadataJSON, `"autoDryRun":true`) {
+		t.Fatalf("project metadata = %#v, want autoDryRun backpressure override", stored)
+	}
+	notification, err := repos.Notifications.GetLatestByDedupe(context.Background(), "in_app", "runtime.sweeper.auto_dry_run:looper:nexu-io/looper")
+	if err != nil {
+		t.Fatalf("Notifications.GetLatestByDedupe() error = %v", err)
+	}
+	if notification == nil || notification.Level != "warning" || !strings.Contains(notification.Body, "agent timeout rate") {
+		t.Fatalf("notification = %#v, want warning backpressure alert", notification)
+	}
+	if len(sweeperRunner.issueDiscoverCalls) != 1 || len(sweeperRunner.pullRequestDiscoverCalls) != 1 || len(sweeperRunner.reconcileDiscoverCalls) != 1 {
+		t.Fatalf("sweeper discovery calls = issues:%#v prs:%#v reconcile:%#v, want discovery to continue under dry-run", sweeperRunner.issueDiscoverCalls, sweeperRunner.pullRequestDiscoverCalls, sweeperRunner.reconcileDiscoverCalls)
+	}
+}
+
 func TestGithubCLIAutoPROpeningAvailableRechecksAuthenticatedCLIWithoutConfiguredPath(t *testing.T) {
 	t.Parallel()
 
@@ -839,6 +895,7 @@ type stubSweeperScheduler struct {
 	processedItems           []string
 	discoverErr              error
 	processErr               error
+	stats                    sweeper.RepoStats
 }
 
 func (s *stubSweeperScheduler) DiscoverIssues(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
@@ -873,6 +930,10 @@ func (s *stubSweeperScheduler) processItemCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.processedItems)
+}
+
+func (s *stubSweeperScheduler) RepoOperatorStats(_ context.Context, _, _ string, _ int) (sweeper.RepoStats, error) {
+	return s.stats, nil
 }
 
 type parallelWorkerScheduler struct {

@@ -371,6 +371,381 @@ func TestProcessWarnAgentApplyRetryReusesExistingAgentProposal(t *testing.T) {
 	}
 }
 
+func TestReplayCaseProposalDryRunPersistsValidatedAgentProposalWithoutMutatingCase(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
+	caseRecord := seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_replay_agent",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 71,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{
+		proposalID:     "proposal_replay_base_agent",
+		decision:       "warn",
+		category:       categoryStale,
+		proposerKind:   "heuristic_v1",
+		factBundle:     replayFactBundle("acme/looper", "issue", 71, fixture.now.Add(-100*24*time.Hour)),
+		createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
+		lastProposalID: true,
+	})
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"agent replay warning","rationale":"agent replay rationale","markerUUID":"marker-replay-71"}`}}
+
+	proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
+	if err != nil {
+		t.Fatalf("ReplayCaseProposalDryRun() error = %v", err)
+	}
+	if proposal == nil || proposal.ProposerKind != proposerKindAgentV1 || proposal.ValidationStatus == nil || *proposal.ValidationStatus != "passed" || proposal.RawResultJSON == nil {
+		t.Fatalf("ReplayCaseProposalDryRun() = %#v, want persisted validated agent proposal", proposal)
+	}
+	if proposal.CaseID != caseRecord.ID || proposal.Decision != "warn" {
+		t.Fatalf("replay proposal = %#v, want warn proposal for same case", proposal)
+	}
+	if len(fixture.agent.calls) != 1 {
+		t.Fatalf("agent calls = %d, want 1", len(fixture.agent.calls))
+	}
+
+	persistedCase, err := fixture.repos.SweeperCases.GetByID(context.Background(), caseRecord.ID)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByID() error = %v", err)
+	}
+	if persistedCase == nil || persistedCase.CurrentPhase != "warn" || persistedCase.Status != "pending" || persistedCase.LastProposalID == nil || *persistedCase.LastProposalID != "proposal_replay_base_agent" {
+		t.Fatalf("persisted case = %#v, want unchanged case state and last proposal id", persistedCase)
+	}
+
+	proposals, err := fixture.repos.SweeperProposals.ListByCaseID(context.Background(), caseRecord.ID)
+	if err != nil {
+		t.Fatalf("SweeperProposals.ListByCaseID() error = %v", err)
+	}
+	if len(proposals) != 2 || proposals[0].ID != proposal.ID || proposals[1].ID != "proposal_replay_base_agent" {
+		t.Fatalf("ListByCaseID() = %#v, want new replay proposal followed by base proposal", proposals)
+	}
+}
+
+func TestReplayCaseProposalDryRunFallsBackToHeuristicProposal(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		mode      config.SweeperProposerMode
+		dropAgent bool
+	}{
+		{name: "heuristic fallback mode", mode: config.SweeperProposerModeHeuristicFallback},
+		{name: "missing agent", mode: config.SweeperProposerModeAgentApply, dropAgent: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			fixture.cfg.Roles.Sweeper.Proposer.Mode = tc.mode
+			if tc.dropAgent {
+				fixture.runner.agent = nil
+			}
+			caseRecord := seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+				ID:           "case_replay_heuristic_" + strings.ReplaceAll(tc.name, " ", "_"),
+				ProjectID:    fixture.projectID,
+				Repo:         "acme/looper",
+				TargetType:   "issue",
+				TargetNumber: 72,
+				Status:       "pending",
+				CurrentPhase: "warn",
+				CreatedAt:    fixture.nowISO,
+				UpdatedAt:    fixture.nowISO,
+			}, seedReplayProposalInput{
+				proposalID:     "proposal_replay_base_heuristic",
+				decision:       "warn",
+				category:       categoryStale,
+				proposerKind:   "heuristic_v1",
+				factBundle:     replayFactBundle("acme/looper", "issue", 72, fixture.now.Add(-120*24*time.Hour)),
+				createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
+				lastProposalID: true,
+			})
+
+			proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
+			if err != nil {
+				t.Fatalf("ReplayCaseProposalDryRun() error = %v", err)
+			}
+			if proposal == nil || proposal.ProposerKind != "heuristic_v1" || proposal.ValidationStatus == nil || *proposal.ValidationStatus != "passed" {
+				t.Fatalf("ReplayCaseProposalDryRun() = %#v, want persisted heuristic proposal", proposal)
+			}
+			if proposal.RawResultJSON != nil {
+				t.Fatalf("heuristic replay proposal raw result = %#v, want nil", proposal.RawResultJSON)
+			}
+			if len(fixture.agent.calls) != 0 {
+				t.Fatalf("agent calls = %d, want 0", len(fixture.agent.calls))
+			}
+		})
+	}
+}
+
+func TestReplayCaseProposalDryRunPersistsFailedValidationProposalForInvalidAgentOutput(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
+	caseRecord := seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_replay_invalid",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 73,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{
+		proposalID:     "proposal_replay_base_invalid",
+		decision:       "warn",
+		category:       categoryStale,
+		proposerKind:   "heuristic_v1",
+		factBundle:     replayFactBundle("acme/looper", "issue", 73, fixture.now.Add(-100*24*time.Hour)),
+		createdAt:      fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC),
+		lastProposalID: true,
+	})
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"missing marker","rationale":"invalid replay validation"}`}}
+
+	proposal, err := fixture.runner.ReplayCaseProposalDryRun(context.Background(), caseRecord.ID)
+	if err == nil {
+		t.Fatal("ReplayCaseProposalDryRun() error = nil, want validation error")
+	}
+	if proposal != nil {
+		t.Fatalf("ReplayCaseProposalDryRun() proposal = %#v, want nil on validation failure", proposal)
+	}
+
+	proposals, listErr := fixture.repos.SweeperProposals.ListByCaseID(context.Background(), caseRecord.ID)
+	if listErr != nil {
+		t.Fatalf("SweeperProposals.ListByCaseID() error = %v", listErr)
+	}
+	if len(proposals) != 2 {
+		t.Fatalf("len(proposals) = %d, want 2", len(proposals))
+	}
+	failed := proposals[0]
+	if failed.ValidationStatus == nil || *failed.ValidationStatus != "failed" || failed.ValidationError == nil || !strings.Contains(*failed.ValidationError, "markerUUID is required") || failed.RawResultJSON == nil {
+		t.Fatalf("failed replay proposal = %#v, want failed validation proposal with raw result", failed)
+	}
+	if failed.Decision != "no_action" || failed.Category != categoryNone {
+		t.Fatalf("failed replay proposal = %#v, want no_action/none placeholder", failed)
+	}
+}
+
+func TestListCasesAndInspectCaseUseSharedOperatorPlumbing(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_operator_warn",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 81,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.now.Add(time.Minute).Format(javaScriptISOStringUTC),
+	}, seedReplayProposalInput{proposalID: "proposal_operator_warn", decision: "warn", category: categoryStale, proposerKind: "heuristic_v1", factBundle: replayFactBundle("acme/looper", "issue", 81, fixture.now.Add(-90*24*time.Hour)), createdAt: fixture.nowISO, lastProposalID: true})
+	seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_operator_terminal",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 82,
+		Status:       "terminal",
+		CurrentPhase: "terminal",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.now.Format(javaScriptISOStringUTC),
+	}, seedReplayProposalInput{proposalID: "proposal_operator_terminal", decision: "close", category: categoryStale, proposerKind: proposerKindAgentV1, factBundle: replayFactBundle("acme/looper", "issue", 82, fixture.now.Add(-120*24*time.Hour)), createdAt: fixture.nowISO, lastProposalID: true})
+
+	records, err := fixture.runner.ListCases(context.Background(), CaseQuery{ProjectID: fixture.projectID, Repo: "acme/looper", Phase: "warn", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListCases() error = %v", err)
+	}
+	if len(records) != 1 || records[0].ID != "case_operator_warn" {
+		t.Fatalf("ListCases() = %#v, want only warn-phase case", records)
+	}
+
+	inspection, err := fixture.runner.InspectCase(context.Background(), "case_operator_warn")
+	if err != nil {
+		t.Fatalf("InspectCase() error = %v", err)
+	}
+	if inspection == nil || inspection.Case.ID != "case_operator_warn" || len(inspection.Proposals) != 1 || inspection.Proposals[0].ID != "proposal_operator_warn" {
+		t.Fatalf("InspectCase() = %#v, want case with its proposal", inspection)
+	}
+}
+
+func TestRepoOperatorStatsSummarizesProposalAndTimeoutData(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_stats_warn",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 91,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{proposalID: "proposal_stats_warn", decision: "warn", category: categoryStale, proposerKind: proposerKindAgentV1, factBundle: replayFactBundle("acme/looper", "issue", 91, fixture.now.Add(-90*24*time.Hour)), createdAt: fixture.nowISO, lastProposalID: true})
+	if err := fixture.repos.SweeperProposals.UpdateApplyReceipt(context.Background(), "proposal_stats_warn", "completed_warned", nil, nil, nil); err != nil {
+		t.Fatalf("UpdateApplyReceipt() error = %v", err)
+	}
+	seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_stats_close",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 92,
+		Status:       "terminal",
+		CurrentPhase: "terminal",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{proposalID: "proposal_stats_close", decision: "close", category: categoryAbandonedPR, proposerKind: "heuristic_v1", factBundle: replayFactBundle("acme/looper", "issue", 92, fixture.now.Add(-120*24*time.Hour)), createdAt: fixture.now.Add(time.Minute).Format(javaScriptISOStringUTC), lastProposalID: true})
+	timeoutRaw := `{"status":"timeout","timeoutType":"max_runtime"}`
+	validation := "passed"
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{
+		ID:               "proposal_stats_timeout",
+		CaseID:           "case_stats_warn",
+		ProjectID:        fixture.projectID,
+		Repo:             "acme/looper",
+		TargetType:       "issue",
+		TargetNumber:     91,
+		SchemaVersion:    1,
+		ProposerKind:     proposerKindAgentV1,
+		FactBundleJSON:   mustMarshalJSON(replayFactBundle("acme/looper", "issue", 91, fixture.now.Add(-90*24*time.Hour))),
+		FingerprintJSON:  `{"hash":"stats-timeout"}`,
+		ProposalJSON:     `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":80,"summary":"timeout replay","rationale":"timeout replay rationale","markerUUID":"marker-timeout"}`,
+		RawResultJSON:    &timeoutRaw,
+		Decision:         "warn",
+		Category:         categoryStale,
+		ConfidenceScore:  80,
+		ValidationStatus: &validation,
+		CreatedAt:        fixture.now.Add(2 * time.Minute).Format(javaScriptISOStringUTC),
+	}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(timeout) error = %v", err)
+	}
+	stats, err := fixture.runner.RepoOperatorStats(context.Background(), fixture.projectID, "acme/looper", 10)
+	if err != nil {
+		t.Fatalf("RepoOperatorStats() error = %v", err)
+	}
+	if stats.CaseCount != 2 || stats.ProposalCount != 3 {
+		t.Fatalf("RepoOperatorStats() = %#v, want 2 cases and 3 proposals", stats)
+	}
+	if stats.ProposalsByProposerKind[proposerKindAgentV1] != 2 || stats.ProposalsByProposerKind["heuristic_v1"] != 1 {
+		t.Fatalf("ProposalsByProposerKind = %#v, want two agent and one heuristic proposals", stats.ProposalsByProposerKind)
+	}
+	if stats.ApplyOutcomes["completed_warned"] != 1 || stats.ApplyOutcomes["pending"] != 2 {
+		t.Fatalf("ApplyOutcomes = %#v, want completed_warned=1 pending=2", stats.ApplyOutcomes)
+	}
+	if stats.CurrentPhases["warn"] != 1 || stats.CurrentPhases["terminal"] != 1 {
+		t.Fatalf("CurrentPhases = %#v, want warn=1 terminal=1", stats.CurrentPhases)
+	}
+	if stats.StaleRate <= 0 || stats.AgentProposalCount != 2 || stats.AgentTimeouts != 1 || stats.AgentTimeoutRate <= 0 {
+		t.Fatalf("RepoOperatorStats() = %#v, want stale proposals plus non-zero timeout rate", stats)
+	}
+}
+
+func TestProjectMetadataAutoDryRunOverridesSweeperRoleConfig(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	metadata := `{"repo":"acme/looper","sweeper":{"autoDryRun":true,"autoDryRunReason":"timeout threshold exceeded"}}`
+	project, err := fixture.repos.Projects.GetByID(context.Background(), fixture.projectID)
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	_, roleCfg, err := fixture.runner.projectConfig(context.Background(), fixture.projectID)
+	if err != nil {
+		t.Fatalf("projectConfig() error = %v", err)
+	}
+	if !roleCfg.DryRun {
+		t.Fatalf("roleCfg.DryRun = false, want true from project metadata override")
+	}
+}
+
+func TestProcessWarnDiagnosticModePersistsFreshShadowAndAgentProposal(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = true
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
+	fixture.cfg.Roles.Sweeper.Proposer.DiagnosticMode = true
+	caseRecord := seedReplayCase(t, fixture, storage.SweeperCaseRecord{
+		ID:           "case_diagnostic_warn",
+		ProjectID:    fixture.projectID,
+		Repo:         "acme/looper",
+		TargetType:   "issue",
+		TargetNumber: 96,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    fixture.nowISO,
+		UpdatedAt:    fixture.nowISO,
+	}, seedReplayProposalInput{proposalID: "proposal_diagnostic_existing_agent", decision: "warn", category: categoryStale, proposerKind: proposerKindAgentV1, factBundle: replayFactBundle("acme/looper", "issue", 96, fixture.now.Add(-100*24*time.Hour)), createdAt: fixture.now.Add(-time.Hour).Format(javaScriptISOStringUTC), lastProposalID: true})
+	validation := "passed"
+	if err := fixture.repos.SweeperProposals.UpdateApplyReceipt(context.Background(), "proposal_diagnostic_existing_agent", "completed_warned", nil, nil, nil); err != nil {
+		t.Fatalf("UpdateApplyReceipt() error = %v", err)
+	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), "proposal_diagnostic_existing_agent")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	proposal.ValidationStatus = &validation
+	proposal.SchemaVersion = 1
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: caseRecord.ID, ProjectID: caseRecord.ProjectID, Repo: caseRecord.Repo, TargetType: caseRecord.TargetType, TargetNumber: caseRecord.TargetNumber, Status: caseRecord.Status, CurrentPhase: caseRecord.CurrentPhase, LastProposalID: &proposal.ID, CreatedAt: caseRecord.CreatedAt, UpdatedAt: caseRecord.UpdatedAt}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	fixture.github.issueDetails["acme/looper#96"] = githubinfra.IssueDetail{Number: 96, Title: "Old stale issue", Body: "still stale", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: nil}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":90,"summary":"diagnostic agent warning","rationale":"diagnostic rationale","markerUUID":"marker-diagnostic-96"}`}}
+	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: caseRecord.ID})
+	queueID := "queue_sweeper_warn_diagnostic"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#96", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#96", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "skipped" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want dry-run skipped result", result)
+	}
+	proposals, err := fixture.repos.SweeperProposals.ListByCaseID(context.Background(), caseRecord.ID)
+	if err != nil {
+		t.Fatalf("ListByCaseID() error = %v", err)
+	}
+	if len(proposals) != 3 {
+		t.Fatalf("len(proposals) = %d, want existing agent + fresh heuristic shadow + fresh agent", len(proposals))
+	}
+	agentCount := 0
+	heuristicCount := 0
+	foundExisting := false
+	for _, proposal := range proposals {
+		switch proposal.ProposerKind {
+		case proposerKindAgentV1:
+			agentCount++
+		case "heuristic_v1":
+			heuristicCount++
+		}
+		if proposal.ID == "proposal_diagnostic_existing_agent" {
+			foundExisting = true
+		}
+	}
+	if agentCount != 2 || heuristicCount != 1 || !foundExisting {
+		t.Fatalf("proposals = %#v, want two agent proposals, one heuristic shadow, and the original agent proposal preserved", proposals)
+	}
+}
+
 func TestProcessCloseClosesAndReconcilesLabels(t *testing.T) {
 	t.Parallel()
 
@@ -1162,6 +1537,88 @@ func itoa(value int64) string {
 
 func int64Ptr(value int64) *int64 {
 	return &value
+}
+
+type seedReplayProposalInput struct {
+	proposalID     string
+	decision       string
+	category       string
+	proposerKind   string
+	factBundle     FactBundle
+	createdAt      string
+	lastProposalID bool
+}
+
+func seedReplayCase(t *testing.T, fixture runnerFixture, record storage.SweeperCaseRecord, proposal seedReplayProposalInput) storage.SweeperCaseRecord {
+	t.Helper()
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+
+	factBundleJSON, err := json.Marshal(proposal.factBundle)
+	if err != nil {
+		t.Fatalf("json.Marshal(factBundle) error = %v", err)
+	}
+	fingerprintJSON, err := BuildFingerprint(proposal.factBundle)
+	if err != nil {
+		t.Fatalf("BuildFingerprint() error = %v", err)
+	}
+	validation := "passed"
+	proposalJSON := `{"schemaVersion":1,"decision":"` + proposal.decision + `","category":"` + proposal.category + `","confidenceScore":80,"summary":"base proposal","rationale":"base rationale"`
+	if proposal.decision == "warn" {
+		proposalJSON += `,"markerUUID":"marker-base"`
+	}
+	proposalJSON += `}`
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{
+		ID:               proposal.proposalID,
+		CaseID:           record.ID,
+		ProjectID:        record.ProjectID,
+		Repo:             record.Repo,
+		TargetType:       record.TargetType,
+		TargetNumber:     record.TargetNumber,
+		SchemaVersion:    1,
+		ProposerKind:     proposal.proposerKind,
+		FactBundleJSON:   string(factBundleJSON),
+		FingerprintJSON:  fingerprintJSON,
+		ProposalJSON:     proposalJSON,
+		Decision:         proposal.decision,
+		Category:         proposal.category,
+		ConfidenceScore:  80,
+		ValidationStatus: &validation,
+		CreatedAt:        proposal.createdAt,
+	}); err != nil {
+		t.Fatalf("SweeperProposals.Insert() error = %v", err)
+	}
+	if proposal.lastProposalID {
+		record.LastProposalID = &proposal.proposalID
+		if err := fixture.repos.SweeperCases.Upsert(context.Background(), record); err != nil {
+			t.Fatalf("SweeperCases.Upsert(update last proposal) error = %v", err)
+		}
+	}
+	return record
+}
+
+func replayFactBundle(repo, targetType string, number int64, updatedAt time.Time) FactBundle {
+	return FactBundle{
+		Repo:              repo,
+		TargetType:        targetType,
+		Number:            number,
+		State:             "open",
+		UpdatedAt:         updatedAt.Format(time.RFC3339),
+		CreatedAt:         updatedAt.Add(-24 * time.Hour).Format(time.RFC3339),
+		Title:             "Replay target",
+		Body:              "Needs replay coverage",
+		Author:            "octo",
+		AuthorAssociation: "CONTRIBUTOR",
+		CommentCount:      1,
+		IsDraft:           false,
+		HeadSHA:           "abc123",
+	}
+}
+
+func mustMarshalJSON(value any) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
 }
 
 func mustMarshalLegacyPayload(payload sweeperPayload) string {

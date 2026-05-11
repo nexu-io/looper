@@ -413,10 +413,13 @@ const (
 )
 
 type SweeperProposerConfig struct {
-	Mode           SweeperProposerMode `json:"mode"`
-	Model          *string             `json:"model,omitempty"`
-	TimeoutSeconds int                 `json:"timeoutSeconds"`
-	SchemaVersion  int                 `json:"schemaVersion"`
+	Mode                        SweeperProposerMode `json:"mode"`
+	Model                       *string             `json:"model,omitempty"`
+	TimeoutSeconds              int                 `json:"timeoutSeconds"`
+	SchemaVersion               int                 `json:"schemaVersion"`
+	DiagnosticMode              bool                `json:"diagnosticMode"`
+	TimeoutRateDryRunThreshold  float64             `json:"timeoutRateDryRunThreshold"`
+	TimeoutRateDryRunMinSamples int                 `json:"timeoutRateDryRunMinSamples"`
 }
 
 type SweeperFilterConfig struct {
@@ -704,10 +707,13 @@ type PartialSweeperReportingConfig struct {
 }
 
 type PartialSweeperProposerConfig struct {
-	Mode           *SweeperProposerMode `json:"mode,omitempty"`
-	Model          *string              `json:"model,omitempty"`
-	TimeoutSeconds *int                 `json:"timeoutSeconds,omitempty"`
-	SchemaVersion  *int                 `json:"schemaVersion,omitempty"`
+	Mode                        *SweeperProposerMode `json:"mode,omitempty"`
+	Model                       *string              `json:"model,omitempty"`
+	TimeoutSeconds              *int                 `json:"timeoutSeconds,omitempty"`
+	SchemaVersion               *int                 `json:"schemaVersion,omitempty"`
+	DiagnosticMode              *bool                `json:"diagnosticMode,omitempty"`
+	TimeoutRateDryRunThreshold  *float64             `json:"timeoutRateDryRunThreshold,omitempty"`
+	TimeoutRateDryRunMinSamples *int                 `json:"timeoutRateDryRunMinSamples,omitempty"`
 }
 
 type PartialSweeperFilterConfig struct {

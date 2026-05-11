@@ -614,6 +614,9 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	if diagnosticModeEnabled(roleCfg) && existingProposal != nil {
+		existingProposal = nil
+	}
 	if r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
 		if validAgentApplyProposal(existingProposal, "warn", roleCfg.Proposer.SchemaVersion) {
 			proposal = existingProposal
@@ -833,6 +836,12 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	decision := categoryDecisionForPhase("close", category)
 	var proposal *storage.SweeperProposalRecord
+	if diagnosticModeEnabled(roleCfg) && r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
+		if _, _, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale); err != nil {
+			return payload, "failed", "", err
+		}
+		applyProposal = nil
+	}
 	if r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
 		if applyProposal != nil && applyProposal.Decision == "close" {
 			if !validAgentApplyProposal(applyProposal, "close", roleCfg.Proposer.SchemaVersion) {
@@ -1807,7 +1816,11 @@ func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.
 	if project == nil {
 		return nil, config.SweeperRoleConfig{}, fmt.Errorf("project not found: %s", projectID)
 	}
-	return project, r.roleConfig(projectID), nil
+	roleCfg := r.roleConfig(projectID)
+	if meta := parseProjectSweeperMetadata(project.MetadataJSON); meta.AutoDryRun {
+		roleCfg.DryRun = true
+	}
+	return project, roleCfg, nil
 }
 
 func (r *Runner) roleConfig(projectID string) config.SweeperRoleConfig {
@@ -1845,6 +1858,33 @@ func isSupportedQueueType(queueType string) bool {
 	default:
 		return false
 	}
+}
+
+type projectSweeperMetadata struct {
+	AutoDryRun       bool
+	AutoDryRunReason string
+	AutoDryRunSetAt  string
+}
+
+func parseProjectSweeperMetadata(metadataJSON *string) projectSweeperMetadata {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return projectSweeperMetadata{}
+	}
+	var decoded struct {
+		Sweeper struct {
+			AutoDryRun       bool   `json:"autoDryRun"`
+			AutoDryRunReason string `json:"autoDryRunReason,omitempty"`
+			AutoDryRunSetAt  string `json:"autoDryRunSetAt,omitempty"`
+		} `json:"sweeper"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(*metadataJSON)), &decoded); err != nil {
+		return projectSweeperMetadata{}
+	}
+	return projectSweeperMetadata{AutoDryRun: decoded.Sweeper.AutoDryRun, AutoDryRunReason: strings.TrimSpace(decoded.Sweeper.AutoDryRunReason), AutoDryRunSetAt: strings.TrimSpace(decoded.Sweeper.AutoDryRunSetAt)}
+}
+
+func diagnosticModeEnabled(roleCfg config.SweeperRoleConfig) bool {
+	return roleCfg.Proposer.DiagnosticMode
 }
 
 func buildTargetID(repo string, number int64) string {

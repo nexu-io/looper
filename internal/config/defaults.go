@@ -220,9 +220,12 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 				Filter: SweeperFilterConfig{Mode: SweeperFilterModeDeterministic},
 				Proposer: SweeperProposerConfig{
-					Mode:           SweeperProposerModeAgentApply,
-					TimeoutSeconds: 180,
-					SchemaVersion:  1,
+					Mode:                        SweeperProposerModeAgentApply,
+					TimeoutSeconds:              180,
+					SchemaVersion:               1,
+					DiagnosticMode:              false,
+					TimeoutRateDryRunThreshold:  0.5,
+					TimeoutRateDryRunMinSamples: 3,
 				},
 				Lifecycle: SweeperLifecycleConfig{
 					PendingLabel: "looper:sweep-pending",

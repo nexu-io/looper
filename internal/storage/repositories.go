@@ -812,6 +812,25 @@ func (r *SweeperCasesRepository) ListByProjectRepoPhase(ctx context.Context, pro
 	return scanSweeperCases(rows)
 }
 
+func (r *SweeperCasesRepository) ListByProjectRepo(ctx context.Context, projectID, repo string, limit int) ([]SweeperCaseRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT *
+		FROM sweeper_cases
+		WHERE project_id = ? AND repo = ?
+		ORDER BY updated_at DESC, id DESC
+		LIMIT ?
+	`, projectID, repo, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list sweeper cases by repo: %w", err)
+	}
+	defer rows.Close()
+
+	return scanSweeperCases(rows)
+}
+
 func (r *SweeperCasesRepository) ListByProjectRepoStatus(ctx context.Context, projectID, repo, status string) ([]SweeperCaseRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
 		SELECT *
@@ -902,6 +921,29 @@ func (r *SweeperProposalsRepository) ListByCaseID(ctx context.Context, caseID st
 	`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("list sweeper proposals by case: %w", err)
+	}
+	defer rows.Close()
+
+	return scanSweeperProposals(rows)
+}
+
+func (r *SweeperProposalsRepository) ListByProjectRepo(ctx context.Context, projectID, repo string, limit int) ([]SweeperProposalRecord, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT id, case_id, project_id, repo, target_type, target_number,
+			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
+			proposal_json, raw_result_json, decision, category, confidence_score,
+			summary, rationale, marker_uuid, validation_status, validation_error,
+			apply_status, apply_summary, apply_error, applied_at, created_at
+		FROM sweeper_proposals
+		WHERE project_id = ? AND repo = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, projectID, repo, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list sweeper proposals by repo: %w", err)
 	}
 	defer rows.Close()
 

@@ -40,11 +40,11 @@
 
 ## Phase 2 — Hardening and operator surface
 
-- [ ] Operator inspection commands (list cases, show proposal+receipt, replay propose)
-- [ ] Metrics/dashboards for proposals, apply outcomes, stale rate, agent timeout rate
-- [ ] Backpressure: auto-flip repo to dry-run on agent timeout-rate threshold
-- [ ] Schema version 2 design review (no implementation)
-- [ ] Diagnostic mode: heuristic + agent in parallel for offline accuracy comparison
+- [x] Operator inspection commands (list cases, show proposal+receipt, replay propose)
+- [x] Metrics/dashboards for proposals, apply outcomes, stale rate, agent timeout rate
+- [x] Backpressure: auto-flip repo to dry-run on agent timeout-rate threshold
+- [x] Schema version 2 design review (no implementation)
+- [x] Diagnostic mode: heuristic + agent in parallel for offline accuracy comparison
 
 ## Phase 3 — Richer fact bundle and deterministic evidence categories
 

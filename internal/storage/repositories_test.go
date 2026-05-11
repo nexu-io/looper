@@ -376,7 +376,7 @@ func TestRepositoriesRoundTripForSweeperCasesAndProposals(t *testing.T) {
 		Repo:         repo,
 		TargetType:   "pull_request",
 		TargetNumber: 7,
-		Status:       "open",
+		Status:       "quarantined",
 		CurrentPhase: "prefilter",
 		CreatedAt:    now,
 		UpdatedAt:    "2026-04-11T12:02:00.000Z",
@@ -448,12 +448,20 @@ func TestRepositoriesRoundTripForSweeperCasesAndProposals(t *testing.T) {
 		t.Fatalf("SweeperCases.ListByProjectRepoPhase() = %#v, want [case_1 case_2]", phaseCases)
 	}
 
-	statusCases, err := repos.SweeperCases.ListByProjectRepoStatus(ctx, projectID, repo, "open")
+	statusCases, err := repos.SweeperCases.ListByProjectRepoStatus(ctx, projectID, repo, "quarantined")
 	if err != nil {
 		t.Fatalf("SweeperCases.ListByProjectRepoStatus() error = %v", err)
 	}
 	if len(statusCases) != 1 || statusCases[0].ID != "case_3" {
 		t.Fatalf("SweeperCases.ListByProjectRepoStatus() = %#v, want [case_3]", statusCases)
+	}
+
+	caseList, err := repos.SweeperCases.ListByProjectRepo(ctx, projectID, repo, 2)
+	if err != nil {
+		t.Fatalf("SweeperCases.ListByProjectRepo() error = %v", err)
+	}
+	if len(caseList) != 2 || caseList[0].ID != "case_1" || caseList[1].ID != "case_4" {
+		t.Fatalf("SweeperCases.ListByProjectRepo() = %#v, want [case_1 case_4]", caseList)
 	}
 
 	summary1 := "proposal one"
@@ -553,6 +561,14 @@ func TestRepositoriesRoundTripForSweeperCasesAndProposals(t *testing.T) {
 	}
 	if len(proposalList) != 2 || proposalList[0].ID != "proposal_2" || proposalList[1].ID != "proposal_1" {
 		t.Fatalf("SweeperProposals.ListByCaseID() = %#v, want [proposal_2 proposal_1]", proposalList)
+	}
+
+	proposalRepoList, err := repos.SweeperProposals.ListByProjectRepo(ctx, projectID, repo, 2)
+	if err != nil {
+		t.Fatalf("SweeperProposals.ListByProjectRepo() error = %v", err)
+	}
+	if len(proposalRepoList) != 2 || proposalRepoList[0].ID != "proposal_2" || proposalRepoList[1].ID != "proposal_3" {
+		t.Fatalf("SweeperProposals.ListByProjectRepo() = %#v, want [proposal_2 proposal_3]", proposalRepoList)
 	}
 
 	applySummary := "applied successfully"

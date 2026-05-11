@@ -647,6 +647,12 @@ func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]
 	if config.Proposer.TimeoutSeconds <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutSeconds", Message: "must be a positive integer"})
 	}
+	if config.Proposer.TimeoutRateDryRunThreshold < 0 || config.Proposer.TimeoutRateDryRunThreshold > 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunThreshold", Message: "must be between 0 and 1"})
+	}
+	if config.Proposer.TimeoutRateDryRunMinSamples < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunMinSamples", Message: "must be greater than or equal to 0"})
+	}
 	if config.Proposer.SchemaVersion != 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.schemaVersion", Message: "must be 1"})
 	}

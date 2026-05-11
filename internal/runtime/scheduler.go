@@ -56,6 +56,10 @@ type sweeperScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*sweeper.ProcessResult, error)
 }
 
+type sweeperOperatorStatsProvider interface {
+	RepoOperatorStats(context.Context, string, string, int) (sweeper.RepoStats, error)
+}
+
 type snapshotScheduler interface {
 	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 }
@@ -80,6 +84,7 @@ type defaultSchedulerTickInput struct {
 	Worker                   workerScheduler
 	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
+	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
@@ -995,6 +1000,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Worker:                   workerRunner,
 			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
+			Config:                   &cfg,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
@@ -1114,6 +1120,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+			appendErr(applySweeperBackpressure(ctx, input, project, repo))
 			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
 			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, err))
 			_, err = input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
@@ -1332,6 +1339,92 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 	}
 	repo, _ := metadata["repo"].(string)
 	return strings.TrimSpace(repo)
+}
+
+func applySweeperBackpressure(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord, repo string) error {
+	if input.Config == nil || input.Sweeper == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil
+	}
+	statsProvider, ok := input.Sweeper.(sweeperOperatorStatsProvider)
+	if !ok {
+		return nil
+	}
+	roleCfg := config.ProjectRoleConfigs(*input.Config, project.ID).Sweeper
+	threshold := roleCfg.Proposer.TimeoutRateDryRunThreshold
+	minSamples := roleCfg.Proposer.TimeoutRateDryRunMinSamples
+	if threshold <= 0 {
+		return nil
+	}
+	meta := parseSchedulerProjectMetadata(project.MetadataJSON)
+	if meta.Sweeper.AutoDryRun {
+		return nil
+	}
+	stats, err := statsProvider.RepoOperatorStats(ctx, project.ID, repo, 1000)
+	if err != nil {
+		return fmt.Errorf("compute sweeper backpressure stats: %w", err)
+	}
+	if stats.AgentProposalCount < minSamples || stats.AgentTimeoutRate < threshold {
+		return nil
+	}
+	nowFn := input.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	nowISO := formatJavaScriptISOString(nowFn().UTC())
+	reason := fmt.Sprintf("agent timeout rate %.2f exceeded threshold %.2f across %d agent proposals", stats.AgentTimeoutRate, threshold, stats.AgentProposalCount)
+	updatedMetadata, err := mergeSchedulerProjectMetadata(project.MetadataJSON, map[string]any{"sweeper": map[string]any{"autoDryRun": true, "autoDryRunReason": reason, "autoDryRunSetAt": nowISO}})
+	if err != nil {
+		return fmt.Errorf("update sweeper backpressure metadata: %w", err)
+	}
+	updated := project
+	updated.MetadataJSON = &updatedMetadata
+	updated.UpdatedAt = nowISO
+	if err := input.Repos.Projects.Upsert(ctx, updated); err != nil {
+		return fmt.Errorf("persist sweeper backpressure override: %w", err)
+	}
+	if input.Repos.Notifications != nil {
+		dedupeKey := fmt.Sprintf("runtime.sweeper.auto_dry_run:%s:%s", project.ID, repo)
+		payloadJSON := fmt.Sprintf(`{"repo":%q,"reason":%q}`, repo, reason)
+		_ = input.Repos.Notifications.Upsert(ctx, storage.NotificationRecord{ID: dedupeKey, ProjectID: stringPtr(project.ID), EntityType: stringPtr("project"), EntityID: stringPtr(project.ID), Channel: "in_app", Level: "warning", Title: "Looper Sweeper Auto Dry-Run", Subtitle: stringPtr(repo), Body: reason, Status: "sent", DedupeKey: &dedupeKey, PayloadJSON: &payloadJSON, SentAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO})
+	}
+	if input.Logger != nil {
+		input.Logger.Warn("sweeper auto-enabled dry-run backpressure", map[string]any{"projectId": project.ID, "repo": repo, "reason": reason})
+	}
+	return nil
+}
+
+type schedulerProjectMetadata struct {
+	Sweeper struct {
+		AutoDryRun bool `json:"autoDryRun"`
+	} `json:"sweeper"`
+}
+
+func parseSchedulerProjectMetadata(metadataJSON *string) schedulerProjectMetadata {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return schedulerProjectMetadata{}
+	}
+	var metadata schedulerProjectMetadata
+	if err := json.Unmarshal([]byte(strings.TrimSpace(*metadataJSON)), &metadata); err != nil {
+		return schedulerProjectMetadata{}
+	}
+	return metadata
+}
+
+func mergeSchedulerProjectMetadata(current *string, updates map[string]any) (string, error) {
+	metadata := map[string]any{}
+	if current != nil && strings.TrimSpace(*current) != "" {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(*current)), &metadata); err != nil {
+			return "", err
+		}
+	}
+	for key, value := range updates {
+		metadata[key] = value
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func wrapSchedulerError(action, projectID, repo string, err error) error {

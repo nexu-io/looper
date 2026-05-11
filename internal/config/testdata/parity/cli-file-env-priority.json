@@ -278,7 +278,10 @@
             "mode": "deterministic"
           },
           "proposer": {
+            "diagnosticMode": false,
             "mode": "agent_apply",
+            "timeoutRateDryRunMinSamples": 3,
+            "timeoutRateDryRunThreshold": 0.5,
             "timeoutSeconds": 180,
             "schemaVersion": 1
           },

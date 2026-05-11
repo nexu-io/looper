@@ -768,6 +768,15 @@ func mergeSweeperProposerConfig(config *SweeperProposerConfig, partial PartialSw
 	if partial.SchemaVersion != nil {
 		config.SchemaVersion = *partial.SchemaVersion
 	}
+	if partial.DiagnosticMode != nil {
+		config.DiagnosticMode = *partial.DiagnosticMode
+	}
+	if partial.TimeoutRateDryRunThreshold != nil {
+		config.TimeoutRateDryRunThreshold = *partial.TimeoutRateDryRunThreshold
+	}
+	if partial.TimeoutRateDryRunMinSamples != nil {
+		config.TimeoutRateDryRunMinSamples = *partial.TimeoutRateDryRunMinSamples
+	}
 }
 
 func mergeSweeperLifecycleConfig(config *SweeperLifecycleConfig, partial PartialSweeperLifecycleConfig) {
