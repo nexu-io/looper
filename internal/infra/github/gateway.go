@@ -74,7 +74,9 @@ type PullRequestDetail struct {
 	Body              string
 	URL               string
 	State             string
+	CreatedAt         string
 	UpdatedAt         string
+	ClosedAt          string
 	IsDraft           bool
 	ReviewDecision    string
 	Labels            []string
@@ -84,12 +86,23 @@ type PullRequestDetail struct {
 	BaseSHA           string
 	Author            string
 	AuthorAssociation string
+	CommentCount      int
 	ReviewRequests    []string
 	HasConflicts      bool
 	Comments          []map[string]any
-	IssueComments     []map[string]any
+	IssueComments     []CommentInfo
 	Reviews           []map[string]any
 	Checks            []map[string]any
+}
+
+type CommentInfo struct {
+	ID                int64
+	Author            string
+	AuthorAssociation string
+	Body              string
+	CreatedAt         string
+	UpdatedAt         string
+	URL               string
 }
 
 type PullRequestHeadAndAuthor struct {
@@ -111,7 +124,23 @@ type IssueSummary struct {
 	IsPullRequest     bool
 }
 
-type IssueDetail = IssueSummary
+type IssueDetail struct {
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	CreatedAt         string
+	UpdatedAt         string
+	ClosedAt          string
+	Author            string
+	AuthorAssociation string
+	Assignees         []string
+	Labels            []string
+	IsPullRequest     bool
+	CommentCount      int
+	Comments          []CommentInfo
+}
 
 type IssueCommentInput struct {
 	Repo        string
@@ -556,18 +585,30 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 	if err != nil {
 		return IssueDetail{}, err
 	}
+	commentsResult, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber))
+	if err != nil {
+		return IssueDetail{}, err
+	}
+	commentRows, err := decodeJSONArray(commentsResult.Stdout)
+	if err != nil {
+		return IssueDetail{}, err
+	}
 	return IssueDetail{
 		Number:            asInt64(row["number"]),
 		Title:             asString(row["title"]),
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		CreatedAt:         firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
+		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
 		Assignees:         extractActorLogins(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
 		IsPullRequest:     row["pull_request"] != nil,
+		CommentCount:      len(commentRows),
+		Comments:          extractCommentInfos(commentRows),
 	}, nil
 }
 
@@ -668,7 +709,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -686,7 +727,9 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Body:              asString(row["body"]),
 		URL:               asString(row["url"]),
 		State:             asString(row["state"]),
+		CreatedAt:         asString(row["createdAt"]),
 		UpdatedAt:         asString(row["updatedAt"]),
+		ClosedAt:          asString(row["closedAt"]),
 		IsDraft:           asBool(row["isDraft"]),
 		ReviewDecision:    asString(row["reviewDecision"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -696,10 +739,11 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		BaseSHA:           asString(row["baseRefOid"]),
 		Author:            extractAuthor(row["author"]),
 		AuthorAssociation: asString(row["authorAssociation"]),
+		CommentCount:      len(toObjectSlice(row["comments"])),
 		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
 		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
 		Comments:          threads,
-		IssueComments:     toObjectSlice(row["comments"]),
+		IssueComments:     extractCommentInfos(toObjectSlice(row["comments"])),
 		Reviews:           toObjectSlice(row["reviews"]),
 		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
@@ -2125,6 +2169,28 @@ func toObjectSlice(value any) []map[string]any {
 		if row, ok := item.(map[string]any); ok {
 			out = append(out, row)
 		}
+	}
+	return out
+}
+
+func extractCommentInfos(value any) []CommentInfo {
+	items := toObjectSlice(value)
+	if len(items) == 0 {
+		if rows, ok := value.([]map[string]any); ok {
+			items = append(items, rows...)
+		}
+	}
+	out := make([]CommentInfo, 0, len(items))
+	for _, row := range items {
+		out = append(out, CommentInfo{
+			ID:                asInt64(firstNonNil(row["id"], row["databaseId"])),
+			Author:            extractAuthor(firstNonNil(row["author"], row["user"])),
+			AuthorAssociation: firstNonEmpty(asString(row["authorAssociation"]), asString(row["author_association"])),
+			Body:              asString(row["body"]),
+			CreatedAt:         firstNonEmpty(asString(row["createdAt"]), asString(row["created_at"])),
+			UpdatedAt:         firstNonEmpty(asString(row["updatedAt"]), asString(row["updated_at"])),
+			URL:               firstNonEmpty(asString(row["url"]), asString(row["html_url"])),
+		})
 	}
 	return out
 }

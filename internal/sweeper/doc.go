@@ -1,2 +1,2 @@
-// Package sweeper scaffolds the sweeper role lifecycle.
+// Package sweeper implements Looper's sweeper case/proposal lifecycle.
 package sweeper

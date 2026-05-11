@@ -2,28 +2,28 @@
 
 ## Phase 0 — Documentation deltas
 
-- [ ] Land this spec under `specs/2026-05-11-sweeper-architecture/`
-- [ ] Update `docs/sweeper.md` and `roles.sweeper` config reference to the target model
-- [ ] Align CLI help / debug output with canonical vocabulary (case, proposal, fact bundle, apply receipt, stale proposal, marker UUID)
-- [ ] Define metric names for `sweeper.proposals.*` and `sweeper.apply.*`
+- [x] Land this spec under `specs/2026-05-11-sweeper-architecture/`
+- [x] Update `docs/sweeper.md` and `roles.sweeper` config reference to the target model
+- [x] Align CLI help / debug output with canonical vocabulary (case, proposal, fact bundle, apply receipt, stale proposal, marker UUID)
+- [x] Define metric names for `sweeper.proposals.*` and `sweeper.apply.*`
 
 ## Phase 1a — Persisted ledger (no agent surface change)
 
-- [ ] Add `sweeper_cases` table, repository, and required indexes
-- [ ] Add `sweeper_proposals` table, repository, and required indexes
-- [ ] Migrate runner internals to read/write the new tables
-- [ ] Reduce queue payload to orchestration metadata only
-- [ ] Extract deterministic prefilter stage from current runner
-- [ ] Build Phase 1 fact bundle per §5.1 (no new gateway methods)
-- [ ] Widen `ViewIssue` / `ViewPullRequest` return shape to expose comment timestamps if missing
-- [ ] Implement fingerprint algorithm and persist on case + proposal rows
-- [ ] Implement marker pre-check using `markerUUID`
-- [ ] Implement per-step apply protocol with `partial:*` receipts
-- [ ] Implement stale-proposal detection on apply
+- [x] Add `sweeper_cases` table, repository, and required indexes
+- [x] Add `sweeper_proposals` table, repository, and required indexes
+- [x] Migrate runner internals to read/write the new tables
+- [x] Reduce queue payload to orchestration metadata only
+- [x] Extract deterministic prefilter stage from current runner
+- [x] Build Phase 1 fact bundle per §5.1 (no new gateway methods)
+- [x] Widen `ViewIssue` / `ViewPullRequest` return shape to expose comment timestamps if missing
+- [x] Implement fingerprint algorithm and persist on case + proposal rows
+- [x] Implement marker pre-check using `markerUUID`
+- [x] Implement per-step apply protocol with `partial:*` receipts
+- [x] Implement stale-proposal detection on apply
 - [ ] Expand reconcile to cover the full triggers table (event-driven path)
-- [ ] Add maintenance reconcile entry point
-- [ ] Move daily ceilings to applied-side accounting (soft + hard budget split)
-- [ ] Wire heuristic classifier as `proposer_kind=heuristic_v1` writing real proposals
+- [x] Add maintenance reconcile entry point
+- [x] Move daily ceilings to applied-side accounting (soft + hard budget split)
+- [x] Wire heuristic classifier as `proposer_kind=heuristic_v1` writing real proposals
 
 ## Phase 1b — Agent proposer on the same ledger
 

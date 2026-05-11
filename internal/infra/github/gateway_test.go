@@ -28,6 +28,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","updatedAt":"2026-05-02T12:00:00Z","author":{"login":"octocat"},"authorAssociation":"OWNER","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
 			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","updated_at":"2026-05-03T12:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+		case args == "api repos/acme/looper/issues/8/comments":
+			return shell.Result{Stdout: `[{"id":91,"body":"First human follow-up","html_url":"https://example.test/issues/8#issuecomment-91","created_at":"2026-05-03T13:00:00Z","updated_at":"2026-05-03T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -183,6 +185,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if issueDetail.UpdatedAt != "2026-05-03T12:00:00Z" {
 		t.Fatalf("issueDetail.UpdatedAt = %q, want parsed updated timestamp", issueDetail.UpdatedAt)
 	}
+	if issueDetail.CommentCount != 1 || len(issueDetail.Comments) != 1 || issueDetail.Comments[0].Body != "First human follow-up" {
+		t.Fatalf("issueDetail comments = %#v / %d, want one parsed issue comment", issueDetail.Comments, issueDetail.CommentCount)
+	}
 	if comment.ID != 91 || comment.URL != "https://example.test/issues/8#issuecomment-91" {
 		t.Fatalf("comment = %#v, want parsed issue comment metadata", comment)
 	}
@@ -207,7 +212,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if len(detail.Comments) != 1 || detail.Comments[0]["id"] != "comment-1" || detail.Comments[0]["threadId"] != "thread-1" || detail.Comments[0]["state"] != "UNRESOLVED" || detail.Comments[0]["body"] != "Fix this" {
 		t.Fatalf("detail.Comments = %#v, want normalized review thread", detail.Comments)
 	}
-	if len(detail.IssueComments) != 1 || detail.IssueComments[0]["id"] != "issue-comment-1" || detail.IssueComments[0]["body"] != "conversation notice" {
+	if len(detail.IssueComments) != 1 || detail.IssueComments[0].Body != "conversation notice" {
 		t.Fatalf("detail.IssueComments = %#v, want PR conversation comments", detail.IssueComments)
 	}
 	if login != "reviewer" {

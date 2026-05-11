@@ -96,7 +96,14 @@ type payloadEnvelope struct {
 	Sweeper sweeperPayload `json:"sweeper"`
 }
 
+type persistedSweeperPayload struct {
+	CaseID     string `json:"case_id,omitempty"`
+	ProposalID string `json:"proposal_id,omitempty"`
+}
+
 type sweeperPayload struct {
+	CaseID            string `json:"case_id,omitempty"`
+	ProposalID        string `json:"proposal_id,omitempty"`
 	Phase             string `json:"phase,omitempty"`
 	Outcome           string `json:"outcome,omitempty"`
 	Category          string `json:"category,omitempty"`
@@ -123,15 +130,42 @@ type sweeperStateRecord struct {
 }
 
 type liveTarget struct {
-	Number    int64
-	State     string
-	Title     string
-	Body      string
-	UpdatedAt string
-	Author    string
-	Labels    []string
-	IsPR      bool
-	Draft     bool
+	Number            int64
+	State             string
+	Title             string
+	Body              string
+	CreatedAt         string
+	UpdatedAt         string
+	ClosedAt          string
+	Author            string
+	AuthorAssociation string
+	Labels            []string
+	CommentCount      int
+	IssueComments     []githubinfra.CommentInfo
+	HeadSHA           string
+	IsPR              bool
+	Draft             bool
+}
+
+type caseDiscoveryState struct {
+	Case           *storage.SweeperCaseRecord
+	Legacy         sweeperStateRecord
+	HasLegacy      bool
+	LastProposalID string
+	CloseDueAt     string
+	Phase          string
+	Outcome        string
+}
+
+type prefilterCandidate struct {
+	TargetID       string
+	TargetType     string
+	TargetNumber   int64
+	Labels         []string
+	Author         string
+	Association    string
+	State          caseDiscoveryState
+	DefaultPayload sweeperPayload
 }
 
 func New(options Options) *Runner {
@@ -151,6 +185,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) DiscoverReconcile(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	return r.discoverReconcile(ctx, input, false)
+}
+
+func (r *Runner) DiscoverMaintenanceReconcile(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	return r.discoverReconcile(ctx, input, true)
+}
+
+func (r *Runner) discoverReconcile(ctx context.Context, input DiscoveryInput, maintenance bool) (DiscoveryResult, error) {
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Queue == nil {
 		return DiscoveryResult{}, fmt.Errorf("sweeper repositories are not configured")
 	}
@@ -158,15 +200,41 @@ func (r *Runner) DiscoverReconcile(ctx context.Context, input DiscoveryInput) (D
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	if project.Archived || !roleCfg.AutoDiscovery {
+	if project.Archived || (!maintenance && !roleCfg.AutoDiscovery) {
 		return DiscoveryResult{Skipped: 1}, nil
+	}
+	limit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
+	items := make([]storage.QueueItemRecord, 0, limit)
+	if r.repos.SweeperCases != nil {
+		cases, err := r.repos.SweeperCases.ListByProjectRepoPhase(ctx, input.ProjectID, input.Repo, "warn")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		for _, caseRecord := range cases {
+			if len(items) >= limit {
+				break
+			}
+			if caseRecord.Status != "pending" {
+				continue
+			}
+			payload := sweeperPayload{CaseID: caseRecord.ID}
+			targetID := buildTargetID(caseRecord.Repo, caseRecord.TargetNumber)
+			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeReconcile, TargetType: caseRecord.TargetType, TargetID: targetID, Number: caseRecord.TargetNumber, Payload: payload})
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			if ok {
+				items = append(items, queueItem)
+			}
+		}
+		if len(items) > 0 || maintenance {
+			return DiscoveryResult{QueueItems: items}, nil
+		}
 	}
 	states, err := r.latestSweeperRecords(ctx)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	limit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
-	items := make([]storage.QueueItemRecord, 0, limit)
 	for targetID, state := range states {
 		if len(items) >= limit {
 			break
@@ -174,7 +242,12 @@ func (r *Runner) DiscoverReconcile(ctx context.Context, input DiscoveryInput) (D
 		if state.payload.Repo != input.Repo || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" {
 			continue
 		}
-		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeReconcile, TargetType: state.payload.TargetType, TargetID: targetID, Number: state.payload.TargetNumber, Payload: state.payload})
+		caseState, err := r.getCaseDiscoveryState(ctx, input.ProjectID, input.Repo, state.payload.TargetType, state.payload.TargetNumber, states)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		reconcilePayload := sweeperPayload{CaseID: firstNonEmpty(state.payload.CaseID, derefStringFromCase(caseState.Case))}
+		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeReconcile, TargetType: state.payload.TargetType, TargetID: targetID, Number: state.payload.TargetNumber, Payload: reconcilePayload})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -228,6 +301,14 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 	if payload.Repo == "" && queueItem.Repo != nil {
 		payload.Repo = *queueItem.Repo
 	}
+	if payload.TargetType == "" {
+		payload.TargetType = queueItem.TargetType
+	}
+	if payload.TargetNumber == 0 {
+		if targetNumber, parseErr := parseTargetNumber(queueItem); parseErr == nil {
+			payload.TargetNumber = targetNumber
+		}
+	}
 	var summary string
 	var status string
 	switch queueItem.Type {
@@ -241,12 +322,12 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 		status = "skipped"
 		summary = defaultSkippedSummary
 	}
-	if err != nil {
-		return nil, err
-	}
 	queueItem.PayloadJSON = stringPtr(mustMarshalPayload(payload))
 	queueItem.UpdatedAt = r.nowISO()
-	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+	if upsertErr := r.repos.Queue.Upsert(ctx, queueItem); upsertErr != nil {
+		return nil, upsertErr
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
@@ -289,16 +370,29 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			continue
 		}
 		targetID := buildTargetID(input.Repo, issue.Number)
-		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, states[targetID], roleCfg) {
+		legacyState := states[targetID]
+		caseState, err := r.getCaseDiscoveryState(ctx, input.ProjectID, input.Repo, "issue", issue.Number, states)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		candidate := prefilterCandidate{TargetID: targetID, TargetType: "issue", TargetNumber: issue.Number, Labels: issue.Labels, Author: issue.Author, Association: issue.AuthorAssociation, State: caseState, DefaultPayload: sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}}
+		if r.prefilterSkipCandidate(candidate, legacyState, roleCfg) {
 			result.Skipped++
 			continue
 		}
 		if hasLabel(issue.Labels, roleCfg.Lifecycle.PendingLabel) {
-			state, ok := states[targetID]
-			if !ok || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" || !dueForClose(state.payload.CloseBy, r.now()) || closeCount >= closeLimit {
+			closeDueAt := caseState.CloseDueAt
+			if closeDueAt == "" && caseState.HasLegacy {
+				closeDueAt = caseState.Legacy.payload.CloseBy
+			}
+			if caseState.Phase != "warn" || !dueForClose(closeDueAt, r.now()) || closeCount >= closeLimit || (caseState.Case == nil && (!caseState.HasLegacy || caseState.Legacy.payload.Outcome != outcomePending)) {
 				continue
 			}
-			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: state.payload})
+			closePayload := sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}
+			if caseState.HasLegacy {
+				closePayload.CaseID = firstNonEmpty(closePayload.CaseID, caseState.Legacy.payload.CaseID)
+			}
+			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: closePayload})
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -311,7 +405,8 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 		if warnCount >= warnLimit {
 			continue
 		}
-		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeWarn, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: sweeperPayload{Phase: "warn", Repo: input.Repo, TargetType: "issue", TargetNumber: issue.Number, PendingLabel: roleCfg.Lifecycle.PendingLabel, ClosedLabel: roleCfg.Lifecycle.ClosedLabel, KeepLabel: roleCfg.Lifecycle.KeepLabel, QuarantineLabel: roleCfg.Security.QuarantineLabel}})
+		warnPayload := candidate.DefaultPayload
+		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeWarn, TargetType: "issue", TargetID: targetID, Number: issue.Number, Payload: warnPayload})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -358,16 +453,29 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			continue
 		}
 		targetID := buildTargetID(input.Repo, pr.Number)
-		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, states[targetID], roleCfg) {
+		legacyState := states[targetID]
+		caseState, err := r.getCaseDiscoveryState(ctx, input.ProjectID, input.Repo, "pull_request", pr.Number, states)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		candidate := prefilterCandidate{TargetID: targetID, TargetType: "pull_request", TargetNumber: pr.Number, Labels: pr.Labels, Author: pr.Author, Association: pr.AuthorAssociation, State: caseState, DefaultPayload: sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}}
+		if r.prefilterSkipCandidate(candidate, legacyState, roleCfg) {
 			result.Skipped++
 			continue
 		}
 		if hasLabel(pr.Labels, roleCfg.Lifecycle.PendingLabel) {
-			state, ok := states[targetID]
-			if !ok || state.payload.Outcome != outcomePending || state.payload.Phase != "warn" || !dueForClose(state.payload.CloseBy, r.now()) || closeCount >= closeLimit {
+			closeDueAt := caseState.CloseDueAt
+			if closeDueAt == "" && caseState.HasLegacy {
+				closeDueAt = caseState.Legacy.payload.CloseBy
+			}
+			if caseState.Phase != "warn" || !dueForClose(closeDueAt, r.now()) || closeCount >= closeLimit || (caseState.Case == nil && (!caseState.HasLegacy || caseState.Legacy.payload.Outcome != outcomePending)) {
 				continue
 			}
-			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: state.payload})
+			closePayload := sweeperPayload{CaseID: derefStringFromCase(caseState.Case)}
+			if caseState.HasLegacy {
+				closePayload.CaseID = firstNonEmpty(closePayload.CaseID, caseState.Legacy.payload.CaseID)
+			}
+			queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeClose, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: closePayload})
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -380,7 +488,8 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 		if warnCount >= warnLimit {
 			continue
 		}
-		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeWarn, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: sweeperPayload{Phase: "warn", Repo: input.Repo, TargetType: "pull_request", TargetNumber: pr.Number, PendingLabel: roleCfg.Lifecycle.PendingLabel, ClosedLabel: roleCfg.Lifecycle.ClosedLabel, KeepLabel: roleCfg.Lifecycle.KeepLabel, QuarantineLabel: roleCfg.Security.QuarantineLabel}})
+		warnPayload := candidate.DefaultPayload
+		queueItem, ok, err := r.buildQueueItem(ctx, queueSeed{ProjectID: input.ProjectID, Repo: input.Repo, QueueType: QueueTypeWarn, TargetType: "pull_request", TargetID: targetID, Number: pr.Number, Payload: warnPayload})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -449,6 +558,25 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if caseRecord != nil {
+		payload.CaseID = caseRecord.ID
+		if payload.WarningCommentID == 0 {
+			payload.WarningCommentID = derefInt64(caseRecord.WarningCommentID)
+		}
+		if payload.WarningMarkerUUID == "" {
+			payload.WarningMarkerUUID = derefString(caseRecord.WarningMarkerUUID)
+		}
+		if payload.WarningPostedAt == "" {
+			payload.WarningPostedAt = derefString(caseRecord.WarnedAt)
+		}
+		if payload.CloseBy == "" {
+			payload.CloseBy = derefString(caseRecord.CloseDueAt)
+		}
+	}
 	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	payload.Phase = "warn"
 	payload.Outcome = outcomeNoAction
@@ -462,14 +590,34 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	payload.ClosedLabel = roleCfg.Lifecycle.ClosedLabel
 	payload.KeepLabel = roleCfg.Lifecycle.KeepLabel
 	payload.QuarantineLabel = roleCfg.Security.QuarantineLabel
+	decision := categoryDecisionForPhase("warn", category)
+	proposal, fingerprintJSON, err := r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if proposal != nil {
+		payload.ProposalID = proposal.ID
+	}
 	if category == categoryNone {
 		payload.Summary = defaultSkippedSummary
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_no_action", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "skipped", defaultSkippedSummary, nil
 	}
 	if category == categoryRouteSecurity {
 		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
 			payload.Outcome = outcomeDryRun
 			payload.Summary = "sweeper dry-run quarantine"
+			if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
+				return payload, "failed", "", err
+			}
+			if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+				return payload, "failed", "", err
+			}
 			return payload, "skipped", payload.Summary, nil
 		}
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Security.QuarantineLabel}}); err != nil {
@@ -477,34 +625,104 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 		}
 		payload.Outcome = outcomeQuarantined
 		payload.Summary = "sweeper quarantined target"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_quarantined", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "completed", payload.Summary, nil
 	}
 	graceDays := gracePeriodForCategory(category, roleCfg)
-	payload.WarningMarkerUUID = eventlog.NewEventID("sweeper")
-	payload.WarningPostedAt = r.nowISO()
-	payload.CloseBy = r.now().UTC().Add(time.Duration(graceDays) * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	if proposal != nil && proposal.MarkerUUID != nil {
+		payload.WarningMarkerUUID = *proposal.MarkerUUID
+	} else if strings.TrimSpace(payload.WarningMarkerUUID) == "" {
+		payload.WarningMarkerUUID = NewMarkerUUID()
+	}
+	haveWarningComment := payload.WarningCommentID > 0
+	if existingComment := markerComment(target.IssueComments, payload.WarningMarkerUUID); existingComment != nil {
+		payload.WarningCommentID = existingComment.ID
+		if strings.TrimSpace(payload.WarningPostedAt) == "" {
+			payload.WarningPostedAt = strings.TrimSpace(existingComment.CreatedAt)
+		}
+		if strings.TrimSpace(payload.CloseBy) == "" {
+			payload.CloseBy = warningCommentCloseBy(existingComment.Body)
+		}
+		haveWarningComment = true
+	}
+	if strings.TrimSpace(payload.WarningPostedAt) == "" {
+		payload.WarningPostedAt = r.nowISO()
+	}
+	if strings.TrimSpace(payload.CloseBy) == "" {
+		payload.CloseBy = r.now().UTC().Add(time.Duration(graceDays) * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	}
 	payload.CommentBody = buildWarningComment(target, payload, graceDays)
+	if haveWarningComment {
+		if hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
+			payload.Outcome = outcomePending
+			payload.Summary = fmt.Sprintf("sweeper warned %s #%d", targetKind(target.IsPR), target.Number)
+			if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_warned", payload.Summary, nil, true); err != nil {
+				return payload, "failed", "", err
+			}
+			if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+				return payload, "failed", "", err
+			}
+			return payload, "completed", payload.Summary, nil
+		}
+	}
 	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
 		payload.Outcome = outcomeDryRun
 		payload.Summary = "sweeper dry-run warning"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "skipped", payload.Summary, nil
 	}
-	comment, err := r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: payload.Repo, IssueNumber: target.Number, Body: payload.CommentBody})
-	if err != nil {
+	if !haveWarningComment {
+		comment, err := r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: payload.Repo, IssueNumber: target.Number, Body: payload.CommentBody})
+		if err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "warning comment failed", &applyErr, false)
+			return payload, "failed", "", err
+		}
+		payload.WarningCommentID = comment.ID
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:commented", "warning comment posted", nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+	}
+	if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
+		applyErr := err.Error()
+		_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "warning label failed", &applyErr, false)
+		_ = r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg)
 		return payload, "failed", "", err
 	}
-	payload.WarningCommentID = comment.ID
-	if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
+	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:labeled", "warning label added", nil, false); err != nil {
 		return payload, "failed", "", err
 	}
 	payload.Outcome = outcomePending
 	payload.Summary = fmt.Sprintf("sweeper warned %s #%d", targetKind(target.IsPR), target.Number)
+	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_warned", payload.Summary, nil, true); err != nil {
+		return payload, "failed", "", err
+	}
+	if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+		return payload, "failed", "", err
+	}
 	return payload, "completed", payload.Summary, nil
 }
 
 func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRecord, payload sweeperPayload) (sweeperPayload, string, string, error) {
 	roleCfg := r.roleConfig(derefString(queueItem.ProjectID))
 	target, err := r.loadTarget(ctx, queueItem)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
 	if err != nil {
 		return payload, "failed", "", err
 	}
@@ -516,12 +734,74 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	payload.ClosedLabel = roleCfg.Lifecycle.ClosedLabel
 	payload.KeepLabel = roleCfg.Lifecycle.KeepLabel
 	payload.QuarantineLabel = roleCfg.Security.QuarantineLabel
+	if caseRecord != nil {
+		payload.CaseID = caseRecord.ID
+		if payload.Category == "" {
+			payload.Category = derefString(caseRecord.CurrentCategory)
+		}
+		if payload.Confidence == 0 {
+			payload.Confidence = int(derefInt64(caseRecord.CurrentConfidenceScore))
+		}
+		if payload.WarningCommentID == 0 {
+			payload.WarningCommentID = derefInt64(caseRecord.WarningCommentID)
+		}
+		if payload.WarningMarkerUUID == "" {
+			payload.WarningMarkerUUID = derefString(caseRecord.WarningMarkerUUID)
+		}
+		if payload.WarningPostedAt == "" {
+			payload.WarningPostedAt = derefString(caseRecord.WarnedAt)
+		}
+		if payload.CloseBy == "" {
+			payload.CloseBy = derefString(caseRecord.CloseDueAt)
+		}
+	}
+	applyProposal, err := r.loadProposalForApply(ctx, payload, caseRecord)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	payload = hydratePayloadFromProposal(payload, applyProposal)
+	if strings.TrimSpace(payload.CommentBody) == "" && payload.Category != "" && payload.Rationale != "" && payload.CloseBy != "" {
+		payload.CommentBody = buildWarningComment(target, payload, gracePeriodForCategory(payload.Category, roleCfg))
+	}
+	stale, priorProposal, fingerprintJSON, err := r.staleProposalStatusForApply(target, caseRecord, roleCfg, applyProposal)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if stale {
+		payload.Outcome = outcomeNoAction
+		payload.Summary = "sweeper stale proposal"
+		if priorProposal != nil {
+			payload.ProposalID = priorProposal.ID
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_stale_proposal", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, priorProposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
+		return payload, "skipped", payload.Summary, nil
+	}
+	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
+	decision := categoryDecisionForPhase("close", category)
+	proposal, fingerprintJSON, err := r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if proposal != nil {
+		payload.ProposalID = proposal.ID
+	}
 	if strings.EqualFold(target.State, "closed") {
 		if err := r.removePendingLabel(ctx, roleCfg, payload.Repo, target.Number); err != nil {
 			return payload, "failed", "", err
 		}
 		payload.Outcome = outcomeAlreadyClosedByHuman
 		payload.Summary = "target already closed"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_cancelled", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "completed", payload.Summary, nil
 	}
 	if !hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
@@ -529,6 +809,12 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		payload.Summary = "sweeper warning cancelled"
 		if payload.WarningCommentID > 0 && r.github != nil && !roleCfg.DryRun {
 			_ = r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: payload.Repo, CommentID: payload.WarningCommentID, Body: payload.CommentBody + "\n\nCancellation noted by sweeper."})
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_cancelled", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
 		}
 		return payload, "completed", payload.Summary, nil
 	}
@@ -543,13 +829,24 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		if payload.WarningCommentID > 0 && r.github != nil && !roleCfg.DryRun {
 			_ = r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: payload.Repo, CommentID: payload.WarningCommentID, Body: payload.CommentBody + "\n\nCancellation noted by sweeper."})
 		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_cancelled", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "completed", payload.Summary, nil
 	}
-	category, _, rationale := classifyTarget(target, roleCfg, r.now())
 	if category == categoryRouteSecurity {
 		if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
 			payload.Outcome = outcomeDryRun
 			payload.Summary = "sweeper dry-run quarantine"
+			if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
+				return payload, "failed", "", err
+			}
+			if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+				return payload, "failed", "", err
+			}
 			return payload, "skipped", payload.Summary, nil
 		}
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Security.QuarantineLabel}}); err != nil {
@@ -558,6 +855,12 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		_ = r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}})
 		payload.Outcome = outcomeQuarantined
 		payload.Summary = "sweeper quarantined target"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_quarantined", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "completed", payload.Summary, nil
 	}
 	if category == categoryNone || (payload.Category != "" && category != payload.Category) {
@@ -566,19 +869,57 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		}
 		payload.Outcome = outcomeCancelled
 		payload.Summary = "sweeper close cancelled"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_cancelled", payload.Summary, nil, true); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "completed", payload.Summary, nil
 	}
 	closeComment := buildCloseComment(target, payload, rationale)
 	if roleCfg.DryRun || roleCfg.Limits.GlobalKillSwitch || r.github == nil {
 		payload.Outcome = outcomeDryRun
 		payload.Summary = "sweeper dry-run close"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_dry_run", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "skipped", payload.Summary, nil
 	}
-	if _, err := r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: payload.Repo, IssueNumber: target.Number, Body: closeComment}); err != nil {
+	applyStatus := ""
+	if applyProposal != nil && applyProposal.ApplyStatus != nil {
+		applyStatus = *applyProposal.ApplyStatus
+	}
+	if applyStatus != "partial:commented" && applyStatus != "partial:labeled" {
+		if _, err := r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: payload.Repo, IssueNumber: target.Number, Body: closeComment}); err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "close comment failed", &applyErr, false)
+			return payload, "failed", "", err
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:commented", "close comment posted", nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+	}
+	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
+		applyErr := err.Error()
+		_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "remove pending label failed", &applyErr, false)
+		return payload, "failed", "", err
+	}
+	if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.ClosedLabel}}); err != nil {
+		applyErr := err.Error()
+		_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "add closed label failed", &applyErr, false)
+		return payload, "failed", "", err
+	}
+	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:labeled", "close labels updated", nil, false); err != nil {
 		return payload, "failed", "", err
 	}
 	if target.IsPR {
 		if err := r.github.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: payload.Repo, PRNumber: target.Number}); err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "close target failed", &applyErr, false)
 			return payload, "failed", "", err
 		}
 	} else {
@@ -587,17 +928,19 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 			reason = "completed"
 		}
 		if err := r.github.CloseIssue(ctx, githubinfra.CloseIssueInput{Repo: payload.Repo, IssueNumber: target.Number, StateReason: reason}); err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "close target failed", &applyErr, false)
 			return payload, "failed", "", err
 		}
 	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
-		return payload, "failed", "", err
-	}
-	if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.ClosedLabel}}); err != nil {
-		return payload, "failed", "", err
-	}
 	payload.Outcome = outcomeClosed
 	payload.Summary = fmt.Sprintf("sweeper closed %s #%d", targetKind(target.IsPR), target.Number)
+	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_closed", payload.Summary, nil, true); err != nil {
+		return payload, "failed", "", err
+	}
+	if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+		return payload, "failed", "", err
+	}
 	return payload, "completed", payload.Summary, nil
 }
 
@@ -612,8 +955,54 @@ func (r *Runner) processReconcile(ctx context.Context, queueItem storage.QueueIt
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if caseRecord != nil {
+		payload.CaseID = caseRecord.ID
+		if payload.Category == "" {
+			payload.Category = derefString(caseRecord.CurrentCategory)
+		}
+		if payload.Confidence == 0 {
+			payload.Confidence = int(derefInt64(caseRecord.CurrentConfidenceScore))
+		}
+		if payload.WarningCommentID == 0 {
+			payload.WarningCommentID = derefInt64(caseRecord.WarningCommentID)
+		}
+		if payload.WarningMarkerUUID == "" {
+			payload.WarningMarkerUUID = derefString(caseRecord.WarningMarkerUUID)
+		}
+		if payload.WarningPostedAt == "" {
+			payload.WarningPostedAt = derefString(caseRecord.WarnedAt)
+		}
+		if payload.CloseBy == "" {
+			payload.CloseBy = derefString(caseRecord.CloseDueAt)
+		}
+	}
+	applyProposal, err := r.loadProposalForApply(ctx, payload, caseRecord)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	payload = hydratePayloadFromProposal(payload, applyProposal)
+	if strings.TrimSpace(payload.CommentBody) == "" && payload.Category != "" && payload.Rationale != "" && payload.CloseBy != "" {
+		payload.CommentBody = buildWarningComment(target, payload, gracePeriodForCategory(payload.Category, roleCfg))
+	}
+	proposal, fingerprintJSON, err := r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, "cancel", payload.Category, payload.Confidence, payload.Rationale)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if proposal != nil {
+		payload.ProposalID = proposal.ID
+	}
 	if hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
 		payload.Summary = "sweeper reconcile: still pending"
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_no_action", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
 		return payload, "skipped", payload.Summary, nil
 	}
 	payload.Phase = "reconcile"
@@ -622,6 +1011,12 @@ func (r *Runner) processReconcile(ctx context.Context, queueItem storage.QueueIt
 	}
 	payload.Outcome = outcomeCancelledByLabelRemoval
 	payload.Summary = "sweeper reconciled removed pending label"
+	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "completed_cancelled", payload.Summary, nil, true); err != nil {
+		return payload, "failed", "", err
+	}
+	if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+		return payload, "failed", "", err
+	}
 	return payload, "completed", payload.Summary, nil
 }
 
@@ -639,13 +1034,370 @@ func (r *Runner) loadTarget(ctx context.Context, item storage.QueueItemRecord) (
 		if err != nil {
 			return liveTarget{}, err
 		}
-		return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, UpdatedAt: detail.UpdatedAt, Author: detail.Author, Labels: append([]string(nil), detail.Labels...), IsPR: true, Draft: detail.IsDraft}, nil
+		return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.IssueComments...), HeadSHA: detail.HeadSHA, IsPR: true, Draft: detail.IsDraft}, nil
 	}
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: number})
 	if err != nil {
 		return liveTarget{}, err
 	}
-	return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, UpdatedAt: detail.UpdatedAt, Author: detail.Author, Labels: append([]string(nil), detail.Labels...)}, nil
+	return liveTarget{Number: detail.Number, State: detail.State, Title: detail.Title, Body: detail.Body, CreatedAt: detail.CreatedAt, UpdatedAt: detail.UpdatedAt, ClosedAt: detail.ClosedAt, Author: detail.Author, AuthorAssociation: detail.AuthorAssociation, Labels: append([]string(nil), detail.Labels...), CommentCount: detail.CommentCount, IssueComments: append([]githubinfra.CommentInfo(nil), detail.Comments...)}, nil
+}
+
+func (r *Runner) getCaseDiscoveryState(ctx context.Context, projectID, repo, targetType string, targetNumber int64, legacy map[string]sweeperStateRecord) (caseDiscoveryState, error) {
+	state := caseDiscoveryState{}
+	if r.repos != nil && r.repos.SweeperCases != nil {
+		caseRecord, err := r.repos.SweeperCases.GetByProjectRepoTarget(ctx, projectID, repo, targetType, targetNumber)
+		if err != nil {
+			return state, err
+		}
+		if caseRecord != nil {
+			state.Case = caseRecord
+			state.LastProposalID = derefString(caseRecord.LastProposalID)
+			state.CloseDueAt = derefString(caseRecord.CloseDueAt)
+			state.Phase = caseRecord.CurrentPhase
+			state.Outcome = caseRecord.Status
+			return state, nil
+		}
+	}
+	key := buildTargetID(repo, targetNumber)
+	legacyState, ok := legacy[key]
+	if ok {
+		state.Legacy = legacyState
+		state.HasLegacy = true
+		state.LastProposalID = legacyState.payload.ProposalID
+		state.CloseDueAt = legacyState.payload.CloseBy
+		state.Phase = legacyState.payload.Phase
+		state.Outcome = legacyState.payload.Outcome
+	}
+	return state, nil
+}
+
+func (r *Runner) ensureCase(ctx context.Context, projectID string, target liveTarget, payload sweeperPayload, roleCfg config.SweeperRoleConfig) (*storage.SweeperCaseRecord, error) {
+	_ = roleCfg
+	if r.repos == nil || r.repos.SweeperCases == nil {
+		return nil, nil
+	}
+	repo := strings.TrimSpace(firstNonEmpty(payload.Repo))
+	targetType := targetTypeFromBool(target.IsPR)
+	caseRecord, err := r.repos.SweeperCases.GetByProjectRepoTarget(ctx, projectID, repo, targetType, target.Number)
+	if err != nil {
+		return nil, err
+	}
+	if caseRecord != nil {
+		return caseRecord, nil
+	}
+	id := payload.CaseID
+	if strings.TrimSpace(id) == "" {
+		id = eventlog.NewEventID("sweeper_case")
+	}
+	nowISO := r.nowISO()
+	record := storage.SweeperCaseRecord{
+		ID:           id,
+		ProjectID:    projectID,
+		Repo:         repo,
+		TargetType:   targetType,
+		TargetNumber: target.Number,
+		Status:       "open",
+		CurrentPhase: "prefilter",
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}
+	if err := r.repos.SweeperCases.Upsert(ctx, record); err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+func (r *Runner) persistProposal(ctx context.Context, projectID string, target liveTarget, payload sweeperPayload, caseRecord *storage.SweeperCaseRecord, roleCfg config.SweeperRoleConfig, decision string, category string, confidence int, rationale string) (*storage.SweeperProposalRecord, string, error) {
+	if r.repos == nil || r.repos.SweeperProposals == nil || caseRecord == nil {
+		return nil, "", nil
+	}
+	if existingID := strings.TrimSpace(payload.ProposalID); existingID != "" {
+		existing, err := r.repos.SweeperProposals.GetByID(ctx, existingID)
+		if err != nil {
+			return nil, "", err
+		}
+		if existing != nil && existing.Decision == decision {
+			return existing, existing.FingerprintJSON, nil
+		}
+		if existing != nil && existing.Decision != decision {
+			payload.ProposalID = ""
+		}
+	}
+	repo := strings.TrimSpace(firstNonEmpty(payload.Repo))
+	factBundle := r.buildFactBundle(target, caseRecord, roleCfg)
+	factBundleJSON, err := json.Marshal(factBundle)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal sweeper fact bundle: %w", err)
+	}
+	fingerprintJSON, err := BuildFingerprint(factBundle)
+	if err != nil {
+		return nil, "", fmt.Errorf("build sweeper fingerprint: %w", err)
+	}
+	markerUUID := payload.WarningMarkerUUID
+	if strings.TrimSpace(markerUUID) == "" && decision == "warn" {
+		markerUUID = NewMarkerUUID()
+	}
+	proposalBody, err := json.Marshal(map[string]any{
+		"schemaVersion":   1,
+		"decision":        decision,
+		"category":        category,
+		"confidenceScore": confidence,
+		"rationale":       rationale,
+		"markerUUID":      markerUUID,
+		"fingerprint":     fingerprintJSON,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal sweeper proposal: %w", err)
+	}
+	proposalID := payload.ProposalID
+	if strings.TrimSpace(proposalID) == "" {
+		proposalID = eventlog.NewEventID("sweeper_proposal")
+	}
+	summary := payload.Summary
+	validationStatus := "passed"
+	record := storage.SweeperProposalRecord{
+		ID:               proposalID,
+		CaseID:           caseRecord.ID,
+		ProjectID:        projectID,
+		Repo:             repo,
+		TargetType:       targetTypeFromBool(target.IsPR),
+		TargetNumber:     target.Number,
+		SchemaVersion:    1,
+		ProposerKind:     "heuristic_v1",
+		FactBundleJSON:   string(factBundleJSON),
+		FingerprintJSON:  fingerprintJSON,
+		ProposalJSON:     string(proposalBody),
+		Decision:         decision,
+		Category:         category,
+		ConfidenceScore:  int64(confidence),
+		Summary:          optionalString(summary),
+		Rationale:        optionalString(rationale),
+		MarkerUUID:       optionalString(markerUUID),
+		ValidationStatus: &validationStatus,
+		CreatedAt:        r.nowISO(),
+	}
+	if err := r.repos.SweeperProposals.Insert(ctx, record); err != nil {
+		return nil, "", err
+	}
+	return &record, fingerprintJSON, nil
+}
+
+func (r *Runner) updateProposalApplyReceipt(ctx context.Context, proposalID string, applyStatus string, applySummary string, applyError *string, terminal bool) error {
+	if r.repos == nil || r.repos.SweeperProposals == nil || strings.TrimSpace(proposalID) == "" {
+		return nil
+	}
+	var appliedAt *string
+	if terminal {
+		appliedAt = stringPtr(r.nowISO())
+	}
+	return r.repos.SweeperProposals.UpdateApplyReceipt(ctx, proposalID, applyStatus, optionalString(applySummary), applyError, appliedAt)
+}
+
+func (r *Runner) syncCase(ctx context.Context, projectID string, target liveTarget, payload sweeperPayload, proposal *storage.SweeperProposalRecord, fingerprintJSON string, roleCfg config.SweeperRoleConfig) error {
+	if r.repos == nil || r.repos.SweeperCases == nil {
+		return nil
+	}
+	caseRecord, err := r.ensureCase(ctx, projectID, target, payload, roleCfg)
+	if err != nil || caseRecord == nil {
+		return err
+	}
+	record := *caseRecord
+	record.Status = caseStatusFromOutcome(payload.Outcome)
+	record.CurrentPhase = casePhaseFromPayload(payload)
+	record.CurrentCategory = optionalString(payload.Category)
+	record.CurrentConfidenceScore = optionalInt64(int64(payload.Confidence))
+	if payload.WarningCommentID > 0 {
+		record.WarningCommentID = optionalInt64(payload.WarningCommentID)
+	}
+	record.WarningMarkerUUID = optionalString(payload.WarningMarkerUUID)
+	if proposal != nil {
+		record.LastProposalID = &proposal.ID
+	}
+	record.LastFingerprintJSON = optionalString(fingerprintJSON)
+	lastHumanCommentAt, _ := DeriveHumanCommentStats(target.IssueComments, nil, roleCfg.Triggers.ExcludeAuthors, "")
+	record.LastHumanActivityAt = optionalString(lastHumanCommentAt)
+	record.WarnedAt = optionalString(payload.WarningPostedAt)
+	record.CloseDueAt = optionalString(payload.CloseBy)
+	if terminalOutcome := terminalOutcomeFromPayload(payload); terminalOutcome != "" {
+		record.TerminalOutcome = &terminalOutcome
+		record.TerminalAt = stringPtr(r.nowISO())
+	}
+	record.UpdatedAt = r.nowISO()
+	return r.repos.SweeperCases.Upsert(ctx, record)
+}
+
+func (r *Runner) loadProposalForApply(ctx context.Context, payload sweeperPayload, caseRecord *storage.SweeperCaseRecord) (*storage.SweeperProposalRecord, error) {
+	if r.repos == nil || r.repos.SweeperProposals == nil {
+		return nil, nil
+	}
+	proposalID := strings.TrimSpace(payload.ProposalID)
+	if proposalID != "" {
+		return r.repos.SweeperProposals.GetByID(ctx, proposalID)
+	}
+	if caseRecord != nil {
+		return r.repos.SweeperProposals.GetLatestByCaseID(ctx, caseRecord.ID)
+	}
+	return nil, nil
+}
+
+func (r *Runner) staleProposalStatusForApply(target liveTarget, caseRecord *storage.SweeperCaseRecord, roleCfg config.SweeperRoleConfig, proposal *storage.SweeperProposalRecord) (bool, *storage.SweeperProposalRecord, string, error) {
+	if proposal == nil {
+		return false, nil, "", nil
+	}
+	bundle := r.buildFactBundle(target, caseRecord, roleCfg)
+	fingerprintJSON, err := BuildFingerprint(bundle)
+	if err != nil {
+		return false, proposal, "", err
+	}
+	if strings.TrimSpace(proposal.FingerprintJSON) != strings.TrimSpace(fingerprintJSON) {
+		return true, proposal, fingerprintJSON, nil
+	}
+	return false, proposal, fingerprintJSON, nil
+}
+
+func markerComment(issueComments []githubinfra.CommentInfo, markerUUID string) *githubinfra.CommentInfo {
+	markerUUID = strings.TrimSpace(markerUUID)
+	if markerUUID == "" {
+		return nil
+	}
+	needle := "looper:sweeper:warn id=" + markerUUID
+	for i := range issueComments {
+		if strings.Contains(issueComments[i].Body, needle) {
+			return &issueComments[i]
+		}
+	}
+	return nil
+}
+
+func warningCommentCloseBy(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	const prefix = "This will be eligible for closure after "
+	const suffix = " unless someone comments or removes `"
+	idx := strings.Index(body, prefix)
+	if idx < 0 {
+		return ""
+	}
+	segment := body[idx+len(prefix):]
+	end := strings.Index(segment, suffix)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(segment[:end])
+}
+
+func (r *Runner) buildFactBundle(target liveTarget, caseRecord *storage.SweeperCaseRecord, roleCfg config.SweeperRoleConfig) FactBundle {
+	body, truncated := TruncateFactBody(target.Body)
+	lastHumanCommentAt, humanCommentCount := DeriveHumanCommentStats(target.IssueComments, nil, roleCfg.Triggers.ExcludeAuthors, "")
+	bundle := FactBundle{
+		Repo:                       caseRecord.Repo,
+		TargetType:                 targetTypeFromBool(target.IsPR),
+		Number:                     target.Number,
+		State:                      target.State,
+		IsDraft:                    target.Draft,
+		HeadSHA:                    target.HeadSHA,
+		CreatedAt:                  target.CreatedAt,
+		UpdatedAt:                  target.UpdatedAt,
+		ClosedAt:                   target.ClosedAt,
+		Title:                      target.Title,
+		Body:                       body,
+		BodyTruncated:              truncated,
+		Author:                     target.Author,
+		AuthorAssociation:          target.AuthorAssociation,
+		Labels:                     append([]string(nil), target.Labels...),
+		PolicyLabelsPresent:        PolicyLabelsPresent(target.Labels, roleCfg),
+		CommentCount:               target.CommentCount,
+		PolicySnapshot:             roleCfg,
+		LastHumanCommentAt:         lastHumanCommentAt,
+		HumanCommentCountSinceOpen: humanCommentCount,
+	}
+	if caseRecord != nil {
+		bundle.Case = FactBundleCase{
+			CurrentPhase:        caseRecord.CurrentPhase,
+			WarnedAt:            derefString(caseRecord.WarnedAt),
+			CloseDueAt:          derefString(caseRecord.CloseDueAt),
+			WarningMarkerUUID:   derefString(caseRecord.WarningMarkerUUID),
+			LastHumanActivityAt: derefString(caseRecord.LastHumanActivityAt),
+		}
+	}
+	return bundle
+}
+
+func categoryDecisionForPhase(phase, category string) string {
+	if category == categoryNone {
+		return "no_action"
+	}
+	if category == categoryRouteSecurity {
+		return "quarantine"
+	}
+	if phase == "close" {
+		return "close"
+	}
+	return "warn"
+}
+
+func casePhaseFromPayload(payload sweeperPayload) string {
+	if payload.Outcome == outcomeClosed || payload.Outcome == outcomeCancelled || payload.Outcome == outcomeCancelledByLabelRemoval || payload.Outcome == outcomeAlreadyClosedByHuman || payload.Outcome == outcomeQuarantined {
+		return "terminal"
+	}
+	if strings.TrimSpace(payload.Phase) != "" {
+		return payload.Phase
+	}
+	return "prefilter"
+}
+
+func caseStatusFromOutcome(outcome string) string {
+	switch outcome {
+	case outcomePending:
+		return "pending"
+	case outcomeClosed, outcomeCancelled, outcomeCancelledByLabelRemoval, outcomeAlreadyClosedByHuman:
+		return "terminal"
+	case outcomeQuarantined:
+		return "quarantined"
+	default:
+		return "open"
+	}
+}
+
+func terminalOutcomeFromPayload(payload sweeperPayload) string {
+	switch payload.Outcome {
+	case outcomeClosed, outcomeCancelled, outcomeCancelledByLabelRemoval, outcomeAlreadyClosedByHuman, outcomeQuarantined:
+		return payload.Outcome
+	default:
+		return ""
+	}
+}
+
+func targetTypeFromBool(isPR bool) string {
+	if isPR {
+		return "pull_request"
+	}
+	return "issue"
+}
+
+func derefStringFromCase(record *storage.SweeperCaseRecord) string {
+	if record == nil {
+		return ""
+	}
+	return record.ID
+}
+
+func optionalString(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func optionalInt64(value int64) *int64 {
+	if value == 0 {
+		return nil
+	}
+	return &value
 }
 
 func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now time.Time) (string, int, string) {
@@ -714,8 +1466,12 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 	return false
 }
 
+func (r *Runner) prefilterSkipCandidate(candidate prefilterCandidate, legacyState sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+	return r.shouldSkipSummary(candidate.Labels, candidate.Author, candidate.Association, legacyState, roleCfg)
+}
+
 func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
-	if state.payload.Outcome != outcomeClosed {
+	if state.payload.Outcome != outcomeClosed && state.item.Type != QueueTypeClose {
 		return true
 	}
 	closedAt, ok := parseGitHubTimestamp(firstNonEmpty(state.item.UpdatedAt, state.item.CreatedAt))
@@ -729,7 +1485,7 @@ func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.S
 func (r *Runner) discoveryBudgets(ctx context.Context, input DiscoveryInput, roleCfg config.SweeperRoleConfig) (int, int, error) {
 	warnLimit := r.discoveryLimit(input.Limit, roleCfg.Triggers.MaxPerTick)
 	closeLimit := warnLimit * 3
-	remainingWarn, remainingClose, err := r.remainingDailyDiscoveryBudget(ctx, input.Repo, roleCfg)
+	remainingWarn, remainingClose, err := r.remainingDailyDiscoveryBudget(ctx, input.ProjectID, input.Repo, roleCfg)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -748,29 +1504,28 @@ func (r *Runner) discoveryBudgets(ctx context.Context, input DiscoveryInput, rol
 	return warnLimit, closeLimit, nil
 }
 
-func (r *Runner) remainingDailyDiscoveryBudget(ctx context.Context, repo string, roleCfg config.SweeperRoleConfig) (int, int, error) {
-	if r.repos == nil || r.repos.Queue == nil {
-		return 0, 0, fmt.Errorf("sweeper queue repository is not configured")
+func (r *Runner) remainingDailyDiscoveryBudget(ctx context.Context, projectID, repo string, roleCfg config.SweeperRoleConfig) (int, int, error) {
+	if r.repos == nil || r.repos.SweeperProposals == nil {
+		return 0, 0, fmt.Errorf("sweeper proposal repository is not configured")
 	}
-	items, err := r.repos.Queue.List(ctx)
+	dayStart := r.now().UTC().Format("2006-01-02T00:00:00.000Z")
+	warnApplied, err := r.repos.SweeperProposals.CountAppliedByRepoAndDecisionSince(ctx, projectID, repo, "warn", dayStart)
 	if err != nil {
 		return 0, 0, err
 	}
-	today := r.now().UTC().Format("2006-01-02")
-	warnUsed := 0
-	closeUsed := 0
-	for _, item := range items {
-		if derefString(item.Repo) != repo || !strings.HasPrefix(item.CreatedAt, today) {
-			continue
-		}
-		switch item.Type {
-		case QueueTypeWarn:
-			warnUsed++
-		case QueueTypeClose:
-			closeUsed++
-		}
+	warnInflight, err := r.repos.SweeperProposals.CountInflightByRepoAndDecision(ctx, projectID, repo, "warn")
+	if err != nil {
+		return 0, 0, err
 	}
-	return remainingCount(roleCfg.Limits.MaxWarningsPerRepoPerDay, warnUsed), remainingCount(roleCfg.Limits.MaxClosesPerRepoPerDay, closeUsed), nil
+	closeApplied, err := r.repos.SweeperProposals.CountAppliedByRepoAndDecisionSince(ctx, projectID, repo, "close", dayStart)
+	if err != nil {
+		return 0, 0, err
+	}
+	closeInflight, err := r.repos.SweeperProposals.CountInflightByRepoAndDecision(ctx, projectID, repo, "close")
+	if err != nil {
+		return 0, 0, err
+	}
+	return remainingCount(roleCfg.Limits.MaxWarningsPerRepoPerDay, int(warnApplied+warnInflight)), remainingCount(roleCfg.Limits.MaxClosesPerRepoPerDay, int(closeApplied+closeInflight)), nil
 }
 
 func remainingCount(limit, used int) int {
@@ -834,8 +1589,29 @@ func (r *Runner) readPayload(item storage.QueueItemRecord) sweeperPayload {
 }
 
 func mustMarshalPayload(payload sweeperPayload) string {
-	encoded, _ := json.Marshal(payloadEnvelope{Sweeper: payload})
+	encoded, _ := json.Marshal(struct {
+		Sweeper persistedSweeperPayload `json:"sweeper"`
+	}{Sweeper: persistedSweeperPayload{CaseID: payload.CaseID, ProposalID: payload.ProposalID}})
 	return string(encoded)
+}
+
+func hydratePayloadFromProposal(payload sweeperPayload, proposal *storage.SweeperProposalRecord) sweeperPayload {
+	if proposal == nil {
+		return payload
+	}
+	if strings.TrimSpace(payload.Category) == "" {
+		payload.Category = proposal.Category
+	}
+	if payload.Confidence == 0 {
+		payload.Confidence = int(proposal.ConfidenceScore)
+	}
+	if strings.TrimSpace(payload.Rationale) == "" {
+		payload.Rationale = derefString(proposal.Rationale)
+	}
+	if strings.TrimSpace(payload.WarningMarkerUUID) == "" {
+		payload.WarningMarkerUUID = derefString(proposal.MarkerUUID)
+	}
+	return payload
 }
 
 func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.ProjectRecord, config.SweeperRoleConfig, error) {
@@ -1022,4 +1798,11 @@ func derefString(value *string) string {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func derefInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
