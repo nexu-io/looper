@@ -82,7 +82,7 @@ looper daemon logs
 
 Launchd mode:
 
-- creates a user LaunchAgent plist at `~/Library/LaunchAgents/com.nexu-io.looper.looperd.plist` unless `daemon.plistPath` is set
+- creates a user LaunchAgent plist at `~/Library/LaunchAgents/io.nexu.looper.looperd.plist` unless `daemon.plistPath` is set (any leftover plist at the legacy `com.nexu-io.looper.looperd.plist` path is unloaded and removed automatically on the next `daemon start --daemon-mode launchd`)
 - stores launchd stdout/stderr logs under `~/.looper/logs/launchd/`
 - stores startup logs under `~/.looper/logs/startup/`
 - stores lifecycle state in `~/.looper/looperd.state.json`
