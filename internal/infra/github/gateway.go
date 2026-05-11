@@ -548,7 +548,12 @@ func issueListLabels(input ListOpenIssuesInput) []string {
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d", input.Repo, input.IssueNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return IssueDetail{}, err
 	}
@@ -1891,6 +1896,14 @@ func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 		return repo
 	}
 	return parsed.Hostname() + "/" + repo
+}
+
+func splitRepoHostname(repo string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]) + "/" + strings.TrimSpace(parts[2])
+	}
+	return "", strings.TrimSpace(repo)
 }
 
 func summarizeChecks(checks []map[string]any) string {

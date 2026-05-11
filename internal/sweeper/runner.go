@@ -738,19 +738,11 @@ func authorAssociationExcluded(authorAssociation string, roleCfg config.SweeperR
 	return false
 }
 
-func issueDetailLookupRepo(repo string) string {
-	parts := strings.Split(strings.TrimSpace(repo), "/")
-	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
-		return strings.TrimSpace(parts[1]) + "/" + strings.TrimSpace(parts[2])
-	}
-	return strings.TrimSpace(repo)
-}
-
 func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, cwd string, number int64, current string, roleCfg config.SweeperRoleConfig) (string, bool) {
 	if strings.TrimSpace(current) != "" || len(roleCfg.Triggers.ExcludeAuthorAssociations) == 0 || r.github == nil {
 		return current, true
 	}
-	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueDetailLookupRepo(repo), IssueNumber: number, CWD: cwd})
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: strings.TrimSpace(repo), IssueNumber: number, CWD: cwd})
 	if err != nil {
 		return "", false
 	}

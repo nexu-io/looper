@@ -166,13 +166,13 @@ func TestDiscoverPullRequestsSkipsExcludedAuthorBeforeAuthorAssociationLookup(t 
 	}
 }
 
-func TestDiscoverIssuesBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
+func TestDiscoverIssuesBackfillsAssociationUsingHostQualifiedRepo(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
 	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"OWNER"}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo"}}
-	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
+	fixture.github.issueDetails["github.example.com/acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "OWNER"}
 
 	result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
 	if err != nil {
@@ -184,21 +184,21 @@ func TestDiscoverIssuesBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
 	if fixture.github.viewIssueCalls != 1 {
 		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
 	}
-	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
-		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "github.example.com/acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [github.example.com/acme/looper]", got)
 	}
 	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
 		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)
 	}
 }
 
-func TestDiscoverPullRequestsBackfillsAssociationUsingOwnerRepoPath(t *testing.T) {
+func TestDiscoverPullRequestsBackfillsAssociationUsingHostQualifiedRepo(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
 	fixture.cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"MEMBER"}
 	fixture.github.prs = []githubinfra.PullRequestSummary{{Number: 1, Title: "stale pr", Author: "octo", UpdatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(javaScriptISOStringUTC)}}
-	fixture.github.issueDetails["acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "MEMBER"}
+	fixture.github.issueDetails["github.example.com/acme/looper#1"] = githubinfra.IssueDetail{Number: 1, AuthorAssociation: "MEMBER"}
 
 	result, err := fixture.runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"})
 	if err != nil {
@@ -210,8 +210,8 @@ func TestDiscoverPullRequestsBackfillsAssociationUsingOwnerRepoPath(t *testing.T
 	if fixture.github.viewIssueCalls != 1 {
 		t.Fatalf("ViewIssue() calls = %d, want 1", fixture.github.viewIssueCalls)
 	}
-	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "acme/looper" {
-		t.Fatalf("ViewIssue() repos = %v, want [acme/looper]", got)
+	if got := fixture.github.viewIssueRepos; len(got) != 1 || got[0] != "github.example.com/acme/looper" {
+		t.Fatalf("ViewIssue() repos = %v, want [github.example.com/acme/looper]", got)
 	}
 	if got := fixture.github.viewIssueCWDs; len(got) != 1 || got[0] == "" {
 		t.Fatalf("ViewIssue() CWDs = %v, want project repo path", got)

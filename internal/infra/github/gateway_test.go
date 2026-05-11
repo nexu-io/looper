@@ -1107,6 +1107,26 @@ func TestGatewayIsAuthenticatedScopesStatusToHostname(t *testing.T) {
 	}
 }
 
+func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/issues/8 --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"number":8,"title":"Issue","body":"Body","state":"open","updated_at":"2026-05-01T00:00:00Z","user":{"login":"octo"},"author_association":"MEMBER","labels":[]}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewIssue(context.Background(), ViewIssueInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ViewIssue() error = %v", err)
+	}
+	if detail.Number != 8 || detail.AuthorAssociation != "MEMBER" {
+		t.Fatalf("ViewIssue() = %#v, want parsed enterprise issue detail", detail)
+	}
+}
+
 func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
