@@ -95,6 +95,66 @@ func TestReadConfigFileRejectsUnknownNestedKeys(t *testing.T) {
 	}
 }
 
+func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"Server":{"host":"0.0.0.0"},"SCHEDULER":{"pollIntervalSeconds":7}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "0.0.0.0" {
+		t.Fatalf("readConfigFile() server host = %#v, want 0.0.0.0", partial.Server)
+	}
+	if partial.Scheduler == nil || partial.Scheduler.PollIntervalSeconds == nil || *partial.Scheduler.PollIntervalSeconds != 7 {
+		t.Fatalf("readConfigFile() scheduler = %#v, want pollIntervalSeconds 7", partial.Scheduler)
+	}
+}
+
+func TestReadConfigFileLastMatchingTopLevelKeyWinsAcrossCaseVariants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"SERVER":{"host":"0.0.0.0"},"Server":{"host":"127.0.0.2"}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "127.0.0.2" {
+		t.Fatalf("readConfigFile() server host = %#v, want 127.0.0.2", partial.Server)
+	}
+}
+
+func TestReadConfigFileLastMatchingTopLevelKeyCanOverrideInvalidEarlierCaseVariant(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{"SERVER":{"bad":1},"Server":{"host":"127.0.0.2"}}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	partial, present, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatal("readConfigFile() present = false, want true")
+	}
+	if partial.Server == nil || partial.Server.Host == nil || *partial.Server.Host != "127.0.0.2" {
+		t.Fatalf("readConfigFile() server host = %#v, want 127.0.0.2", partial.Server)
+	}
+}
+
 func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	cfg, err := Normalize(t.TempDir())
 	if err != nil {
