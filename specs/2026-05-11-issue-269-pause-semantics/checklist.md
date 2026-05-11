@@ -14,44 +14,44 @@
 
 ## Phase 1 - Shared policy helpers
 
-- [ ] Introduce shared helper(s) for “should this failure pause the loop?”
-- [ ] Introduce shared helper(s) for “should this state restart from discover?”
-- [ ] Introduce shared helper(s) for “is this a true hard hold?”
-- [ ] Introduce shared helper(s) for “should autonomous recovery be suppressed?”
-- [ ] Introduce shared helper(s) for default resume-policy normalization
-- [ ] Centralize the meaning of `manual_intervention` vs `restart_from_discover`
-- [ ] Remove duplicated ad hoc `FailureManualIntervention => paused` logic where practical
-- [ ] Ensure helper behavior can inspect queue outcome + resume policy together
-- [ ] Audit all `createRunContext` / resume-gating logic for `manual_intervention`
+- [x] Introduce shared helper(s) for “should this failure pause the loop?”
+- [x] Introduce shared helper(s) for “should this state restart from discover?”
+- [x] Introduce shared helper(s) for “is this a true hard hold?”
+- [x] Introduce shared helper(s) for “should autonomous recovery be suppressed?”
+- [x] Introduce shared helper(s) for default resume-policy normalization
+- [x] Centralize the meaning of `manual_intervention` vs `restart_from_discover`
+- [x] Remove duplicated ad hoc `FailureManualIntervention => paused` logic where practical
+- [x] Ensure helper behavior can inspect queue outcome + resume policy together
+- [x] Audit all `createRunContext` / resume-gating logic for `manual_intervention`
 - [ ] Audit all rediscovery/recovery filters that exclude loops by `paused`, `failed`, or `manual_intervention`
-- [ ] Centralize hard-hold vs safe-blocked semantics in one shared policy path
+- [x] Centralize hard-hold vs safe-blocked semantics in one shared policy path
 
 ## Phase 2 - Fixer
 
 - [x] Keep fixer agent setup failures retryable rather than permanently paused
 - [x] Keep fixer no-new-commit `resolve-comments` path rediscoverable
 - [x] Preserve explicit `restart_from_discover` semantics through run failure handling
-- [ ] Keep dirty worktree / unsafe repo states paused
-- [ ] Keep risky conflict gates paused when explicit human approval is required
+- [x] Keep dirty worktree / unsafe repo states paused
+- [x] Keep risky conflict gates paused when explicit human approval is required
 - [ ] Split auto-commit-disabled cases into:
   - [ ] safe policy-blocked states
-  - [ ] genuinely unsafe manual-hold states
-- [ ] Decide v1 semantics for `allowAutoPush=false`
-- [ ] If `allowAutoPush=false` remains a hard hold in v1, document it as an explicit temporary exception
+  - [x] genuinely unsafe manual-hold states
+- [x] Decide v1 semantics for `allowAutoPush=false`
+- [x] If `allowAutoPush=false` remains a hard hold in v1, document it as an explicit temporary exception
 - [ ] For fixer safe policy blockers, specify:
   - [ ] expected loop status
   - [ ] expected failure kind
   - [ ] expected resume policy
   - [ ] expected re-entry trigger
   - [ ] expected user-facing summary/message
-- [ ] Ensure fixer discover still skips genuinely paused loops
+- [x] Ensure fixer discover still skips genuinely paused loops
 - [ ] Add/update fixer tests for:
   - [x] agent setup failure
   - [x] no-new-commit resolve-comments path
-  - [ ] dirty worktree unsafe hold
-  - [ ] risky conflict gate
+  - [x] dirty worktree unsafe hold
+  - [x] risky conflict gate
   - [ ] auto-commit-disabled safe vs unsafe split
-  - [ ] auto-push-disabled behavior
+  - [x] auto-push-disabled behavior
 
 ## Phase 3 - Worker
 
@@ -133,8 +133,8 @@
 - [ ] Verify CLI/API/user-facing outputs do not label safe blocked states as “paused”
 - [ ] Verify notifications/comments distinguish hard hold vs retryable/safe blocked failures
 - [x] Run fixer tests
-- [ ] Run worker tests
-- [ ] Run planner tests
-- [ ] Run runtime tests
+- [x] Run worker tests
+- [x] Run planner tests
+- [x] Run runtime tests
 - [x] Run full `go test ./...`
 - [x] Verify any unrelated pre-existing failures separately from issue-269 changes

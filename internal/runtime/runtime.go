@@ -1684,12 +1684,9 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy == "manual_intervention" {
-		return false
-	}
 	queueKind := derefString(latestQueue.LastErrorKind)
 	queueMessage := derefString(latestQueue.LastError)
-	if queueKind == "manual_intervention" {
+	if loops.SuppressesAutonomousRecovery(queueKind, checkpoint.ResumePolicy) {
 		return false
 	}
 	if checkpoint.Detail == nil {

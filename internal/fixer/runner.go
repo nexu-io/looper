@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -956,7 +957,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if shouldPauseLoopAfterFailure(failureKind, failedQueue, "") {
+			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -1034,9 +1035,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-		if latest.ResumePolicy == "" {
-			latest.ResumePolicy = "replay_step"
-		}
+		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
@@ -1050,7 +1049,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				updated.Status = "queued"
 				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 			} else {
-				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+				if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 					updated.Status = "paused"
 				} else {
 					updated.Status = "failed"
@@ -1101,22 +1100,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := checkpoint
-			resumePolicy := latest.ResumePolicy
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				if strings.TrimSpace(resumePolicy) == "" {
-					resumePolicy = "advance_from_checkpoint"
-				}
-			case FailureManualIntervention:
-				if strings.TrimSpace(resumePolicy) == "" {
-					resumePolicy = "manual_intervention"
-				}
-			default:
-				if resumePolicy == "" {
-					resumePolicy = "replay_step"
-				}
-			}
-			latest.ResumePolicy = resumePolicy
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -1133,7 +1117,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if shouldPauseLoopAfterFailure(failure.kind, failedQueue, latest.ResumePolicy) {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
@@ -1323,6 +1307,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
 	preparedAt := r.nowISO()
@@ -1350,9 +1335,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if !r.allowRiskyFixes {
 		for _, item := range checkpoint.FixItems {
 			if item.Type == "conflict" {
-				checkpoint.SkipReason = fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber)
-				checkpoint.ResumePolicy = "manual_intervention"
-				return checkpoint, nil
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 			}
 		}
 	}
@@ -1485,9 +1469,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	if !r.allowAutoPush {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "auto_push_disabled"}})
-		checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Auto push disabled"}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch), kind: FailureManualIntervention}
 	}
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
@@ -1571,7 +1555,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems) {
-		checkpoint.ResumePolicy = "restart_from_discover"
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureRetryableAfterResume}
 	}
 	if checkpoint.ResolvedComments == nil {
@@ -2086,7 +2070,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || shouldRestartFromDiscoverByResumePolicy(latestRun.Status, checkpoint)
+		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
@@ -2362,6 +2346,7 @@ func (r *Runner) reconcileCommits(ctx context.Context, checkpoint fixerCheckpoin
 	committedByLoop := false
 	if initial.HasUncommittedChanges {
 		if !r.allowAutoCommit {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			return checkpoint, &loopError{message: fmt.Sprintf("Auto commit disabled but fixer worktree has uncommitted changes: %s", firstNonEmpty(strings.Join(initial.ChangedFiles, ", "), "unknown files")), kind: FailureManualIntervention}
 		}
 		if _, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: commitMessage}); err != nil {
@@ -2914,28 +2899,6 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 		return true
 	}
 	return strings.Contains(failureSummary, "PR head changed before resolving comments")
-}
-
-func shouldRestartFromDiscoverByResumePolicy(status string, checkpoint fixerCheckpoint) bool {
-	if status != "failed" && status != "interrupted" {
-		return false
-	}
-	switch checkpoint.ResumePolicy {
-	case "manual_intervention", "restart_from_discover":
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldPauseLoopAfterFailure(failureKind QueueFailureKind, failedQueue *storage.QueueItemRecord, resumePolicy string) bool {
-	if failedQueue != nil && failedQueue.Status == "cancelled" {
-		return true
-	}
-	if strings.TrimSpace(resumePolicy) != "" {
-		return resumePolicy == "manual_intervention"
-	}
-	return failureKind == FailureManualIntervention
 }
 
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {

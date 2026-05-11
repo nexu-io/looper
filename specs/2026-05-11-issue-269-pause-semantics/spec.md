@@ -238,6 +238,12 @@ Recommended v1 treatment:
 - keep the loop visible for rediscovery only when there is a meaningful state change trigger
 - if that state-change gate is not yet implemented, explicitly treat it as a temporary hard-hold exception and document that exception clearly
 
+Current Phase 2 implementation decision:
+
+- `allowAutoPush=false` remains a temporary hard-hold exception in v1
+- the fixer run now fails with `manual_intervention` and leaves the loop `paused` rather than silently completing as skipped
+- this exception should be revisited once there is a concrete autonomous re-entry trigger for policy changes or manual push completion
+
 Safe policy blockers must **not** keep using `manual_intervention` as a compatibility label while still being considered autonomous. If a v1 path still uses `manual_intervention`, it must be treated as a true hard hold and excluded from the “issue solved” set for that scenario.
 
 ## 7.2 Worker
