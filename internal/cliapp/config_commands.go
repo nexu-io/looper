@@ -224,7 +224,12 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) loadConfigForEdit() (config.LoadedFileConfig, error) {
-	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
+	if err != nil {
+		return config.LoadedFileConfig{}, err
+	}
+	r.emitConfigLoadNotices(loaded)
+	return loaded, nil
 }
 
 func (r *commandRuntime) loadRawConfigForEdit() (config.LoadedFileConfig, error) {

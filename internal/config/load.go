@@ -31,6 +31,7 @@ type LoadedFileConfig struct {
 	Metadata LoadFileMetadata
 	Partial  PartialConfig
 	Warnings []string
+	Notices  []string
 }
 
 type LoadFileOptions struct {
@@ -107,6 +108,10 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	fileWarnings := collectMixedSchemaWarnings(partialConfig)
+	fileNotices, err := collectConfigLoadNotices(resolvedConfigPath, present)
+	if err != nil {
+		return LoadedFileConfig{}, err
+	}
 	envWarnings := collectDeprecatedEnvWarnings(lookupEnv)
 	cliWarnings := collectDeprecatedCLIWarnings(options.Args)
 	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
@@ -133,12 +138,29 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		Config:   config,
 		Partial:  partialConfig,
 		Warnings: dedupeWarnings(fileWarnings, envWarnings, cliWarnings),
+		Notices:  fileNotices,
 		Metadata: LoadFileMetadata{
 			ConfigPath:        resolvedConfigPath,
 			ConfigFilePresent: present,
 			ToolDetection:     toolDetection.Detection,
 		},
 	}, nil
+}
+
+func collectConfigLoadNotices(resolvedConfigPath string, present bool) ([]string, error) {
+	if !present {
+		return nil, nil
+	}
+	looperHome, err := DefaultLooperHome()
+	if err != nil {
+		return nil, err
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	canonicalDefaultPath := filepath.Join(looperHome, "config.toml")
+	if filepath.Clean(resolvedConfigPath) != filepath.Clean(legacyDefaultPath) {
+		return nil, nil
+	}
+	return []string{legacyDefaultConfigMigrationNote(legacyDefaultPath, canonicalDefaultPath)}, nil
 }
 
 func DiscoverDefaultConfigPath() (string, error) {

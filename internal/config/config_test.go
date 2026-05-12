@@ -925,6 +925,13 @@ func assertWarningsEqual(t *testing.T, got []string, want []string) {
 	}
 }
 
+func assertNoticesEqual(t *testing.T, got []string, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("notices = %#v, want %#v", got, want)
+	}
+}
+
 func roleConfigMapFromRoles(t *testing.T, roles any, role string) (map[string]any, bool) {
 	t.Helper()
 	raw := toJSONValue(t, roles)
@@ -1965,6 +1972,65 @@ func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
 	if got := err.Error(); !strings.Contains(got, "multiple default config files found") || !strings.Contains(got, "config.toml") || !strings.Contains(got, "config.json") {
 		t.Fatalf("LoadFile() error = %q, want multiple-default-files error", got)
 	}
+}
+
+func TestLoadFileLegacyDefaultConfigJSONEmitsMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	canonicalDefaultPath := filepath.Join(looperHome, "config.toml")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	wantNotices := []string{legacyDefaultConfigMigrationNote(legacyDefaultPath, canonicalDefaultPath)}
+
+	t.Run("discovered default path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+
+	t.Run("explicit env path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": legacyDefaultPath})})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+
+	t.Run("explicit cli path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), Args: []string{"--config", legacyDefaultPath}, LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+}
+
+func TestLoadFileDoesNotEmitMigrationNoteForNonLegacyDefaultJSON(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	otherJSONPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(otherJSONPath, []byte(`{"server":{"port":7500}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), ConfigPath: otherJSONPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	assertNoticesEqual(t, loaded.Notices, nil)
 }
 
 func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {

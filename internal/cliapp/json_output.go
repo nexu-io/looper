@@ -18,14 +18,15 @@ import (
 )
 
 type commandRuntime struct {
-	app               *App
-	argv              []string
-	startupOutputPath string
-	skipAPIStartProbe bool
+	app                *App
+	argv               []string
+	startupOutputPath  string
+	skipAPIStartProbe  bool
+	emittedConfigNotes map[string]struct{}
 }
 
 func newCommandRuntime(app *App, argv []string) *commandRuntime {
-	return &commandRuntime{app: app, argv: append([]string{}, argv...)}
+	return &commandRuntime{app: app, argv: append([]string{}, argv...), emittedConfigNotes: map[string]struct{}{}}
 }
 
 func (r *commandRuntime) status(cmd *cobra.Command, args []string) error {

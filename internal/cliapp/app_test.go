@@ -1320,6 +1320,46 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 }
 
+func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "validate")
+	if exitCode != 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid: "+legacyDefaultPath) {
+		t.Fatalf("stdout = %q, want config-valid output for %q", stdout, legacyDefaultPath)
+	}
+	if !strings.Contains(stderr, "note: legacy default config file ") || !strings.Contains(stderr, legacyDefaultPath) || !strings.Contains(stderr, filepath.Join(looperHome, "config.toml")) || !strings.Contains(stderr, "docs/configuration.md") {
+		t.Fatalf("stderr = %q, want migration note", stderr)
+	}
+	if _, err := os.Stat(legacyDefaultPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want legacy config file preserved", legacyDefaultPath, err)
+	}
+}
+
+func TestEmitConfigLoadNoticesPrintsEachNoticeOncePerRuntime(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
+	loaded := config.LoadedFileConfig{Notices: []string{"migrate me"}}
+
+	runtime.emitConfigLoadNotices(loaded)
+	runtime.emitConfigLoadNotices(loaded)
+
+	if got := stderr.String(); got != "note: migrate me\n" {
+		t.Fatalf("stderr = %q, want one emitted notice", got)
+	}
+}
+
 func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 	t.Parallel()
 
