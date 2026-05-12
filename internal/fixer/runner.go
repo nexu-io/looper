@@ -398,6 +398,7 @@ type ProcessResult struct {
 type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
 	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
+	RunStartedRunID  string                      `json:"runStartedRunId,omitempty"`
 	Detail           *checkpointDetail           `json:"detail,omitempty"`
 	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
 	FixItems         []FixItem                   `json:"fixItems,omitempty"`
@@ -1109,6 +1110,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	checkpoint.RunStartedAt = r.nowISO()
+	checkpoint.RunStartedRunID = run.ID
 	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
@@ -2166,6 +2168,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		initialCheckpoint = resumedCheckpoint
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
+	initialCheckpoint.RunStartedAt = ""
+	initialCheckpoint.RunStartedRunID = ""
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed {
@@ -2199,7 +2203,7 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 		}
 	}
 	checkpoint := parseCheckpoint(run.CheckpointJSON)
-	if checkpoint.RunStartedAt != "" {
+	if checkpointStartedCurrentRun(checkpoint, run) {
 		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s", run.LoopID, run.ID))
 	}
 	if r.repos.Events != nil {
@@ -2222,6 +2226,33 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 
 func activeFixerRunError(message string) error {
 	return &loopError{message: message, kind: FailureRetryableTransient}
+}
+
+func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
+	if checkpoint.RunStartedAt == "" {
+		return false
+	}
+	if checkpoint.RunStartedRunID != "" {
+		return checkpoint.RunStartedRunID == run.ID
+	}
+	return !timestampBefore(checkpoint.RunStartedAt, firstNonEmpty(run.CreatedAt, run.StartedAt))
+}
+
+func timestampBefore(raw, floor string) bool {
+	raw = strings.TrimSpace(raw)
+	floor = strings.TrimSpace(floor)
+	if raw == "" || floor == "" {
+		return false
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return false
+	}
+	floorTimestamp, err := time.Parse(time.RFC3339Nano, floor)
+	if err != nil {
+		return false
+	}
+	return timestamp.Before(floorTimestamp)
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step FixerStep, checkpoint fixerCheckpoint) (storage.RunRecord, error) {

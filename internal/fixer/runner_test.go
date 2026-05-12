@@ -1367,7 +1367,7 @@ func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *t
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO})
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO, RunStartedRunID: "run_started_missing_event"})
 	startedRun := storage.RunRecord{ID: "run_started_missing_event", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -1394,6 +1394,43 @@ func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *t
 	}
 	if latestRun.ID != startedRun.ID {
 		t.Fatalf("latestRun.ID = %q, want preserved run %q", latestRun.ID, startedRun.ID)
+	}
+}
+
+func TestCreateRunContextInterruptsResumedRunWithStaleStartMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	staleStartedAt := fixture.current.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_stale_started_run", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt, RunStartedRunID: "previous_run"})
+	orphan := storage.RunRecord{ID: "run_stale_started_marker", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	if created.Checkpoint.RunStartedAt != "" || created.Checkpoint.RunStartedRunID != "" {
+		t.Fatalf("created.Checkpoint = %#v, want cleared start marker", created.Checkpoint)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted stale pre-start run", oldRun)
 	}
 }
 
