@@ -1483,6 +1483,29 @@ func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLoc
 	}
 }
 
+func TestReacquireClaimedLockAllowsSameOwnerLiveLock(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	lockKey := "issue:acme/looper:27"
+	nowISO := fixture.nowISO()
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "queue_worker_1", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() seed error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() seed = false, want live lock for same owner")
+	}
+
+	acquired, err = runner.reacquireClaimedLock(context.Background(), lockKey, "queue_worker_1")
+	if err != nil {
+		t.Fatalf("reacquireClaimedLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("reacquireClaimedLock() = false, want same-owner live lock to be adopted")
+	}
+}
+
 func TestProcessClaimedItemSkipsPRCreationWhenBranchNotAhead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

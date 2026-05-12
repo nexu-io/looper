@@ -850,21 +850,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
-	if resumedRun.Resumed {
-		result, handled, err := r.stopObsoleteResumedIssueRun(ctx, *project, *loop, run, queueItem, checkpoint)
-		if err != nil || handled {
-			return result, err
-		}
-	}
 	claimedLockKey := ""
 	acquiredClaimedLock := false
 	if resumedRun.StartStep != stepPrepareWork {
 		claimedLockKey = checkpoint.ClaimedLockKey
 	}
 	if claimedLockKey != "" {
-		nowISO := r.nowISO()
-		reason := "worker-run-resume"
-		acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: queueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
+		acquired, err := r.reacquireClaimedLock(ctx, claimedLockKey, queueItem.ID)
 		if err != nil {
 			return ProcessResult{}, err
 		}
@@ -892,6 +884,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
+	if resumedRun.Resumed {
+		result, handled, err := r.stopObsoleteResumedIssueRun(ctx, *project, *loop, run, queueItem, checkpoint)
+		if err != nil || handled {
+			return result, err
+		}
+	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -1038,6 +1036,23 @@ func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInp
 	}
 }
 
+func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string, owner string) (bool, error) {
+	nowISO := r.nowISO()
+	reason := "worker-run-resume"
+	acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: owner, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		return false, err
+	}
+	if acquired {
+		return true, nil
+	}
+	lock, err := r.repos.Locks.Get(ctx, claimedLockKey)
+	if err != nil {
+		return false, err
+	}
+	return lock != nil && lock.Owner == owner, nil
+}
+
 func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (ProcessResult, bool, error) {
 	if checkpoint.Work == nil || checkpoint.Work.ExecutionMode != "create-pr" || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
 		return ProcessResult{}, false, nil
@@ -1048,15 +1063,6 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 		return ProcessResult{}, false, nil
 	} else {
 		if checkpoint.ClaimedLockKey != "" {
-			lock, err := r.repos.Locks.Get(ctx, checkpoint.ClaimedLockKey)
-			if err != nil {
-				return ProcessResult{}, true, err
-			}
-			if lock != nil && lock.Owner == queueItem.ID {
-				if err := r.repos.Locks.Release(context.Background(), checkpoint.ClaimedLockKey); err != nil {
-					return ProcessResult{}, true, err
-				}
-			}
 			checkpoint.ClaimedLockKey = ""
 		}
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
