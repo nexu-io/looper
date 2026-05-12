@@ -339,6 +339,77 @@ func TestLegacyFixAllPullRequestsMapsToFixerAuthorFilter(t *testing.T) {
 	}
 }
 
+func TestLegacyAndCanonicalConfigSurfacesProduceEquivalentTargets(t *testing.T) {
+	testCases := []struct {
+		name      string
+		legacy    string
+		canonical string
+		extract   func(t *testing.T, cfg Config) any
+	}{
+		{
+			name:      "reviewer behavior root",
+			legacy:    `{"reviewer":{"reviewEvents":{"clean":"APPROVE","blocking":"REQUEST_CHANGES"},"loop":{"enabledByDefault":true,"quietPeriodSeconds":45,"minPublishIntervalSeconds":120},"nativeResume":{"onHeadChange":true,"reReviewPromptOnHeadChange":false}}}`,
+			canonical: `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"APPROVE","blocking":"REQUEST_CHANGES"},"loop":{"enabledByDefault":true,"quietPeriodSeconds":45,"minPublishIntervalSeconds":120},"nativeResume":{"onHeadChange":true,"reReviewPromptOnHeadChange":false}}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return toJSONValue(t, cfg.Roles.Reviewer.Behavior)
+			},
+		},
+		{
+			name:      "allowAutoApprove alias",
+			legacy:    `{"defaults":{"allowAutoApprove":true}}`,
+			canonical: `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"APPROVE"}}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return map[string]any{"clean": cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean, "blocking": cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking}
+			},
+		},
+		{
+			name:      "fixAllPullRequests alias",
+			legacy:    `{"defaults":{"fixAllPullRequests":true}}`,
+			canonical: `{"roles":{"fixer":{"triggers":{"authorFilter":"any"}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return cfg.Roles.Fixer.Triggers.AuthorFilter
+			},
+		},
+		{
+			name:      "project path alias",
+			legacy:    `{"projects":[{"id":"demo","name":"Demo","path":"/repos/demo"}]}`,
+			canonical: `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo"}]}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				if len(cfg.Projects) != 1 {
+					t.Fatalf("len(cfg.Projects) = %d, want 1", len(cfg.Projects))
+				}
+				return cfg.Projects[0].RepoPath
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy := loadConfigFromJSONFixture(t, tc.legacy)
+			canonical := loadConfigFromJSONFixture(t, tc.canonical)
+
+			legacyValue := tc.extract(t, legacy.Config)
+			canonicalValue := tc.extract(t, canonical.Config)
+			if !reflect.DeepEqual(legacyValue, canonicalValue) {
+				t.Fatalf("legacy target = %#v, canonical target = %#v", legacyValue, canonicalValue)
+			}
+		})
+	}
+}
+
+func TestLegacyAndCanonicalFixerEnvOverridesProduceEquivalentTargets(t *testing.T) {
+	legacy := loadConfigWithEnvFixture(t, map[string]string{"LOOPER_FIX_ALL_PULL_REQUESTS": "true"})
+	canonical := loadConfigWithEnvFixture(t, map[string]string{"LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER": "any"})
+
+	if legacy.Config.Roles.Fixer.Triggers.AuthorFilter != canonical.Config.Roles.Fixer.Triggers.AuthorFilter {
+		t.Fatalf("legacy fixer authorFilter = %q, canonical fixer authorFilter = %q", legacy.Config.Roles.Fixer.Triggers.AuthorFilter, canonical.Config.Roles.Fixer.Triggers.AuthorFilter)
+	}
+}
+
 func TestRoleEnvironmentOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
@@ -392,6 +463,35 @@ func reflectStringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func loadConfigFromJSONFixture(t *testing.T, contents string) LoadedFileConfig {
+	t.Helper()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	return loaded
+}
+
+func loadConfigWithEnvFixture(t *testing.T, env map[string]string) LoadedFileConfig {
+	t.Helper()
+
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: filepath.Join(cwd, "missing.json"), LookupEnv: mapEnvLookup(env), LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	return loaded
 }
 
 func roleConfigMapFromRoles(t *testing.T, roles any, role string) (map[string]any, bool) {
