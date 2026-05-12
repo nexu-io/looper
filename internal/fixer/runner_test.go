@@ -1153,6 +1153,109 @@ func TestRunResolveCommentsStepFailsWhenThreadChangesAfterReply(t *testing.T) {
 	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "stale_state" {
 		t.Fatalf("resolved comments = %#v, want stale_state marker", updated.ResolvedComments)
 	}
+	if updated.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepRequestsRediscoveryWhenVerifiedEvidenceIsStale(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	checkpoint := fixerCheckpoint{
+		FixItems:     fixItems,
+		FixItemsHash: fixItemsHash,
+		Validation:   &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "old-head"},
+		Push:         &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "old-head"},
+		Lifecycle:    &lifecycle.State{Pushed: true},
+		ReconcileCommits: &checkpointReconcileCommits{
+			BaseHeadSHA:      "base-head",
+			FinalHeadSHA:     "old-head",
+			NewCommitSHAs:    []string{"old-head"},
+			WorkingTreeClean: true,
+		},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err == nil || !strings.Contains(err.Error(), "verified fix evidence is missing or stale") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want stale-evidence retry failure", err)
+	}
+	if updated.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when evidence is stale", len(github.resolveCalls))
+	}
+}
+
+func TestRunResolveCommentsStepRequestsRediscoveryWhenValidationIsNotBoundToEvidence(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"fix-head\",\"lastFixItemsHash\":%q,\"lastFixEvidence\":{\"valid\":true,\"headSha\":\"fix-head\",\"producedNewCommits\":true,\"commentRecords\":[{\"fixItemId\":\"c1\",\"threadId\":\"t1\",\"commitSha\":\"fix-head\"}]}}", fixItemsHash)
+	checkpoint := fixerCheckpoint{
+		FixItems:     fixItems,
+		FixItemsHash: fixItemsHash,
+		Validation:   &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "older-head"},
+		Push:         &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		ReconcileCommits: &checkpointReconcileCommits{
+			BaseHeadSHA:      "base-head",
+			FinalHeadSHA:     "base-head",
+			WorkingTreeClean: true,
+		},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{MetadataJSON: &loopMetadata},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation bound to verified fix evidence head") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want validation/evidence mismatch failure", err)
+	}
+	if updated.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when validation is stale", len(github.resolveCalls))
+	}
 }
 
 func TestRunResolveCommentsStepUsesRefreshedPushHeadSHA(t *testing.T) {
