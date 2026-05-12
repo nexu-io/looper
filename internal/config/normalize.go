@@ -6,34 +6,156 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
-	explicitReviewerCleanReviewEvent := hasExplicitReviewerCleanReviewEvent(partials)
-	fixerAuthorFilterExplicit := false
 	for _, partial := range partials {
-		if partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.AuthorFilter != nil {
-			fixerAuthorFilterExplicit = true
-		}
-		mergeConfig(&config, partial)
-	}
-	if config.Defaults.AllowAutoApprove && !explicitReviewerCleanReviewEvent {
-		config.Roles.Reviewer.Behavior.ReviewEvents.Clean = ReviewerReviewEventApprove
-	}
-	if !fixerAuthorFilterExplicit && config.Defaults.FixAllPullRequests {
-		config.Roles.Fixer.Triggers.AuthorFilter = FixerAuthorFilterAny
+		mergeConfig(&config, normalizeLayerPartial(partial))
 	}
 
 	return config, nil
 }
 
-func hasExplicitReviewerCleanReviewEvent(partials []PartialConfig) bool {
-	for _, partial := range partials {
-		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil && partial.LegacyReviewer.ReviewEvents.Clean != nil {
-			return true
+func normalizeLayerPartial(partial PartialConfig) PartialConfig {
+	normalized := partial
+
+	if normalized.LegacyReviewer != nil {
+		reviewer := ensureReviewerRoleConfig(&normalized)
+		reviewer.Behavior = mergePartialReviewerConfigWithCanonicalPriority(reviewer.Behavior, normalized.LegacyReviewer)
+	}
+
+	if normalized.Roles != nil && normalized.Roles.Reviewer != nil {
+		normalizeReviewerRoleLegacyShape(normalized.Roles.Reviewer)
+	}
+
+	if normalized.Projects != nil {
+		projects := *normalized.Projects
+		for i := range projects {
+			if projects[i].RepoPath == "" {
+				projects[i].RepoPath = projects[i].Path
+			}
+			projects[i].Roles = mergeLegacyProjectInstructionsIntoRoles(projects[i].Roles, projects[i].Instructions)
+			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
+				normalizeReviewerRoleLegacyShape(projects[i].Roles.Reviewer)
+			}
 		}
-		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil {
-			return true
+		normalized.Projects = &projects
+	}
+
+	if normalized.Defaults != nil {
+		if normalized.Defaults.AllowAutoApprove != nil {
+			reviewEvents := ensureReviewerReviewEventsConfig(&normalized)
+			if reviewEvents.Clean == nil {
+				event := ReviewerReviewEventComment
+				if *normalized.Defaults.AllowAutoApprove {
+					event = ReviewerReviewEventApprove
+				}
+				reviewEvents.Clean = &event
+			}
+		}
+		if normalized.Defaults.FixAllPullRequests != nil {
+			triggers := ensureFixerRoleTriggersConfig(&normalized)
+			if triggers.AuthorFilter == nil {
+				authorFilter := FixerAuthorFilterCurrentUser
+				if *normalized.Defaults.FixAllPullRequests {
+					authorFilter = FixerAuthorFilterAny
+				}
+				triggers.AuthorFilter = &authorFilter
+			}
 		}
 	}
-	return false
+
+	return normalized
+}
+
+func normalizeReviewerRoleLegacyShape(reviewer *PartialReviewerRoleConfig) {
+	if reviewer == nil {
+		return
+	}
+	reviewer.Discovery = mergePartialReviewerRoleDiscoveryWithCanonicalPriority(reviewer.Discovery, reviewer.AutoDiscovery, reviewer.Triggers, reviewer.SpecReview)
+}
+
+func mergePartialReviewerConfigWithCanonicalPriority(canonical *PartialReviewerConfig, legacy *PartialReviewerConfig) *PartialReviewerConfig {
+	if canonical == nil {
+		return legacy
+	}
+	if legacy == nil {
+		return canonical
+	}
+	if canonical.Loop == nil {
+		canonical.Loop = legacy.Loop
+	}
+	if canonical.Scope == nil {
+		canonical.Scope = legacy.Scope
+	}
+	if canonical.PublishMode == nil {
+		canonical.PublishMode = legacy.PublishMode
+	}
+	if canonical.ReviewEvents == nil {
+		canonical.ReviewEvents = legacy.ReviewEvents
+	} else if legacy.ReviewEvents != nil {
+		if canonical.ReviewEvents.Clean == nil {
+			canonical.ReviewEvents.Clean = legacy.ReviewEvents.Clean
+		}
+		if canonical.ReviewEvents.Blocking == nil {
+			canonical.ReviewEvents.Blocking = legacy.ReviewEvents.Blocking
+		}
+		if canonical.ReviewEvents.Clean == nil && canonical.ReviewEvents.Blocking == nil {
+			canonical.ReviewEvents = legacy.ReviewEvents
+		}
+	}
+	if canonical.DetectDuplicateFindings == nil {
+		canonical.DetectDuplicateFindings = legacy.DetectDuplicateFindings
+	}
+	if canonical.DedupeFindings == nil {
+		canonical.DedupeFindings = legacy.DedupeFindings
+	}
+	if canonical.NativeResume == nil {
+		canonical.NativeResume = legacy.NativeResume
+	}
+	if canonical.ThreadResolution == nil {
+		canonical.ThreadResolution = legacy.ThreadResolution
+	}
+	return canonical
+}
+
+func mergePartialReviewerRoleDiscoveryWithCanonicalPriority(canonical *PartialReviewerRoleDiscoveryConfig, legacyAutoDiscovery *bool, legacyTriggers *PartialReviewerRoleTriggersConfig, legacySpecReview *PartialReviewerSpecReviewConfig) *PartialReviewerRoleDiscoveryConfig {
+	if canonical == nil && legacyAutoDiscovery == nil && legacyTriggers == nil && legacySpecReview == nil {
+		return nil
+	}
+	if canonical == nil {
+		canonical = &PartialReviewerRoleDiscoveryConfig{}
+	}
+	if canonical.AutoDiscovery == nil {
+		canonical.AutoDiscovery = legacyAutoDiscovery
+	}
+	if canonical.Triggers == nil {
+		canonical.Triggers = legacyTriggers
+	} else if legacyTriggers != nil {
+		if canonical.Triggers.IncludeDrafts == nil {
+			canonical.Triggers.IncludeDrafts = legacyTriggers.IncludeDrafts
+		}
+		if canonical.Triggers.RequireReviewRequest == nil {
+			canonical.Triggers.RequireReviewRequest = legacyTriggers.RequireReviewRequest
+		}
+		if canonical.Triggers.EnableSelfReview == nil {
+			canonical.Triggers.EnableSelfReview = legacyTriggers.EnableSelfReview
+		}
+		if canonical.Triggers.Labels == nil {
+			canonical.Triggers.Labels = legacyTriggers.Labels
+		}
+		if canonical.Triggers.LabelMode == nil {
+			canonical.Triggers.LabelMode = legacyTriggers.LabelMode
+		}
+	}
+	if canonical.SpecReview == nil {
+		canonical.SpecReview = legacySpecReview
+	} else if legacySpecReview != nil {
+		if canonical.SpecReview.IncludeReviewingLabel == nil {
+			canonical.SpecReview.IncludeReviewingLabel = legacySpecReview.IncludeReviewingLabel
+		}
+		if canonical.SpecReview.ReviewingLabel == nil {
+			canonical.SpecReview.ReviewingLabel = legacySpecReview.ReviewingLabel
+		}
+	}
+	return canonical
 }
 
 func mergeConfig(config *Config, partial PartialConfig) {

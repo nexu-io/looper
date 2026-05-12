@@ -583,6 +583,182 @@ func TestMixedSchemaConfigRejectsStructurallyIncompatibleTargets(t *testing.T) {
 	}
 }
 
+func TestNormalizeLayersProduceEquivalentEffectiveConfigAcrossCanonicalLegacyAndMixedInputs(t *testing.T) {
+	legacyFile := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove:   boolPtr(true),
+			FixAllPullRequests: boolPtr(true),
+		},
+		LegacyReviewer: &PartialReviewerConfig{
+			Loop: &PartialReviewerLoopConfig{EnabledByDefault: boolPtr(true)},
+		},
+		Roles: &PartialRoleConfigs{
+			Reviewer: &PartialReviewerRoleConfig{
+				AutoDiscovery: boolPtr(false),
+				Triggers:      &PartialReviewerRoleTriggersConfig{Labels: &[]string{"legacy-file"}, LabelMode: labelModePtr(LabelModeAll)},
+			},
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:           "demo",
+			Name:         "Demo",
+			Path:         "/repos/demo",
+			Instructions: map[string]string{"worker": "legacy worker instructions"},
+			Roles:        &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoDiscovery: boolPtr(false)}},
+		}},
+	}
+	canonicalFile := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove:   boolPtr(true),
+			FixAllPullRequests: boolPtr(true),
+		},
+		Roles: &PartialRoleConfigs{
+			Reviewer: &PartialReviewerRoleConfig{
+				Behavior:  &PartialReviewerConfig{Loop: &PartialReviewerLoopConfig{EnabledByDefault: boolPtr(true)}},
+				Discovery: &PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(false), Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"legacy-file"}, LabelMode: labelModePtr(LabelModeAll)}},
+			},
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:       "demo",
+			Name:     "Demo",
+			RepoPath: "/repos/demo",
+			Roles: &PartialRoleConfigs{
+				Worker:   &PartialWorkerRoleConfig{Instructions: stringPtr("legacy worker instructions")},
+				Reviewer: &PartialReviewerRoleConfig{Discovery: &PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(false)}},
+			},
+		}},
+	}
+
+	legacyEnv, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+		"LOOPER_ALLOW_AUTO_APPROVE":                         "false",
+		"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}))
+	if err != nil {
+		t.Fatalf("buildEnvOverrides(legacy) error = %v", err)
+	}
+	canonicalEnv, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+		"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN":          "COMMENT",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}))
+	if err != nil {
+		t.Fatalf("buildEnvOverrides(canonical) error = %v", err)
+	}
+
+	legacyCLI, err := parseCLIArgs([]string{"--reviewer-loop-enabled=true", "--reviewer-enable-self-review=false", "--fix-all-pull-requests=false"})
+	if err != nil {
+		t.Fatalf("parseCLIArgs(legacy) error = %v", err)
+	}
+	canonicalCLI, err := parseCLIArgs([]string{"--roles-reviewer-behavior-loop-enabled-by-default=true", "--roles-reviewer-discovery-triggers-enable-self-review=false", "--roles-fixer-triggers-author-filter=current_user"})
+	if err != nil {
+		t.Fatalf("parseCLIArgs(canonical) error = %v", err)
+	}
+
+	cwd := t.TempDir()
+	legacyConfig, err := Normalize(cwd, legacyFile, legacyEnv, legacyCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(legacy layers) error = %v", err)
+	}
+	canonicalConfig, err := Normalize(cwd, canonicalFile, canonicalEnv, canonicalCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(canonical layers) error = %v", err)
+	}
+	mixedConfig, err := Normalize(cwd, legacyFile, canonicalEnv, legacyCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(mixed layers) error = %v", err)
+	}
+
+	legacyEffective := map[string]any{
+		"clean":             legacyConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": legacyConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       legacyConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  legacyConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    legacyConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   legacyConfig.Projects[0].RepoPath,
+		"projectWorkerText": *legacyConfig.Projects[0].Roles.Worker.Instructions,
+	}
+	canonicalEffective := map[string]any{
+		"clean":             canonicalConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": canonicalConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       canonicalConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  canonicalConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    canonicalConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   canonicalConfig.Projects[0].RepoPath,
+		"projectWorkerText": *canonicalConfig.Projects[0].Roles.Worker.Instructions,
+	}
+	mixedEffective := map[string]any{
+		"clean":             mixedConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": mixedConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       mixedConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  mixedConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    mixedConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   mixedConfig.Projects[0].RepoPath,
+		"projectWorkerText": *mixedConfig.Projects[0].Roles.Worker.Instructions,
+	}
+
+	if !reflect.DeepEqual(legacyEffective, canonicalEffective) {
+		t.Fatalf("legacy effective = %#v, canonical effective = %#v", legacyEffective, canonicalEffective)
+	}
+	if !reflect.DeepEqual(mixedEffective, canonicalEffective) {
+		t.Fatalf("mixed effective = %#v, canonical effective = %#v", mixedEffective, canonicalEffective)
+	}
+	if got := canonicalConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventComment)
+	}
+	if got := canonicalConfig.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("fixer authorFilter = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
+	if got := canonicalConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview; got {
+		t.Fatalf("reviewer enableSelfReview = %v, want false", got)
+	}
+	if got := canonicalConfig.Projects[0].RepoPath; got != "/repos/demo" {
+		t.Fatalf("project repoPath = %q, want %q", got, "/repos/demo")
+	}
+	if got := canonicalConfig.Projects[0].Roles.Worker.Instructions; got == nil || *got != "legacy worker instructions" {
+		t.Fatalf("project worker instructions = %v, want %q", got, "legacy worker instructions")
+	}
+}
+
+func TestNormalizeLayersKeepDeepMergeForObjectsAndArrayReplacementForArrays(t *testing.T) {
+	config, err := Normalize(t.TempDir(),
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"file": true}, "fileOnly": "file"}},
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"file-a", "file-b"}, LabelMode: labelModePtr(LabelModeAll)}}},
+		},
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"env": true}, "envOnly": "env"}},
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Discovery: &PartialReviewerRoleDiscoveryConfig{Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"env-only"}, LabelMode: labelModePtr(LabelModeAny)}}}},
+		},
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"cli": true}, "cliOnly": "cli"}},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	shared, ok := config.Agent.Params["shared"].(map[string]any)
+	if !ok {
+		t.Fatalf("shared params type = %T, want map[string]any", config.Agent.Params["shared"])
+	}
+	if !reflect.DeepEqual(shared, map[string]any{"file": true, "env": true, "cli": true}) {
+		t.Fatalf("shared params = %#v", shared)
+	}
+	if got := config.Agent.Params["fileOnly"]; got != "file" {
+		t.Fatalf("fileOnly = %#v, want %q", got, "file")
+	}
+	if got := config.Agent.Params["envOnly"]; got != "env" {
+		t.Fatalf("envOnly = %#v, want %q", got, "env")
+	}
+	if got := config.Agent.Params["cliOnly"]; got != "cli" {
+		t.Fatalf("cliOnly = %#v, want %q", got, "cli")
+	}
+	if !reflect.DeepEqual(config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"env-only"}) {
+		t.Fatalf("reviewer labels = %#v, want %#v", config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"env-only"})
+	}
+	if got := config.Roles.Reviewer.Discovery.Triggers.LabelMode; got != LabelModeAny {
+		t.Fatalf("reviewer labelMode = %q, want %q", got, LabelModeAny)
+	}
+}
+
 func TestRoleEnvironmentOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
@@ -2682,5 +2858,9 @@ func emptyEnvLookup(string) (string, bool) {
 }
 
 func intPtr(value int) *int {
+	return &value
+}
+
+func labelModePtr(value LabelMode) *LabelMode {
 	return &value
 }
