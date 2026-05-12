@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
@@ -189,6 +190,8 @@ type CreateWorktreeResult struct {
 }
 
 type PushInput struct {
+	RepoPath          string
+	WorktreeRoot      string
 	WorktreePath      string
 	Branch            string
 	Remote            string
@@ -196,6 +199,8 @@ type PushInput struct {
 }
 
 type InspectHeadInput struct {
+	RepoPath     string
+	WorktreeRoot string
 	WorktreePath string
 	BaseRef      string
 }
@@ -208,6 +213,8 @@ type InspectHeadResult struct {
 }
 
 type CommitInput struct {
+	RepoPath     string
+	WorktreeRoot string
 	WorktreePath string
 	Message      string
 }
@@ -870,20 +877,28 @@ func (input stepInput) CheckpointIssueLogin() string {
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	if checkpoint.SkipReason != "" || checkpoint.Worktree != nil {
+	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
-	}
-	issue, err := requireIssue(checkpoint)
-	if err != nil {
-		return checkpoint, err
 	}
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot := stringFromAnyDefault(projectMetadata["worktreeRoot"])
+	var err error
 	if worktreeRoot == "" {
 		worktreeRoot, err = config.DefaultProjectWorktreeRoot(input.Project.ID, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, err
 		}
+	}
+	if checkpoint.Worktree != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err == nil {
+			return checkpoint, nil
+		}
+		checkpoint.Worktree = nil
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return checkpoint, err
 	}
 	baseBranch := firstNonEmpty(derefString(input.Project.BaseBranch), "main")
 	branch := buildPlannerBranch(issue.IssueNumber, issue.Title)
@@ -913,6 +928,16 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
+	}
+	worktreeRoot, rootErr := plannerWorktreeRoot(input.Project)
+	if rootErr != nil {
+		return checkpoint, rootErr
+	}
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+		checkpoint.Worktree = nil
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		input.Checkpoint = checkpoint
+		return r.runPrepareWorktreeStep(ctx, input)
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
@@ -961,12 +986,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		return checkpoint, wrapRetryableAfterResume(err)
 	}
 	if r.git != nil {
-		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if inspect.HasUncommittedChanges {
-			committed, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue)})
+			committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue)})
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1015,7 +1040,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		checkpoint.Publish.ReviewersAdded = []string{}
 	}
 	if !checkpoint.Publish.Pushed {
-		if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
+		worktreeRoot, rootErr := plannerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.Publish.Pushed = true
@@ -1129,6 +1158,15 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func plannerWorktreeRoot(project storage.ProjectRecord) (string, error) {
+	projectMetadata := parseJSONObject(project.MetadataJSON)
+	worktreeRoot := stringFromAnyDefault(projectMetadata["worktreeRoot"])
+	if worktreeRoot != "" {
+		return worktreeRoot, nil
+	}
+	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
 }
 
 func (r *Runner) findOpenPullRequestForBranch(ctx context.Context, repo, branch, baseBranch, cwd string) (*PullRequestSummary, error) {

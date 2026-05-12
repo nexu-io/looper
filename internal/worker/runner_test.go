@@ -232,6 +232,35 @@ func TestDiscoverIssuesRequeuesFailedWorkerLoopWhenFingerprintChanges(t *testing
 	}
 }
 
+func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/worker/loop_worker_1", BaseBranch: "main", WorktreeID: "worktree_1"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath},
+		Loop:    storage.LoopRecord{ID: "loop_worker_1"},
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Repo: "acme/looper", IssueNumber: 42, BaseBranch: "main"},
+			Worktree: &checkpointWorktree{Path: repoPath, Branch: "stale", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	}
+}
+
 func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -214,7 +214,7 @@ func (a plannerGitAdapter) CreateWorktree(ctx context.Context, input planner.Cre
 }
 
 func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.InspectHeadInput) (planner.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return planner.InspectHeadResult{}, err
 	}
@@ -223,7 +223,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "planner")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return planner.CommitResult{}, err
 	}
@@ -231,7 +231,7 @@ func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput
 }
 
 func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
 type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
@@ -366,7 +366,7 @@ func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.C
 }
 
 func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.PrepareWorktreeInput) (reviewer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return reviewer.PrepareWorktreeResult{}, err
 	}
@@ -374,7 +374,7 @@ func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.
 }
 
 func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.CleanupWorktreeInput) error {
-	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
@@ -475,7 +475,7 @@ func (a fixerGitAdapter) CreateWorktree(ctx context.Context, input fixer.CreateW
 }
 
 func (a fixerGitAdapter) PrepareWorktree(ctx context.Context, input fixer.PrepareWorktreeInput) (fixer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return fixer.PrepareWorktreeResult{}, err
 	}
@@ -483,7 +483,7 @@ func (a fixerGitAdapter) PrepareWorktree(ctx context.Context, input fixer.Prepar
 }
 
 func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHeadInput) (fixer.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return fixer.InspectHeadResult{}, err
 	}
@@ -492,7 +492,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "fixer")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return fixer.CommitResult{}, err
 	}
@@ -500,11 +500,11 @@ func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (f
 }
 
 func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.CleanupWorktreeInput) error {
-	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
 type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
@@ -641,7 +641,7 @@ func (a workerGitAdapter) RestoreWorktree(ctx context.Context, input worker.Rest
 }
 
 func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return worker.PrepareWorktreeResult{}, err
 	}
@@ -649,7 +649,7 @@ func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.Prep
 }
 
 func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
@@ -658,7 +658,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 
 func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "worker")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return worker.CommitResult{}, err
 	}
@@ -666,7 +666,7 @@ func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) 
 }
 
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
 type workerAgentExecutorAdapter struct {

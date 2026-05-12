@@ -14,6 +14,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -63,6 +64,8 @@ type RestoreWorktreeInput struct {
 }
 
 type PrepareWorktreeInput struct {
+	RepoPath        string
+	WorktreeRoot    string
 	WorktreePath    string
 	Branch          string
 	Ref             string
@@ -76,6 +79,8 @@ type PrepareWorktreeResult struct {
 }
 
 type InspectHeadInput struct {
+	RepoPath     string
+	WorktreeRoot string
 	WorktreePath string
 	BaseRef      string
 }
@@ -88,6 +93,8 @@ type InspectHeadResult struct {
 }
 
 type CommitInput struct {
+	RepoPath     string
+	WorktreeRoot string
 	WorktreePath string
 	Message      string
 }
@@ -99,12 +106,15 @@ type CommitResult struct {
 type CleanupWorktreeInput struct {
 	ProjectID         string
 	RepoPath          string
+	WorktreeRoot      string
 	WorktreePath      string
 	Branch            string
 	ProtectedBranches []string
 }
 
 type PushInput struct {
+	RepoPath              string
+	WorktreeRoot          string
 	WorktreePath          string
 	Branch                string
 	Remote                string
@@ -295,7 +305,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		if err != nil {
 			return nil, fmt.Errorf("get stored worktree by branch: %w", err)
 		}
-		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && normalizeComparablePath(stored.WorktreePath) != normalizeComparablePath(input.RepoPath) && (input.WorktreeRoot == "" || isWithinRoot(stored.WorktreePath, input.WorktreeRoot)) {
+		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
 			if err != nil {
 				return nil, err
@@ -347,10 +357,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		} else if candidate.Branch != input.Branch {
 			continue
 		}
-		if normalizeComparablePath(candidate.Path) == normalizeComparablePath(input.RepoPath) {
-			continue
-		}
-		if input.WorktreeRoot != "" && !isWithinRoot(candidate.Path, input.WorktreeRoot) {
+		if !worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: candidate.Path, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			continue
 		}
 		match = &candidate
@@ -427,6 +434,9 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := g.AssertWritableBranch(input.Branch, input.ProtectedBranches); err != nil {
 		return err
 	}
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
+		return err
+	}
 	if err := g.runGit(ctx, input.RepoPath, nil, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
@@ -459,6 +469,9 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 	if err := g.AssertWritableBranch(input.Branch, input.ProtectedBranches); err != nil {
+		return err
+	}
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return err
 	}
 	remote := input.Remote
@@ -500,6 +513,9 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 }
 
 func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return PrepareWorktreeResult{}, err
+	}
 	remote := input.Remote
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
@@ -558,6 +574,9 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 }
 
 func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (InspectHeadResult, error) {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return InspectHeadResult{}, err
+	}
 	headSHA, err := g.getHeadSHA(ctx, input.WorktreePath)
 	if err != nil {
 		return InspectHeadResult{}, err
@@ -590,6 +609,9 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return CommitResult{}, err
+	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
 		return CommitResult{}, err
 	}
@@ -606,6 +628,15 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	}
 
 	return CommitResult{CommitSHA: headSHA}, nil
+}
+
+func (g *Gateway) validateMutationWorktree(worktreePath, repoPath, worktreeRoot string) error {
+	if repoPath == "" && worktreeRoot == "" && g.repos != nil {
+		// Legacy callers may not provide safety context. Keep them working while
+		// adapter callers pass repo/root context for the hard safety check.
+		return nil
+	}
+	return worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktreePath, RepoPath: repoPath, WorktreeRoot: worktreeRoot})
 }
 
 func (g *Gateway) AssertWritableBranch(branch string, protectedBranches []string) error {

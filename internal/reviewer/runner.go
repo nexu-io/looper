@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
@@ -145,6 +146,8 @@ type CreateWorktreeResult struct {
 }
 
 type PrepareWorktreeInput struct {
+	RepoPath        string
+	WorktreeRoot    string
 	WorktreePath    string
 	Branch          string
 	Ref             string
@@ -160,6 +163,7 @@ type PrepareWorktreeResult struct {
 type CleanupWorktreeInput struct {
 	ProjectID         string
 	RepoPath          string
+	WorktreeRoot      string
 	WorktreePath      string
 	Branch            string
 	ProtectedBranches []string
@@ -1611,9 +1615,6 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if reviewerWorktreePrepared(checkpoint) {
-		return checkpoint, nil
-	}
 	if r.git == nil {
 		return checkpoint, fmt.Errorf("reviewer git gateway is not configured")
 	}
@@ -1634,6 +1635,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 		worktreeRoot = resolvedRoot
+	}
+	if checkpoint.Worktree != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+			checkpoint.Worktree = nil
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+		} else if reviewerWorktreePrepared(checkpoint) {
+			return checkpoint, nil
+		}
 	}
 	protectedBranches := make([]string, 0, 2)
 	if candidate := strings.TrimSpace(checkpoint.Detail.BaseRefName); candidate != "" {
@@ -1656,7 +1665,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 	}
-	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 		if errors.As(err, &remoteHeadChanged) {
@@ -2137,6 +2146,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
+	}
+	if reviewerWorktreePrepared(checkpoint) {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+			checkpoint.Worktree = nil
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+		}
 	}
 	if !reviewerWorktreePrepared(checkpoint) {
 		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
@@ -4596,7 +4611,12 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	if baseBranch := strings.TrimSpace(derefString(project.BaseBranch)); baseBranch != "" {
 		protectedBranches = append(protectedBranches, baseBranch)
 	}
-	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: protectedBranches}); err != nil {
+	worktreeRoot, rootErr := reviewerWorktreeRoot(project)
+	if rootErr != nil {
+		r.logWarn("reviewer worktree cleanup skipped", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "error": rootErr.Error()})
+		return
+	}
+	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: protectedBranches}); err != nil {
 		r.logWarn("reviewer worktree cleanup failed", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "error": err.Error()})
 		return
 	}
@@ -4608,6 +4628,15 @@ func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error)
 		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
 	}
 	return checkpoint.Worktree, nil
+}
+
+func reviewerWorktreeRoot(project storage.ProjectRecord) (string, error) {
+	projectMetadata := parseJSONObject(project.MetadataJSON)
+	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
+	if worktreeRoot != "" {
+		return worktreeRoot, nil
+	}
+	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
 }
 
 func reviewerWorktreePrepared(checkpoint reviewerCheckpoint) bool {
