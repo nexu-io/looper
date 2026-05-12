@@ -1084,13 +1084,6 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err == nil {
-			return checkpoint, nil
-		}
-		checkpoint.Worktree = nil
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
-	}
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1102,6 +1095,13 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		if err != nil {
 			return checkpoint, err
 		}
+	}
+	if checkpoint.Worktree != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
+			return checkpoint, nil
+		}
+		checkpoint.Worktree = nil
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	branch := work.Branch
 	if branch == "" {

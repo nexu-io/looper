@@ -109,6 +109,38 @@ func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T)
 	}
 }
 
+func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "legacy-wt"), Branch: "feature/fix-42", PreparedAt: "stale"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+}
+
 func TestBuildFixerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
 	t.Parallel()
 

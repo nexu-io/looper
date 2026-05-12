@@ -890,7 +890,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 		}
 	}
 	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err == nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
 			return checkpoint, nil
 		}
 		checkpoint.Worktree = nil

@@ -1305,7 +1305,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		worktreeRoot = resolvedRoot
 	}
 	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 		} else if checkpoint.Worktree.PreparedAt != "" {
