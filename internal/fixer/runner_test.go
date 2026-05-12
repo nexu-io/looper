@@ -861,8 +861,8 @@ func TestRunResolveCommentsStepRefreshesVerifiedNoPushHeadBeforeResolve(t *testi
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v", err)
 	}
-	if github.viewIndex != 1 {
-		t.Fatalf("github.viewIndex = %d, want single live refresh", github.viewIndex)
+	if github.viewIndex != 2 {
+		t.Fatalf("github.viewIndex = %d, want initial refresh plus pre-resolve recheck", github.viewIndex)
 	}
 	if len(github.resolveCalls) != 1 {
 		t.Fatalf("resolve calls = %d, want 1 after refreshing verified head", len(github.resolveCalls))
@@ -981,6 +981,177 @@ func TestRunResolveCommentsStepResolvesMatchingThreadsAndSkipsNewOnes(t *testing
 	}
 	if updated.ResumePolicy != "advance_from_checkpoint" {
 		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepDoesNotBackfillLegacyEvidenceFromLiveComments(t *testing.T) {
+	t.Parallel()
+
+	oldItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: normalizeThreadFingerprint("", "t1", "c1"), Summary: "please fix"}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t2",
+			"body":     "new follow-up",
+		}},
+	}}}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{
+		FixItems:         oldItems,
+		FixItemsHash:     hashFixItems(oldItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "new-head", Evidence: &fixEvidence{Valid: true, HeadSHA: "new-head", FixItemsHash: hashFixItems(oldItems), ProducedNewCommits: true}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}, WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when legacy evidence has no safe per-thread records", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 2 {
+		t.Fatalf("resolved comments = %#v, want both live threads marked without evidence", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepSkipsSameThreadWhenFingerprintChanged(t *testing.T) {
+	t.Parallel()
+
+	liveFingerprint := "latest=reply-2|updated=2026-04-11T12:05:00Z|count=2"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":                "c1",
+			"threadId":          "t1",
+			"threadFingerprint": liveFingerprint,
+			"body":              "please fix",
+		}},
+	}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=comment-1|updated=2026-04-11T12:00:00Z|count=1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"fix-head\",\"lastFixItemsHash\":%q,\"lastFixEvidence\":{\"valid\":true,\"headSha\":\"fix-head\",\"producedNewCommits\":true,\"commentRecords\":[{\"fixItemId\":\"c1\",\"threadId\":\"t1\",\"threadFingerprint\":\"latest=comment-1|updated=2026-04-11T12:00:00Z|count=1\",\"commitSha\":\"fix-head\"}]}}", fixItemsHash)
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: fixItemsHash, Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: &loopMetadata}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after same-thread drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_no_evidence" {
+		t.Fatalf("resolved comments = %#v, want skipped_no_evidence after fingerprint drift", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepSkipsDuplicateReplyWhenMarkerAlreadyExists(t *testing.T) {
+	t.Parallel()
+
+	marker := fixerReplyMarker("t1", "fix-head")
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "fix-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}},
+		}, {
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "fix-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}},
+		}},
+		threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}, {ID: "reply-1", Body: "already replied\n\n" + marker}}}},
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: normalizeThreadFingerprint("", "t1", "c1"), Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"fix-head\",\"lastFixItemsHash\":%q,\"lastFixEvidence\":{\"valid\":true,\"headSha\":\"fix-head\",\"producedNewCommits\":true,\"commentRecords\":[{\"fixItemId\":\"c1\",\"threadId\":\"t1\",\"threadFingerprint\":%q,\"commitSha\":\"fix-head\"}]}}", fixItemsHash, normalizeThreadFingerprint("", "t1", "c1"))
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: fixItemsHash, Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: &loopMetadata}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 when marker already exists remotely", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 after deduped reply", len(github.resolveCalls))
+	}
+}
+
+func TestRunResolveCommentsStepFailsWhenThreadChangesAfterReply(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":                "c1",
+			"threadId":          "t1",
+			"threadFingerprint": "latest=comment-1|updated=2026-04-11T12:00:00Z|count=1",
+			"body":              "please fix",
+		}},
+	}, {
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":                "c1",
+			"threadId":          "t1",
+			"threadFingerprint": "latest=comment-2|updated=2026-04-11T12:01:00Z|count=2",
+			"body":              "please fix",
+		}},
+	}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=comment-1|updated=2026-04-11T12:00:00Z|count=1", Summary: "please fix"}}
+	fixItemsHash := hashFixItems(fixItems)
+	loopMetadata := fmt.Sprintf("{\"lastFixHeadSha\":\"fix-head\",\"lastFixItemsHash\":%q,\"lastFixEvidence\":{\"valid\":true,\"headSha\":\"fix-head\",\"producedNewCommits\":true,\"commentRecords\":[{\"fixItemId\":\"c1\",\"threadId\":\"t1\",\"threadFingerprint\":\"latest=comment-1|updated=2026-04-11T12:00:00Z|count=1\",\"commitSha\":\"fix-head\"}]}}", fixItemsHash)
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: fixItemsHash, Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: &loopMetadata}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "Failed to resolve 1 review thread") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want stale-state retry failure", err)
+	}
+	if len(github.replyCalls) != 1 {
+		t.Fatalf("reply calls = %d, want 1 before stale recheck aborts resolve", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after stale recheck", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "stale_state" {
+		t.Fatalf("resolved comments = %#v, want stale_state marker", updated.ResolvedComments)
 	}
 }
 
@@ -2754,6 +2925,7 @@ type fakeGitHubGateway struct {
 	listOpenByLabel       map[string][]PullRequestSummary
 	listCalls             []ListOpenPullRequestsInput
 	viewResponses         []PullRequestDetail
+	threads               []ReviewThread
 	viewIndex             int
 	resolveCalls          []ResolveReviewThreadInput
 	addLabelCalls         []PullRequestLabelsInput
@@ -2813,7 +2985,49 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	if result.Author == "" {
 		result.Author = firstNonEmpty(f.currentUser, "looper")
 	}
+	for i := range result.Comments {
+		if _, ok := stringFromAny(result.Comments[i]["threadFingerprint"]); ok {
+			continue
+		}
+		threadID, _ := stringFromAny(result.Comments[i]["threadId"])
+		commentID, _ := stringFromAny(result.Comments[i]["id"])
+		result.Comments[i]["threadFingerprint"] = normalizeThreadFingerprint("", threadID, commentID)
+	}
 	return result, nil
+}
+
+func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThreadsInput) ([]ReviewThread, error) {
+	if f.threads != nil {
+		return append([]ReviewThread(nil), f.threads...), nil
+	}
+	threads := make([]ReviewThread, 0)
+	if f.viewIndex == 0 || len(f.viewResponses) == 0 {
+		return threads, nil
+	}
+	idx := f.viewIndex - 1
+	if idx >= len(f.viewResponses) {
+		idx = len(f.viewResponses) - 1
+	}
+	for _, comment := range f.viewResponses[idx].Comments {
+		threadID, _ := stringFromAny(comment["threadId"])
+		commentID, _ := stringFromAny(comment["id"])
+		body, _ := stringFromAny(comment["body"])
+		if threadID == "" {
+			threadID = commentID
+		}
+		threads = append(threads, ReviewThread{ID: threadID, Comments: []ReviewThreadComment{{ID: commentID, Body: body}}})
+	}
+	return threads, nil
+}
+
+func (f *fakeGitHubGateway) ViewReviewThread(_ context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
+	threads, _ := f.ListReviewThreads(context.Background(), ListReviewThreadsInput{})
+	for _, thread := range threads {
+		if thread.ID == input.ThreadID {
+			return thread, nil
+		}
+	}
+	return ReviewThread{ID: input.ThreadID}, nil
 }
 
 func (f *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input ResolveReviewThreadInput) error {
@@ -2823,6 +3037,12 @@ func (f *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input Resolve
 
 func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
 	f.replyCalls = append(f.replyCalls, input)
+	for i := range f.threads {
+		if f.threads[i].ID == input.ThreadID {
+			f.threads[i].Comments = append(f.threads[i].Comments, ReviewThreadComment{ID: fmt.Sprintf("reply-%d", len(f.replyCalls)), Body: input.Body})
+			return f.replyErr
+		}
+	}
 	return f.replyErr
 }
 
@@ -2860,6 +3080,7 @@ type fakeGitGateway struct {
 	inspectResults []InspectHeadResult
 	inspectIndex   int
 	ancestor       map[string]bool
+	fetchErr       error
 	pushErrors     []error
 	pushIndex      int
 
@@ -2868,6 +3089,7 @@ type fakeGitGateway struct {
 	inspectCalls []InspectHeadInput
 	commitCalls  []CommitInput
 	pushCalls    []PushInput
+	fetchCalls   []string
 	cleanupCalls []CleanupWorktreeInput
 }
 
@@ -2929,6 +3151,11 @@ func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 	}
 	f.pushIndex++
 	return nil
+}
+
+func (f *fakeGitGateway) FetchBranch(_ context.Context, repoPath, remote, branch string) error {
+	f.fetchCalls = append(f.fetchCalls, repoPath+"|"+remote+"|"+branch)
+	return f.fetchErr
 }
 
 func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, descendant string) (bool, error) {

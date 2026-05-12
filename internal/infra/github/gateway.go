@@ -301,6 +301,11 @@ type ListReviewThreadsInput struct {
 	Limit    int
 }
 
+type ViewReviewThreadInput struct {
+	ThreadID string
+	CWD      string
+}
+
 type ReviewThread struct {
 	ID         string
 	IsResolved bool
@@ -780,6 +785,30 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 		return fmt.Errorf("failed to resolve review thread %s", input.ThreadID)
 	}
 	return nil
+}
+
+func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
+	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD)
+	if err != nil {
+		return ReviewThread{}, err
+	}
+	if thread == nil {
+		return ReviewThread{}, nil
+	}
+	out := ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved}
+	cursor := ""
+	for {
+		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadCommentsPage(ctx, input.CWD, input.ThreadID, cursor)
+		if err != nil {
+			return ReviewThread{}, err
+		}
+		out.Comments = appendReviewThreadComments(out.Comments, nodes)
+		if !hasNextPage {
+			break
+		}
+		cursor = nextCursor
+	}
+	return out, nil
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
@@ -1648,6 +1677,25 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 		for _, node := range nodes {
 			normalized, ok := normalizeReviewThread(node)
 			if ok {
+				threadRow, _ := node.(map[string]any)
+				commentsRow, _ := threadRow["comments"].(map[string]any)
+				commentNodes, _ := commentsRow["nodes"].([]any)
+				pageInfo, _ := commentsRow["pageInfo"].(map[string]any)
+				commentCursor := asString(pageInfo["endCursor"])
+				hasMoreComments := asBool(pageInfo["hasNextPage"])
+				allCommentNodes := append([]any(nil), commentNodes...)
+				for hasMoreComments {
+					moreComments, nextCommentCursor, hasMore, err := g.fetchReviewThreadCommentsPage(ctx, cwd, asString(normalized["threadId"]), commentCursor)
+					if err != nil {
+						return nil, err
+					}
+					allCommentNodes = append(allCommentNodes, moreComments...)
+					commentCursor = nextCommentCursor
+					hasMoreComments = hasMore
+				}
+				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
+					normalized["threadFingerprint"] = fingerprint
+				}
 				out = append(out, normalized)
 			}
 		}
@@ -1704,8 +1752,9 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"          isResolved",
 		"          path",
 		"          line",
-		"          comments(first: 1) {",
-		"            nodes { id body url path line author { login } }",
+		"          comments(first: 100) {",
+		"            nodes { id body updatedAt url path line author { login } }",
+		"            pageInfo { hasNextPage endCursor }",
 		"          }",
 		"        }",
 		"        pageInfo { hasNextPage endCursor }",
@@ -1997,7 +2046,33 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
+	if fingerprint := reviewThreadFingerprintFromNodes(nodes); fingerprint != "" {
+		out["threadFingerprint"] = fingerprint
+	}
 	return out, true
+}
+
+func reviewThreadFingerprintFromNodes(nodes []any) string {
+	parts := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		comment, _ := node.(map[string]any)
+		if comment == nil {
+			continue
+		}
+		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+			continue
+		}
+		id := strings.TrimSpace(asString(comment["id"]))
+		updatedAt := strings.TrimSpace(asString(comment["updatedAt"]))
+		if id == "" && updatedAt == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s@%s", id, updatedAt))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "|")
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {

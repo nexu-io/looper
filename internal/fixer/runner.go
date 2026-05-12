@@ -77,16 +77,17 @@ const (
 )
 
 type FixItem struct {
-	Type     string   `json:"type"`
-	ID       string   `json:"id,omitempty"`
-	ThreadID string   `json:"threadId,omitempty"`
-	Name     string   `json:"name,omitempty"`
-	Summary  string   `json:"summary,omitempty"`
-	Files    []string `json:"files,omitempty"`
-	Author   string   `json:"author,omitempty"`
-	URL      string   `json:"url,omitempty"`
-	Path     string   `json:"path,omitempty"`
-	Line     int64    `json:"line,omitempty"`
+	Type              string   `json:"type"`
+	ID                string   `json:"id,omitempty"`
+	ThreadID          string   `json:"threadId,omitempty"`
+	ThreadFingerprint string   `json:"threadFingerprint,omitempty"`
+	Name              string   `json:"name,omitempty"`
+	Summary           string   `json:"summary,omitempty"`
+	Files             []string `json:"files,omitempty"`
+	Author            string   `json:"author,omitempty"`
+	URL               string   `json:"url,omitempty"`
+	Path              string   `json:"path,omitempty"`
+	Line              int64    `json:"line,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -128,6 +129,29 @@ type ViewPullRequestInput struct {
 	Repo     string
 	PRNumber int64
 	CWD      string
+}
+
+type ListReviewThreadsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+	Limit    int
+}
+
+type ViewReviewThreadInput struct {
+	ThreadID string
+	CWD      string
+}
+
+type ReviewThread struct {
+	ID         string
+	IsResolved bool
+	Comments   []ReviewThreadComment
+}
+
+type ReviewThreadComment struct {
+	ID   string
+	Body string
 }
 
 type ResolveReviewThreadInput struct {
@@ -174,6 +198,8 @@ type GitHubGateway interface {
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
+	ViewReviewThread(context.Context, ViewReviewThreadInput) (ReviewThread, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
@@ -261,6 +287,7 @@ type GitGateway interface {
 	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
 	Commit(context.Context, CommitInput) (CommitResult, error)
 	Push(context.Context, PushInput) error
+	FetchBranch(context.Context, string, string, string) error
 	IsAncestor(context.Context, string, string, string) (bool, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
 }
@@ -520,10 +547,11 @@ type fixEvidence struct {
 }
 
 type fixCommentEvidence struct {
-	FixItemID   string `json:"fixItemId,omitempty"`
-	ThreadID    string `json:"threadId,omitempty"`
-	CommitSHA   string `json:"commitSha,omitempty"`
-	Explanation string `json:"explanation,omitempty"`
+	FixItemID         string `json:"fixItemId,omitempty"`
+	ThreadID          string `json:"threadId,omitempty"`
+	ThreadFingerprint string `json:"threadFingerprint,omitempty"`
+	CommitSHA         string `json:"commitSha,omitempty"`
+	Explanation       string `json:"explanation,omitempty"`
 }
 
 type checkpointResolvedComments struct {
@@ -860,8 +888,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		fixItemsHash := hashFixItems(fixItems)
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash)
+		fixItemsStateHash := hashFixItemsState(fixItems)
+		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsStateHash)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -882,7 +910,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			Repo:         input.Repo,
 			PRNumber:     pr.Number,
 			HeadSHA:      headSHA,
-			FixItemsHash: fixItemsHash,
+			FixItemsHash: fixItemsStateHash,
 		})
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -1616,7 +1644,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	adopted, updatedCheckpoint, err := r.adoptLifecyclePushEvidence(ctx, input, checkpoint, branch)
 	if err != nil {
-		return checkpoint, err
+		return updatedCheckpoint, err
 	}
 	if adopted {
 		return updatedCheckpoint, nil
@@ -1644,11 +1672,10 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
 	evidence := &fixEvidence{Valid: pushedHeadSHA != "" && checkpoint.FixItemsHash != "", HeadSHA: pushedHeadSHA, CommitSHAs: cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, lastNonEmptyString(checkpoint.ReconcileCommits.NewCommitSHAs, pushedHeadSHA)), Source: "fallback_push", ProducedNewCommits: roundProducedNewCommits(&checkpoint), PushedAt: pushedAt}
 	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt, Evidence: evidence}
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
-	if err != nil {
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return checkpoint, err
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.mergeLoopMetadata(ctx, input.Loop, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence}); err != nil {
 		return checkpoint, err
 	}
 	liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: finalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
@@ -1661,11 +1688,10 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	pushedHeadSHA = resolveCommentsExpectedHeadSHA(checkpoint)
 	checkpoint.Push.HeadSHA = pushedHeadSHA
 	checkpoint.Push.Evidence.HeadSHA = pushedHeadSHA
-	metadataJSON, err = mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
-	if err != nil {
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return checkpoint, err
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.mergeLoopMetadata(ctx, input.Loop, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence}); err != nil {
 		return checkpoint, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(pushedHeadSHA)}})
@@ -1747,11 +1773,10 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	pushedAt := r.nowISO()
 	evidence := &fixEvidence{Valid: true, Source: "agent_push", HeadSHA: adoptedHead, CommitSHAs: cloneStrings(lc.CommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, lastNonEmptyString(lc.CommitSHAs, adoptedHead)), ProducedNewCommits: true, PushedAt: pushedAt}
 	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: adoptedHead, PushedAt: pushedAt, Evidence: evidence}
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": adoptedHead, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
-	if err != nil {
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return false, checkpoint, err
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.mergeLoopMetadata(ctx, input.Loop, map[string]any{"lastFixHeadSha": adoptedHead, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence}); err != nil {
 		return false, checkpoint, err
 	}
 	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
@@ -1783,9 +1808,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	fixItems := collectFixItems(liveDetail)
 	currentFixItemsHash := hashFixItems(fixItems)
+	currentFixItemsStateHash := hashFixItemsState(fixItems)
+	evidence := resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = currentFixItemsHash
-	evidence := resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 	verifiedEvidence, err := r.verifyFixEvidence(ctx, input, checkpoint, evidence, liveDetail)
 	if err != nil {
 		return checkpoint, err
@@ -1813,11 +1839,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			}
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
 		}
-		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveAt": r.nowISO()})
-		if err != nil {
-			return checkpoint, err
-		}
-		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		if _, err := r.mergeLoopMetadata(ctx, input.Loop, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveStateHash": currentFixItemsStateHash, "lastNoopResolveAt": r.nowISO()}); err != nil {
 			return checkpoint, err
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1838,7 +1860,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
 		}
-		record, hasRecord := evidenceRecordForItem(evidenceByThread, item)
+		record, hasRecord := evidenceRecordForItem(evidenceByThread, item, evidenceFixItemsHash(evidence), currentFixItemsHash)
 		if !verifiedEvidence || !hasRecord {
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
 			continue
@@ -1850,6 +1872,24 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			failedCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "reply_failed", Message: "Failed to post fixer auto-reply", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			continue
+		}
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
+			return checkpoint, err
+		}
+		resolveState, resolveDetail, resolveErr := r.refreshResolveCommentState(ctx, input, checkpoint, evidence, item)
+		if resolveErr != nil {
+			return checkpoint, resolveErr
+		}
+		switch resolveState {
+		case "already_resolved":
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			continue
+		case "stale":
+			failedCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "stale_state", Message: "PR head or review thread changed before resolve", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			continue
+		case "ok":
+			checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, resolveDetail)
 		}
 		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
 			message := err.Error()
@@ -1893,10 +1933,62 @@ func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item 
 		}
 	}
 	body := buildFixerReplyBody(item, commitSHA, explanation)
+	existingRemoteReply, err := r.hasExistingFixerReply(ctx, input, item, commitSHA)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	if existingRemoteReply {
+		return "sent", ""
+	}
 	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath}); err != nil {
 		return "failed", err.Error()
 	}
 	return "sent", ""
+}
+
+func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, item FixItem, commitSHA string) (bool, error) {
+	marker := fixerReplyMarker(item.ThreadID, commitSHA)
+	if marker == "" {
+		return false, nil
+	}
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
+	if err != nil {
+		return false, err
+	}
+	for _, comment := range thread.Comments {
+		if strings.Contains(comment.Body, marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence *fixEvidence, item FixItem) (string, PullRequestDetail, error) {
+	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", PullRequestDetail{}, err
+	}
+	refreshCheckpoint := checkpoint
+	refreshCheckpoint.Detail = mergeCheckpointDetailPreservingLabels(refreshCheckpoint.Detail, liveDetail)
+	refreshCheckpoint.FixItems = collectFixItems(liveDetail)
+	refreshCheckpoint.FixItemsHash = hashFixItems(refreshCheckpoint.FixItems)
+	verified, err := r.verifyFixEvidence(ctx, input, refreshCheckpoint, evidence, liveDetail)
+	if err != nil {
+		return "", PullRequestDetail{}, err
+	}
+	if !verified {
+		return "stale", liveDetail, nil
+	}
+	for _, liveItem := range refreshCheckpoint.FixItems {
+		if strings.TrimSpace(liveItem.ThreadID) != strings.TrimSpace(item.ThreadID) {
+			continue
+		}
+		if _, ok := evidenceRecordForItem(evidenceCommentRecordsByThread(evidence), liveItem, evidenceFixItemsHash(evidence), refreshCheckpoint.FixItemsHash); !ok {
+			return "stale", liveDetail, nil
+		}
+		return "ok", liveDetail, nil
+	}
+	return "already_resolved", liveDetail, nil
 }
 
 // lookupReplyExplanations returns a map of fixItemId → sanitized agent
@@ -1939,13 +2031,24 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 	if explanation = strings.TrimSpace(explanation); explanation != "" {
 		b.WriteString("\n\n")
 		b.WriteString(explanation)
-		return b.String()
-	}
-	if summary := summarizeFixItem(item); summary != "" {
+	} else if summary := summarizeFixItem(item); summary != "" {
 		b.WriteString("\n\n")
 		b.WriteString(summary)
 	}
+	if marker := fixerReplyMarker(item.ThreadID, commitSHA); marker != "" {
+		b.WriteString("\n\n")
+		b.WriteString(marker)
+	}
 	return b.String()
+}
+
+func fixerReplyMarker(threadID, commitSHA string) string {
+	threadID = strings.TrimSpace(threadID)
+	commitSHA = strings.TrimSpace(commitSHA)
+	if threadID == "" || commitSHA == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply thread:%s commit:%s -->", threadID, commitSHA)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -2583,6 +2686,9 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 }
 
 func (r *Runner) persistCheckpoint(ctx context.Context, runID string, step FixerStep, checkpoint fixerCheckpoint) error {
+	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+		return nil
+	}
 	run, err := r.repos.Runs.GetByID(ctx, runID)
 	if err != nil || run == nil {
 		return err
@@ -2728,6 +2834,36 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 		updated = *current
 	}
 	mutate(&updated)
+	updated.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		return storage.LoopRecord{}, err
+	}
+	return updated, nil
+}
+
+func (r *Runner) mergeLoopMetadata(ctx context.Context, loop storage.LoopRecord, updates map[string]any) (storage.LoopRecord, error) {
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		updated := loop
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
+		return updated, nil
+	}
+	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return storage.LoopRecord{}, err
+	}
+	updated := loop
+	if current != nil {
+		updated = *current
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
+	if err != nil {
+		return storage.LoopRecord{}, err
+	}
+	updated.MetadataJSON = stringPtr(metadataJSON)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -3045,6 +3181,8 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		author, _ := stringFromAny(comment["author"])
 		url, _ := stringFromAny(comment["url"])
 		path, _ := stringFromAny(comment["path"])
+		threadFingerprint, _ := stringFromAny(comment["threadFingerprint"])
+		threadFingerprint = normalizeThreadFingerprint(threadFingerprint, threadID, id)
 		var line int64
 		switch v := comment["line"].(type) {
 		case float64:
@@ -3054,7 +3192,7 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", ID: id, ThreadID: threadID, Summary: summary, Author: author, URL: url, Path: path, Line: line})
+		result = append(result, FixItem{Type: "comment", ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, Summary: summary, Author: author, URL: url, Path: path, Line: line})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
@@ -3114,6 +3252,26 @@ func buildFixerDedupeKey(projectID, loopID, repo string, prNumber int64, headSHA
 func hashFixItems(items []FixItem) string {
 	parts := make([]string, 0, len(items))
 	for _, item := range items {
+		if item.Type == "comment" {
+			item.ThreadFingerprint = ""
+		}
+		encoded, _ := json.Marshal(item)
+		parts = append(parts, string(encoded))
+	}
+	sort.Strings(parts)
+	sum := sha1.Sum([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:])
+}
+
+func hashFixItemsState(items []FixItem) string {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Type == "comment" {
+			item.ThreadFingerprint = strings.TrimSpace(item.ThreadFingerprint)
+			if strings.HasPrefix(item.ThreadFingerprint, "legacy:") {
+				item.ThreadFingerprint = ""
+			}
+		}
 		encoded, _ := json.Marshal(item)
 		parts = append(parts, string(encoded))
 	}
@@ -3398,17 +3556,96 @@ func buildResolveReplyExplanations(checkpoint fixerCheckpoint, evidence *fixEvid
 	return out
 }
 
-func evidenceRecordForItem(records map[string]fixCommentEvidence, item FixItem) (fixCommentEvidence, bool) {
+func evidenceRecordForItem(records map[string]fixCommentEvidence, item FixItem, evidenceFixItemsHash, currentFixItemsHash string) (fixCommentEvidence, bool) {
 	if len(records) == 0 {
 		return fixCommentEvidence{}, false
 	}
 	if record, ok := records[strings.TrimSpace(item.ThreadID)]; ok {
-		return record, true
+		if evidenceRecordMatchesItem(record, item, evidenceFixItemsHash, currentFixItemsHash) {
+			return record, true
+		}
 	}
 	if record, ok := records[strings.TrimSpace(item.ID)]; ok {
-		return record, true
+		if evidenceRecordMatchesItem(record, item, evidenceFixItemsHash, currentFixItemsHash) {
+			return record, true
+		}
 	}
 	return fixCommentEvidence{}, false
+}
+
+func evidenceRecordMatchesItem(record fixCommentEvidence, item FixItem, evidenceFixItemsHash, currentFixItemsHash string) bool {
+	if strings.TrimSpace(record.ThreadID) != "" && strings.TrimSpace(item.ThreadID) != "" && strings.TrimSpace(record.ThreadID) != strings.TrimSpace(item.ThreadID) {
+		return false
+	}
+	if strings.TrimSpace(record.FixItemID) != "" && strings.TrimSpace(item.ID) != "" && strings.TrimSpace(record.FixItemID) != strings.TrimSpace(item.ID) {
+		return false
+	}
+	rawRecordFingerprint := strings.TrimSpace(record.ThreadFingerprint)
+	recordFingerprint := normalizeThreadFingerprint(record.ThreadFingerprint, record.ThreadID, record.FixItemID)
+	itemFingerprint := normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID)
+	if rawRecordFingerprint == "" {
+		latestID := threadFingerprintLatestCommentID(item.ThreadFingerprint)
+		if latestID == "" {
+			latestID = item.ID
+		}
+		if latestID == "" || latestID != strings.TrimSpace(record.FixItemID) {
+			return false
+		}
+		if strings.TrimSpace(evidenceFixItemsHash) == "" {
+			return false
+		}
+		if evidenceFixItemsHash == currentFixItemsHash {
+			return true
+		}
+		return evidenceFixItemsHash == hashFixItems([]FixItem{item})
+	}
+	if itemFingerprint == "" {
+		return false
+	}
+	return recordFingerprint == itemFingerprint
+}
+
+func evidenceFixItemsHash(evidence *fixEvidence) string {
+	if evidence == nil {
+		return ""
+	}
+	return strings.TrimSpace(evidence.FixItemsHash)
+}
+
+func normalizeThreadFingerprint(fingerprint, threadID, itemID string) string {
+	if fingerprint = strings.TrimSpace(fingerprint); fingerprint != "" {
+		return fingerprint
+	}
+	threadID = strings.TrimSpace(threadID)
+	itemID = strings.TrimSpace(itemID)
+	if threadID == "" || itemID == "" {
+		return ""
+	}
+	return fmt.Sprintf("legacy:%s:%s", threadID, itemID)
+}
+
+func threadFingerprintLatestCommentID(fingerprint string) string {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return ""
+	}
+	if strings.HasPrefix(fingerprint, "latest=") {
+		parts := strings.Split(fingerprint, "|")
+		return strings.TrimPrefix(parts[0], "latest=")
+	}
+	if strings.Contains(fingerprint, "@") {
+		parts := strings.Split(fingerprint, "|")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		commentParts := strings.SplitN(last, "@", 2)
+		return strings.TrimSpace(commentParts[0])
+	}
+	if strings.HasPrefix(fingerprint, "legacy:") {
+		parts := strings.Split(fingerprint, ":")
+		if len(parts) == 3 {
+			return parts[2]
+		}
+	}
+	return ""
 }
 
 func evidenceCommentRecordsByThread(evidence *fixEvidence) map[string]fixCommentEvidence {
@@ -3593,8 +3830,11 @@ func resolveFixEvidence(checkpoint fixerCheckpoint, loopMetadataJSON *string, fi
 			evidence.HeadSHA = checkpoint.Push.HeadSHA
 		}
 		if evidence.Valid && evidence.HeadSHA != "" && evidence.ProducedNewCommits {
-			if len(evidence.CommentRecords) == 0 {
+			if len(evidence.CommentRecords) == 0 && canBackfillEvidenceRecords(checkpoint, evidence.FixItemsHash, fixItemsHash) {
 				evidence.CommentRecords = buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, &evidence, true))
+			}
+			if !evidenceSafeForCurrentFixItems(&evidence, fixItemsHash) {
+				return nil
 			}
 			return &evidence
 		}
@@ -3605,18 +3845,65 @@ func resolveFixEvidence(checkpoint fixerCheckpoint, loopMetadataJSON *string, fi
 		if !producedNewCommits {
 			return nil
 		}
-		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: checkpoint.Push.HeadSHA, CommitSHAs: cloneStrings(commitEvidenceSHAs(checkpoint)), FixItemsHash: fixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false)), ProducedNewCommits: producedNewCommits, PushedAt: checkpoint.Push.PushedAt}
+		evidence := &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: checkpoint.Push.HeadSHA, CommitSHAs: cloneStrings(commitEvidenceSHAs(checkpoint)), FixItemsHash: fixItemsHash, ProducedNewCommits: producedNewCommits, PushedAt: checkpoint.Push.PushedAt}
+		if canBackfillEvidenceRecords(checkpoint, fixItemsHash, fixItemsHash) {
+			evidence.CommentRecords = buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false))
+		}
+		if !evidenceSafeForCurrentFixItems(evidence, fixItemsHash) {
+			return nil
+		}
+		return evidence
 	}
 	if persisted := persistedFixEvidence(loopMetadataJSON); persisted != nil && persisted.Valid && persisted.HeadSHA != "" && persisted.ProducedNewCommits {
+		if !evidenceSafeForCurrentFixItems(persisted, fixItemsHash) {
+			return nil
+		}
 		return persisted
 	}
 	if fixItemsHash == "" {
 		return nil
 	}
 	if headSHA := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, loopMetadataJSON, fixItemsHash); headSHA != "" {
-		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: headSHA, FixItemsHash: fixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false)), ProducedNewCommits: true}
+		evidence := &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: headSHA, FixItemsHash: fixItemsHash, ProducedNewCommits: true}
+		if canBackfillEvidenceRecords(checkpoint, fixItemsHash, fixItemsHash) {
+			evidence.CommentRecords = buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false))
+		}
+		if !evidenceSafeForCurrentFixItems(evidence, fixItemsHash) {
+			return nil
+		}
+		return evidence
 	}
 	return nil
+}
+
+func evidenceSafeForCurrentFixItems(evidence *fixEvidence, currentFixItemsHash string) bool {
+	if evidence == nil {
+		return false
+	}
+	if !evidenceUsesLegacyThreadMatching(evidence) {
+		return true
+	}
+	return strings.TrimSpace(evidence.FixItemsHash) != ""
+}
+
+func evidenceUsesLegacyThreadMatching(evidence *fixEvidence) bool {
+	for _, record := range evidence.CommentRecords {
+		fingerprint := strings.TrimSpace(record.ThreadFingerprint)
+		if fingerprint == "" || strings.HasPrefix(fingerprint, "legacy:") {
+			return true
+		}
+	}
+	return false
+}
+
+func canBackfillEvidenceRecords(checkpoint fixerCheckpoint, storedFixItemsHash, liveFixItemsHash string) bool {
+	if strings.TrimSpace(storedFixItemsHash) == "" || strings.TrimSpace(liveFixItemsHash) == "" {
+		return false
+	}
+	if strings.TrimSpace(checkpoint.FixItemsHash) == "" || checkpoint.FixItemsHash != storedFixItemsHash || storedFixItemsHash != liveFixItemsHash {
+		return false
+	}
+	return len(checkpoint.FixItems) > 0
 }
 
 func evidenceHeadSHA(evidence *fixEvidence) string {
@@ -3656,6 +3943,9 @@ func persistedFixEvidence(loopMetadataJSON *string) *fixEvidence {
 	if evidence.HeadSHA == "" {
 		return nil
 	}
+	if evidence.FixItemsHash == "" {
+		evidence.FixItemsHash, _ = stringFromAny(metadata["lastFixItemsHash"])
+	}
 	evidence.CommentRecords = cloneFixCommentEvidence(evidence.CommentRecords)
 	evidence.CommitSHAs = cloneStrings(evidence.CommitSHAs)
 	return &evidence
@@ -3671,7 +3961,7 @@ func buildFixCommentEvidenceRecords(checkpoint fixerCheckpoint, commitSHA string
 		if item.Type != "comment" {
 			continue
 		}
-		records = append(records, fixCommentEvidence{FixItemID: item.ID, ThreadID: item.ThreadID, CommitSHA: commitSHA, Explanation: explanationByID[item.ID]})
+		records = append(records, fixCommentEvidence{FixItemID: item.ID, ThreadID: item.ThreadID, ThreadFingerprint: normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID), CommitSHA: commitSHA, Explanation: explanationByID[item.ID]})
 	}
 	return records
 }
@@ -3718,10 +4008,14 @@ func (r *Runner) verifyFixEvidence(ctx context.Context, input stepInput, checkpo
 		if _, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ExpectedHeadSHA: liveHeadSHA}); err != nil {
 			return false, err
 		}
+	} else if branch := strings.TrimSpace(liveDetail.HeadRefName); branch != "" {
+		if err := r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", branch); err != nil {
+			return false, &loopError{message: fmt.Sprintf("failed to fetch live PR head for evidence verification: %v", err), kind: FailureRetryableTransient}
+		}
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, liveHeadSHA)
 	if err != nil {
-		return false, nil
+		return false, &loopError{message: fmt.Sprintf("failed to verify fix evidence ancestry: %v", err), kind: FailureRetryableTransient}
 	}
 	return ancestor, nil
 }
@@ -3742,19 +4036,22 @@ func (r *Runner) validationMatchesEvidence(ctx context.Context, input stepInput,
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, validationHeadSHA)
 	if err != nil {
-		return false, nil
+		return false, &loopError{message: fmt.Sprintf("failed to verify validation ancestry: %v", err), kind: FailureRetryableTransient}
 	}
 	return ancestor, nil
 }
 
-func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsHash string) bool {
-	if headSHA == "" || fixItemsHash == "" {
+func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsStateHash string) bool {
+	if headSHA == "" || fixItemsStateHash == "" {
 		return false
 	}
 	metadata := parseJSONObject(loopMetadataJSON)
 	lastHeadSHA, _ := stringFromAny(metadata["lastNoopResolveHeadSha"])
-	lastFixItemsHash, _ := stringFromAny(metadata["lastNoopResolveFixItemsHash"])
-	return lastHeadSHA != "" && lastHeadSHA == headSHA && lastFixItemsHash != "" && lastFixItemsHash == fixItemsHash
+	lastFixItemsStateHash, _ := stringFromAny(metadata["lastNoopResolveStateHash"])
+	if lastFixItemsStateHash == "" {
+		lastFixItemsStateHash, _ = stringFromAny(metadata["lastNoopResolveFixItemsHash"])
+	}
+	return lastHeadSHA != "" && lastHeadSHA == headSHA && lastFixItemsStateHash != "" && lastFixItemsStateHash == fixItemsStateHash
 }
 
 func buildFixerDiscoveryFingerprint(repo string, prNumber int64, headSHA, fixItemsHash string) string {

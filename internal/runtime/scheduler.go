@@ -430,6 +430,34 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: detail.IssueComments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
+func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.ReviewThread, 0, len(threads))
+	for _, thread := range threads {
+		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
+		for _, comment := range thread.Comments {
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+		}
+		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
+	}
+	return out, nil
+}
+
+func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
+	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD})
+	if err != nil {
+		return fixer.ReviewThread{}, err
+	}
+	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
+	for _, comment := range thread.Comments {
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+	}
+	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
+}
+
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
@@ -501,6 +529,10 @@ func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (f
 
 func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+}
+
+func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, branch string) error {
+	return a.gateway.FetchBranch(ctx, repoPath, remote, branch)
 }
 
 func (a fixerGitAdapter) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
