@@ -70,6 +70,7 @@ func TestRootPreRunSkipsAutoUpgradeForUnsupportedInstallSource(t *testing.T) {
 	app := New(Deps{
 		Stdout:         stdout,
 		Stderr:         stderr,
+		HomeDir:        t.TempDir(),
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
@@ -205,7 +206,7 @@ func TestEnvDisablesAutoUpgrade(t *testing.T) {
 	}
 }
 
-func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
+func TestAutoUpgradeStartsBackgroundWorkerAndCachesInFlightState(t *testing.T) {
 	t.Parallel()
 
 	homeDir := t.TempDir()
@@ -213,7 +214,9 @@ func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
-	var latestCalls int
+	workerPID := os.Getpid()
+	var spawnCalls int
+	var spawnedArgs []string
 	app := New(Deps{
 		Stdout:         stdout,
 		Stderr:         stderr,
@@ -221,18 +224,26 @@ func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
-				latestCalls++
-				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.0.0-dev","assets":[]}`), nil
-			default:
-				t.Fatalf("unexpected request URL %q", req.URL.String())
-				return nil, nil
-			}
+			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+			return nil, nil
 		}),
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = command
+			_ = cwd
+			_ = env
+			spawnCalls++
+			spawnedArgs = append([]string{}, args...)
+			return workerPID, nil
+		},
+		Getwd: func() (string, error) {
+			return homeDir, nil
+		},
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
 			_ = timeout
+			if command == "ps" {
+				return commandExecutionResult{Stdout: filepath.Join(homeDir, ".looper", "bin", "looper") + " upgrade --background-auto\n", ExitCode: 0}, nil
+			}
 			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
 		},
 	})
@@ -245,11 +256,188 @@ func TestAutoUpgradeCachesLatestReleaseCheck(t *testing.T) {
 			t.Fatalf("run %d Run([version --config]) exit code = %d, want 0; stderr=%q", i+1, exitCode, stderr.String())
 		}
 	}
-	if latestCalls != 1 {
-		t.Fatalf("latest release calls = %d, want 1", latestCalls)
+	if spawnCalls != 1 {
+		t.Fatalf("spawnDetached calls = %d, want 1", spawnCalls)
 	}
-	if _, err := os.Stat(statePath); err != nil {
-		t.Fatalf("Stat(auto-upgrade state) error = %v, want file to exist", err)
+	if got, want := strings.Join(spawnedArgs, " "), "upgrade --background-auto --config "+configPath; got != want {
+		t.Fatalf("spawned args = %q, want %q", got, want)
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(auto-upgrade state) error = %v", err)
+	}
+	var state autoUpgradeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("Unmarshal(auto-upgrade state) error = %v", err)
+	}
+	if state.InFlight == nil || state.InFlight.PID != workerPID {
+		t.Fatalf("state.InFlight = %#v, want pid %d", state.InFlight, workerPID)
+	}
+	if state.LastCheckedAt != nil {
+		t.Fatalf("state.LastCheckedAt = %v, want nil until background worker finishes", state.LastCheckedAt)
+	}
+}
+
+func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
+	execPath := filepath.Join(homeDir, ".looper", "bin", "looper")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(execPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(exec dir) error = %v", err)
+	}
+	if err := os.WriteFile(execPath, []byte("old looper"), 0o755); err != nil {
+		t.Fatalf("WriteFile(execPath) error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("old looperd"), 0o755); err != nil {
+		t.Fatalf("WriteFile(managedPath) error = %v", err)
+	}
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	if err := runtime.writeAutoUpgradeState(statePath, autoUpgradeState{InFlight: &autoUpgradeInFlightState{PID: 4321, StartedAt: timePtr(time.Now().UTC())}}); err != nil {
+		t.Fatalf("writeAutoUpgradeState() error = %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cliBinary := []byte("new looper")
+	cliChecksum := sha256.Sum256(cliBinary)
+	daemonBinary := []byte("new looperd")
+	daemonChecksum := sha256.Sum256(daemonBinary)
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.1","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest",
+				"https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looper-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, cliBinary), nil
+			case "https://example.invalid/looper-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, hex.EncodeToString(cliChecksum[:])+"  looper-darwin-arm64\n"), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, daemonBinary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, hex.EncodeToString(daemonChecksum[:])+"  looperd-darwin-arm64\n"), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.2.1\n", ExitCode: 0}, nil
+			}
+			if command == looperdBinaryName && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	if exitCode := app.Run(context.Background(), []string{"upgrade", "--background-auto", "--config", configPath}); exitCode != 0 {
+		t.Fatalf("Run([upgrade --background-auto]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(auto-upgrade state) error = %v", err)
+	}
+	var state autoUpgradeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("Unmarshal(auto-upgrade state) error = %v", err)
+	}
+	if state.InFlight != nil {
+		t.Fatalf("state.InFlight = %#v, want nil", state.InFlight)
+	}
+	if state.LastCheckedAt == nil {
+		t.Fatal("state.LastCheckedAt = nil, want timestamp")
+	}
+	if state.Ready == nil {
+		t.Fatal("state.Ready = nil, want ready notification")
+	}
+	if !state.Ready.CLIChanged || state.Ready.CLIVersion != "0.3.0" {
+		t.Fatalf("state.Ready CLI = %#v, want changed version 0.3.0", state.Ready)
+	}
+	if !state.Ready.DaemonChanged || state.Ready.DaemonVersion != "0.3.0" {
+		t.Fatalf("state.Ready daemon = %#v, want changed version 0.3.0", state.Ready)
+	}
+	if !state.Ready.DaemonRestartRequired || state.Ready.RunningDaemonVersion != "0.2.1" {
+		t.Fatalf("state.Ready restart = %#v, want restart from 0.2.1", state.Ready)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty string", stdout.String())
+	}
+}
+
+func TestAutoUpgradeReadyNoticePrintsRestartCommand(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(managedPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(managed dir) error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("managed looperd"), 0o755); err != nil {
+		t.Fatalf("WriteFile(managedPath) error = %v", err)
+	}
+	now := time.Now().UTC()
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	if err := runtime.writeAutoUpgradeState(statePath, autoUpgradeState{LastCheckedAt: &now, Ready: &autoUpgradeReadyState{DaemonChanged: true, DaemonVersion: "0.3.0", DaemonRestartRequired: true, CompletedAt: now}}); err != nil {
+		t.Fatalf("writeAutoUpgradeState() error = %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
+		CLIChannel:     cliInstallChannelStable,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.0","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.3.0\n", ExitCode: 0}, nil
+			}
+			if command == looperdBinaryName && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	if exitCode := app.Run(context.Background(), []string{"version", "--config", configPath}); exitCode != 0 {
+		t.Fatalf("Run([version --config]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Auto-upgrade ready: looperd 0.3.0 is installed") {
+		t.Fatalf("stderr = %q, want daemon ready message", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "looper daemon restart") {
+		t.Fatalf("stderr = %q, want restart command", stderr.String())
 	}
 }
 
@@ -741,6 +929,7 @@ func TestUpgradeCLIRefusesHomebrewSymlinkWithGuidance(t *testing.T) {
 	app := New(Deps{
 		Stdout:         stdout,
 		Stderr:         stderr,
+		HomeDir:        homebrewRoot,
 		ExecutablePath: symlinkPath,
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
@@ -773,6 +962,7 @@ func TestUpgradeCLIPreflightsInstallPathBeforeDownload(t *testing.T) {
 	app := New(Deps{
 		Stdout:         stdout,
 		Stderr:         stderr,
+		HomeDir:        t.TempDir(),
 		ExecutablePath: execPath,
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
@@ -818,6 +1008,7 @@ func TestUpgradeCLIPrintsDownloadProgressToStderr(t *testing.T) {
 	app := New(Deps{
 		Stdout:         stdout,
 		Stderr:         stderr,
+		HomeDir:        root,
 		Platform:       "darwin",
 		Arch:           "arm64",
 		ExecutablePath: execPath,
@@ -1079,6 +1270,7 @@ func TestUpgradeDaemonInstallsManagedBinaryWhenOnlyPathBinaryExists(t *testing.T
 func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
 	configPath := writeCLIConfig(t, "http://daemon.test", "")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
@@ -1245,6 +1437,11 @@ func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Upgraded looperd 0.2.0 → 0.3.0") {
 		t.Fatalf("stdout = %q, want upgrade confirmation", stdout.String())
 	}
+	upgradeCompletedAt := time.Now().UTC()
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	if err := runtime.writeAutoUpgradeState(statePath, autoUpgradeState{Ready: &autoUpgradeReadyState{DaemonChanged: true, DaemonVersion: "0.3.0", DaemonRestartRequired: true, RunningDaemonVersion: "0.2.0", CompletedAt: upgradeCompletedAt}}); err != nil {
+		t.Fatalf("writeAutoUpgradeState() error = %v", err)
+	}
 
 	stdout.Reset()
 	stderr.Reset()
@@ -1260,4 +1457,15 @@ func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 	assertJSONContains(t, stdout.String(), "apiReachable", true)
 	assertJSONContains(t, stdout.String(), "daemonVersion", "0.3.0")
 	assertJSONContains(t, stdout.String(), "daemonVersionSource", "api")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(auto-upgrade state) error = %v", err)
+	}
+	var state autoUpgradeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("Unmarshal(auto-upgrade state) error = %v", err)
+	}
+	if state.Ready != nil {
+		t.Fatalf("state.Ready = %#v, want cleared after restart", state.Ready)
+	}
 }
