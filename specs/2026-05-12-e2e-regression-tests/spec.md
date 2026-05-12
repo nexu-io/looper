@@ -426,6 +426,14 @@ sandbox 要求：
 
 ## 9. Rollout plan
 
+当前实现状态（2026-05-12）：
+
+- Phase 1 已落地：`internal/e2e/harness`、fake agent、strict fake gh、temp HOME/runtime、daemon helpers 均已就位。
+- Phase 2 已落地并通过：daemon boot smoke 已覆盖 default config、roles config、unknown top-level fields、explicit tool paths、invalid `osascript` fail-fast。
+- Phase 3 已基本落地并通过：fixture-driven gh schema、unsupported `--json` failure、`gh api`/GraphQL contract、repo form coverage、opt-in real-gh smoke 已实现；反向字段契约与 PR #261 detail fallback 仍待补充。
+- Phase 4 已部分落地并通过：已覆盖 fresh schedule worktree isolation、cwd evidence、user repo unchanged、isolated commit；worker reuse / restore / bad checkpoint / fixer 等价路径仍待补充。
+- Phase 5 已落地：fake-gh 已支持基于 bare origin 的 PR head、thread state 持久化、resolve/unresolve mutation、closed/open target state、no-push rerun 所需状态种子；并已覆盖 stale-head-after-push、no-push-rerun-stale-head、no-new-commit-unresolved、closed-PR skip、resumed-closed-target、worker no-diff/no-PR 场景。
+
 ### Phase 1：Integration harness skeleton
 
 建立 `internal/e2e/harness`：`TestMain` 构建二进制、temp HOME、dynamic config/port、daemon readiness、fake gh argv log、fake agent cwd evidence。

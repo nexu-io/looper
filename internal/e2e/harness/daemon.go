@@ -31,6 +31,13 @@ type DaemonProcess struct {
 	waitErr    error
 }
 
+func (d *DaemonProcess) BaseURL() string {
+	if d == nil {
+		return ""
+	}
+	return d.baseURL
+}
+
 func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath string, extraEnv map[string]string, host string, port int) *DaemonProcess {
 	tb.Helper()
 	stdoutPath := filepath.Join(home.ArtifactsDir, "looperd.stdout.log")
@@ -57,15 +64,7 @@ func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath s
 		_ = stderrFile.Close()
 		tb.Fatalf("start looperd: %v", err)
 	}
-	proc := &DaemonProcess{
-		cmd:        cmd,
-		home:       home,
-		configPath: configPath,
-		stdoutPath: stdoutPath,
-		stderrPath: stderrPath,
-		baseURL:    BaseURL(host, port),
-		doneCh:     make(chan struct{}),
-	}
+	proc := &DaemonProcess{cmd: cmd, home: home, configPath: configPath, stdoutPath: stdoutPath, stderrPath: stderrPath, baseURL: BaseURL(host, port), doneCh: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
 		_ = stdoutFile.Close()

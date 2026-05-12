@@ -66,7 +66,7 @@
 - [x] fake agent 写入 `cwd-evidence.json`
 - [x] 实现 strict fake gh executable helper
 - [x] fake gh 支持 argv / stdin / cwd / env 记录
-- [ ] fake gh 从真实 fixture 加载 `--json` allowlist
+- [x] fake gh 从真实 fixture 加载 `--json` allowlist
 - [x] fake gh 支持接近真实 `gh` 的 unsupported-field 错误输出
 - [x] fake gh 支持跨进程 state 文件
 - [x] fake gh 支持 strict / replay / record 模式
@@ -77,90 +77,90 @@
 
 ## Phase 2 - Daemon boot smoke
 
-- [ ] 添加 `TestSmokeLooperdBootsWithDefaultConfig`
-- [ ] 添加 `TestSmokeLooperdBootsWithRolesConfig`
-- [ ] 添加 `TestSmokeLooperdBootsWithUnknownConfigFields`
-- [ ] 添加 `TestSmokeLooperdBootsWithExplicitToolPaths`
-- [ ] 添加 invalid `osascript` path + enabled=true fail-fast 测试
-- [ ] 验证 `/api/v1/status` HTTP 200
-- [ ] 验证 status response 包含 pid / version / status 类稳定字段
-- [ ] 验证 DB path 可写
-- [ ] 验证 logs path 可写
-- [ ] 验证 backups path 可写
-- [ ] 验证 worktree root 可写
+- [x] 添加 `TestSmokeLooperdBootsWithDefaultConfig`
+- [x] 添加 `TestSmokeLooperdBootsWithRolesConfig`
+- [x] 添加 `TestSmokeLooperdBootsWithUnknownConfigFields`
+- [x] 添加 `TestSmokeLooperdBootsWithExplicitToolPaths`
+- [x] 添加 invalid `osascript` path + enabled=true fail-fast 测试
+- [x] 验证 `/api/v1/status` HTTP 200
+- [x] 验证 status response 包含 pid / version / status 类稳定字段
+- [x] 验证 DB path 可写
+- [x] 验证 logs path 可写
+- [x] 验证 backups path 可写
+- [x] 验证 worktree root 可写
 - [ ] 验证 missing optional config 不导致启动失败
-- [ ] 验证 unsupported required tool path 会产生清晰启动失败
-- [ ] 验证 daemon 可被正常停止
-- [ ] 验证测试不依赖固定端口
-- [ ] 失败时 dump stderr、`~/.looper/logs`、config、fake gh invocation log
+- [x] 验证 unsupported required tool path 会产生清晰启动失败
+- [x] 验证 daemon 可被正常停止
+- [x] 验证测试不依赖固定端口
+- [x] 失败时 dump stderr、`~/.looper/logs`、config、fake gh invocation log
 - [ ] 将 daemon boot smoke 加入 PR 默认 CI
 
 ## Phase 3 - GitHub CLI command contract
 
-- [ ] 建立真实 `gh` fixture 目录：`internal/e2e/githubcontract/testdata/gh-schema/`
-- [ ] 增加 fixture 刷新脚本：`scripts/refresh-gh-fixtures.sh`
+- [x] 建立真实 `gh` fixture 目录：`internal/e2e/githubcontract/testdata/gh-schema/`
+- [x] 增加 fixture 刷新脚本：`scripts/refresh-gh-fixtures.sh`
 - [ ] 为 `gh issue list --json` 建立 fixture-driven supported field allowlist
-- [ ] 为 `gh pr list --json` 建立 fixture-driven supported field allowlist
-- [ ] 为 `gh pr view --json` 建立 fixture-driven supported field allowlist
-- [ ] 为 `gh api repos/:owner/:repo/issues/:number` 建立 route contract
-- [ ] 为 GraphQL query / mutation 建立 contract
-- [ ] 添加 `TestInvariantGatewayUsesSupportedGHJSONFields`
-- [ ] 添加 PR #255 regression test，确保 list summary 不请求 `authorAssociation`
+- [x] 为 `gh pr list --json` 建立 fixture-driven supported field allowlist
+- [x] 为 `gh pr view --json` 建立 fixture-driven supported field allowlist
+- [x] 为 `gh api repos/:owner/:repo/issues/:number` 建立 route contract
+- [x] 为 GraphQL query / mutation 建立 contract
+- [x] 添加 `TestInvariantGatewayUsesSupportedGHJSONFields`
+- [x] 添加 PR #255 regression test，确保 list summary 不请求 `authorAssociation`
 - [ ] 添加 PR #261 regression test，确保需要 author association 时走 detail fallback
 - [ ] 添加读取字段必须出现在请求字段中的反向契约测试
-- [ ] 验证 `owner/repo` repo 形态
-- [ ] 验证 `github.com/owner/repo` repo 形态
-- [ ] 验证 `ghe.example.com/owner/repo` repo 形态
-- [ ] fake gh 对 unsupported `--json` field 必须 fail
-- [ ] fake gh 记录 argv + stdin 供失败诊断
-- [ ] 增加 opt-in real-gh read-only smoke
-- [ ] real-gh smoke 提示 fixture 是否过期
+- [x] 验证 `owner/repo` repo 形态
+- [x] 验证 `github.com/owner/repo` repo 形态
+- [x] 验证 `ghe.example.com/owner/repo` repo 形态
+- [x] fake gh 对 unsupported `--json` field 必须 fail
+- [x] fake gh 记录 argv + stdin 供失败诊断
+- [x] 增加 opt-in real-gh read-only smoke
+- [x] real-gh smoke 提示 fixture 是否过期
 - [ ] 将 `internal/infra/github/**` 变更映射到 gh contract E2E job
 
 ## Phase 4 - Worktree isolation invariant
 
-- [ ] 添加 `TestInvariantWorkerUsesIsolatedWorktreeAndLeavesUserRepoClean`
-- [ ] 创建真实 temp user repo 并提交初始文件
-- [ ] snapshot 用户 repo HEAD
-- [ ] snapshot 用户 repo `git status --porcelain`
-- [ ] snapshot 用户 repo index 状态
-- [ ] 在 user repo 中放置 dirty sentinel
-- [ ] 触发 worker 执行 fake agent `write-file`
-- [ ] 断言 fake agent 生成 `cwd-evidence.json`
-- [ ] 断言 fake agent cwd 位于 Looper worktree
-- [ ] 断言 fake agent cwd 不等于 user repo path
-- [ ] 断言 fake agent cwd 不等于 looperd 启动 cwd
-- [ ] 断言用户 repo 未出现 fake agent 写入文件
-- [ ] 断言用户 repo dirty sentinel 未被清理、覆盖、提交
-- [ ] 断言用户 repo HEAD/status/index 不变
-- [ ] 断言 worktree 中存在 fake agent 写入文件
-- [ ] 断言 run metadata 记录 worktree path
+- [x] 添加 `TestInvariantWorkerUsesIsolatedWorktreeAndLeavesUserRepoClean`
+- [x] 创建真实 temp user repo 并提交初始文件
+- [x] snapshot 用户 repo HEAD
+- [x] snapshot 用户 repo `git status --porcelain`
+- [x] snapshot 用户 repo index 状态
+- [x] 在 user repo 中放置 dirty sentinel
+- [x] 触发 worker 执行 fake agent `write-file`
+- [x] 断言 fake agent 生成 `cwd-evidence.json`
+- [x] 断言 fake agent cwd 位于 Looper worktree
+- [x] 断言 fake agent cwd 不等于 user repo path
+- [x] 断言 fake agent cwd 不等于 looperd 启动 cwd
+- [x] 断言用户 repo 未出现 fake agent 写入文件
+- [x] 断言用户 repo dirty sentinel 未被清理、覆盖、提交
+- [x] 断言用户 repo HEAD/status/index 不变
+- [x] 断言 worktree 中存在 fake agent 写入文件
+- [x] 断言 run metadata 记录 worktree path
 - [ ] 添加 PR #194 fresh schedule regression test
 - [ ] 添加 PR #194 reused loop / active worker regression test
 - [ ] 添加 worktree 被外部删除后的 restore/recreate test
 - [ ] 添加 checkpoint worktree path == repo path 必须 reject/recover test
-- [ ] 添加 agent commit/push 到隔离分支而非用户当前分支的断言
+- [x] 添加 agent commit/push 到隔离分支而非用户当前分支的断言
 - [ ] 添加 fixer worktree isolation 等价测试
 - [ ] 将 `internal/worker/**`、`internal/fixer/**`、`internal/api/**`、worktree 相关路径映射到 worktree E2E job
 
 ## Phase 5 - Resolve-comments scenario tests
 
-- [ ] 建立 temp bare repo as origin helper
-- [ ] 建立 fake GitHub cross-process state file helper
-- [ ] fake gh 从 bare repo 派生 PR head SHA
-- [ ] fake gh 支持 unresolved review threads 列表
-- [ ] fake gh 支持 GraphQL resolve/unresolve mutation
-- [ ] fake gh 支持 thread resolved/unresolved 状态变化
-- [ ] fake gh 支持 no-push rerun checkpoint state
-- [ ] fake gh 支持 closed issue/PR state
-- [ ] 添加 stale checkpoint head after successful push regression test
-- [ ] 添加 no-push rerun stale checkpoint head regression test
-- [ ] 添加 no-new-commit but unresolved threads remain regression test
-- [ ] 添加 no-diff branch before PR creation regression test
+- [x] 建立 temp bare repo as origin helper
+- [x] 建立 fake GitHub cross-process state file helper
+- [x] fake gh 从 bare repo 派生 PR head SHA
+- [x] fake gh 支持 unresolved review threads 列表
+- [x] fake gh 支持 GraphQL resolve/unresolve mutation
+- [x] fake gh 支持 thread resolved/unresolved 状态变化
+- [x] fake gh 支持 no-push rerun checkpoint state
+- [x] fake gh 支持 closed issue/PR state
+- [x] 添加 stale checkpoint head after successful push regression test
+- [x] 添加 no-push rerun stale checkpoint head regression test
+- [x] 添加 no-new-commit but unresolved threads remain regression test
+- [x] 添加 no-diff branch before PR creation regression test
 - [ ] 添加 target already closed stops resumed worker/fixer regression test
-- [ ] 验证 GraphQL resolve mutation 被调用且 state file 状态正确
-- [ ] 验证失败路径不会错误进入永久 paused
-- [ ] 将 `internal/fixer/**`、`internal/reviewer/**` 变更映射到 resolve-comments scenario E2E job
+- [x] 验证 GraphQL resolve mutation 被调用且 state file 状态正确
+- [x] 验证失败路径不会错误进入永久 paused
+- [x] 将 `internal/fixer/**`、`internal/reviewer/**` 变更映射到 resolve-comments scenario E2E job
 
 ## Phase 6 - CI integration strategy
 
@@ -229,18 +229,18 @@
 ## Phase 9 - One-week minimum rollout
 
 - [ ] 完成 E2E harness skeleton
-- [ ] 完成 daemon boot smoke：default config
-- [ ] 完成 daemon boot smoke：roles config
-- [ ] 完成 daemon boot smoke：explicit fake tools config
-- [ ] 完成 daemon boot smoke：invalid osascript fail-fast
-- [ ] 完成 gh contract：fixture-driven allowlist
-- [ ] 完成 gh contract：unsupported `--json` fail
-- [ ] 完成 gh contract：`gh api` route
+- [x] 完成 daemon boot smoke：default config
+- [x] 完成 daemon boot smoke：roles config
+- [x] 完成 daemon boot smoke：explicit fake tools config
+- [x] 完成 daemon boot smoke：invalid osascript fail-fast
+- [x] 完成 gh contract：fixture-driven allowlist
+- [x] 完成 gh contract：unsupported `--json` fail
+- [x] 完成 gh contract：`gh api` route
 - [ ] 完成 gh contract：反向字段契约
-- [ ] 完成 worktree invariant：fresh schedule
+- [x] 完成 worktree invariant：fresh schedule
 - [ ] 完成 worktree invariant：worker reuse
-- [ ] 完成 worktree invariant：fake agent cwd evidence
-- [ ] 完成 worktree invariant：用户 repo HEAD/status 不变
+- [x] 完成 worktree invariant：fake agent cwd evidence
+- [x] 完成 worktree invariant：用户 repo HEAD/status 不变
 - [ ] 完成 worktree invariant：bad checkpoint reject
 - [ ] Stretch：完成 resolve-comments stale-head-after-push 场景
 

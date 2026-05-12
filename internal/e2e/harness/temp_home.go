@@ -35,24 +35,8 @@ func NewTempHome(tb testing.TB) TempHome {
 			tb.Fatalf("mkdir %s: %v", path, err)
 		}
 	}
-	return TempHome{
-		Root:         root,
-		HomeDir:      homeDir,
-		LooperHome:   looperHome,
-		ArtifactsDir: artifactsDir,
-		LogDir:       logDir,
-		BackupDir:    backupDir,
-		WorktreeRoot: worktreeRoot,
-		WorkingDir:   workingDir,
-		DBPath:       filepath.Join(looperHome, "looper.sqlite"),
-		ConfigPath:   filepath.Join(looperHome, "config.json"),
-	}
+	return TempHome{Root: root, HomeDir: homeDir, LooperHome: looperHome, ArtifactsDir: artifactsDir, LogDir: logDir, BackupDir: backupDir, WorktreeRoot: worktreeRoot, WorkingDir: workingDir, DBPath: filepath.Join(looperHome, "looper.sqlite"), ConfigPath: filepath.Join(looperHome, "config.json")}
 }
 
-func (h TempHome) EnvMap() map[string]string {
-	return map[string]string{"HOME": h.HomeDir}
-}
-
-func (h TempHome) EnvSlice() []string {
-	return []string{"HOME=" + h.HomeDir}
-}
+func (h TempHome) EnvMap() map[string]string { return map[string]string{"HOME": h.HomeDir} }
+func (h TempHome) EnvSlice() []string        { return []string{"HOME=" + h.HomeDir} }

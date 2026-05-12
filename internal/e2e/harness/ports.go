@@ -6,21 +6,19 @@ import (
 	"testing"
 )
 
-func ReserveTCPPort(tb testing.TB) int {
+func MustFreePort(tb testing.TB) int {
 	tb.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		tb.Fatalf("reserve tcp port: %v", err)
+		tb.Fatalf("listen for free port: %v", err)
 	}
 	defer listener.Close()
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		tb.Fatalf("listener addr %T is not TCP", listener.Addr())
-	}
-	if addr.Port <= 0 {
-		tb.Fatalf("reserved invalid port %d", addr.Port)
-	}
-	return addr.Port
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func ReserveTCPPort(tb testing.TB) int {
+	tb.Helper()
+	return MustFreePort(tb)
 }
 
 func BaseURL(host string, port int) string {

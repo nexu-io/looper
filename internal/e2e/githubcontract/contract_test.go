@@ -1,0 +1,260 @@
+package githubcontract
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/nexu-io/looper/internal/e2e/harness"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+)
+
+type fakeGHState struct {
+	Routes  map[string]json.RawMessage `json:"routes,omitempty"`
+	GraphQL map[string]json.RawMessage `json:"graphql,omitempty"`
+}
+
+func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	schema := loadFixtureSchema(t)
+	fakeGH := harness.NewFakeGH(t, bins, schema)
+	writeFakeState(t, fakeGH.StatePath, fakeGHState{
+		Routes: map[string]json.RawMessage{
+			"repos/acme/looper/issues/7": json.RawMessage(`{"number":7,"title":"Issue title","body":"body","html_url":"https://github.com/acme/looper/issues/7","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"octocat"}],"labels":[{"name":"bug"}]}`),
+		},
+		GraphQL: map[string]json.RawMessage{
+			"default":             json.RawMessage(`{"data":{"node":{"id":"thread-1","isResolved":false,"path":"foo.go","line":7,"comments":{"nodes":[{"id":"comment-1","body":"please fix","author":{"login":"octocat"},"createdAt":"2026-05-12T00:00:00Z","updatedAt":"2026-05-12T00:00:00Z","path":"foo.go","line":7,"originalCommit":{"oid":"base-head"},"commit":{"oid":"head-1"},"url":"https://example.test/thread-1"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`),
+			"resolveReviewThread": json.RawMessage(`{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}`),
+		},
+	})
+	root := t.TempDir()
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	t.Setenv("HOME", root)
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
+
+	ctx := context.Background()
+	prs, err := gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: root, Limit: 5})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("ListOpenPullRequests() len = %d, want 1", len(prs))
+	}
+	if prs[0].AuthorAssociation != "" {
+		t.Fatalf("prs[0].AuthorAssociation = %q, want empty unsupported field", prs[0].AuthorAssociation)
+	}
+	issue, err := gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: "acme/looper", IssueNumber: 7, CWD: root})
+	if err != nil {
+		t.Fatalf("ViewIssue() error = %v", err)
+	}
+	if issue.AuthorAssociation != "COLLABORATOR" {
+		t.Fatalf("issue.AuthorAssociation = %q, want COLLABORATOR", issue.AuthorAssociation)
+	}
+	if err := gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-1", CWD: root}); err != nil {
+		t.Fatalf("ResolveReviewThread() error = %v", err)
+	}
+	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
+	assertInvocationHasJSONFields(t, invocations, "pr", "list", []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"})
+	assertInvocationMissingJSONField(t, invocations, "pr", "list", "authorAssociation")
+	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/7"})
+	assertInvocationContains(t, invocations, []string{"api", "graphql"})
+}
+
+func TestInvariantGatewaySupportsRepoForms(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	writeFakeState(t, fakeGH.StatePath, fakeGHState{
+		Routes: map[string]json.RawMessage{
+			"repos/acme/looper/issues/11": json.RawMessage(`{"number":11,"title":"Issue title","body":"body","html_url":"https://example.test/acme/looper/issues/11","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"}}`),
+		},
+	})
+	root := t.TempDir()
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	t.Setenv("HOME", root)
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
+	for _, repo := range []string{"acme/looper", "github.com/acme/looper", "ghe.example.com/acme/looper"} {
+		if _, err := gateway.ViewIssue(context.Background(), githubinfra.ViewIssueInput{Repo: repo, IssueNumber: 11, CWD: root}); err != nil {
+			t.Fatalf("ViewIssue(%q) error = %v", repo, err)
+		}
+	}
+	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
+	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/11"})
+	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/11", "--hostname", "github.com"})
+	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/11", "--hostname", "ghe.example.com"})
+}
+
+func TestFakeGHFixtureRejectsUnsupportedJSONField(t *testing.T) {
+	t.Parallel()
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	cmd := exec.Command(fakeGH.Path, "pr", "list", "--json", "number,authorAssociation")
+	cmd.Env = append(os.Environ(), flattenEnv(fakeGH.EnvMap())...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected unsupported field failure")
+	}
+	if !strings.Contains(string(output), `unknown JSON field: "authorAssociation"`) {
+		t.Fatalf("output = %s, want unsupported-field error", string(output))
+	}
+}
+
+func TestRealGHReadOnlySmoke(t *testing.T) {
+	if os.Getenv("LOOPER_E2E_REAL_GH") == "" {
+		t.Skip("set LOOPER_E2E_REAL_GH=1 to run real-gh smoke")
+	}
+	ghPath, err := exec.LookPath("gh")
+	if err != nil {
+		t.Skipf("gh not available: %v", err)
+	}
+	root := t.TempDir()
+	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: root})
+	if _, err := gateway.ListOpenPullRequests(context.Background(), githubinfra.ListOpenPullRequestsInput{Repo: "nexu-io/looper", CWD: root, Limit: 1}); err != nil {
+		t.Fatalf("real-gh pr list smoke failed; fixture may be stale: %v", err)
+	}
+}
+
+func loadFixtureSchema(tb testing.TB) harness.GHSchema {
+	tb.Helper()
+	path := filepath.Join("testdata", "gh-schema", "schema.json")
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatalf("read gh schema fixture: %v", err)
+	}
+	var schema harness.GHSchema
+	if err := json.Unmarshal(payload, &schema); err != nil {
+		tb.Fatalf("decode gh schema fixture: %v", err)
+	}
+	return schema
+}
+
+func writeFakeState(tb testing.TB, path string, state fakeGHState) {
+	tb.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		tb.Fatalf("mkdir fake-gh state dir: %v", err)
+	}
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		tb.Fatalf("marshal fake-gh state: %v", err)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		tb.Fatalf("write fake-gh state: %v", err)
+	}
+}
+
+func flattenEnv(env map[string]string) []string {
+	items := make([]string, 0, len(env))
+	for key, value := range env {
+		items = append(items, key+"="+value)
+	}
+	return items
+}
+
+func readInvocationsForContract(tb testing.TB, path string) []map[string]any {
+	tb.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatalf("read invocation log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
+	out := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			tb.Fatalf("decode invocation line %q: %v", line, err)
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func assertInvocationContains(tb testing.TB, invocations []map[string]any, want []string) {
+	tb.Helper()
+	for _, invocation := range invocations {
+		argv, _ := invocation["argv"].([]any)
+		parts := make([]string, 0, len(argv))
+		for _, part := range argv {
+			parts = append(parts, part.(string))
+		}
+		if containsOrdered(parts, want) {
+			return
+		}
+	}
+	tb.Fatalf("did not find invocation containing %v in %#v", want, invocations)
+}
+
+func assertInvocationHasJSONFields(tb testing.TB, invocations []map[string]any, noun string, verb string, want []string) {
+	tb.Helper()
+	for _, invocation := range invocations {
+		argv := argvStrings(invocation)
+		if len(argv) < 2 || argv[0] != noun || argv[1] != verb {
+			continue
+		}
+		for index, arg := range argv {
+			if arg == "--json" && index+1 < len(argv) {
+				got := strings.Split(argv[index+1], ",")
+				if strings.Join(got, ",") != strings.Join(want, ",") {
+					tb.Fatalf("%s %s json fields = %v, want %v", noun, verb, got, want)
+				}
+				return
+			}
+		}
+	}
+	tb.Fatalf("no %s %s invocation found", noun, verb)
+}
+
+func assertInvocationMissingJSONField(tb testing.TB, invocations []map[string]any, noun string, verb string, field string) {
+	tb.Helper()
+	for _, invocation := range invocations {
+		argv := argvStrings(invocation)
+		if len(argv) < 2 || argv[0] != noun || argv[1] != verb {
+			continue
+		}
+		for index, arg := range argv {
+			if arg == "--json" && index+1 < len(argv) && strings.Contains(argv[index+1], field) {
+				tb.Fatalf("%s %s unexpectedly requested %s: %v", noun, verb, field, argv)
+			}
+		}
+	}
+}
+
+func argvStrings(invocation map[string]any) []string {
+	argv, _ := invocation["argv"].([]any)
+	parts := make([]string, 0, len(argv))
+	for _, part := range argv {
+		parts = append(parts, part.(string))
+	}
+	return parts
+}
+
+func containsOrdered(haystack []string, needle []string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	start := 0
+	for _, want := range needle {
+		found := false
+		for start < len(haystack) {
+			if haystack[start] == want {
+				found = true
+				start++
+				break
+			}
+			start++
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}

@@ -49,3 +49,30 @@ jobs:
         run: |
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+
+  resolve-comments-e2e:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect resolve-comments changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            resolve_comments:
+              - 'internal/fixer/**'
+              - 'internal/reviewer/**'
+
+      - name: Set up Go
+        if: steps.changes.outputs.resolve_comments == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run resolve-comments E2E
+        if: steps.changes.outputs.resolve_comments == 'true'
+        run: go test ./internal/e2e -run 'TestScenarioResolveComments' -count=1

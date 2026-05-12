@@ -109,9 +109,7 @@ func WriteConfig(tb testing.TB, path string, cfg config.Config, rawOverrides map
 	}
 }
 
-func stringPtr(value string) *string {
-	return &value
-}
+func stringPtr(value string) *string { return &value }
 
 func deepMerge(dst map[string]any, src map[string]any) {
 	for key, value := range src {

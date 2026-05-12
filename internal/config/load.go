@@ -105,6 +105,15 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 
 	toolDetection := DetectToolPaths(config.Tools, options.LookPath)
 	config.Tools = toolDetection.Paths
+	if err := validateConfiguredToolPath(config.Tools.GitPath, "tools.gitPath"); err != nil {
+		return LoadedFileConfig{}, err
+	}
+	if err := validateConfiguredToolPath(config.Tools.GHPath, "tools.ghPath"); err != nil {
+		return LoadedFileConfig{}, err
+	}
+	if err := validateConfiguredToolPath(config.Tools.OsascriptPath, "tools.osascriptPath"); err != nil {
+		return LoadedFileConfig{}, err
+	}
 	if config.Notifications.Osascript.Enabled && isNilOrEmptyString(config.Tools.OsascriptPath) {
 		return LoadedFileConfig{}, &ConfigValidationError{Issues: []ValidationIssue{{
 			Path:    "tools.osascriptPath",
@@ -125,6 +134,25 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 			ToolDetection:     toolDetection.Detection,
 		},
 	}, nil
+}
+
+func validateConfiguredToolPath(path *string, field string) error {
+	if isNilOrEmptyString(path) {
+		return nil
+	}
+	value := strings.TrimSpace(*path)
+	if !filepath.IsAbs(value) && !strings.ContainsRune(value, os.PathSeparator) {
+		return nil
+	}
+	info, err := os.Stat(value)
+	if err == nil && !info.IsDir() {
+		return nil
+	}
+	message := "must reference an existing executable file"
+	if err == nil && info.IsDir() {
+		message = "must reference a file, not a directory"
+	}
+	return &ConfigValidationError{Issues: []ValidationIssue{{Path: field, Message: message}}}
 }
 
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {

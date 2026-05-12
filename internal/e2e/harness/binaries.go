@@ -50,9 +50,7 @@ func MustBinaries(tb testing.TB) BuiltBinaries {
 	if bins, ok := binariesFromEnv(); ok {
 		return bins
 	}
-	builtOnce.Do(func() {
-		builtSet, _, builtErr = buildAll()
-	})
+	builtOnce.Do(func() { builtSet, _, builtErr = buildAll() })
 	if builtErr != nil {
 		tb.Fatalf("build e2e binaries: %v", builtErr)
 	}
@@ -97,16 +95,12 @@ func buildAll() (BuiltBinaries, string, error) {
 		FakeGHPath:        filepath.Join(outDir, executableName("fake-gh")),
 		FakeOsascriptPath: filepath.Join(outDir, executableName("fake-osascript")),
 	}
-	targets := []struct {
-		out  string
-		pkg  string
-		name string
-	}{
-		{out: bins.LooperPath, pkg: "./cmd/looper", name: "looper"},
-		{out: bins.LooperdPath, pkg: "./cmd/looperd", name: "looperd"},
-		{out: bins.FakeAgentPath, pkg: "./internal/e2e/harness/cmd/fake-agent", name: "fake-agent"},
-		{out: bins.FakeGHPath, pkg: "./internal/e2e/harness/cmd/fake-gh", name: "fake-gh"},
-		{out: bins.FakeOsascriptPath, pkg: "./internal/e2e/harness/cmd/fake-osascript", name: "fake-osascript"},
+	targets := []struct{ out, pkg, name string }{
+		{bins.LooperPath, "./cmd/looper", "looper"},
+		{bins.LooperdPath, "./cmd/looperd", "looperd"},
+		{bins.FakeAgentPath, "./internal/e2e/harness/cmd/fake-agent", "fake-agent"},
+		{bins.FakeGHPath, "./internal/e2e/harness/cmd/fake-gh", "fake-gh"},
+		{bins.FakeOsascriptPath, "./internal/e2e/harness/cmd/fake-osascript", "fake-osascript"},
 	}
 	for _, target := range targets {
 		if err := goBuild(repoRoot, target.out, target.pkg); err != nil {
@@ -120,8 +114,7 @@ func buildAll() (BuiltBinaries, string, error) {
 func goBuild(repoRoot string, out string, pkg string) error {
 	cmd := exec.Command("go", "build", "-o", out, pkg)
 	cmd.Dir = repoRoot
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

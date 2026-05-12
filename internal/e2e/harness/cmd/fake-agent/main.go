@@ -51,16 +51,12 @@ func main() {
 		marker = defaultCompletionMarker
 	}
 	switch mode {
-	case "success-with-diff":
+	case "success-with-diff", "write-file":
 		path := envOr(envFakeAgentWriteFile, "agent-output.txt")
 		mustWriteFile(path, []byte("changed by fake agent\n"))
 		printCompletion(marker, map[string]any{"summary": "fake agent wrote file", "changedFiles": []string{path}})
 	case "success-no-diff":
 		printCompletion(marker, map[string]any{"summary": "fake agent no diff"})
-	case "write-file":
-		path := envOr(envFakeAgentWriteFile, "agent-output.txt")
-		mustWriteFile(path, []byte("changed by fake agent\n"))
-		printCompletion(marker, map[string]any{"summary": "fake agent wrote file", "changedFiles": []string{path}})
 	case "modify-file":
 		path := envOr(envFakeAgentModifyFile, "README.md")
 		mustAppendFile(path, []byte("modified by fake agent\n"))
@@ -95,14 +91,7 @@ func writeEvidence(dir string, mode string) error {
 	if err != nil {
 		return err
 	}
-	data := evidence{
-		CWD:       cwd,
-		Args:      os.Args[1:],
-		Env:       collectEnv(),
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		Mode:      mode,
-		PID:       os.Getpid(),
-	}
+	data := evidence{CWD: cwd, Args: os.Args[1:], Env: collectEnv(), Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Mode: mode, PID: os.Getpid()}
 	payload, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err

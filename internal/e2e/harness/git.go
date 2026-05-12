@@ -36,11 +36,7 @@ func CreateSeededRepo(tb testing.TB, gitPath string) SeededRepo {
 	}
 	runGit(tb, gitPath, repoPath, "add", "README.md")
 	runGit(tb, gitPath, repoPath, "commit", "-m", "initial commit")
-	return SeededRepo{
-		Path:          repoPath,
-		DefaultBranch: "main",
-		InitialCommit: strings.TrimSpace(runGit(tb, gitPath, repoPath, "rev-parse", "HEAD")),
-	}
+	return SeededRepo{Path: repoPath, DefaultBranch: "main", InitialCommit: strings.TrimSpace(runGit(tb, gitPath, repoPath, "rev-parse", "HEAD"))}
 }
 
 func CreateBareOrigin(tb testing.TB, gitPath string, repoPath string) string {
@@ -50,6 +46,24 @@ func CreateBareOrigin(tb testing.TB, gitPath string, repoPath string) string {
 	runGit(tb, gitPath, repoPath, "remote", "add", "origin", originPath)
 	runGit(tb, gitPath, repoPath, "push", "-u", "origin", "main")
 	return originPath
+}
+
+func CreateBranchCommitAndPush(tb testing.TB, gitPath string, repoPath string, branch string, filePath string, content string) string {
+	tb.Helper()
+	runGit(tb, gitPath, repoPath, "checkout", "-b", branch)
+	fullPath := filepath.Join(repoPath, filePath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		tb.Fatalf("mkdir branch file dir: %v", err)
+	}
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		tb.Fatalf("write branch file: %v", err)
+	}
+	runGit(tb, gitPath, repoPath, "add", filePath)
+	runGit(tb, gitPath, repoPath, "commit", "-m", "seed feature branch")
+	sha := strings.TrimSpace(runGit(tb, gitPath, repoPath, "rev-parse", "HEAD"))
+	runGit(tb, gitPath, repoPath, "push", "-u", "origin", branch)
+	runGit(tb, gitPath, repoPath, "checkout", "main")
+	return sha
 }
 
 func SnapshotRepo(tb testing.TB, gitPath string, repoPath string) RepoSnapshot {
@@ -78,8 +92,7 @@ func runCommand(command string, cwd string, env []string, args ...string) (strin
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
