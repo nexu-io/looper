@@ -855,6 +855,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 		Scope:                   cfg.Reviewer.Scope,
 		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
+		NativeResume:            cfg.Reviewer.NativeResume,
 		ThreadResolution:        cfg.Reviewer.ThreadResolution,
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,

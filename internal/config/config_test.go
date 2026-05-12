@@ -1305,6 +1305,19 @@ func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) 
 	}
 }
 
+func TestLoadFileReviewerNativeResumeOnHeadChangeEnvOverride(t *testing.T) {
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:       t.TempDir(),
+		LookupEnv: mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE": "true"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Reviewer.NativeResume.OnHeadChange {
+		t.Fatalf("reviewer.nativeResume.onHeadChange = false, want true")
+	}
+}
+
 func TestNormalizeAllowAutoApproveLegacyAliasRespectsExplicitReviewerCleanEvent(t *testing.T) {
 	trueValue := true
 	comment := ReviewerReviewEventComment
@@ -1719,6 +1732,10 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 
 	if len(config.Agent.Params) != 0 || len(config.Agent.Env) != 0 {
 		t.Fatalf("DefaultConfig().Agent maps = %#v / %#v, want empty maps", config.Agent.Params, config.Agent.Env)
+	}
+
+	if config.Reviewer.NativeResume.OnHeadChange {
+		t.Fatal("DefaultConfig().Reviewer.NativeResume.OnHeadChange = true, want false")
 	}
 
 	if len(config.Projects) != 0 {

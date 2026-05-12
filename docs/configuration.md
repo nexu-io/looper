@@ -154,6 +154,9 @@ Example minimal `~/.looper/config.json`:
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"
+    },
+    "nativeResume": {
+      "onHeadChange": false
     }
   },
   "roles": {
@@ -419,6 +422,7 @@ Default values:
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
+- `nativeResume.onHeadChange`: when `true`, a reviewer agent interrupted because the PR head changed can resume its native CLI session on the next review pass with a re-review continuation prompt. Default: `false`.
 - Reviewer loop budget options (`maxIterationsPerPR`, `maxIterationsPerHead`, `maxWallClockSeconds`, `maxConsecutiveFailures`, and `maxAgentExecutionsPerPR`) are deprecated and ignored by the reviewer filter. Reviewer loops keep following PR updates until a clear terminal product state such as the PR closing/merging, an approved Looper review for the current head, or the ready label.
 
 Default reviewer behavior is safe and comment-only:
@@ -429,6 +433,9 @@ Default reviewer behavior is safe and comment-only:
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"
+    },
+    "nativeResume": {
+      "onHeadChange": false
     }
   }
 }
@@ -607,6 +614,7 @@ Supported environment overrides:
 - `LOOPER_ALLOW_AUTO_APPROVE`
 - `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
 - `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
+- `LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE`
 - `LOOPER_FIX_ALL_PULL_REQUESTS`
 - `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
 - `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`
