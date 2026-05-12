@@ -157,7 +157,7 @@
 - [x] 添加 no-push rerun stale checkpoint head regression test
 - [x] 添加 no-new-commit but unresolved threads remain regression test
 - [x] 添加 no-diff branch before PR creation regression test
-- [ ] 添加 target already closed stops resumed worker/fixer regression test
+- [x] 添加 target already closed stops resumed worker/fixer regression test
 - [x] 验证 GraphQL resolve mutation 被调用且 state file 状态正确
 - [x] 验证失败路径不会错误进入永久 paused
 - [x] 将 `internal/fixer/**`、`internal/reviewer/**` 变更映射到 resolve-comments scenario E2E job
