@@ -1448,6 +1448,7 @@ func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLoc
 	checkpointJSON := mustMarshalJSON(workerCheckpoint{
 		Work:           &workerInput{Repo: "acme/looper", IssueNumber: 27, ExecutionMode: "create-pr", BaseBranch: "main"},
 		ClaimedLockKey: lockKey,
+		PullRequest:    &checkpointPullPR{Number: 101, URL: "https://example/pr/101"},
 	})
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume_issue_closed", LoopID: "loop_worker_1", Status: "failed", LastCompletedStep: stringPtr(string(stepPlan)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -1481,6 +1482,23 @@ func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLoc
 	if lock != nil {
 		t.Fatalf("lock = %#v, want persisted claimed lock released", lock)
 	}
+	latestRun, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if latestRun == nil {
+		t.Fatal("latestRun = nil, want persisted skipped run")
+	}
+	latestCheckpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint(latestRun) error = %v", err)
+	}
+	if latestCheckpoint.ClaimedLockKey != "" {
+		t.Fatalf("latestCheckpoint.ClaimedLockKey = %q, want cleared lock key", latestCheckpoint.ClaimedLockKey)
+	}
+	if latestCheckpoint.SkipReason == "" || !strings.Contains(latestCheckpoint.SkipReason, "no longer an open issue") {
+		t.Fatalf("latestCheckpoint.SkipReason = %q, want obsolete issue skip reason", latestCheckpoint.SkipReason)
+	}
 }
 
 func TestReacquireClaimedLockAllowsSameOwnerLiveLock(t *testing.T) {
@@ -1503,6 +1521,20 @@ func TestReacquireClaimedLockAllowsSameOwnerLiveLock(t *testing.T) {
 	}
 	if !acquired {
 		t.Fatal("reacquireClaimedLock() = false, want same-owner live lock to be adopted")
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock == nil {
+		t.Fatal("lock = nil, want refreshed lock")
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+	if err != nil {
+		t.Fatalf("time.Parse(lock.ExpiresAt) error = %v", err)
+	}
+	if !expiresAt.After(fixture.now().Add(9 * time.Minute)) {
+		t.Fatalf("lock.ExpiresAt = %q, want refreshed TTL near claim duration", lock.ExpiresAt)
 	}
 }
 
