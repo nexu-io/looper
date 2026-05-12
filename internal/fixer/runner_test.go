@@ -114,6 +114,7 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
@@ -124,7 +125,7 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 		PRNumber: 42,
 		Checkpoint: fixerCheckpoint{
 			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
-			Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "legacy-wt"), Branch: "feature/fix-42", PreparedAt: "stale"},
+			Worktree: &checkpointWorktree{Path: legacyPath, Branch: "feature/fix-42", PreparedAt: "stale"},
 		},
 	})
 	if err != nil {
@@ -136,8 +137,14 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
 		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
 	}
+	if checkpoint.Worktree.Path == legacyPath {
+		t.Fatalf("checkpoint.Worktree.Path = %q, want recreated path outside legacy prepared worktree", checkpoint.Worktree.Path)
+	}
 	if git.createCalls[0].WorktreeRoot != worktreeRoot {
 		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
 	}
 }
 
