@@ -61,7 +61,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config file value", "set       Set a config file value", "unset     Unset a config file value", "validate  Validate the config file", "show      Show active config", "edit      Edit the config file"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
@@ -277,6 +277,29 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	} {
 		if !strings.Contains(stdout, syntax) {
 			t.Fatalf("Run([--help]) stdout = %q, want to contain %q", stdout, syntax)
+		}
+	}
+	if !strings.Contains(stdout, "Config path (`~/.looper/config.toml` by default; also supports .yaml, .yml, and .json)") {
+		t.Fatalf("Run([--help]) stdout = %q, want canonical config flag description", stdout)
+	}
+}
+
+func TestConfigHelpUsesCanonicalReviewerExamples(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "config", "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([config --help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config --help]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{
+		"roles.reviewer.behavior.reviewEvents.clean",
+		"$ looper config set roles.reviewer.behavior.reviewEvents.clean APPROVE",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([config --help]) stdout = %q, want to contain %q", stdout, want)
 		}
 	}
 }

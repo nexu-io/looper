@@ -181,8 +181,11 @@ looper daemon install|start|stop|restart|status
 
 ## Configuration
 
-- Default config: `~/.looper/config.json`
-- Precedence: defaults → config file → env → CLI flags
+- Canonical default path: `~/.looper/config.toml`
+- Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
+- Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
+- All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
+- Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
 - If `server.authMode=local-token`, set `server.localToken` and export `LOOPER_TOKEN` for the CLI
 

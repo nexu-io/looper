@@ -190,11 +190,11 @@ func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReview
 	switch strings.ToUpper(strings.TrimSpace(event)) {
 	case "APPROVE":
 		if policy.Clean != config.ReviewerReviewEventApprove {
-			return fmt.Errorf("review submit --event APPROVE requires reviewer.reviewEvents.clean=APPROVE")
+			return fmt.Errorf("review submit --event APPROVE requires roles.reviewer.behavior.reviewEvents.clean=APPROVE")
 		}
 	case "REQUEST_CHANGES":
 		if policy.Blocking != config.ReviewerReviewEventRequestChanges {
-			return fmt.Errorf("review submit --event REQUEST_CHANGES requires reviewer.reviewEvents.blocking=REQUEST_CHANGES")
+			return fmt.Errorf("review submit --event REQUEST_CHANGES requires roles.reviewer.behavior.reviewEvents.blocking=REQUEST_CHANGES")
 		}
 	}
 	return nil
