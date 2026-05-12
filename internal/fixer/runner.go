@@ -2182,7 +2182,7 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 			return err
 		}
 		if execution != nil {
-			return fmt.Errorf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID)
+			return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID))
 		}
 	}
 	if r.repos.Events != nil {
@@ -2192,7 +2192,7 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 		}
 		for _, event := range events {
 			if event.EventType == "run.started" {
-				return fmt.Errorf("loop %s already has a running fixer run %s", run.LoopID, run.ID)
+				return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s", run.LoopID, run.ID))
 			}
 		}
 	}
@@ -2202,6 +2202,10 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 	}
 	_, err := r.completeRun(ctx, run, "interrupted", "Interrupted orphaned fixer run before start", "Interrupted orphaned fixer run before start", checkpoint)
 	return err
+}
+
+func activeFixerRunError(message string) error {
+	return &loopError{message: message, kind: FailureRetryableTransient}
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step FixerStep, checkpoint fixerCheckpoint) (storage.RunRecord, error) {
