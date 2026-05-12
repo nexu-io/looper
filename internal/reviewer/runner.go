@@ -3532,7 +3532,7 @@ func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool
 }
 
 func (r *Runner) hasPendingHeadChangeNativeResume(ctx context.Context, loopID string) bool {
-	if !r.nativeResume.OnHeadChange {
+	if !r.nativeResume.OnHeadChange && !r.nativeResume.ReReviewPromptOnHeadChange {
 		return false
 	}
 	record := r.pendingNativeResume(ctx, loopID)
@@ -3548,7 +3548,7 @@ func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInpu
 	if record == nil {
 		return ""
 	}
-	if r.nativeResume.OnHeadChange {
+	if r.nativeResume.ReReviewPromptOnHeadChange {
 		if headChange, ok := reviewerNativeResumeHeadChange(record); ok && headChange.matches(input.Repo, input.PRNumber) {
 			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey)
 		}

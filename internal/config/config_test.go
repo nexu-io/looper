@@ -1306,15 +1306,38 @@ func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) 
 }
 
 func TestLoadFileReviewerNativeResumeOnHeadChangeEnvOverride(t *testing.T) {
+	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
-		CWD:       t.TempDir(),
-		LookupEnv: mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE": "true"}),
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE": "true"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 	if !loaded.Config.Reviewer.NativeResume.OnHeadChange {
 		t.Fatalf("reviewer.nativeResume.onHeadChange = false, want true")
+	}
+	if loaded.Config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = true, want false")
+	}
+}
+
+func TestLoadFileReviewerNativeResumeReReviewPromptOnHeadChangeEnvOverride(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE": "true"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = false, want true")
+	}
+	if loaded.Config.Reviewer.NativeResume.OnHeadChange {
+		t.Fatalf("reviewer.nativeResume.onHeadChange = true, want false")
 	}
 }
 
@@ -1736,6 +1759,9 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 
 	if config.Reviewer.NativeResume.OnHeadChange {
 		t.Fatal("DefaultConfig().Reviewer.NativeResume.OnHeadChange = true, want false")
+	}
+	if config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatal("DefaultConfig().Reviewer.NativeResume.ReReviewPromptOnHeadChange = true, want false")
 	}
 
 	if len(config.Projects) != 0 {

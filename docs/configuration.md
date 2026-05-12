@@ -156,7 +156,8 @@ Example minimal `~/.looper/config.json`:
       "blocking": "COMMENT"
     },
     "nativeResume": {
-      "onHeadChange": false
+      "onHeadChange": false,
+      "reReviewPromptOnHeadChange": false
     }
   },
   "roles": {
@@ -422,7 +423,8 @@ Default values:
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
-- `nativeResume.onHeadChange`: when `true`, a reviewer agent interrupted because the PR head changed can resume its native CLI session on the next review pass with a re-review continuation prompt. Default: `false`.
+- `nativeResume.onHeadChange`: when `true`, a reviewer agent interrupted because the PR head changed can mark its native CLI session as pending for the next review pass. Default: `false`.
+- `nativeResume.reReviewPromptOnHeadChange`: when `true`, pending reviewer native resume sessions that were interrupted by a PR head change use a re-review continuation prompt instead of the generic native resume continuation prompt. Default: `false`.
 - Reviewer loop budget options (`maxIterationsPerPR`, `maxIterationsPerHead`, `maxWallClockSeconds`, `maxConsecutiveFailures`, and `maxAgentExecutionsPerPR`) are deprecated and ignored by the reviewer filter. Reviewer loops keep following PR updates until a clear terminal product state such as the PR closing/merging, an approved Looper review for the current head, or the ready label.
 
 Default reviewer behavior is safe and comment-only:
@@ -435,7 +437,8 @@ Default reviewer behavior is safe and comment-only:
       "blocking": "COMMENT"
     },
     "nativeResume": {
-      "onHeadChange": false
+      "onHeadChange": false,
+      "reReviewPromptOnHeadChange": false
     }
   }
 }
@@ -615,6 +618,7 @@ Supported environment overrides:
 - `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
 - `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
 - `LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE`
+- `LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE`
 - `LOOPER_FIX_ALL_PULL_REQUESTS`
 - `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
 - `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`

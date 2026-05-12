@@ -154,6 +154,7 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["detectDuplicateFindings"], cfg.Reviewer.DetectDuplicateFindings)
 	nativeResume := reviewer["nativeResume"].(map[string]any)
 	assertEqual(t, nativeResume["onHeadChange"], cfg.Reviewer.NativeResume.OnHeadChange)
+	assertEqual(t, nativeResume["reReviewPromptOnHeadChange"], cfg.Reviewer.NativeResume.ReReviewPromptOnHeadChange)
 	threadResolution := reviewer["threadResolution"].(map[string]any)
 	assertEqual(t, threadResolution["enabled"], cfg.Reviewer.ThreadResolution.Enabled)
 	assertEqual(t, threadResolution["mode"], string(cfg.Reviewer.ThreadResolution.Mode))

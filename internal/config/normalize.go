@@ -435,6 +435,9 @@ func mergeReviewerNativeResumeConfig(config *ReviewerNativeResumeConfig, partial
 	if partial.OnHeadChange != nil {
 		config.OnHeadChange = *partial.OnHeadChange
 	}
+	if partial.ReReviewPromptOnHeadChange != nil {
+		config.ReReviewPromptOnHeadChange = *partial.ReReviewPromptOnHeadChange
+	}
 }
 
 func mergeReviewerThreadResolutionConfig(config *ReviewerThreadResolutionConfig, partial PartialReviewerThreadResolutionConfig) {

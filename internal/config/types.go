@@ -286,7 +286,8 @@ type ReviewerReviewEventsConfig struct {
 }
 
 type ReviewerNativeResumeConfig struct {
-	OnHeadChange bool `json:"onHeadChange"`
+	OnHeadChange               bool `json:"onHeadChange"`
+	ReReviewPromptOnHeadChange bool `json:"reReviewPromptOnHeadChange"`
 }
 
 type ReviewerThreadResolutionConfig struct {
@@ -603,7 +604,8 @@ type PartialReviewerReviewEventsConfig struct {
 }
 
 type PartialReviewerNativeResumeConfig struct {
-	OnHeadChange *bool `json:"onHeadChange,omitempty"`
+	OnHeadChange               *bool `json:"onHeadChange,omitempty"`
+	ReReviewPromptOnHeadChange *bool `json:"reReviewPromptOnHeadChange,omitempty"`
 }
 
 type PartialReviewerThreadResolutionConfig struct {

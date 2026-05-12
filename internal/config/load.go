@@ -833,6 +833,13 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureReviewerNativeResumeConfig(&overrides).OnHeadChange = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE: %q is not a boolean", value)
+		}
+		ensureReviewerNativeResumeConfig(&overrides).ReReviewPromptOnHeadChange = parsed
+	}
 	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED"); ok {
 		parsed, err := parseBoolean(value)
 		if err != nil {

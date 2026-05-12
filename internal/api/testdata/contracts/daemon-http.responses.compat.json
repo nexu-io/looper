@@ -264,7 +264,8 @@
             },
             "detectDuplicateFindings": true,
             "nativeResume": {
-              "onHeadChange": false
+              "onHeadChange": false,
+              "reReviewPromptOnHeadChange": false
             },
             "threadResolution": {
               "autoResolve": "objective_only",
