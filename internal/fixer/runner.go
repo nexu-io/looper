@@ -1912,6 +1912,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if failedCount == 0 && resolvedCount > 0 {
 		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, defaultCommitSHA, explanationByID)
 	}
+	if failedCount == 0 && shouldPersistNoopResolveMetadata(fixItems, checkpoint.ResolvedComments.Items, resolvedCount) {
+		if _, err := r.mergeLoopMetadata(ctx, input.Loop, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveStateHash": currentFixItemsStateHash, "lastNoopResolveAt": r.nowISO()}); err != nil {
+			return checkpoint, err
+		}
+	}
 	if failedCount > 0 {
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s)", failedCount), kind: FailureRetryableAfterResume}
 	}
@@ -3528,6 +3533,31 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	return false
 }
 
+func shouldPersistNoopResolveMetadata(fixItems []FixItem, resolvedComments []checkpointResolvedComment, resolvedCount int) bool {
+	if resolvedCount != 0 {
+		return false
+	}
+	hasComment := false
+	for _, item := range fixItems {
+		if item.Type != "comment" {
+			continue
+		}
+		hasComment = true
+		matched := false
+		for _, resolved := range resolvedComments {
+			if resolved.FixItemID != item.ID && (resolved.ThreadID == "" || resolved.ThreadID != item.ThreadID) {
+				continue
+			}
+			matched = resolved.Status == "skipped_no_evidence"
+			break
+		}
+		if !matched {
+			return false
+		}
+	}
+	return hasComment
+}
+
 func resolveCommentCommitSHA(checkpoint fixerCheckpoint, evidence *fixEvidence, verifiedEvidence bool) string {
 	commitSHA := ""
 	if checkpoint.ReconcileCommits != nil {
@@ -4019,6 +4049,9 @@ func (r *Runner) verifyFixEvidence(ctx context.Context, input stepInput, checkpo
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, liveHeadSHA)
 	if err != nil {
+		if shouldTreatMissingGitRevisionAsStale(err) {
+			return false, nil
+		}
 		return false, &loopError{message: fmt.Sprintf("failed to verify fix evidence ancestry: %v", err), kind: FailureRetryableTransient}
 	}
 	return ancestor, nil
@@ -4040,9 +4073,32 @@ func (r *Runner) validationMatchesEvidence(ctx context.Context, input stepInput,
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, validationHeadSHA)
 	if err != nil {
+		if shouldTreatMissingGitRevisionAsStale(err) {
+			return false, nil
+		}
 		return false, &loopError{message: fmt.Sprintf("failed to verify validation ancestry: %v", err), kind: FailureRetryableTransient}
 	}
 	return ancestor, nil
+}
+
+func shouldTreatMissingGitRevisionAsStale(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"unknown revision",
+		"bad revision",
+		"not a valid object name",
+		"not a valid commit name",
+		"unknown commit or path",
+		"ambiguous argument",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsStateHash string) bool {
