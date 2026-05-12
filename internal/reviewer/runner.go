@@ -903,7 +903,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.AutoDiscovery, IncludeDrafts: roles.Reviewer.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Triggers.Labels...), LabelMode: roles.Reviewer.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.SpecReview.ReviewingLabel}
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel}
 }
 
 func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {

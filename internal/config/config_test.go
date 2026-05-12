@@ -235,10 +235,10 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
 		t.Fatalf("planner role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Reviewer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || !got.Triggers.RequireReviewRequest || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 || !got.SpecReview.IncludeReviewingLabel || got.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
 		t.Fatalf("reviewer role defaults = %#v", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Triggers); got {
+	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("reviewer enableSelfReview default = %v, want false", got)
 	}
 	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
@@ -442,11 +442,11 @@ func TestRoleEnvironmentOverrides(t *testing.T) {
 	if loaded.Config.Roles.Planner.Triggers.LabelMode != LabelModeAny || loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("planner triggers = %#v", loaded.Config.Roles.Planner.Triggers)
 	}
-	if !loaded.Config.Roles.Reviewer.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Triggers.RequireReviewRequest {
-		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Triggers)
+	if !loaded.Config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Discovery.Triggers)
 	}
-	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.SpecReview.IncludeReviewingLabel {
-		t.Fatalf("reviewer config = %#v", loaded.Config.Roles.Reviewer)
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel {
+		t.Fatalf("reviewer discovery = %#v", loaded.Config.Roles.Reviewer)
 	}
 	if loaded.Config.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(loaded.Config.Roles.Fixer.Triggers.Labels, []string{"bugfix"}) {
 		t.Fatalf("fixer config = %#v", loaded.Config.Roles.Fixer)
@@ -751,13 +751,13 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	if !projectRoles.Worker.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Worker.Triggers.Labels, []string{"project"}) || projectRoles.Worker.Triggers.LabelMode != LabelModeAny || projectRoles.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("project worker roles = %#v", projectRoles.Worker)
 	}
-	if !projectRoles.Reviewer.Triggers.IncludeDrafts || !projectRoles.Reviewer.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Triggers.Labels, []string{"review"}) {
-		t.Fatalf("project reviewer roles = %#v", projectRoles.Reviewer)
+	if !projectRoles.Reviewer.Discovery.Triggers.IncludeDrafts || !projectRoles.Reviewer.Discovery.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Discovery.Triggers.Labels, []string{"review"}) {
+		t.Fatalf("project reviewer triggers = %#v", projectRoles.Reviewer)
 	}
-	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Triggers); got {
+	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want false", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, projectRoles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, projectRoles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("project reviewer enableSelfReview = %v, want true", got)
 	}
 	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "worker") {
@@ -954,10 +954,10 @@ func TestLoadFileSupportsReviewerEnableSelfReviewOverride(t *testing.T) {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); got {
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.Triggers); got {
 		t.Fatalf("project reviewer enableSelfReview = %v, want false", got)
 	}
 }
@@ -990,11 +990,11 @@ func TestEnvOverrideReviewerEnableSelfReviewBeatsProjectConfig(t *testing.T) {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); !got {
-		t.Fatalf("project reviewer enableSelfReview = %v, want true from env override", got)
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("project reviewer enableSelfReview = %v, want true", got)
 	}
 }
 

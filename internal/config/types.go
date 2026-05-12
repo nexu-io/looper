@@ -325,6 +325,12 @@ type ReviewerSpecReviewConfig struct {
 	ReviewingLabel        string `json:"reviewingLabel"`
 }
 
+type ReviewerRoleDiscoveryConfig struct {
+	AutoDiscovery bool                       `json:"autoDiscovery"`
+	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
+	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+}
+
 type FixerRoleTriggersConfig struct {
 	IncludeDrafts bool              `json:"includeDrafts"`
 	AuthorFilter  FixerAuthorFilter `json:"authorFilter"`
@@ -345,11 +351,9 @@ type WorkerRoleConfig struct {
 }
 
 type ReviewerRoleConfig struct {
-	AutoDiscovery bool                       `json:"autoDiscovery"`
-	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
-	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
-	Behavior      ReviewerConfig             `json:"behavior"`
-	Instructions  string                     `json:"instructions,omitempty"`
+	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
+	Behavior     ReviewerConfig              `json:"behavior"`
+	Instructions string                      `json:"instructions,omitempty"`
 }
 
 type FixerRoleConfig struct {
@@ -648,6 +652,12 @@ type PartialReviewerSpecReviewConfig struct {
 	ReviewingLabel        *string `json:"reviewingLabel,omitempty"`
 }
 
+type PartialReviewerRoleDiscoveryConfig struct {
+	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
+	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
+	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+}
+
 type PartialFixerRoleTriggersConfig struct {
 	IncludeDrafts *bool              `json:"includeDrafts,omitempty"`
 	AuthorFilter  *FixerAuthorFilter `json:"authorFilter,omitempty"`
@@ -716,11 +726,13 @@ type PartialWorkerRoleConfig struct {
 }
 
 type PartialReviewerRoleConfig struct {
+	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
+	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
+	Instructions *string                             `json:"instructions,omitempty"`
+
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
-	Behavior      *PartialReviewerConfig             `json:"behavior,omitempty"`
-	Instructions  *string                            `json:"instructions,omitempty"`
 }
 
 type PartialFixerRoleConfig struct {

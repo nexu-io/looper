@@ -567,6 +567,25 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 }
 
 func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewerRoleConfig) {
+	if partial.AutoDiscovery != nil || partial.Triggers != nil || partial.SpecReview != nil {
+		mergeReviewerRoleDiscoveryConfig(&config.Discovery, PartialReviewerRoleDiscoveryConfig{
+			AutoDiscovery: partial.AutoDiscovery,
+			Triggers:      partial.Triggers,
+			SpecReview:    partial.SpecReview,
+		})
+	}
+	if partial.Discovery != nil {
+		mergeReviewerRoleDiscoveryConfig(&config.Discovery, *partial.Discovery)
+	}
+	if partial.Behavior != nil {
+		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeReviewerRoleDiscoveryConfig(config *ReviewerRoleDiscoveryConfig, partial PartialReviewerRoleDiscoveryConfig) {
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
@@ -575,12 +594,6 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	}
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
-	}
-	if partial.Behavior != nil {
-		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
-	}
-	if partial.Instructions != nil {
-		config.Instructions = *partial.Instructions
 	}
 }
 
@@ -926,6 +939,22 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Reviewer != nil {
 		reviewer := *configs.Reviewer
+		if configs.Reviewer.Discovery != nil {
+			discovery := *configs.Reviewer.Discovery
+			if configs.Reviewer.Discovery.Triggers != nil {
+				triggers := *configs.Reviewer.Discovery.Triggers
+				if triggers.Labels != nil {
+					labels := cloneStrings(*triggers.Labels)
+					triggers.Labels = &labels
+				}
+				discovery.Triggers = &triggers
+			}
+			if configs.Reviewer.Discovery.SpecReview != nil {
+				specReview := *configs.Reviewer.Discovery.SpecReview
+				discovery.SpecReview = &specReview
+			}
+			reviewer.Discovery = &discovery
+		}
 		if configs.Reviewer.Triggers != nil {
 			triggers := *configs.Reviewer.Triggers
 			if triggers.Labels != nil {

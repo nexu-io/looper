@@ -128,11 +128,20 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 }
 
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
-	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Triggers == nil || partial.Roles.Reviewer.Triggers.EnableSelfReview == nil {
+	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil {
 		return
 	}
-	value := *partial.Roles.Reviewer.Triggers.EnableSelfReview
-	config.Roles.Reviewer.Triggers.EnableSelfReview = value
+	var source *PartialReviewerRoleTriggersConfig
+	if partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil {
+		source = partial.Roles.Reviewer.Discovery.Triggers
+	} else if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil {
+		source = partial.Roles.Reviewer.Triggers
+	}
+	if source == nil || source.EnableSelfReview == nil {
+		return
+	}
+	value := *source.EnableSelfReview
+	config.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = value
 	for i := range config.Projects {
 		if config.Projects[i].Roles == nil {
 			continue
@@ -140,10 +149,13 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 		if config.Projects[i].Roles.Reviewer == nil {
 			continue
 		}
-		if config.Projects[i].Roles.Reviewer.Triggers == nil {
-			config.Projects[i].Roles.Reviewer.Triggers = &PartialReviewerRoleTriggersConfig{}
+		if config.Projects[i].Roles.Reviewer.Discovery == nil {
+			config.Projects[i].Roles.Reviewer.Discovery = &PartialReviewerRoleDiscoveryConfig{}
 		}
-		config.Projects[i].Roles.Reviewer.Triggers.EnableSelfReview = &value
+		if config.Projects[i].Roles.Reviewer.Discovery.Triggers == nil {
+			config.Projects[i].Roles.Reviewer.Discovery.Triggers = &PartialReviewerRoleTriggersConfig{}
+		}
+		config.Projects[i].Roles.Reviewer.Discovery.Triggers.EnableSelfReview = &value
 	}
 }
 

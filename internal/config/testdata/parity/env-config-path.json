@@ -213,7 +213,6 @@
           }
         },
         "reviewer": {
-          "autoDiscovery": true,
           "behavior": {
             "loop": {
               "enabledByDefault": true,
@@ -250,15 +249,18 @@
               "scope": "looper_authored_only"
             }
           },
-          "triggers": {
-            "includeDrafts": false,
-            "requireReviewRequest": true,
-            "labels": [],
-            "labelMode": "all"
-          },
-          "specReview": {
-            "includeReviewingLabel": true,
-            "reviewingLabel": "looper:spec-reviewing"
+          "discovery": {
+            "autoDiscovery": true,
+            "triggers": {
+              "includeDrafts": false,
+              "requireReviewRequest": true,
+              "labels": [],
+              "labelMode": "all"
+            },
+            "specReview": {
+              "includeReviewingLabel": true,
+              "reviewingLabel": "looper:spec-reviewing"
+            }
           }
         },
         "fixer": {

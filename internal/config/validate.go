@@ -187,13 +187,13 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateInstructions(config, &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
-	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
+	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	validateSweeperRoleConfig(config.Roles.Sweeper, "roles.sweeper", &issues)
-	if config.Roles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) == "" {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
-	} else if config.Roles.Reviewer.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.SpecReview.ReviewingLabel) {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
+	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 	}
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
@@ -237,8 +237,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			path := fmt.Sprintf("%s.roles.%s.instructions", prefix, roleInstruction.role)
 			validateAggregateInstructionBytes(path, roleInstruction.text, project.Instructions[roleInstruction.role], config.Instructions.MaxBytes, &issues)
 		}
-		if effectiveProjectRoles.Reviewer.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.SpecReview.ReviewingLabel) == "" {
-			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
 		if project.Roles != nil && project.Roles.Sweeper != nil {
 			validateSweeperRoleConfig(effectiveProjectRoles.Sweeper, prefix+".roles.sweeper", &issues)
@@ -317,6 +317,17 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	}
 	if roles.Reviewer != nil {
 		validateProjectRoleInstruction(prefix+".reviewer.instructions", "reviewer", roles.Reviewer.Instructions, maxInstructionBytes, issues)
+		if roles.Reviewer.Discovery != nil {
+			if roles.Reviewer.Discovery.Triggers != nil {
+				validateReviewerRoleTriggers(partialReviewerRoleTriggers(*roles.Reviewer.Discovery.Triggers), prefix+".reviewer.discovery.triggers", issues)
+			}
+			if roles.Reviewer.Discovery.SpecReview != nil && roles.Reviewer.Discovery.SpecReview.ReviewingLabel != nil {
+				label := *roles.Reviewer.Discovery.SpecReview.ReviewingLabel
+				if label != "" && label != strings.TrimSpace(label) {
+					*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.discovery.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
+				}
+			}
+		}
 		if roles.Reviewer.Triggers != nil {
 			validateReviewerRoleTriggers(partialReviewerRoleTriggers(*roles.Reviewer.Triggers), prefix+".reviewer.triggers", issues)
 		}

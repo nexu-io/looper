@@ -21,7 +21,7 @@ func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	case "planner":
 		return roles.Planner.AutoDiscovery
 	case "reviewer":
-		return roles.Reviewer.AutoDiscovery
+		return roles.Reviewer.Discovery.AutoDiscovery
 	case "fixer":
 		return roles.Fixer.AutoDiscovery
 	case "worker":

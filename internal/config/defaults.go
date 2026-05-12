@@ -145,17 +145,19 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 			},
 			Reviewer: ReviewerRoleConfig{
-				AutoDiscovery: true,
-				Triggers: ReviewerRoleTriggersConfig{
-					IncludeDrafts:        false,
-					RequireReviewRequest: true,
-					EnableSelfReview:     false,
-					Labels:               []string{},
-					LabelMode:            LabelModeAll,
-				},
-				SpecReview: ReviewerSpecReviewConfig{
-					IncludeReviewingLabel: true,
-					ReviewingLabel:        "looper:spec-reviewing",
+				Discovery: ReviewerRoleDiscoveryConfig{
+					AutoDiscovery: true,
+					Triggers: ReviewerRoleTriggersConfig{
+						IncludeDrafts:        false,
+						RequireReviewRequest: true,
+						EnableSelfReview:     false,
+						Labels:               []string{},
+						LabelMode:            LabelModeAll,
+					},
+					SpecReview: ReviewerSpecReviewConfig{
+						IncludeReviewingLabel: true,
+						ReviewingLabel:        "looper:spec-reviewing",
+					},
 				},
 				Behavior: ReviewerConfig{
 					Loop: ReviewerLoopConfig{

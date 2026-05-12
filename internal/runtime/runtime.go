@@ -876,7 +876,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			return RecoverySummary{}, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
 			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
@@ -1079,7 +1079,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 			return requeued, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
+			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
 			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
