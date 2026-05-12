@@ -272,6 +272,12 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
 	}
+	if !strings.Contains(github.createPRCalls[0].Body, disclosure.Marker) {
+		t.Fatalf("created PR body = %q, want disclosure marker", github.createPRCalls[0].Body)
+	}
+	if !strings.Contains(github.createPRCalls[0].Body, "runner=worker") {
+		t.Fatalf("created PR body = %q, want worker disclosure footer", github.createPRCalls[0].Body)
+	}
 	if len(completed) != 1 {
 		t.Fatalf("len(completed) = %d, want 1", len(completed))
 	}
@@ -2188,12 +2194,12 @@ func TestProcessClaimedItemDoesNotRenamePlannerSpecPRWhenPushFails(t *testing.T)
 	}
 }
 
-func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
+func TestProcessClaimedItemFindsExistingPRAfterPushAndStampsWorkerDisclosure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{openPRResponses: [][]PullRequestSummary{{}, {{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}}
+	github := &fakeGitHubGateway{openPRResponses: [][]PullRequestSummary{{}, {{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}, prDetail: PullRequestDetail{Number: 201, URL: "https://example/pr/201", Body: "## Summary\n\nExisting worker PR", BaseRefName: "main", HeadRefName: branch}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
 
@@ -2207,6 +2213,15 @@ func TestProcessClaimedItemFindsExistingPRAfterPush(t *testing.T) {
 	}
 	if len(github.createPRCalls) != 0 {
 		t.Fatalf("len(github.createPRCalls) = %d, want 0", len(github.createPRCalls))
+	}
+	if len(github.updatePRBodyCalls) != 1 {
+		t.Fatalf("updatePRBodyCalls = %#v, want one disclosure rewrite", github.updatePRBodyCalls)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, disclosure.Marker) {
+		t.Fatalf("updated body = %q, want disclosure marker", github.updatePRBodyCalls[0].Body)
+	}
+	if !strings.Contains(github.updatePRBodyCalls[0].Body, "runner=worker") {
+		t.Fatalf("updated body = %q, want worker disclosure footer", github.updatePRBodyCalls[0].Body)
 	}
 }
 

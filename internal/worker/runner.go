@@ -1498,7 +1498,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, false); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
@@ -1515,7 +1515,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, false); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
@@ -1527,7 +1527,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: work.Repo, HeadBranch: worktree.Branch, BaseBranch: work.BaseBranch, Title: work.Title, Body: buildPullRequestBody(work, checkpoint.Plan, checkpoint.Execution), CWD: input.Project.RepoPath})
+	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: work.Repo, HeadBranch: worktree.Branch, BaseBranch: work.BaseBranch, Title: work.Title, Body: r.stampPullRequestDisclosure(buildPullRequestBody(work, checkpoint.Plan, checkpoint.Execution)), CWD: input.Project.RepoPath})
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -2499,12 +2499,19 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 	if !force && !disclosure.HasMarkdownStamp(detail.Body) {
 		return nil
 	}
-	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
-	body := stamper.Markdown(detail.Body, "worker", disclosure.ChannelPullRequest)
+	body := r.stampPullRequestDisclosure(detail.Body)
 	if body == detail.Body {
 		return nil
 	}
 	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
+}
+
+func (r *Runner) stampPullRequestDisclosure(body string) string {
+	if !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
+		return body
+	}
+	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
+	return stamper.Markdown(body, "worker", disclosure.ChannelPullRequest)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
