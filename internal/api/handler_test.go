@@ -139,8 +139,10 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	server := data["server"].(map[string]any)
 	storageInfo := data["storage"].(map[string]any)
 	daemon := data["daemon"].(map[string]any)
-	reviewer := data["reviewer"].(map[string]any)
-	reviewerLoop := reviewer["loop"].(map[string]any)
+	roles := data["roles"].(map[string]any)
+	reviewer := roles["reviewer"].(map[string]any)
+	behavior := reviewer["behavior"].(map[string]any)
+	reviewerLoop := behavior["loop"].(map[string]any)
 
 	assertEqual(t, server["host"], cfg.Server.Host)
 	assertEqual(t, server["port"], float64(cfg.Server.Port))
@@ -149,17 +151,17 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, storageInfo["mode"], cfg.Storage.Mode)
 	assertEqual(t, daemon["mode"], string(cfg.Daemon.Mode))
 	assertEqual(t, daemon["workingDirectory"], cfg.Daemon.WorkingDirectory)
-	assertEqual(t, reviewer["scope"], string(cfg.Reviewer.Scope))
-	assertEqual(t, reviewer["publishMode"], string(cfg.Reviewer.PublishMode))
-	assertEqual(t, reviewer["detectDuplicateFindings"], cfg.Reviewer.DetectDuplicateFindings)
-	nativeResume := reviewer["nativeResume"].(map[string]any)
-	assertEqual(t, nativeResume["onHeadChange"], cfg.Reviewer.NativeResume.OnHeadChange)
-	assertEqual(t, nativeResume["reReviewPromptOnHeadChange"], cfg.Reviewer.NativeResume.ReReviewPromptOnHeadChange)
-	threadResolution := reviewer["threadResolution"].(map[string]any)
-	assertEqual(t, threadResolution["enabled"], cfg.Reviewer.ThreadResolution.Enabled)
-	assertEqual(t, threadResolution["mode"], string(cfg.Reviewer.ThreadResolution.Mode))
-	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Reviewer.Loop.EnabledByDefault)
-	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Reviewer.Loop.MaxConsecutiveFailures))
+	assertEqual(t, behavior["scope"], string(cfg.Roles.Reviewer.Behavior.Scope))
+	assertEqual(t, behavior["publishMode"], string(cfg.Roles.Reviewer.Behavior.PublishMode))
+	assertEqual(t, behavior["detectDuplicateFindings"], cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings)
+	nativeResume := behavior["nativeResume"].(map[string]any)
+	assertEqual(t, nativeResume["onHeadChange"], cfg.Roles.Reviewer.Behavior.NativeResume.OnHeadChange)
+	assertEqual(t, nativeResume["reReviewPromptOnHeadChange"], cfg.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange)
+	threadResolution := behavior["threadResolution"].(map[string]any)
+	assertEqual(t, threadResolution["enabled"], cfg.Roles.Reviewer.Behavior.ThreadResolution.Enabled)
+	assertEqual(t, threadResolution["mode"], string(cfg.Roles.Reviewer.Behavior.ThreadResolution.Mode))
+	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Roles.Reviewer.Behavior.Loop.EnabledByDefault)
+	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Roles.Reviewer.Behavior.Loop.MaxConsecutiveFailures))
 	if _, ok := daemon["shutdownTimeoutMs"]; ok {
 		t.Fatalf("daemon.shutdownTimeoutMs should be omitted from config response: %#v", daemon)
 	}
@@ -177,7 +179,7 @@ func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	existing := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_iterations_per_pr","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
 	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
 
-	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Reviewer, target, "2026-04-11T12:00:00.000Z")
+	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Roles.Reviewer.Behavior, target, "2026-04-11T12:00:00.000Z")
 	if err != nil {
 		t.Fatalf("reviewerLoopMetadataJSON() error = %v", err)
 	}

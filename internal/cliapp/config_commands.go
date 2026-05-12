@@ -37,10 +37,16 @@ var configFieldRegistry = map[string]configField{
 	"instructions.enabled":        boolField("instructions.enabled", "", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
 	"package.autoUpgradeEnabled":  boolField("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
 	"instructions.maxBytes":       positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
-	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"roles.reviewer.behavior.reviewEvents.clean": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
-	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Clean
+	}),
+	"roles.reviewer.behavior.reviewEvents.blocking": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Blocking
+	}),
+	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Blocking
 	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
@@ -474,11 +480,11 @@ func reviewerReviewEventField(key, env, flag string, get func(config.Config) any
 	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
 		switch key {
-		case "reviewer.reviewEvents.clean":
+		case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
 			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventApprove {
 				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove)
 			}
-		case "reviewer.reviewEvents.blocking":
+		case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
 			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventRequestChanges {
 				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges)
 			}
@@ -528,13 +534,14 @@ func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefault
 }
 
 func ensurePartialReviewerReviewEvents(partial *config.PartialConfig) *config.PartialReviewerReviewEventsConfig {
-	if partial.Reviewer == nil {
-		partial.Reviewer = &config.PartialReviewerConfig{}
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &config.PartialReviewerConfig{}
 	}
-	if partial.Reviewer.ReviewEvents == nil {
-		partial.Reviewer.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
+	if reviewer.Behavior.ReviewEvents == nil {
+		reviewer.Behavior.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
 	}
-	return partial.Reviewer.ReviewEvents
+	return reviewer.Behavior.ReviewEvents
 }
 
 func ensurePartialInstructions(partial *config.PartialConfig) *config.PartialInstructionsConfig {
@@ -678,10 +685,10 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Package != nil && partial.Package.AutoUpgradeEnabled != nil
 	case "instructions.maxBytes":
 		return partial.Instructions != nil && partial.Instructions.MaxBytes != nil
-	case "reviewer.reviewEvents.clean":
-		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil
-	case "reviewer.reviewEvents.blocking":
-		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Blocking != nil
+	case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil
+	case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking != nil
 	case "roles.planner.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
 	case "roles.planner.instructions":

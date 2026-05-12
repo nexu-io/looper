@@ -210,7 +210,7 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 			return decodeTopLevelConfigSection(raw, "defaults", &partialConfig.Defaults)
 		}},
 		{key: "reviewer", decode: func(raw json.RawMessage) error {
-			return decodeTopLevelConfigSection(raw, "reviewer", &partialConfig.Reviewer)
+			return decodeTopLevelConfigSection(raw, "reviewer", &partialConfig.LegacyReviewer)
 		}},
 		{key: "instructions", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "instructions", &partialConfig.Instructions)
@@ -1140,10 +1140,11 @@ func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 }
 
 func ensureReviewerConfig(partial *PartialConfig) *PartialReviewerConfig {
-	if partial.Reviewer == nil {
-		partial.Reviewer = &PartialReviewerConfig{}
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &PartialReviewerConfig{}
 	}
-	return partial.Reviewer
+	return reviewer.Behavior
 }
 
 func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig {

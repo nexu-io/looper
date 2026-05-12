@@ -69,7 +69,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	policy, err := effectiveReviewSubmitPolicy(
-		loaded.Config.Reviewer.ReviewEvents,
+		loaded.Config.Roles.Reviewer.Behavior.ReviewEvents,
 		getStringFlag(cmd, "clean-review-event"),
 		getStringFlag(cmd, "blocking-review-event"),
 	)

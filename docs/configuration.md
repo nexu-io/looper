@@ -24,6 +24,31 @@ The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`
 
 Later layers override earlier ones.
 
+## Canonical taxonomy
+
+Looper's frozen canonical top-level config roots are:
+
+| Root | Purpose |
+| --- | --- |
+| `server` | network-facing API/server configuration |
+| `daemon` | daemon lifecycle, runtime paths, and local process behavior |
+| `storage` | sqlite/database/backups/history retention and storage-specific settings |
+| `scheduler` | loop scheduling, concurrency, polling, and timing policy that is not role-specific |
+| `agent` | model/provider/executor defaults that apply across roles unless overridden more locally |
+| `logging` | logs, verbosity, sinks, and diagnostic controls |
+| `notifications` | user notifications such as osascript or future notifier integrations |
+| `disclosure` | disclosure/stamping policy for outward-facing automation output |
+| `tools` | external tool paths and tool-specific execution settings such as `git`, `gh`, and `osascript` |
+| `package` | packaging, upgrade, and distribution policy |
+| `defaults` | user-facing default policy that does not belong to a narrower domain |
+| `instructions` | global instruction-system settings that are not role-specific instruction content |
+| `roles` | role-specific config grouped by role name, for example `roles.<role>` |
+| `projects` | per-project metadata and supported project-scoped overrides |
+
+Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
+
+Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths.
+
 Default config file path:
 
 - `~/.looper/config.json`
@@ -150,16 +175,6 @@ Example minimal `~/.looper/config.json`:
     "openPrStrategy": "all_done",
     "addSnapshotMode": "async"
   },
-  "reviewer": {
-    "reviewEvents": {
-      "clean": "COMMENT",
-      "blocking": "COMMENT"
-    },
-    "nativeResume": {
-      "onHeadChange": false,
-      "reReviewPromptOnHeadChange": false
-    }
-  },
   "roles": {
     "planner": {
       "autoDiscovery": true,
@@ -171,6 +186,16 @@ Example minimal `~/.looper/config.json`:
     },
     "reviewer": {
       "autoDiscovery": true,
+      "behavior": {
+        "reviewEvents": {
+          "clean": "COMMENT",
+          "blocking": "COMMENT"
+        },
+        "nativeResume": {
+          "onHeadChange": false,
+          "reReviewPromptOnHeadChange": false
+        }
+      },
       "triggers": {
         "includeDrafts": false,
         "requireReviewRequest": true,
@@ -405,7 +430,7 @@ Defaults:
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
 - `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
 
-`defaults.allowAutoApprove=true` is a legacy alias for reviewer clean approvals. If `reviewer.reviewEvents.clean` is not explicitly configured, it maps clean reviewer outcomes to `APPROVE`; an explicit `reviewer.reviewEvents.clean` value wins.
+`defaults.allowAutoApprove=true` is a legacy alias for reviewer clean approvals. If `roles.reviewer.behavior.reviewEvents.clean` is not explicitly configured, it maps clean reviewer outcomes to `APPROVE`; an explicit reviewer clean-review event value wins.
 
 Default values:
 
@@ -419,7 +444,7 @@ Default values:
 - `openPrStrategy`: `all_done`
 - `addSnapshotMode`: `async`
 
-### `reviewer`
+### `roles.reviewer.behavior`
 
 - `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
 - `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
@@ -431,14 +456,18 @@ Default reviewer behavior is safe and comment-only:
 
 ```json
 {
-  "reviewer": {
-    "reviewEvents": {
-      "clean": "COMMENT",
-      "blocking": "COMMENT"
-    },
-    "nativeResume": {
-      "onHeadChange": false,
-      "reReviewPromptOnHeadChange": false
+  "roles": {
+    "reviewer": {
+      "behavior": {
+        "reviewEvents": {
+          "clean": "COMMENT",
+          "blocking": "COMMENT"
+        },
+        "nativeResume": {
+          "onHeadChange": false,
+          "reReviewPromptOnHeadChange": false
+        }
+      }
     }
   }
 }
@@ -448,10 +477,14 @@ To allow reviewer decision reviews:
 
 ```json
 {
-  "reviewer": {
-    "reviewEvents": {
-      "clean": "APPROVE",
-      "blocking": "REQUEST_CHANGES"
+  "roles": {
+    "reviewer": {
+      "behavior": {
+        "reviewEvents": {
+          "clean": "APPROVE",
+          "blocking": "REQUEST_CHANGES"
+        }
+      }
     }
   }
 }
@@ -459,7 +492,7 @@ To allow reviewer decision reviews:
 
 Reviewer behavior matrix:
 
-| Reviewer outcome | `reviewEvents.clean` | `reviewEvents.blocking` | GitHub event |
+| Reviewer outcome | `roles.reviewer.behavior.reviewEvents.clean` | `roles.reviewer.behavior.reviewEvents.blocking` | GitHub event |
 |---|---:|---:|---|
 | `clean` | `COMMENT` | any | `COMMENT` |
 | `clean` | `APPROVE` | any | `APPROVE` |

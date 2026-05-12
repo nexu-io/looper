@@ -247,7 +247,7 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
 		t.Fatalf("worker role defaults = %#v", got)
 	}
-	if got := cfg.Reviewer.Loop.MaxWallClockSeconds; got != 0 {
+	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxWallClockSeconds; got != 0 {
 		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
 	}
 }
@@ -1271,7 +1271,7 @@ func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	loop := loaded.Config.Reviewer.Loop
+	loop := loaded.Config.Roles.Reviewer.Behavior.Loop
 	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MinPublishIntervalSeconds != 1200 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
 		t.Fatalf("reviewer loop config = %#v, want cli/env/file precedence applied", loop)
 	}
@@ -1297,10 +1297,10 @@ func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) 
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if got := loaded.Config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
 		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventApprove)
 	}
-	if got := loaded.Config.Reviewer.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
 		t.Fatalf("blocking review event = %q, want %q", got, ReviewerReviewEventRequestChanges)
 	}
 }
@@ -1315,10 +1315,10 @@ func TestLoadFileReviewerNativeResumeOnHeadChangeEnvOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if !loaded.Config.Reviewer.NativeResume.OnHeadChange {
+	if !loaded.Config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
 		t.Fatalf("reviewer.nativeResume.onHeadChange = false, want true")
 	}
-	if loaded.Config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+	if loaded.Config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
 		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = true, want false")
 	}
 }
@@ -1333,10 +1333,10 @@ func TestLoadFileReviewerNativeResumeReReviewPromptOnHeadChangeEnvOverride(t *te
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if !loaded.Config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+	if !loaded.Config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
 		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = false, want true")
 	}
-	if loaded.Config.Reviewer.NativeResume.OnHeadChange {
+	if loaded.Config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
 		t.Fatalf("reviewer.nativeResume.onHeadChange = true, want false")
 	}
 }
@@ -1348,15 +1348,15 @@ func TestNormalizeAllowAutoApproveLegacyAliasRespectsExplicitReviewerCleanEvent(
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
-	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+	if got := config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
 		t.Fatalf("legacy clean review event = %q, want %q", got, ReviewerReviewEventApprove)
 	}
 
-	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, Reviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
+	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, LegacyReviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
 	if err != nil {
 		t.Fatalf("Normalize(explicit) error = %v", err)
 	}
-	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+	if got := config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
 		t.Fatalf("explicit clean review event = %q, want %q", got, ReviewerReviewEventComment)
 	}
 }
@@ -1366,8 +1366,8 @@ func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	cfg.Reviewer.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
-	cfg.Reviewer.ReviewEvents.Blocking = ReviewerReviewEventApprove
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = ReviewerReviewEventApprove
 	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "config validation failed") {
 		t.Fatalf("ValidateWithOptions() error = %v, want validation failure", err)
@@ -1467,10 +1467,10 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
 	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
-	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
-	assertValidationIssue(t, validationErr, "reviewer.loop.minPublishIntervalSeconds", "must be an integer >= 0")
-	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
-	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.minPublishIntervalSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.publishMode", "must be single_review")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
 }
@@ -1757,10 +1757,10 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Agent maps = %#v / %#v, want empty maps", config.Agent.Params, config.Agent.Env)
 	}
 
-	if config.Reviewer.NativeResume.OnHeadChange {
+	if config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
 		t.Fatal("DefaultConfig().Reviewer.NativeResume.OnHeadChange = true, want false")
 	}
-	if config.Reviewer.NativeResume.ReReviewPromptOnHeadChange {
+	if config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
 		t.Fatal("DefaultConfig().Reviewer.NativeResume.ReReviewPromptOnHeadChange = true, want false")
 	}
 

@@ -15,7 +15,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		mergeConfig(&config, partial)
 	}
 	if config.Defaults.AllowAutoApprove && !explicitReviewerCleanReviewEvent {
-		config.Reviewer.ReviewEvents.Clean = ReviewerReviewEventApprove
+		config.Roles.Reviewer.Behavior.ReviewEvents.Clean = ReviewerReviewEventApprove
 	}
 	if !fixerAuthorFilterExplicit && config.Defaults.FixAllPullRequests {
 		config.Roles.Fixer.Triggers.AuthorFilter = FixerAuthorFilterAny
@@ -26,7 +26,10 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 
 func hasExplicitReviewerCleanReviewEvent(partials []PartialConfig) bool {
 	for _, partial := range partials {
-		if partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil {
+		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil && partial.LegacyReviewer.ReviewEvents.Clean != nil {
+			return true
+		}
+		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil {
 			return true
 		}
 	}
@@ -78,8 +81,8 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeDefaultsConfig(&config.Defaults, *partial.Defaults)
 	}
 
-	if partial.Reviewer != nil {
-		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
+	if partial.LegacyReviewer != nil {
+		mergeReviewerConfig(&config.Roles.Reviewer.Behavior, *partial.LegacyReviewer)
 	}
 
 	if partial.Instructions != nil {
@@ -573,6 +576,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
 	}
+	if partial.Behavior != nil {
+		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
@@ -931,6 +937,26 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		if configs.Reviewer.SpecReview != nil {
 			specReview := *configs.Reviewer.SpecReview
 			reviewer.SpecReview = &specReview
+		}
+		if configs.Reviewer.Behavior != nil {
+			behavior := *configs.Reviewer.Behavior
+			if configs.Reviewer.Behavior.Loop != nil {
+				loop := *configs.Reviewer.Behavior.Loop
+				behavior.Loop = &loop
+			}
+			if configs.Reviewer.Behavior.ReviewEvents != nil {
+				reviewEvents := *configs.Reviewer.Behavior.ReviewEvents
+				behavior.ReviewEvents = &reviewEvents
+			}
+			if configs.Reviewer.Behavior.NativeResume != nil {
+				nativeResume := *configs.Reviewer.Behavior.NativeResume
+				behavior.NativeResume = &nativeResume
+			}
+			if configs.Reviewer.Behavior.ThreadResolution != nil {
+				threadResolution := *configs.Reviewer.Behavior.ThreadResolution
+				behavior.ThreadResolution = &threadResolution
+			}
+			reviewer.Behavior = &behavior
 		}
 		cloned.Reviewer = &reviewer
 	}

@@ -877,8 +877,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 		policy := runtimeReviewerRecoveryPolicy{
 			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
+			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -1080,8 +1080,8 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		}
 		policy := runtimeReviewerRecoveryPolicy{
 			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
+			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue

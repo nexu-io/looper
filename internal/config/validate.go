@@ -150,38 +150,38 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
 	}
 
-	if config.Reviewer.Loop.QuietPeriodSeconds < 0 {
-		issues = append(issues, ValidationIssue{Path: "reviewer.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
+	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
 	}
-	if config.Reviewer.Loop.MinPublishIntervalSeconds < 0 {
-		issues = append(issues, ValidationIssue{Path: "reviewer.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
+	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
-	if !isValidReviewerScope(config.Reviewer.Scope) {
-		issues = append(issues, ValidationIssue{Path: "reviewer.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
+	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}
-	if config.Reviewer.PublishMode != ReviewerPublishModeSingleReview {
-		issues = append(issues, ValidationIssue{Path: "reviewer.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
+	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
-	if !isValidReviewerThreadResolutionMode(config.Reviewer.ThreadResolution.Mode) {
-		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
+	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
 	}
-	if config.Reviewer.ThreadResolution.Scope != ReviewerThreadResolutionScopeLooperAuthoredOnly {
-		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.scope", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionScopeLooperAuthoredOnly)})
+	if config.Roles.Reviewer.Behavior.ThreadResolution.Scope != ReviewerThreadResolutionScopeLooperAuthoredOnly {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.scope", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionScopeLooperAuthoredOnly)})
 	}
-	if config.Reviewer.ThreadResolution.AutoResolve != ReviewerThreadResolutionAutoResolveObjectiveOnly {
-		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.autoResolve", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionAutoResolveObjectiveOnly)})
+	if config.Roles.Reviewer.Behavior.ThreadResolution.AutoResolve != ReviewerThreadResolutionAutoResolveObjectiveOnly {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.autoResolve", Message: fmt.Sprintf("must be %s", ReviewerThreadResolutionAutoResolveObjectiveOnly)})
 	}
-	if config.Reviewer.ThreadResolution.MaxThreadsPerRun < 1 {
-		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.maxThreadsPerRun", Message: "must be a positive integer"})
+	if config.Roles.Reviewer.Behavior.ThreadResolution.MaxThreadsPerRun < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.maxThreadsPerRun", Message: "must be a positive integer"})
 	}
-	if config.Reviewer.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Reviewer.ThreadResolution.RequireAuditComment {
-		issues = append(issues, ValidationIssue{Path: "reviewer.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
+	if config.Roles.Reviewer.Behavior.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Roles.Reviewer.Behavior.ThreadResolution.RequireAuditComment {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
 	}
-	if config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Clean != ReviewerReviewEventApprove {
-		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
+	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
 	}
-	if config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventComment && config.Reviewer.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
-		issues = append(issues, ValidationIssue{Path: "reviewer.reviewEvents.blocking", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventRequestChanges)})
+	if config.Roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.blocking", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventRequestChanges)})
 	}
 
 	validateInstructions(config, &issues)
