@@ -261,6 +261,7 @@ type GitGateway interface {
 	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
 	Commit(context.Context, CommitInput) (CommitResult, error)
 	Push(context.Context, PushInput) error
+	IsAncestor(context.Context, string, string, string) (bool, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
 }
 
@@ -507,14 +508,22 @@ type checkpointPush struct {
 }
 
 type fixEvidence struct {
-	Valid              bool     `json:"valid,omitempty"`
-	Source             string   `json:"source,omitempty"`
-	HeadSHA            string   `json:"headSha,omitempty"`
-	CommitSHAs         []string `json:"commitShas,omitempty"`
-	BaseHeadSHA        string   `json:"baseHeadSha,omitempty"`
-	FixItemsHash       string   `json:"fixItemsHash,omitempty"`
-	ProducedNewCommits bool     `json:"producedNewCommits,omitempty"`
-	PushedAt           string   `json:"pushedAt,omitempty"`
+	Valid              bool                 `json:"valid,omitempty"`
+	Source             string               `json:"source,omitempty"`
+	HeadSHA            string               `json:"headSha,omitempty"`
+	CommitSHAs         []string             `json:"commitShas,omitempty"`
+	BaseHeadSHA        string               `json:"baseHeadSha,omitempty"`
+	FixItemsHash       string               `json:"fixItemsHash,omitempty"`
+	CommentRecords     []fixCommentEvidence `json:"commentRecords,omitempty"`
+	ProducedNewCommits bool                 `json:"producedNewCommits,omitempty"`
+	PushedAt           string               `json:"pushedAt,omitempty"`
+}
+
+type fixCommentEvidence struct {
+	FixItemID   string `json:"fixItemId,omitempty"`
+	ThreadID    string `json:"threadId,omitempty"`
+	CommitSHA   string `json:"commitSha,omitempty"`
+	Explanation string `json:"explanation,omitempty"`
 }
 
 type checkpointResolvedComments struct {
@@ -1631,6 +1640,17 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
 	}
+	pushedAt := r.nowISO()
+	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
+	evidence := &fixEvidence{Valid: pushedHeadSHA != "" && checkpoint.FixItemsHash != "", HeadSHA: pushedHeadSHA, CommitSHAs: cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, lastNonEmptyString(checkpoint.ReconcileCommits.NewCommitSHAs, pushedHeadSHA)), Source: "fallback_push", ProducedNewCommits: roundProducedNewCommits(&checkpoint), PushedAt: pushedAt}
+	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt, Evidence: evidence}
+	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
+	if err != nil {
+		return checkpoint, err
+	}
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		return checkpoint, err
+	}
 	liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: finalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
 		return fmt.Sprintf("PR head did not update after push: expected %s, got %s", finalHeadSHA, firstNonEmpty(actual, "unknown"))
 	}})
@@ -1638,17 +1658,17 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, err
 	}
 	checkpoint = refreshCheckpointHeadAfterPush(checkpoint, liveDetail)
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": resolveCommentsExpectedHeadSHA(checkpoint), "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": r.nowISO()})
+	pushedHeadSHA = resolveCommentsExpectedHeadSHA(checkpoint)
+	checkpoint.Push.HeadSHA = pushedHeadSHA
+	checkpoint.Push.Evidence.HeadSHA = pushedHeadSHA
+	metadataJSON, err = mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": pushedHeadSHA, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
 	if err != nil {
 		return checkpoint, err
 	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
 		return checkpoint, err
 	}
-	pushedAt := r.nowISO()
-	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
 	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(pushedHeadSHA)}})
-	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt, Evidence: &fixEvidence{Valid: pushedHeadSHA != "" && checkpoint.FixItemsHash != "", HeadSHA: pushedHeadSHA, CommitSHAs: cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, Source: "fallback_push", ProducedNewCommits: roundProducedNewCommits(&checkpoint), PushedAt: pushedAt}}
 	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
 	checkpoint.Lifecycle.Pushed = true
 	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
@@ -1725,8 +1745,9 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	pushedAt := r.nowISO()
-	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: adoptedHead, PushedAt: pushedAt, Evidence: &fixEvidence{Valid: true, Source: "agent_push", HeadSHA: adoptedHead, CommitSHAs: cloneStrings(lc.CommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, ProducedNewCommits: true, PushedAt: pushedAt}}
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": adoptedHead, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt})
+	evidence := &fixEvidence{Valid: true, Source: "agent_push", HeadSHA: adoptedHead, CommitSHAs: cloneStrings(lc.CommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, lastNonEmptyString(lc.CommitSHAs, adoptedHead)), ProducedNewCommits: true, PushedAt: pushedAt}
+	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: adoptedHead, PushedAt: pushedAt, Evidence: evidence}
+	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": adoptedHead, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt, "lastFixEvidence": evidence})
 	if err != nil {
 		return false, checkpoint, err
 	}
@@ -1755,46 +1776,43 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Push == nil {
 		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
 	}
-	fixItems := checkpoint.FixItems
-	currentFixItemsHash := checkpoint.FixItemsHash
+	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return checkpoint, err
+	}
+	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
+	fixItems := collectFixItems(liveDetail)
+	currentFixItemsHash := hashFixItems(fixItems)
+	checkpoint.FixItems = fixItems
+	checkpoint.FixItemsHash = currentFixItemsHash
 	evidence := resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
-	if checkpoint.Push != nil && !checkpoint.Push.Pushed {
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	verifiedEvidence, err := r.verifyFixEvidence(ctx, input, checkpoint, evidence, liveDetail)
+	if err != nil {
+		return checkpoint, err
+	}
+	validationBound := false
+	if verifiedEvidence {
+		validationBound, err = r.validationMatchesEvidence(ctx, input, checkpoint, evidence)
 		if err != nil {
 			return checkpoint, err
 		}
-		fixItems = collectFixItems(detail)
-		currentFixItemsHash = hashFixItems(fixItems)
-		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
-		evidence = resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 	}
-	expectedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
-	if evidence != nil && evidence.Valid && evidence.HeadSHA != "" {
-		expectedHeadSHA = evidence.HeadSHA
-	}
-	if expectedHeadSHA != "" {
-		liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: expectedHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
-			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", expectedHeadSHA, firstNonEmpty(actual, "unknown"))
-		}})
-		if err != nil {
-			return checkpoint, err
-		}
-		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
-		if checkpoint.Push != nil && !checkpoint.Push.Pushed {
-			fixItems = collectFixItems(liveDetail)
-			currentFixItemsHash = hashFixItems(fixItems)
-			evidence = resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
-		}
-	}
-	verifiedEvidence := evidence != nil && evidence.Valid && evidence.HeadSHA != "" && evidence.HeadSHA == detailHeadSHA(checkpoint.Detail)
-	if verifiedEvidence && (checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != evidence.HeadSHA) {
+	if verifiedEvidence && !validationBound {
 		return checkpoint, &loopError{message: "resolve-comments requires validation bound to verified fix evidence head", kind: FailureRetryableAfterResume}
 	}
 	if !verifiedEvidence && hasCommentFixItems(fixItems) && checkpoint.Push != nil && checkpoint.Push.Pushed {
-		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: "resolve-comments refused because verified fix evidence is missing or stale; leaving review threads unresolved", kind: FailureRetryableAfterResume}
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedEvidence) {
+		if checkpoint.ResolvedComments == nil {
+			checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
+		}
+		for _, item := range fixItems {
+			if item.Type != "comment" || alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+				continue
+			}
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
+		}
 		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveAt": r.nowISO()})
 		if err != nil {
 			return checkpoint, err
@@ -1802,25 +1820,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
 			return checkpoint, err
 		}
-		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureRetryableAfterResume}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
 	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
-	commitSHA := ""
-	if checkpoint.ReconcileCommits != nil {
-		if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
-			commitSHA = checkpoint.ReconcileCommits.NewCommitSHAs[len(checkpoint.ReconcileCommits.NewCommitSHAs)-1]
-		} else {
-			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
-		}
-	}
-	if commitSHA == "" || (verifiedEvidence && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
-		commitSHA = firstNonEmpty(evidenceHeadSHA(evidence), commitSHA)
-	}
+	defaultCommitSHA := resolveCommentCommitSHA(checkpoint, evidence, verifiedEvidence)
 	failedCount := 0
-	explanationByID := lookupReplyExplanations(checkpoint)
+	resolvedCount := 0
+	evidenceByThread := evidenceCommentRecordsByThread(evidence)
+	explanationByID := buildResolveReplyExplanations(checkpoint, evidence)
 	for _, item := range fixItems {
 		if item.Type != "comment" {
 			continue
@@ -1828,7 +1838,19 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
 		}
-		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanationByID[item.ID], checkpoint.ResolvedComments.Items)
+		record, hasRecord := evidenceRecordForItem(evidenceByThread, item)
+		if !verifiedEvidence || !hasRecord {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
+			continue
+		}
+		commitSHA := firstNonEmpty(record.CommitSHA, defaultCommitSHA)
+		explanation := firstNonEmpty(explanationByID[item.ID], record.Explanation)
+		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanation, checkpoint.ResolvedComments.Items)
+		if replyState == "failed" {
+			failedCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "reply_failed", Message: "Failed to post fixer auto-reply", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			continue
+		}
 		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
 			message := err.Error()
 			status := "failed"
@@ -1840,11 +1862,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: status, Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			continue
 		}
+		resolvedCount++
 		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
-	if failedCount == 0 {
-		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, explanationByID)
+	if failedCount == 0 && resolvedCount > 0 {
+		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, defaultCommitSHA, explanationByID)
 	}
 	if failedCount > 0 {
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s)", failedCount), kind: FailureRetryableAfterResume}
@@ -1854,10 +1877,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 }
 
 // replyToFixedComment posts a reply on the review thread acknowledging the fix
-// before the thread is resolved. Replies are best-effort: failures are recorded
-// in the checkpoint but never block the resolve step. The disclosure stamper
-// applied by the GitHub adapter ensures every reply carries the looper exposure
-// marker, so automated replies can be filtered downstream.
+// before the thread is resolved. Reply failures are recorded so the caller can
+// retry before resolving the thread. The disclosure stamper applied by the
+// GitHub adapter ensures every reply carries the looper exposure marker, so
+// automated replies can be filtered downstream.
 func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item FixItem, commitSHA, explanation string, existing []checkpointResolvedComment) (string, string) {
 	if item.ThreadID == "" {
 		return "skipped_no_thread", ""
@@ -3313,10 +3336,7 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 	if failedStep != stepResolveComments {
 		return false
 	}
-	if status == "interrupted" {
-		return true
-	}
-	return strings.Contains(failureSummary, "PR head changed before resolving comments")
+	return status == "interrupted"
 }
 
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {
@@ -3345,6 +3365,69 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 		}
 	}
 	return false
+}
+
+func resolveCommentCommitSHA(checkpoint fixerCheckpoint, evidence *fixEvidence, verifiedEvidence bool) string {
+	commitSHA := ""
+	if checkpoint.ReconcileCommits != nil {
+		if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
+			commitSHA = checkpoint.ReconcileCommits.NewCommitSHAs[len(checkpoint.ReconcileCommits.NewCommitSHAs)-1]
+		} else {
+			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
+		}
+	}
+	if commitSHA == "" || (verifiedEvidence && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+		commitSHA = firstNonEmpty(evidenceHeadSHA(evidence), commitSHA)
+	}
+	return commitSHA
+}
+
+func buildResolveReplyExplanations(checkpoint fixerCheckpoint, evidence *fixEvidence) map[string]string {
+	out := lookupReplyExplanations(checkpoint)
+	for _, record := range evidenceCommentRecords(evidence) {
+		if strings.TrimSpace(record.FixItemID) == "" || strings.TrimSpace(record.Explanation) == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		if _, exists := out[record.FixItemID]; !exists {
+			out[record.FixItemID] = record.Explanation
+		}
+	}
+	return out
+}
+
+func evidenceRecordForItem(records map[string]fixCommentEvidence, item FixItem) (fixCommentEvidence, bool) {
+	if len(records) == 0 {
+		return fixCommentEvidence{}, false
+	}
+	if record, ok := records[strings.TrimSpace(item.ThreadID)]; ok {
+		return record, true
+	}
+	if record, ok := records[strings.TrimSpace(item.ID)]; ok {
+		return record, true
+	}
+	return fixCommentEvidence{}, false
+}
+
+func evidenceCommentRecordsByThread(evidence *fixEvidence) map[string]fixCommentEvidence {
+	items := evidenceCommentRecords(evidence)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make(map[string]fixCommentEvidence, len(items)*2)
+	for _, item := range items {
+		if key := strings.TrimSpace(item.ThreadID); key != "" {
+			out[key] = item
+		}
+		if key := strings.TrimSpace(item.FixItemID); key != "" {
+			if _, exists := out[key]; !exists {
+				out[key] = item
+			}
+		}
+	}
+	return out
 }
 
 func hasCommentFixItems(fixItems []FixItem) bool {
@@ -3504,15 +3587,15 @@ func resolveCommentsExpectedHeadSHA(checkpoint fixerCheckpoint) string {
 }
 
 func resolveFixEvidence(checkpoint fixerCheckpoint, loopMetadataJSON *string, fixItemsHash string) *fixEvidence {
-	if fixItemsHash == "" {
-		return nil
-	}
 	if checkpoint.Push != nil && checkpoint.Push.Evidence != nil {
 		evidence := *checkpoint.Push.Evidence
 		if evidence.HeadSHA == "" {
 			evidence.HeadSHA = checkpoint.Push.HeadSHA
 		}
-		if evidence.Valid && evidence.HeadSHA != "" && evidence.FixItemsHash != "" && evidence.FixItemsHash == fixItemsHash && evidence.ProducedNewCommits {
+		if evidence.Valid && evidence.HeadSHA != "" && evidence.ProducedNewCommits {
+			if len(evidence.CommentRecords) == 0 {
+				evidence.CommentRecords = buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, &evidence, true))
+			}
 			return &evidence
 		}
 		return nil
@@ -3522,10 +3605,16 @@ func resolveFixEvidence(checkpoint fixerCheckpoint, loopMetadataJSON *string, fi
 		if !producedNewCommits {
 			return nil
 		}
-		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: checkpoint.Push.HeadSHA, FixItemsHash: fixItemsHash, ProducedNewCommits: producedNewCommits, PushedAt: checkpoint.Push.PushedAt}
+		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: checkpoint.Push.HeadSHA, CommitSHAs: cloneStrings(commitEvidenceSHAs(checkpoint)), FixItemsHash: fixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false)), ProducedNewCommits: producedNewCommits, PushedAt: checkpoint.Push.PushedAt}
+	}
+	if persisted := persistedFixEvidence(loopMetadataJSON); persisted != nil && persisted.Valid && persisted.HeadSHA != "" && persisted.ProducedNewCommits {
+		return persisted
+	}
+	if fixItemsHash == "" {
+		return nil
 	}
 	if headSHA := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, loopMetadataJSON, fixItemsHash); headSHA != "" {
-		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: headSHA, FixItemsHash: fixItemsHash, ProducedNewCommits: true}
+		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: headSHA, FixItemsHash: fixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, resolveCommentCommitSHA(checkpoint, nil, false)), ProducedNewCommits: true}
 	}
 	return nil
 }
@@ -3548,6 +3637,114 @@ func resolveCommentsVerifiedNoPushHeadSHA(push *checkpointPush, loopMetadataJSON
 		return ""
 	}
 	return lastFixHeadSHA
+}
+
+func persistedFixEvidence(loopMetadataJSON *string) *fixEvidence {
+	metadata := parseJSONObject(loopMetadataJSON)
+	raw, ok := metadata["lastFixEvidence"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var evidence fixEvidence
+	if err := json.Unmarshal(encoded, &evidence); err != nil {
+		return nil
+	}
+	if evidence.HeadSHA == "" {
+		return nil
+	}
+	evidence.CommentRecords = cloneFixCommentEvidence(evidence.CommentRecords)
+	evidence.CommitSHAs = cloneStrings(evidence.CommitSHAs)
+	return &evidence
+}
+
+func buildFixCommentEvidenceRecords(checkpoint fixerCheckpoint, commitSHA string) []fixCommentEvidence {
+	if len(checkpoint.FixItems) == 0 {
+		return nil
+	}
+	explanationByID := lookupReplyExplanations(checkpoint)
+	records := make([]fixCommentEvidence, 0, len(checkpoint.FixItems))
+	for _, item := range checkpoint.FixItems {
+		if item.Type != "comment" {
+			continue
+		}
+		records = append(records, fixCommentEvidence{FixItemID: item.ID, ThreadID: item.ThreadID, CommitSHA: commitSHA, Explanation: explanationByID[item.ID]})
+	}
+	return records
+}
+
+func evidenceCommentRecords(evidence *fixEvidence) []fixCommentEvidence {
+	if evidence == nil {
+		return nil
+	}
+	return cloneFixCommentEvidence(evidence.CommentRecords)
+}
+
+func commitEvidenceSHAs(checkpoint fixerCheckpoint) []string {
+	if checkpoint.ReconcileCommits == nil {
+		return nil
+	}
+	if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
+		return cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs)
+	}
+	if checkpoint.ReconcileCommits.FinalHeadSHA != "" {
+		return []string{checkpoint.ReconcileCommits.FinalHeadSHA}
+	}
+	return nil
+}
+
+func (r *Runner) verifyFixEvidence(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence *fixEvidence, liveDetail PullRequestDetail) (bool, error) {
+	if evidence == nil || !evidence.Valid || strings.TrimSpace(evidence.HeadSHA) == "" {
+		return false, nil
+	}
+	liveHeadSHA := strings.TrimSpace(liveDetail.HeadSHA)
+	if liveHeadSHA == "" {
+		return false, nil
+	}
+	if liveHeadSHA == strings.TrimSpace(evidence.HeadSHA) {
+		return true, nil
+	}
+	if r.git == nil {
+		return false, nil
+	}
+	if checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
+		worktreeRoot, err := fixerWorktreeRoot(input.Project)
+		if err != nil {
+			return false, err
+		}
+		if _, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ExpectedHeadSHA: liveHeadSHA}); err != nil {
+			return false, err
+		}
+	}
+	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, liveHeadSHA)
+	if err != nil {
+		return false, nil
+	}
+	return ancestor, nil
+}
+
+func (r *Runner) validationMatchesEvidence(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence *fixEvidence) (bool, error) {
+	if checkpoint.Validation == nil || !checkpoint.Validation.Passed || evidence == nil || strings.TrimSpace(evidence.HeadSHA) == "" {
+		return false, nil
+	}
+	validationHeadSHA := strings.TrimSpace(checkpoint.Validation.HeadSHA)
+	if validationHeadSHA == "" {
+		return false, nil
+	}
+	if validationHeadSHA == strings.TrimSpace(evidence.HeadSHA) {
+		return true, nil
+	}
+	if r.git == nil {
+		return false, nil
+	}
+	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, validationHeadSHA)
+	if err != nil {
+		return false, nil
+	}
+	return ancestor, nil
 }
 
 func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsHash string) bool {
@@ -3619,10 +3816,17 @@ func compactStrings(values []string) []string {
 }
 
 func cloneStrings(values []string) []string {
-	if values == nil {
+	if len(values) == 0 {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func cloneFixCommentEvidence(values []fixCommentEvidence) []fixCommentEvidence {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]fixCommentEvidence(nil), values...)
 }
 
 func cloneObjectSlice(values []map[string]any) []map[string]any {
@@ -3679,6 +3883,15 @@ func stringFromAny(value any) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func lastNonEmptyString(values []string, fallback string) string {
+	for i := len(values) - 1; i >= 0; i-- {
+		if strings.TrimSpace(values[i]) != "" {
+			return values[i]
+		}
+	}
+	return fallback
 }
 
 func int64FromAny(value any) int64 {
