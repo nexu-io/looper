@@ -385,7 +385,9 @@ func (r *commandRuntime) tryAcquireAutoUpgradeLock(path string) (func(), bool, e
 	if err != nil {
 		if os.IsExist(err) {
 			if r.shouldBreakAutoUpgradeLock(path) {
-				_ = os.Remove(path)
+				if err := os.Remove(path); err != nil {
+					return nil, false, err
+				}
 				return r.tryAcquireAutoUpgradeLock(path)
 			}
 			return func() {}, false, nil

@@ -278,6 +278,46 @@ func TestAutoUpgradeStartsBackgroundWorkerAndCachesInFlightState(t *testing.T) {
 	}
 }
 
+func TestTryAcquireAutoUpgradeLockReturnsRemoveErrorForStaleLock(t *testing.T) {
+	homeDir := t.TempDir()
+	lockDir := filepath.Join(homeDir, ".looper")
+	lockPath := filepath.Join(lockDir, "auto-upgrade.lock")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	if err := os.WriteFile(lockPath, []byte("invalid-pid\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(lockPath) error = %v", err)
+	}
+	staleTime := time.Now().Add(-autoUpgradeBusyRetryDelay - time.Second)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes(lockPath) error = %v", err)
+	}
+	if err := os.Chmod(lockDir, 0o555); err != nil {
+		t.Fatalf("Chmod(lockDir) error = %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(lockDir, 0o755)
+	}()
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	unlock, acquired, err := runtime.tryAcquireAutoUpgradeLock(lockPath)
+	if err == nil {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatal("tryAcquireAutoUpgradeLock() error = nil, want stale lock removal failure")
+	}
+	if acquired {
+		t.Fatal("tryAcquireAutoUpgradeLock() acquired = true, want false")
+	}
+	if unlock != nil {
+		t.Fatal("tryAcquireAutoUpgradeLock() unlock != nil, want nil")
+	}
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Fatalf("Stat(lockPath) error = %v, want stale lock to remain", statErr)
+	}
+}
+
 func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
 	t.Parallel()
 
