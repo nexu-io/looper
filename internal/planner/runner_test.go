@@ -263,6 +263,44 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	}
 }
 
+func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"},
+			Worktree:  &checkpointWorktree{Path: legacyPath, Branch: "stale", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	}
+	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "completed" || checkpoint.WriteSpec.GitReconciled {
+		t.Fatalf("checkpoint.WriteSpec = %#v, want write-spec state preserved while recreating worktree", checkpoint.WriteSpec)
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1219,6 +1257,8 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
+	} else if input.WorktreeRoot != "" {
+		result.WorktreePath = filepath.Join(input.WorktreeRoot, filepath.Base(result.WorktreePath))
 	}
 	if result.Branch == "" {
 		result.Branch = input.Branch
@@ -1226,6 +1266,7 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if result.BaseBranch == "" {
 		result.BaseBranch = input.BaseBranch
 	}
+	f.createResult = result
 	return result, nil
 }
 

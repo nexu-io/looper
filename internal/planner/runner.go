@@ -933,7 +933,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		checkpoint.Worktree = nil
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		input.Checkpoint = checkpoint

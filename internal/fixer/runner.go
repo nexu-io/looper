@@ -1363,7 +1363,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, err
 	}
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+	worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)
+	if rootErr != nil {
+		return checkpoint, rootErr
+	}
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		checkpoint.Worktree = nil
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		input.Checkpoint = checkpoint

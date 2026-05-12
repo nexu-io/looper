@@ -1154,7 +1154,11 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 	if strings.TrimSpace(worktree.Path) == "" {
 		return worktree, nil
 	}
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
+	if rootErr != nil {
+		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
+	}
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, err.Error())
 	}
 	info, err := os.Stat(worktree.Path)

@@ -1974,6 +1974,50 @@ func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *
 	}
 }
 
+func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:       &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			FixItems:     []FixItem{{ID: "fix-1", Summary: "repair disclosure"}},
+			Worktree:     &checkpointWorktree{Path: legacyPath, Branch: "feature/fix-42", PreparedAt: "stale"},
+			FixItemsHash: "hash-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("runRepairStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+	if checkpoint.Repair != nil {
+		t.Fatalf("checkpoint.Repair = %#v, want repair state unchanged during worktree recovery", checkpoint.Repair)
+	}
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	}
+}
+
 func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirty(t *testing.T) {
 	t.Parallel()
 
@@ -2239,6 +2283,8 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
+	} else if input.WorktreeRoot != "" {
+		result.WorktreePath = filepath.Join(input.WorktreeRoot, filepath.Base(result.WorktreePath))
 	}
 	if result.Branch == "" {
 		result.Branch = input.Branch
@@ -2246,6 +2292,7 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if result.HeadSHA == "" {
 		result.HeadSHA = "base-head"
 	}
+	f.createResult = result
 	return result, nil
 }
 
