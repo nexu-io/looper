@@ -21,7 +21,7 @@ type downloadProgressFactory interface {
 
 type downloadProgressTracker interface {
 	wrap(io.ReadCloser) io.ReadCloser
-	finish()
+	finish(success bool)
 }
 
 func ensureDownloadProgressFactory(w io.Writer) (downloadProgressFactory, bool) {
@@ -79,7 +79,7 @@ func (f *mpbDownloadProgressFactory) Write(p []byte) (int, error) {
 func (f *mpbDownloadProgressFactory) newTracker(name string, total int64) downloadProgressTracker {
 	label := progressDisplayName(name)
 	if total > 0 {
-		bar := f.progress.New(total,
+		bar := f.progress.New(0,
 			mpb.BarStyle().Lbound("[").Filler("#").Tip("#").Padding("-").Rbound("]"),
 			mpb.PrependDecorators(
 				decor.Name(label, decor.WCSyncSpaceR),
@@ -89,7 +89,8 @@ func (f *mpbDownloadProgressFactory) newTracker(name string, total int64) downlo
 				decor.CountersKibiByte("% d / % d", decor.WCSyncSpace),
 			),
 		)
-		return &mpbDownloadProgressTracker{bar: bar, totalKnown: true}
+		bar.SetTotal(total, false)
+		return &mpbDownloadProgressTracker{bar: bar, total: total, totalKnown: true}
 	}
 	bar := f.progress.AddSpinner(0,
 		mpb.PrependDecorators(
@@ -112,6 +113,7 @@ func (f *mpbDownloadProgressFactory) close() {
 type mpbDownloadProgressTracker struct {
 	bar        *mpb.Bar
 	reader     io.ReadCloser
+	total      int64
 	totalKnown bool
 }
 
@@ -123,17 +125,27 @@ func (t *mpbDownloadProgressTracker) wrap(r io.ReadCloser) io.ReadCloser {
 	return t.reader
 }
 
-func (t *mpbDownloadProgressTracker) finish() {
+func (t *mpbDownloadProgressTracker) finish(success bool) {
 	if t == nil || t.bar == nil {
+		return
+	}
+	if !success {
+		if t.totalKnown {
+			current := t.bar.Current()
+			if current >= t.total {
+				t.bar.SetTotal(current+1, false)
+			}
+		}
+		if !t.bar.Aborted() && !t.bar.Completed() {
+			t.bar.Abort(false)
+		}
 		return
 	}
 	if !t.totalKnown {
 		t.bar.SetTotal(-1, true)
 		return
 	}
-	if !t.bar.Aborted() && !t.bar.Completed() {
-		t.bar.Abort(false)
-	}
+	t.bar.SetTotal(t.total, true)
 }
 
 type summaryDownloadProgressFactory struct {
@@ -190,11 +202,14 @@ func (p *summaryDownloadProgress) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (p *summaryDownloadProgress) finish() {
+func (p *summaryDownloadProgress) finish(success bool) {
 	if p.finished {
 		return
 	}
 	p.finished = true
+	if !success {
+		return
+	}
 	p.print(false)
 }
 

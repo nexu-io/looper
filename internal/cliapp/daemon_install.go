@@ -212,13 +212,14 @@ func (r *commandRuntime) download(ctx context.Context, url string, accept string
 	}
 
 	reader := io.ReadCloser(resp.Body)
+	downloadSucceeded := false
 	if progress != nil && strings.TrimSpace(progressName) != "" {
 		factory, owned := ensureDownloadProgressFactory(progress)
 		if owned {
 			defer factory.close()
 		}
 		tracker := factory.newTracker(progressName, resp.ContentLength)
-		defer tracker.finish()
+		defer func() { tracker.finish(downloadSucceeded) }()
 		reader = tracker.wrap(resp.Body)
 	}
 	defer reader.Close()
@@ -227,6 +228,7 @@ func (r *commandRuntime) download(ctx context.Context, url string, accept string
 	if err != nil {
 		return nil, nil, err
 	}
+	downloadSucceeded = true
 	return data, resp, nil
 }
 
