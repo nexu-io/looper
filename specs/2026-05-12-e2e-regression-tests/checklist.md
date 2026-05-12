@@ -136,12 +136,12 @@
 - [x] 断言 worktree 中存在 fake agent 写入文件
 - [x] 断言 run metadata 记录 worktree path
 - [ ] 添加 PR #194 fresh schedule regression test
-- [ ] 添加 PR #194 reused loop / active worker regression test
+- [x] 添加 PR #194 reused loop / active worker regression test
 - [ ] 添加 worktree 被外部删除后的 restore/recreate test
-- [ ] 添加 checkpoint worktree path == repo path 必须 reject/recover test
+- [x] 添加 checkpoint worktree path == repo path 必须 reject/recover test
 - [x] 添加 agent commit/push 到隔离分支而非用户当前分支的断言
-- [ ] 添加 fixer worktree isolation 等价测试
-- [ ] 将 `internal/worker/**`、`internal/fixer/**`、`internal/api/**`、worktree 相关路径映射到 worktree E2E job
+- [x] 添加 fixer worktree isolation 等价测试
+- [x] 将 `internal/worker/**`、`internal/fixer/**`、`internal/api/**`、worktree 相关路径映射到 worktree E2E job
 
 ## Phase 5 - Resolve-comments scenario tests
 
@@ -241,7 +241,7 @@
 - [ ] 完成 worktree invariant：worker reuse
 - [x] 完成 worktree invariant：fake agent cwd evidence
 - [x] 完成 worktree invariant：用户 repo HEAD/status 不变
-- [ ] 完成 worktree invariant：bad checkpoint reject
+- [x] 完成 worktree invariant：bad checkpoint reject
 - [ ] Stretch：完成 resolve-comments stale-head-after-push 场景
 
 ## Phase 10 - Verification

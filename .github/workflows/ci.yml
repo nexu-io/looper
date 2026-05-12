@@ -76,3 +76,33 @@ jobs:
       - name: Run resolve-comments E2E
         if: steps.changes.outputs.resolve_comments == 'true'
         run: go test ./internal/e2e -run 'TestScenarioResolveComments' -count=1
+
+  worktree-invariants-e2e:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect worktree-sensitive changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            worktree_invariants:
+              - 'internal/worker/**'
+              - 'internal/fixer/**'
+              - 'internal/reviewer/**'
+              - 'internal/api/**'
+              - 'internal/worktree*/**'
+
+      - name: Set up Go
+        if: steps.changes.outputs.worktree_invariants == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run worktree invariants E2E
+        if: steps.changes.outputs.worktree_invariants == 'true'
+        run: go test ./internal/e2e -run 'TestInvariantWorker' -count=1
