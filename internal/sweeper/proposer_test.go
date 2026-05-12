@@ -5,6 +5,23 @@ import (
 	"testing"
 )
 
+func TestParseNormalizedProposalRejectsTrailingContent(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		`{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":80,"summary":"s","rationale":"r"} trailing`,
+		`{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":80,"summary":"s","rationale":"r"}{"extra":true}`,
+	} {
+		_, err := parseNormalizedProposal(raw)
+		if err == nil {
+			t.Fatalf("parseNormalizedProposal(%q) error = nil, want trailing content rejection", raw)
+		}
+		if !strings.Contains(err.Error(), "trailing content") {
+			t.Fatalf("parseNormalizedProposal(%q) error = %v, want trailing content rejection", raw, err)
+		}
+	}
+}
+
 func TestValidateNormalizedProposalRejectsQuarantineOutput(t *testing.T) {
 	t.Parallel()
 

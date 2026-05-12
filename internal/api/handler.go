@@ -328,7 +328,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
 		h.writeSuccess(w, requestID, payload)
 		return
 	case apiBasePath + "/sweeper/stats":

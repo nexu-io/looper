@@ -23,6 +23,7 @@ const (
 	defaultClaimedBy       = "sweeper"
 	defaultSkippedSummary  = "sweeper: no action"
 	javaScriptISOStringUTC = "2006-01-02T15:04:05.000Z"
+	defaultRetryDelay      = 5 * time.Second
 	defaultRetryMax        = int64(3)
 	defaultQueuePriority   = storage.QueuePriorityWorker
 
@@ -101,6 +102,7 @@ type Runner struct {
 	agentModel   *string
 	claimer      string
 	maxTry       int64
+	retryDelay   time.Duration
 }
 
 type payloadEnvelope struct {
@@ -189,7 +191,7 @@ func New(options Options) *Runner {
 	if now == nil {
 		now = time.Now
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax}
+	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax, retryDelay: defaultRetryDelay}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -344,12 +346,29 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 		return nil, upsertErr
 	}
 	if err != nil {
-		return nil, err
+		return r.recoverClaimedQueueItem(ctx, queueItem, err)
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return nil, err
 	}
 	return &ProcessResult{QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+}
+
+func (r *Runner) recoverClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+	failureKind, failureMessage := classifyQueueFailure(err)
+	nowISO := r.nowISO()
+	nextAttempts := queueItem.Attempts + 1
+	if failureKind == "retryable_transient" && nextAttempts < queueItem.MaxAttempts {
+		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryDelay, nextAttempts)))
+		if markErr := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: stringPtr(failureMessage), ErrorKind: failureKind, UpdatedAt: nowISO}); markErr != nil {
+			return nil, markErr
+		}
+	} else {
+		if failErr := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: stringPtr(failureMessage), ErrorKind: failureKind, UpdatedAt: nowISO}); failErr != nil {
+			return nil, failErr
+		}
+	}
+	return &ProcessResult{QueueItemID: queueItem.ID, Status: "failed", Summary: failureMessage}, nil
 }
 
 func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1677,7 +1696,7 @@ func mustMarshalJSONValue(value any) string {
 
 func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now time.Time) (string, int, string) {
 	text := strings.ToLower(target.Title + "\n" + target.Body)
-	if strings.Contains(text, "security") {
+	if hasSecuritySensitiveSignal(text) {
 		return categoryRouteSecurity, 100, "security-sensitive content detected"
 	}
 	if roleCfg.Categories.Superseded.Enabled && (hasSupersededEvidence(target) || strings.Contains(text, "duplicate of #") || strings.Contains(text, "superseded by #")) {
@@ -1696,6 +1715,64 @@ func classifyTarget(target liveTarget, roleCfg config.SweeperRoleConfig, now tim
 		return categoryStale, maxConfidence(roleCfg.Categories.Stale.MinConfidence), "open item matched stale sweeper heuristics"
 	}
 	return categoryNone, 0, "no enabled sweeper category matched"
+}
+
+func classifyQueueFailure(err error) (kind, message string) {
+	message = strings.TrimSpace(err.Error())
+	if message == "" {
+		message = "sweeper processing failed"
+	}
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "unsupported sweeper queue item type"),
+		strings.Contains(lower, "queue item id is required"),
+		strings.Contains(lower, "queue repository is not configured"),
+		strings.Contains(lower, "project repository is not configured"),
+		strings.Contains(lower, "project not found"),
+		strings.Contains(lower, "invalid sweeper target id"),
+		strings.Contains(lower, "agent proposer is not configured"),
+		strings.Contains(lower, "marshal sweeper"):
+		return "non_retryable", message
+	default:
+		return "retryable_transient", message
+	}
+}
+
+func hasSecuritySensitiveSignal(text string) bool {
+	for _, signal := range []string{
+		"security vulnerability",
+		"cve-",
+		"private disclosure",
+		"responsible disclosure",
+		"security incident",
+		"auth bypass",
+		"authentication bypass",
+		"authorization bypass",
+		"remote code execution",
+		"sql injection",
+		"command injection",
+		"code injection",
+		"cross-site scripting",
+		"cross site scripting",
+		"cross-site request forgery",
+		"cross site request forgery",
+		"server-side request forgery",
+		"server side request forgery",
+		"directory traversal",
+		"path traversal",
+		"privilege escalation",
+		"token leak",
+		"token leaked",
+		"credential leak",
+		"credentials leaked",
+		"secret leak",
+		"secrets leaked",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasAlreadyFixedEvidence(target liveTarget) bool {
@@ -1987,6 +2064,13 @@ func isSupportedQueueType(queueType string) bool {
 	}
 }
 
+func backoffDelay(base time.Duration, attempts int64) time.Duration {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	return time.Duration(attempts) * base
+}
+
 type projectSweeperMetadata struct {
 	AutoDryRun       bool
 	AutoDryRunReason string
@@ -2026,7 +2110,11 @@ func parseTargetNumber(item storage.QueueItemRecord) (int64, error) {
 	if len(parts) != 2 {
 		return 0, fmt.Errorf("invalid sweeper target id %q", item.TargetID)
 	}
-	return strconv.ParseInt(parts[1], 10, 64)
+	number, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid sweeper target id %q: %w", item.TargetID, err)
+	}
+	return number, nil
 }
 
 func (r *Runner) removePendingLabel(ctx context.Context, roleCfg config.SweeperRoleConfig, repo string, issueNumber int64) error {

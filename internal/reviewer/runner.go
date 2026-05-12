@@ -1162,7 +1162,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, loopErr
 			}
 			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
-				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, Attempts: failedQueue.Attempts, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
 					return ProcessResult{}, err
 				}
 				failedQueue.Status = "failed"
@@ -3358,7 +3358,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 			return nil, err
 		}
 	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 	}

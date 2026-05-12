@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -129,15 +130,21 @@ func parseNormalizedProposal(raw string) (normalizedProposal, error) {
 		return normalizedProposal{}, fmt.Errorf("agent returned empty output")
 	}
 	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start < 0 || end < start {
+	if start < 0 {
 		return normalizedProposal{}, fmt.Errorf("agent output did not contain a JSON object")
 	}
 	var proposal normalizedProposal
-	decoder := json.NewDecoder(bytes.NewReader([]byte(raw[start : end+1])))
+	decoder := json.NewDecoder(bytes.NewReader([]byte(raw[start:])))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&proposal); err != nil {
 		return normalizedProposal{}, fmt.Errorf("parse agent proposal json: %w", err)
+	}
+	if decoder.More() {
+		return normalizedProposal{}, fmt.Errorf("parse agent proposal json: trailing content after object")
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return normalizedProposal{}, fmt.Errorf("parse agent proposal json: trailing content after object")
 	}
 	return proposal, nil
 }

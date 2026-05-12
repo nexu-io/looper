@@ -207,6 +207,35 @@ func TestHandlerSweeperCasesAndStatsRoutes(t *testing.T) {
 	}
 }
 
+type writeHeaderCountingRecorder struct {
+	http.ResponseWriter
+	count int
+}
+
+func (w *writeHeaderCountingRecorder) WriteHeader(statusCode int) {
+	w.count++
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func TestHandlerSweeperCasesWritesSuccessHeaderOnce(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedSweeperOperatorData(t, rt, t.TempDir())
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sweeper/cases?projectId=project_sweeper_api&repo=acme/looper&phase=warn", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	base := httptest.NewRecorder()
+	recorder := &writeHeaderCountingRecorder{ResponseWriter: base}
+
+	h.ServeHTTP(recorder, req)
+
+	if base.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", base.Code, base.Body.String())
+	}
+	if recorder.count != 1 {
+		t.Fatalf("WriteHeader call count = %d, want 1", recorder.count)
+	}
+}
+
 func TestHandlerSweeperCaseShowAndReplayRoutes(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	repoPath := t.TempDir()

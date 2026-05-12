@@ -610,6 +610,16 @@ func TestRepositoriesRoundTripForSweeperCasesAndProposals(t *testing.T) {
 	if inflightWarn != 1 {
 		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn) = %d, want 1", inflightWarn)
 	}
+	if err := repos.SweeperProposals.UpdateApplyReceipt(ctx, "proposal_3", "failed_retryable", &applySummary, &applyError, nil); err != nil {
+		t.Fatalf("SweeperProposals.UpdateApplyReceipt(failed_retryable) error = %v", err)
+	}
+	inflightWarn, err = repos.SweeperProposals.CountInflightByRepoAndDecision(ctx, projectID, repo, "warn")
+	if err != nil {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn after failed_retryable) error = %v", err)
+	}
+	if inflightWarn != 0 {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn after failed_retryable) = %d, want 0", inflightWarn)
+	}
 }
 
 func TestRunsGetLatestByLoopIDBreaksStartedAtTiesByCreatedAt(t *testing.T) {
@@ -1264,14 +1274,14 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	}
 
 	failReason := "needs human"
-	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_fail", FinishedAt: finished, ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: finished}); err != nil {
+	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_fail", Attempts: 4, FinishedAt: finished, ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: finished}); err != nil {
 		t.Fatalf("Queue.Fail() error = %v", err)
 	}
 	gotFailed, err := repos.Queue.GetByID(ctx, "qi_fail")
 	if err != nil {
 		t.Fatalf("Queue.GetByID(qi_fail) error = %v", err)
 	}
-	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason {
+	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason || gotFailed.Attempts != 4 {
 		t.Fatalf("Queue.GetByID(qi_fail) after fail = %#v, want manual_intervention", gotFailed)
 	}
 }

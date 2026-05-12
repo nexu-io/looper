@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -445,6 +446,40 @@ func TestProcessWarnKeepsRouteSecurityDryRunOnlyInHeuristicMode(t *testing.T) {
 	}
 }
 
+func TestProcessWarnDoesNotRouteGenericSecurityText(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeHeuristicFallback
+	fixture.github.issueDetails["acme/looper#66"] = githubinfra.IssueDetail{Number: 66, Title: "Security policy docs update", Body: "Please refresh the security policy and docs for the next release.", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+	queueID := "queue_sweeper_warn_generic_security_66"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#66", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#66", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" || result.Summary != "sweeper warned issue #66" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want normal warning flow for generic security text", result)
+	}
+	if got := fixture.github.addedLabels["acme/looper#66"]; !containsString(got, "looper:sweep-pending") {
+		t.Fatalf("addedLabels = %#v, want pending label not quarantine", fixture.github.addedLabels)
+	}
+	if got := fixture.github.addedLabels["acme/looper#66"]; containsString(got, fixture.cfg.Roles.Sweeper.Security.QuarantineLabel) {
+		t.Fatalf("addedLabels = %#v, want no quarantine label for generic security text", fixture.github.addedLabels)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 66)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil || caseRecord.CurrentCategory == nil || *caseRecord.CurrentCategory == categoryRouteSecurity {
+		t.Fatalf("caseRecord = %#v, want non-route_security case record", caseRecord)
+	}
+}
+
 func TestProcessWarnAgentApplyUsesAgentProposalAndPersistsRawResult(t *testing.T) {
 	t.Parallel()
 
@@ -508,17 +543,28 @@ func TestProcessWarnAgentApplyRetryReusesExistingAgentProposal(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	if _, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn}); err == nil {
-		t.Fatal("first ProcessClaimedQueueItem() error = nil, want retryable label failure")
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("first ProcessClaimedQueueItem() error = %v, want recovered failed result", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("first ProcessClaimedQueueItem() = %#v, want failed result", result)
 	}
 	if len(fixture.agent.calls) != 1 {
 		t.Fatalf("agent calls after first attempt = %d, want 1", len(fixture.agent.calls))
 	}
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#62", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#62", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
-		t.Fatalf("Queue.Upsert() retry error = %v", err)
+	stored, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "queued" || stored.Attempts != 1 || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want queued retry after first failure", stored)
+	}
+	if stored.AvailableAt == fixture.nowISO {
+		t.Fatalf("stored queue item available_at = %q, want retry backoff", stored.AvailableAt)
 	}
 
-	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	result, err = fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
 	if err != nil {
 		t.Fatalf("retry ProcessClaimedQueueItem() error = %v", err)
 	}
@@ -1179,8 +1225,12 @@ func TestProcessWarnRecoversAfterCommentPostedButLabelFails(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	if _, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn}); err == nil {
-		t.Fatal("ProcessClaimedQueueItem() error = nil, want transient label failure")
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want recovered failed result", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want failed result", result)
 	}
 	if len(fixture.github.createdComments) != 1 {
 		t.Fatalf("createdComments = %d, want exactly one posted warning comment", len(fixture.github.createdComments))
@@ -1192,6 +1242,12 @@ func TestProcessWarnRecoversAfterCommentPostedButLabelFails(t *testing.T) {
 	payload := fixture.runner.readPayload(*stored)
 	if payload.CaseID == "" || payload.ProposalID == "" || payload.WarningCommentID != 0 || payload.WarningMarkerUUID != "" {
 		t.Fatalf("payload = %#v, want lean persisted retry metadata after partial warn", payload)
+	}
+	if stored.Status != "queued" || stored.Attempts != 1 || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want queued retry after partial warn failure", stored)
+	}
+	if stored.AvailableAt == fixture.nowISO {
+		t.Fatalf("stored queue item available_at = %q, want retry backoff", stored.AvailableAt)
 	}
 	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), payload.ProposalID)
 	if err != nil {
@@ -1212,7 +1268,7 @@ func TestProcessWarnRecoversAfterCommentPostedButLabelFails(t *testing.T) {
 	fixture.github.issueDetails["acme/looper#45"] = githubinfra.IssueDetail{Number: 45, Title: "Bug", Body: "already fixed by #9", State: "open", Author: "octo", Comments: []githubinfra.CommentInfo{{ID: 1, Body: fixture.github.createdComments[0].Body}}}
 	fixture.github.addIssueLabelsErr = nil
 
-	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	result, err = fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem(retry) error = %v", err)
 	}
@@ -1231,6 +1287,61 @@ func TestProcessWarnRecoversAfterCommentPostedButLabelFails(t *testing.T) {
 	}
 	if caseRecord == nil || caseRecord.WarnedAt == nil || caseRecord.CloseDueAt == nil || *caseRecord.WarnedAt != firstWarnedAt || *caseRecord.CloseDueAt != firstCloseDueAt {
 		t.Fatalf("caseRecord after retry = %#v, want warned_at/close_due_at preserved", caseRecord)
+	}
+}
+
+func TestProcessWarnFailsQueueItemAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.github.addIssueLabelsErr = errors.New("temporary label failure")
+	fixture.github.issueDetails["acme/looper#46"] = githubinfra.IssueDetail{Number: 46, Title: "Bug", Body: "already fixed by #9", State: "open", Author: "octo"}
+	queueID := "queue_sweeper_warn_fail_terminal"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#46", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#46", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, Attempts: 2, MaxAttempts: 3, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want recovered failed result", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want failed result", result)
+	}
+	stored, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "failed" || stored.Attempts != 3 || stored.FinishedAt == nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want terminal failed queue item after max attempts", stored)
+	}
+}
+
+func TestHasSecuritySensitiveSignalAvoidsShortTokenFalsePositives(t *testing.T) {
+	t.Parallel()
+
+	if hasSecuritySensitiveSignal("source map update") {
+		t.Fatal("hasSecuritySensitiveSignal(source map update) = true, want false")
+	}
+	if hasSecuritySensitiveSignal("vulnerability disclosure policy docs update") {
+		t.Fatal("hasSecuritySensitiveSignal(vulnerability disclosure policy docs update) = true, want false")
+	}
+}
+
+func TestClassifyQueueFailureTreatsDeterministicErrorsAsNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []string{
+		"project not found: looper",
+		"invalid sweeper target id \"oops\"",
+		"invalid sweeper target id \"repo#abc\": strconv.ParseInt: parsing \"abc\": invalid syntax",
+		"sweeper agent proposer is not configured",
+	} {
+		kind, _ := classifyQueueFailure(fmt.Errorf(tc))
+		if kind != "non_retryable" {
+			t.Fatalf("classifyQueueFailure(%q) kind = %q, want non_retryable", tc, kind)
+		}
 	}
 }
 

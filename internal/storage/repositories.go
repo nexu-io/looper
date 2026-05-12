@@ -263,6 +263,7 @@ type QueueMarkRetryInput struct {
 
 type QueueFailInput struct {
 	ID           string
+	Attempts     int64
 	FinishedAt   string
 	ErrorMessage *string
 	ErrorKind    string
@@ -1007,7 +1008,7 @@ func (r *SweeperProposalsRepository) CountInflightByRepoAndDecision(ctx context.
 			AND (p.apply_status IS NULL OR (
 				p.apply_status NOT LIKE 'completed_%'
 				AND p.apply_status NOT LIKE 'skipped_%'
-				AND p.apply_status != 'failed_terminal'
+				AND p.apply_status NOT LIKE 'failed_%'
 			))
 	`, projectID, repo, decision).Scan(&count)
 	if err != nil {
@@ -1590,12 +1591,13 @@ func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error 
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = ?,
+			attempts = CASE WHEN ? > 0 THEN ? ELSE attempts END,
 			finished_at = ?,
 			last_error = ?,
 			last_error_kind = ?,
 			updated_at = ?
 		WHERE id = ?
-	`, terminalStatus, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	`, terminalStatus, input.Attempts, input.Attempts, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("fail queue item: %w", err)
 	}
