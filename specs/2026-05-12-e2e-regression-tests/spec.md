@@ -429,10 +429,11 @@ sandbox 要求：
 当前实现状态（2026-05-12）：
 
 - Phase 1 已落地：`internal/e2e/harness`、fake agent、strict fake gh、temp HOME/runtime、daemon helpers 均已就位。
-- Phase 2 已落地并通过：daemon boot smoke 已覆盖 default config、roles config、unknown top-level fields、explicit tool paths、invalid `osascript` fail-fast。
-- Phase 3 已基本落地并通过：fixture-driven gh schema、unsupported `--json` failure、`gh api`/GraphQL contract、repo form coverage、opt-in real-gh smoke 已实现；反向字段契约与 PR #261 detail fallback 仍待补充。
+- Phase 2 已落地并通过：daemon boot smoke 已覆盖 default config、roles config、unknown top-level fields、explicit tool paths、missing optional sections、invalid `osascript` fail-fast，并已接入 PR 默认 CI。
+- Phase 3 已落地并通过：fixture-driven gh schema（含 `issue list` / `pr list` / `pr view` allowlist）、unsupported `--json` failure、`gh api`/GraphQL contract、repo form coverage、反向字段契约、PR #261 detail fallback、opt-in real-gh smoke 已实现；并已将 `internal/infra/github/**` 映射到 gh contract E2E job。
 - Phase 4 已部分落地并通过：已覆盖 fresh schedule worktree isolation、cwd evidence、user repo unchanged、isolated commit、worker reuse / active loop、bad checkpoint safe reject、fixer isolation 等价路径；仅剩 worktree restore 路径待补充或澄清产品语义。
 - Phase 5 已落地：fake-gh 已支持基于 bare origin 的 PR head、thread state 持久化、resolve/unresolve mutation、closed/open target state、no-push rerun 所需状态种子；并已覆盖 stale-head-after-push、no-push-rerun-stale-head、no-new-commit-unresolved、closed-PR skip、resumed-closed-target、worker no-diff/no-PR 场景。
+- Phase 6 已基本落地：PR 默认 `Contract/invariant integration smoke` 已接入；高风险路径使用 centralized changed-files path filter 路由到 daemon boot / gh contract / resolve-comments / worktree E2E；`go.mod` / `go.sum` 与 path-filter 失败会 fallback 全跑；E2E job 已统一 `-count=1`、超时与失败 artifact 上传（含 temp HOME、config、sqlite DB、looperd logs、fake gh invocation log、fake agent cwd evidence、bare origin refs、worktree list）。main/nightly/release + sandbox 编排仍待 Phase 7 衔接。
 
 ### Phase 1：Integration harness skeleton
 
@@ -456,7 +457,7 @@ sandbox 要求：
 
 ### Phase 6：CI path filter
 
-把高风险路径变更映射到对应 E2E job，并配置 artifact 上传与 fallback 全跑。
+把高风险路径变更映射到对应 E2E job，并配置 artifact 上传与 fallback 全跑；当前已落地 PR smoke、centralized path filter、`go.mod`/`go.sum` 全跑、失败 artifacts，剩余是 main/nightly/release + sandbox 编排。
 
 ### Phase 7：GitHub sandbox E2E
 

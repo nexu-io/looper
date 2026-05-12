@@ -90,7 +90,7 @@ type GHState struct {
 
 func NewFakeGH(tb testing.TB, bins BuiltBinaries, schema GHSchema) FakeGH {
 	tb.Helper()
-	root := filepath.Join(tb.TempDir(), "fake-gh")
+	root := filepath.Join(artifactTempDir(tb, "fake-gh"), "fake-gh")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		tb.Fatalf("mkdir fake gh root: %v", err)
 	}

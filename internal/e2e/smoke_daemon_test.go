@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,6 +96,43 @@ func TestSmokeLooperdBootsWithExplicitToolPaths(t *testing.T) {
 	tools, _ := status["tools"].(map[string]any)
 	if tools == nil || tools["gh"] != true || tools["git"] != true || tools["osascript"] != true {
 		t.Fatalf("status.tools = %#v, want all explicit tools present", tools)
+	}
+	proc.Stop(context.Background())
+}
+
+func TestSmokeLooperdBootsWithoutOptionalConfigSections(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	home := harness.NewTempHome(t)
+	port := harness.MustFreePort(t)
+	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{Port: port})
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	for _, key := range []string{"notifications", "disclosure", "tools", "reviewer", "instructions", "projects", "roles"} {
+		delete(doc, key)
+	}
+	overrides, ok := doc["daemon"].(map[string]any)
+	if !ok {
+		t.Fatalf("daemon section missing from config doc: %#v", doc)
+	}
+	overrides["workingDirectory"] = home.WorkingDir
+	formatted, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal optional-sections config: %v", err)
+	}
+	if err := os.WriteFile(home.ConfigPath, formatted, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, nil, cfg.Server.Host, cfg.Server.Port)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		t.Fatalf("wait for ready: %v", err)
 	}
 	proc.Stop(context.Background())
 }

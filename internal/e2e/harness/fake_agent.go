@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,7 +26,10 @@ type FakeAgent struct {
 
 func NewFakeAgent(tb testing.TB, bins BuiltBinaries) FakeAgent {
 	tb.Helper()
-	artifactDir := filepath.Join(tb.TempDir(), "fake-agent")
+	artifactDir := filepath.Join(artifactTempDir(tb, "fake-agent"), "fake-agent")
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		tb.Fatalf("mkdir fake agent artifact dir: %v", err)
+	}
 	statePath := filepath.Join(artifactDir, "state.json")
 	return FakeAgent{Path: bins.FakeAgentPath, ArtifactDir: artifactDir, StatePath: statePath}
 }

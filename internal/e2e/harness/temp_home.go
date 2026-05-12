@@ -21,7 +21,7 @@ type TempHome struct {
 
 func NewTempHome(tb testing.TB) TempHome {
 	tb.Helper()
-	root := tb.TempDir()
+	root := artifactTempDir(tb, "temp-home")
 	homeDir := filepath.Join(root, "home")
 	looperHome := filepath.Join(homeDir, ".looper")
 	artifactsDir := filepath.Join(root, "artifacts")

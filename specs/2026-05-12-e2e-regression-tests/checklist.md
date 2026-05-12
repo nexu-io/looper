@@ -88,26 +88,26 @@
 - [x] 验证 logs path 可写
 - [x] 验证 backups path 可写
 - [x] 验证 worktree root 可写
-- [ ] 验证 missing optional config 不导致启动失败
+- [x] 验证 missing optional config 不导致启动失败
 - [x] 验证 unsupported required tool path 会产生清晰启动失败
 - [x] 验证 daemon 可被正常停止
 - [x] 验证测试不依赖固定端口
 - [x] 失败时 dump stderr、`~/.looper/logs`、config、fake gh invocation log
-- [ ] 将 daemon boot smoke 加入 PR 默认 CI
+- [x] 将 daemon boot smoke 加入 PR 默认 CI
 
 ## Phase 3 - GitHub CLI command contract
 
 - [x] 建立真实 `gh` fixture 目录：`internal/e2e/githubcontract/testdata/gh-schema/`
 - [x] 增加 fixture 刷新脚本：`scripts/refresh-gh-fixtures.sh`
-- [ ] 为 `gh issue list --json` 建立 fixture-driven supported field allowlist
+- [x] 为 `gh issue list --json` 建立 fixture-driven supported field allowlist
 - [x] 为 `gh pr list --json` 建立 fixture-driven supported field allowlist
 - [x] 为 `gh pr view --json` 建立 fixture-driven supported field allowlist
 - [x] 为 `gh api repos/:owner/:repo/issues/:number` 建立 route contract
 - [x] 为 GraphQL query / mutation 建立 contract
 - [x] 添加 `TestInvariantGatewayUsesSupportedGHJSONFields`
 - [x] 添加 PR #255 regression test，确保 list summary 不请求 `authorAssociation`
-- [ ] 添加 PR #261 regression test，确保需要 author association 时走 detail fallback
-- [ ] 添加读取字段必须出现在请求字段中的反向契约测试
+- [x] 添加 PR #261 regression test，确保需要 author association 时走 detail fallback
+- [x] 添加读取字段必须出现在请求字段中的反向契约测试
 - [x] 验证 `owner/repo` repo 形态
 - [x] 验证 `github.com/owner/repo` repo 形态
 - [x] 验证 `ghe.example.com/owner/repo` repo 形态
@@ -115,7 +115,7 @@
 - [x] fake gh 记录 argv + stdin 供失败诊断
 - [x] 增加 opt-in real-gh read-only smoke
 - [x] real-gh smoke 提示 fixture 是否过期
-- [ ] 将 `internal/infra/github/**` 变更映射到 gh contract E2E job
+- [x] 将 `internal/infra/github/**` 变更映射到 gh contract E2E job
 
 ## Phase 4 - Worktree isolation invariant
 
@@ -135,7 +135,7 @@
 - [x] 断言用户 repo HEAD/status/index 不变
 - [x] 断言 worktree 中存在 fake agent 写入文件
 - [x] 断言 run metadata 记录 worktree path
-- [ ] 添加 PR #194 fresh schedule regression test
+- [x] 添加 PR #194 fresh schedule regression test
 - [x] 添加 PR #194 reused loop / active worker regression test
 - [ ] 添加 worktree 被外部删除后的 restore/recreate test
 - [x] 添加 checkpoint worktree path == repo path 必须 reject/recover test
@@ -164,31 +164,31 @@
 
 ## Phase 6 - CI integration strategy
 
-- [ ] 在 PR CI 中加入本地 E2E smoke job
-- [ ] 将该 job 命名/描述为 contract/invariant integration smoke
-- [ ] PR 默认 integration smoke 目标耗时约 60s
-- [ ] 所有 E2E 使用 `-count=1`
-- [ ] 设置 E2E job 超时
-- [ ] E2E job 失败时上传 logs artifact
-- [ ] artifact 包含 temp HOME
-- [ ] artifact 包含 config
-- [ ] artifact 包含 sqlite DB
-- [ ] artifact 包含 looperd logs
-- [ ] artifact 包含 fake gh invocation log
-- [ ] artifact 包含 fake agent cwd evidence
-- [ ] artifact 包含 bare origin refs
-- [ ] artifact 包含 worktree list
-- [ ] 添加 changed-files path filter
-- [ ] path filter 出错时全跑
-- [ ] `go.mod` / `go.sum` 命中时全跑
-- [ ] 为 daemon/config/runtime/cmd 变更运行 daemon boot matrix
-- [ ] 为 github gateway 变更运行 gh contract tests
-- [ ] 为 worker/fixer/reviewer/API/worktree 变更运行 worktree/resolve scenario tests
-- [ ] 确保 `go test ./...` 仍保留为基础检查
-- [ ] 确保默认 PR E2E 不依赖真实 GitHub token
-- [ ] 确保 sandbox 不进入普通 PR 必跑链路
-- [ ] 普通 PR 跑 unit tests + small integration smoke
-- [ ] 高风险路径 PR 跑 unit tests + targeted integration tests
+- [x] 在 PR CI 中加入本地 E2E smoke job
+- [x] 将该 job 命名/描述为 contract/invariant integration smoke
+- [x] PR 默认 integration smoke 目标耗时约 60s
+- [x] 所有 E2E 使用 `-count=1`
+- [x] 设置 E2E job 超时
+- [x] E2E job 失败时上传 logs artifact
+- [x] artifact 包含 temp HOME
+- [x] artifact 包含 config
+- [x] artifact 包含 sqlite DB
+- [x] artifact 包含 looperd logs
+- [x] artifact 包含 fake gh invocation log
+- [x] artifact 包含 fake agent cwd evidence
+- [x] artifact 包含 bare origin refs
+- [x] artifact 包含 worktree list
+- [x] 添加 changed-files path filter
+- [x] path filter 出错时全跑
+- [x] `go.mod` / `go.sum` 命中时全跑
+- [x] 为 daemon/config/runtime/cmd 变更运行 daemon boot matrix
+- [x] 为 github gateway 变更运行 gh contract tests
+- [x] 为 worker/fixer/reviewer/API/worktree 变更运行 worktree/resolve scenario tests
+- [x] 确保 `go test ./...` 仍保留为基础检查
+- [x] 确保默认 PR E2E 不依赖真实 GitHub token
+- [x] 确保 sandbox 不进入普通 PR 必跑链路
+- [x] 普通 PR 跑 unit tests + small integration smoke
+- [x] 高风险路径 PR 跑 unit tests + targeted integration tests
 - [ ] main/nightly/release 跑 unit tests + integration tests + sandbox E2E
 
 ## Phase 7 - GitHub sandbox E2E
@@ -228,7 +228,7 @@
 
 ## Phase 9 - One-week minimum rollout
 
-- [ ] 完成 E2E harness skeleton
+- [x] 完成 E2E harness skeleton
 - [x] 完成 daemon boot smoke：default config
 - [x] 完成 daemon boot smoke：roles config
 - [x] 完成 daemon boot smoke：explicit fake tools config
@@ -236,13 +236,13 @@
 - [x] 完成 gh contract：fixture-driven allowlist
 - [x] 完成 gh contract：unsupported `--json` fail
 - [x] 完成 gh contract：`gh api` route
-- [ ] 完成 gh contract：反向字段契约
+- [x] 完成 gh contract：反向字段契约
 - [x] 完成 worktree invariant：fresh schedule
-- [ ] 完成 worktree invariant：worker reuse
+- [x] 完成 worktree invariant：worker reuse
 - [x] 完成 worktree invariant：fake agent cwd evidence
 - [x] 完成 worktree invariant：用户 repo HEAD/status 不变
 - [x] 完成 worktree invariant：bad checkpoint reject
-- [ ] Stretch：完成 resolve-comments stale-head-after-push 场景
+- [x] Stretch：完成 resolve-comments stale-head-after-push 场景
 
 ## Phase 10 - Verification
 
