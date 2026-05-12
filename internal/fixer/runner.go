@@ -4011,8 +4011,11 @@ func (r *Runner) verifyFixEvidence(ctx context.Context, input stepInput, checkpo
 		if _, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ExpectedHeadSHA: liveHeadSHA}); err != nil {
 			return false, err
 		}
-	} else if branch := strings.TrimSpace(liveDetail.HeadRefName); branch != "" {
-		_ = r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", branch)
+	} else {
+		if branch := strings.TrimSpace(liveDetail.HeadRefName); branch != "" {
+			_ = r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", branch)
+		}
+		_ = r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", liveHeadSHA)
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, liveHeadSHA)
 	if err != nil {

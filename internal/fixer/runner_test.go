@@ -1327,7 +1327,7 @@ func TestRunResolveCommentsStepIgnoresForkBranchFetchFailureDuringEvidenceVerifi
 			"body":     "please fix",
 		}},
 	}}}
-	git := &fakeGitGateway{fetchErr: errors.New("remote ref not found"), ancestor: map[string]bool{"old-head->new-head": true}}
+	git := &fakeGitGateway{fetchErrors: []error{errors.New("remote ref not found"), nil}, ancestor: map[string]bool{"old-head->new-head": true}}
 	runner := New(Options{GitHub: github, Git: git})
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	fixItemsHash := hashFixItems(fixItems)
@@ -1354,8 +1354,14 @@ func TestRunResolveCommentsStepIgnoresForkBranchFetchFailureDuringEvidenceVerifi
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v", err)
 	}
-	if len(git.fetchCalls) != 2 {
-		t.Fatalf("fetch calls = %d, want 2", len(git.fetchCalls))
+	if len(git.fetchCalls) < 2 {
+		t.Fatalf("fetch calls = %d, want at least 2", len(git.fetchCalls))
+	}
+	if !strings.HasSuffix(git.fetchCalls[0], "|fork-owner:feature/fix-42") {
+		t.Fatalf("first fetch = %q, want fork branch fetch", git.fetchCalls[0])
+	}
+	if !strings.HasSuffix(git.fetchCalls[1], "|new-head") {
+		t.Fatalf("second fetch = %q, want head SHA fetch", git.fetchCalls[1])
 	}
 	if len(github.resolveCalls) != 1 {
 		t.Fatalf("resolve calls = %d, want 1", len(github.resolveCalls))
@@ -3237,6 +3243,8 @@ type fakeGitGateway struct {
 	inspectResults []InspectHeadResult
 	inspectIndex   int
 	ancestor       map[string]bool
+	fetchErrors    []error
+	fetchIndex     int
 	fetchErr       error
 	pushErrors     []error
 	pushIndex      int
@@ -3312,6 +3320,11 @@ func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 
 func (f *fakeGitGateway) FetchBranch(_ context.Context, repoPath, remote, branch string) error {
 	f.fetchCalls = append(f.fetchCalls, repoPath+"|"+remote+"|"+branch)
+	if f.fetchIndex < len(f.fetchErrors) {
+		err := f.fetchErrors[f.fetchIndex]
+		f.fetchIndex++
+		return err
+	}
 	return f.fetchErr
 }
 
