@@ -298,6 +298,7 @@ type ValidationResult struct {
 	Passed  bool   `json:"passed"`
 	Summary string `json:"summary,omitempty"`
 	Output  string `json:"output,omitempty"`
+	HeadSHA string `json:"headSha,omitempty"`
 }
 
 type ValidationRunner func(context.Context, ValidationInput) (ValidationResult, error)
@@ -487,12 +488,24 @@ type checkpointReconcileCommits struct {
 }
 
 type checkpointPush struct {
-	Pushed        bool   `json:"pushed"`
-	Branch        string `json:"branch,omitempty"`
-	Remote        string `json:"remote,omitempty"`
-	HeadSHA       string `json:"headSha,omitempty"`
-	PushedAt      string `json:"pushedAt,omitempty"`
-	SkippedReason string `json:"skippedReason,omitempty"`
+	Pushed        bool         `json:"pushed"`
+	Branch        string       `json:"branch,omitempty"`
+	Remote        string       `json:"remote,omitempty"`
+	HeadSHA       string       `json:"headSha,omitempty"`
+	PushedAt      string       `json:"pushedAt,omitempty"`
+	SkippedReason string       `json:"skippedReason,omitempty"`
+	Evidence      *fixEvidence `json:"evidence,omitempty"`
+}
+
+type fixEvidence struct {
+	Valid              bool     `json:"valid,omitempty"`
+	Source             string   `json:"source,omitempty"`
+	HeadSHA            string   `json:"headSha,omitempty"`
+	CommitSHAs         []string `json:"commitShas,omitempty"`
+	BaseHeadSHA        string   `json:"baseHeadSha,omitempty"`
+	FixItemsHash       string   `json:"fixItemsHash,omitempty"`
+	ProducedNewCommits bool     `json:"producedNewCommits,omitempty"`
+	PushedAt           string   `json:"pushedAt,omitempty"`
 }
 
 type checkpointResolvedComments struct {
@@ -1485,11 +1498,13 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if finalInspect.HasUncommittedChanges {
 			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureRetryableAfterResume}
 		}
+		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
 		checkpoint.Validation = &second
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
+	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -1527,9 +1542,16 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if !checkpoint.ReconcileCommits.WorkingTreeClean {
 		return checkpoint, &loopError{message: "Working tree must be clean before push", kind: FailureRetryableAfterResume}
 	}
+	adopted, updatedCheckpoint, err := r.adoptLifecyclePushEvidence(ctx, input, checkpoint, branch)
+	if err != nil {
+		return checkpoint, err
+	}
+	if adopted {
+		return updatedCheckpoint, nil
+	}
 	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA == worktree.BaseHeadSHA {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "no_new_commits"}})
-		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "No new commits to push"}
+		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "No new commits to push", Evidence: resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
@@ -1563,7 +1585,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	pushedAt := r.nowISO()
 	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
 	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(pushedHeadSHA)}})
-	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt}
+	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt, Evidence: &fixEvidence{Valid: pushedHeadSHA != "" && checkpoint.FixItemsHash != "", HeadSHA: pushedHeadSHA, CommitSHAs: cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, Source: "fallback_push", ProducedNewCommits: roundProducedNewCommits(&checkpoint), PushedAt: pushedAt}}
 	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
 	checkpoint.Lifecycle.Pushed = true
 	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
@@ -1572,6 +1594,91 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch string) (bool, fixerCheckpoint, error) {
+	if checkpoint.Repair == nil || checkpoint.Repair.Status != "completed" {
+		return false, checkpoint, nil
+	}
+	lc := checkpoint.Repair.Lifecycle
+	if lc == nil {
+		lc = checkpoint.Lifecycle
+	}
+	if lc == nil {
+		return false, checkpoint, nil
+	}
+	if !lc.Pushed || lc.Actions.Push != lifecycle.ActionSourceAgent || len(lc.CommitSHAs) == 0 {
+		return false, checkpoint, nil
+	}
+	adoptedHead := strings.TrimSpace(lc.CommitSHAs[len(lc.CommitSHAs)-1])
+	if adoptedHead == "" || adoptedHead == checkpoint.Worktree.BaseHeadSHA {
+		return false, checkpoint, nil
+	}
+	if lc.PRNumber > 0 && lc.PRNumber != input.PRNumber {
+		return false, checkpoint, nil
+	}
+	if strings.TrimSpace(lc.Branch) != "" && strings.TrimSpace(lc.Branch) != branch {
+		return false, checkpoint, nil
+	}
+	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
+		return false, checkpoint, nil
+	}
+	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return false, checkpoint, err
+	}
+	if strings.TrimSpace(liveDetail.HeadRefName) != branch || strings.TrimSpace(liveDetail.HeadSHA) != adoptedHead {
+		return false, checkpoint, nil
+	}
+	if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != adoptedHead {
+		worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return false, checkpoint, rootErr
+		}
+		prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: branch, ExpectedHeadSHA: adoptedHead})
+		if err != nil {
+			return false, checkpoint, err
+		}
+		if !prepared.Clean {
+			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: FailureRetryableAfterResume}
+		}
+		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: r.validationCommands})
+		if err != nil {
+			return false, checkpoint, err
+		}
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, BaseRef: checkpoint.ReconcileCommits.BaseHeadSHA})
+		if err != nil {
+			return false, checkpoint, err
+		}
+		validation.HeadSHA = inspect.HeadSHA
+		checkpoint.Validation = &validation
+		if inspect.HasUncommittedChanges {
+			return false, checkpoint, &loopError{message: "Validation produced uncommitted changes after adopting agent-pushed head", kind: FailureRetryableAfterResume}
+		}
+		if !validation.Passed || validation.HeadSHA != adoptedHead {
+			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: FailureRetryableAfterResume}
+		}
+		checkpoint.Worktree.HeadSHA = adoptedHead
+	}
+	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
+	pushedAt := r.nowISO()
+	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: adoptedHead, PushedAt: pushedAt, Evidence: &fixEvidence{Valid: true, Source: "agent_push", HeadSHA: adoptedHead, CommitSHAs: cloneStrings(lc.CommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, ProducedNewCommits: true, PushedAt: pushedAt}}
+	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": adoptedHead, "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": pushedAt})
+	if err != nil {
+		return false, checkpoint, err
+	}
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		return false, checkpoint, err
+	}
+	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, adoptedHead)
+	checkpoint.Lifecycle.Pushed = true
+	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceAgent
+	checkpoint.Lifecycle.PRNumber = input.PRNumber
+	checkpoint.Lifecycle.PRAdopted = true
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	r.appendEvent(ctx, eventInput{eventType: "fixer.push.adopted", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "headSha": adoptedHead}})
+	return true, checkpoint, nil
 }
 
 func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -1587,7 +1694,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	fixItems := checkpoint.FixItems
 	currentFixItemsHash := checkpoint.FixItemsHash
-	verifiedNoPushHeadSHA := ""
+	evidence := resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 	if checkpoint.Push != nil && !checkpoint.Push.Pushed {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -1596,11 +1703,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		fixItems = collectFixItems(detail)
 		currentFixItemsHash = hashFixItems(fixItems)
 		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
-		verifiedNoPushHeadSHA = resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, currentFixItemsHash)
+		evidence = resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 	}
 	expectedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
-	if verifiedNoPushHeadSHA != "" {
-		expectedHeadSHA = verifiedNoPushHeadSHA
+	if evidence != nil && evidence.Valid && evidence.HeadSHA != "" {
+		expectedHeadSHA = evidence.HeadSHA
 	}
 	if expectedHeadSHA != "" {
 		liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: expectedHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
@@ -1613,10 +1720,18 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if checkpoint.Push != nil && !checkpoint.Push.Pushed {
 			fixItems = collectFixItems(liveDetail)
 			currentFixItemsHash = hashFixItems(fixItems)
-			verifiedNoPushHeadSHA = resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, currentFixItemsHash)
+			evidence = resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, currentFixItemsHash)
 		}
 	}
-	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedNoPushHeadSHA != "" && verifiedNoPushHeadSHA == detailHeadSHA(checkpoint.Detail)) {
+	verifiedEvidence := evidence != nil && evidence.Valid && evidence.HeadSHA != "" && evidence.HeadSHA == detailHeadSHA(checkpoint.Detail)
+	if verifiedEvidence && (checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != evidence.HeadSHA) {
+		return checkpoint, &loopError{message: "resolve-comments requires validation bound to verified fix evidence head", kind: FailureRetryableAfterResume}
+	}
+	if !verifiedEvidence && hasCommentFixItems(fixItems) && checkpoint.Push != nil && checkpoint.Push.Pushed {
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: "resolve-comments refused because verified fix evidence is missing or stale; leaving review threads unresolved", kind: FailureRetryableAfterResume}
+	}
+	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedEvidence) {
 		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveAt": r.nowISO()})
 		if err != nil {
 			return checkpoint, err
@@ -1638,8 +1753,8 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
 		}
 	}
-	if commitSHA == "" || (verifiedNoPushHeadSHA != "" && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
-		commitSHA = firstNonEmpty(verifiedNoPushHeadSHA, commitSHA)
+	if commitSHA == "" || (verifiedEvidence && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+		commitSHA = firstNonEmpty(evidenceHeadSHA(evidence), commitSHA)
 	}
 	failedCount := 0
 	explanationByID := lookupReplyExplanations(checkpoint)
@@ -1799,12 +1914,14 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 	if headSHA == "" {
 		return
 	}
-	if checkpoint.Push == nil || !checkpoint.Push.Pushed {
+	evidence := resolveFixEvidence(*checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
+	if evidence == nil || !evidence.Valid || evidence.HeadSHA == "" {
 		return
 	}
-	if !roundProducedNewCommits(checkpoint) {
+	if !roundProducedNewCommits(checkpoint) && (checkpoint.ReconcileCommits == nil || evidence.HeadSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
 		return
 	}
+	headSHA = evidence.HeadSHA
 	commentItems := summaryCommentItems(fixItems, checkpoint, explanationByID)
 	if len(commentItems) == 0 {
 		return
@@ -3024,6 +3141,15 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	return false
 }
 
+func hasCommentFixItems(fixItems []FixItem) bool {
+	for _, item := range fixItems {
+		if item.Type == "comment" {
+			return true
+		}
+	}
+	return false
+}
+
 func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint {
 	checkpoint.SkipReason = ""
 	if checkpoint.Worktree != nil {
@@ -3169,6 +3295,40 @@ func resolveCommentsExpectedHeadSHA(checkpoint fixerCheckpoint) string {
 		return checkpoint.ReconcileCommits.FinalHeadSHA
 	}
 	return detailHeadSHA(checkpoint.Detail)
+}
+
+func resolveFixEvidence(checkpoint fixerCheckpoint, loopMetadataJSON *string, fixItemsHash string) *fixEvidence {
+	if fixItemsHash == "" {
+		return nil
+	}
+	if checkpoint.Push != nil && checkpoint.Push.Evidence != nil {
+		evidence := *checkpoint.Push.Evidence
+		if evidence.HeadSHA == "" {
+			evidence.HeadSHA = checkpoint.Push.HeadSHA
+		}
+		if evidence.Valid && evidence.HeadSHA != "" && evidence.FixItemsHash != "" && evidence.FixItemsHash == fixItemsHash && evidence.ProducedNewCommits {
+			return &evidence
+		}
+		return nil
+	}
+	if checkpoint.Push != nil && checkpoint.Push.Pushed && checkpoint.Push.HeadSHA != "" {
+		producedNewCommits := roundProducedNewCommits(&checkpoint)
+		if !producedNewCommits {
+			return nil
+		}
+		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: checkpoint.Push.HeadSHA, FixItemsHash: fixItemsHash, ProducedNewCommits: producedNewCommits, PushedAt: checkpoint.Push.PushedAt}
+	}
+	if headSHA := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, loopMetadataJSON, fixItemsHash); headSHA != "" {
+		return &fixEvidence{Valid: true, Source: "prior_verified_push", HeadSHA: headSHA, FixItemsHash: fixItemsHash, ProducedNewCommits: true}
+	}
+	return nil
+}
+
+func evidenceHeadSHA(evidence *fixEvidence) string {
+	if evidence == nil {
+		return ""
+	}
+	return evidence.HeadSHA
 }
 
 func resolveCommentsVerifiedNoPushHeadSHA(push *checkpointPush, loopMetadataJSON *string, fixItemsHash string) string {
