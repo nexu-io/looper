@@ -94,6 +94,110 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	}
 }
 
+func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_1"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			if got, want := body["type"], "fixer"; got != want {
+				t.Fatalf("body.type = %#v, want %#v", got, want)
+			}
+			if got, want := body["repo"], "acme/looper"; got != want {
+				t.Fatalf("body.repo = %#v, want %#v", got, want)
+			}
+			if got, want := body["prNumber"], float64(123); got != want {
+				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"fix", "123", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([fix 123]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([fix 123]) stderr = %q, want empty string", got)
+	}
+	if got := stdout.String(); !strings.Contains(got, "Fixer started") || !strings.Contains(got, "acme/looper#123") {
+		t.Fatalf("Run([fix 123]) stdout = %q, want fixer summary for %q", got, "acme/looper#123")
+	}
+}
+
+func TestFixCreateRequiresExplicitProjectWhenCurrentProjectIsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	repoPath := filepath.Join(rootPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper A", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}, {"id": "project_2", "name": "Looper B", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:01:00.000Z"}}}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"fix", "123", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([fix 123]) exit code = 0, want non-zero")
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("Run([fix 123]) stdout = %q, want empty string", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "--project is required") {
+		t.Fatalf("Run([fix 123]) stderr = %q, want to contain %q", got, "--project is required")
+	}
+}
+
 func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 	t.Parallel()
 

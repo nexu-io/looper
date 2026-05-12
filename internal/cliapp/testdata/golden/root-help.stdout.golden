@@ -20,6 +20,7 @@ Subcommands:
   plan       Create a planner run
   pr         Pull request commands
   review     Create a reviewer task for a pull request
+  fix        Create a fixer task for a pull request
   feedback   Submit feedback as a GitHub issue
   ps         Show running loops
   jump       Print shell command for a loop worktree
