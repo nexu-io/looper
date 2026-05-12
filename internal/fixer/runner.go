@@ -935,7 +935,14 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	var activeErr *activeRunError
+	var failedQueue *storage.QueueItemRecord
+	var failErr error
+	if errors.As(err, &activeErr) {
+		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
+	} else {
+		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	}
 	if failErr != nil {
 		return nil, failErr
 	}
@@ -2187,10 +2194,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	initialCheckpoint.RunStartedAt = ""
 	initialCheckpoint.RunStartedRunID = ""
-	initialCheckpoint.RunPreStartAt = ""
-	initialCheckpoint.RunPreStartRunID = ""
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	initialCheckpoint.RunPreStartAt = nowISO
+	initialCheckpoint.RunPreStartRunID = run.ID
 	if resumed {
 		switch {
 		case restartFromDiscover:
@@ -2231,16 +2238,8 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 	if r.preStartMarkerActive(checkpoint, run) {
 		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s in pre-start checks", run.LoopID, run.ID))
 	}
-	if r.repos.Events != nil {
-		events, err := r.repos.Events.ListByEntity(ctx, "run", run.ID)
-		if err != nil {
-			return err
-		}
-		for _, event := range events {
-			if event.EventType == "run.started" {
-				return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s", run.LoopID, run.ID))
-			}
-		}
+	if r.freshMarkerlessRunningRunActive(checkpoint, run) {
+		return activeFixerRunError(fmt.Sprintf("loop %s already has a freshly-created running fixer run %s", run.LoopID, run.ID))
 	}
 	if checkpoint.ResumePolicy == "" {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
@@ -2250,7 +2249,15 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 }
 
 func activeFixerRunError(message string) error {
-	return &loopError{message: message, kind: FailureRetryableTransient}
+	return &activeRunError{loopError: &loopError{message: message, kind: FailureRetryableTransient}}
+}
+
+type activeRunError struct {
+	*loopError
+}
+
+func (e *activeRunError) Unwrap() error {
+	return e.loopError
 }
 
 func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
@@ -2264,13 +2271,17 @@ func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunReco
 }
 
 func (r *Runner) preStartMarkerActive(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
-	if checkpoint.RunPreStartAt == "" {
-		return false
-	}
-	if checkpoint.RunPreStartRunID != "" && checkpoint.RunPreStartRunID != run.ID {
+	if checkpoint.RunPreStartAt == "" || checkpoint.RunPreStartRunID != run.ID {
 		return false
 	}
 	return timestampWithin(checkpoint.RunPreStartAt, r.now(), r.claimTTL)
+}
+
+func (r *Runner) freshMarkerlessRunningRunActive(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
+	if checkpoint.RunStartedAt != "" || checkpoint.RunPreStartAt != "" {
+		return false
+	}
+	return timestampWithin(firstNonEmpty(run.CreatedAt, run.StartedAt), r.now(), r.claimTTL)
 }
 
 func timestampWithin(raw string, now time.Time, ttl time.Duration) bool {
@@ -2471,6 +2482,19 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
+	return r.requeueOrFailQueueItem(ctx, queueItem, kind, message, nextAttempts)
+}
+
+func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, attempts+1)))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
 		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts)))
