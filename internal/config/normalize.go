@@ -880,20 +880,21 @@ func cloneStrings(values []string) []string {
 	return cloned
 }
 
-func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
+func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 	if projects == nil {
 		return nil
 	}
 
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
+		roles := mergeLegacyProjectInstructionsIntoRoles(clonePartialRoleConfigs(project.Roles), project.Instructions)
+		repoPath := firstNonEmpty(project.RepoPath, project.Path)
+
 		cloned[index] = ProjectRefConfig{
-			ID:           project.ID,
-			Name:         project.Name,
-			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
-			Path:         project.Path,
-			Instructions: cloneStringMap(project.Instructions),
-			Roles:        clonePartialRoleConfigs(project.Roles),
+			ID:       project.ID,
+			Name:     project.Name,
+			RepoPath: repoPath,
+			Roles:    roles,
 		}
 
 		if project.BaseBranch != nil {
@@ -906,6 +907,55 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instructions map[string]string) *PartialRoleConfigs {
+	if len(instructions) == 0 {
+		return roles
+	}
+	if roles == nil {
+		roles = &PartialRoleConfigs{}
+	}
+	for role, text := range instructions {
+		switch role {
+		case "planner":
+			if roles.Planner == nil {
+				roles.Planner = &PartialPlannerRoleConfig{}
+			}
+			if roles.Planner.Instructions == nil {
+				roles.Planner.Instructions = stringPtr(text)
+			}
+		case "worker":
+			if roles.Worker == nil {
+				roles.Worker = &PartialWorkerRoleConfig{}
+			}
+			if roles.Worker.Instructions == nil {
+				roles.Worker.Instructions = stringPtr(text)
+			}
+		case "reviewer":
+			if roles.Reviewer == nil {
+				roles.Reviewer = &PartialReviewerRoleConfig{}
+			}
+			if roles.Reviewer.Instructions == nil {
+				roles.Reviewer.Instructions = stringPtr(text)
+			}
+		case "fixer":
+			if roles.Fixer == nil {
+				roles.Fixer = &PartialFixerRoleConfig{}
+			}
+			if roles.Fixer.Instructions == nil {
+				roles.Fixer.Instructions = stringPtr(text)
+			}
+		case "sweeper":
+			if roles.Sweeper == nil {
+				roles.Sweeper = &PartialSweeperRoleConfig{}
+			}
+			if roles.Sweeper.Instructions == nil {
+				roles.Sweeper.Instructions = stringPtr(text)
+			}
+		}
+	}
+	return roles
 }
 
 func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {

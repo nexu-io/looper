@@ -45,10 +45,6 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 				block.Sources = append(block.Sources, CustomInstructionSource{Kind: "project-role", Path: "projects." + project.ID + ".roles." + role + ".instructions"})
 			}
 		}
-		if text := strings.TrimSpace(project.Instructions[role]); text != "" {
-			sections = append(sections, fmt.Sprintf("Project %s %s instructions:\n%s", project.ID, role, text))
-			block.Sources = append(block.Sources, CustomInstructionSource{Kind: "project-role", Path: "projects." + project.ID + ".instructions." + role})
-		}
 	}
 	if len(sections) == 0 {
 		return block

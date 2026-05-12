@@ -437,6 +437,16 @@ type ProjectRefConfig struct {
 	Path         string              `json:"path,omitempty"`
 	BaseBranch   *string             `json:"baseBranch,omitempty"`
 	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
+	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
+}
+
+type PartialProjectRefConfig struct {
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	RepoPath     string              `json:"repoPath"`
+	Path         string              `json:"path,omitempty"`
+	BaseBranch   *string             `json:"baseBranch,omitempty"`
+	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
 	Instructions map[string]string   `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
 }
@@ -776,5 +786,5 @@ type PartialConfig struct {
 	LegacyReviewer *PartialReviewerConfig     `json:"-"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
-	Projects       *[]ProjectRefConfig        `json:"projects,omitempty"`
+	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`
 }

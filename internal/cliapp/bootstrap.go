@@ -473,11 +473,11 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 	if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
 		return false, false, nil
 	}
-	projects := []config.ProjectRefConfig{}
+	projects := []config.PartialProjectRefConfig{}
 	if partial.Projects != nil {
 		projects = append(projects, (*partial.Projects)...)
 	}
-	projects = append(projects, buildBootstrapProject(plan.ProjectPath, normalized.Defaults.BaseBranch))
+	projects = append(projects, partialProjectFromConfig(buildBootstrapProject(plan.ProjectPath, normalized.Defaults.BaseBranch)))
 	partial.Projects = &projects
 	updated, err := config.Normalize(cwd, partial)
 	if err != nil {
@@ -534,6 +534,18 @@ func readBootstrapPartialConfig(path string) (config.PartialConfig, error) {
 		return config.PartialConfig{}, fmt.Errorf("parse bootstrap config: %w", err)
 	}
 	return partial, nil
+}
+
+func partialProjectFromConfig(project config.ProjectRefConfig) config.PartialProjectRefConfig {
+	return config.PartialProjectRefConfig{
+		ID:           project.ID,
+		Name:         project.Name,
+		RepoPath:     project.RepoPath,
+		Path:         project.Path,
+		BaseBranch:   project.BaseBranch,
+		WorktreeRoot: project.WorktreeRoot,
+		Roles:        project.Roles,
+	}
 }
 
 func writeBootstrapPartialConfig(path string, partial config.PartialConfig) error {

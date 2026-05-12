@@ -502,6 +502,43 @@ func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *test
 			},
 			wantWarnings: []string{`deprecated config path "defaults.fixAllPullRequests" is accepted for now; use "roles.fixer.triggers.authorFilter" instead`},
 		},
+		{
+			name:     "legacy project instructions lose to canonical project role instructions",
+			fileName: "config.json",
+			contents: `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","instructions":{"worker":"legacy"},"roles":{"worker":{"instructions":"canonical"}}}]}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+				if !strings.Contains(block.Text, "canonical") || strings.Contains(block.Text, "legacy") {
+					t.Fatalf("custom instruction block = %q, want canonical project instructions to win", block.Text)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`},
+		},
+		{
+			name:     "legacy project reviewer discovery loses to canonical discovery",
+			fileName: "config.toml",
+			contents: "[[projects]]\nid = \"demo\"\nname = \"Demo\"\nrepoPath = \"/repos/demo\"\n\n[projects.roles.reviewer]\nautoDiscovery = false\n\n[projects.roles.reviewer.discovery]\nautoDiscovery = true\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if !ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.AutoDiscovery {
+					t.Fatal("project reviewer discovery autoDiscovery = false, want true")
+				}
+			},
+			wantWarnings: []string{`deprecated config path "projects[].roles.reviewer.autoDiscovery" is accepted for now; use "projects[].roles.reviewer.discovery.autoDiscovery" instead`},
+		},
+		{
+			name:     "legacy project path loses to canonical repoPath",
+			fileName: "config.yaml",
+			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/legacy\n    repoPath: /repos/canonical\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Projects[0].RepoPath; got != "/repos/canonical" {
+					t.Fatalf("project repoPath = %q, want %q", got, "/repos/canonical")
+				}
+			},
+			wantWarnings: []string{},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -869,7 +906,7 @@ func TestLoadFileSupportsCustomInstructions(t *testing.T) {
 		t.Fatalf("project repo path = %q", got)
 	}
 	block := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
-	if !strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
+	if strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
 		t.Fatalf("custom block missing instructions: %s", block.Text)
 	}
 }
@@ -879,16 +916,20 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
 		"roles": {
+			"planner": {"autoDiscovery": false, "triggers": {"labels": ["needs-plan"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global planner guidance."},
 			"worker": {"autoDiscovery": false, "triggers": {"labels": ["global"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global worker guidance."},
-			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "enableSelfReview": false, "labels": ["review"], "labelMode": "all"}}
+			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "enableSelfReview": false, "labels": ["review"], "labelMode": "all"}},
+			"fixer": {"autoDiscovery": false, "triggers": {"includeDrafts": false, "authorFilter": "current_user", "labels": ["needs-fix"], "labelMode": "all"}, "instructions": "Global fixer guidance."}
 		},
 		"projects": [{
 			"id": "demo",
 			"name": "Demo",
 			"repoPath": "/repos/demo",
 			"roles": {
+				"planner": {"autoDiscovery": true, "triggers": {"labels": ["project-plan"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project planner guidance."},
 				"worker": {"autoDiscovery": true, "triggers": {"labels": ["project"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project worker guidance."},
-				"reviewer": {"triggers": {"includeDrafts": true, "enableSelfReview": true}}
+				"reviewer": {"triggers": {"includeDrafts": true, "enableSelfReview": true}},
+				"fixer": {"autoDiscovery": true, "triggers": {"includeDrafts": true, "authorFilter": "any", "labels": ["project-fix"], "labelMode": "any"}, "instructions": "Project fixer guidance."}
 			}
 		}]
 	}`
@@ -901,16 +942,28 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	}
 
 	global := ProjectRoleConfigs(loaded.Config, "missing")
+	if global.Planner.AutoDiscovery || !reflectStringSlicesEqual(global.Planner.Triggers.Labels, []string{"needs-plan"}) || !global.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("global planner roles = %#v", global.Planner)
+	}
 	if global.Worker.AutoDiscovery || !reflectStringSlicesEqual(global.Worker.Triggers.Labels, []string{"global"}) || !global.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("global worker roles = %#v", global.Worker)
 	}
+	if global.Fixer.AutoDiscovery || global.Fixer.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || !reflectStringSlicesEqual(global.Fixer.Triggers.Labels, []string{"needs-fix"}) {
+		t.Fatalf("global fixer roles = %#v", global.Fixer)
+	}
 
 	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
+	if !projectRoles.Planner.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Planner.Triggers.Labels, []string{"project-plan"}) || projectRoles.Planner.Triggers.LabelMode != LabelModeAny || projectRoles.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("project planner roles = %#v", projectRoles.Planner)
+	}
 	if !projectRoles.Worker.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Worker.Triggers.Labels, []string{"project"}) || projectRoles.Worker.Triggers.LabelMode != LabelModeAny || projectRoles.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("project worker roles = %#v", projectRoles.Worker)
 	}
 	if !projectRoles.Reviewer.Discovery.Triggers.IncludeDrafts || !projectRoles.Reviewer.Discovery.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Discovery.Triggers.Labels, []string{"review"}) {
 		t.Fatalf("project reviewer triggers = %#v", projectRoles.Reviewer)
+	}
+	if !projectRoles.Fixer.AutoDiscovery || projectRoles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(projectRoles.Fixer.Triggers.Labels, []string{"project-fix"}) || projectRoles.Fixer.Triggers.LabelMode != LabelModeAny {
+		t.Fatalf("project fixer roles = %#v", projectRoles.Fixer)
 	}
 	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want false", got)
@@ -925,6 +978,14 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
 	if strings.Contains(block.Text, "Global worker guidance.") || !strings.Contains(block.Text, "Project worker guidance.") {
 		t.Fatalf("custom instruction block did not use project role override: %s", block.Text)
+	}
+	plannerBlock := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
+	if strings.Contains(plannerBlock.Text, "Global planner guidance.") || !strings.Contains(plannerBlock.Text, "Project planner guidance.") {
+		t.Fatalf("planner custom instruction block did not use project role override: %s", plannerBlock.Text)
+	}
+	fixerBlock := BuildCustomInstructionBlock(loaded.Config, "demo", "fixer")
+	if strings.Contains(fixerBlock.Text, "Global fixer guidance.") || !strings.Contains(fixerBlock.Text, "Project fixer guidance.") {
+		t.Fatalf("fixer custom instruction block did not use project role override: %s", fixerBlock.Text)
 	}
 }
 
@@ -1021,8 +1082,8 @@ func TestLoadFileSupportsSweeperCustomInstructions(t *testing.T) {
 	if !strings.Contains(block.Text, "Project demo sweeper role instruction") {
 		t.Fatalf("custom instruction block did not include project sweeper role override: %q", block.Text)
 	}
-	if !strings.Contains(block.Text, "Project demo sweeper instructions") {
-		t.Fatalf("custom instruction block did not include project sweeper map instruction: %q", block.Text)
+	if strings.Contains(block.Text, "Project demo sweeper instructions") || strings.Contains(block.Text, "Project sweeper map instruction.") {
+		t.Fatalf("custom instruction block kept deprecated project instruction map instead of canonical project role instructions: %q", block.Text)
 	}
 }
 
@@ -1159,7 +1220,7 @@ func TestEnvOverrideReviewerEnableSelfReviewBeatsProjectConfig(t *testing.T) {
 func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
 		Roles:    &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("Global worker guidance.")}},
-		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("")}}}},
+		Projects: &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("")}}}},
 	})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
@@ -1170,25 +1231,47 @@ func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
 	}
 }
 
-func TestValidateProjectRoleInstructionAggregateBytes(t *testing.T) {
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
-		Projects:     &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("12345")}}, Instructions: map[string]string{"worker": "6789"}}},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
+func TestLegacyProjectInstructionsNormalizeToCanonicalProjectRoleInstructions(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"worker": "Legacy project worker guidance."}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if !strings.Contains(block.Text, "Legacy project worker guidance.") {
+		t.Fatalf("custom instruction block = %q, want normalized legacy project instruction", block.Text)
 	}
-	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-	var validationErr *ConfigValidationError
-	if err == nil || !errors.As(err, &validationErr) || !hasValidationIssue(validationErr.Issues, "projects[0].instructions.worker") {
-		t.Fatalf("ValidateWithOptions() error = %v, issues = %#v, want aggregate project instruction validation", err, validationErr)
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
+}
+
+func TestCanonicalProjectRoleInstructionsBeatLegacyProjectInstructionMap(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"worker": "Legacy worker guidance."},
+			"roles": {"worker": {"instructions": "Canonical worker guidance."}}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if !strings.Contains(block.Text, "Canonical worker guidance.") || strings.Contains(block.Text, "Legacy worker guidance.") {
+		t.Fatalf("custom instruction block = %q, want canonical project role instructions to win", block.Text)
 	}
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
 }
 
 func TestValidateProjectReviewerLabelCanBeClearedWhenDisabled(t *testing.T) {
 	falseValue := false
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{SpecReview: &PartialReviewerSpecReviewConfig{IncludeReviewingLabel: &falseValue, ReviewingLabel: stringPtr("")}}}}},
+		Projects: &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{SpecReview: &PartialReviewerSpecReviewConfig{IncludeReviewingLabel: &falseValue, ReviewingLabel: stringPtr("")}}}}},
 	})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
@@ -2189,7 +2272,7 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 	repoBaseBranch := "stable"
 	worktreeRoot := "/tmp/worktrees/project-a"
 
-	projects := []ProjectRefConfig{{
+	projects := []PartialProjectRefConfig{{
 		ID:           "project-a",
 		Name:         "Project A",
 		RepoPath:     "/repos/project-a",
@@ -2373,7 +2456,7 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 func TestNormalizeReplacesArraysAndClonesMaps(t *testing.T) {
 	soundLevels := []NotificationSoundLevel{}
-	projects := []ProjectRefConfig{{ID: "project-b", Name: "Project B", RepoPath: "/repos/project-b"}}
+	projects := []PartialProjectRefConfig{{ID: "project-b", Name: "Project B", RepoPath: "/repos/project-b"}}
 	params := map[string]any{"reasoning": "high"}
 	env := map[string]string{"FOO": "bar"}
 	environment := map[string]string{"BAR": "baz"}
@@ -2425,7 +2508,7 @@ func TestNormalizeAppliesLayersInOrder(t *testing.T) {
 	overriddenPort := 7000
 	baseParams := map[string]any{"reasoning": map[string]any{"level": "high", "mode": "careful"}}
 	overrideParams := map[string]any{"reasoning": map[string]any{"mode": "fast"}, "verbosity": "low"}
-	projects := []ProjectRefConfig{}
+	projects := []PartialProjectRefConfig{}
 
 	config, err := Normalize("/tmp/cwd",
 		PartialConfig{

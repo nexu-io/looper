@@ -225,17 +225,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
-		for role, text := range project.Instructions {
-			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
-			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
-			validateAggregateInstructionBytes(path, roleInstructionText(effectiveProjectRoles, role), text, config.Instructions.MaxBytes, &issues)
-		}
 		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
 			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
 				continue
 			}
 			path := fmt.Sprintf("%s.roles.%s.instructions", prefix, roleInstruction.role)
-			validateAggregateInstructionBytes(path, roleInstruction.text, project.Instructions[roleInstruction.role], config.Instructions.MaxBytes, &issues)
+			validateInstructionText(path, roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, &issues)
 		}
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
