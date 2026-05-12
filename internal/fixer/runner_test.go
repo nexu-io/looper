@@ -1258,6 +1258,49 @@ func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateRunContextTreatsOlderActiveAgentExecutionAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	activeStartedAt := fixture.current.Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_older_active_agent_execution", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	orphan := storage.RunRecord{ID: "run_older_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := orphan.ID
+	loopID := loop.ID
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_older_active_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "running", StartedAt: activeStartedAt, CreatedAt: activeStartedAt, UpdatedAt: activeStartedAt}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(active) error = %v", err)
+	}
+	endedAt := nowISO
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_newer_terminal_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "completed", StartedAt: nowISO, EndedAt: &endedAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(terminal) error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable active-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(active) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running active run", activeRun)
+	}
+}
+
 func TestCreateRunContextInterruptsOrphanWithTerminalAgentExecution(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -2187,6 +2187,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	encoded := mustMarshalJSON(initialCheckpoint)
 	run.CheckpointJSON = &encoded
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run", loop.ID))
+		}
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
@@ -2194,11 +2197,11 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 
 func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRecord) error {
 	if r.repos.AgentExecutions != nil {
-		execution, err := r.repos.AgentExecutions.GetLatestByRunID(ctx, run.ID)
+		execution, err := r.repos.AgentExecutions.GetLatestActiveByRunID(ctx, run.ID)
 		if err != nil {
 			return err
 		}
-		if execution != nil && isActiveAgentExecutionStatus(execution.Status) {
+		if execution != nil {
 			return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID))
 		}
 	}
@@ -2226,15 +2229,6 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 
 func activeFixerRunError(message string) error {
 	return &loopError{message: message, kind: FailureRetryableTransient}
-}
-
-func isActiveAgentExecutionStatus(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "running", "cancelling":
-		return true
-	default:
-		return false
-	}
 }
 
 func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunRecord) bool {

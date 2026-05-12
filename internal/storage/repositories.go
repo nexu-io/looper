@@ -696,6 +696,19 @@ func (r *AgentExecutionsRepository) GetLatestByRunID(ctx context.Context, runID 
 	return &record, nil
 }
 
+func (r *AgentExecutionsRepository) GetLatestActiveByRunID(ctx context.Context, runID string) (*AgentExecutionRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE run_id = ? AND status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC LIMIT 1`, runID)
+	record, err := scanAgentExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest active agent execution by run id: %w", err)
+	}
+
+	return &record, nil
+}
+
 func (r *AgentExecutionsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*AgentExecutionRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
 	record, err := scanAgentExecution(row)
