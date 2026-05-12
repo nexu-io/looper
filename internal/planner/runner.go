@@ -918,9 +918,6 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		return checkpoint, nil
 	}
 	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
-	if writeSpecCompleted && checkpoint.WriteSpec.GitReconciled {
-		return checkpoint, nil
-	}
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -935,9 +932,26 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		checkpoint.Worktree = nil
+		if checkpoint.WriteSpec != nil && !checkpoint.WriteSpec.GitReconciled {
+			checkpoint.WriteSpec = nil
+			writeSpecCompleted = false
+		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		input.Checkpoint = checkpoint
-		return r.runPrepareWorktreeStep(ctx, input)
+		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
+		if err != nil {
+			return checkpoint, err
+		}
+		worktree, err = requireWorktree(checkpoint)
+		if err != nil {
+			return checkpoint, err
+		}
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+			return checkpoint, err
+		}
+	}
+	if writeSpecCompleted && checkpoint.WriteSpec.GitReconciled {
+		return checkpoint, nil
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")

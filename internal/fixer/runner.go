@@ -1371,7 +1371,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		checkpoint.Worktree = nil
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		input.Checkpoint = checkpoint
-		return r.runPrepareWorktreeStep(ctx, input)
+		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
+		if err != nil {
+			return checkpoint, err
+		}
+		worktree, err = requireWorktree(checkpoint)
+		if err != nil {
+			return checkpoint, err
+		}
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+			return checkpoint, err
+		}
 	}
 	executionID := eventlog.NewEventID("agent")
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)

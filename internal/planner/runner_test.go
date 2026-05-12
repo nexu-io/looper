@@ -237,7 +237,8 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
 		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
@@ -270,13 +271,25 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_rebuild"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
 		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
 		Checkpoint: plannerCheckpoint{
-			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"},
+			Issue:     issue,
 			Worktree:  &checkpointWorktree{Path: legacyPath, Branch: "stale", BaseBranch: "main"},
 			WriteSpec: &checkpointWriteSpec{Status: "completed"},
 		},
@@ -293,11 +306,14 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	if git.createCalls[0].WorktreeRoot != worktreeRoot {
 		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
 	}
-	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
-		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
-	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "completed" || checkpoint.WriteSpec.GitReconciled {
-		t.Fatalf("checkpoint.WriteSpec = %#v, want write-spec state preserved while recreating worktree", checkpoint.WriteSpec)
+	if agent.starts[0].WorkingDirectory != git.createResult.WorktreePath {
+		t.Fatalf("agent WorkingDirectory = %q, want rebuilt worktree %q", agent.starts[0].WorkingDirectory, git.createResult.WorktreePath)
+	}
+	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "completed" || !checkpoint.WriteSpec.GitReconciled {
+		t.Fatalf("checkpoint.WriteSpec = %#v, want completed and reconciled write-spec after worktree recovery", checkpoint.WriteSpec)
 	}
 }
 

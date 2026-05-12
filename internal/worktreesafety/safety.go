@@ -57,24 +57,62 @@ func withinRoot(path, root string) bool {
 	}
 	normalizedPath := normalizePath(path)
 	normalizedRoot := normalizePath(root)
-	if normalizedPath == normalizedRoot {
-		return true
+	rel, err := filepath.Rel(normalizedRoot, normalizedPath)
+	if err != nil {
+		return false
 	}
-	return strings.HasPrefix(normalizedPath, normalizedRoot+string(filepath.Separator))
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
 }
 
 func normalizePath(path string) string {
-	abs, err := filepath.Abs(filepath.Clean(path))
-	if err != nil {
-		abs = filepath.Clean(path)
+	return normalizePathDepth(path, 0)
+}
+
+func normalizePathDepth(path string, depth int) string {
+	if depth > 255 {
+		return filepath.Clean(path)
 	}
-	if evaluated, err := os.Readlink(abs); err == nil && !filepath.IsAbs(evaluated) {
-		abs = filepath.Join(filepath.Dir(abs), evaluated)
-	} else if err == nil {
-		abs = evaluated
+	abs := path
+	if !filepath.IsAbs(abs) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return filepath.Clean(path)
+		}
+		abs = wd + string(filepath.Separator) + path
 	}
-	if evaluated, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = evaluated
+	volume := filepath.VolumeName(abs)
+	rest := strings.TrimPrefix(abs, volume)
+	current := volume + string(filepath.Separator)
+	parts := strings.FieldsFunc(rest, func(r rune) bool { return r == filepath.Separator })
+	for index, part := range parts {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			current = filepath.Dir(current)
+			continue
+		}
+
+		candidate := filepath.Join(current, part)
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			remaining := append([]string{candidate}, parts[index+1:]...)
+			return filepath.Clean(filepath.Join(remaining...))
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			current = candidate
+			continue
+		}
+		target, err := os.Readlink(candidate)
+		if err != nil {
+			current = candidate
+			continue
+		}
+		if filepath.IsAbs(target) {
+			current = normalizePathDepth(target, depth+1)
+		} else {
+			current = normalizePathDepth(current+string(filepath.Separator)+target, depth+1)
+		}
 	}
-	return filepath.Clean(abs)
+	return filepath.Clean(current)
 }

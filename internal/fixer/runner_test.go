@@ -117,7 +117,8 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
 		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
@@ -1982,7 +1983,8 @@ func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
 		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
@@ -2010,11 +2012,14 @@ func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	if git.createCalls[0].WorktreeRoot != worktreeRoot {
 		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
 	}
-	if checkpoint.Repair != nil {
-		t.Fatalf("checkpoint.Repair = %#v, want repair state unchanged during worktree recovery", checkpoint.Repair)
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
-	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
-		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	if agent.starts[0].WorkingDirectory != git.createResult.WorktreePath {
+		t.Fatalf("agent WorkingDirectory = %q, want rebuilt worktree %q", agent.starts[0].WorkingDirectory, git.createResult.WorktreePath)
+	}
+	if checkpoint.Repair == nil || checkpoint.Repair.Summary != "applied fixes" {
+		t.Fatalf("checkpoint.Repair = %#v, want completed repair after worktree recovery", checkpoint.Repair)
 	}
 }
 
