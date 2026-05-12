@@ -121,6 +121,8 @@
 
 ## Phase 10 - Migration UX
 
+Implementation note: follow `reference/migration-ux-decision.md` for the resolved migration-UX scope, safety guarantees, informational-note behavior, and hard-error timing.
+
 - [ ] Decide whether to add `looper config migrate`
 - [ ] If added, scope it to rewrite only known legacy config paths/names
 - [ ] If added, decide whether it can convert `config.json` to `config.toml`

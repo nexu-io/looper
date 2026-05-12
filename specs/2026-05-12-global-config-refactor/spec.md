@@ -398,7 +398,7 @@ Implementation must produce:
 
 - Which config domains deserve their own canonical subgroup vs staying flat within a top-level concern?
 - Which global settings, beyond role config, are legitimately project-overrideable?
-- Whether a migration helper such as `looper config migrate` should exist, and if so what exact scope and safety guarantees it must provide.
+- Migration UX decisions for helper-vs-guidance, legacy `config.json` notes, file-safety guarantees, and hard-error timing are recorded in `reference/migration-ux-decision.md`.
 
 ## Recommended outcome
 
