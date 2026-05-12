@@ -1,16 +1,14 @@
 package config
 
-import "fmt"
-
 func collectMixedSchemaWarnings(partial PartialConfig) []string {
-	warnings := []string{}
+	deprecated := []deprecatedSurface{}
 	seen := map[string]struct{}{}
 	add := func(path string, replacement string) {
 		if _, ok := seen[path]; ok {
 			return
 		}
 		seen[path] = struct{}{}
-		warnings = append(warnings, fmt.Sprintf("deprecated config path %q is accepted for now; use %q instead", path, replacement))
+		deprecated = append(deprecated, deprecatedSurface{kind: deprecatedSurfaceConfigPath, legacy: path, replacement: replacement})
 	}
 
 	if partial.LegacyReviewer != nil {
@@ -56,7 +54,7 @@ func collectMixedSchemaWarnings(partial PartialConfig) []string {
 		}
 	}
 
-	return warnings
+	return dedupeDeprecationWarnings(deprecated)
 }
 
 func dedupeWarnings(groups ...[]string) []string {

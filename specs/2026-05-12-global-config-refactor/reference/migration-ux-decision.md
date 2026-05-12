@@ -67,6 +67,31 @@ Earliest removal policy:
 - The earliest allowed hard-error point is the first release after at least one full shipped release cycle where canonical docs, help text, templates, and startup guidance are already in place.
 - A follow-up spec must name the exact removal release and error text before implementation flips from warn-only to hard-error.
 
+## Deprecation policy for this refactor
+
+During the warning-only migration window, deprecation handling must follow these rules:
+
+- Validate the effective canonical config model after accepted legacy config has been normalized into canonical targets.
+- Continue accepting supported legacy config-file paths, legacy environment variable names, and legacy CLI flag names during this refactor.
+- Reject unsupported config-file suffixes with a clear error that names the provided suffix, the file path, and the supported suffix list.
+- Emit at most one warning per deprecated logical surface per process load:
+  - deprecated config-file paths warn by deprecated canonical path name
+  - deprecated environment variables warn by legacy env var name
+  - deprecated CLI flags warn by legacy flag name
+- Each warning must include the exact canonical replacement surface.
+
+Warning text templates for this release:
+
+- Config path: `deprecated config path "<legacy-path>" is accepted for now; use "<canonical-path>" instead`
+- Environment variable: `deprecated environment variable "<legacy-env>" is accepted for now; use "<canonical-env>" instead`
+- CLI flag: `deprecated CLI flag "<legacy-flag>" is accepted for now; use "<canonical-flag>" instead`
+
+Future hard-error text templates reserved for the follow-up removal release:
+
+- Config path: `legacy config path "<legacy-path>" is no longer supported; use "<canonical-path>" instead`
+- Environment variable: `legacy environment variable "<legacy-env>" is no longer supported; use "<canonical-env>" instead`
+- CLI flag: `legacy CLI flag "<legacy-flag>" is no longer supported; use "<canonical-flag>" instead`
+
 ## Implementation notes
 
 - Treat this record as the source of truth for the migration UX task and the later implementation task for startup guidance / warnings.

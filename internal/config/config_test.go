@@ -566,6 +566,66 @@ func TestMixedSchemaEnvAndCLIOverridesStillBeatFileBackedValues(t *testing.T) {
 	assertWarningsEqual(t, cliLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
 }
 
+func TestDeprecatedAliasWarningsDeduplicateAndUseExactReplacementNames(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"projects": [
+			{"id":"demo-a","name":"Demo A","repoPath":"/repos/demo-a","instructions":{"worker":"legacy a"}},
+			{"id":"demo-b","name":"Demo B","repoPath":"/repos/demo-b","instructions":{"worker":"legacy b"}}
+		]
+	}`, map[string]string{
+		"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}, []string{
+		"--reviewer-enable-self-review=true",
+		"--reviewer-enable-self-review=false",
+	})
+
+	assertWarningsEqual(t, loaded.Warnings, []string{
+		`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`,
+		`deprecated environment variable "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW" is accepted for now; use "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW" instead`,
+		`deprecated CLI flag "--reviewer-enable-self-review" is accepted for now; use "--roles-reviewer-discovery-triggers-enable-self-review" instead`,
+	})
+}
+
+func TestLoadFileRejectsUnsupportedConfigSuffixWithExactMessage(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.txt")
+	if err := os.WriteFile(configPath, []byte("server:\n  port: 6101\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	want := fmt.Sprintf("unsupported config file suffix %q at %s; supported suffixes: .toml, .yaml, .yml, .json", ".txt", configPath)
+	if got := err.Error(); got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
+func TestLegacyReviewerConfigStillValidatesAgainstCanonicalRules(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"reviewer":{"scope":"bad-scope","loop":{"quietPeriodSeconds":-1}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
+}
+
 func TestMixedSchemaConfigRejectsStructurallyIncompatibleTargets(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

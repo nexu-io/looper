@@ -107,8 +107,8 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	fileWarnings := collectMixedSchemaWarnings(partialConfig)
-	envWarnings := collectMixedSchemaWarnings(envOverrides)
-	cliWarnings := collectMixedSchemaWarnings(parsedCLI.overrides)
+	envWarnings := collectDeprecatedEnvWarnings(lookupEnv)
+	cliWarnings := collectDeprecatedCLIWarnings(options.Args)
 	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
 	if err != nil {
 		return LoadedFileConfig{}, err
@@ -804,6 +804,44 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	return parsed, nil
 }
 
+func collectDeprecatedCLIWarnings(args []string) []string {
+	deprecated := []deprecatedSurface{}
+	add := func(flag string, replacement string) {
+		deprecated = append(deprecated, deprecatedSurface{kind: deprecatedSurfaceCLIFlag, legacy: flag, replacement: replacement})
+	}
+
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "--") {
+			continue
+		}
+
+		switch {
+		case matchesFlag(arg, "--allow-auto-approve"):
+			add("--allow-auto-approve", "--roles-reviewer-behavior-review-events-clean")
+		case matchesFlag(arg, "--fix-all-pull-requests"):
+			add("--fix-all-pull-requests", "--roles-fixer-triggers-author-filter")
+		case matchesFlag(arg, "--reviewer-loop-enabled"):
+			add("--reviewer-loop-enabled", "--roles-reviewer-behavior-loop-enabled-by-default")
+		case matchesFlag(arg, "--reviewer-enable-self-review"):
+			add("--reviewer-enable-self-review", "--roles-reviewer-discovery-triggers-enable-self-review")
+		case matchesFlag(arg, "--reviewer-clean-review-event"):
+			add("--reviewer-clean-review-event", "--roles-reviewer-behavior-review-events-clean")
+		case matchesFlag(arg, "--reviewer-blocking-review-event"):
+			add("--reviewer-blocking-review-event", "--roles-reviewer-behavior-review-events-blocking")
+		case matchesFlag(arg, "--reviewer-quiet-period-seconds"):
+			add("--reviewer-quiet-period-seconds", "--roles-reviewer-behavior-loop-quiet-period-seconds")
+		case matchesFlag(arg, "--reviewer-min-publish-interval-seconds"):
+			add("--reviewer-min-publish-interval-seconds", "--roles-reviewer-behavior-loop-min-publish-interval-seconds")
+		case matchesFlag(arg, "--reviewer-max-iterations-per-pr"):
+			add("--reviewer-max-iterations-per-pr", "--roles-reviewer-behavior-loop-max-iterations-per-pr")
+		case matchesFlag(arg, "--reviewer-max-iterations-per-head"):
+			add("--reviewer-max-iterations-per-head", "--roles-reviewer-behavior-loop-max-iterations-per-head")
+		}
+	}
+
+	return dedupeDeprecationWarnings(deprecated)
+}
+
 func matchesFlag(arg string, flag string) bool {
 	return arg == flag || strings.HasPrefix(arg, flag+"=")
 }
@@ -1087,6 +1125,41 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	}
 
 	return overrides, nil
+}
+
+func collectDeprecatedEnvWarnings(lookupEnv EnvLookupFunc) []string {
+	deprecated := []deprecatedSurface{}
+	add := func(name string, replacement string) {
+		if _, ok := lookupEnv(name); !ok {
+			return
+		}
+		deprecated = append(deprecated, deprecatedSurface{kind: deprecatedSurfaceEnvVar, legacy: name, replacement: replacement})
+	}
+
+	add("LOOPER_ALLOW_AUTO_APPROVE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	add("LOOPER_FIX_ALL_PULL_REQUESTS", "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER")
+	add("LOOPER_REVIEWER_LOOP_ENABLED", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_ENABLED_BY_DEFAULT")
+	add("LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	add("LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING")
+	add("LOOPER_REVIEWER_QUIET_PERIOD_SECONDS", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS")
+	add("LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS")
+	add("LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_PR")
+	add("LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_HEAD")
+	add("LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_ON_HEAD_CHANGE")
+	add("LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_RE_REVIEW_PROMPT_ON_HEAD_CHANGE")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_ENABLED")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_MODE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MODE")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MAX_THREADS_PER_RUN")
+	add("LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE")
+	add("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL")
+	add("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL")
+
+	return dedupeDeprecationWarnings(deprecated)
 }
 
 func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
