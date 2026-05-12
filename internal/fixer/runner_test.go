@@ -1137,6 +1137,89 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentUserErr: errors.New("github timeout")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_ownership_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_ownership_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	_, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err == nil || !strings.Contains(err.Error(), "github timeout") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want github timeout", err)
+	}
+	latest, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), loop.ID)
+	if err != nil || latest == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want run", latest, err)
+	}
+	if latest.Status != "failed" || latest.EndedAt == nil {
+		t.Fatalf("latest run = %#v, want failed terminal run", latest)
+	}
+	if latest.CurrentStep == nil || *latest.CurrentStep != string(stepDiscoverPR) {
+		t.Fatalf("latest.CurrentStep = %#v, want discover-pr", latest.CurrentStep)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "run", latest.ID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType == "run.started" {
+			t.Fatalf("events = %#v, want no run.started before ownership failure", events)
+		}
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() retry error = %v", err)
+	}
+	if resumed.Run.ID == latest.ID || resumed.Run.Status != "running" {
+		t.Fatalf("resumed.Run = %#v, want new running run", resumed.Run)
+	}
+}
+
+func TestCreateRunContextInterruptsOrphanPreStartRunningRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_orphan_prestart", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	orphan := storage.RunRecord{ID: "run_orphan_prestart", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want new running run", created.Run)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted terminal orphan", oldRun)
+	}
+}
+
 func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2047,6 +2130,7 @@ func (f *runnerFixture) nowISO() string {
 
 type fakeGitHubGateway struct {
 	currentUser           string
+	currentUserErr        error
 	listOpen              []PullRequestSummary
 	listOpenByLabel       map[string][]PullRequestSummary
 	listCalls             []ListOpenPullRequestsInput
@@ -2079,6 +2163,9 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 }
 
 func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	if f.currentUserErr != nil {
+		return "", f.currentUserErr
+	}
 	return firstNonEmpty(f.currentUser, "looper"), nil
 }
 

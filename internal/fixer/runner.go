@@ -970,7 +970,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	return err
 }
 
-func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (result ProcessResult, retErr error) {
 	if queueItem.Type != "fixer" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -997,6 +997,25 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
+	runCreated := true
+	defer func() {
+		if retErr == nil || !runCreated {
+			return
+		}
+		persisted, err := r.repos.Runs.GetByID(context.Background(), run.ID)
+		if err != nil || persisted == nil || persisted.Status != "running" {
+			return
+		}
+		failure := r.classifyFailure(retErr)
+		latest := r.getLatestCheckpoint(context.Background(), run, checkpoint)
+		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
+		completed, err := r.completeRun(context.Background(), *persisted, "failed", failure.message, failure.message, latest)
+		if err != nil {
+			r.logWarn("fixer run cleanup after pre-start failure failed", map[string]any{"runId": run.ID, "queueItemId": queueItem.ID, "error": err.Error()})
+			return
+		}
+		run = completed
+	}()
 	claimedLockKey := ""
 	acquiredClaimedLock := false
 	if resumedRun.Resumed && resumedRun.StartStep != stepClaimPR {
@@ -2090,6 +2109,17 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	lastCompleted := FixerStep("")
 	failedStep := FixerStep("")
 	if latestRun != nil {
+		if latestRun.Status == "running" {
+			if err := r.recoverOrphanPreStartRun(ctx, *latestRun); err != nil {
+				return resumedRunContext{}, err
+			}
+			latestRun, err = r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+			if err != nil {
+				return resumedRunContext{}, err
+			}
+		}
+	}
+	if latestRun != nil {
 		checkpoint = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asFixerStep(derefString(latestRun.LastCompletedStep))
 		failedStep = asFixerStep(derefString(latestRun.CurrentStep))
@@ -2143,6 +2173,35 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
+}
+
+func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRecord) error {
+	if r.repos.AgentExecutions != nil {
+		execution, err := r.repos.AgentExecutions.GetLatestByRunID(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		if execution != nil {
+			return fmt.Errorf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID)
+		}
+	}
+	if r.repos.Events != nil {
+		events, err := r.repos.Events.ListByEntity(ctx, "run", run.ID)
+		if err != nil {
+			return err
+		}
+		for _, event := range events {
+			if event.EventType == "run.started" {
+				return fmt.Errorf("loop %s already has a running fixer run %s", run.LoopID, run.ID)
+			}
+		}
+	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.ResumePolicy == "" {
+		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
+	}
+	_, err := r.completeRun(ctx, run, "interrupted", "Interrupted orphaned fixer run before start", "Interrupted orphaned fixer run before start", checkpoint)
+	return err
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step FixerStep, checkpoint fixerCheckpoint) (storage.RunRecord, error) {
