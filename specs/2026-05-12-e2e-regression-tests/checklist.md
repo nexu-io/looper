@@ -2,78 +2,78 @@
 
 ## Phase 0 - Scope and conventions
 
-- [ ] 明确采用三层测试：unit → contract/invariant integration → real sandbox E2E
-- [ ] 明确不采用两层（unit + real E2E）作为主策略
-- [ ] 明确 contract/invariant integration 是 PR 主防线
-- [ ] 明确 sandbox E2E 只用于 main/nightly/release/手动触发
-- [ ] 明确 deterministic E2E without real network 的边界
-- [ ] 创建 `internal/e2e` 测试包
-- [ ] 创建 `internal/e2e/harness` helper 包
-- [ ] 创建 `internal/e2e/githubcontract` 或等价 contract fixture 包
-- [ ] 明确所有 E2E 默认不访问真实网络
-- [ ] 明确所有 E2E 必须使用 temp HOME / temp runtime path
-- [ ] 明确 fake tools 通过 config 绝对路径注入，PATH 只作为补充
-- [ ] 明确 looperd 使用动态端口
-- [ ] 明确 daemon readiness 固定为 `GET /api/v1/status`
-- [ ] 明确 fake `gh` allowlist 来源于真实 `gh` fixture
-- [ ] 明确失败时必须输出 daemon logs、config、fake gh argv、fake agent cwd evidence
-- [ ] 为 PR #255 / #261 和 PR #194 建立 regression 注释约定
-- [ ] 明确 `TestMain` 构建 `looper` / `looperd` 一次并在 E2E 中复用
+- [x] 明确采用三层测试：unit → contract/invariant integration → real sandbox E2E
+- [x] 明确不采用两层（unit + real E2E）作为主策略
+- [x] 明确 contract/invariant integration 是 PR 主防线
+- [x] 明确 sandbox E2E 只用于 main/nightly/release/手动触发
+- [x] 明确 deterministic E2E without real network 的边界
+- [x] 创建 `internal/e2e` 测试包
+- [x] 创建 `internal/e2e/harness` helper 包
+- [x] 创建 `internal/e2e/githubcontract` 或等价 contract fixture 包
+- [x] 明确所有 E2E 默认不访问真实网络
+- [x] 明确所有 E2E 必须使用 temp HOME / temp runtime path
+- [x] 明确 fake tools 通过 config 绝对路径注入，PATH 只作为补充
+- [x] 明确 looperd 使用动态端口
+- [x] 明确 daemon readiness 固定为 `GET /api/v1/status`
+- [x] 明确 fake `gh` allowlist 来源于真实 `gh` fixture
+- [x] 明确失败时必须输出 daemon logs、config、fake gh argv、fake agent cwd evidence
+- [x] 为 PR #255 / #261 和 PR #194 建立 regression 注释约定
+- [x] 明确 `TestMain` 构建 `looper` / `looperd` 一次并在 E2E 中复用
 
 ## Phase 0.5 - Layer responsibilities
 
-- [ ] 记录 unit test 负责纯逻辑、小状态机、小 parser、小 helper
-- [ ] 记录 unit test 不起 daemon、不跑真实 git repo、不依赖 fake gh executable
-- [ ] 记录 integration test 使用真实 Looper 内部流程
-- [ ] 记录 integration test 使用 strict fake 外部边界
-- [ ] 记录 integration test 覆盖 daemon boot、gh contract、worktree isolation、resolve-comments scenario
-- [ ] 记录 sandbox E2E 负责验证真实 GitHub 行为、auth/scope、rate limit、review thread mutation
-- [ ] 记录 sandbox E2E 不替代 integration test
-- [ ] 记录 P0/P1 regression 优先补 integration scenario
-- [ ] 记录只有真实 GitHub 行为疑点才升级为 sandbox E2E
+- [x] 记录 unit test 负责纯逻辑、小状态机、小 parser、小 helper
+- [x] 记录 unit test 不起 daemon、不跑真实 git repo、不依赖 fake gh executable
+- [x] 记录 integration test 使用真实 Looper 内部流程
+- [x] 记录 integration test 使用 strict fake 外部边界
+- [x] 记录 integration test 覆盖 daemon boot、gh contract、worktree isolation、resolve-comments scenario
+- [x] 记录 sandbox E2E 负责验证真实 GitHub 行为、auth/scope、rate limit、review thread mutation
+- [x] 记录 sandbox E2E 不替代 integration test
+- [x] 记录 P0/P1 regression 优先补 integration scenario
+- [x] 记录只有真实 GitHub 行为疑点才升级为 sandbox E2E
 
 ## Phase 1 - Contract/invariant integration harness
 
-- [ ] 实现 `internal/e2e/harness/binaries.go`
-- [ ] 实现 `internal/e2e/harness/config.go`
-- [ ] 实现 `internal/e2e/harness/daemon.go`
-- [ ] 实现 `internal/e2e/harness/fake_agent.go`
-- [ ] 实现 `internal/e2e/harness/fake_gh.go`
-- [ ] 实现 `internal/e2e/harness/git.go`
-- [ ] 实现 `internal/e2e/harness/ports.go`
-- [ ] 实现 `internal/e2e/harness/assertions.go`
-- [ ] 实现 `internal/e2e/harness/temp_home.go`
-- [ ] 实现 temp HOME helper
-- [ ] 实现 isolated runtime path helper
-- [ ] 实现 dynamic port helper
-- [ ] 实现 seeded git repo helper
-- [ ] 实现 temp bare origin helper
-- [ ] 实现 git HEAD/status/index snapshot helper
-- [ ] 实现 assert user repo unchanged helper
-- [ ] 实现 assert cwd inside worktree helper
-- [ ] 实现 assert cwd not repo path helper
-- [ ] 实现 fake agent executable helper
-- [ ] fake agent 支持 `success-with-diff`
-- [ ] fake agent 支持 `success-no-diff`
-- [ ] fake agent 支持 `write-file`
-- [ ] fake agent 支持 `modify-file`
-- [ ] fake agent 支持 `commit`
-- [ ] fake agent 支持 `transient-failure`
-- [ ] fake agent 支持 `malformed-marker`
-- [ ] fake agent 支持 `timeout` / `no-marker`
-- [ ] fake agent 读取 `LOOPER_COMPLETION_MARKER` 或当前 executor marker 配置
-- [ ] fake agent 输出真实 runner 可解析的 completion JSON
-- [ ] fake agent 写入 `cwd-evidence.json`
-- [ ] 实现 strict fake gh executable helper
-- [ ] fake gh 支持 argv / stdin / cwd / env 记录
+- [x] 实现 `internal/e2e/harness/binaries.go`
+- [x] 实现 `internal/e2e/harness/config.go`
+- [x] 实现 `internal/e2e/harness/daemon.go`
+- [x] 实现 `internal/e2e/harness/fake_agent.go`
+- [x] 实现 `internal/e2e/harness/fake_gh.go`
+- [x] 实现 `internal/e2e/harness/git.go`
+- [x] 实现 `internal/e2e/harness/ports.go`
+- [x] 实现 `internal/e2e/harness/assertions.go`
+- [x] 实现 `internal/e2e/harness/temp_home.go`
+- [x] 实现 temp HOME helper
+- [x] 实现 isolated runtime path helper
+- [x] 实现 dynamic port helper
+- [x] 实现 seeded git repo helper
+- [x] 实现 temp bare origin helper
+- [x] 实现 git HEAD/status/index snapshot helper
+- [x] 实现 assert user repo unchanged helper
+- [x] 实现 assert cwd inside worktree helper
+- [x] 实现 assert cwd not repo path helper
+- [x] 实现 fake agent executable helper
+- [x] fake agent 支持 `success-with-diff`
+- [x] fake agent 支持 `success-no-diff`
+- [x] fake agent 支持 `write-file`
+- [x] fake agent 支持 `modify-file`
+- [x] fake agent 支持 `commit`
+- [x] fake agent 支持 `transient-failure`
+- [x] fake agent 支持 `malformed-marker`
+- [x] fake agent 支持 `timeout` / `no-marker`
+- [x] fake agent 读取 `LOOPER_COMPLETION_MARKER` 或当前 executor marker 配置
+- [x] fake agent 输出真实 runner 可解析的 completion JSON
+- [x] fake agent 写入 `cwd-evidence.json`
+- [x] 实现 strict fake gh executable helper
+- [x] fake gh 支持 argv / stdin / cwd / env 记录
 - [ ] fake gh 从真实 fixture 加载 `--json` allowlist
-- [ ] fake gh 支持接近真实 `gh` 的 unsupported-field 错误输出
-- [ ] fake gh 支持跨进程 state 文件
-- [ ] fake gh 支持 strict / replay / record 模式
-- [ ] 实现 fake osascript helper，避免测试依赖 macOS notification 状态
-- [ ] 实现 looperd start/stop helper
-- [ ] 实现 `/api/v1/status` readiness wait helper
-- [ ] 实现失败时自动 dump daemon logs/config/artifacts helper
+- [x] fake gh 支持接近真实 `gh` 的 unsupported-field 错误输出
+- [x] fake gh 支持跨进程 state 文件
+- [x] fake gh 支持 strict / replay / record 模式
+- [x] 实现 fake osascript helper，避免测试依赖 macOS notification 状态
+- [x] 实现 looperd start/stop helper
+- [x] 实现 `/api/v1/status` readiness wait helper
+- [x] 实现失败时自动 dump daemon logs/config/artifacts helper
 
 ## Phase 2 - Daemon boot smoke
 
