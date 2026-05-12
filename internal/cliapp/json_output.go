@@ -172,7 +172,7 @@ func (r *commandRuntime) loopPause(cmd *cobra.Command, args []string) error {
 			loopID = strings.TrimSpace(args[0])
 		}
 		if loopID == "" {
-			return nil, fmt.Errorf("Usage: looper loop pause <id>")
+			return nil, fmt.Errorf("loop pause requires [id] or --id <id>")
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(loopID)+"/pause", nil)

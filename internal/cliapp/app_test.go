@@ -2271,6 +2271,85 @@ func TestLoopStartRequiresExplicitProjectWhenRepoMatchesMultipleProjects(t *test
 	}
 }
 
+func TestLoopPauseHelpOnlyShowsSupportedIDForms(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "loop", "pause", "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([loop pause --help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([loop pause --help]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Usage:\n  looper loop pause [id]", "--id <id>"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([loop pause --help]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	for _, unwanted := range []string{"--type <type>", "--pr <repo#number>"} {
+		if strings.Contains(stdout, unwanted) {
+			t.Fatalf("Run([loop pause --help]) stdout = %q, want not to contain %q", stdout, unwanted)
+		}
+	}
+}
+
+func TestLoopPauseRequiresID(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "loop", "pause")
+	if exitCode == 0 {
+		t.Fatalf("Run([loop pause]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("Run([loop pause]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "loop pause requires [id] or --id <id>") {
+		t.Fatalf("Run([loop pause]) stderr = %q, want missing id error", stderr)
+	}
+}
+
+func TestLoopPauseAcceptsPositionalAndFlagID(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantPath string
+	}{
+		{name: "positional", args: []string{"loop", "pause", "loop_123"}, wantPath: "/api/v1/loops/loop_123/pause"},
+		{name: "flag", args: []string{"loop", "pause", "--id", "loop_456"}, wantPath: "/api/v1/loops/loop_456/pause"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got, want := r.Method, http.MethodPost; got != want {
+					t.Fatalf("request method = %q, want %q", got, want)
+				}
+				if got, want := r.URL.Path, tc.wantPath; got != want {
+					t.Fatalf("request path = %q, want %q", got, want)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_loop_pause", map[string]any{"id": strings.TrimSuffix(strings.TrimPrefix(tc.wantPath, "/api/v1/loops/"), "/pause"), "status": "paused"}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			args := append(tc.args, "--config", configPath)
+			exitCode, stdout, stderr := runApp(t, args...)
+			if exitCode != 0 {
+				t.Fatalf("Run(%v) exit code = %d, want 0", args, exitCode)
+			}
+			if stderr != "" {
+				t.Fatalf("Run(%v) stderr = %q, want empty string", args, stderr)
+			}
+			if !strings.Contains(stdout, "Loop paused") {
+				t.Fatalf("Run(%v) stdout = %q, want pause success output", args, stdout)
+			}
+		})
+	}
+}
+
 func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktree(t *testing.T) {
 	repoPath := initSampleGitRepo(t)
 	runtimeRoot := t.TempDir()
