@@ -243,6 +243,20 @@ type CreatePullRequestResult struct {
 	URL    string
 }
 
+type CompareBranchesInput struct {
+	Repo       string
+	BaseBranch string
+	HeadBranch string
+	CWD        string
+}
+
+type CompareBranchesResult struct {
+	AheadBy      int
+	BehindBy     int
+	Status       string
+	TotalCommits int
+}
+
 type UpdatePullRequestTitleInput struct {
 	Repo     string
 	PRNumber int64
@@ -1480,6 +1494,29 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 		return CreatePullRequestResult{}, &shell.CommandExecutionError{Message: "gh pr create returned an empty URL", Result: result}
 	}
 	return CreatePullRequestResult{Number: parsePRNumberFromURL(prURL), URL: prURL}, nil
+}
+
+func (g *Gateway) CompareBranches(ctx context.Context, input CompareBranchesInput) (CompareBranchesResult, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	comparison := encodeURIComponent(input.BaseBranch) + "..." + encodeURIComponent(input.HeadBranch)
+	args := []string{"api", fmt.Sprintf("repos/%s/compare/%s", repo, comparison)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return CompareBranchesResult{}, err
+	}
+	var payload struct {
+		AheadBy      int    `json:"ahead_by"`
+		BehindBy     int    `json:"behind_by"`
+		Status       string `json:"status"`
+		TotalCommits int    `json:"total_commits"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &payload); err != nil {
+		return CompareBranchesResult{}, err
+	}
+	return CompareBranchesResult{AheadBy: payload.AheadBy, BehindBy: payload.BehindBy, Status: payload.Status, TotalCommits: payload.TotalCommits}, nil
 }
 
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {

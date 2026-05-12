@@ -602,6 +602,14 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
 }
 
+func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
+	comparison, err := a.gateway.CompareBranches(ctx, githubinfra.CompareBranchesInput{Repo: input.Repo, BaseBranch: input.BaseBranch, HeadBranch: input.HeadBranch, CWD: input.CWD})
+	if err != nil {
+		return worker.CompareBranchesResult{}, err
+	}
+	return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
+}
+
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
 	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})

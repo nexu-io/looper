@@ -1400,6 +1400,75 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 }
 
+func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+		createPRErrors: []error{fmt.Errorf("temporary create pr failure")},
+		issueDetailResponses: []IssueDetail{
+			{Number: 27, Title: "Implement worker loop", State: "OPEN"},
+			{Number: 27, Title: "Implement worker loop", State: "OPEN"},
+			{Number: 27, Title: "Implement worker loop", State: "CLOSED"},
+		},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim1, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	first, err := runner.ProcessClaimedItem(context.Background(), *claim1)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable_after_resume failure", first)
+	}
+	fixture.advance(5 * time.Second)
+	claim2, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	second, err := runner.ProcessClaimedItem(context.Background(), *claim2)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(second) error = %v", err)
+	}
+	if second.Status != "skipped" || !strings.Contains(second.Summary, "no longer an open issue") {
+		t.Fatalf("second = %#v, want skipped obsolete issue", second)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want resumed worker not to rerun agent", len(agent.starts))
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want no PR creation on obsolete resume", len(github.createPRCalls))
+	}
+}
+
+func TestProcessClaimedItemSkipsPRCreationWhenBranchNotAhead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	compare := CompareBranchesResult{AheadBy: 0, BehindBy: 2, Status: "behind", TotalCommits: 0}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, compareResult: &compare}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result = %#v, want skipped no-ahead branch", result)
+	}
+	if len(github.compareCalls) != 1 {
+		t.Fatalf("len(github.compareCalls) = %d, want branch comparison", len(github.compareCalls))
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("len(github.createPRCalls) = %d, want no PR creation", len(github.createPRCalls))
+	}
+}
+
 func TestFindPreviousIssueClaimPrefersNewestMatchingRun(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2733,6 +2802,8 @@ type fakeGitHubGateway struct {
 	prDetailResponses       []PullRequestDetail
 	viewPRIndex             int
 	issueDetail             IssueDetail
+	issueDetailResponses    []IssueDetail
+	viewIssueIndex          int
 	viewPRCalls             []ViewPullRequestInput
 	viewIssueCalls          []ViewIssueInput
 	createIssueCommentCalls []IssueCommentInput
@@ -2741,6 +2812,8 @@ type fakeGitHubGateway struct {
 	createPRResult          CreatePullRequestResult
 	createPRErrors          []error
 	createPRCalls           []CreatePullRequestInput
+	compareResult           *CompareBranchesResult
+	compareCalls            []CompareBranchesInput
 	updatePRTitleCalls      []UpdatePullRequestTitleInput
 	updatePRBodyCalls       []UpdatePullRequestBodyInput
 	updatePRTitleErrors     []error
@@ -2806,6 +2879,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
 	f.viewIssueCalls = append(f.viewIssueCalls, input)
 	detail := f.issueDetail
+	if f.viewIssueIndex < len(f.issueDetailResponses) {
+		detail = f.issueDetailResponses[f.viewIssueIndex]
+	}
+	f.viewIssueIndex++
 	if detail.Number == 0 {
 		detail.Number = input.IssueNumber
 	}
@@ -2837,6 +2914,14 @@ func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePul
 	}
 	f.createPRIndex++
 	return f.createPRResult, nil
+}
+
+func (f *fakeGitHubGateway) CompareBranches(_ context.Context, input CompareBranchesInput) (CompareBranchesResult, error) {
+	f.compareCalls = append(f.compareCalls, input)
+	if f.compareResult != nil {
+		return *f.compareResult, nil
+	}
+	return CompareBranchesResult{AheadBy: 1, Status: "ahead", TotalCommits: 1}, nil
 }
 
 func (f *fakeGitHubGateway) UpdatePullRequestTitle(_ context.Context, input UpdatePullRequestTitleInput) error {
