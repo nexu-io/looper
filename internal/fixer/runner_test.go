@@ -1296,6 +1296,40 @@ func TestCreateRunContextTreatsStartedRunAsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_started_run_missing_event", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO})
+	startedRun := storage.RunRecord{ID: "run_started_missing_event", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable started-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(started) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running started run", activeRun)
+	}
+}
+
 func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

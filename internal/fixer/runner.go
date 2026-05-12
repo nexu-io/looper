@@ -397,6 +397,7 @@ type ProcessResult struct {
 
 type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
+	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
 	Detail           *checkpointDetail           `json:"detail,omitempty"`
 	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
 	FixItems         []FixItem                   `json:"fixItems,omitempty"`
@@ -1107,6 +1108,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
+	checkpoint.RunStartedAt = r.nowISO()
+	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	persistedRun, err := r.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if persistedRun == nil {
+		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
+	}
+	run = *persistedRun
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -2185,6 +2198,10 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 			return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID))
 		}
 	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.RunStartedAt != "" {
+		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s", run.LoopID, run.ID))
+	}
 	if r.repos.Events != nil {
 		events, err := r.repos.Events.ListByEntity(ctx, "run", run.ID)
 		if err != nil {
@@ -2196,7 +2213,6 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 			}
 		}
 	}
-	checkpoint := parseCheckpoint(run.CheckpointJSON)
 	if checkpoint.ResumePolicy == "" {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 	}
