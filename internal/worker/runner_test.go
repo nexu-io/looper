@@ -1441,6 +1441,48 @@ func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosed(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLock(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	lockKey := "issue:acme/looper:27"
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Repo: "acme/looper", IssueNumber: 27, ExecutionMode: "create-pr", BaseBranch: "main"},
+		ClaimedLockKey: lockKey,
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume_issue_closed", LoopID: "loop_worker_1", Status: "failed", LastCompletedStep: stringPtr(string(stepPlan)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{{Number: 27, Title: "Implement worker loop", State: "CLOSED"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: claim.ID, ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() seed error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() seed = false, want persisted lock held by resumed queue item")
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "no longer an open issue") {
+		t.Fatalf("result = %#v, want skipped obsolete issue", result)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want persisted claimed lock released", lock)
+	}
+}
+
 func TestProcessClaimedItemSkipsPRCreationWhenBranchNotAhead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

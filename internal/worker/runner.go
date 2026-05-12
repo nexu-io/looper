@@ -1047,6 +1047,18 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 	} else if !isWorkerIssueTargetObsolete(err) {
 		return ProcessResult{}, false, nil
 	} else {
+		if checkpoint.ClaimedLockKey != "" {
+			lock, err := r.repos.Locks.Get(ctx, checkpoint.ClaimedLockKey)
+			if err != nil {
+				return ProcessResult{}, true, err
+			}
+			if lock != nil && lock.Owner == queueItem.ID {
+				if err := r.repos.Locks.Release(context.Background(), checkpoint.ClaimedLockKey); err != nil {
+					return ProcessResult{}, true, err
+				}
+			}
+			checkpoint.ClaimedLockKey = ""
+		}
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		summary := r.buildSuccessSummary(loop, checkpoint)
