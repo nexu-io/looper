@@ -1499,6 +1499,22 @@ func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLoc
 	if latestCheckpoint.SkipReason == "" || !strings.Contains(latestCheckpoint.SkipReason, "no longer an open issue") {
 		t.Fatalf("latestCheckpoint.SkipReason = %q, want obsolete issue skip reason", latestCheckpoint.SkipReason)
 	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil {
+		t.Fatal("queue = nil, want completed queue item")
+	}
+	if queue.TargetType != "issue" || queue.TargetID != lockKey {
+		t.Fatalf("queue target = (%q, %q), want original issue target", queue.TargetType, queue.TargetID)
+	}
+	if queue.LockKey == nil || *queue.LockKey != lockKey {
+		t.Fatalf("queue.LockKey = %#v, want original issue lock key", queue.LockKey)
+	}
+	if queue.PRNumber != nil {
+		t.Fatalf("queue.PRNumber = %#v, want nil after obsolete resume skip", queue.PRNumber)
+	}
 }
 
 func TestReacquireClaimedLockAllowsSameOwnerLiveLock(t *testing.T) {
