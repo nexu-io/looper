@@ -5595,6 +5595,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"\"pr_number\": 42",
 		"\"head_sha\": \"abc123\"",
 		"Agent-side GitHub fetch contract",
+		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification",
+		"Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
 		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
@@ -5812,6 +5814,7 @@ func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
 	for _, want := range []string{
 		"Review scope: full_pr",
 		"complete diff fetched through `gh` according to the agent-side GitHub fetch contract",
+		"canonical local checkout",
 		"supported by the fetched context",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -5824,6 +5827,20 @@ func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt still contains stale embedded-context guidance %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
+func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil)
+	for _, want := range []string{
+		"canonical local checkout",
+		"Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
 }
