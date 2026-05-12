@@ -410,6 +410,54 @@ func TestLegacyAndCanonicalFixerEnvOverridesProduceEquivalentTargets(t *testing.
 	}
 }
 
+func TestLegacyAndCanonicalReviewerEnvOverridesResolveIdenticallyAndBeatFileConfig(t *testing.T) {
+	cleanFile := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+	legacyClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, map[string]string{"LOOPER_ALLOW_AUTO_APPROVE": "true"}, nil)
+	canonicalClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, map[string]string{"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN": "APPROVE"}, nil)
+
+	if got := legacyClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := canonicalClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("canonical env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	selfReviewFile := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":false}}}}}`
+	legacySelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, map[string]string{"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true"}, nil)
+	canonicalSelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, map[string]string{"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW": "true"}, nil)
+
+	if got := reviewerEnableSelfReviewValue(t, legacySelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("legacy env reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, canonicalSelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("canonical env reviewer enableSelfReview = %v, want true", got)
+	}
+}
+
+func TestLegacyAndCanonicalReviewerCLIOverridesResolveIdenticallyAndBeatFileConfig(t *testing.T) {
+	cleanFile := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+	legacyClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, nil, []string{"--allow-auto-approve=true"})
+	canonicalClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, nil, []string{"--roles-reviewer-behavior-review-events-clean=APPROVE"})
+
+	if got := legacyClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := canonicalClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("canonical cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	selfReviewFile := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":false}}}}}`
+	legacySelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, nil, []string{"--reviewer-enable-self-review=true"})
+	canonicalSelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, nil, []string{"--roles-reviewer-discovery-triggers-enable-self-review=true"})
+
+	if got := reviewerEnableSelfReviewValue(t, legacySelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("legacy cli reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, canonicalSelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("canonical cli reviewer enableSelfReview = %v, want true", got)
+	}
+}
+
 func TestRoleEnvironmentOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
@@ -487,6 +535,28 @@ func loadConfigWithEnvFixture(t *testing.T, env map[string]string) LoadedFileCon
 
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: filepath.Join(cwd, "missing.json"), LookupEnv: mapEnvLookup(env), LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	return loaded
+}
+
+func loadConfigFromJSONWithEnvAndArgsFixture(t *testing.T, contents string, env map[string]string, args []string) LoadedFileConfig {
+	t.Helper()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	lookupEnv := emptyEnvLookup
+	if env != nil {
+		lookupEnv = mapEnvLookup(env)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: lookupEnv, Args: args, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}

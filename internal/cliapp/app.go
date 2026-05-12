@@ -91,6 +91,7 @@ type flagSpec struct {
 	valueName   string
 	description string
 	kind        flagKind
+	hidden      bool
 }
 
 type flagKind int
@@ -489,6 +490,9 @@ func addFlags(flagSet *pflag.FlagSet, flags []flagSpec) {
 		if defined != nil && flag.valueName != "" {
 			defined.Annotations = map[string][]string{"looperValueName": {flag.valueName}}
 		}
+		if defined != nil {
+			defined.Hidden = flag.hidden
+		}
 	}
 }
 
@@ -496,8 +500,16 @@ func boolFlag(name, description string) flagSpec {
 	return flagSpec{name: name, description: description, kind: flagKindBool}
 }
 
+func hiddenBoolFlag(name, description string) flagSpec {
+	return flagSpec{name: name, description: description, kind: flagKindBool, hidden: true}
+}
+
 func stringFlag(name, valueName, description string) flagSpec {
 	return flagSpec{name: name, valueName: valueName, description: description, kind: flagKindString}
+}
+
+func hiddenStringFlag(name, valueName, description string) flagSpec {
+	return flagSpec{name: name, valueName: valueName, description: description, kind: flagKindString, hidden: true}
 }
 
 func renderHelp(w io.Writer, cmd *cobra.Command, listedSubcommands []helpSubcommand) {
@@ -584,7 +596,8 @@ func collectFlags(flagSet *pflag.FlagSet) []string {
 func globalFlags() []flagSpec {
 	return []flagSpec{
 		boolFlag("json", "Emit JSON output"),
-		boolFlag("no-auto-upgrade", "Disable automatic upgrade checks for this command"),
+		hiddenBoolFlag("no-auto-upgrade", "Disable automatic upgrade checks for this command"),
+		stringFlag("package-auto-upgrade-enabled", "bool", "Enable automatic upgrade checks for this command"),
 		stringFlag("config", "path", "Config path"),
 		stringFlag("host", "host", "Server host"),
 		stringFlag("port", "port", "Server port"),
@@ -601,14 +614,27 @@ func globalFlags() []flagSpec {
 		stringFlag("worker-agent-timeout-seconds", "seconds", "Worker agent execution timeout"),
 		stringFlag("reviewer-agent-timeout-seconds", "seconds", "Reviewer agent execution timeout"),
 		stringFlag("fixer-agent-timeout-seconds", "seconds", "Fixer agent execution timeout"),
-		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
-		stringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
-		stringFlag("reviewer-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
-		stringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
-		stringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
-		stringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
-		stringFlag("reviewer-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
-		boolFlag("no-custom-instructions", "Disable custom instructions for debugging"),
+		stringFlag("roles-fixer-triggers-author-filter", "filter", "Fixer author filter: current-user or any"),
+		hiddenStringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
+		stringFlag("roles-reviewer-behavior-loop-enabled-by-default", "bool", "Enable reviewer follow-up loops by default"),
+		hiddenStringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
+		stringFlag("roles-reviewer-discovery-triggers-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
+		hiddenStringFlag("reviewer-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
+		stringFlag("roles-reviewer-behavior-review-events-clean", "event", "Reviewer event for clean runs: COMMENT, APPROVE, or REQUEST_CHANGES"),
+		hiddenStringFlag("allow-auto-approve", "bool", "Legacy alias for reviewer clean approvals"),
+		hiddenStringFlag("reviewer-clean-review-event", "event", "Reviewer event for clean runs: COMMENT, APPROVE, or REQUEST_CHANGES"),
+		stringFlag("roles-reviewer-behavior-review-events-blocking", "event", "Reviewer event for blocking findings: COMMENT, APPROVE, or REQUEST_CHANGES"),
+		hiddenStringFlag("reviewer-blocking-review-event", "event", "Reviewer event for blocking findings: COMMENT, APPROVE, or REQUEST_CHANGES"),
+		stringFlag("roles-reviewer-behavior-loop-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		hiddenStringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		stringFlag("roles-reviewer-behavior-loop-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		hiddenStringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
+		hiddenStringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
+		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
+		hiddenStringFlag("reviewer-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
+		stringFlag("instructions-enabled", "bool", "Enable custom instructions"),
+		hiddenBoolFlag("no-custom-instructions", "Disable custom instructions for debugging"),
 	}
 }
 
@@ -655,31 +681,45 @@ func (a *App) stderr() io.Writer {
 }
 
 var configFlagNames = map[string]struct{}{
-	"config":                                {},
-	"no-auto-upgrade":                       {},
-	"host":                                  {},
-	"port":                                  {},
-	"db-path":                               {},
-	"log-dir":                               {},
-	"daemon-mode":                           {},
-	"daemon-restart-policy":                 {},
-	"daemon-restart-throttle-seconds":       {},
-	"git-path":                              {},
-	"gh-path":                               {},
-	"looper-path":                           {},
-	"osascript-path":                        {},
-	"planner-agent-timeout-seconds":         {},
-	"worker-agent-timeout-seconds":          {},
-	"reviewer-agent-timeout-seconds":        {},
-	"fixer-agent-timeout-seconds":           {},
-	"fix-all-pull-requests":                 {},
-	"reviewer-loop-enabled":                 {},
-	"reviewer-enable-self-review":           {},
-	"reviewer-quiet-period-seconds":         {},
-	"reviewer-min-publish-interval-seconds": {},
-	"reviewer-max-iterations-per-pr":        {},
-	"reviewer-max-iterations-per-head":      {},
-	"no-custom-instructions":                {},
+	"config":                             {},
+	"no-auto-upgrade":                    {},
+	"package-auto-upgrade-enabled":       {},
+	"host":                               {},
+	"port":                               {},
+	"db-path":                            {},
+	"log-dir":                            {},
+	"daemon-mode":                        {},
+	"daemon-restart-policy":              {},
+	"daemon-restart-throttle-seconds":    {},
+	"git-path":                           {},
+	"gh-path":                            {},
+	"looper-path":                        {},
+	"osascript-path":                     {},
+	"planner-agent-timeout-seconds":      {},
+	"worker-agent-timeout-seconds":       {},
+	"reviewer-agent-timeout-seconds":     {},
+	"fixer-agent-timeout-seconds":        {},
+	"roles-fixer-triggers-author-filter": {},
+	"fix-all-pull-requests":              {},
+	"allow-auto-approve":                 {},
+	"roles-reviewer-behavior-review-events-clean":               {},
+	"reviewer-clean-review-event":                               {},
+	"roles-reviewer-behavior-review-events-blocking":            {},
+	"reviewer-blocking-review-event":                            {},
+	"roles-reviewer-behavior-loop-enabled-by-default":           {},
+	"reviewer-loop-enabled":                                     {},
+	"roles-reviewer-discovery-triggers-enable-self-review":      {},
+	"reviewer-enable-self-review":                               {},
+	"roles-reviewer-behavior-loop-quiet-period-seconds":         {},
+	"reviewer-quiet-period-seconds":                             {},
+	"roles-reviewer-behavior-loop-min-publish-interval-seconds": {},
+	"reviewer-min-publish-interval-seconds":                     {},
+	"roles-reviewer-behavior-loop-max-iterations-per-pr":        {},
+	"reviewer-max-iterations-per-pr":                            {},
+	"roles-reviewer-behavior-loop-max-iterations-per-head":      {},
+	"reviewer-max-iterations-per-head":                          {},
+	"instructions-enabled":                                      {},
+	"no-custom-instructions":                                    {},
 }
 
 var configBoolFlagNames = map[string]struct{}{

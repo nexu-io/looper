@@ -508,6 +508,39 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 	}
 }
 
+func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
+	t.Parallel()
+
+	got := ExtractConfigArgs([]string{
+		"status",
+		"--package-auto-upgrade-enabled=false",
+		"--roles-fixer-triggers-author-filter",
+		"any",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-discovery-triggers-enable-self-review",
+		"true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--instructions-enabled=true",
+		"--project",
+		"demo",
+	})
+
+	want := []string{
+		"--package-auto-upgrade-enabled=false",
+		"--roles-fixer-triggers-author-filter",
+		"any",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-discovery-triggers-enable-self-review",
+		"true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--instructions-enabled=true",
+	}
+
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ExtractConfigArgs() = %#v, want %#v", got, want)
+	}
+}
+
 func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
 	t.Parallel()
 
@@ -570,6 +603,36 @@ func TestStatusAcceptsReviewerEnableSelfReviewConfigOverrideFlag(t *testing.T) {
 	}
 	if stderr != "" {
 		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want empty string", stderr)
+	}
+}
+
+func TestStatusAcceptsCanonicalReviewerConfigOverrideFlags(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t,
+		"status",
+		"--roles-reviewer-discovery-triggers-enable-self-review=true",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--roles-fixer-triggers-author-filter=any",
+		"--package-auto-upgrade-enabled=false",
+		"--instructions-enabled=true",
+		"--config", configPath,
+	)
+	if exitCode != 0 {
+		t.Fatalf("Run([status canonical config flags]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status canonical config flags]) stderr = %q, want empty string", stderr)
 	}
 }
 
