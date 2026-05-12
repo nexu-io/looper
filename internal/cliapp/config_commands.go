@@ -1,7 +1,6 @@
 package cliapp
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -188,7 +187,7 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if !loaded.Metadata.ConfigFilePresent {
-		if err := r.writeConfigFile(loaded.Metadata.ConfigPath, loaded.Partial); err != nil {
+		if err := r.writeDefaultConfigTemplate(loaded.Metadata.ConfigPath, loaded.Config); err != nil {
 			return err
 		}
 	}
@@ -241,20 +240,16 @@ func (r *commandRuntime) loadRawConfigForEdit() (config.LoadedFileConfig, error)
 	if err != nil {
 		return config.LoadedFileConfig{}, err
 	}
-	raw, err := os.ReadFile(configPath)
+	partial, present, err := config.ReadPartialConfigFile(configPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return config.LoadedFileConfig{}, fmt.Errorf("failed to read config file at %s: %w", configPath, err)
-		}
+		return config.LoadedFileConfig{}, err
+	}
+	if !present {
 		full, normErr := config.Normalize(cwd)
 		if normErr != nil {
 			return config.LoadedFileConfig{}, normErr
 		}
 		return config.LoadedFileConfig{Config: full, Partial: config.PartialConfig{}, Metadata: config.LoadFileMetadata{ConfigPath: configPath, ConfigFilePresent: false}}, nil
-	}
-	var partial config.PartialConfig
-	if err := json.Unmarshal(raw, &partial); err != nil {
-		return config.LoadedFileConfig{}, fmt.Errorf("failed to read config file at %s: %w", configPath, err)
 	}
 	full, err := config.Normalize(cwd, partial)
 	if err != nil {
@@ -294,11 +289,10 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	raw, err := json.MarshalIndent(partial, "", "  ")
+	raw, err := config.MarshalConfigFile(path, partial)
 	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return err
 	}
-	raw = append(raw, '\n')
 	tmpPattern := ".config-*" + filepath.Ext(path)
 	if filepath.Ext(path) == "" {
 		tmpPattern = ".config-*.tmp"
@@ -324,6 +318,23 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+func (r *commandRuntime) writeDefaultConfigTemplate(path string, cfg config.Config) error {
+	if err := config.Validate(cfg); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	raw, err := config.MarshalConfigFile(path, cfg)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
 }

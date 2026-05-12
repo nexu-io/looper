@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
@@ -425,6 +427,101 @@ func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "Started looperd") || strings.Contains(stdout.String(), "PID file:") {
 		t.Fatalf("stdout contains daemon start chatter: %q", stdout.String())
+	}
+}
+
+func TestEnsureBootstrapConfigPreservesExplicitYAMLFormat(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "bootstrap.yaml")
+	projectPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	created, projectAdded, err := runtime.ensureBootstrapConfig(configPath, t.TempDir(), bootstrapConfigPlan{ProjectPath: projectPath})
+	if err != nil {
+		t.Fatalf("ensureBootstrapConfig() error = %v", err)
+	}
+	if !created {
+		t.Fatal("ensureBootstrapConfig() created = false, want true")
+	}
+	if !projectAdded {
+		t.Fatal("ensureBootstrapConfig() projectAdded = false, want true")
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{"server:", "daemon:", "storage:", "defaults:", "roles:", "projects:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("bootstrap YAML = %q, want to contain %q", text, want)
+		}
+	}
+	if strings.Contains(text, "\"server\"") || strings.Contains(text, "reviewer:") && !strings.Contains(text, "roles:") {
+		t.Fatalf("bootstrap YAML = %q, want canonical structured format", text)
+	}
+
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if len(loaded.Config.Projects) != 1 || loaded.Config.Projects[0].RepoPath != projectPath {
+		t.Fatalf("loaded projects = %#v, want bootstrap project for %q", loaded.Config.Projects, projectPath)
+	}
+}
+
+func TestBootstrapDefaultPathReusesExistingLegacyDefaultConfig(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("MkdirAll(looperHome) error = %v", err)
+	}
+	legacyPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(legacyPath, []byte(`{"notifications":{"osascript":{"enabled":false}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(legacyPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	resolvedPath, err := runtime.resolveBootstrapConfigPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolveBootstrapConfigPath() error = %v", err)
+	}
+	if resolvedPath != legacyPath {
+		t.Fatalf("resolveBootstrapConfigPath() = %q, want %q", resolvedPath, legacyPath)
+	}
+
+	created, projectAdded, err := runtime.ensureBootstrapConfig(resolvedPath, t.TempDir(), bootstrapConfigPlan{})
+	if err != nil {
+		t.Fatalf("ensureBootstrapConfig() error = %v", err)
+	}
+	if created || projectAdded {
+		t.Fatalf("ensureBootstrapConfig() = (created=%t, projectAdded=%t), want both false", created, projectAdded)
+	}
+	if _, err := os.Stat(filepath.Join(looperHome, "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("config.toml existence err = %v, want not exists", err)
+	}
+}
+
+func TestBootstrapDefaultPathPrefersCanonicalTOMLWhenNoDefaultExists(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	resolvedPath, err := runtime.resolveBootstrapConfigPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolveBootstrapConfigPath() error = %v", err)
+	}
+	want := filepath.Join(homeDir, ".looper", "config.toml")
+	if resolvedPath != want {
+		t.Fatalf("resolveBootstrapConfigPath() = %q, want %q", resolvedPath, want)
 	}
 }
 

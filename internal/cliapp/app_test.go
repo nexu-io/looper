@@ -1312,6 +1312,84 @@ EOF
 	}
 }
 
+func TestConfigEditCreatesCanonicalTemplateAtSelectedTOMLPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "generated.toml")
+	editorPath := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write editor script: %v", err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	exitCode, stdout, stderr := runApp(t, "config", "edit", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config edit --config generated.toml]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid: "+configPath) {
+		t.Fatalf("stdout = %q, want config-valid output for %q", stdout, configPath)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{"[server]", "[daemon]", "[storage]", "[defaults]", "[instructions]", "[roles.planner]"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated TOML = %q, want to contain %q", text, want)
+		}
+	}
+	if strings.Contains(text, "[reviewer]") {
+		t.Fatalf("generated TOML = %q, did not expect legacy reviewer root", text)
+	}
+
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+}
+
+func TestConfigSetPreservesSelectedYAMLFormat(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "selected.yaml")
+	exitCode, stdout, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set ... --config selected.yaml]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Set defaults.allowRiskyFixes in "+configPath) {
+		t.Fatalf("stdout = %q, want set confirmation for %q", stdout, configPath)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "defaults:") || !strings.Contains(text, "allowRiskyFixes: true") {
+		t.Fatalf("generated YAML = %q, want defaults.allowRiskyFixes field", text)
+	}
+	if strings.Contains(text, "\"defaults\"") {
+		t.Fatalf("generated YAML = %q, did not expect JSON formatting", text)
+	}
+
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Defaults.AllowRiskyFixes {
+		t.Fatalf("loaded config allowRiskyFixes = %t, want true", loaded.Config.Defaults.AllowRiskyFixes)
+	}
+}
+
 func invalidOsascriptNotificationConfigPayload(allowRiskyFixes bool) map[string]any {
 	return map[string]any{
 		"notifications": map[string]any{
