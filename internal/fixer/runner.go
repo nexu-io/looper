@@ -1088,6 +1088,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
+	checkpoint.RunStartedAt = r.nowISO()
+	checkpoint.RunStartedRunID = run.ID
+	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	persistedRun, err := r.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if persistedRun == nil {
+		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
+	}
+	run = *persistedRun
 	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
@@ -1109,19 +1122,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
-	checkpoint.RunStartedAt = r.nowISO()
-	checkpoint.RunStartedRunID = run.ID
-	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
-		return ProcessResult{}, err
-	}
-	persistedRun, err := r.repos.Runs.GetByID(ctx, run.ID)
-	if err != nil {
-		return ProcessResult{}, err
-	}
-	if persistedRun == nil {
-		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
-	}
-	run = *persistedRun
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})

@@ -1168,6 +1168,10 @@ func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *
 	if latest.CurrentStep == nil || *latest.CurrentStep != string(stepDiscoverPR) {
 		t.Fatalf("latest.CurrentStep = %#v, want discover-pr", latest.CurrentStep)
 	}
+	checkpoint := parseCheckpoint(latest.CheckpointJSON)
+	if checkpoint.RunStartedAt == "" || checkpoint.RunStartedRunID != latest.ID {
+		t.Fatalf("checkpoint start marker = (%q, %q), want current run marker", checkpoint.RunStartedAt, checkpoint.RunStartedRunID)
+	}
 	events, err := fixture.repos.Events.ListByEntity(context.Background(), "run", latest.ID)
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
