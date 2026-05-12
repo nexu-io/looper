@@ -74,6 +74,7 @@ type defaultSchedulerTickInput struct {
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
 	AsyncRunner              schedulerAsyncRunner
+	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
@@ -704,7 +705,7 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
+func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time) RunSchedulerTickFunc {
 	if now == nil {
 		now = time.Now
 	}
@@ -944,6 +945,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Now:                      now,
 			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
 			AsyncRunner:              runner,
+			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
@@ -1015,6 +1017,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			errs = append(errs, err)
 		}
 	}
+	discoveredRunnableIDs := make(map[string]struct{})
+	trackRunnableDiscovery := func(queueItems []storage.QueueItemRecord) {
+		for _, id := range runnableSchedulerQueueItemIDs(queueItems, now) {
+			discoveredRunnableIDs[id] = struct{}{}
+		}
+	}
 
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
 	if err != nil {
@@ -1022,7 +1030,8 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		availableSlots = 0
 	}
 	if availableSlots > 0 && input.Repos.Queue != nil {
-		appendErr(claimAndRunScheduledQueueItems(ctx, availableSlots, input))
+		_, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		appendErr(err)
 	}
 
 	projectsList, err := input.Repos.Projects.List(ctx)
@@ -1045,28 +1054,56 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
-			_, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("planner discovery", project.ID, repo, err))
 		} else if input.Planner != nil && input.Logger != nil {
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
-			_, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("reviewer discovery", project.ID, repo, err))
 		} else if input.Reviewer != nil && input.Logger != nil {
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			_, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("fixer discovery", project.ID, repo, err))
 		} else if input.Fixer != nil && input.Logger != nil {
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			_, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		}
+	}
+
+	availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+	if err != nil {
+		appendErr(err)
+		availableSlots = 0
+	}
+	if availableSlots > 0 && input.Repos.Queue != nil {
+		claimedItems, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		appendErr(err)
+		requestWakeForClaimedDiscovery(claimedItems, discoveredRunnableIDs, input.RequestSchedulerWake)
+	}
+
+	for _, project := range projectsList {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if project.Archived {
+			continue
+		}
+		repo := repoFromProjectMetadata(project.MetadataJSON)
+		if repo == "" {
+			continue
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
 			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
@@ -1090,6 +1127,35 @@ func discoveryEnabled(value *bool) bool {
 	return value == nil || *value
 }
 
+func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now func() time.Time) []string {
+	if len(queueItems) == 0 {
+		return nil
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	ids := make([]string, 0, len(queueItems))
+	for _, item := range queueItems {
+		if item.Status == "queued" && item.AvailableAt <= nowISO {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
+}
+
+func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discoveredRunnableIDs map[string]struct{}, requestWake func()) {
+	if requestWake == nil || len(claimedItems) == 0 || len(discoveredRunnableIDs) == 0 {
+		return
+	}
+	for _, item := range claimedItems {
+		if _, ok := discoveredRunnableIDs[item.ID]; ok {
+			requestWake()
+			return
+		}
+	}
+}
+
 func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, maxConcurrentRuns int) (int, error) {
 	if repos == nil || repos.Queue == nil {
 		return 0, nil
@@ -1108,9 +1174,9 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
-func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) error {
+func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
-		return nil
+		return nil, nil
 	}
 	now := input.Now
 	if now == nil {
@@ -1120,18 +1186,18 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return queueItems, err
 		}
 		item, err := input.Repos.Queue.ClaimNext(ctx, nowISO, "scheduler")
 		if err != nil {
-			return err
+			return queueItems, err
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	return runScheduledQueueItems(ctx, queueItems, input)
+	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {

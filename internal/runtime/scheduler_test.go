@@ -153,6 +153,197 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	}
 }
 
+func TestRunDefaultSchedulerTickClaimsWorkerDiscoveredDuringTickBeforeSweeper(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-discovered-worker.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	workerRunner := &discoveringWorkerScheduler{repos: repos, nowISO: nowISO, item: schedulerTestQueueItem("queue_worker_discovered", "worker", nowISO)}
+	sweeperRunner := &assertingSweeperScheduler{t: t, beforeDiscover: func() {
+		if workerRunner.processItemCount() != 1 {
+			t.Fatalf("sweeper discovery started before discovered worker was claimed; processed workers = %d, want 1", workerRunner.processItemCount())
+		}
+	}}
+
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 1,
+		AsyncRunner:       immediateSchedulerRunner{},
+		Worker:            workerRunner,
+		Sweeper:           sweeperRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if workerRunner.processItemCount() != 1 {
+		t.Fatalf("worker processed items = %#v, want discovered worker claimed before tick returned", workerRunner.processedItems)
+	}
+	if sweeperRunner.issueCalls != 1 {
+		t.Fatalf("sweeper issue discovery calls = %d, want 1", sweeperRunner.issueCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickSecondClaimPassDoesNotExceedAvailableSlots(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-second-pass-slots.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	queued := schedulerTestQueueItem("queue_worker_existing", "worker", nowISO)
+	if err := repos.Queue.Upsert(context.Background(), queued); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	discovered := schedulerTestQueueItem("queue_worker_discovered", "worker", nowISO)
+	workerRunner := &discoveringWorkerScheduler{repos: repos, nowISO: nowISO, item: discovered}
+	var wakes int32
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                repos,
+		Now:                  func() time.Time { return now },
+		MaxConcurrentRuns:    1,
+		AsyncRunner:          immediateSchedulerRunner{},
+		RequestSchedulerWake: func() { atomic.AddInt32(&wakes, 1) },
+		Worker:               workerRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if workerRunner.processItemCount() != 1 || workerRunner.processedItems[0] != queued.ID {
+		t.Fatalf("worker processed items = %#v, want only first-pass item", workerRunner.processedItems)
+	}
+	item, err := repos.Queue.GetByID(context.Background(), discovered.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if item == nil || item.Status != "queued" {
+		t.Fatalf("discovered item = %#v, want still queued because first-pass run used the only slot", item)
+	}
+	if got := atomic.LoadInt32(&wakes); got != 0 {
+		t.Fatalf("scheduler wake requests = %d, want none when discovered work could not be claimed", got)
+	}
+}
+
+func TestRunDefaultSchedulerTickSecondClaimPassDoesNotDoubleClaim(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-no-double-claim.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	queued := schedulerTestQueueItem("queue_worker_existing", "worker", nowISO)
+	if err := repos.Queue.Upsert(context.Background(), queued); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	workerRunner := &stubWorkerScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 2,
+		AsyncRunner:       immediateSchedulerRunner{},
+		Worker:            workerRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if workerRunner.processItemCount() != 1 || workerRunner.processedItems[0] != queued.ID {
+		t.Fatalf("worker processed items = %#v, want existing item exactly once", workerRunner.processedItems)
+	}
+}
+
+func TestRunDefaultSchedulerTickSecondClaimPassPreservesQueueEligibilityRules(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-second-pass-eligibility.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	lockKey := "repo:nexu-io/looper"
+	lockedA := schedulerTestQueueItem("queue_worker_lock_a", "worker", nowISO)
+	lockedA.LockKey = &lockKey
+	lockedB := schedulerTestQueueItem("queue_worker_lock_b", "worker", nowISO)
+	lockedB.LockKey = &lockKey
+	repo := "nexu-io/looper"
+	pr := int64(281)
+	reviewerItem := schedulerTestQueueItem("queue_reviewer_pr", "reviewer", nowISO)
+	reviewerItem.Repo = &repo
+	reviewerItem.PRNumber = &pr
+	fixerItem := schedulerTestQueueItem("queue_fixer_pr", "fixer", nowISO)
+	fixerItem.Repo = &repo
+	fixerItem.PRNumber = &pr
+
+	plannerRunner := &enqueueingPlannerScheduler{repos: repos, items: []storage.QueueItemRecord{lockedA, lockedB}}
+	reviewerRunner := &enqueueingReviewerScheduler{repos: repos, item: reviewerItem}
+	fixerRunner := &enqueueingFixerScheduler{repos: repos, item: fixerItem}
+	workerRunner := &stubWorkerScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 4,
+		AsyncRunner:       immediateSchedulerRunner{},
+		Planner:           plannerRunner,
+		Reviewer:          reviewerRunner,
+		Fixer:             fixerRunner,
+		Worker:            workerRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if workerRunner.processItemCount() != 1 {
+		t.Fatalf("worker processed items = %#v, want one of two same-lock discovered workers", workerRunner.processedItems)
+	}
+	if reviewerRunner.processItemCount() != 1 {
+		t.Fatalf("reviewer processed items = %#v, want reviewer claimed", reviewerRunner.processedItems)
+	}
+	if fixerRunner.processItemCount() != 0 {
+		t.Fatalf("fixer processed items = %#v, want fixer gated behind reviewer", fixerRunner.processedItems)
+	}
+}
+
+func TestRunDefaultSchedulerTickDiscoveryWakeIsBounded(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-wake-bounded.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	var wakes int32
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       4,
+		RequestSchedulerWake:    func() { atomic.AddInt32(&wakes, 1) },
+		Planner:                 &enqueueingPlannerScheduler{repos: repos, items: []storage.QueueItemRecord{schedulerTestQueueItem("queue_worker_from_planner_a", "worker", nowISO), schedulerTestQueueItem("queue_worker_from_planner_b", "worker", nowISO)}},
+		Reviewer:                &enqueueingReviewerScheduler{repos: repos, item: schedulerTestQueueItem("queue_reviewer_wake", "reviewer", nowISO)},
+		Fixer:                   &enqueueingFixerScheduler{repos: repos, item: schedulerTestQueueItem("queue_fixer_wake", "fixer", nowISO)},
+		Worker:                  &discoveringWorkerScheduler{repos: repos, nowISO: nowISO, item: schedulerTestQueueItem("queue_worker_wake", "worker", nowISO)},
+		SweeperDiscoveryEnabled: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&wakes); got != 1 {
+		t.Fatalf("scheduler wake requests = %d, want one coalesced wake for repeated enqueue events", got)
+	}
+}
+
 func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	t.Parallel()
 
@@ -258,7 +449,7 @@ func TestClaimAndRunScheduledQueueItemsBackfillsAvailableSlots(t *testing.T) {
 	}
 
 	workerRunner := &stubWorkerScheduler{}
-	if err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+	if _, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
 		Repos:  repos,
 		Now:    func() time.Time { return now },
 		Worker: workerRunner,
@@ -630,6 +821,98 @@ type stubPlannerScheduler struct {
 	processedItems []string
 	discoverErr    error
 	processErr     error
+}
+
+type immediateSchedulerRunner struct{}
+
+func (immediateSchedulerRunner) Go(fn func()) { fn() }
+
+func insertSchedulerProject(t *testing.T, repos *storage.Repositories, workingDir, nowISO string) {
+	t.Helper()
+	baseBranch := "main"
+	projectMetadata := `{"repo":"nexu-io/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+}
+
+func schedulerTestQueueItem(id, queueType, nowISO string) storage.QueueItemRecord {
+	projectID := "looper"
+	return storage.QueueItemRecord{ID: id, ProjectID: &projectID, Type: queueType, TargetType: "project", TargetID: "project:looper", Repo: stringPtr("nexu-io/looper"), DedupeKey: "dedupe:" + id, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+}
+
+type enqueueingPlannerScheduler struct {
+	stubPlannerScheduler
+	repos *storage.Repositories
+	items []storage.QueueItemRecord
+}
+
+func (s *enqueueingPlannerScheduler) DiscoverIssues(ctx context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.stubPlannerScheduler.DiscoverIssues(ctx, input)
+	for _, item := range s.items {
+		if err := s.repos.Queue.Upsert(ctx, item); err != nil {
+			return planner.DiscoveryResult{}, err
+		}
+	}
+	return planner.DiscoveryResult{QueueItems: append([]storage.QueueItemRecord(nil), s.items...)}, nil
+}
+
+type enqueueingReviewerScheduler struct {
+	stubReviewerScheduler
+	repos *storage.Repositories
+	item  storage.QueueItemRecord
+}
+
+func (s *enqueueingReviewerScheduler) DiscoverPullRequests(ctx context.Context, input reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error) {
+	s.stubReviewerScheduler.DiscoverPullRequests(ctx, input)
+	if err := s.repos.Queue.Upsert(ctx, s.item); err != nil {
+		return reviewer.DiscoveryResult{}, err
+	}
+	return reviewer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
+}
+
+type enqueueingFixerScheduler struct {
+	stubFixerScheduler
+	repos *storage.Repositories
+	item  storage.QueueItemRecord
+}
+
+func (s *enqueueingFixerScheduler) DiscoverPullRequests(ctx context.Context, input fixer.DiscoveryInput) (fixer.DiscoveryResult, error) {
+	s.stubFixerScheduler.DiscoverPullRequests(ctx, input)
+	if err := s.repos.Queue.Upsert(ctx, s.item); err != nil {
+		return fixer.DiscoveryResult{}, err
+	}
+	return fixer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
+}
+
+type discoveringWorkerScheduler struct {
+	stubWorkerScheduler
+	repos  *storage.Repositories
+	nowISO string
+	item   storage.QueueItemRecord
+}
+
+func (s *discoveringWorkerScheduler) DiscoverIssues(ctx context.Context, input worker.DiscoveryInput) (worker.DiscoveryResult, error) {
+	s.stubWorkerScheduler.DiscoverIssues(ctx, input)
+	if err := s.repos.Queue.Upsert(ctx, s.item); err != nil {
+		return worker.DiscoveryResult{}, err
+	}
+	return worker.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
+}
+
+type assertingSweeperScheduler struct {
+	stubSweeperScheduler
+	t              *testing.T
+	beforeDiscover func()
+	issueCalls     int
+}
+
+func (s *assertingSweeperScheduler) DiscoverIssues(ctx context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
+	if s.beforeDiscover != nil {
+		s.beforeDiscover()
+	}
+	s.issueCalls++
+	return s.stubSweeperScheduler.DiscoverIssues(ctx, input)
 }
 
 type queueStatusCheckingPlannerScheduler struct {
