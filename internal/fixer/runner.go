@@ -66,8 +66,13 @@ const (
 
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
-	defaultRetryDelay   = 5 * time.Second
-	defaultRetryMax     = 3
+	// defaultLegacyMarkerlessRunGrace protects running fixer runs that predate
+	// durable start/pre-start checkpoint markers during rollout. It must be much
+	// longer than claim TTL because non-agent fixer steps may legitimately run
+	// longer than a queue claim window without an active agent execution.
+	defaultLegacyMarkerlessRunGrace = 24 * time.Hour
+	defaultRetryDelay               = 5 * time.Second
+	defaultRetryMax                 = 3
 )
 
 type FixItem struct {
@@ -2238,8 +2243,8 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 	if r.preStartMarkerActive(checkpoint, run) {
 		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s in pre-start checks", run.LoopID, run.ID))
 	}
-	if r.freshMarkerlessRunningRunActive(checkpoint, run) {
-		return activeFixerRunError(fmt.Sprintf("loop %s already has a freshly-created running fixer run %s", run.LoopID, run.ID))
+	if r.markerlessRunningRunActive(checkpoint, run) {
+		return activeFixerRunError(fmt.Sprintf("loop %s already has a markerless running fixer run %s", run.LoopID, run.ID))
 	}
 	if checkpoint.ResumePolicy == "" {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
@@ -2277,11 +2282,31 @@ func (r *Runner) preStartMarkerActive(checkpoint fixerCheckpoint, run storage.Ru
 	return timestampWithin(checkpoint.RunPreStartAt, r.now(), r.claimTTL)
 }
 
-func (r *Runner) freshMarkerlessRunningRunActive(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
-	if checkpoint.RunStartedAt != "" || checkpoint.RunPreStartAt != "" {
+func (r *Runner) markerlessRunningRunActive(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
+	if checkpoint.RunStartedAt != "" || checkpoint.RunStartedRunID != "" || checkpoint.RunPreStartAt != "" || checkpoint.RunPreStartRunID != "" {
 		return false
 	}
-	return timestampWithin(firstNonEmpty(run.CreatedAt, run.StartedAt), r.now(), r.claimTTL)
+	return timestampWithin(freshestTimestamp(derefString(run.LastHeartbeatAt), run.UpdatedAt, run.StartedAt, run.CreatedAt), r.now(), defaultLegacyMarkerlessRunGrace)
+}
+
+func freshestTimestamp(values ...string) string {
+	var freshest time.Time
+	var freshestRaw string
+	for _, raw := range values {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		timestamp, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			continue
+		}
+		if freshestRaw == "" || timestamp.After(freshest) {
+			freshest = timestamp
+			freshestRaw = raw
+		}
+	}
+	return freshestRaw
 }
 
 func timestampWithin(raw string, now time.Time, ttl time.Duration) bool {
