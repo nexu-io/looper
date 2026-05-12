@@ -30,6 +30,7 @@ type LoadedFileConfig struct {
 	Config   Config
 	Metadata LoadFileMetadata
 	Partial  PartialConfig
+	Warnings []string
 }
 
 type LoadFileOptions struct {
@@ -105,6 +106,9 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
+	fileWarnings := collectMixedSchemaWarnings(partialConfig)
+	envWarnings := collectMixedSchemaWarnings(envOverrides)
+	cliWarnings := collectMixedSchemaWarnings(parsedCLI.overrides)
 	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
 	if err != nil {
 		return LoadedFileConfig{}, err
@@ -126,8 +130,9 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	return LoadedFileConfig{
-		Config:  config,
-		Partial: partialConfig,
+		Config:   config,
+		Partial:  partialConfig,
+		Warnings: dedupeWarnings(fileWarnings, envWarnings, cliWarnings),
 		Metadata: LoadFileMetadata{
 			ConfigPath:        resolvedConfigPath,
 			ConfigFilePresent: present,

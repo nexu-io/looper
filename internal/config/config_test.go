@@ -458,6 +458,94 @@ func TestLegacyAndCanonicalReviewerCLIOverridesResolveIdenticallyAndBeatFileConf
 	}
 }
 
+func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
+	testCases := []struct {
+		name         string
+		fileName     string
+		contents     string
+		assertConfig func(t *testing.T, loaded LoadedFileConfig)
+		wantWarnings []string
+	}{
+		{
+			name:     "legacy reviewer root loses to canonical behavior",
+			fileName: "config.json",
+			contents: `{"reviewer":{"reviewEvents":{"clean":"APPROVE"}},"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+					t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventComment)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "reviewer" is accepted for now; use "roles.reviewer.behavior" instead`},
+		},
+		{
+			name:     "legacy reviewer discovery root loses to canonical discovery",
+			fileName: "config.toml",
+			contents: "[roles.reviewer]\nautoDiscovery = false\n\n[roles.reviewer.discovery]\nautoDiscovery = true\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if !loaded.Config.Roles.Reviewer.Discovery.AutoDiscovery {
+					t.Fatal("reviewer discovery autoDiscovery = false, want true")
+				}
+			},
+			wantWarnings: []string{`deprecated config path "roles.reviewer.autoDiscovery" is accepted for now; use "roles.reviewer.discovery.autoDiscovery" instead`},
+		},
+		{
+			name:     "legacy defaults alias loses to canonical fixer target",
+			fileName: "config.yaml",
+			contents: "defaults:\n  fixAllPullRequests: true\nroles:\n  fixer:\n    triggers:\n      authorFilter: current_user\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+					t.Fatalf("fixer authorFilter = %q, want %q", got, FixerAuthorFilterCurrentUser)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "defaults.fixAllPullRequests" is accepted for now; use "roles.fixer.triggers.authorFilter" instead`},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			loaded := loadConfigFixture(t, tc.fileName, tc.contents, nil, nil)
+			tc.assertConfig(t, loaded)
+			assertWarningsEqual(t, loaded.Warnings, tc.wantWarnings)
+		})
+	}
+}
+
+func TestMixedSchemaEnvAndCLIOverridesStillBeatFileBackedValues(t *testing.T) {
+	file := `{"defaults":{"allowAutoApprove":true},"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+
+	envLoaded := loadConfigFixture(t, "config.json", file, map[string]string{"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN": "APPROVE"}, nil)
+	if got := envLoaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	assertWarningsEqual(t, envLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
+
+	cliLoaded := loadConfigFixture(t, "config.json", file, nil, []string{"--roles-reviewer-behavior-review-events-clean=APPROVE"})
+	if got := cliLoaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	assertWarningsEqual(t, cliLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
+}
+
+func TestMixedSchemaConfigRejectsStructurallyIncompatibleTargets(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"reviewer":{"reviewEvents":{"clean":"APPROVE"}},"roles":{"reviewer":{"behavior":{"reviewEvents":"COMMENT"}}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `reviewEvents`) {
+		t.Fatalf("LoadFile() error = %q, want reviewEvents incompatibility", err)
+	}
+}
+
 func TestRoleEnvironmentOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
@@ -515,14 +603,24 @@ func reflectStringSlicesEqual(left, right []string) bool {
 
 func loadConfigFromJSONFixture(t *testing.T, contents string) LoadedFileConfig {
 	t.Helper()
+	return loadConfigFixture(t, "config.json", contents, nil, nil)
+}
+
+func loadConfigFixture(t *testing.T, fileName string, contents string, env map[string]string, args []string) LoadedFileConfig {
+	t.Helper()
 
 	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
+	configPath := filepath.Join(cwd, fileName)
 	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	lookupEnv := emptyEnvLookup
+	if env != nil {
+		lookupEnv = mapEnvLookup(env)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: lookupEnv, Args: args, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -544,24 +642,14 @@ func loadConfigWithEnvFixture(t *testing.T, env map[string]string) LoadedFileCon
 
 func loadConfigFromJSONWithEnvAndArgsFixture(t *testing.T, contents string, env map[string]string, args []string) LoadedFileConfig {
 	t.Helper()
+	return loadConfigFixture(t, "config.json", contents, env, args)
+}
 
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
+func assertWarningsEqual(t *testing.T, got []string, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("warnings = %#v, want %#v", got, want)
 	}
-
-	lookupEnv := emptyEnvLookup
-	if env != nil {
-		lookupEnv = mapEnvLookup(env)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: lookupEnv, Args: args, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-
-	return loaded
 }
 
 func roleConfigMapFromRoles(t *testing.T, roles any, role string) (map[string]any, bool) {
