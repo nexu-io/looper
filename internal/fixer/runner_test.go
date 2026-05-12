@@ -1258,6 +1258,44 @@ func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateRunContextInterruptsOrphanWithTerminalAgentExecution(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_terminal_agent_execution", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	orphan := storage.RunRecord{ID: "run_terminal_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := orphan.ID
+	loopID := loop.ID
+	endedAt := nowISO
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_terminal_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "completed", StartedAt: nowISO, EndedAt: &endedAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted terminal-execution orphan", oldRun)
+	}
+}
+
 func TestProcessClaimedQueueItemRequeuesWhenActiveRunHasAgentExecution(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

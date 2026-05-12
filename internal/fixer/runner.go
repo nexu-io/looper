@@ -2198,7 +2198,7 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 		if err != nil {
 			return err
 		}
-		if execution != nil {
+		if execution != nil && isActiveAgentExecutionStatus(execution.Status) {
 			return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s with agent execution %s", run.LoopID, run.ID, execution.ID))
 		}
 	}
@@ -2226,6 +2226,15 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 
 func activeFixerRunError(message string) error {
 	return &loopError{message: message, kind: FailureRetryableTransient}
+}
+
+func isActiveAgentExecutionStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "running", "cancelling":
+		return true
+	default:
+		return false
+	}
 }
 
 func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
