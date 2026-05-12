@@ -4012,9 +4012,7 @@ func (r *Runner) verifyFixEvidence(ctx context.Context, input stepInput, checkpo
 			return false, err
 		}
 	} else if branch := strings.TrimSpace(liveDetail.HeadRefName); branch != "" {
-		if err := r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", branch); err != nil {
-			return false, &loopError{message: fmt.Sprintf("failed to fetch live PR head for evidence verification: %v", err), kind: FailureRetryableTransient}
-		}
+		_ = r.git.FetchBranch(ctx, input.Project.RepoPath, "origin", branch)
 	}
 	ancestor, err := r.git.IsAncestor(ctx, input.Project.RepoPath, evidence.HeadSHA, liveHeadSHA)
 	if err != nil {
