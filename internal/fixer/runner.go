@@ -399,6 +399,8 @@ type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
 	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
 	RunStartedRunID  string                      `json:"runStartedRunId,omitempty"`
+	RunPreStartAt    string                      `json:"runPreStartAt,omitempty"`
+	RunPreStartRunID string                      `json:"runPreStartRunId,omitempty"`
 	Detail           *checkpointDetail           `json:"detail,omitempty"`
 	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
 	FixItems         []FixItem                   `json:"fixItems,omitempty"`
@@ -1088,8 +1090,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
-	checkpoint.RunStartedAt = r.nowISO()
-	checkpoint.RunStartedRunID = run.ID
+	checkpoint.RunPreStartAt = r.nowISO()
+	checkpoint.RunPreStartRunID = run.ID
 	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
@@ -1122,6 +1124,21 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
+	checkpoint.RunStartedAt = r.nowISO()
+	checkpoint.RunStartedRunID = run.ID
+	checkpoint.RunPreStartAt = ""
+	checkpoint.RunPreStartRunID = ""
+	if err := r.persistCheckpoint(ctx, run.ID, resumedRun.StartStep, checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	persistedRun, err = r.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if persistedRun == nil {
+		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
+	}
+	run = *persistedRun
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -2170,6 +2187,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	initialCheckpoint.RunStartedAt = ""
 	initialCheckpoint.RunStartedRunID = ""
+	initialCheckpoint.RunPreStartAt = ""
+	initialCheckpoint.RunPreStartRunID = ""
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed {
@@ -2209,6 +2228,9 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 	if checkpointStartedCurrentRun(checkpoint, run) {
 		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s", run.LoopID, run.ID))
 	}
+	if r.preStartMarkerActive(checkpoint, run) {
+		return activeFixerRunError(fmt.Sprintf("loop %s already has a running fixer run %s in pre-start checks", run.LoopID, run.ID))
+	}
 	if r.repos.Events != nil {
 		events, err := r.repos.Events.ListByEntity(ctx, "run", run.ID)
 		if err != nil {
@@ -2239,6 +2261,28 @@ func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunReco
 		return checkpoint.RunStartedRunID == run.ID
 	}
 	return !timestampBefore(checkpoint.RunStartedAt, firstNonEmpty(run.CreatedAt, run.StartedAt))
+}
+
+func (r *Runner) preStartMarkerActive(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
+	if checkpoint.RunPreStartAt == "" {
+		return false
+	}
+	if checkpoint.RunPreStartRunID != "" && checkpoint.RunPreStartRunID != run.ID {
+		return false
+	}
+	return timestampWithin(checkpoint.RunPreStartAt, r.now(), r.claimTTL)
+}
+
+func timestampWithin(raw string, now time.Time, ttl time.Duration) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || ttl <= 0 {
+		return false
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return false
+	}
+	return !timestamp.After(now) && now.Sub(timestamp) <= ttl
 }
 
 func timestampBefore(raw, floor string) bool {
