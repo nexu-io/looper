@@ -4111,6 +4111,40 @@ func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T)
 	}
 }
 
+func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "looper-worktrees")
+	outsidePath := filepath.Join(t.TempDir(), "outside", "wt")
+	git := &fakeGitGateway{worktreePath: filepath.Join(worktreeRoot, "wt")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: outsidePath, Branch: "stale", BaseBranch: "main", PreparedAt: "stale"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.worktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if got := git.createCalls[0].WorktreeRoot; got != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", got, worktreeRoot)
+	}
+}
+
 func TestReviewerWorktreeBranchIgnoresHeadRefName(t *testing.T) {
 	t.Parallel()
 
@@ -4133,7 +4167,7 @@ func TestReviewerWorktreeBranchIgnoresHeadRefName(t *testing.T) {
 func TestRunReviewStepRepreparesMissingReviewerWorktree(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{worktreePath: filepath.Join(t.TempDir(), "reviewer-worktree")}
+	git := &fakeGitGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -4462,8 +4496,8 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 	if retryResult.Status != "success" {
 		t.Fatalf("retry result = %#v, want success", retryResult)
 	}
-	if len(git.createCalls) != 2 || len(git.prepareCalls) != 2 {
-		t.Fatalf("createCalls=%d prepareCalls=%d, want 2 each", len(git.createCalls), len(git.prepareCalls))
+	if len(git.createCalls) != 3 || len(git.prepareCalls) != 3 {
+		t.Fatalf("createCalls=%d prepareCalls=%d, want 3 each", len(git.createCalls), len(git.prepareCalls))
 	}
 	if len(agent.starts) != 2 {
 		t.Fatalf("len(agent.starts) = %d, want 2", len(agent.starts))
@@ -6637,7 +6671,7 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	f.createCalls = append(f.createCalls, input)
 	path := f.worktreePath
 	if path == "" {
-		path = filepath.Join("/tmp", "reviewer-worktree")
+		path = filepath.Join(input.WorktreeRoot, "reviewer-worktree")
 		f.worktreePath = path
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {

@@ -1637,7 +1637,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		worktreeRoot = resolvedRoot
 	}
 	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 		} else if reviewerWorktreePrepared(checkpoint) {
@@ -2148,7 +2148,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
 	if reviewerWorktreePrepared(checkpoint) {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath}); err != nil {
+		worktreeRoot, rootErr := reviewerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 		}
