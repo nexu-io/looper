@@ -1975,7 +1975,7 @@ func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *
 	}
 }
 
-func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()

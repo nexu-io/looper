@@ -198,6 +198,9 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	}
 
 	worktreePath := filepath.Join(input.WorktreeRoot, buildWorktreeDirectoryName(input))
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
 
 	restored, err := g.RestoreWorktree(ctx, RestoreWorktreeInput{

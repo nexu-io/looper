@@ -42,6 +42,39 @@ func TestValidateRejectsSiblingPrefixOutsideRoot(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsRepoPathThroughSymlink(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	link := filepath.Join(t.TempDir(), "repo-link")
+	if err := os.Symlink(repoPath, link); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	if err := Validate(CheckInput{WorktreePath: link, RepoPath: repoPath}); err == nil {
+		t.Fatal("Validate() error = nil, want repo path rejection")
+	}
+}
+
+func TestValidateAllowsExistingWorktreeUnderSymlinkedRoot(t *testing.T) {
+	t.Parallel()
+
+	realRoot := filepath.Join(t.TempDir(), "real-worktrees")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(realRoot) error = %v", err)
+	}
+	symlinkRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.Symlink(realRoot, symlinkRoot); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	worktreePath := filepath.Join(symlinkRoot, "existing-worktree")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktreePath) error = %v", err)
+	}
+	if err := Validate(CheckInput{WorktreePath: worktreePath, RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: realRoot}); err != nil {
+		t.Fatalf("Validate() error = %v, want existing symlinked child accepted", err)
+	}
+}
+
 func TestValidateRejectsSymlinkDotDotEscape(t *testing.T) {
 	t.Parallel()
 

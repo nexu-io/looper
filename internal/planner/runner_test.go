@@ -264,7 +264,7 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 	}
 }
 
-func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()
