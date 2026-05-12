@@ -1647,6 +1647,53 @@ func TestLoadFileLoadsSupportedConfigFormats(t *testing.T) {
 	}
 }
 
+func TestLoadFileNullEmptyAndOmittedShapesProduceEquivalentDefaultsAcrossFormats(t *testing.T) {
+	lookPath := fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})
+	cwd := t.TempDir()
+	tests := []struct {
+		name     string
+		fileName string
+		contents string
+	}{
+		{name: "json null", fileName: "config.json", contents: `null`},
+		{name: "json empty object", fileName: "config.json", contents: `{}`},
+		{name: "yaml null", fileName: "config.yaml", contents: "null\n"},
+		{name: "yaml empty object", fileName: "config.yaml", contents: "{}\n"},
+		{name: "yaml omitted", fileName: "config.yaml", contents: ""},
+		{name: "toml omitted", fileName: "config.toml", contents: ""},
+	}
+
+	var baselineConfig any
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(cwd, tt.fileName)
+			if err := os.WriteFile(configPath, []byte(tt.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+
+			loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: lookPath})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+			if !loaded.Metadata.ConfigFilePresent {
+				t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+			}
+			if loaded.Partial != (PartialConfig{}) {
+				t.Fatalf("LoadFile().Partial = %#v, want empty partial config", loaded.Partial)
+			}
+
+			current := toJSONValue(t, loaded.Config)
+			if baselineConfig == nil {
+				baselineConfig = current
+				return
+			}
+			if !reflect.DeepEqual(current, baselineConfig) {
+				t.Fatalf("effective config mismatch\ncurrent: %#v\nbaseline: %#v", current, baselineConfig)
+			}
+		})
+	}
+}
+
 func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
