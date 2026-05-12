@@ -9,7 +9,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	toml "github.com/pelletier/go-toml/v2"
+	"gopkg.in/yaml.v3"
 )
+
+var supportedDefaultConfigNames = []string{"config.toml", "config.yaml", "config.yml", "config.json"}
+
+var supportedConfigSuffixes = []string{".toml", ".yaml", ".yml", ".json"}
 
 type EnvLookupFunc func(string) (string, bool)
 
@@ -68,16 +75,18 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
-	configPath := options.ConfigPath
+	configPath := ""
 	if parsedCLI.hasConfigPath {
 		configPath = parsedCLI.configPath
 	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok {
 		configPath = envConfigPath
-	} else if configPath == "" {
+	} else if options.ConfigPath != "" {
+		configPath = options.ConfigPath
+	} else if options.DefaultConfigPath != "" {
 		configPath = options.DefaultConfigPath
 	}
 	if configPath == "" {
-		defaultConfigPath, err := DefaultConfigPath()
+		defaultConfigPath, err := DiscoverDefaultConfigPath()
 		if err != nil {
 			return LoadedFileConfig{}, fmt.Errorf("determine default config path: %w", err)
 		}
@@ -127,6 +136,40 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}, nil
 }
 
+func DiscoverDefaultConfigPath() (string, error) {
+	looperHome, err := DefaultLooperHome()
+	if err != nil {
+		return "", err
+	}
+
+	candidates := make([]string, 0, len(supportedDefaultConfigNames))
+	found := make([]string, 0, len(supportedDefaultConfigNames))
+	for _, name := range supportedDefaultConfigNames {
+		path := filepath.Join(looperHome, name)
+		candidates = append(candidates, path)
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("check config file at %s: %w", path, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		found = append(found, path)
+	}
+
+	if len(found) > 1 {
+		return "", fmt.Errorf("multiple default config files found: %s; keep only one of %s", strings.Join(found, ", "), strings.Join(candidates, ", "))
+	}
+	if len(found) == 1 {
+		return found[0], nil
+	}
+
+	return candidates[0], nil
+}
+
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
 	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil {
 		return
@@ -160,6 +203,10 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 }
 
 func readConfigFile(path string) (PartialConfig, bool, error) {
+	if err := validateConfigFileSuffix(path); err != nil {
+		return PartialConfig{}, false, err
+	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -169,16 +216,62 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 		return PartialConfig{}, false, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 
-	var partialConfig PartialConfig
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
+	partialConfig, err := decodeConfigFile(path, raw)
+	if err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: trailing JSON value", path)
 	}
 
 	return partialConfig, true, nil
+}
+
+func validateConfigFileSuffix(path string) error {
+	suffix := strings.ToLower(filepath.Ext(path))
+	for _, supported := range supportedConfigSuffixes {
+		if suffix == supported {
+			return nil
+		}
+	}
+	if suffix == "" {
+		suffix = "<none>"
+	}
+	return fmt.Errorf("unsupported config file suffix %q at %s; supported suffixes: %s", suffix, path, strings.Join(supportedConfigSuffixes, ", "))
+}
+
+func decodeConfigFile(path string, raw []byte) (PartialConfig, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".json":
+		return decodeJSONConfigFile(raw)
+	case ".yaml", ".yml":
+		return decodeStructuredConfigFile(raw, func(target any) error { return yaml.Unmarshal(raw, target) })
+	case ".toml":
+		return decodeStructuredConfigFile(raw, func(target any) error { return toml.Unmarshal(raw, target) })
+	default:
+		return PartialConfig{}, fmt.Errorf("unsupported config file suffix %q", filepath.Ext(path))
+	}
+}
+
+func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
+	var partialConfig PartialConfig
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
+		return PartialConfig{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return PartialConfig{}, fmt.Errorf("trailing JSON value")
+	}
+	return partialConfig, nil
+}
+
+func decodeStructuredConfigFile(raw []byte, unmarshal func(any) error) (PartialConfig, error) {
+	var decoded map[string]any
+	if err := unmarshal(&decoded); err != nil {
+		return PartialConfig{}, err
+	}
+	normalizedRaw, err := json.Marshal(decoded)
+	if err != nil {
+		return PartialConfig{}, fmt.Errorf("normalize structured config: %w", err)
+	}
+	return decodeJSONConfigFile(normalizedRaw)
 }
 
 func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {

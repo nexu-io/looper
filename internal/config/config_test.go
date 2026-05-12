@@ -1100,6 +1100,13 @@ func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
 }
 
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:      t.TempDir(),
 		LookPath: fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
@@ -1115,6 +1122,44 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 
 	if loaded.Metadata.ConfigPath != defaultConfigPath {
 		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+	}
+}
+
+func TestLoadFileLoadsSupportedConfigFormats(t *testing.T) {
+	cwd := t.TempDir()
+	lookPath := fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"})
+
+	tests := []struct {
+		name     string
+		suffix   string
+		contents string
+		port     int
+	}{
+		{name: "json", suffix: ".json", contents: `{"server":{"port":6101}}`, port: 6101},
+		{name: "yaml", suffix: ".yaml", contents: "server:\n  port: 6102\n", port: 6102},
+		{name: "yml", suffix: ".yml", contents: "server:\n  port: 6103\n", port: 6103},
+		{name: "toml", suffix: ".toml", contents: "[server]\nport = 6104\n", port: 6104},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(cwd, "config"+tt.suffix)
+			if err := os.WriteFile(configPath, []byte(tt.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+
+			loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: lookPath})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+
+			if loaded.Config.Server.Port != tt.port {
+				t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, tt.port)
+			}
+			if !loaded.Metadata.ConfigFilePresent {
+				t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+			}
+		})
 	}
 }
 
@@ -1346,6 +1391,103 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
 			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 6200)
 		}
 	})
+}
+
+func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenDiscoveredDefault(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
+	cwd := t.TempDir()
+	cliConfigPath := filepath.Join(cwd, "cli.yaml")
+	envConfigPath := filepath.Join(cwd, "env.json")
+	defaultConfigPath := filepath.Join(looperHome, "config.toml")
+
+	for path, contents := range map[string]string{
+		cliConfigPath:     "server:\n  port: 7100\n",
+		envConfigPath:     `{"server":{"port":7200}}`,
+		defaultConfigPath: "[server]\nport = 7300\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+	}
+
+	t.Run("cli beats env and discovered default", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:       cwd,
+			Args:      []string{"--config", cliConfigPath},
+			LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != cliConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, cliConfigPath)
+		}
+		if loaded.Config.Server.Port != 7100 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7100)
+		}
+	})
+
+	t.Run("env beats discovered default when cli absent", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:       cwd,
+			LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != envConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, envConfigPath)
+		}
+		if loaded.Config.Server.Port != 7200 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7200)
+		}
+	})
+
+	t.Run("discovered default used when cli and env absent", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: cwd, LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != defaultConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+		}
+		if loaded.Config.Server.Port != 7300 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7300)
+		}
+	})
+}
+
+func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
+	for _, name := range []string{"config.toml", "config.json"} {
+		if err := os.WriteFile(filepath.Join(looperHome, name), []byte("{}"), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
+		}
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got := err.Error(); !strings.Contains(got, "multiple default config files found") || !strings.Contains(got, "config.toml") || !strings.Contains(got, "config.json") {
+		t.Fatalf("LoadFile() error = %q, want multiple-default-files error", got)
+	}
 }
 
 func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
@@ -2183,8 +2325,8 @@ func TestDefaultPathHelpersMatchTSLayout(t *testing.T) {
 		t.Fatalf("DefaultConfigPath() error = %v", err)
 	}
 
-	if configPath != filepath.Join(homeDir, ".looper", "config.json") {
-		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, filepath.Join(homeDir, ".looper", "config.json"))
+	if configPath != filepath.Join(homeDir, ".looper", "config.toml") {
+		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, filepath.Join(homeDir, ".looper", "config.toml"))
 	}
 
 	worktreeRoot, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo")

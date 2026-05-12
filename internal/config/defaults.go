@@ -23,7 +23,7 @@ func DefaultConfigPath() (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(looperHome, "config.json"), nil
+	return filepath.Join(looperHome, "config.toml"), nil
 }
 
 func DefaultWorktreeRoot() (string, error) {

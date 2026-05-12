@@ -275,7 +275,7 @@ func resolveConfigPathFromArgs(argv []string, cwd string) (string, error) {
 	if envPath, ok := os.LookupEnv("LOOPER_CONFIG"); ok {
 		return config.ResolveConfigPath(envPath, cwd), nil
 	}
-	defaultPath, err := config.DefaultConfigPath()
+	defaultPath, err := config.DiscoverDefaultConfigPath()
 	if err != nil {
 		return "", fmt.Errorf("determine default config path: %w", err)
 	}
@@ -294,7 +294,11 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 		return fmt.Errorf("encode config: %w", err)
 	}
 	raw = append(raw, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
+	tmpPattern := ".config-*" + filepath.Ext(path)
+	if filepath.Ext(path) == "" {
+		tmpPattern = ".config-*.tmp"
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
 	if err != nil {
 		return fmt.Errorf("create temporary config: %w", err)
 	}
