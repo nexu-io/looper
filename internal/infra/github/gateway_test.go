@@ -1143,6 +1143,26 @@ func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
 	}
 }
 
+func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.Contains(args, "api graphql") || !strings.Contains(args, "-F owner=acme") || !strings.Contains(args, "-F repo=looper") || strings.Contains(args, "github.example.com/acme") {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":42,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}]}}}}}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListLinkedPullRequests(context.Background(), LinkedPullRequestsInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListLinkedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergeCommitSHA != "abc123" {
+		t.Fatalf("ListLinkedPullRequests() = %#v, want parsed linked PRs", prs)
+	}
+}
+
 func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

@@ -864,6 +864,10 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	if strings.TrimSpace(payload.CommentBody) == "" && payload.Category != "" && payload.Rationale != "" && payload.CloseBy != "" {
 		payload.CommentBody = buildWarningComment(target, payload, gracePeriodForCategory(payload.Category, roleCfg))
 	}
+	applyStatus := ""
+	if applyProposal != nil && applyProposal.ApplyStatus != nil {
+		applyStatus = *applyProposal.ApplyStatus
+	}
 	stale, priorProposal, fingerprintJSON, err := r.staleProposalStatusForApply(target, caseRecord, roleCfg, applyProposal)
 	if err != nil {
 		return payload, "failed", "", err
@@ -941,7 +945,7 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		}
 		return payload, "completed", payload.Summary, nil
 	}
-	if !hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) {
+	if !hasLabel(target.Labels, roleCfg.Lifecycle.PendingLabel) && applyStatus != "partial:labeled" {
 		payload.Outcome = outcomeCancelled
 		payload.Summary = "sweeper warning cancelled"
 		if payload.WarningCommentID > 0 && r.github != nil && !roleCfg.DryRun {
@@ -1026,10 +1030,6 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		}
 		return payload, "skipped", payload.Summary, nil
 	}
-	applyStatus := ""
-	if applyProposal != nil && applyProposal.ApplyStatus != nil {
-		applyStatus = *applyProposal.ApplyStatus
-	}
 	if applyStatus != "partial:commented" && applyStatus != "partial:labeled" {
 		if _, err := r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: payload.Repo, IssueNumber: target.Number, Body: closeComment}); err != nil {
 			applyErr := err.Error()
@@ -1039,19 +1039,6 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:commented", "close comment posted", nil, false); err != nil {
 			return payload, "failed", "", err
 		}
-	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
-		applyErr := err.Error()
-		_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "remove pending label failed", &applyErr, false)
-		return payload, "failed", "", err
-	}
-	if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.ClosedLabel}}); err != nil {
-		applyErr := err.Error()
-		_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "add closed label failed", &applyErr, false)
-		return payload, "failed", "", err
-	}
-	if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:labeled", "close labels updated", nil, false); err != nil {
-		return payload, "failed", "", err
 	}
 	if target.IsPR {
 		if err := r.github.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: payload.Repo, PRNumber: target.Number}); err != nil {
@@ -1067,6 +1054,21 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 		if err := r.github.CloseIssue(ctx, githubinfra.CloseIssueInput{Repo: payload.Repo, IssueNumber: target.Number, StateReason: reason}); err != nil {
 			applyErr := err.Error()
 			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "close target failed", &applyErr, false)
+			return payload, "failed", "", err
+		}
+	}
+	if applyStatus != "partial:labeled" {
+		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.PendingLabel}}); err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "remove pending label failed", &applyErr, false)
+			return payload, "failed", "", err
+		}
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: payload.Repo, IssueNumber: target.Number, Labels: []string{roleCfg.Lifecycle.ClosedLabel}}); err != nil {
+			applyErr := err.Error()
+			_ = r.updateProposalApplyReceipt(ctx, payload.ProposalID, "failed_retryable", "add closed label failed", &applyErr, false)
+			return payload, "failed", "", err
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "partial:labeled", "close labels updated", nil, false); err != nil {
 			return payload, "failed", "", err
 		}
 	}

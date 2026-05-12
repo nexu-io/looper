@@ -1160,6 +1160,72 @@ func TestProcessCloseAgentApplyConsumesAgentCloseProposal(t *testing.T) {
 	}
 }
 
+func TestProcessCloseRetriesCloseBeforeRemovingPendingLabel(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	category := categoryAlreadyFixed
+	confidence := int64(90)
+	marker := "marker-close-retry"
+	warningCommentID := int64(100)
+	warnedAt := fixture.now.Add(-8 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	closeDueAt := fixture.now.Add(-24 * time.Hour).Format(javaScriptISOStringUTC)
+	validation := "passed"
+	rationale := "target appears already fixed"
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_close_retry", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 43, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_warn_close_retry"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	closeCaseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 43)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	warnTarget := liveTarget{Number: 43, State: "open", Title: "Bug", Body: "already fixed by #9", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	warnFingerprint, err := BuildFingerprint(fixture.runner.buildFactBundle(warnTarget, closeCaseRecord, fixture.cfg.Roles.Sweeper))
+	if err != nil {
+		t.Fatalf("BuildFingerprint() error = %v", err)
+	}
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_close_retry", CaseID: "case_close_retry", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 43, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: warnFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+		t.Fatalf("SweeperProposals.Insert() error = %v", err)
+	}
+	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_close_retry"})
+	fixture.github.issueDetails["acme/looper#43"] = githubinfra.IssueDetail{Number: 43, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	fixture.github.closeIssueErr = errors.New("temporary close failure")
+	queueID := "queue_sweeper_close_retry"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#43", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#43", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want failed result", result)
+	}
+	if got := fixture.github.removedLabels["acme/looper#43"]; len(got) != 0 {
+		t.Fatalf("removedLabels = %#v, want pending label untouched after close failure", fixture.github.removedLabels)
+	}
+	stored, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "queued" || stored.Attempts != 1 {
+		t.Fatalf("stored queue item = %#v, want queued retry after close failure", stored)
+	}
+
+	result, err = fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem(retry) error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem(retry) = %#v, want completed result", result)
+	}
+	if !containsString(fixture.github.removedLabels["acme/looper#43"], "looper:sweep-pending") {
+		t.Fatalf("removedLabels = %#v, want pending label removed only after successful close", fixture.github.removedLabels)
+	}
+}
+
 func TestProcessWarnResumesFromMarkerWithoutDuplicateComment(t *testing.T) {
 	t.Parallel()
 
@@ -1841,6 +1907,7 @@ type stubGitHub struct {
 	addedLabels       map[string][]string
 	removedLabels     map[string][]string
 	addIssueLabelsErr error
+	closeIssueErr     error
 	issueComments     []githubinfra.CommentInfo
 	timeline          []map[string]any
 	linkedPRs         []githubinfra.LinkedPullRequest
@@ -1922,6 +1989,11 @@ func (g *stubGitHub) UpdateIssueComment(_ context.Context, input githubinfra.Upd
 }
 
 func (g *stubGitHub) CloseIssue(_ context.Context, input githubinfra.CloseIssueInput) error {
+	if g.closeIssueErr != nil {
+		err := g.closeIssueErr
+		g.closeIssueErr = nil
+		return err
+	}
 	g.closedIssues = append(g.closedIssues, input)
 	return nil
 }
