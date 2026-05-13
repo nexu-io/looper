@@ -47,7 +47,8 @@ jobs:
         env:
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
         run: |
-          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
 
   detect-e2e-changes:
@@ -148,8 +149,6 @@ jobs:
     name: Contract/invariant integration smoke
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
 
     steps:
       - name: Check out repository
@@ -161,6 +160,8 @@ jobs:
           go-version-file: go.mod
 
       - name: Run contract/invariant smoke
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
         run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1 && go test ./internal/e2e/githubcontract -run 'TestInvariantGatewayUsesSupportedGHJSONFields|TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation|TestFakeGHFixtureRejectsUnsupportedJSONField' -count=1
 
       - name: Upload smoke artifacts on failure
@@ -168,7 +169,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: contract-invariant-integration-smoke-artifacts
-          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
           if-no-files-found: ignore
 
   daemon-boot-e2e:
@@ -177,8 +178,6 @@ jobs:
     needs: detect-e2e-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
 
     steps:
       - name: Check out repository
@@ -192,6 +191,8 @@ jobs:
 
       - name: Run daemon boot smoke E2E
         if: needs.detect-e2e-changes.outputs.daemon_boot == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
         run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1
 
       - name: Upload daemon boot artifacts on failure
@@ -199,7 +200,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daemon-boot-e2e-artifacts
-          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
           if-no-files-found: ignore
 
   github-contract-e2e:
@@ -208,8 +209,6 @@ jobs:
     needs: detect-e2e-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-contract-e2e
 
     steps:
       - name: Check out repository
@@ -223,6 +222,8 @@ jobs:
 
       - name: Run GitHub contract E2E
         if: needs.detect-e2e-changes.outputs.github_contract == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-contract-e2e
         run: go test ./internal/e2e/githubcontract -count=1
 
       - name: Upload GitHub contract artifacts on failure
@@ -230,7 +231,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: github-contract-e2e-artifacts
-          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/looper-e2e/github-contract-e2e
           if-no-files-found: ignore
 
   resolve-comments-e2e:
@@ -239,8 +240,6 @@ jobs:
     needs: detect-e2e-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
 
     steps:
       - name: Check out repository
@@ -254,6 +253,8 @@ jobs:
 
       - name: Run resolve-comments E2E
         if: needs.detect-e2e-changes.outputs.resolve_comments == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
         run: go test ./internal/e2e -run 'TestScenarioResolveComments' -count=1
 
       - name: Upload resolve-comments artifacts on failure
@@ -261,7 +262,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: resolve-comments-e2e-artifacts
-          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
           if-no-files-found: ignore
 
   worktree-invariants-e2e:
@@ -270,8 +271,6 @@ jobs:
     needs: detect-e2e-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
 
     steps:
       - name: Check out repository
@@ -285,6 +284,8 @@ jobs:
 
       - name: Run worktree invariants E2E
         if: needs.detect-e2e-changes.outputs.worktree_invariants == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
         run: go test ./internal/e2e -run 'TestInvariantWorker' -count=1
 
       - name: Upload worktree artifacts on failure
@@ -292,5 +293,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: worktree-invariants-e2e-artifacts
-          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
           if-no-files-found: ignore
