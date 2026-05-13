@@ -1244,6 +1244,19 @@ func TestConfigSetSupportsCanonicalReviewerDiscoveryKeys(t *testing.T) {
 			},
 		},
 		{
+			key:   "roles.reviewer.discovery.triggers.enableSelfReview",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview == nil || !*partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview {
+					t.Fatalf("canonical reviewer trigger missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil {
+					t.Fatalf("legacy reviewer trigger should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
 			key:   "roles.reviewer.discovery.triggers.labels",
 			value: "looper:review,looper:review-extra",
 			assert: func(t *testing.T, partial config.PartialConfig) {
@@ -1351,6 +1364,7 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 		"roles.reviewer.discovery.autoDiscovery",
 		"roles.reviewer.discovery.triggers.includeDrafts",
 		"roles.reviewer.discovery.triggers.requireReviewRequest",
+		"roles.reviewer.discovery.triggers.enableSelfReview",
 		"roles.reviewer.discovery.triggers.labels",
 		"roles.reviewer.discovery.triggers.labelMode",
 		"roles.reviewer.discovery.specReview.includeReviewingLabel",
@@ -1383,6 +1397,9 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 	}
 	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts != nil {
 		t.Fatalf("canonical reviewer includeDrafts still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil {
+		t.Fatalf("canonical reviewer enableSelfReview still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
 	}
 	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.Labels != nil {
 		t.Fatalf("canonical reviewer labels still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
@@ -1667,6 +1684,7 @@ func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testin
 			"reviewer": map[string]any{
 				"discovery": map[string]any{
 					"triggers": map[string]any{
+						"enableSelfReview":     false,
 						"includeDrafts":        false,
 						"requireReviewRequest": false,
 						"labels":               []string{"looper:review"},
@@ -1681,6 +1699,7 @@ func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testin
 		},
 	})
 
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "true")
 	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", "true")
 	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", "true")
 	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", "looper:review,looper:extra")
@@ -1692,12 +1711,34 @@ func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testin
 	if exitCode != 0 {
 		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.enableSelfReview", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.includeDrafts", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.requireReviewRequest", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labels", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labelMode", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.includeReviewingLabel", "env")
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.reviewingLabel", "env")
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerEnableSelfReviewCLIOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{
+					"triggers": map[string]any{"enableSelfReview": false},
+				},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--roles-reviewer-discovery-triggers-enable-self-review=true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-reviewer-discovery-triggers-enable-self-review]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.enableSelfReview", "cli")
 }
 
 func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {

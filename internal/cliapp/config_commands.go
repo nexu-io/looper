@@ -95,6 +95,16 @@ var configFieldRegistry = map[string]configField{
 	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleTriggers(p).RequireReviewRequest
 	}),
+	"roles.reviewer.discovery.triggers.enableSelfReview": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.triggers.enableSelfReview", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "roles-reviewer-discovery-triggers-enable-self-review", "reviewer-enable-self-review", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.EnableSelfReview }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).EnableSelfReview
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).EnableSelfReview
+	}),
+	"roles.reviewer.triggers.enableSelfReview": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.triggers.enableSelfReview", "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "reviewer-enable-self-review", "roles-reviewer-discovery-triggers-enable-self-review", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.EnableSelfReview }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).EnableSelfReview
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).EnableSelfReview
+	}),
 	"roles.reviewer.discovery.triggers.labels": reviewerDiscoveryStringListFieldWithAlias("roles.reviewer.discovery.triggers.labels", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.Labels }, func(p *config.PartialConfig) **[]string {
 		return &ensurePartialReviewerRoleDiscoveryTriggers(p).Labels
 	}, func(p *config.PartialConfig) **[]string {
@@ -949,6 +959,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil))
 	case "roles.reviewer.discovery.triggers.requireReviewRequest", "roles.reviewer.triggers.requireReviewRequest":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.RequireReviewRequest != nil))
+	case "roles.reviewer.discovery.triggers.enableSelfReview", "roles.reviewer.triggers.enableSelfReview":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil))
 	case "roles.reviewer.discovery.triggers.labels", "roles.reviewer.triggers.labels":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.Labels != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil))
 	case "roles.reviewer.discovery.triggers.labelMode", "roles.reviewer.triggers.labelMode":
