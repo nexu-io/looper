@@ -461,6 +461,13 @@ type ProcessResult struct {
 	FailureKind QueueFailureKind
 }
 
+type replyAction string
+
+const (
+	replyActionFixed    replyAction = "fixed"
+	replyActionDeclined replyAction = "declined"
+)
+
 type fixerFollowupReason string
 
 const (
@@ -486,6 +493,20 @@ type fixerFollowupState struct {
 	LastAttemptAt          string   `json:"lastAttemptAt,omitempty"`
 	NextEligibleAt         string   `json:"nextEligibleAt,omitempty"`
 	Terminal               bool     `json:"terminal,omitempty"`
+}
+
+type declinedThreadRecord struct {
+	RecordedAt string `json:"recordedAt,omitempty"`
+	ThreadID   string `json:"threadId,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type zeroProgressState struct {
+	HeadSHA           string `json:"headSha,omitempty"`
+	FixItemsHash      string `json:"fixItemsHash,omitempty"`
+	FixItemsStateHash string `json:"fixItemsStateHash,omitempty"`
+	ConsecutiveCount  int    `json:"consecutiveCount,omitempty"`
+	RecordedAt        string `json:"recordedAt,omitempty"`
 }
 
 type rediscoveryAction string
@@ -573,6 +594,7 @@ type checkpointRepair struct {
 type replyExplanationEntry struct {
 	FixItemID   string `json:"fixItemId"`
 	ThreadID    string `json:"threadId,omitempty"`
+	Action      string `json:"action,omitempty"`
 	Explanation string `json:"explanation"`
 }
 
@@ -646,6 +668,7 @@ type checkpointResolvedComments struct {
 type checkpointResolvedComment struct {
 	FixItemID  string `json:"fixItemId,omitempty"`
 	ThreadID   string `json:"threadId,omitempty"`
+	Action     string `json:"action,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Message    string `json:"message,omitempty"`
 	UpdatedAt  string `json:"updatedAt,omitempty"`
@@ -713,6 +736,13 @@ func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentRe
 // limits prompt-injection blast radius if a malicious reviewer plants payload.
 const maxReplyExplanationLength = 500
 
+const (
+	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
+	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
+	maxDeclinedThreadRecords              = 200
+	zeroProgressPauseReason               = "agent_zero_progress"
+)
+
 // parseReplyExplanations extracts the optional review_thread_replies array from
 // the final __LOOPER_RESULT__ JSON line. Failure to parse is not an error: the
 // runner simply treats the affected threads as lacking agent confirmation for
@@ -747,6 +777,7 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		ReviewThreadReplies []struct {
 			FixItemID   string `json:"fixItemId"`
 			ThreadID    string `json:"threadId"`
+			Action      string `json:"action"`
 			Explanation string `json:"explanation"`
 		} `json:"review_thread_replies"`
 	}
@@ -771,6 +802,10 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		if threadID != "" && item.ThreadID != "" && threadID != item.ThreadID {
 			continue
 		}
+		action := canonicalizeReplyAction(raw.Action)
+		if action == "" {
+			action = string(replyActionFixed)
+		}
 		explanation := sanitizeReplyExplanation(raw.Explanation)
 		if explanation == "" {
 			continue
@@ -779,12 +814,45 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 			continue
 		}
 		seen[fixItemID] = struct{}{}
-		out = append(out, replyExplanationEntry{FixItemID: fixItemID, ThreadID: item.ThreadID, Explanation: explanation})
+		out = append(out, replyExplanationEntry{FixItemID: fixItemID, ThreadID: item.ThreadID, Action: action, Explanation: explanation})
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func normalizeReplyAction(raw string) string {
+	switch replyAction(strings.ToLower(strings.TrimSpace(raw))) {
+	case replyActionFixed:
+		return string(replyActionFixed)
+	case replyActionDeclined:
+		return string(replyActionDeclined)
+	default:
+		return ""
+	}
+}
+
+func parseReplyAction(raw string) (string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return "", true
+	}
+	action := normalizeReplyAction(raw)
+	if action == "" {
+		return "", false
+	}
+	return action, true
+}
+
+func canonicalizeReplyAction(raw string) string {
+	action, ok := parseReplyAction(raw)
+	if ok {
+		if action == "" {
+			return string(replyActionFixed)
+		}
+		return action
+	}
+	return strings.TrimSpace(raw)
 }
 
 // extractCompletionMarkerPayload mirrors the agent core's last-line scan but
@@ -976,16 +1044,25 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		fixItems := collectFixItems(detail)
-		if len(fixItems) == 0 {
+		allFixItems := collectFixItems(detail)
+		if len(allFixItems) == 0 {
 			if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
 				return DiscoveryResult{}, err
 			}
 			result.Skipped++
 			continue
 		}
+		allFixItemsStateHash := hashFixItemsState(allFixItems)
+		fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, pr.Number), detail.HeadSHA, allFixItems)
+		if len(fixItems) == 0 {
+			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
+				return DiscoveryResult{}, err
+			}
+			result.Skipped++
+			continue
+		}
 		fixItemsHash := hashFixItems(fixItems)
-		fixItemsStateHash := hashFixItemsState(fixItems)
+		fixItemsStateHash := allFixItemsStateHash
 		unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
 		if len(unresolvedThreadIDs) == 0 {
 			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
@@ -1398,6 +1475,20 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
 	}
+	if hasProgressed(checkpoint) {
+		if _, err := r.clearZeroProgressMetadata(ctx, *loop); err != nil {
+			return ProcessResult{}, err
+		}
+	} else {
+		paused, err := r.recordZeroProgressSuccess(ctx, *loop, checkpoint)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if paused {
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+		}
+	}
 	if scheduled, err := r.scheduleFollowupRetryAfterSuccess(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber, checkpoint.SkipReason == ""); err != nil {
 		return ProcessResult{}, err
 	} else if !scheduled {
@@ -1410,11 +1501,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-	status := "success"
-	if checkpoint.SkipReason != "" {
-		status = "skipped"
-	}
+	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+}
+
+func statusForSkip(skipReason string) string {
+	if skipReason != "" {
+		return "skipped"
+	}
+	return "success"
 }
 
 func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64, allow bool) (bool, error) {
@@ -1682,7 +1777,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
-	checkpoint.Repair.ReplyExplanations = parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems)
+	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
 	checkpoint.Repair.FixItemsHash = checkpoint.FixItemsHash
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
@@ -2004,6 +2099,8 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
 	resolvedCount := 0
+	contractViolationCount := 0
+	declinedUpdates := map[string]declinedThreadRecord{}
 	commentItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
 		if item.Type == "comment" {
@@ -2048,13 +2145,16 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
 		}
-		explanation := repliesByItemID[item.ID]
-		if explanation == "" && item.ThreadID != "" {
-			explanation = repliesByThreadID[item.ThreadID]
+		decision, ok := repliesByItemID[item.ID]
+		if !ok && item.ThreadID != "" {
+			decision, ok = repliesByThreadID[item.ThreadID]
 		}
-		if strings.TrimSpace(explanation) == "" {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_agent_declined", Message: "Agent did not include this thread in review_thread_replies", UpdatedAt: r.nowISO()})
-			continue
+		if !ok {
+			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentMissingThreadDecisionExplanation}
+			contractViolationCount++
+		} else if _, validAction := parseReplyAction(decision.Action); !validAction {
+			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentInvalidThreadDecisionExplanation}
+			contractViolationCount++
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -2069,26 +2169,51 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
 			continue
 		}
-		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanation, checkpoint.ResolvedComments.Items)
-		if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
-			return checkpoint, err
-		}
-		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
-			message := err.Error()
-			if strings.Contains(strings.ToLower(message), "already") {
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+		switch normalizeReplyAction(decision.Action) {
+		case string(replyActionDeclined):
+			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
+			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
+			if replyState == "failed" {
+				mutationFailureCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 				continue
 			}
-			mutationFailureCount++
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-			continue
+			if replyState == "sent" {
+				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
+			}
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "agent_declined", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+		default:
+			replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, decision.Explanation, checkpoint.ResolvedComments.Items)
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
+				return checkpoint, err
+			}
+			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
+				message := err.Error()
+				if strings.Contains(strings.ToLower(message), "already") {
+					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+					continue
+				}
+				mutationFailureCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+				continue
+			}
+			resolvedCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 		}
-		resolvedCount++
-		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+	}
+	if contractViolationCount > 0 {
+		if _, err := r.incrementContractViolationCount(ctx, input.Loop, contractViolationCount); err != nil {
+			return checkpoint, err
+		}
+	}
+	if len(declinedUpdates) > 0 {
+		if _, err := r.persistDeclinedThreadRecords(ctx, input.Loop, declinedUpdates); err != nil {
+			return checkpoint, err
+		}
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
 	if resolvedCount > 0 {
-		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, repliesByItemID)
+		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, lookupReplyExplanations(checkpoint))
 	}
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
@@ -2135,8 +2260,53 @@ func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item 
 	return "sent", ""
 }
 
+func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, item FixItem, decisionFingerprint, explanation string, existing []checkpointResolvedComment) (string, string) {
+	if item.ThreadID == "" {
+		return "skipped_no_thread", ""
+	}
+	for _, entry := range existing {
+		if entry.Action != string(replyActionDeclined) {
+			continue
+		}
+		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+				return entry.ReplyState, entry.ReplyError
+			}
+		}
+	}
+	body := buildFixerDeclinedReplyBody(item, explanation, decisionFingerprint)
+	existingRemoteReply, err := r.hasExistingFixerDeclinedReply(ctx, input, item, decisionFingerprint)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	if existingRemoteReply {
+		return "sent", ""
+	}
+	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+		return "failed", err.Error()
+	}
+	return "sent", ""
+}
+
 func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, item FixItem, commitSHA string) (bool, error) {
 	marker := fixerReplyMarker(item.ThreadID, commitSHA)
+	if marker == "" {
+		return false, nil
+	}
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
+	if err != nil {
+		return false, err
+	}
+	for _, comment := range thread.Comments {
+		if strings.Contains(comment.Body, marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
+	marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
 	if marker == "" {
 		return false, nil
 	}
@@ -2203,6 +2373,18 @@ func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
 	return out
 }
 
+func normalizeReplyExplanationActions(entries []replyExplanationEntry) []replyExplanationEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]replyExplanationEntry, 0, len(entries))
+	for _, entry := range entries {
+		entry.Action = canonicalizeReplyAction(entry.Action)
+		out = append(out, entry)
+	}
+	return out
+}
+
 // agentResolveReplyExplanationsValid reports whether the agent-provided
 // reply explanations were captured against the same fix-items snapshot
 // represented by the current checkpoint. When the snapshot drifted (e.g.
@@ -2218,11 +2400,11 @@ func agentResolveReplyExplanationsValid(checkpoint fixerCheckpoint) bool {
 	return true
 }
 
-func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]string {
+func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]replyExplanationEntry {
 	if !agentResolveReplyExplanationsValid(checkpoint) {
 		return nil
 	}
-	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
+	out := make(map[string]replyExplanationEntry, len(checkpoint.Repair.ReplyExplanations))
 	for _, entry := range checkpoint.Repair.ReplyExplanations {
 		fixItemID := strings.TrimSpace(entry.FixItemID)
 		explanation := strings.TrimSpace(entry.Explanation)
@@ -2230,7 +2412,8 @@ func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]strin
 			continue
 		}
 		if _, exists := out[fixItemID]; !exists {
-			out[fixItemID] = explanation
+			entry.Action = canonicalizeReplyAction(entry.Action)
+			out[fixItemID] = entry
 		}
 	}
 	if len(out) == 0 {
@@ -2239,11 +2422,11 @@ func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]strin
 	return out
 }
 
-func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]string {
+func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]replyExplanationEntry {
 	if !agentResolveReplyExplanationsValid(checkpoint) {
 		return nil
 	}
-	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
+	out := make(map[string]replyExplanationEntry, len(checkpoint.Repair.ReplyExplanations))
 	for _, entry := range checkpoint.Repair.ReplyExplanations {
 		threadID := strings.TrimSpace(entry.ThreadID)
 		explanation := strings.TrimSpace(entry.Explanation)
@@ -2251,7 +2434,8 @@ func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]string
 			continue
 		}
 		if _, exists := out[threadID]; !exists {
-			out[threadID] = explanation
+			entry.Action = canonicalizeReplyAction(entry.Action)
+			out[threadID] = entry
 		}
 	}
 	if len(out) == 0 {
@@ -2334,6 +2518,26 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 	return b.String()
 }
 
+func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint string) string {
+	var b strings.Builder
+	mention := strings.TrimSpace(item.Author)
+	if mention != "" {
+		b.WriteString("@")
+		b.WriteString(mention)
+		b.WriteString(" ")
+	}
+	b.WriteString("I'm not making a code change for this thread.")
+	if explanation = strings.TrimSpace(explanation); explanation != "" {
+		b.WriteString("\n\n")
+		b.WriteString(explanation)
+	}
+	if marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint); marker != "" {
+		b.WriteString("\n\n")
+		b.WriteString(marker)
+	}
+	return b.String()
+}
+
 func fixerReplyMarker(threadID, commitSHA string) string {
 	threadID = strings.TrimSpace(threadID)
 	commitSHA = strings.TrimSpace(commitSHA)
@@ -2341,6 +2545,15 @@ func fixerReplyMarker(threadID, commitSHA string) string {
 		return ""
 	}
 	return fmt.Sprintf("<!-- looper-fixer-reply thread:%s commit:%s -->", threadID, commitSHA)
+}
+
+func fixerDeclinedReplyMarker(threadID, decisionFingerprint string) string {
+	threadID = strings.TrimSpace(threadID)
+	decisionFingerprint = strings.TrimSpace(decisionFingerprint)
+	if threadID == "" || decisionFingerprint == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -2495,6 +2708,9 @@ func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explan
 			if ok {
 				entry.Status = resolved.Status
 				entry.ReplyState = resolved.ReplyState
+				if entry.Explanation == "" && strings.TrimSpace(resolved.Message) != "" {
+					entry.Explanation = resolved.Message
+				}
 			} else {
 				entry.Status = "pending"
 			}
@@ -2600,6 +2816,8 @@ func summaryStatusIcon(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "resolved", "already_resolved":
 		return "✅"
+	case "agent_declined":
+		return "⏸️"
 	case "failed":
 		return "⚠️"
 	case "pending":
@@ -3014,7 +3232,13 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	for _, existing := range existingLoops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
 			if existing.Status == "paused" {
-				return loopUpsertResult{record: existing, created: false}, nil
+				if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
+					return loopUpsertResult{}, err
+				} else if !resumed {
+					return loopUpsertResult{record: existing, created: false}, nil
+				} else {
+					existing = updated
+				}
 			}
 			if loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsStateHash)) {
 				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
@@ -3056,6 +3280,46 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
+}
+
+func (r *Runner) resumePausedZeroProgressLoopIfStateChanged(ctx context.Context, projectID, repo string, prNumber int64, headSHA, fixItemsStateHash string) error {
+	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
+	if err != nil || loop == nil {
+		return err
+	}
+	_, _, err = r.resumePausedZeroProgressLoop(ctx, *loop, headSHA, fixItemsStateHash)
+	return err
+}
+
+func (r *Runner) resumePausedZeroProgressLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string) (bool, storage.LoopRecord, error) {
+	if loop.Status != "paused" {
+		return false, loop, nil
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != zeroProgressPauseReason {
+		return false, loop, nil
+	}
+	state, ok := parseZeroProgressState(metadata)
+	if !ok {
+		return false, loop, nil
+	}
+	if state.HeadSHA == strings.TrimSpace(headSHA) && state.FixItemsStateHash == strings.TrimSpace(fixItemsStateHash) {
+		return false, loop, nil
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		nextRunAt := r.nowISO()
+		updated.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	updated, err = r.clearZeroProgressMetadata(ctx, updated)
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	return true, updated, nil
 }
 
 func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentUser string) ([]storage.QueueItemRecord, error) {
@@ -3351,6 +3615,17 @@ func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, 
 	return nil, nil
 }
 
+func loopMetadataForPR(ctx context.Context, runner *Runner, projectID, repo string, prNumber int64) *string {
+	if runner == nil {
+		return nil
+	}
+	loop, err := runner.findFixerLoopByPR(ctx, projectID, repo, prNumber)
+	if err != nil || loop == nil {
+		return nil
+	}
+	return loop.MetadataJSON
+}
+
 func (r *Runner) clearFixerFollowupStateForPR(ctx context.Context, projectID, repo string, prNumber int64) error {
 	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
 	if err != nil || loop == nil {
@@ -3411,6 +3686,29 @@ func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.Lo
 			return storage.LoopRecord{}, err
 		}
 		return updated, nil
+	}
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
+	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
+}
+
+func (r *Runner) clearZeroProgressMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	apply := func(updated *storage.LoopRecord) error {
+		meta := parseJSONObject(updated.MetadataJSON)
+		delete(meta, "fixerZeroProgress")
+		delete(meta, "pauseReason")
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		metadataJSON := string(encoded)
+		updated.MetadataJSON = &metadataJSON
+		return nil
 	}
 	var mutateErr error
 	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
@@ -3508,6 +3806,84 @@ func (r *Runner) mergeLoopMetadata(ctx context.Context, loop storage.LoopRecord,
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+func (r *Runner) incrementContractViolationCount(ctx context.Context, loop storage.LoopRecord, count int) (storage.LoopRecord, error) {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	current := int(int64FromAny(metadata["fixerContractViolationCount"]))
+	return r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerContractViolationCount": current + count})
+}
+
+func (r *Runner) persistDeclinedThreadRecords(ctx context.Context, loop storage.LoopRecord, updates map[string]declinedThreadRecord) (storage.LoopRecord, error) {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	records := parseDeclinedThreadRecords(metadata)
+	if records == nil {
+		records = map[string]declinedThreadRecord{}
+	}
+	for fingerprint, record := range updates {
+		records[fingerprint] = record
+	}
+	records = trimDeclinedThreadRecords(records, maxDeclinedThreadRecords)
+	return r.mergeLoopMetadata(ctx, loop, map[string]any{"declinedThreads": records})
+}
+
+func (r *Runner) recordZeroProgressSuccess(ctx context.Context, loop storage.LoopRecord, checkpoint fixerCheckpoint) (bool, error) {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if current != nil {
+			loop = *current
+		}
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	previous, _ := parseZeroProgressState(metadata)
+	current := zeroProgressState{
+		HeadSHA:           detailHeadSHA(checkpoint.Detail),
+		FixItemsHash:      strings.TrimSpace(checkpoint.FixItemsHash),
+		FixItemsStateHash: hashFixItemsState(checkpoint.FixItems),
+		ConsecutiveCount:  1,
+		RecordedAt:        r.nowISO(),
+	}
+	if previous.HeadSHA == current.HeadSHA && previous.FixItemsHash == current.FixItemsHash && previous.FixItemsStateHash == current.FixItemsStateHash {
+		current.ConsecutiveCount = previous.ConsecutiveCount + 1
+	}
+	updatedLoop, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerZeroProgress": current})
+	if err != nil {
+		return false, err
+	}
+	if current.ConsecutiveCount < 3 {
+		_ = updatedLoop
+		return false, nil
+	}
+	updatedLoop, err = r.mergeLoopMetadata(ctx, updatedLoop, map[string]any{"pauseReason": zeroProgressPauseReason})
+	if err != nil {
+		return false, err
+	}
+	_, err = r.updateLoop(ctx, updatedLoop, func(updated *storage.LoopRecord) {
+		updated.Status = "paused"
+		updated.NextRunAt = nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func hasProgressed(checkpoint fixerCheckpoint) bool {
+	if checkpoint.ReconcileCommits != nil && len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
+		return true
+	}
+	if checkpoint.ResolvedComments == nil {
+		return false
+	}
+	for _, item := range checkpoint.ResolvedComments.Items {
+		if item.Status == "resolved" || item.Action == string(replyActionFixed) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
@@ -3785,6 +4161,66 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
+func parseDeclinedThreadRecords(metadata map[string]any) map[string]declinedThreadRecord {
+	raw, ok := metadata["declinedThreads"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var records map[string]declinedThreadRecord
+	if err := json.Unmarshal(encoded, &records); err != nil {
+		return nil
+	}
+	return records
+}
+
+func parseZeroProgressState(metadata map[string]any) (zeroProgressState, bool) {
+	raw, ok := metadata["fixerZeroProgress"]
+	if !ok || raw == nil {
+		return zeroProgressState{}, false
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return zeroProgressState{}, false
+	}
+	var state zeroProgressState
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return zeroProgressState{}, false
+	}
+	if state.HeadSHA == "" && state.FixItemsHash == "" && state.FixItemsStateHash == "" {
+		return zeroProgressState{}, false
+	}
+	return state, true
+}
+
+func trimDeclinedThreadRecords(records map[string]declinedThreadRecord, max int) map[string]declinedThreadRecord {
+	if len(records) <= max || max <= 0 {
+		return records
+	}
+	type declinedEntry struct {
+		fingerprint string
+		recordedAt  time.Time
+	}
+	entries := make([]declinedEntry, 0, len(records))
+	for fingerprint, record := range records {
+		entries = append(entries, declinedEntry{fingerprint: fingerprint, recordedAt: parseRFC3339OrZero(record.RecordedAt)})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].recordedAt.Equal(entries[j].recordedAt) {
+			return entries[i].fingerprint < entries[j].fingerprint
+		}
+		return entries[i].recordedAt.After(entries[j].recordedAt)
+	})
+	trimmed := make(map[string]declinedThreadRecord, max)
+	for _, entry := range entries[:max] {
+		trimmed[entry.fingerprint] = records[entry.fingerprint]
+	}
+	return trimmed
+}
+
 func collectFixItemsFromCheckpoint(checkpoint fixerCheckpoint) []FixItem {
 	if checkpoint.Detail == nil {
 		return nil
@@ -3919,6 +4355,33 @@ func hashFixItemsState(items []FixItem) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
+	payload := strings.Join([]string{
+		strings.TrimSpace(item.ThreadID),
+		normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID),
+		strings.TrimSpace(headSHA),
+	}, "|")
+	sum := sha1.Sum([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func suppressDeclinedFixItems(loopMetadataJSON *string, headSHA string, fixItems []FixItem) []FixItem {
+	records := parseDeclinedThreadRecords(parseJSONObject(loopMetadataJSON))
+	if len(records) == 0 {
+		return fixItems
+	}
+	filtered := make([]FixItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		if item.Type == "comment" {
+			if _, ok := records[buildDeclinedThreadFingerprint(item, headSHA)]; ok {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
 func buildFixerMinimalPRSeed(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
 	seed := map[string]any{
 		"repo":           repo,
@@ -4050,11 +4513,15 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		return ""
 	}
 	return strings.Join([]string{
-		"For each comment-type fix item you actually addressed, include an entry in a top-level `review_thread_replies` array on the final " + agent.CompletionMarker + " JSON line. Each entry must be an object with these fields:",
-		`  - "fixItemId": the exact "id" of the fix item you addressed`,
+		"For EVERY comment-type fix item, you MUST include exactly one entry in a top-level `review_thread_replies` array on the final " + agent.CompletionMarker + " JSON line.",
+		"Each entry must be an object with these fields:",
+		`  - "fixItemId": the exact "id" of the fix item`,
 		`  - "threadId": the exact "threadId" of the same fix item`,
-		`  - "explanation": one or two sentences (max ~500 chars) describing what you changed and, when relevant, which file(s) or test(s) cover it. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		"Before including an entry, re-read the relevant review thread/comment context and only include items you can confidently confirm are actually addressed by the current branch state. If anything is ambiguous, partially fixed, or still pending, omit that entry.",
+		`  - "action": "fixed" or "declined"`,
+		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+		"Before including an entry, re-read the relevant review thread/comment context.",
+		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
+		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",
 		"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",
 	}, "\n")
 }

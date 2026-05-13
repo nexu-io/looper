@@ -91,6 +91,7 @@ type flagSpec struct {
 	valueName   string
 	description string
 	kind        flagKind
+	hidden      bool
 }
 
 type flagKind int
@@ -221,6 +222,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					boolFlag("check", "Check available CLI and daemon updates"),
 					boolFlag("cli", "Upgrade the looper CLI binary when self-upgrade is allowed"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
+					hiddenBoolFlag("background-auto", "Run the auto-upgrade worker in the background"),
 				},
 				exampleLines: []string{
 					"$ looper upgrade --check",
@@ -497,11 +499,18 @@ func addFlags(flagSet *pflag.FlagSet, flags []flagSpec) {
 		if defined != nil && flag.valueName != "" {
 			defined.Annotations = map[string][]string{"looperValueName": {flag.valueName}}
 		}
+		if defined != nil {
+			defined.Hidden = flag.hidden
+		}
 	}
 }
 
 func boolFlag(name, description string) flagSpec {
 	return flagSpec{name: name, description: description, kind: flagKindBool}
+}
+
+func hiddenBoolFlag(name, description string) flagSpec {
+	return flagSpec{name: name, description: description, kind: flagKindBool, hidden: true}
 }
 
 func stringFlag(name, valueName, description string) flagSpec {

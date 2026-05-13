@@ -502,7 +502,11 @@ func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error 
 	}
 
 	r.skipAPIStartProbe = stopped
-	return r.daemonStart(cmd, nil)
+	if err := r.daemonStart(cmd, nil); err != nil {
+		return err
+	}
+	_ = r.clearAutoUpgradeReadyState(cmd.Context())
+	return nil
 }
 
 func (r *commandRuntime) daemonStop(cmd *cobra.Command, args []string) error {
@@ -1243,11 +1247,16 @@ func (r *commandRuntime) spawnDetached(command string, args []string, cwd string
 	}
 	defer devNull.Close()
 
-	startupLog, err := os.OpenFile(r.startupOutputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return 0, err
+	startupLog := devNull
+	if r.startupOutputPath == "" {
+		startupLog = devNull
+	} else {
+		startupLog, err = os.OpenFile(r.startupOutputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return 0, err
+		}
+		defer startupLog.Close()
 	}
-	defer startupLog.Close()
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = cwd

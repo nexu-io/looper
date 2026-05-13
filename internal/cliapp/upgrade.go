@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,11 +21,44 @@ import (
 const (
 	autoUpgradeStateSchemaVersion = 1
 	autoUpgradeCheckInterval      = 24 * time.Hour
+	autoUpgradeInFlightTimeout    = 30 * time.Minute
+	autoUpgradeBusyRetryDelay     = 5 * time.Minute
 )
 
 type autoUpgradeState struct {
-	SchemaVersion int        `json:"schemaVersion"`
-	LastCheckedAt *time.Time `json:"lastCheckedAt,omitempty"`
+	SchemaVersion int                       `json:"schemaVersion"`
+	LastCheckedAt *time.Time                `json:"lastCheckedAt,omitempty"`
+	RetryAfter    *time.Time                `json:"retryAfter,omitempty"`
+	InFlight      *autoUpgradeInFlightState `json:"inFlight,omitempty"`
+	Ready         *autoUpgradeReadyState    `json:"ready,omitempty"`
+}
+
+type autoUpgradeInFlightState struct {
+	PID       int        `json:"pid"`
+	StartedAt *time.Time `json:"startedAt,omitempty"`
+}
+
+type autoUpgradeReadyState struct {
+	CLIChanged            bool      `json:"cliChanged,omitempty"`
+	CLIVersion            string    `json:"cliVersion,omitempty"`
+	DaemonChanged         bool      `json:"daemonChanged,omitempty"`
+	DaemonVersion         string    `json:"daemonVersion,omitempty"`
+	DaemonRestartRequired bool      `json:"daemonRestartRequired,omitempty"`
+	RunningDaemonVersion  string    `json:"runningDaemonVersion,omitempty"`
+	CompletedAt           time.Time `json:"completedAt"`
+}
+
+type autoUpgradeLockState struct {
+	PID        int    `json:"pid"`
+	Executable string `json:"executable,omitempty"`
+	Command    string `json:"command,omitempty"`
+	ObservedAt string `json:"observedAt,omitempty"`
+}
+
+type autoUpgradeLockProcessState struct {
+	Executable     string
+	Command        string
+	ElapsedSeconds int
 }
 
 type upgradeCheckSummary struct {
@@ -141,19 +175,83 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 	if err != nil {
 		return nil
 	}
+	lockPath, err := r.resolveAutoUpgradeLockPath()
+	if err != nil {
+		return nil
+	}
+	unlock, acquired, err := r.tryAcquireAutoUpgradeLock(lockPath)
+	if err != nil || !acquired {
+		return nil
+	}
+	defer unlock()
 	state, err := r.readAutoUpgradeState(statePath)
 	if err != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade skipped: read state: %v\n", err)
 		return nil
 	}
-	if !shouldRunAutoUpgradeCheck(state, time.Now()) {
+	state, changed, err := r.reconcileAutoUpgradeState(cmd.Context(), state)
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade skipped: reconcile state: %v\n", err)
+		return nil
+	}
+	if changed {
+		if err := r.writeAutoUpgradeState(statePath, *state); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+		}
+	}
+	if state != nil && state.Ready != nil {
+		if err := r.writeAutoUpgradeReadyNotice(cmd.ErrOrStderr(), *state.Ready); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade notice failed: %v\n", err)
+		}
+		if !state.Ready.DaemonRestartRequired {
+			state.Ready = nil
+			if err := r.writeAutoUpgradeState(statePath, *state); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+			}
+		} else {
+			return nil
+		}
+	}
+	if state != nil && state.InFlight != nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	if state != nil && state.RetryAfter != nil {
+		if now.Before(*state.RetryAfter) {
+			return nil
+		}
+		state.RetryAfter = nil
+		if err := r.writeAutoUpgradeState(statePath, *state); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+		}
+	}
+	if !shouldRunAutoUpgradeCheck(state, now) {
 		return nil
 	}
 
-	autoCmd := newAutoUpgradeCommand(cmd)
-	r.runAutoUpgrade(autoCmd)
-	if err := r.writeAutoUpgradeState(statePath, autoUpgradeState{LastCheckedAt: timePtr(time.Now())}); err != nil {
+	state, started, err := r.startBackgroundAutoUpgrade(cmd, state)
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade skipped: start background download: %v\n", err)
+		return nil
+	}
+	if !started {
+		return nil
+	}
+	state, err = r.persistAutoUpgradeInFlightState(statePath, *state)
+	if err != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+		return nil
+	}
+	if state != nil && state.Ready != nil {
+		if err := r.writeAutoUpgradeReadyNotice(cmd.ErrOrStderr(), *state.Ready); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade notice failed: %v\n", err)
+		}
+		if !state.Ready.DaemonRestartRequired {
+			state.Ready = nil
+			if err := r.writeAutoUpgradeState(statePath, *state); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade state update failed: %v\n", err)
+			}
+		}
 	}
 	return nil
 }
@@ -184,57 +282,29 @@ func newAutoUpgradeCommand(parent *cobra.Command) *cobra.Command {
 	return cmd
 }
 
-func (r *commandRuntime) runAutoUpgrade(cmd *cobra.Command) {
-	cliOutput, cliErr := r.upgradeCLIWithOutput(cmd, false)
-	if cliErr != nil {
-		var refused *cliUpgradeRefusedError
-		if errors.As(cliErr, &refused) {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: CLI skipped: %s\n", refused.message)
-		} else {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: CLI check failed: %v\n", cliErr)
-		}
-	} else if cliOutput.Changed {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: upgraded looper %s → %s\n", cliOutput.CurrentVersion, cliOutput.LatestVersion)
-	}
-
-	managedDaemon, err := r.readManagedUpgradeDaemonVersion(cmd.Context())
+func (r *commandRuntime) startBackgroundAutoUpgrade(cmd *cobra.Command, state *autoUpgradeState) (*autoUpgradeState, bool, error) {
+	execPath, err := r.executablePath()
 	if err != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon check failed: %v\n", err)
-		return
+		return state, false, err
 	}
-	if managedDaemon == nil {
-		return
+	if state == nil {
+		state = &autoUpgradeState{}
 	}
-
-	statusPayload, statusErr := r.currentDaemonStatusPayload(cmd.Context())
-	if statusErr != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon status check failed: %v\n", statusErr)
-		return
+	workingDir, err := r.getwd()
+	if err != nil {
+		workingDir = ""
 	}
-	pathDaemon, pathErr := r.readPathUpgradeDaemonVersion(cmd.Context())
-	if pathErr != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon path version check failed: %v\n", pathErr)
-		return
+	forwardedArgs := normalizeForwardedConfigPathArgs(ExtractConfigArgs(r.argv), workingDir)
+	args := append([]string{"upgrade", "--background-auto"}, forwardedArgs...)
+	pid, err := r.spawnDetached(execPath, args, workingDir, os.Environ())
+	if err != nil {
+		return state, false, err
 	}
-	runningDaemon := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
-
-	daemonOutput, daemonErr := r.upgradeDaemonWithOutput(cmd, false)
-	if daemonErr != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: daemon check failed: %v\n", daemonErr)
-		return
-	}
-	if !daemonOutput.Changed {
-		return
-	}
-
-	if daemonOutput.PreviousVersion != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: installed looperd %s → %s\n", *daemonOutput.PreviousVersion, daemonOutput.LatestVersion)
-	} else {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: installed looperd %s\n", daemonOutput.LatestVersion)
-	}
-	if len(statusPayload) > 0 && runningDaemon != nil && runningDaemon.Source == "installed-binary" && runningDaemon.Version != daemonOutput.LatestVersion {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Auto-upgrade: looperd %s is installed on disk, but the running daemon is still %s. Run `looper daemon restart`.\n", daemonOutput.LatestVersion, runningDaemon.Version)
-	}
+	now := time.Now().UTC()
+	state.InFlight = &autoUpgradeInFlightState{PID: pid, StartedAt: &now}
+	state.RetryAfter = nil
+	state.Ready = nil
+	return state, true, nil
 }
 
 func (r *commandRuntime) resolveAutoUpgradeStatePath() (string, error) {
@@ -243,6 +313,22 @@ func (r *commandRuntime) resolveAutoUpgradeStatePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(homeDir, ".looper", "auto-upgrade.state.json"), nil
+}
+
+func (r *commandRuntime) resolveAutoUpgradeLockPath() (string, error) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".looper", "auto-upgrade.state.lock"), nil
+}
+
+func (r *commandRuntime) resolveAutoUpgradeRunLockPath() (string, error) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".looper", "auto-upgrade.run.lock"), nil
 }
 
 func (r *commandRuntime) readAutoUpgradeState(path string) (*autoUpgradeState, error) {
@@ -284,6 +370,344 @@ func (r *commandRuntime) writeAutoUpgradeState(path string, state autoUpgradeSta
 	return nil
 }
 
+func (r *commandRuntime) persistAutoUpgradeInFlightState(path string, pending autoUpgradeState) (*autoUpgradeState, error) {
+	current, err := r.readAutoUpgradeState(path)
+	if err != nil {
+		return nil, err
+	}
+	if current != nil && current.Ready != nil && current.InFlight == nil {
+		return current, nil
+	}
+	if current != nil && current.LastCheckedAt != nil {
+		pending.LastCheckedAt = current.LastCheckedAt
+	}
+	if current != nil && current.RetryAfter != nil {
+		pending.RetryAfter = current.RetryAfter
+	}
+	if err := r.writeAutoUpgradeState(path, pending); err != nil {
+		return nil, err
+	}
+	return &pending, nil
+}
+
+func (r *commandRuntime) tryAcquireAutoUpgradeLock(path string) (func(), bool, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, false, err
+	}
+	for {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			if !os.IsExist(err) {
+				return nil, false, err
+			}
+			if !r.shouldBreakAutoUpgradeLock(path) {
+				return func() {}, false, nil
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return nil, false, err
+			}
+			continue
+		}
+		_ = json.NewEncoder(file).Encode(r.currentAutoUpgradeLockState())
+		unlock := func() {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+		return unlock, true, nil
+	}
+}
+
+func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	lock, ok := parseAutoUpgradeLockState(raw)
+	if !ok || lock.PID <= 0 {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if !r.isProcessAlive(lock.PID) {
+		return true
+	}
+	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if !r.isExpectedAutoUpgradeLockProcess(path, process) {
+		return true
+	}
+	if lock.Executable == "" || lock.Command == "" || lock.ObservedAt == "" {
+		return false
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, lock.ObservedAt)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if process.ElapsedSeconds < 0 {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if process.Executable != lock.Executable || process.Command != lock.Command {
+		return true
+	}
+	earliestPossibleStart := time.Now().UTC().Add(-time.Duration(process.ElapsedSeconds+1) * time.Second)
+	return earliestPossibleStart.After(observedAt)
+}
+
+func (r *commandRuntime) isExpectedAutoUpgradeLockProcess(path string, process autoUpgradeLockProcessState) bool {
+	if process.Executable == "" || process.Command == "" {
+		return false
+	}
+	if process.Executable != r.autoUpgradeLockExecutable() {
+		return false
+	}
+	switch filepath.Base(path) {
+	case "auto-upgrade.run.lock":
+		for _, token := range splitProcessCommand(process.Command)[1:] {
+			if token == "upgrade" {
+				return true
+			}
+		}
+		return false
+	case "auto-upgrade.state.lock":
+		return true
+	default:
+		return r.isBackgroundAutoUpgradeProcess(process)
+	}
+}
+
+func parseAutoUpgradeLockState(raw []byte) (autoUpgradeLockState, bool) {
+	var lock autoUpgradeLockState
+	if err := json.Unmarshal(raw, &lock); err == nil {
+		return lock, true
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return autoUpgradeLockState{}, false
+	}
+	return autoUpgradeLockState{PID: pid}, true
+}
+
+func (r *commandRuntime) autoUpgradeLockExecutable() string {
+	if base := filepath.Base(strings.TrimSpace(r.app.deps.ExecutablePath)); base != "" && base != "." {
+		return base
+	}
+	return "looper"
+}
+
+func (r *commandRuntime) currentAutoUpgradeLockState() autoUpgradeLockState {
+	lock := autoUpgradeLockState{PID: os.Getpid(), Executable: r.autoUpgradeLockExecutable(), ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
+	if err != nil {
+		return lock
+	}
+	if process.Executable != "" {
+		lock.Executable = process.Executable
+	}
+	lock.Command = process.Command
+	return lock
+}
+
+func (r *commandRuntime) readAutoUpgradeLockProcess(ctx context.Context, pid int) (autoUpgradeLockProcessState, error) {
+	command, err := r.readProcessCommand(ctx, pid)
+	if err != nil {
+		return autoUpgradeLockProcessState{}, err
+	}
+	elapsedSeconds, err := r.readProcessElapsedSeconds(ctx, pid)
+	if err != nil {
+		return autoUpgradeLockProcessState{}, err
+	}
+	if command == "" {
+		return autoUpgradeLockProcessState{}, nil
+	}
+	tokens := splitProcessCommand(command)
+	if len(tokens) == 0 {
+		return autoUpgradeLockProcessState{}, nil
+	}
+	return autoUpgradeLockProcessState{Executable: filepath.Base(tokens[0]), Command: command, ElapsedSeconds: elapsedSeconds}, nil
+}
+
+func (r *commandRuntime) isBackgroundAutoUpgradeProcess(process autoUpgradeLockProcessState) bool {
+	if process.Executable == "" || process.Command == "" {
+		return false
+	}
+	if process.Executable != r.autoUpgradeLockExecutable() {
+		return false
+	}
+	tokens := splitProcessCommand(process.Command)
+	if len(tokens) < 3 {
+		return false
+	}
+	hasUpgrade := false
+	hasBackgroundAuto := false
+	for _, token := range tokens[1:] {
+		switch token {
+		case "upgrade":
+			hasUpgrade = true
+		case "--background-auto":
+			hasBackgroundAuto = true
+		}
+	}
+	return hasUpgrade && hasBackgroundAuto
+}
+
+func (r *commandRuntime) readProcessElapsedSeconds(ctx context.Context, pid int) (int, error) {
+	result, err := r.runCommand(ctx, "ps", []string{"-p", fmt.Sprintf("%d", pid), "-o", "etime="}, daemonCommandTimeout)
+	if err != nil {
+		return -1, fmt.Errorf("inspect process %d elapsed time with ps: %w", pid, err)
+	}
+	if result.ExitCode != 0 {
+		return -1, nil
+	}
+	elapsed, err := parsePSElapsedSeconds(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return -1, fmt.Errorf("parse process %d elapsed time %q: %w", pid, strings.TrimSpace(result.Stdout), err)
+	}
+	return elapsed, nil
+}
+
+func parsePSElapsedSeconds(raw string) (int, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("empty elapsed time")
+	}
+	dayParts := strings.SplitN(raw, "-", 2)
+	days := 0
+	timePart := raw
+	if len(dayParts) == 2 {
+		parsedDays, err := strconv.Atoi(dayParts[0])
+		if err != nil {
+			return 0, err
+		}
+		days = parsedDays
+		timePart = dayParts[1]
+	}
+	parts := strings.Split(timePart, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, fmt.Errorf("unexpected elapsed time format")
+	}
+	values := make([]int, len(parts))
+	for i, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil {
+			return 0, err
+		}
+		values[i] = value
+	}
+	hours := 0
+	minutes := values[0]
+	seconds := values[1]
+	if len(values) == 3 {
+		hours = values[0]
+		minutes = values[1]
+		seconds = values[2]
+	}
+	return (((days*24)+hours)*60+minutes)*60 + seconds, nil
+}
+
+func (r *commandRuntime) reconcileAutoUpgradeState(ctx context.Context, state *autoUpgradeState) (*autoUpgradeState, bool, error) {
+	if state == nil {
+		return nil, false, nil
+	}
+	changed := false
+	if state.InFlight != nil && r.shouldClearAutoUpgradeInFlight(ctx, state.InFlight) {
+		state.InFlight = nil
+		changed = true
+	}
+	if state.Ready == nil {
+		return state, changed, nil
+	}
+	if !state.Ready.DaemonRestartRequired {
+		return state, changed, nil
+	}
+	managedDaemon, err := r.readManagedUpgradeDaemonVersion(ctx)
+	if err != nil {
+		return state, changed, err
+	}
+	statusPayload, err := r.currentDaemonStatusPayload(ctx)
+	if err != nil {
+		return state, changed, err
+	}
+	pathDaemon, err := r.readPathUpgradeDaemonVersion(ctx)
+	if err != nil {
+		return state, changed, err
+	}
+	runningDaemon := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
+	if managedDaemon == nil || runningDaemon == nil || runningDaemon.Version == managedDaemon.Version {
+		state.Ready = nil
+		changed = true
+		return state, changed, nil
+	}
+	state.Ready.DaemonVersion = managedDaemon.Version
+	state.Ready.RunningDaemonVersion = runningDaemon.Version
+	return state, changed, nil
+}
+
+func (r *commandRuntime) shouldClearAutoUpgradeInFlight(ctx context.Context, state *autoUpgradeInFlightState) bool {
+	if state == nil {
+		return false
+	}
+	if state.PID <= 0 {
+		return true
+	}
+	if !r.isProcessAlive(state.PID) {
+		return true
+	}
+	result, err := r.runCommand(ctx, "ps", []string{"-p", fmt.Sprintf("%d", state.PID), "-o", "command="}, daemonCommandTimeout)
+	if err != nil || result.ExitCode != 0 {
+		return false
+	}
+	return !r.isBackgroundAutoUpgradeProcess(autoUpgradeLockProcessState{Executable: r.autoUpgradeLockExecutable(), Command: result.Stdout})
+}
+
+func (r *commandRuntime) clearAutoUpgradeReadyState(ctx context.Context) error {
+	statePath, err := r.resolveAutoUpgradeStatePath()
+	if err != nil {
+		return err
+	}
+	state, err := r.readAutoUpgradeState(statePath)
+	if err != nil || state == nil || state.Ready == nil {
+		return err
+	}
+	state, changed, err := r.reconcileAutoUpgradeState(ctx, state)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return r.writeAutoUpgradeState(statePath, *state)
+}
+
+func (r *commandRuntime) writeAutoUpgradeReadyNotice(w io.Writer, ready autoUpgradeReadyState) error {
+	if ready.CLIChanged {
+		if _, err := fmt.Fprintf(w, "Auto-upgrade ready: looper %s is installed.\n", ready.CLIVersion); err != nil {
+			return err
+		}
+	}
+	if ready.DaemonChanged {
+		if ready.DaemonRestartRequired {
+			if strings.TrimSpace(ready.RunningDaemonVersion) != "" {
+				if _, err := fmt.Fprintf(w, "Auto-upgrade ready: looperd %s is installed, but the running daemon is still %s. Restart to activate it:\n", ready.DaemonVersion, ready.RunningDaemonVersion); err != nil {
+					return err
+				}
+			} else {
+				if _, err := fmt.Fprintf(w, "Auto-upgrade ready: looperd %s is installed. Restart to activate it:\n", ready.DaemonVersion); err != nil {
+					return err
+				}
+			}
+			_, err := fmt.Fprintln(w, "  looper daemon restart")
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "Auto-upgrade ready: looperd %s is installed.\n", ready.DaemonVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func shouldRunAutoUpgradeCheck(state *autoUpgradeState, now time.Time) bool {
 	if state == nil || state.LastCheckedAt == nil {
 		return true
@@ -297,6 +721,9 @@ func timePtr(value time.Time) *time.Time {
 
 func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 	_ = args
+	if getBoolFlag(cmd, "background-auto") {
+		return r.runBackgroundAutoUpgrade(cmd)
+	}
 
 	check := getBoolFlag(cmd, "check")
 	cliOnly := getBoolFlag(cmd, "cli")
@@ -326,6 +753,18 @@ func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 		}
 		return writeHumanUpgradeSummary(cmd.OutOrStdout(), summary)
 	}
+	runLockPath, err := r.resolveAutoUpgradeRunLockPath()
+	if err != nil {
+		return err
+	}
+	unlock, acquired, err := r.tryAcquireAutoUpgradeLock(runLockPath)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("another looper upgrade is already running; try again in a moment")
+	}
+	defer unlock()
 
 	if daemonOnly {
 		return r.upgradeDaemon(cmd)
@@ -337,6 +776,99 @@ func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 	}
 
 	return r.upgradeUnified(cmd)
+}
+
+func (r *commandRuntime) runBackgroundAutoUpgrade(cmd *cobra.Command) error {
+	statePath, err := r.resolveAutoUpgradeStatePath()
+	if err != nil {
+		return err
+	}
+	state, err := r.readAutoUpgradeState(statePath)
+	if err != nil {
+		return err
+	}
+	runLockPath, err := r.resolveAutoUpgradeRunLockPath()
+	if err != nil {
+		return err
+	}
+	unlock, acquired, err := r.tryAcquireAutoUpgradeLock(runLockPath)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		if state == nil {
+			state = &autoUpgradeState{}
+		}
+		retryAfter := time.Now().UTC().Add(autoUpgradeBusyRetryDelay)
+		state.RetryAfter = &retryAfter
+		state.InFlight = nil
+		return r.writeAutoUpgradeState(statePath, *state)
+	}
+	defer unlock()
+	workerCtx, cancel := context.WithTimeout(cmd.Context(), autoUpgradeInFlightTimeout)
+	defer cancel()
+	autoCmd := newAutoUpgradeCommand(cmd)
+	autoCmd.SetContext(workerCtx)
+	ready := r.collectBackgroundAutoUpgradeResult(autoCmd)
+	if state == nil {
+		state = &autoUpgradeState{}
+	}
+	if ready == nil && state.Ready != nil && state.Ready.DaemonRestartRequired {
+		ready = state.Ready
+	}
+	now := time.Now().UTC()
+	state.LastCheckedAt = &now
+	state.RetryAfter = nil
+	state.InFlight = nil
+	state.Ready = ready
+	return r.writeAutoUpgradeState(statePath, *state)
+}
+
+func (r *commandRuntime) collectBackgroundAutoUpgradeResult(cmd *cobra.Command) *autoUpgradeReadyState {
+	ready := &autoUpgradeReadyState{CompletedAt: time.Now().UTC()}
+	cliOutput, cliErr := r.upgradeCLIWithOutput(cmd, false)
+	if cliErr == nil && cliOutput.Changed {
+		ready.CLIChanged = true
+		ready.CLIVersion = cliOutput.LatestVersion
+	}
+
+	managedDaemon, managedErr := r.readManagedUpgradeDaemonVersion(cmd.Context())
+	if managedErr != nil {
+		return autoUpgradeReadyOrNil(ready)
+	}
+	if managedDaemon == nil {
+		return autoUpgradeReadyOrNil(ready)
+	}
+	statusPayload, statusErr := r.currentDaemonStatusPayload(cmd.Context())
+	if statusErr != nil {
+		return autoUpgradeReadyOrNil(ready)
+	}
+	pathDaemon, pathErr := r.readPathUpgradeDaemonVersion(cmd.Context())
+	if pathErr != nil {
+		return autoUpgradeReadyOrNil(ready)
+	}
+	runningDaemon := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
+
+	daemonOutput, daemonErr := r.upgradeDaemonWithOutput(cmd, false)
+	if daemonErr == nil && daemonOutput.Changed {
+		ready.DaemonChanged = true
+		ready.DaemonVersion = daemonOutput.LatestVersion
+		if len(statusPayload) > 0 && runningDaemon != nil && runningDaemon.Source == "installed-binary" && runningDaemon.Version != daemonOutput.LatestVersion {
+			ready.DaemonRestartRequired = true
+			ready.RunningDaemonVersion = runningDaemon.Version
+		}
+	}
+	return autoUpgradeReadyOrNil(ready)
+}
+
+func autoUpgradeReadyOrNil(ready *autoUpgradeReadyState) *autoUpgradeReadyState {
+	if ready == nil {
+		return nil
+	}
+	if !ready.CLIChanged && !ready.DaemonChanged {
+		return nil
+	}
+	return ready
 }
 
 func (r *commandRuntime) collectUpgradeCheckSummary(ctx context.Context) (upgradeCheckSummary, error) {
