@@ -584,7 +584,6 @@ type checkpointRepair struct {
 	ElapsedRuntimeSeconds        int64                   `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string                  `json:"lastProgressAt,omitempty"`
 	ReplyExplanations            []replyExplanationEntry `json:"replyExplanations,omitempty"`
-	FixItemsHash                 string                  `json:"fixItemsHash,omitempty"`
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
@@ -1778,7 +1777,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
-	checkpoint.Repair.FixItemsHash = checkpoint.FixItemsHash
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1985,9 +1983,11 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	if strings.TrimSpace(lc.Branch) != "" && strings.TrimSpace(lc.Branch) != branch {
 		return false, checkpoint, nil
 	}
-	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
-		return false, checkpoint, nil
-	}
+	// PRNumber/Branch/HeadRefName/HeadSHA are validated independently
+	// against the live PR detail below; we deliberately do not gate
+	// adoption on a fix-items hash match. New review threads arriving
+	// during repair routinely shift the snapshot hash without
+	// invalidating the agent's claim that it pushed the right commit.
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return false, checkpoint, err
@@ -2124,23 +2124,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Repair != nil && strings.TrimSpace(checkpoint.Repair.CompletedAt) != "" {
 		driftSince = checkpoint.Repair.CompletedAt
 	}
-	// If the agent's reply explanations were captured against a different
-	// fix-items snapshot than the live PR shows, the underlying threads or
-	// comments have changed since the agent ran. Treat the whole step as
-	// thread drift and rediscover, instead of marking each thread as
-	// skipped_agent_declined (which would silently bypass the drift path).
-	if len(commentItems) > 0 && checkpoint.Repair != nil && len(checkpoint.Repair.ReplyExplanations) > 0 && !agentResolveReplyExplanationsValid(checkpoint) {
-		for _, item := range commentItems {
-			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
-				continue
-			}
-			driftCount++
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "Fix-items snapshot changed since the agent recorded reply explanations", UpdatedAt: r.nowISO()})
-		}
-		r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
-		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: fmt.Sprintf("Fix-items snapshot drifted; will rediscover %d thread(s)", driftCount), kind: FailureRetryableAfterResume}
-	}
+	// Per-thread drift detection (hasNonLooperCommentSince below) handles
+	// the case where a reviewer added or edited a comment on an existing
+	// thread after the agent recorded its decisions. New threads that
+	// appeared after the snapshot are not present in the agent's payload
+	// and fall through to the contract-violation → synthetic-decline path,
+	// which posts a visible reply without resolving the thread. Both
+	// behaviours are correct without invalidating the entire reply set on
+	// a fix-items hash mismatch — doing so threw away every successful
+	// "fixed" decision whenever a single new thread appeared, which on PRs
+	// receiving a steady stream of bot comments produced an unbreakable
+	// drift loop.
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -2351,16 +2345,15 @@ func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput
 }
 
 // lookupReplyExplanations returns a map of fixItemId → sanitized agent
-// explanation, but only when the explanations were captured against the same
-// fix-items snapshot represented by the current checkpoint. If the snapshot
-// changed (e.g. PR rebased, new comments arrived), the agent's explanations no
-// longer describe the threads we are about to handle, so they do not count as
-// durable confirmation for auto-reply/resolve.
+// explanation. Per-thread drift (a new human comment posted after the
+// agent's decision) is detected separately by hasNonLooperCommentSince.
+// We deliberately do not invalidate the whole reply set when the
+// fix-items hash differs from the snapshot the agent saw: keeping the
+// per-item explanations available preserves round summary text and
+// evidence records for the threads the agent actually decided about,
+// without affecting how new (unknown) threads are handled downstream.
 func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
-		return nil
-	}
-	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
 		return nil
 	}
 	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
@@ -2386,15 +2379,16 @@ func normalizeReplyExplanationActions(entries []replyExplanationEntry) []replyEx
 }
 
 // agentResolveReplyExplanationsValid reports whether the agent-provided
-// reply explanations were captured against the same fix-items snapshot
-// represented by the current checkpoint. When the snapshot drifted (e.g.
-// rebase, new comments) the explanations no longer describe the threads
-// we are about to handle and must not be used as resolve authority.
+// reply explanations exist on the checkpoint and can be consulted as the
+// per-item reply authority. Per-thread drift (a new human comment posted
+// after the agent's decision) is detected separately by
+// hasNonLooperCommentSince. We deliberately do not invalidate the whole
+// reply set when the fix-items hash differs from the snapshot the agent
+// saw: new threads simply fall through to the contract-violation path and
+// receive synthetic declines, while previously decided threads continue to
+// be replied/resolved as the agent intended.
 func agentResolveReplyExplanationsValid(checkpoint fixerCheckpoint) bool {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
-		return false
-	}
-	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
 		return false
 	}
 	return true
