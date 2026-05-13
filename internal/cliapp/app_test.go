@@ -1601,6 +1601,65 @@ func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverride(t *testing
 	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.autoDiscovery", "env")
 }
 
+func TestConfigShowSourceDetectsCanonicalEnableFlagOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"instructions": map[string]any{"enabled": false},
+		"package":      map[string]any{"autoUpgradeEnabled": true},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--instructions-enabled=true", "--package-auto-upgrade-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --instructions-enabled --package-auto-upgrade-enabled]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "instructions.enabled", "cli")
+	assertConfigFieldSource(t, stdout, "package.autoUpgradeEnabled", "cli")
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{
+					"triggers": map[string]any{
+						"includeDrafts":        false,
+						"requireReviewRequest": false,
+						"labels":               []string{"looper:review"},
+						"labelMode":            "all",
+					},
+					"specReview": map[string]any{
+						"includeReviewingLabel": false,
+						"reviewingLabel":        "looper:reviewing",
+					},
+				},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", "looper:review,looper:extra")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE", "any")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "looper:canonical")
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.includeDrafts", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.requireReviewRequest", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labels", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labelMode", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.includeReviewingLabel", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.reviewingLabel", "env")
+}
+
 func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
 	t.Parallel()
 
@@ -1848,6 +1907,22 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "warning: LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY is set") {
 		t.Fatalf("stderr = %q, want canonical reviewer discovery env override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "instructions.enabled", "false", "--instructions-enabled=true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set instructions.enabled with canonical override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --instructions-enabled is set") {
+		t.Fatalf("stderr = %q, want canonical instructions flag override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "package.autoUpgradeEnabled", "true", "--package-auto-upgrade-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set package.autoUpgradeEnabled with canonical override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --package-auto-upgrade-enabled is set") {
+		t.Fatalf("stderr = %q, want canonical package flag override warning", stderr)
 	}
 }
 
