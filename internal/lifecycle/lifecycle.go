@@ -17,6 +17,9 @@ const (
 	ActionSourceNone     = "none"
 	ActionSourceAgent    = "agent"
 	ActionSourceFallback = "fallback"
+
+	BranchProvenancePlanned       = "planned"
+	BranchProvenanceAgentMigrated = "agent_migrated"
 )
 
 type Policy struct {
@@ -36,36 +39,50 @@ type Actions struct {
 }
 
 type State struct {
-	Policy          string   `json:"policy,omitempty"`
-	PolicyVersion   int      `json:"policy_version,omitempty"`
-	Branch          string   `json:"branch,omitempty"`
-	BaseBranch      string   `json:"base_branch,omitempty"`
-	CommitSHAs      []string `json:"commit_shas,omitempty"`
-	Pushed          bool     `json:"pushed,omitempty"`
-	PRNumber        int64    `json:"pr_number,omitempty"`
-	PRURL           string   `json:"pr_url,omitempty"`
-	PRAdopted       bool     `json:"pr_adopted,omitempty"`
-	Actions         Actions  `json:"actions,omitempty"`
-	ReconciledAt    string   `json:"reconciled_at,omitempty"`
-	ReconciledBy    string   `json:"reconciled_by,omitempty"`
-	LastError       string   `json:"last_reconciliation_error,omitempty"`
-	AgentIngestedAt string   `json:"agent_ingested_at,omitempty"`
+	Policy            string   `json:"policy,omitempty"`
+	PolicyVersion     int      `json:"policy_version,omitempty"`
+	Branch            string   `json:"branch,omitempty"`
+	BaseBranch        string   `json:"base_branch,omitempty"`
+	PlannedBranch     string   `json:"planned_branch,omitempty"`
+	PlannedBaseBranch string   `json:"planned_base_branch,omitempty"`
+	AgentBranch       string   `json:"agent_branch,omitempty"`
+	AgentBaseBranch   string   `json:"agent_base_branch,omitempty"`
+	ActiveBranch      string   `json:"active_branch,omitempty"`
+	ActiveBaseBranch  string   `json:"active_base_branch,omitempty"`
+	BranchProvenance  string   `json:"branch_provenance,omitempty"`
+	CommitSHAs        []string `json:"commit_shas,omitempty"`
+	Pushed            bool     `json:"pushed,omitempty"`
+	PRNumber          int64    `json:"pr_number,omitempty"`
+	PRURL             string   `json:"pr_url,omitempty"`
+	PRAdopted         bool     `json:"pr_adopted,omitempty"`
+	Actions           Actions  `json:"actions,omitempty"`
+	ReconciledAt      string   `json:"reconciled_at,omitempty"`
+	ReconciledBy      string   `json:"reconciled_by,omitempty"`
+	LastError         string   `json:"last_reconciliation_error,omitempty"`
+	AgentIngestedAt   string   `json:"agent_ingested_at,omitempty"`
 }
 
 func (s *State) UnmarshalJSON(data []byte) error {
 	type stateAlias State
 	var raw struct {
 		stateAlias
-		PolicyVersionCamel   int      `json:"policyVersion,omitempty"`
-		BaseBranchCamel      string   `json:"baseBranch,omitempty"`
-		CommitSHAsCamel      []string `json:"commitShas,omitempty"`
-		PRNumberCamel        int64    `json:"prNumber,omitempty"`
-		PRURLCamel           string   `json:"prUrl,omitempty"`
-		PRAdoptedCamel       bool     `json:"prAdopted,omitempty"`
-		ReconciledAtCamel    string   `json:"reconciledAt,omitempty"`
-		ReconciledByCamel    string   `json:"reconciledBy,omitempty"`
-		LastErrorCamel       string   `json:"lastReconciliationError,omitempty"`
-		AgentIngestedAtCamel string   `json:"agentIngestedAt,omitempty"`
+		PolicyVersionCamel     int      `json:"policyVersion,omitempty"`
+		BaseBranchCamel        string   `json:"baseBranch,omitempty"`
+		PlannedBranchCamel     string   `json:"plannedBranch,omitempty"`
+		PlannedBaseBranchCamel string   `json:"plannedBaseBranch,omitempty"`
+		AgentBranchCamel       string   `json:"agentBranch,omitempty"`
+		AgentBaseBranchCamel   string   `json:"agentBaseBranch,omitempty"`
+		ActiveBranchCamel      string   `json:"activeBranch,omitempty"`
+		ActiveBaseBranchCamel  string   `json:"activeBaseBranch,omitempty"`
+		BranchProvenanceCamel  string   `json:"branchProvenance,omitempty"`
+		CommitSHAsCamel        []string `json:"commitShas,omitempty"`
+		PRNumberCamel          int64    `json:"prNumber,omitempty"`
+		PRURLCamel             string   `json:"prUrl,omitempty"`
+		PRAdoptedCamel         bool     `json:"prAdopted,omitempty"`
+		ReconciledAtCamel      string   `json:"reconciledAt,omitempty"`
+		ReconciledByCamel      string   `json:"reconciledBy,omitempty"`
+		LastErrorCamel         string   `json:"lastReconciliationError,omitempty"`
+		AgentIngestedAtCamel   string   `json:"agentIngestedAt,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -76,6 +93,27 @@ func (s *State) UnmarshalJSON(data []byte) error {
 	}
 	if s.BaseBranch == "" {
 		s.BaseBranch = raw.BaseBranchCamel
+	}
+	if s.PlannedBranch == "" {
+		s.PlannedBranch = raw.PlannedBranchCamel
+	}
+	if s.PlannedBaseBranch == "" {
+		s.PlannedBaseBranch = raw.PlannedBaseBranchCamel
+	}
+	if s.AgentBranch == "" {
+		s.AgentBranch = raw.AgentBranchCamel
+	}
+	if s.AgentBaseBranch == "" {
+		s.AgentBaseBranch = raw.AgentBaseBranchCamel
+	}
+	if s.ActiveBranch == "" {
+		s.ActiveBranch = raw.ActiveBranchCamel
+	}
+	if s.ActiveBaseBranch == "" {
+		s.ActiveBaseBranch = raw.ActiveBaseBranchCamel
+	}
+	if s.BranchProvenance == "" {
+		s.BranchProvenance = raw.BranchProvenanceCamel
 	}
 	if len(s.CommitSHAs) == 0 {
 		s.CommitSHAs = raw.CommitSHAsCamel
@@ -109,7 +147,9 @@ func AgentManagedWithFallbackPolicy(runner string, expectPR bool) Policy {
 }
 
 func NewState(policy Policy, branch, baseBranch string) *State {
-	return &State{Policy: policy.Name, PolicyVersion: policy.Version, Branch: strings.TrimSpace(branch), BaseBranch: strings.TrimSpace(baseBranch), Actions: Actions{Commit: ActionSourceNone, Push: ActionSourceNone, PR: ActionSourceNone}}
+	branch = strings.TrimSpace(branch)
+	baseBranch = strings.TrimSpace(baseBranch)
+	return &State{Policy: policy.Name, PolicyVersion: policy.Version, Branch: branch, BaseBranch: baseBranch, PlannedBranch: branch, PlannedBaseBranch: baseBranch, ActiveBranch: branch, ActiveBaseBranch: baseBranch, BranchProvenance: BranchProvenancePlanned, Actions: Actions{Commit: ActionSourceNone, Push: ActionSourceNone, PR: ActionSourceNone}}
 }
 
 func FromMap(value any) (*State, error) {
@@ -140,6 +180,37 @@ func (s *State) Normalize() {
 	}
 	s.Branch = strings.TrimSpace(s.Branch)
 	s.BaseBranch = strings.TrimSpace(s.BaseBranch)
+	s.PlannedBranch = strings.TrimSpace(s.PlannedBranch)
+	s.PlannedBaseBranch = strings.TrimSpace(s.PlannedBaseBranch)
+	s.AgentBranch = strings.TrimSpace(s.AgentBranch)
+	s.AgentBaseBranch = strings.TrimSpace(s.AgentBaseBranch)
+	s.ActiveBranch = strings.TrimSpace(s.ActiveBranch)
+	s.ActiveBaseBranch = strings.TrimSpace(s.ActiveBaseBranch)
+	s.BranchProvenance = strings.TrimSpace(s.BranchProvenance)
+	if s.Branch == "" {
+		s.Branch = firstNonEmpty(s.ActiveBranch, s.PlannedBranch)
+	}
+	if s.BaseBranch == "" {
+		s.BaseBranch = firstNonEmpty(s.ActiveBaseBranch, s.PlannedBaseBranch)
+	}
+	if s.PlannedBranch == "" {
+		s.PlannedBranch = s.Branch
+	}
+	if s.PlannedBaseBranch == "" {
+		s.PlannedBaseBranch = s.BaseBranch
+	}
+	if s.ActiveBranch == "" {
+		s.ActiveBranch = firstNonEmpty(s.AgentBranch, s.Branch)
+	}
+	if s.ActiveBaseBranch == "" {
+		s.ActiveBaseBranch = firstNonEmpty(s.AgentBaseBranch, s.BaseBranch)
+	}
+	if s.BranchProvenance == "" {
+		s.BranchProvenance = BranchProvenancePlanned
+		if s.PlannedBranch != "" && s.ActiveBranch != "" && s.PlannedBranch != s.ActiveBranch {
+			s.BranchProvenance = BranchProvenanceAgentMigrated
+		}
+	}
 	s.CommitSHAs = compact(s.CommitSHAs)
 	if s.Actions.Commit == "" {
 		s.Actions.Commit = actionSourceFromBool(len(s.CommitSHAs) > 0)
@@ -169,6 +240,27 @@ func (s *State) MergeAgent(agent *State, ingestedAt string) {
 	if s.BaseBranch == "" && agent.BaseBranch != "" {
 		s.BaseBranch = agent.BaseBranch
 	}
+	if s.PlannedBranch == "" {
+		s.PlannedBranch = firstNonEmpty(agent.PlannedBranch, agent.Branch)
+	}
+	if s.PlannedBaseBranch == "" {
+		s.PlannedBaseBranch = firstNonEmpty(agent.PlannedBaseBranch, agent.BaseBranch)
+	}
+	if branch := firstNonEmpty(agent.AgentBranch, agent.Branch); branch != "" {
+		s.AgentBranch = branch
+	}
+	if baseBranch := firstNonEmpty(agent.AgentBaseBranch, agent.BaseBranch); baseBranch != "" {
+		s.AgentBaseBranch = baseBranch
+	}
+	if s.ActiveBranch == "" {
+		s.ActiveBranch = firstNonEmpty(agent.ActiveBranch, agent.Branch)
+	}
+	if s.ActiveBaseBranch == "" {
+		s.ActiveBaseBranch = firstNonEmpty(agent.ActiveBaseBranch, agent.BaseBranch)
+	}
+	if agent.BranchProvenance != "" {
+		s.BranchProvenance = agent.BranchProvenance
+	}
 	s.CommitSHAs = appendUnique(s.CommitSHAs, agent.CommitSHAs...)
 	if agent.Pushed {
 		s.Pushed = true
@@ -193,6 +285,35 @@ func (s *State) MergeAgent(agent *State, ingestedAt string) {
 	}
 	if ingestedAt != "" {
 		s.AgentIngestedAt = ingestedAt
+	}
+	s.Normalize()
+}
+
+func (s *State) RecordAgentBranch(branch, baseBranch string) {
+	if s == nil {
+		return
+	}
+	if branch = strings.TrimSpace(branch); branch != "" {
+		s.AgentBranch = branch
+	}
+	if baseBranch = strings.TrimSpace(baseBranch); baseBranch != "" {
+		s.AgentBaseBranch = baseBranch
+	}
+	s.Normalize()
+}
+
+func (s *State) SetActiveBranch(branch, baseBranch, provenance string) {
+	if s == nil {
+		return
+	}
+	if branch = strings.TrimSpace(branch); branch != "" {
+		s.ActiveBranch = branch
+	}
+	if baseBranch = strings.TrimSpace(baseBranch); baseBranch != "" {
+		s.ActiveBaseBranch = baseBranch
+	}
+	if provenance = strings.TrimSpace(provenance); provenance != "" {
+		s.BranchProvenance = provenance
 	}
 	s.Normalize()
 }
@@ -294,4 +415,13 @@ func appendUnique(dst []string, values ...string) []string {
 		dst = append(dst, value)
 	}
 	return dst
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

@@ -2519,6 +2519,95 @@ func TestProcessClaimedItemFindsExistingPRAfterPushAndStampsWorkerDisclosure(t *
 	}
 }
 
+func TestProcessClaimedItemAdoptsAgentCreatedPROnMigratedBranch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	plannedBranch := "looper/feature"
+	agentBranch := "fix/migrated-branch"
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: plannedBranch, BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: agentBranch, BaseRefName: "main", HeadSHA: "agentsha"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: agentBranch, BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 311 {
+		t.Fatalf("result = %#v, want success with adopted PR 311", result)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 || len(github.compareCalls) != 0 {
+		t.Fatalf("push/createPR/compare = %d/%d/%d, want 0/0/0 after lifecycle adoption", len(git.pushCalls), len(github.createPRCalls), len(github.compareCalls))
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if checkpoint.Lifecycle == nil || checkpoint.Lifecycle.PlannedBranch != plannedBranch || checkpoint.Lifecycle.AgentBranch != agentBranch || checkpoint.Lifecycle.ActiveBranch != agentBranch || checkpoint.Lifecycle.BranchProvenance != lifecycle.BranchProvenanceAgentMigrated || !checkpoint.Lifecycle.Pushed || checkpoint.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
+		t.Fatalf("checkpoint lifecycle = %#v, want adopted migrated branch lifecycle", checkpoint.Lifecycle)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint.SkipReason = %q, want empty", checkpoint.SkipReason)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.PRNumber == nil || *loop.PRNumber != 311 {
+		t.Fatalf("loop = %#v, want adopted PR persisted", loop)
+	}
+}
+
+func TestProcessClaimedItemFailsWithSpecificReasonWhenMigratedPRBaseMismatches(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: "fix/migrated-branch", BaseRefName: "release", HeadSHA: "agentsha"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: "fix/migrated-branch", BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "Agent created PR #311 on branch fix/migrated-branch but worker could not adopt it: expected base main, got release") {
+		t.Fatalf("result = %#v, want specific manual-intervention adoption failure", result)
+	}
+	if strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result.Summary = %q, want migrated-PR adoption reason instead of no-ahead skip", result.Summary)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 || len(github.compareCalls) != 0 {
+		t.Fatalf("push/createPR/compare = %d/%d/%d, want 0/0/0 after rejection", len(git.pushCalls), len(github.createPRCalls), len(github.compareCalls))
+	}
+}
+
+func TestProcessClaimedItemFailsWithSpecificReasonWhenMigratedPRHeadSHAMismatches(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: "fix/migrated-branch", BaseRefName: "main", HeadSHA: "unexpected"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: "fix/migrated-branch", BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "PR head unexpected does not match lifecycle commits") {
+		t.Fatalf("result = %#v, want specific SHA-mismatch adoption failure", result)
+	}
+	if strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result.Summary = %q, want migrated-PR adoption reason instead of no-ahead skip", result.Summary)
+	}
+}
+
 func TestProcessClaimedItemFailsWhenCreatedPRNumberIsMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
