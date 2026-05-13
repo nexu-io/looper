@@ -318,6 +318,156 @@ func TestTryAcquireAutoUpgradeLockReturnsRemoveErrorForStaleLock(t *testing.T) {
 	}
 }
 
+func TestTryAcquireAutoUpgradeLockBreaksLegacyStaleLockWhenPIDIsReused(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	lockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatalf("WriteFile(lockPath) error = %v", err)
+	}
+	staleTime := time.Now().Add(-autoUpgradeBusyRetryDelay - time.Second)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes(lockPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir, ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper")}), nil)
+	unlock, acquired, err := runtime.tryAcquireAutoUpgradeLock(lockPath)
+	if err != nil {
+		t.Fatalf("tryAcquireAutoUpgradeLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("tryAcquireAutoUpgradeLock() acquired = false, want true")
+	}
+	defer unlock()
+
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("ReadFile(lockPath) error = %v", err)
+	}
+	lock, ok := parseAutoUpgradeLockState(raw)
+	if !ok {
+		t.Fatalf("parseAutoUpgradeLockState(lock file) = false, want true; raw=%q", string(raw))
+	}
+	if lock.PID != os.Getpid() {
+		t.Fatalf("lock.PID = %d, want %d", lock.PID, os.Getpid())
+	}
+	if lock.Executable == "" {
+		t.Fatal("lock.Executable = empty, want process metadata")
+	}
+	if lock.Command == "" {
+		t.Fatal("lock.Command = empty, want process metadata")
+	}
+	if lock.ObservedAt == "" {
+		t.Fatal("lock.ObservedAt = empty, want process metadata")
+	}
+}
+
+func TestShouldBreakAutoUpgradeLockKeepsMatchingExecutableLockActive(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	lockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	commandLine := "/usr/local/bin/looper upgrade --background-auto"
+	observedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	raw, err := json.Marshal(autoUpgradeLockState{PID: os.Getpid(), Executable: "looper", Command: commandLine, ObservedAt: observedAt})
+	if err != nil {
+		t.Fatalf("Marshal(lock state) error = %v", err)
+	}
+	if err := os.WriteFile(lockPath, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile(lockPath) error = %v", err)
+	}
+	staleTime := time.Now().Add(-autoUpgradeBusyRetryDelay - time.Second)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes(lockPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir, RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		if command != "ps" {
+			t.Fatalf("RunCommand command = %q, want ps", command)
+		}
+		switch strings.Join(args, " ") {
+		case fmt.Sprintf("-p %d -o command=", os.Getpid()):
+			return commandExecutionResult{Stdout: commandLine + "\n", ExitCode: 0}, nil
+		case fmt.Sprintf("-p %d -o etime=", os.Getpid()):
+			return commandExecutionResult{Stdout: "0:00\n", ExitCode: 0}, nil
+		default:
+			t.Fatalf("RunCommand args = %q, want ps query for command or elapsed time", strings.Join(args, " "))
+			return commandExecutionResult{}, nil
+		}
+	}}), nil)
+	if runtime.shouldBreakAutoUpgradeLock(lockPath) {
+		t.Fatal("shouldBreakAutoUpgradeLock() = true, want false")
+	}
+}
+
+func TestShouldBreakAutoUpgradeLockBreaksWhenProcessStartTimeChanges(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	lockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	raw, err := json.Marshal(autoUpgradeLockState{PID: os.Getpid(), Executable: "looper", Command: "/usr/local/bin/looper upgrade --background-auto", ObservedAt: time.Now().UTC().Add(-10 * time.Second).Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatalf("Marshal(lock state) error = %v", err)
+	}
+	if err := os.WriteFile(lockPath, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile(lockPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir, RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		if command != "ps" {
+			t.Fatalf("RunCommand command = %q, want ps", command)
+		}
+		switch strings.Join(args, " ") {
+		case fmt.Sprintf("-p %d -o command=", os.Getpid()):
+			return commandExecutionResult{Stdout: "/usr/local/bin/looper upgrade --background-auto\n", ExitCode: 0}, nil
+		case fmt.Sprintf("-p %d -o etime=", os.Getpid()):
+			return commandExecutionResult{Stdout: "0:01\n", ExitCode: 0}, nil
+		default:
+			t.Fatalf("RunCommand args = %q, want ps query for command or elapsed time", strings.Join(args, " "))
+			return commandExecutionResult{}, nil
+		}
+	}}), nil)
+	if !runtime.shouldBreakAutoUpgradeLock(lockPath) {
+		t.Fatal("shouldBreakAutoUpgradeLock() = false, want true")
+	}
+}
+
+func TestParsePSElapsedSeconds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{raw: "0:07", want: 7},
+		{raw: "12:34", want: 12*60 + 34},
+		{raw: "1:02:03", want: 3723},
+		{raw: "2-03:04:05", want: (((2*24)+3)*60+4)*60 + 5},
+	} {
+		got, err := parsePSElapsedSeconds(tc.raw)
+		if err != nil {
+			t.Fatalf("parsePSElapsedSeconds(%q) error = %v", tc.raw, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parsePSElapsedSeconds(%q) = %d, want %d", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
 	t.Parallel()
 

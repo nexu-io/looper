@@ -48,6 +48,19 @@ type autoUpgradeReadyState struct {
 	CompletedAt           time.Time `json:"completedAt"`
 }
 
+type autoUpgradeLockState struct {
+	PID        int    `json:"pid"`
+	Executable string `json:"executable,omitempty"`
+	Command    string `json:"command,omitempty"`
+	ObservedAt string `json:"observedAt,omitempty"`
+}
+
+type autoUpgradeLockProcessState struct {
+	Executable     string
+	Command        string
+	ElapsedSeconds int
+}
+
 type upgradeCheckSummary struct {
 	CLI    upgradeCLISummary    `json:"cli"`
 	Daemon upgradeDaemonSummary `json:"daemon"`
@@ -381,25 +394,27 @@ func (r *commandRuntime) tryAcquireAutoUpgradeLock(path string) (func(), bool, e
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, false, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			if r.shouldBreakAutoUpgradeLock(path) {
-				if err := os.Remove(path); err != nil {
-					return nil, false, err
-				}
-				return r.tryAcquireAutoUpgradeLock(path)
+	for {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			if !os.IsExist(err) {
+				return nil, false, err
 			}
-			return func() {}, false, nil
+			if !r.shouldBreakAutoUpgradeLock(path) {
+				return func() {}, false, nil
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return nil, false, err
+			}
+			continue
 		}
-		return nil, false, err
+		_ = json.NewEncoder(file).Encode(r.currentAutoUpgradeLockState())
+		unlock := func() {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+		return unlock, true, nil
 	}
-	_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
-	unlock := func() {
-		_ = file.Close()
-		_ = os.Remove(path)
-	}
-	return unlock, true, nil
 }
 
 func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
@@ -411,11 +426,136 @@ func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
 	if err != nil {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid <= 0 {
+	lock, ok := parseAutoUpgradeLockState(raw)
+	if !ok || lock.PID <= 0 {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
-	return !r.isProcessAlive(pid)
+	if !r.isProcessAlive(lock.PID) {
+		return true
+	}
+	if lock.Executable == "" || lock.Command == "" || lock.ObservedAt == "" {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, lock.ObservedAt)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if process.Executable == "" || process.Command == "" || process.ElapsedSeconds < 0 {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if process.Executable != lock.Executable || process.Command != lock.Command {
+		return true
+	}
+	earliestPossibleStart := time.Now().UTC().Add(-time.Duration(process.ElapsedSeconds+1) * time.Second)
+	return earliestPossibleStart.After(observedAt)
+}
+
+func parseAutoUpgradeLockState(raw []byte) (autoUpgradeLockState, bool) {
+	var lock autoUpgradeLockState
+	if err := json.Unmarshal(raw, &lock); err == nil {
+		return lock, true
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return autoUpgradeLockState{}, false
+	}
+	return autoUpgradeLockState{PID: pid}, true
+}
+
+func (r *commandRuntime) autoUpgradeLockExecutable() string {
+	if base := filepath.Base(strings.TrimSpace(r.app.deps.ExecutablePath)); base != "" && base != "." {
+		return base
+	}
+	return "looper"
+}
+
+func (r *commandRuntime) currentAutoUpgradeLockState() autoUpgradeLockState {
+	lock := autoUpgradeLockState{PID: os.Getpid(), Executable: r.autoUpgradeLockExecutable(), ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
+	if err != nil {
+		return lock
+	}
+	if process.Executable != "" {
+		lock.Executable = process.Executable
+	}
+	lock.Command = process.Command
+	return lock
+}
+
+func (r *commandRuntime) readAutoUpgradeLockProcess(ctx context.Context, pid int) (autoUpgradeLockProcessState, error) {
+	command, err := r.readProcessCommand(ctx, pid)
+	if err != nil {
+		return autoUpgradeLockProcessState{}, err
+	}
+	elapsedSeconds, err := r.readProcessElapsedSeconds(ctx, pid)
+	if err != nil {
+		return autoUpgradeLockProcessState{}, err
+	}
+	if command == "" {
+		return autoUpgradeLockProcessState{}, nil
+	}
+	tokens := splitProcessCommand(command)
+	if len(tokens) == 0 {
+		return autoUpgradeLockProcessState{}, nil
+	}
+	return autoUpgradeLockProcessState{Executable: filepath.Base(tokens[0]), Command: command, ElapsedSeconds: elapsedSeconds}, nil
+}
+
+func (r *commandRuntime) readProcessElapsedSeconds(ctx context.Context, pid int) (int, error) {
+	result, err := r.runCommand(ctx, "ps", []string{"-p", fmt.Sprintf("%d", pid), "-o", "etime="}, daemonCommandTimeout)
+	if err != nil {
+		return -1, fmt.Errorf("inspect process %d elapsed time with ps: %w", pid, err)
+	}
+	if result.ExitCode != 0 {
+		return -1, nil
+	}
+	elapsed, err := parsePSElapsedSeconds(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return -1, fmt.Errorf("parse process %d elapsed time %q: %w", pid, strings.TrimSpace(result.Stdout), err)
+	}
+	return elapsed, nil
+}
+
+func parsePSElapsedSeconds(raw string) (int, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("empty elapsed time")
+	}
+	dayParts := strings.SplitN(raw, "-", 2)
+	days := 0
+	timePart := raw
+	if len(dayParts) == 2 {
+		parsedDays, err := strconv.Atoi(dayParts[0])
+		if err != nil {
+			return 0, err
+		}
+		days = parsedDays
+		timePart = dayParts[1]
+	}
+	parts := strings.Split(timePart, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, fmt.Errorf("unexpected elapsed time format")
+	}
+	values := make([]int, len(parts))
+	for i, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil {
+			return 0, err
+		}
+		values[i] = value
+	}
+	hours := 0
+	minutes := values[0]
+	seconds := values[1]
+	if len(values) == 3 {
+		hours = values[0]
+		minutes = values[1]
+		seconds = values[2]
+	}
+	return (((days*24)+hours)*60+minutes)*60 + seconds, nil
 }
 
 func (r *commandRuntime) reconcileAutoUpgradeState(ctx context.Context, state *autoUpgradeState) (*autoUpgradeState, bool, error) {
