@@ -783,7 +783,7 @@ type PartialConfig struct {
 	Daemon         *PartialDaemonConfig       `json:"daemon,omitempty"`
 	Package        *PartialPackageConfig      `json:"package,omitempty"`
 	Defaults       *PartialDefaultsConfig     `json:"defaults,omitempty"`
-	LegacyReviewer *PartialReviewerConfig     `json:"-"`
+	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

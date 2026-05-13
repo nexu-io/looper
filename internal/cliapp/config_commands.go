@@ -18,7 +18,9 @@ type configField struct {
 	key       string
 	valueType string
 	env       string
+	envAlias  string
 	flag      string
+	flagAlias string
 	get       func(config.Config) any
 	set       func(*config.PartialConfig, string) error
 	unset     func(*config.PartialConfig)
@@ -36,16 +38,16 @@ var configFieldRegistry = map[string]configField{
 	"instructions.enabled":        boolField("instructions.enabled", "", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
 	"package.autoUpgradeEnabled":  boolField("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
 	"instructions.maxBytes":       positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
-	"roles.reviewer.behavior.reviewEvents.clean": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"roles.reviewer.behavior.reviewEvents.clean": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.clean", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "roles-reviewer-behavior-review-events-clean", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
-	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", "roles-reviewer-behavior-review-events-clean", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
-	"roles.reviewer.behavior.reviewEvents.blocking": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"roles.reviewer.behavior.reviewEvents.blocking": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.blocking", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "roles-reviewer-behavior-review-events-blocking", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Blocking
 	}),
-	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", "roles-reviewer-behavior-review-events-blocking", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Blocking
 	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
@@ -227,12 +229,10 @@ func (r *commandRuntime) configShowSource(cmd *cobra.Command) error {
 		if configFieldSet(loaded.Partial, key) {
 			source = "config-file"
 		}
-		if field.env != "" {
-			if _, ok := os.LookupEnv(field.env); ok {
-				source = "env"
-			}
+		if field.overrideFromEnv() {
+			source = "env"
 		}
-		if field.flag != "" && commandFlagChanged(cmd, field.flag) {
+		if field.overrideFromFlag(cmd) {
 			source = "cli"
 		}
 		values[key] = map[string]any{"value": field.get(loaded.Config), "source": source}
@@ -431,14 +431,44 @@ func backupConfigFile(path string) error {
 }
 
 func (r *commandRuntime) warnConfigOverrides(cmd *cobra.Command, field configField) {
-	if field.env != "" {
-		if _, ok := os.LookupEnv(field.env); ok {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is set, so %s from the config file may not take effect\n", field.env, field.key)
+	if env := field.activeOverrideEnv(); env != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is set, so %s from the config file may not take effect\n", env, field.key)
+	}
+	if flag := field.activeOverrideFlag(cmd); flag != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: --%s is set, so %s from the config file may not take effect\n", flag, field.key)
+	}
+}
+
+func (f configField) activeOverrideEnv() string {
+	if f.env != "" {
+		if _, ok := os.LookupEnv(f.env); ok {
+			return f.env
 		}
 	}
-	if field.flag != "" && commandFlagChanged(cmd, field.flag) {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: --%s is set, so %s from the config file may not take effect\n", field.flag, field.key)
+	if f.envAlias != "" {
+		if _, ok := os.LookupEnv(f.envAlias); ok {
+			return f.envAlias
+		}
 	}
+	return ""
+}
+
+func (f configField) overrideFromEnv() bool {
+	return f.activeOverrideEnv() != ""
+}
+
+func (f configField) activeOverrideFlag(cmd *cobra.Command) string {
+	if f.flag != "" && commandFlagChanged(cmd, f.flag) {
+		return f.flag
+	}
+	if f.flagAlias != "" && commandFlagChanged(cmd, f.flagAlias) {
+		return f.flagAlias
+	}
+	return ""
+}
+
+func (f configField) overrideFromFlag(cmd *cobra.Command) bool {
+	return f.activeOverrideFlag(cmd) != ""
 }
 
 func commandFlagChanged(cmd *cobra.Command, name string) bool {
@@ -632,8 +662,8 @@ func openPRStrategyField() configField {
 	}}
 }
 
-func reviewerReviewEventField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
-	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+func reviewerReviewEventField(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
+	return configField{key: key, valueType: "string", env: env, envAlias: envAlias, flag: flag, flagAlias: flagAlias, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
 		switch key {
 		case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":

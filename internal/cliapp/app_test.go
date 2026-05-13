@@ -1398,6 +1398,45 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 	}
 }
 
+func TestConfigSetPreservesLegacyReviewerRootWhenWritingUnrelatedKey(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"loop":  map[string]any{"enabledByDefault": false},
+			"scope": "changed_files",
+		},
+	})
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set defaults.allowRiskyFixes]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"reviewer"`) {
+		t.Fatalf("config = %s, want legacy reviewer root preserved", raw)
+	}
+
+	partial, present, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadPartialConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatalf("ReadPartialConfigFile() present = false, want true")
+	}
+	if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+		t.Fatalf("legacy reviewer loop missing after write: %#v", partial.LegacyReviewer)
+	}
+	if partial.LegacyReviewer.Scope == nil || *partial.LegacyReviewer.Scope != config.ReviewerScopeChangedFiles {
+		t.Fatalf("legacy reviewer scope missing after write: %#v", partial.LegacyReviewer)
+	}
+}
+
 func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	configPath := writeEditableCLIConfig(t)
 
@@ -1511,6 +1550,35 @@ func TestConfigValidateAndShowSource(t *testing.T) {
 	if got, want := instructionsEnabled["value"], true; got != want {
 		t.Fatalf("instructions.enabled value = %#v, want %#v", got, want)
 	}
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerBehaviorOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"behavior": map[string]any{
+					"reviewEvents": map[string]any{"clean": "COMMENT"},
+				},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "APPROVE")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "env")
+
+	os.Unsetenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--roles-reviewer-behavior-review-events-clean=APPROVE", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-reviewer-behavior-review-events-clean]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "cli")
 }
 
 func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
@@ -1734,6 +1802,42 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "warning: --no-custom-instructions is set") {
 		t.Fatalf("stderr = %q, want instructions override warning", stderr)
+	}
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "APPROVE")
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.behavior.reviewEvents.clean", "COMMENT", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.behavior.reviewEvents.clean with env override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN is set") {
+		t.Fatalf("stderr = %q, want canonical env override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.behavior.reviewEvents.clean", "COMMENT", "--roles-reviewer-behavior-review-events-clean=APPROVE", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.behavior.reviewEvents.clean with canonical flag override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --roles-reviewer-behavior-review-events-clean is set") {
+		t.Fatalf("stderr = %q, want canonical flag override warning", stderr)
+	}
+}
+
+func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	field, ok := fields[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want object", key, fields[key])
+	}
+	if got := field["source"]; got != wantSource {
+		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
 	}
 }
 
