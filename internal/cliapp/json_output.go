@@ -173,7 +173,7 @@ func (r *commandRuntime) loopPause(cmd *cobra.Command, args []string) error {
 			loopID = strings.TrimSpace(args[0])
 		}
 		if loopID == "" {
-			return nil, fmt.Errorf("Usage: looper loop pause <id>")
+			return nil, fmt.Errorf("loop pause requires [id] or --id <id>")
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(loopID)+"/pause", nil)
@@ -262,6 +262,26 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 	}, func(w io.Writer, payload json.RawMessage) error {
 		return writeHumanReviewCreate(w, payload, loopSetting)
 	})
+}
+
+func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
+		if err != nil {
+			return nil, err
+		}
+
+		body := map[string]any{
+			"projectId":  projectID,
+			"type":       "fixer",
+			"targetType": "pull_request",
+			"repo":       repo,
+			"prNumber":   prNumber,
+			"status":     "running",
+		}
+
+		return r.postJSON(ctx, "/api/v1/loops", body)
+	}, writeHumanFixCreate)
 }
 
 func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {

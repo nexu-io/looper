@@ -877,6 +877,24 @@ func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, err
 	return &record, nil
 }
 
+func (r *LocksRepository) Refresh(ctx context.Context, record LockRecord) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE locks
+		SET reason = ?, expires_at = ?, updated_at = ?
+		WHERE key = ? AND owner = ?
+	`, record.Reason, record.ExpiresAt, record.UpdatedAt, record.Key, record.Owner)
+	if err != nil {
+		return false, fmt.Errorf("refresh lock: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read refresh lock rows affected: %w", err)
+	}
+
+	return affected > 0, nil
+}
+
 func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]LockRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM locks WHERE expires_at <= ? ORDER BY expires_at ASC`, nowISO)
 	if err != nil {

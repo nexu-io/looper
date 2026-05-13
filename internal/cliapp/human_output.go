@@ -324,6 +324,15 @@ func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopSetting st
 	return nil
 }
 
+func writeHumanFixCreate(w io.Writer, payload json.RawMessage) error {
+	var data loopOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode fixer response: %w", err)
+	}
+	printSection(w, "Fixer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}})
+	return nil
+}
+
 func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 	var data activeRunsOutput
 	if err := json.Unmarshal(payload, &data); err != nil {

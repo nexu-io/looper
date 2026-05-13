@@ -629,9 +629,10 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 	daemonBuf := &bytes.Buffer{}
 
 	progressMux := newConcurrentProgressMux(cmd.ErrOrStderr())
+	defer progressMux.close()
 
-	cliCmd := mirrorCommandWithIO(cmd, cliBuf, progressMux.writer())
-	daemonCmd := mirrorCommandWithIO(cmd, daemonBuf, progressMux.writer())
+	cliCmd := mirrorCommandWithIO(cmd, cliBuf, progressMux)
+	daemonCmd := mirrorCommandWithIO(cmd, daemonBuf, progressMux)
 
 	type cliResult struct {
 		output cliUpgradeOutput

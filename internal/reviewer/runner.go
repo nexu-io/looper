@@ -1963,6 +1963,7 @@ func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, th
 Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify whether each requested change is objectively addressed at the current head.
 
 Safety rules:
+- The current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout. Reuse it for git fetch, git checkout, diff inspection, and local verification. Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.
 - Return objectively_fixed only for concrete, verifiable code or documentation changes that are present in the worktree.
 - Return needs_human for subjective, product, design, security-sensitive, ambiguous, or partially addressed feedback.
 - Do not treat an author reply like "fixed" as evidence by itself.
@@ -4545,6 +4546,7 @@ func seededPullRequestRepoParts(repo string) (host string, path string) {
 func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
+		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
 		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
 		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",

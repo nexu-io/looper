@@ -239,7 +239,7 @@ func TestDaemonInstallCommandPrintsHumanOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon install]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 3 B / 3 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (3 B)") {
 		t.Fatalf("Run([daemon install]) stderr = %q, want download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Installed looperd (darwin-arm64) to ") {
@@ -277,10 +277,83 @@ func TestDownloadBinaryProgressFallsBackWhenLengthUnknown(t *testing.T) {
 	if string(data) != "abcd" {
 		t.Fatalf("downloadBinary() data = %q, want abcd", string(data))
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 4 B downloaded") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (4 B)") {
 		t.Fatalf("progress = %q, want unknown-size fallback", stderr.String())
 	}
 }
+
+func TestDownloadBinaryProgressDoesNotReportSuccessOnReadError(t *testing.T) {
+	t.Parallel()
+
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() != "https://example.invalid/looperd-darwin-arm64" {
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+			}
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Status:        http.StatusText(http.StatusOK),
+				Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+				Body:          errReadCloser{Reader: strings.NewReader("abcd"), err: io.ErrUnexpectedEOF},
+				ContentLength: -1,
+			}, nil
+		}),
+	})
+	runtime := newCommandRuntime(app, nil)
+
+	_, err := runtime.downloadBinary(context.Background(), "https://example.invalid/looperd-darwin-arm64", "looperd-darwin-arm64", stderr)
+	if err == nil {
+		t.Fatal("downloadBinary() error = nil, want read error")
+	}
+	if !strings.Contains(err.Error(), io.ErrUnexpectedEOF.Error()) {
+		t.Fatalf("downloadBinary() error = %q, want %q", err.Error(), io.ErrUnexpectedEOF)
+	}
+	if strings.Contains(stderr.String(), "Downloaded looperd") {
+		t.Fatalf("progress = %q, did not expect success line after read failure", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Downloading looperd…") {
+		t.Fatalf("progress = %q, want initial download line", stderr.String())
+	}
+}
+
+func TestMPBDownloadProgressAbortsKnownSizeReadError(t *testing.T) {
+	t.Parallel()
+
+	progress := newMPBDownloadProgressFactory(io.Discard)
+	tracker, ok := progress.newTracker("looperd-darwin-arm64", 4).(*mpbDownloadProgressTracker)
+	if !ok {
+		t.Fatal("newTracker() did not return *mpbDownloadProgressTracker")
+	}
+	reader := tracker.wrap(errReadCloser{Reader: strings.NewReader("abcd"), err: io.ErrUnexpectedEOF})
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("ReadAll() error = nil, want read error")
+	}
+	if tracker.bar.Completed() {
+		t.Fatal("tracker.bar.Completed() = true, did not expect completed after read error")
+	}
+	tracker.finish(false)
+	progress.close()
+	if tracker.bar.Completed() {
+		t.Fatal("tracker.bar.Completed() = true, did not expect completed after read error")
+	}
+}
+
+type errReadCloser struct {
+	io.Reader
+	err error
+}
+
+func (r errReadCloser) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF && r.err != nil {
+		return n, r.err
+	}
+	return n, err
+}
+
+func (errReadCloser) Close() error { return nil }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

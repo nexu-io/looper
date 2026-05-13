@@ -733,6 +733,22 @@ func (g *Gateway) hasRemote(ctx context.Context, repoPath, remote string) (bool,
 	return false, err
 }
 
+func (g *Gateway) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
+	return g.isAncestor(ctx, repoPath, ancestor, descendant)
+}
+
+func (g *Gateway) FetchBranch(ctx context.Context, repoPath, remote, branch string) error {
+	remote = strings.TrimSpace(remote)
+	branch = strings.TrimSpace(branch)
+	if remote == "" {
+		remote = "origin"
+	}
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	return g.runGit(ctx, repoPath, nil, "fetch", remote, branch)
+}
+
 func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
