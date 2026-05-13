@@ -2018,6 +2018,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	driftCount := 0
 	mutationFailureCount := 0
+	// Drift detection must be anchored to when the agent recorded the
+	// reply explanations, not when the current (possibly retried) run
+	// started. Otherwise a reviewer comment posted between the original
+	// repair and a replay/retry would be classified as "old" and the
+	// stale explanation would be used to resolve fresh feedback.
+	driftSince := input.Run.StartedAt
+	if checkpoint.Repair != nil && strings.TrimSpace(checkpoint.Repair.CompletedAt) != "" {
+		driftSince = checkpoint.Repair.CompletedAt
+	}
 	// If the agent's reply explanations were captured against a different
 	// fix-items snapshot than the live PR shows, the underlying threads or
 	// comments have changed since the agent ran. Treat the whole step as
@@ -2055,7 +2064,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
 			continue
 		}
-		if hasNonLooperCommentSince(thread, input.Run.StartedAt) {
+		if hasNonLooperCommentSince(thread, driftSince) {
 			driftCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
 			continue
