@@ -149,7 +149,7 @@
             "publishMode": "single_review",
             "reviewEvents": {
               "clean": "APPROVE",
-              "blocking": "COMMENT"
+              "blocking": "REQUEST_CHANGES"
             },
             "detectDuplicateFindings": true,
             "nativeResume": {

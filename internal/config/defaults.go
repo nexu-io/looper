@@ -127,7 +127,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			BaseBranch:         "main",
 			AllowAutoCommit:    true,
 			AllowAutoPush:      true,
-			AllowAutoApprove:   false,
+			AllowAutoApprove:   true,
 			AllowAutoMerge:     false,
 			AllowRiskyFixes:    false,
 			FixAllPullRequests: false,
@@ -175,7 +175,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					Scope:                   ReviewerScopeChangedRanges,
 					PublishMode:             ReviewerPublishModeSingleReview,
-					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
+					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventApprove, Blocking: ReviewerReviewEventRequestChanges},
 					DetectDuplicateFindings: true,
 					NativeResume:            ReviewerNativeResumeConfig{OnHeadChange: false, ReReviewPromptOnHeadChange: false},
 					ThreadResolution: ReviewerThreadResolutionConfig{

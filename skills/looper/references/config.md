@@ -106,6 +106,8 @@ Reviewer migration rules:
 
 Canonical reviewer example:
 
+This is a standalone reviewer-only snippet. Do not paste it together with the full config example below as a single TOML file, or table headers such as `[roles.reviewer.behavior.reviewEvents]` would be duplicated.
+
 ```toml
 [roles.reviewer]
 instructions = "Review for correctness, regressions, and migration safety."
@@ -125,13 +127,15 @@ includeReviewingLabel = true
 reviewingLabel = "looper:spec-reviewing"
 
 [roles.reviewer.behavior]
-scope = "changed_files"
+scope = "changed_ranges"
 publishMode = "single_review"
 
 [roles.reviewer.behavior.reviewEvents]
-clean = "COMMENT"
-blocking = "COMMENT"
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
 ```
+
+`defaults.allowAutoApprove` is still accepted as a legacy compatibility alias, but the canonical way to control reviewer publishing is `roles.reviewer.behavior.reviewEvents.*`.
 
 ## Project override rules
 
@@ -253,12 +257,12 @@ includeReviewingLabel = true
 reviewingLabel = "looper:spec-reviewing"
 
 [roles.reviewer.behavior]
-scope = "changed_files"
+scope = "changed_ranges"
 publishMode = "single_review"
 
 [roles.reviewer.behavior.reviewEvents]
-clean = "COMMENT"
-blocking = "COMMENT"
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
 
 [roles.fixer.discovery]
 autoDiscovery = true
@@ -346,6 +350,8 @@ requireReviewRequest = true
 clean = "APPROVE"
 blocking = "REQUEST_CHANGES"
 ```
+
+Note: the snippets above show the current aggressive reviewer defaults. `defaults.allowAutoApprove` remains a compatibility alias for `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"`, but new config should prefer the canonical `reviewEvents` fields.
 
 ## Override examples
 

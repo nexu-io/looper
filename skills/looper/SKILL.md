@@ -227,7 +227,7 @@ looper config show
 - Do not delete runtime artifacts (`~/.looper/looper.sqlite`, `backups/`, `logs/`, `worktrees/`) unless the user explicitly asks and understands the impact.
 - Starting or restarting `looperd` can launch background automation against configured GitHub repositories — confirm intent before doing so.
 - Do not toggle `daemon.mode` (foreground ↔ launchd) without confirming; supervised mode persists across login/reboot.
-- Do not change `reviewer.reviewEvents.clean` from `COMMENT` to `APPROVE` (or `blocking` to `REQUEST_CHANGES`) without explicit user opt-in — this changes how Looper's reviews land on real PRs.
+- Reviewer defaults are intentionally action-taking (`clean=APPROVE`, `blocking=REQUEST_CHANGES`) while `enableSelfReview` stays off. Do not broaden reviewer authority further without explicit user opt-in (for example enabling self-review or auto-merge, or relaxing review-event guardrails).
 - Do not overwrite or delete existing `looper:*` labels in user repos without confirmation; they may have local customizations.
 - Never print secrets from config or environment. Redact tokens and API keys as `***` in summaries.
 - Prefer `looper daemon status`, `looper daemon logs`, and the read-only checks above before making changes.

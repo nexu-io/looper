@@ -123,6 +123,8 @@ Reviewer is the main migration example:
 
 Canonical reviewer example:
 
+This is a standalone reviewer-only snippet. Do not paste it together with the full config example below as a single TOML file, or table headers such as `[roles.reviewer.behavior.reviewEvents]` would be duplicated.
+
 ```toml
 [roles.reviewer]
 instructions = "Review for correctness, regressions, and migration safety."
@@ -142,22 +144,24 @@ includeReviewingLabel = true
 reviewingLabel = "looper:spec-reviewing"
 
 [roles.reviewer.behavior]
-scope = "changed_files"
+scope = "changed_ranges"
 publishMode = "single_review"
 
 [roles.reviewer.behavior.loop]
 enabledByDefault = true
-quietPeriodSeconds = 120
-minPublishIntervalSeconds = 0
+quietPeriodSeconds = 60
+minPublishIntervalSeconds = 300
 
 [roles.reviewer.behavior.reviewEvents]
-clean = "COMMENT"
-blocking = "COMMENT"
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
 
 [roles.reviewer.behavior.nativeResume]
 onHeadChange = false
 reReviewPromptOnHeadChange = false
 ```
+
+The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
 
 ## Project override rules
 
@@ -272,7 +276,7 @@ gitCommit = true
 pullRequest = true
 issueComment = true
 reviewComment = true
-inlineCommentVisible = false
+inlineCommentVisible = true
 
 [tools]
 gitPath = "/usr/bin/git"
@@ -288,11 +292,14 @@ requireBackupBeforeMigrate = false
 baseBranch = "main"
 allowAutoCommit = true
 allowAutoPush = true
-allowAutoApprove = false
+allowAutoApprove = true
 allowAutoMerge = false
 allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
+
+# `allowAutoApprove` is a legacy compatibility alias.
+# Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
 
 [roles.planner.discovery]
 autoDiscovery = true
@@ -320,17 +327,17 @@ includeReviewingLabel = true
 reviewingLabel = "looper:spec-reviewing"
 
 [roles.reviewer.behavior]
-scope = "changed_files"
+scope = "changed_ranges"
 publishMode = "single_review"
 
 [roles.reviewer.behavior.loop]
 enabledByDefault = true
-quietPeriodSeconds = 120
-minPublishIntervalSeconds = 0
+quietPeriodSeconds = 60
+minPublishIntervalSeconds = 300
 
 [roles.reviewer.behavior.reviewEvents]
-clean = "COMMENT"
-blocking = "COMMENT"
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
 
 [roles.reviewer.behavior.nativeResume]
 onHeadChange = false

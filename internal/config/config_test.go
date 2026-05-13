@@ -238,6 +238,12 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
 		t.Fatalf("reviewer role defaults = %#v", got)
 	}
+	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("reviewer clean review event default = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+		t.Fatalf("reviewer blocking review event default = %q, want %q", got, ReviewerReviewEventRequestChanges)
+	}
 	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("reviewer enableSelfReview default = %v, want false", got)
 	}
