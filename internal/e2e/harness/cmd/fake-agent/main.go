@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -81,9 +83,10 @@ func main() {
 			"changedFiles": []string{path},
 			"commits":      []string{sha},
 			"review_thread_replies": []map[string]any{{
-				"fixItemId":   "comment-1",
-				"threadId":    "thread-1",
-				"explanation": "Updated fix-target.txt to address the review feedback.",
+				"fixItemId":              "comment-1",
+				"threadId":               "thread-1",
+				"explanation":            "Updated fix-target.txt to address the review feedback.",
+				"threadCommentsObserved": hashCommentIDs("comment-1"),
 			}},
 		})
 	case "transient-failure":
@@ -125,6 +128,11 @@ func collectEnv() map[string]string {
 		}
 	}
 	return result
+}
+
+func hashCommentIDs(ids ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(ids, "|")))
+	return hex.EncodeToString(sum[:])
 }
 
 func envOr(key string, fallback string) string {

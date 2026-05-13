@@ -590,9 +590,9 @@ type checkpointRepair struct {
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
 // auto-reply posted before resolving the review thread. Stored on the repair
 // checkpoint so resume/retry reuses the same explanation if it still maps to
-// the current fix items snapshot. ThreadCommentsObserved is optional: when the
-// agent supplies it, resolve-comments verifies the live thread still contains
-// exactly the same comment IDs before auto-resolving.
+// the current fix items snapshot. Fixed decisions must include
+// ThreadCommentsObserved so resolve-comments can verify the live thread still
+// contains exactly the same non-Looper comment IDs before auto-resolving.
 type replyExplanationEntry struct {
 	FixItemID              string `json:"fixItemId"`
 	ThreadID               string `json:"threadId,omitempty"`
@@ -2168,9 +2168,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
 			continue
 		}
-		if threadCommentsObservedDrifted(decision, thread) {
+		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
 			driftCount++
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "Review thread changed since the fixer inspected it", UpdatedAt: r.nowISO()})
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "Review thread snapshot was missing or changed since the fixer inspected it", UpdatedAt: r.nowISO()})
 			continue
 		}
 		switch normalizeReplyAction(decision.Action) {
@@ -2458,6 +2458,14 @@ func threadCommentsObservedDrifted(decision replyExplanationEntry, thread Review
 		return false
 	}
 	return observed != hashReviewThreadCommentIDs(thread)
+}
+
+func fixedDecisionMissingThreadSnapshot(decision replyExplanationEntry) bool {
+	action := normalizeReplyAction(decision.Action)
+	if action == string(replyActionDeclined) {
+		return false
+	}
+	return normalizeThreadCommentsObserved(decision.ThreadCommentsObserved) == ""
 }
 
 func hashReviewThreadCommentIDs(thread ReviewThread) string {
