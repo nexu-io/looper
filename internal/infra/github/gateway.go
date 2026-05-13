@@ -1607,9 +1607,21 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			return "", nil
+		}
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+func isUserLoginUnsupportedForCurrentToken(err error) bool {
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(strings.Join([]string{commandErr.Error(), commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")))
+	return strings.Contains(combined, "resource not accessible by integration")
 }
 
 func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (string, error) {

@@ -283,7 +283,6 @@ func TestOnOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {
 }
 
 func TestExecutorResumesPersistedNativeSession(t *testing.T) {
-	t.Parallel()
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
@@ -358,7 +357,6 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 }
 
 func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
-	t.Parallel()
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
@@ -434,7 +432,6 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 }
 
 func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
-	t.Parallel()
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())

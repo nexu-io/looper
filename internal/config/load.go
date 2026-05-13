@@ -199,6 +199,25 @@ func DiscoverDefaultConfigPath() (string, error) {
 	return candidates[0], nil
 }
 
+func validateConfiguredToolPath(path *string, field string) error {
+	if isNilOrEmptyString(path) {
+		return nil
+	}
+	value := strings.TrimSpace(*path)
+	if !filepath.IsAbs(value) && !strings.ContainsRune(value, os.PathSeparator) {
+		return nil
+	}
+	info, err := os.Stat(value)
+	if err == nil && !info.IsDir() {
+		return nil
+	}
+	message := "must reference an existing executable file"
+	if err == nil && info.IsDir() {
+		message = "must reference a file, not a directory"
+	}
+	return &ConfigValidationError{Issues: []ValidationIssue{{Path: field, Message: message}}}
+}
+
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
 	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil {
 		return

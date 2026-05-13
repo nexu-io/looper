@@ -1212,7 +1212,7 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 	}
 	login = normalizeLogin(login)
 	if login == "" {
-		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
+		return nil
 	}
 	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {
 		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}

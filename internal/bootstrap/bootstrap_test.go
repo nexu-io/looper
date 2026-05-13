@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -150,6 +151,74 @@ func TestBootstrapPropagatesLoadConfigError(t *testing.T) {
 	})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Bootstrap() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestBootstrapRejectsConfiguredNonExecutableToolPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("execute-bit validation is not portable on Windows")
+	}
+
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	logDir := filepath.Join(rootDir, "runtime", "logs")
+	dbPath := filepath.Join(rootDir, "data", "looper.sqlite")
+	gitPath := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(gitPath, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{
+				Config: config.Config{
+					Storage: config.StorageConfig{DBPath: dbPath},
+					Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+					Daemon:  config.DaemonConfig{LogDir: logDir, WorkingDirectory: workingDir},
+					Tools:   config.ToolPathsConfig{GitPath: &gitPath},
+				},
+				Metadata: config.LoadFileMetadata{ToolDetection: map[string]config.ToolDetectionStatus{"gitPath": config.ToolDetectionStatusConfigured}},
+			}, nil
+		},
+	})
+	var validationErr *config.ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Bootstrap() error = %T, want *config.ConfigValidationError", err)
+	}
+	if len(validationErr.Issues) != 1 {
+		t.Fatalf("len(validationErr.Issues) = %d, want 1", len(validationErr.Issues))
+	}
+	issue := validationErr.Issues[0]
+	if issue.Path != "tools.gitPath" || issue.Message != "must reference an existing executable file" {
+		t.Fatalf("validation issue = %#v, want tools.gitPath existing executable error", issue)
+	}
+}
+
+func TestBootstrapAllowsConfiguredRelativeToolPath(t *testing.T) {
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	logDir := filepath.Join(rootDir, "runtime", "logs")
+	dbPath := filepath.Join(rootDir, "data", "looper.sqlite")
+	relativeGitPath := "./bin/git"
+
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{
+				Config: config.Config{
+					Storage: config.StorageConfig{DBPath: dbPath},
+					Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+					Daemon:  config.DaemonConfig{LogDir: logDir, WorkingDirectory: workingDir},
+					Tools:   config.ToolPathsConfig{GitPath: &relativeGitPath},
+				},
+				Metadata: config.LoadFileMetadata{ToolDetection: map[string]config.ToolDetectionStatus{"gitPath": config.ToolDetectionStatusConfigured}},
+			}, nil
+		},
+		CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) {
+			return &recordingLogger{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Bootstrap() error = %v, want nil", err)
 	}
 }
 

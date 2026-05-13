@@ -1,0 +1,66 @@
+name: sandbox-e2e
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  github-sandbox-e2e:
+    name: GitHub sandbox E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOOPER_E2E_GITHUB: "1"
+      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve sandbox repository target
+        id: sandbox-repo
+        shell: bash
+        run: |
+          repo="${LOOPER_E2E_SANDBOX_REPO}"
+          owner="${repo%%/*}"
+          name="${repo#*/}"
+          if [ -z "$owner" ] || [ -z "$name" ] || [ "$owner" = "$repo" ]; then
+            printf 'LOOPER_E2E_SANDBOX_REPO must use owner/repo format, got %s\n' "$repo" >&2
+            exit 1
+          fi
+          printf 'owner=%s\n' "$owner" >> "$GITHUB_OUTPUT"
+          printf 'repo=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Mint sandbox GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ steps.sandbox-repo.outputs.owner }}
+          repositories: |
+            ${{ steps.sandbox-repo.outputs.repo }}
+
+      - name: Run GitHub sandbox E2E
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
+          LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+
+      - name: Upload sandbox artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-sandbox-e2e-artifacts
+          path: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
+          if-no-files-found: ignore

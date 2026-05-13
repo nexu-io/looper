@@ -222,6 +222,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					boolFlag("check", "Check available CLI and daemon updates"),
 					boolFlag("cli", "Upgrade the looper CLI binary when self-upgrade is allowed"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
+					hiddenBoolFlag("background-auto", "Run the auto-upgrade worker in the background"),
 				},
 				exampleLines: []string{
 					"$ looper upgrade --check",

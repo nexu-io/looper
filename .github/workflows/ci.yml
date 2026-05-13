@@ -47,5 +47,251 @@ jobs:
         env:
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
         run: |
-          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+
+  detect-e2e-changes:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: Detect E2E change scope
+    runs-on: ubuntu-latest
+    outputs:
+      all_e2e: ${{ steps.outputs.outputs.all_e2e }}
+      daemon_boot: ${{ steps.outputs.outputs.daemon_boot }}
+      github_contract: ${{ steps.outputs.outputs.github_contract }}
+      resolve_comments: ${{ steps.outputs.outputs.resolve_comments }}
+      worktree_invariants: ${{ steps.outputs.outputs.worktree_invariants }}
+
+    steps:
+      - name: Check out repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+
+      - name: Detect changed files
+        if: github.event_name == 'pull_request'
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            all_e2e:
+              - 'go.mod'
+              - 'go.sum'
+              - 'internal/e2e/harness/**'
+              - 'internal/e2e/*.go'
+            daemon_boot:
+              - 'cmd/**'
+              - 'internal/bootstrap/**'
+              - 'internal/config/**'
+              - 'internal/runtime/**'
+              - 'internal/e2e/smoke_daemon_test.go'
+            github_contract:
+              - 'internal/infra/github/**'
+              - 'internal/e2e/githubcontract/**'
+              - 'scripts/refresh-gh-fixtures.sh'
+            resolve_comments:
+              - 'internal/worker/**'
+              - 'internal/fixer/**'
+              - 'internal/reviewer/**'
+              - 'internal/api/**'
+              - 'internal/worktree*/**'
+              - 'internal/e2e/resolve_comments_scenarios_test.go'
+            worktree_invariants:
+              - 'internal/worker/**'
+              - 'internal/fixer/**'
+              - 'internal/reviewer/**'
+              - 'internal/api/**'
+              - 'internal/infra/git/**'
+              - 'internal/worktree*/**'
+              - 'internal/e2e/invariant_worktree_test.go'
+
+      - name: Resolve E2E job outputs
+        id: outputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          ALL_E2E: ${{ steps.filter.outputs.all_e2e }}
+          DAEMON_BOOT: ${{ steps.filter.outputs.daemon_boot }}
+          GITHUB_CONTRACT: ${{ steps.filter.outputs.github_contract }}
+          RESOLVE_COMMENTS: ${{ steps.filter.outputs.resolve_comments }}
+          WORKTREE_INVARIANTS: ${{ steps.filter.outputs.worktree_invariants }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            all=true
+            daemon=true
+            github=true
+            resolve=true
+            worktree=true
+          elif [ "$FILTER_OUTCOME" != "success" ] || [ "$ALL_E2E" = "true" ]; then
+            all=true
+            daemon=true
+            github=true
+            resolve=true
+            worktree=true
+          else
+            all=false
+            daemon="${DAEMON_BOOT:-false}"
+            github="${GITHUB_CONTRACT:-false}"
+            resolve="${RESOLVE_COMMENTS:-false}"
+            worktree="${WORKTREE_INVARIANTS:-false}"
+          fi
+
+          {
+            echo "all_e2e=$all"
+            echo "daemon_boot=$daemon"
+            echo "github_contract=$github"
+            echo "resolve_comments=$resolve"
+            echo "worktree_invariants=$worktree"
+          } >> "$GITHUB_OUTPUT"
+
+  contract-invariant-integration-smoke:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: Contract/invariant integration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run contract/invariant smoke
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
+        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1 && go test ./internal/e2e/githubcontract -run 'TestInvariantGatewayUsesSupportedGHJSONFields|TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation|TestFakeGHFixtureRejectsUnsupportedJSONField' -count=1
+
+      - name: Upload smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-invariant-integration-smoke-artifacts
+          path: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
+          if-no-files-found: ignore
+
+  daemon-boot-e2e:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: Daemon boot E2E
+    needs: detect-e2e-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: needs.detect-e2e-changes.outputs.daemon_boot == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run daemon boot smoke E2E
+        if: needs.detect-e2e-changes.outputs.daemon_boot == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
+        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1
+
+      - name: Upload daemon boot artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-boot-e2e-artifacts
+          path: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
+          if-no-files-found: ignore
+
+  github-contract-e2e:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: GitHub contract E2E
+    needs: detect-e2e-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: needs.detect-e2e-changes.outputs.github_contract == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GitHub contract E2E
+        if: needs.detect-e2e-changes.outputs.github_contract == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-contract-e2e
+        run: go test ./internal/e2e/githubcontract -count=1
+
+      - name: Upload GitHub contract artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-contract-e2e-artifacts
+          path: ${{ runner.temp }}/looper-e2e/github-contract-e2e
+          if-no-files-found: ignore
+
+  resolve-comments-e2e:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: Resolve-comments E2E
+    needs: detect-e2e-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: needs.detect-e2e-changes.outputs.resolve_comments == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run resolve-comments E2E
+        if: needs.detect-e2e-changes.outputs.resolve_comments == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
+        run: go test ./internal/e2e -run 'TestScenarioResolveComments' -count=1
+
+      - name: Upload resolve-comments artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolve-comments-e2e-artifacts
+          path: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
+          if-no-files-found: ignore
+
+  worktree-invariants-e2e:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    name: Worktree invariants E2E
+    needs: detect-e2e-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: needs.detect-e2e-changes.outputs.worktree_invariants == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run worktree invariants E2E
+        if: needs.detect-e2e-changes.outputs.worktree_invariants == 'true'
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
+        run: go test ./internal/e2e -run 'TestInvariantWorker' -count=1
+
+      - name: Upload worktree artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worktree-invariants-e2e-artifacts
+          path: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
+          if-no-files-found: ignore

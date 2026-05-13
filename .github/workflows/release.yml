@@ -34,7 +34,64 @@ env:
   LOOPER_BUILD_MIN_DAEMON_FOR_CLI: "0.2.0"
 
 jobs:
+  sandbox-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOOPER_E2E_GITHUB: "1"
+      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve sandbox repository target
+        id: sandbox-repo
+        shell: bash
+        run: |
+          repo="${LOOPER_E2E_SANDBOX_REPO}"
+          owner="${repo%%/*}"
+          name="${repo#*/}"
+          if [ -z "$owner" ] || [ -z "$name" ] || [ "$owner" = "$repo" ]; then
+            printf 'LOOPER_E2E_SANDBOX_REPO must use owner/repo format, got %s\n' "$repo" >&2
+            exit 1
+          fi
+          printf 'owner=%s\n' "$owner" >> "$GITHUB_OUTPUT"
+          printf 'repo=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Mint sandbox GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ steps.sandbox-repo.outputs.owner }}
+          repositories: |
+            ${{ steps.sandbox-repo.outputs.repo }}
+
+      - name: Run GitHub sandbox preflight E2E
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/release-sandbox-preflight
+          LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+
+      - name: Upload sandbox preflight artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sandbox-preflight-artifacts
+          path: ${{ runner.temp }}/looper-e2e/release-sandbox-preflight
+          if-no-files-found: ignore
+
   prepare-go-release:
+    needs: sandbox-preflight
     runs-on: ubuntu-latest
 
     outputs:
@@ -166,11 +223,13 @@ jobs:
             prerelease="true"
           fi
           released="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo "tag=${tag_name}" >> "$GITHUB_OUTPUT"
-          echo "value=${release_version}" >> "$GITHUB_OUTPUT"
-          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
-          echo "released=${released}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=${tag_name}"
+            echo "value=${release_version}"
+            echo "channel=${channel}"
+            echo "prerelease=${prerelease}"
+            echo "released=${released}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build
         env:
@@ -179,8 +238,10 @@ jobs:
           LOOPER_BUILD_CHANNEL: ${{ steps.release-version.outputs.channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
-          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
-          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          looper_build_git_sha="$(git rev-parse HEAD)"
+          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export LOOPER_BUILD_GIT_SHA="$looper_build_git_sha"
+          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
 
       - name: Create Git tag for manual release
@@ -236,6 +297,7 @@ jobs:
 
   build-looper:
     needs:
+      - sandbox-preflight
       - prepare-go-release
       - create-draft-release
     strategy:
@@ -269,8 +331,10 @@ jobs:
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
-          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
-          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          looper_build_git_sha="$(git rev-parse HEAD)"
+          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export LOOPER_BUILD_GIT_SHA="$looper_build_git_sha"
+          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looper
 
@@ -316,6 +380,7 @@ jobs:
 
   build-looperd:
     needs:
+      - sandbox-preflight
       - prepare-go-release
       - create-draft-release
     strategy:
@@ -350,8 +415,10 @@ jobs:
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
         run: |
-          export LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)"
-          export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          looper_build_git_sha="$(git rev-parse HEAD)"
+          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export LOOPER_BUILD_GIT_SHA="$looper_build_git_sha"
+          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looperd
 
