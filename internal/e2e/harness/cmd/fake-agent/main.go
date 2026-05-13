@@ -13,6 +13,7 @@ import (
 
 const (
 	completionMarkerEnv     = "LOOPER_COMPLETION_MARKER"
+	envLooperPrompt         = "LOOPER_PROMPT"
 	envFakeAgentMode        = "LOOPER_E2E_FAKE_AGENT_MODE"
 	envFakeAgentArtifactDir = "LOOPER_E2E_FAKE_AGENT_ARTIFACT_DIR"
 	envFakeAgentStatePath   = "LOOPER_E2E_FAKE_AGENT_STATE_PATH"
@@ -22,6 +23,12 @@ const (
 	envFakeAgentGitPath     = "LOOPER_E2E_FAKE_AGENT_GIT_PATH"
 	defaultCompletionMarker = "__LOOPER_RESULT__="
 )
+
+type promptFixItem struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	ThreadID string `json:"threadId"`
+}
 
 type evidence struct {
 	CWD       string            `json:"cwd"`
@@ -68,7 +75,11 @@ func main() {
 		mustRun(gitPath, "add", path)
 		mustRun(gitPath, "commit", "-m", "fake agent commit")
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
-		printCompletion(marker, map[string]any{"summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}})
+		payload := map[string]any{"summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}}
+		if replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", false); len(replies) > 0 {
+			payload["review_thread_replies"] = replies
+		}
+		printCompletion(marker, payload)
 	case "commit-with-review-replies":
 		path := envOr(envFakeAgentWriteFile, "fix-target.txt")
 		mustWriteFile(path, []byte("fixed by fake agent\n"))
@@ -76,15 +87,12 @@ func main() {
 		mustRun(gitPath, "add", path)
 		mustRun(gitPath, "commit", "-m", "fake agent commit")
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
+		replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", true)
 		printCompletion(marker, map[string]any{
-			"summary":      "fake agent committed changes",
-			"changedFiles": []string{path},
-			"commits":      []string{sha},
-			"review_thread_replies": []map[string]any{{
-				"fixItemId":   "comment-1",
-				"threadId":    "thread-1",
-				"explanation": "Updated fix-target.txt to address the review feedback.",
-			}},
+			"summary":               "fake agent committed changes",
+			"changedFiles":          []string{path},
+			"commits":               []string{sha},
+			"review_thread_replies": replies,
 		})
 	case "transient-failure":
 		statePath := strings.TrimSpace(os.Getenv(envFakeAgentStatePath))
@@ -197,4 +205,41 @@ func printCompletion(marker string, payload map[string]any) {
 		panic(err)
 	}
 	_, _ = fmt.Printf("%s%s\n", marker, string(encoded))
+}
+
+func promptReviewThreadReplies(explanation string, fallback bool) []map[string]any {
+	prompt := os.Getenv(envLooperPrompt)
+	lines := strings.Split(prompt, "\n")
+	replies := make([]map[string]any, 0)
+	seen := map[string]struct{}{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- {") {
+			continue
+		}
+		var item promptFixItem
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "- ")), &item); err != nil {
+			continue
+		}
+		if strings.TrimSpace(item.Type) != "comment" || strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ThreadID) == "" {
+			continue
+		}
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		seen[item.ID] = struct{}{}
+		replies = append(replies, map[string]any{
+			"fixItemId":   item.ID,
+			"threadId":    item.ThreadID,
+			"explanation": explanation,
+		})
+	}
+	if len(replies) == 0 && fallback {
+		return []map[string]any{{
+			"fixItemId":   "comment-1",
+			"threadId":    "thread-1",
+			"explanation": explanation,
+		}}
+	}
+	return replies
 }
