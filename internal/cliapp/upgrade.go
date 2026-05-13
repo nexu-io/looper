@@ -437,11 +437,11 @@ func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
 	if err != nil {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
-	if !r.isBackgroundAutoUpgradeProcess(process) {
+	if !r.isExpectedAutoUpgradeLockProcess(path, process) {
 		return true
 	}
 	if lock.Executable == "" || lock.Command == "" || lock.ObservedAt == "" {
-		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+		return false
 	}
 	observedAt, err := time.Parse(time.RFC3339Nano, lock.ObservedAt)
 	if err != nil {
@@ -455,6 +455,28 @@ func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
 	}
 	earliestPossibleStart := time.Now().UTC().Add(-time.Duration(process.ElapsedSeconds+1) * time.Second)
 	return earliestPossibleStart.After(observedAt)
+}
+
+func (r *commandRuntime) isExpectedAutoUpgradeLockProcess(path string, process autoUpgradeLockProcessState) bool {
+	if process.Executable == "" || process.Command == "" {
+		return false
+	}
+	if process.Executable != r.autoUpgradeLockExecutable() {
+		return false
+	}
+	switch filepath.Base(path) {
+	case "auto-upgrade.run.lock":
+		for _, token := range splitProcessCommand(process.Command)[1:] {
+			if token == "upgrade" {
+				return true
+			}
+		}
+		return false
+	case "auto-upgrade.state.lock":
+		return true
+	default:
+		return r.isBackgroundAutoUpgradeProcess(process)
+	}
 }
 
 func parseAutoUpgradeLockState(raw []byte) (autoUpgradeLockState, bool) {
