@@ -957,7 +957,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		fixItemsStateHash := hashFixItemsState(fixItems)
 		unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
 		if len(unresolvedThreadIDs) == 0 {
-			if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
+			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
 				return DiscoveryResult{}, err
 			}
 		}
@@ -3063,6 +3063,15 @@ func (r *Runner) clearFixerFollowupStateForPR(ctx context.Context, projectID, re
 		return err
 	}
 	return r.cancelQueuedFixerItemsForLoop(ctx, cleared.ID)
+}
+
+func (r *Runner) clearFixerFollowupMetadataForPR(ctx context.Context, projectID, repo string, prNumber int64) error {
+	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
+	if err != nil || loop == nil {
+		return err
+	}
+	_, err = r.clearFixerFollowupMetadata(ctx, *loop)
+	return err
 }
 
 func (r *Runner) cancelQueuedFixerItemsForLoop(ctx context.Context, loopID string) error {
