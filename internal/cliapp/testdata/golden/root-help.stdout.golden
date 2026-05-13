@@ -28,7 +28,7 @@ Subcommands:
   run        Run commands
 
 Flags:
-  --config <path>             Config path
+  --config <path>             Config path (`~/.looper/config.toml` by default; also supports .yaml, .yml, and .json)
   --daemon-mode <mode>        Daemon mode
   --daemon-restart-policy <policy> Daemon supervisor restart policy: never, on-failure, or always
   --daemon-restart-throttle-seconds <seconds> Daemon supervisor restart throttle
