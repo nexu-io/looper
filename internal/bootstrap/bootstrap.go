@@ -165,7 +165,7 @@ func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 			continue
 		}
 		value := strings.TrimSpace(*check.path)
-		if value == "" || (!filepath.IsAbs(value) && !strings.ContainsRune(value, os.PathSeparator)) {
+		if value == "" || !filepath.IsAbs(value) {
 			continue
 		}
 		info, err := os.Stat(value)

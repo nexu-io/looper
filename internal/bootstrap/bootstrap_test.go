@@ -194,6 +194,34 @@ func TestBootstrapRejectsConfiguredNonExecutableToolPath(t *testing.T) {
 	}
 }
 
+func TestBootstrapAllowsConfiguredRelativeToolPath(t *testing.T) {
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	logDir := filepath.Join(rootDir, "runtime", "logs")
+	dbPath := filepath.Join(rootDir, "data", "looper.sqlite")
+	relativeGitPath := "./bin/git"
+
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{
+				Config: config.Config{
+					Storage: config.StorageConfig{DBPath: dbPath},
+					Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+					Daemon:  config.DaemonConfig{LogDir: logDir, WorkingDirectory: workingDir},
+					Tools:   config.ToolPathsConfig{GitPath: &relativeGitPath},
+				},
+				Metadata: config.LoadFileMetadata{ToolDetection: map[string]config.ToolDetectionStatus{"gitPath": config.ToolDetectionStatusConfigured}},
+			}, nil
+		},
+		CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) {
+			return &recordingLogger{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Bootstrap() error = %v, want nil", err)
+	}
+}
+
 func TestBootstrapWaitForShutdownRegistersSignalsAndStopsRuntime(t *testing.T) {
 	workingDir := t.TempDir()
 	rootDir := t.TempDir()
