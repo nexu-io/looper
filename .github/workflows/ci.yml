@@ -76,9 +76,8 @@ jobs:
             all_e2e:
               - 'go.mod'
               - 'go.sum'
-              - 'internal/e2e/helpers_test.go'
               - 'internal/e2e/harness/**'
-              - 'internal/e2e/main_test.go'
+              - 'internal/e2e/*.go'
             daemon_boot:
               - 'cmd/**'
               - 'internal/bootstrap/**'
