@@ -1438,6 +1438,60 @@ func TestRunResolveCommentsStepPostsDeclinedReplyWithoutResolving(t *testing.T) 
 	}
 }
 
+func TestRunResolveCommentsStepDoesNotPersistDeclinedFingerprintWhenReplyFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_decline_reply_failure", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}, replyErr: errors.New("reply failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{FixItemsHash: hashFixItems(fixItems), ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].ReplyState != "failed" {
+		t.Fatalf("resolved comments = %#v, want failed reply state", updated.ResolvedComments)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if records := parseDeclinedThreadRecords(parseJSONObject(persisted.MetadataJSON)); len(records) != 0 {
+		t.Fatalf("declined thread records = %#v, want none after failed reply", records)
+	}
+	if got := suppressDeclinedFixItems(persisted.MetadataJSON, "new-head", fixItems); len(got) != 1 || got[0].ID != "c1" {
+		t.Fatalf("suppressDeclinedFixItems() = %#v, want original fix item after failed reply", got)
+	}
+}
+
 func TestRunResolveCommentsStepSkipsAllWhenLiveFixItemsAddNewThread(t *testing.T) {
 	t.Parallel()
 
@@ -4133,6 +4187,41 @@ func TestRecordZeroProgressSuccessPausesAfterThreeRunsAndResumesOnStateChange(t 
 	}
 	if !resumed {
 		t.Fatal("resumePausedZeroProgressLoop() = false, want resume on head change")
+	}
+}
+
+func TestClearFixerFollowupMetadataPreservesZeroProgressPauseReason(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(81)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{
+		"fixerFollowup":            map[string]any{"reason": "missing_evidence"},
+		"lastNoopResolveHeadSha":   "head-1",
+		"lastNoopResolveStateHash": "same-hash",
+		"lastNoopResolveAt":        fixture.nowISO(),
+		"pauseReason":              zeroProgressPauseReason,
+	})
+	loop := storage.LoopRecord{ID: "loop_zero_progress_cleanup", Seq: 95, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	updated, err := runner.clearFixerFollowupMetadata(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("clearFixerFollowupMetadata() error = %v", err)
+	}
+	meta := parseJSONObject(updated.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("lastNoopResolveHeadSha still present in %#v", meta)
+	}
+	if got, _ := stringFromAny(meta["pauseReason"]); got != zeroProgressPauseReason {
+		t.Fatalf("pauseReason = %q, want %q", got, zeroProgressPauseReason)
 	}
 }
 

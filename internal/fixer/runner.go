@@ -2146,7 +2146,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		case string(replyActionDeclined):
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
-			declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
+			if replyState == "sent" {
+				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
+			}
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "agent_declined", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 		default:
 			replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, decision.Explanation, checkpoint.ResolvedComments.Items)
@@ -3638,7 +3640,6 @@ func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.Lo
 		delete(meta, "lastNoopResolveFixItemsHash")
 		delete(meta, "lastNoopResolveStateHash")
 		delete(meta, "lastNoopResolveAt")
-		delete(meta, "pauseReason")
 		encoded, err := json.Marshal(meta)
 		if err != nil {
 			return err
