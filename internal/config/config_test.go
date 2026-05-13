@@ -650,13 +650,13 @@ func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *test
 			wantWarnings: []string{`deprecated config path "projects[].roles.reviewer.autoDiscovery" is accepted for now; use "projects[].roles.reviewer.discovery.autoDiscovery" instead`},
 		},
 		{
-			name:     "legacy project path loses to canonical repoPath",
+			name:     "legacy project path alias is preserved when it matches repoPath",
 			fileName: "config.yaml",
-			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/legacy\n    repoPath: /repos/canonical\n",
+			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/demo\n    repoPath: /repos/demo\n",
 			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
 				t.Helper()
-				if got := loaded.Config.Projects[0].RepoPath; got != "/repos/canonical" {
-					t.Fatalf("project repoPath = %q, want %q", got, "/repos/canonical")
+				if got := loaded.Config.Projects[0].RepoPath; got != "/repos/demo" {
+					t.Fatalf("project repoPath = %q, want %q", got, "/repos/demo")
 				}
 			},
 			wantWarnings: []string{},
@@ -686,6 +686,27 @@ func TestMixedSchemaEnvAndCLIOverridesStillBeatFileBackedValues(t *testing.T) {
 		t.Fatalf("cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
 	}
 	assertWarningsEqual(t, cliLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
+}
+
+func TestLoadFileRejectsMismatchedProjectPathAndRepoPathAfterNormalization(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"projects":[{"id":"demo","name":"Demo","path":"/repos/legacy","repoPath":"/repos/canonical"}]}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "projects[0].path", "must match repoPath when both path and repoPath are set")
 }
 
 func TestDeprecatedAliasWarningsDeduplicateAndUseExactReplacementNames(t *testing.T) {

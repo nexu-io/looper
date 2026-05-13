@@ -1016,6 +1016,7 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			ID:       project.ID,
 			Name:     project.Name,
 			RepoPath: repoPath,
+			Path:     project.Path,
 			Roles:    roles,
 		}
 
