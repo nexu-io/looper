@@ -152,6 +152,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			PublishMode:             ReviewerPublishModeSingleReview,
 			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
 			DetectDuplicateFindings: true,
+			NativeResume:            ReviewerNativeResumeConfig{OnHeadChange: false, ReReviewPromptOnHeadChange: false},
 			ThreadResolution: ReviewerThreadResolutionConfig{
 				Enabled:                     false,
 				Mode:                        ReviewerThreadResolutionModeReportOnly,

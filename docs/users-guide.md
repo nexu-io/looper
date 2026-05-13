@@ -44,7 +44,7 @@ If no project matches the current directory, or multiple projects match, pass `-
 | --- | --- | --- |
 | `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper loop start --type fixer --pr <repo>#<pr>` |
+| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
 
 ## 4. Recommended flow
@@ -149,8 +149,16 @@ If reviewer considers the spec review clean, it will:
 The most direct way to use fixer is to start it for a specific PR:
 
 ```bash
-looper loop start --type fixer --pr owner/repo#42
+looper fix owner/repo#42
 ```
+
+If you are already inside the registered repo, you can usually use the PR number by itself:
+
+```bash
+looper fix 42
+```
+
+Use this when you want to force a repair pass on demand before waiting for any automatic fixer trigger.
 
 Fixer will:
 

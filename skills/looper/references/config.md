@@ -153,6 +153,10 @@ Use this as a map of supported sections, not as a template to paste wholesale:
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"
+    },
+    "nativeResume": {
+      "onHeadChange": false,
+      "reReviewPromptOnHeadChange": false
     }
   },
   "roles": {
@@ -399,6 +403,8 @@ Defaults: `mode=foreground`, `restartPolicy=on-failure`, `restartThrottleSeconds
 
 - `reviewEvents.clean`: `COMMENT` or `APPROVE`, default `COMMENT`.
 - `reviewEvents.blocking`: `COMMENT` or `REQUEST_CHANGES`, default `COMMENT`.
+- `nativeResume.onHeadChange`: mark an interrupted native reviewer session as pending after a PR head change, default `false`.
+- `nativeResume.reReviewPromptOnHeadChange`: use the re-review continuation prompt for pending native reviewer sessions interrupted by a PR head change, default `false`.
 - Deprecated reviewer budget options are ignored by the reviewer filter.
 
 Safe default comment-only behavior:
@@ -409,6 +415,10 @@ Safe default comment-only behavior:
     "reviewEvents": {
       "clean": "COMMENT",
       "blocking": "COMMENT"
+    },
+    "nativeResume": {
+      "onHeadChange": false,
+      "reReviewPromptOnHeadChange": false
     }
   }
 }
@@ -567,6 +577,8 @@ Supported environment overrides:
 - `LOOPER_ALLOW_AUTO_APPROVE`
 - `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
 - `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
+- `LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE`
+- `LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE`
 - `LOOPER_FIX_ALL_PULL_REQUESTS`
 - `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
 - `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`

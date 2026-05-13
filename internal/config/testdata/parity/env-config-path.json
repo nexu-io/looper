@@ -222,6 +222,10 @@
           "blocking": "COMMENT"
         },
         "detectDuplicateFindings": true,
+        "nativeResume": {
+          "onHeadChange": false,
+          "reReviewPromptOnHeadChange": false
+        },
         "threadResolution": {
           "autoResolve": "objective_only",
           "enabled": false,

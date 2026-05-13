@@ -263,6 +263,26 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 	})
 }
 
+func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
+		if err != nil {
+			return nil, err
+		}
+
+		body := map[string]any{
+			"projectId":  projectID,
+			"type":       "fixer",
+			"targetType": "pull_request",
+			"repo":       repo,
+			"prNumber":   prNumber,
+			"status":     "running",
+		}
+
+		return r.postJSON(ctx, "/api/v1/loops", body)
+	}, writeHumanFixCreate)
+}
+
 func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
 	shell := strings.TrimSpace(getStringFlag(cmd, "shell-integration"))
 	if shell != "" {

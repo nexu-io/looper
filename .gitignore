@@ -1,4 +1,5 @@
 .ralph/
+.task/
 node_modules/
 dist/
 *.test

@@ -58,6 +58,11 @@ var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b
 var reviewHumanHTMLCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
 var reviewHumanReferenceDefinitionPattern = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 
+const (
+	reviewerNativeResumeMetadataKey      = "reviewerNativeResume"
+	reviewerNativeResumeReasonHeadChange = "head_change"
+)
+
 type ReviewerStep string
 
 type ReviewEvent string
@@ -374,6 +379,7 @@ type Options struct {
 	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
+	NativeResume            config.ReviewerNativeResumeConfig
 	ThreadResolution        config.ReviewerThreadResolutionConfig
 	Disclosure              *config.DisclosureConfig
 	CustomInstructions      *config.Config
@@ -414,6 +420,7 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
+	nativeResume            config.ReviewerNativeResumeConfig
 	threadResolution        config.ReviewerThreadResolutionConfig
 	disclosure              config.DisclosureConfig
 	customInstructions      config.Config
@@ -613,6 +620,7 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
+		nativeResume:            options.NativeResume,
 		threadResolution:        threadResolution,
 		disclosure:              disclosureCfg,
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
@@ -1705,6 +1713,9 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	if checkpoint.Detail == nil || checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR detail or snapshot checkpoint for thread resolution step", kind: FailureRetryableTransient}
 	}
+	if r.hasPendingHeadChangeNativeResume(ctx, input.Loop.ID) {
+		return checkpoint, nil
+	}
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		return checkpoint, nil
 	}
@@ -2072,20 +2083,26 @@ func latestThreadFeedbackCommitOID(thread ReviewThread) string {
 type reviewerHeadChangeMonitor struct {
 	cancel func()
 	done   chan struct{}
-	reason chan string
+	signal chan reviewerHeadChangeSignal
 }
 
-func (m reviewerHeadChangeMonitor) stop() string {
+type reviewerHeadChangeSignal struct {
+	OldHeadSHA string
+	NewHeadSHA string
+	Reason     string
+}
+
+func (m reviewerHeadChangeMonitor) stop() reviewerHeadChangeSignal {
 	if m.cancel == nil {
-		return ""
+		return reviewerHeadChangeSignal{}
 	}
 	m.cancel()
 	<-m.done
 	select {
-	case reason := <-m.reason:
-		return reason
+	case signal := <-m.signal:
+		return signal
 	default:
-		return ""
+		return reviewerHeadChangeSignal{}
 	}
 }
 
@@ -2095,7 +2112,7 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 		return reviewerHeadChangeMonitor{}
 	}
 	monitorCtx, cancel := context.WithCancel(ctx)
-	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), reason: make(chan string, 1)}
+	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), signal: make(chan reviewerHeadChangeSignal, 1)}
 	go func() {
 		defer close(monitor.done)
 		ticker := time.NewTicker(r.headChangePollInterval)
@@ -2116,10 +2133,11 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 					continue
 				}
 				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, headSHA)
+				signal := reviewerHeadChangeSignal{OldHeadSHA: expectedHead, NewHeadSHA: headSHA, Reason: reason}
 				r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.interrupted", "review", executionID, map[string]any{"headSha": expectedHead, "newHeadSha": headSHA, "reason": reason})
 				r.logInfo("reviewer agent interrupted for newer PR head", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": headSHA})
 				select {
-				case monitor.reason <- reason:
+				case monitor.signal <- signal:
 				default:
 				}
 				if err := execution.Kill(reason); err != nil {
@@ -2178,10 +2196,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
-	nativeResumePrompt := ""
-	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
-		nativeResumePrompt = nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
-	}
+	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -2202,11 +2217,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
 	result, err := execution.Wait(ctx)
-	headChangeReason := headMonitor.stop()
-	if headChangeReason != "" {
+	headChange := headMonitor.stop()
+	if headChange.Reason != "" {
+		if r.nativeResume.OnHeadChange {
+			r.markAgentExecutionNativeResumePendingForHeadChange(ctx, executionID, input, headChange)
+		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "restart_from_discover"
-		return checkpoint, &loopError{message: headChangeReason, kind: FailureRetryableAfterResume, interrupted: true}
+		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
@@ -3471,16 +3489,91 @@ func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx c
 	return true
 }
 
-func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
-	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.Context, executionID string, input stepInput, signal reviewerHeadChangeSignal) bool {
+	if strings.TrimSpace(executionID) == "" || strings.TrimSpace(signal.Reason) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
 		return false
+	}
+	record, err := r.repos.AgentExecutions.GetByID(ctx, executionID)
+	if err != nil {
+		r.logWarn("reviewer native resume head-change source lookup failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	if record == nil || record.NativeSessionID == nil || strings.TrimSpace(*record.NativeSessionID) == "" {
+		return false
+	}
+	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if currentVendor != "" && (!nativeResumeSupportedForReviewer(currentVendor) || record.Vendor != string(currentVendor)) {
+		return false
+	}
+	metadata := parseJSONObject(record.MetadataJSON)
+	metadata[reviewerNativeResumeMetadataKey] = map[string]any{
+		"reason":     reviewerNativeResumeReasonHeadChange,
+		"phase":      "review",
+		"repo":       input.Repo,
+		"prNumber":   input.PRNumber,
+		"oldHeadSha": signal.OldHeadSHA,
+		"newHeadSha": signal.NewHeadSHA,
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		r.logWarn("reviewer native resume head-change metadata marshal failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	record.MetadataJSON = stringPtr(string(metadataJSON))
+	record.NativeResumeMode = stringPtr("native_resume")
+	record.NativeResumeStatus = stringPtr("pending")
+	record.NativeResumeError = stringPtr(strings.TrimSpace(signal.Reason))
+	record.UpdatedAt = r.nowISO()
+	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
+		r.logWarn("reviewer native resume head-change source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	r.logInfo("reviewer native resume re-review queued", map[string]any{"executionId": executionID, "loopId": derefString(record.LoopID), "runId": derefString(record.RunID), "oldHeadSha": signal.OldHeadSHA, "newHeadSha": signal.NewHeadSHA})
+	return true
+}
+
+func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storage.AgentExecutionRecord {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+		return nil
 	}
 	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
+		return nil
+	}
+	if !r.isResumableNativeSession(latest) {
+		return nil
+	}
+	return latest
+}
+
+func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
+	return r.pendingNativeResume(ctx, loopID) != nil
+}
+
+func (r *Runner) hasPendingHeadChangeNativeResume(ctx context.Context, loopID string) bool {
+	if !r.nativeResume.OnHeadChange && !r.nativeResume.ReReviewPromptOnHeadChange {
 		return false
 	}
-	return r.isResumableNativeSession(latest)
+	record := r.pendingNativeResume(ctx, loopID)
+	if record == nil {
+		return false
+	}
+	_, ok := reviewerNativeResumeHeadChange(record)
+	return ok
+}
+
+func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string) string {
+	record := r.pendingNativeResume(ctx, input.Loop.ID)
+	if record == nil {
+		return ""
+	}
+	if r.nativeResume.ReReviewPromptOnHeadChange {
+		if headChange, ok := reviewerNativeResumeHeadChange(record); ok && headChange.matches(input.Repo, input.PRNumber) {
+			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey)
+		}
+	}
+	return nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, currentHeadSHA, idempotencyKey)
 }
 
 func (r *Runner) shouldSkipTransientRetryDelayForNativeResume(ctx context.Context, loopID string, err error) bool {
@@ -3551,6 +3644,40 @@ func isRecoverableReviewerNativeResumeSource(status string, resumeStatus *string
 	}
 }
 
+type reviewerNativeResumeHeadChangeInfo struct {
+	Repo       string
+	PRNumber   int64
+	OldHeadSHA string
+	NewHeadSHA string
+}
+
+func (h reviewerNativeResumeHeadChangeInfo) matches(repo string, prNumber int64) bool {
+	return strings.TrimSpace(h.Repo) == strings.TrimSpace(repo) && h.PRNumber == prNumber
+}
+
+func reviewerNativeResumeHeadChange(record *storage.AgentExecutionRecord) (reviewerNativeResumeHeadChangeInfo, bool) {
+	if record == nil {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	metadata := parseJSONObject(record.MetadataJSON)
+	raw, _ := metadata[reviewerNativeResumeMetadataKey].(map[string]any)
+	if raw == nil {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	reason, _ := stringFromAny(raw["reason"])
+	if reason != reviewerNativeResumeReasonHeadChange {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	repo, _ := stringFromAny(raw["repo"])
+	oldHeadSHA, _ := stringFromAny(raw["oldHeadSha"])
+	newHeadSHA, _ := stringFromAny(raw["newHeadSha"])
+	prNumber := int64(intFromAny(raw["prNumber"]))
+	if repo == "" || prNumber == 0 || oldHeadSHA == "" || newHeadSHA == "" {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	return reviewerNativeResumeHeadChangeInfo{Repo: repo, PRNumber: prNumber, OldHeadSHA: oldHeadSHA, NewHeadSHA: newHeadSHA}, true
+}
+
 func nativeResumeContinuationPrompt(phase string, repo string, prNumber int64, headSHA string, idempotencyKey string) string {
 	return fmt.Sprintf(`Continue the existing Looper reviewer %s task in this resumed native session.
 
@@ -3562,6 +3689,23 @@ Before any GitHub side effect, re-check the current PR/head/idempotency guards f
 - idempotency key: %s
 
 If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
+}
+
+func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string) string {
+	return fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session, but treat it as a PR update re-review.
+
+The pull request changed while the prior review was running:
+- PR: %s#%d
+- previous reviewed head SHA: %s
+- head SHA observed at interruption: %s
+- current expected head SHA for this run: %s
+- idempotency key for this run: %s
+
+Use the prior session context only as background. Re-review the current expected head before publishing anything. Discard findings, assumptions, anchors, or conclusions that only apply to the previous head. Keep only findings that are still concrete, actionable, and valid against the current head.
+
+Before any GitHub side effect, re-check that the PR is open, the current head SHA still matches the current expected head SHA, and the current-user review-request/idempotency guards from the existing instructions still pass.
+
+If a matching review for the current expected head and idempotency key was already posted, report the existing completion marker instead of posting a duplicate.`, repo, prNumber, oldHeadSHA, interruptedHeadSHA, currentHeadSHA, idempotencyKey)
 }
 
 func transientProviderMessageFromAgentResult(result AgentResult) string {

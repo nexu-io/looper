@@ -423,8 +423,20 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	} else if partial.DedupeFindings != nil {
 		config.DetectDuplicateFindings = *partial.DedupeFindings
 	}
+	if partial.NativeResume != nil {
+		mergeReviewerNativeResumeConfig(&config.NativeResume, *partial.NativeResume)
+	}
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+}
+
+func mergeReviewerNativeResumeConfig(config *ReviewerNativeResumeConfig, partial PartialReviewerNativeResumeConfig) {
+	if partial.OnHeadChange != nil {
+		config.OnHeadChange = *partial.OnHeadChange
+	}
+	if partial.ReReviewPromptOnHeadChange != nil {
+		config.ReReviewPromptOnHeadChange = *partial.ReReviewPromptOnHeadChange
 	}
 }
 

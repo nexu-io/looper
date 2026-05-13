@@ -276,12 +276,18 @@ type ReviewerConfig struct {
 	PublishMode             ReviewerPublishMode            `json:"publishMode"`
 	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
 	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
+	NativeResume            ReviewerNativeResumeConfig     `json:"nativeResume"`
 	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
 }
 
 type ReviewerReviewEventsConfig struct {
 	Clean    ReviewerReviewEvent `json:"clean"`
 	Blocking ReviewerReviewEvent `json:"blocking"`
+}
+
+type ReviewerNativeResumeConfig struct {
+	OnHeadChange               bool `json:"onHeadChange"`
+	ReReviewPromptOnHeadChange bool `json:"reReviewPromptOnHeadChange"`
 }
 
 type ReviewerThreadResolutionConfig struct {
@@ -588,12 +594,18 @@ type PartialReviewerConfig struct {
 	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
 	DetectDuplicateFindings *bool                                  `json:"detectDuplicateFindings,omitempty"`
 	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
+	NativeResume            *PartialReviewerNativeResumeConfig     `json:"nativeResume,omitempty"`
 	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
 }
 
 type PartialReviewerReviewEventsConfig struct {
 	Clean    *ReviewerReviewEvent `json:"clean,omitempty"`
 	Blocking *ReviewerReviewEvent `json:"blocking,omitempty"`
+}
+
+type PartialReviewerNativeResumeConfig struct {
+	OnHeadChange               *bool `json:"onHeadChange,omitempty"`
+	ReReviewPromptOnHeadChange *bool `json:"reReviewPromptOnHeadChange,omitempty"`
 }
 
 type PartialReviewerThreadResolutionConfig struct {

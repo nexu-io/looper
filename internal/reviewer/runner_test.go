@@ -2707,6 +2707,113 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	}
 }
 
+func TestProcessClaimedItemMarksNativeResumePendingWhenHeadChangesAndFlagEnabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	github := &fakeGitHubGateway{changeHeadOnSecondView: true, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed", Summary: "stale review", Stdout: `__LOOPER_RESULT__={"summary":"stale review"}`, ParseStatus: "parsed"}},
+		wait: func(context.Context) error {
+			time.Sleep(25 * time.Millisecond)
+			return nil
+		},
+	}
+	agent.onStart = func(input AgentRunInput) {
+		nowISO := fixture.nowISO()
+		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: stringPtr(input.ProjectID), LoopID: stringPtr(input.LoopID), RunID: stringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: stringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+		}
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode), NativeResume: config.ReviewerNativeResumeConfig{OnHeadChange: true}, HeadChangePollInterval: time.Millisecond, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_interrupt_head_changed_native_resume", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "interrupted" {
+		t.Fatalf("result.Status = %q, want interrupted", result.Status)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	record, err := fixture.repos.AgentExecutions.GetByID(ctx, agent.starts[0].ExecutionID)
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() = (%#v, %v), want record", record, err)
+	}
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "native_resume" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "pending" {
+		t.Fatalf("native resume fields = mode:%v status:%v, want native_resume/pending", record.NativeResumeMode, record.NativeResumeStatus)
+	}
+	headChange, ok := reviewerNativeResumeHeadChange(record)
+	if !ok || headChange.OldHeadSHA != "abc123" || headChange.NewHeadSHA != "new-head" || !headChange.matches(repo, prNumber) {
+		t.Fatalf("reviewerNativeResume metadata = (%#v, %v), want head-change abc123 -> new-head", headChange, ok)
+	}
+}
+
+func TestProcessClaimedItemDoesNotMarkNativeResumePendingWhenHeadChangeFlagDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	github := &fakeGitHubGateway{changeHeadOnSecondView: true, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed", Summary: "stale review", Stdout: `__LOOPER_RESULT__={"summary":"stale review"}`, ParseStatus: "parsed"}},
+		wait: func(context.Context) error {
+			time.Sleep(25 * time.Millisecond)
+			return nil
+		},
+	}
+	agent.onStart = func(input AgentRunInput) {
+		nowISO := fixture.nowISO()
+		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: stringPtr(input.ProjectID), LoopID: stringPtr(input.LoopID), RunID: stringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: stringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+		}
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode), HeadChangePollInterval: time.Millisecond, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_interrupt_head_changed_native_resume_disabled", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	if _, err := runner.ProcessClaimedItem(ctx, *claimed); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	record, err := fixture.repos.AgentExecutions.GetByID(ctx, agent.starts[0].ExecutionID)
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() = (%#v, %v), want record", record, err)
+	}
+	if record.NativeResumeStatus != nil && *record.NativeResumeStatus == "pending" {
+		t.Fatalf("NativeResumeStatus = %q, want not pending when feature flag is disabled", *record.NativeResumeStatus)
+	}
+}
+
 func TestProcessClaimedItemMarksStaleWhenPullRequestStateDriftsBeforePublish(t *testing.T) {
 	t.Parallel()
 
@@ -4301,6 +4408,114 @@ func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T
 	nativeResumePrompt := agent.starts[0].NativeResumePrompt
 	if !strings.Contains(nativeResumePrompt, "Continue the existing Looper reviewer review task") || !strings.Contains(nativeResumePrompt, "idempotency key: reviewer:loop_native_resume_prompt:abc123") {
 		t.Fatalf("native resume prompt = %q, want short native resume continuation prompt", nativeResumePrompt)
+	}
+}
+
+func TestRunReviewStepUsesReReviewPromptForHeadChangeNativeResume(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode), NativeResume: config.ReviewerNativeResumeConfig{ReReviewPromptOnHeadChange: true}})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_native_rereview_prompt", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_native_rereview_prompt", LoopID: loop.ID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	metadata := mustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), MetadataJSON: stringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runReviewStep(ctx, stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      run,
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "current-head"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	prompt := agent.starts[0].Prompt
+	if strings.Contains(prompt, "PR update re-review") {
+		t.Fatalf("full prompt = %q, want checkpoint fallback full review prompt without re-review continuation", prompt)
+	}
+	nativeResumePrompt := agent.starts[0].NativeResumePrompt
+	for _, want := range []string{"PR update re-review", "previous reviewed head SHA: old-head", "head SHA observed at interruption: new-head", "current expected head SHA for this run: current-head", "idempotency key for this run: reviewer:loop_native_rereview_prompt:current-head", "Discard findings"} {
+		if !strings.Contains(nativeResumePrompt, want) {
+			t.Fatalf("native resume prompt missing %q:\n%s", want, nativeResumePrompt)
+		}
+	}
+	if strings.Contains(nativeResumePrompt, "transient provider interruption") {
+		t.Fatalf("native resume prompt = %q, want re-review prompt instead of transient continuation", nativeResumePrompt)
+	}
+}
+
+func TestRunReviewStepKeepsGenericPromptWhenReReviewPromptFlagDisabled(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode), NativeResume: config.ReviewerNativeResumeConfig{OnHeadChange: true}})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_native_rereview_prompt_disabled", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_native_rereview_prompt_disabled", LoopID: loop.ID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	metadata := mustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change_prompt_disabled", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), MetadataJSON: stringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runReviewStep(ctx, stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      run,
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "current-head"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	nativeResumePrompt := agent.starts[0].NativeResumePrompt
+	if strings.Contains(nativeResumePrompt, "PR update re-review") || strings.Contains(nativeResumePrompt, "Discard findings") {
+		t.Fatalf("native resume prompt = %q, want generic continuation when re-review prompt flag is disabled", nativeResumePrompt)
+	}
+	if !strings.Contains(nativeResumePrompt, "transient provider interruption") {
+		t.Fatalf("native resume prompt = %q, want generic continuation prompt", nativeResumePrompt)
 	}
 }
 
@@ -6721,11 +6936,15 @@ type fakeAgentExecutor struct {
 	waitErr       error
 	waitErrs      []error
 	wait          func(context.Context) error
+	onStart       func(AgentRunInput)
 	killedReasons []string
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
+	if f.onStart != nil {
+		f.onStart(input)
+	}
 	if f.startErr != nil {
 		return nil, f.startErr
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -169,7 +170,9 @@ func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 		}
 		info, err := os.Stat(value)
 		if err == nil && !info.IsDir() {
-			continue
+			if _, err := exec.LookPath(value); err == nil {
+				continue
+			}
 		}
 		message := "must reference an existing executable file"
 		if err == nil && info.IsDir() {

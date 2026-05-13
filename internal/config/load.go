@@ -845,6 +845,20 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureReviewerLoopConfig(&overrides).MaxIterationsPerHead = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE: %q is not a boolean", value)
+		}
+		ensureReviewerNativeResumeConfig(&overrides).OnHeadChange = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE: %q is not a boolean", value)
+		}
+		ensureReviewerNativeResumeConfig(&overrides).ReReviewPromptOnHeadChange = parsed
+	}
 	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED"); ok {
 		parsed, err := parseBoolean(value)
 		if err != nil {
@@ -1173,6 +1187,14 @@ func ensureReviewerReviewEventsConfig(partial *PartialConfig) *PartialReviewerRe
 		reviewer.ReviewEvents = &PartialReviewerReviewEventsConfig{}
 	}
 	return reviewer.ReviewEvents
+}
+
+func ensureReviewerNativeResumeConfig(partial *PartialConfig) *PartialReviewerNativeResumeConfig {
+	reviewer := ensureReviewerConfig(partial)
+	if reviewer.NativeResume == nil {
+		reviewer.NativeResume = &PartialReviewerNativeResumeConfig{}
+	}
+	return reviewer.NativeResume
 }
 
 func ensureInstructionsConfig(partial *PartialConfig) *PartialInstructionsConfig {
