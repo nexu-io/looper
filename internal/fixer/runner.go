@@ -961,7 +961,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 				return DiscoveryResult{}, err
 			}
 		}
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, unresolvedThreadIDs)
+		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -2877,7 +2877,7 @@ type loopUpsertResult struct {
 	availableAt time.Time
 }
 
-func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash, fixItemsStateHash string, unresolvedThreadIDs []string) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash, fixItemsStateHash string, fixItems []FixItem, unresolvedThreadIDs []string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	now := r.now()
 	existingLoops, err := r.repos.Loops.List(ctx)
@@ -2892,7 +2892,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			if loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsStateHash)) {
 				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
 			}
-			decision := decideRediscoveryAfterNoopResolve(existing, headSHA, fixItemsHash, fixItemsStateHash, unresolvedThreadIDs, now)
+			decision := decideRediscoveryAfterNoopResolve(existing, headSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs, now)
 			if decision.Action == rediscoveryActionSuppress {
 				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
 			}
@@ -4760,12 +4760,12 @@ func shouldTreatMissingGitRevisionAsStale(err error) bool {
 	return false
 }
 
-func decideRediscoveryAfterNoopResolve(loop storage.LoopRecord, headSHA, fixItemsHash, fixItemsStateHash string, unresolvedThreadIDs []string, now time.Time) rediscoveryDecision {
+func decideRediscoveryAfterNoopResolve(loop storage.LoopRecord, headSHA, fixItemsHash, fixItemsStateHash string, fixItems []FixItem, unresolvedThreadIDs []string, now time.Time) rediscoveryDecision {
 	if headSHA == "" || fixItemsStateHash == "" || len(unresolvedThreadIDs) == 0 {
 		return rediscoveryDecision{Action: rediscoveryActionEnqueue}
 	}
 	metadata := parseJSONObject(loop.MetadataJSON)
-	hasRecoverableEvidence := hasRecoverableThreadEvidence(loop.MetadataJSON, unresolvedThreadIDs)
+	hasRecoverableEvidence := hasRecoverableThreadEvidence(loop.MetadataJSON, fixItems)
 	if followup, ok := parseFixerFollowupState(metadata); ok {
 		if followup.HeadSHA != headSHA || followup.FixItemsStateHash != fixItemsStateHash || !sameStringSlices(followup.UnresolvedThreadIDs, unresolvedThreadIDs) {
 			return rediscoveryDecision{Action: rediscoveryActionEnqueue}
@@ -4807,17 +4807,23 @@ func decideRediscoveryAfterNoopResolve(loop storage.LoopRecord, headSHA, fixItem
 	return rediscoveryDecision{Action: rediscoveryActionEnqueue}
 }
 
-func hasRecoverableThreadEvidence(loopMetadataJSON *string, unresolvedThreadIDs []string) bool {
-	if len(unresolvedThreadIDs) == 0 {
+func hasRecoverableThreadEvidence(loopMetadataJSON *string, fixItems []FixItem) bool {
+	if len(fixItems) == 0 {
 		return false
 	}
 	store := loadFixEvidenceStoreV2(loopMetadataJSON)
 	if store == nil || len(store.Threads) == 0 {
 		return false
 	}
-	for _, threadID := range unresolvedThreadIDs {
-		entries := store.Threads[strings.TrimSpace(threadID)]
+	for _, item := range fixItems {
+		if item.Type != "comment" {
+			continue
+		}
+		entries := store.Threads[strings.TrimSpace(item.ThreadID)]
 		for _, entry := range entries {
+			if !threadFixEvidenceMatchesItem(entry, item) {
+				continue
+			}
 			if !entry.ProducedNewCommits || strings.TrimSpace(entry.EvidenceHeadSHA) == "" || strings.TrimSpace(entry.ValidationHeadSHA) == "" {
 				continue
 			}

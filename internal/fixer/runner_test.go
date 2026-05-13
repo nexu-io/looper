@@ -818,7 +818,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHash
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:01:00Z|count=1"}}, []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on thread-set change", decision)
 	}
@@ -828,7 +828,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testin
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue after cooldown expiry", decision)
 	}
@@ -838,7 +838,7 @@ func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
 	}
@@ -848,9 +848,22 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on new signal despite terminal prior state", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveIgnoresMismatchedThreadFingerprintEvidence(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=old-comment|updated=2026-04-11T11:59:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "pending"}}}}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer when only mismatched thread evidence exists", decision)
+	}
+	if decision.NextEligibleAt != "2026-04-11T12:05:00.000Z" {
+		t.Fatalf("NextEligibleAt = %q, want followup cooldown", decision.NextEligibleAt)
 	}
 }
 
