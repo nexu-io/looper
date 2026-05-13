@@ -1972,6 +1972,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		commitSHA = resolveCommentsExpectedHeadSHA(checkpoint)
 	}
 	driftCount := 0
+	mutationFailureCount := 0
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -2003,11 +2004,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
 			message := err.Error()
-			status := "failed_mutation_terminal"
 			if strings.Contains(strings.ToLower(message), "already") {
-				status = "already_resolved"
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+				continue
 			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: status, Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			mutationFailureCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			continue
 		}
 		resolvedCount++
@@ -2020,6 +2022,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because new human comments arrived during the fixer run", driftCount), kind: FailureRetryableAfterResume}
+	}
+	if mutationFailureCount > 0 {
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
 	}
 	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
 		return checkpoint, err
@@ -2190,7 +2196,12 @@ func hasNonLooperCommentSince(thread ReviewThread, rawSince string) bool {
 	}
 	for _, comment := range thread.Comments {
 		createdAt := parseRFC3339OrZero(comment.CreatedAt)
-		if createdAt.IsZero() || !createdAt.After(since) {
+		updatedAt := parseRFC3339OrZero(comment.UpdatedAt)
+		latest := createdAt
+		if updatedAt.After(latest) {
+			latest = updatedAt
+		}
+		if latest.IsZero() || !latest.After(since) {
 			continue
 		}
 		if isLooperReviewThreadComment(comment) {

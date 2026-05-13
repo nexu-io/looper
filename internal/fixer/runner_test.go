@@ -1433,6 +1433,44 @@ func TestRunResolveCommentsStepSkipsThreadWhenHumanCommentArrivesAfterRunStart(t
 	}
 }
 
+func TestRunResolveCommentsStepDetectsDriftFromEditedComment(t *testing.T) {
+	t.Parallel()
+
+	runStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Body: "please fix (edited)", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z", UpdatedAt: "2026-04-11T12:05:00Z"},
+	}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{FixItemsHash: hashFixItems(fixItems), ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix."}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "new human comments") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want thread drift retry from edited comment", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after edited-comment drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift for edited comment", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
 func TestRunResolveCommentsStepIgnoresBotCommentForDrift(t *testing.T) {
 	t.Parallel()
 
@@ -1511,7 +1549,7 @@ func TestRunResolveCommentsStepSkipsWhenReplyExplanationsSnapshotDrifted(t *test
 	}
 }
 
-func TestRunResolveCommentsStepRecordsMutationFailureAsTerminal(t *testing.T) {
+func TestRunResolveCommentsStepRecordsMutationFailureAsRetryable(t *testing.T) {
 	t.Parallel()
 
 	github := &fakeGitHubGateway{
@@ -1524,14 +1562,17 @@ func TestRunResolveCommentsStepRecordsMutationFailureAsTerminal(t *testing.T) {
 	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{FixItemsHash: hashFixItems(fixItems), ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix."}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err != nil {
-		t.Fatalf("runResolveCommentsStep() error = %v, want terminal checkpoint outcome", err)
+	if err == nil || !strings.Contains(err.Error(), "Failed to resolve") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable mutation failure error", err)
 	}
 	if len(github.resolveCalls) != 1 {
 		t.Fatalf("resolve calls = %d, want 1", len(github.resolveCalls))
 	}
-	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "failed_mutation_terminal" {
-		t.Fatalf("resolved comments = %#v, want failed_mutation_terminal", updated.ResolvedComments)
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "failed_mutation_retry" {
+		t.Fatalf("resolved comments = %#v, want failed_mutation_retry", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
 	}
 }
 
