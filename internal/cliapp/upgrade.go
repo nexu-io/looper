@@ -787,6 +787,9 @@ func (r *commandRuntime) collectBackgroundAutoUpgradeResult(cmd *cobra.Command) 
 	if managedErr != nil {
 		return autoUpgradeReadyOrNil(ready)
 	}
+	if managedDaemon == nil {
+		return autoUpgradeReadyOrNil(ready)
+	}
 	statusPayload, statusErr := r.currentDaemonStatusPayload(cmd.Context())
 	if statusErr != nil {
 		return autoUpgradeReadyOrNil(ready)

@@ -571,6 +571,100 @@ func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
 	}
 }
 
+func TestBackgroundAutoUpgradeCommandSkipsDaemonInstallWithoutManagedBinary(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	statePath := filepath.Join(homeDir, ".looper", "auto-upgrade.state.json")
+	execPath := filepath.Join(homeDir, ".looper", "bin", "looper")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(execPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(exec dir) error = %v", err)
+	}
+	if err := os.WriteFile(execPath, []byte("old looper"), 0o755); err != nil {
+		t.Fatalf("WriteFile(execPath) error = %v", err)
+	}
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	if err := runtime.writeAutoUpgradeState(statePath, autoUpgradeState{InFlight: &autoUpgradeInFlightState{PID: 4321, StartedAt: timePtr(time.Now().UTC())}}); err != nil {
+		t.Fatalf("writeAutoUpgradeState() error = %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cliBinary := []byte("new looper")
+	cliChecksum := sha256.Sum256(cliBinary)
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looper-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, cliBinary), nil
+			case "https://example.invalid/looper-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, hex.EncodeToString(cliChecksum[:])+"  looper-darwin-arm64\n"), nil
+			case "http://127.0.0.1:4321/api/v1/status":
+				t.Fatalf("unexpected daemon status request %q", req.URL.String())
+				return nil, nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+				t.Fatalf("unexpected daemon release fetch %q", req.URL.String())
+				return nil, nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			if command == looperdBinaryName && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	if exitCode := app.Run(context.Background(), []string{"upgrade", "--background-auto", "--config", configPath}); exitCode != 0 {
+		t.Fatalf("Run([upgrade --background-auto]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(auto-upgrade state) error = %v", err)
+	}
+	var state autoUpgradeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("Unmarshal(auto-upgrade state) error = %v", err)
+	}
+	if state.Ready == nil {
+		t.Fatal("state.Ready = nil, want ready notification")
+	}
+	if !state.Ready.CLIChanged || state.Ready.CLIVersion != "0.3.0" {
+		t.Fatalf("state.Ready CLI = %#v, want changed version 0.3.0", state.Ready)
+	}
+	if state.Ready.DaemonChanged {
+		t.Fatalf("state.Ready.DaemonChanged = true, want false; ready=%#v", state.Ready)
+	}
+	if state.Ready.DaemonRestartRequired {
+		t.Fatalf("state.Ready.DaemonRestartRequired = true, want false; ready=%#v", state.Ready)
+	}
+	if _, err := os.Stat(managedPath); !os.IsNotExist(err) {
+		t.Fatalf("Stat(managedPath) error = %v, want no managed daemon install", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty string", stdout.String())
+	}
+}
+
 func TestAutoUpgradeReadyNoticePrintsRestartCommand(t *testing.T) {
 	t.Parallel()
 
