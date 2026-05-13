@@ -482,6 +482,42 @@ func TestCanonicalReviewerCleanCLIOverrideWinsOverAllowAutoApproveRegardlessOfOr
 	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
 		t.Fatalf("clean review event with legacy then canonical flags = %q, want %q", got, ReviewerReviewEventComment)
 	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+		"--reviewer-clean-review-event=APPROVE",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with canonical then legacy alias = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-clean-review-event=APPROVE",
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with legacy alias then canonical = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestCanonicalFixerAuthorFilterCLIOverrideWinsOverFixAllPullRequestsRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"fixer":{"triggers":{"authorFilter":"current_user"}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-fixer-triggers-author-filter=current_user",
+		"--fix-all-pull-requests=true",
+	})
+	if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("author filter with canonical then legacy flags = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--fix-all-pull-requests=true",
+		"--roles-fixer-triggers-author-filter=current_user",
+	})
+	if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("author filter with legacy then canonical flags = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
 }
 
 func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {

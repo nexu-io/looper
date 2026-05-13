@@ -435,6 +435,7 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalReviewerCleanOverrideSet := false
+	canonicalFixerAuthorFilterOverrideSet := false
 
 	takeValue := func(index int, flag string) (string, int, error) {
 		current := args[index]
@@ -673,9 +674,11 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, err
 			}
 			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
 			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-clean") {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
 				canonicalReviewerCleanOverrideSet = true
+			} else if !canonicalReviewerCleanOverrideSet {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
 			}
 			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-approve"):
@@ -706,6 +709,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-triggers-author-filter: must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)
 			}
 			ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = parsedValue
+			canonicalFixerAuthorFilterOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--fix-all-pull-requests"):
 			value, nextIndex, err := takeValue(index, "--fix-all-pull-requests")
@@ -717,11 +721,13 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fix-all-pull-requests: %q is not a boolean", value)
 			}
 			ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
-			authorFilter := FixerAuthorFilterCurrentUser
-			if *parsedValue {
-				authorFilter = FixerAuthorFilterAny
+			if !canonicalFixerAuthorFilterOverrideSet {
+				authorFilter := FixerAuthorFilterCurrentUser
+				if *parsedValue {
+					authorFilter = FixerAuthorFilterAny
+				}
+				ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = &authorFilter
 			}
-			ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = &authorFilter
 			index = nextIndex
 		case matchesFlag(arg, "--roles-reviewer-behavior-loop-enabled-by-default"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-enabled-by-default")

@@ -1581,6 +1581,27 @@ func TestConfigShowSourceDetectsCanonicalReviewerBehaviorOverrides(t *testing.T)
 	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "cli")
 }
 
+func TestConfigShowSourceDetectsLegacyReviewerReviewEventsAsConfigFileSources(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"reviewEvents": map[string]any{
+				"clean":    "APPROVE",
+				"blocking": "REQUEST_CHANGES",
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.blocking", "config-file")
+}
+
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverride(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
