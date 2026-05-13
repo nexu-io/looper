@@ -122,7 +122,7 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([bootstrap --yes]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 14 B / 14 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (14 B)") {
 		t.Fatalf("Run([bootstrap --yes]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if spawnCalls.Load() != 1 {
@@ -314,7 +314,7 @@ func TestEnsureBootstrapDaemonForceReinstallsBrokenManagedBinary(t *testing.T) {
 	if !bytes.Equal(got, binary) {
 		t.Fatalf("managed daemon bytes = %q, want %q", got, binary)
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64") {
+	if !strings.Contains(stderr.String(), "Downloading looperd…") {
 		t.Fatalf("stderr = %q, want download progress", stderr.String())
 	}
 }
@@ -413,7 +413,7 @@ func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([bootstrap --yes --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 14 B / 14 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (14 B)") {
 		t.Fatalf("Run([bootstrap --yes --json]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	var decoded bootstrapResult

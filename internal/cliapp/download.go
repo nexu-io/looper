@@ -11,7 +11,6 @@ import (
 	"io"
 	"path"
 	"strings"
-	"sync"
 )
 
 // archiveAssetSuffix is appended to the per-target binary name to form the
@@ -173,66 +172,4 @@ func extractBinaryFromTarGz(archiveBytes []byte, binaryName string) ([]byte, err
 		return data, nil
 	}
 	return nil, fmt.Errorf("archive does not contain entry %q", binaryName)
-}
-
-// concurrentProgressMux serializes progress writes from multiple goroutines
-// onto a single underlying writer. It also tells download progress emitters to
-// use compact summary mode so concurrent artifact downloads produce a small,
-// readable set of whole-line updates instead of noisy interleaved carriage-
-// return animations.
-type concurrentProgressMux struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func newConcurrentProgressMux(w io.Writer) *concurrentProgressMux {
-	return &concurrentProgressMux{w: w}
-}
-
-func (m *concurrentProgressMux) writer() io.Writer {
-	if m == nil || m.w == nil {
-		return nil
-	}
-	return &concurrentLineWriter{parent: m}
-}
-
-type concurrentLineWriter struct {
-	parent *concurrentProgressMux
-}
-
-func (c *concurrentLineWriter) downloadProgressMode() downloadProgressMode {
-	return downloadProgressModeSummary
-}
-
-func (c *concurrentLineWriter) Write(p []byte) (int, error) {
-	if c == nil || c.parent == nil || c.parent.w == nil {
-		return len(p), nil
-	}
-	c.parent.mu.Lock()
-	defer c.parent.mu.Unlock()
-	rewritten := bytesReplaceCR(p)
-	if _, err := c.parent.w.Write(rewritten); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-// bytesReplaceCR rewrites a payload so that lone carriage returns become
-// newlines, which is what concurrent line-oriented progress output needs.
-func bytesReplaceCR(input []byte) []byte {
-	if len(input) == 0 {
-		return input
-	}
-	if !bytes.ContainsRune(input, '\r') {
-		return input
-	}
-	out := make([]byte, 0, len(input))
-	for _, b := range input {
-		if b == '\r' {
-			out = append(out, '\n')
-			continue
-		}
-		out = append(out, b)
-	}
-	return out
 }

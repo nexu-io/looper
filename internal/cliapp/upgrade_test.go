@@ -608,7 +608,7 @@ func TestUpgradeWithoutFlagsDoesNotInstallDaemonWhenCLIUpgradeFails(t *testing.T
 	if _, err := os.Stat(managedPath); !os.IsNotExist(err) {
 		t.Fatalf("Stat(%q) error = %v, want daemon install to be skipped", managedPath, err)
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64") {
+	if !strings.Contains(stderr.String(), "Downloading looperd…") {
 		t.Fatalf("stderr = %q, want daemon lane to have started download prep", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "Installed looperd") {
@@ -672,7 +672,7 @@ func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (4 B)") {
 		t.Fatalf("Run([upgrade --json]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
@@ -841,10 +841,10 @@ func TestUpgradeCLIPrintsDownloadProgressToStderr(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looper-darwin-arm64: [####################] 10 B / 10 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looper (10 B)") {
 		t.Fatalf("stderr = %q, want CLI download progress", stderr.String())
 	}
-	if strings.Contains(stdout.String(), "Downloading looper-darwin-arm64") {
+	if strings.Contains(stdout.String(), "Downloading looper") {
 		t.Fatalf("stdout = %q, did not expect download progress", stdout.String())
 	}
 }
@@ -955,7 +955,7 @@ func TestUpgradeDaemonPrintsRestartHint(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --daemon]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (4 B)") {
 		t.Fatalf("Run([upgrade --daemon]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Upgraded looperd 0.2.1 → 0.3.0") {
@@ -1065,7 +1065,7 @@ func TestUpgradeDaemonInstallsManagedBinaryWhenOnlyPathBinaryExists(t *testing.T
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --daemon]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloaded looperd (4 B)") {
 		t.Fatalf("Run([upgrade --daemon]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Installed managed looperd 0.4.0") {

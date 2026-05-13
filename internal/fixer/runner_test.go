@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -809,11 +810,44 @@ func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.
 	}
 }
 
+func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenRecoverableEvidenceExists(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "body": "please fix"}}}
+	fixItems := collectFixItems(detail)
+	metadata := mustJSON(t, map[string]any{
+		"lastNoopResolveHeadSha":   detail.HeadSHA,
+		"lastNoopResolveStateHash": hashFixItemsState(fixItems),
+		"fixEvidenceStoreV2": &fixEvidenceStoreV2{Version: 2, Threads: map[string][]threadFixEvidence{
+			"t1": {{ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", EvidenceHeadSHA: "head-1", ValidationHeadSHA: "head-1", CommitSHA: "head-1", ProducedNewCommits: true, ResolveState: "pending"}},
+		}},
+	})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_recoverable_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovery rediscovery to enqueue", result.QueueItems)
+	}
+}
+
 func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHashMatches(t *testing.T) {
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:01:00Z|count=1"}}, []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on thread-set change", decision)
 	}
@@ -823,7 +857,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testin
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue after cooldown expiry", decision)
 	}
@@ -833,7 +867,7 @@ func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
 	}
@@ -1001,9 +1035,22 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal
 	t.Parallel()
 
 	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
-	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on new signal despite terminal prior state", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveIgnoresMismatchedThreadFingerprintEvidence(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=old-comment|updated=2026-04-11T11:59:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "pending"}}}}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer when only mismatched thread evidence exists", decision)
+	}
+	if decision.NextEligibleAt != "2026-04-11T12:05:00.000Z" {
+		t.Fatalf("NextEligibleAt = %q, want followup cooldown", decision.NextEligibleAt)
 	}
 }
 
@@ -1054,6 +1101,59 @@ func TestDiscoverPullRequestsClearsFollowupStateWhenNoUnresolvedCommentsRemain(t
 	}
 	if activeQueue != nil {
 		t.Fatalf("activeQueue = %#v, want cleared delayed queue item", activeQueue)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsQueuedAttemptsForNonCommentFixItemsWithoutThreads(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_checks", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_checks"
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	delayedAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_followup", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:followup", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: delayedAt, Attempts: 2, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want reused queued item for non-comment fix item", result.QueueItems)
+	}
+	if result.QueueItems[0].ID != "queue_followup" {
+		t.Fatalf("queue item ID = %q, want existing queued fixer item", result.QueueItems[0].ID)
+	}
+	if result.QueueItems[0].Attempts != 2 {
+		t.Fatalf("Attempts = %d, want preserved retry state", result.QueueItems[0].Attempts)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.ID != "queue_followup" || activeQueue.Attempts != 2 {
+		t.Fatalf("activeQueue = %#v, want preserved queued fixer item with attempts", activeQueue)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
 	}
 }
 
@@ -1878,6 +1978,106 @@ func TestRunResolveCommentsStepPersistsNoopResolveMetadataWhenAllThreadsSkipForM
 	}
 	if followup.AttemptsForFingerprint != 1 {
 		t.Fatalf("followup.AttemptsForFingerprint = %d, want 1", followup.AttemptsForFingerprint)
+	}
+}
+
+func TestRunResolveCommentsStepHandlesMixedMultiRoundThreadEvidenceIndependently(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":                "c1",
+			"threadId":          "t1",
+			"threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1",
+			"body":              "please fix a",
+		}, {
+			"id":                "c2",
+			"threadId":          "t2",
+			"threadFingerprint": "latest=c2|updated=2026-04-11T12:10:00Z|count=1",
+			"body":              "please fix b",
+		}},
+	}}}
+	git := &fakeGitGateway{ancestor: map[string]bool{"round-1-head->new-head": true, "round-2-head->new-head": true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", Summary: "please fix a"}, {Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:10:00Z|count=1", Summary: "please fix b"}}
+	loopMetadata := mustJSON(t, map[string]any{"fixEvidenceStoreV2": &fixEvidenceStoreV2{Version: 2, Threads: map[string][]threadFixEvidence{
+		"t1": {{ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", EvidenceHeadSHA: "round-1-head", ValidationHeadSHA: "round-1-head", CommitSHA: "commit-a", ProducedNewCommits: true, Explanation: "Fixed A.", ResolveState: "pending"}},
+		"t2": {{ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:10:00Z|count=1", EvidenceHeadSHA: "round-2-head", ValidationHeadSHA: "round-2-head", CommitSHA: "commit-b", ProducedNewCommits: true, Explanation: "Fixed B.", ResolveState: "pending"}},
+	}}})
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_mixed_evidence", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, MetadataJSON: &loopMetadata}, Run: storage.RunRecord{ID: "run_mixed_evidence"}, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 2 {
+		t.Fatalf("resolve calls = %#v, want both threads resolved independently", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 2 || !contains(github.replyCalls[0].Body, "commit-") || !contains(github.replyCalls[1].Body, "commit-") {
+		t.Fatalf("reply calls = %#v, want per-thread commit replies", github.replyCalls)
+	}
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepRecoversAfterCrashBetweenReplyAndResolve(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	marker := fixerReplyMarker("t1", "fix-head")
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "fix-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "body": "please fix"}},
+		}, {
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     "fix-head",
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "body": "please fix"}},
+		}},
+		threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}, {ID: "reply-1", Body: "already replied\n\n" + marker}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", Summary: "please fix"}}
+	loopMetadata := mustJSON(t, map[string]any{"fixEvidenceStoreV2": &fixEvidenceStoreV2{Version: 2, Threads: map[string][]threadFixEvidence{
+		"t1": {{ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", EvidenceHeadSHA: "fix-head", ValidationHeadSHA: "fix-head", CommitSHA: "fix-head", ProducedNewCommits: true, ReplyState: "sent", ResolveState: "pending"}},
+	}}})
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_crash_recovery", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, MetadataJSON: &loopMetadata}, Run: storage.RunRecord{ID: "run_crash_recovery"}, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %#v, want no duplicate reply after crash recovery", github.replyCalls)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want recovered resolve", github.resolveCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved after crash recovery", updated.ResolvedComments)
 	}
 }
 
@@ -3885,6 +4085,15 @@ func (*testLogger) Warn(string, map[string]any)  {}
 func (*testLogger) Error(string, map[string]any) {}
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return string(encoded)
+}
 
 func TestBuildFixerReplyBodyMentionsAuthorAndCommit(t *testing.T) {
 	t.Parallel()
