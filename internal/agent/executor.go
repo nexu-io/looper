@@ -437,6 +437,12 @@ func (x *execution) run(ctx context.Context) {
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
+			select {
+			case waitErr = <-waitCh:
+				waiting = false
+				continue
+			default:
+			}
 			if !timedOut {
 				timedOut = true
 				timeoutType = "max_runtime"

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1230,6 +1231,61 @@ func TestConfigSetSupportsCanonicalReviewerDiscoveryKeys(t *testing.T) {
 			},
 		},
 		{
+			key:   "roles.reviewer.discovery.triggers.includeDrafts",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts == nil || !*partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts {
+					t.Fatalf("canonical reviewer trigger missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil {
+					t.Fatalf("legacy reviewer trigger should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.labels",
+			value: "looper:review,looper:review-extra",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.Labels == nil {
+					t.Fatalf("canonical reviewer trigger labels missing: %#v", partial.Roles)
+				}
+				if got := *partial.Roles.Reviewer.Discovery.Triggers.Labels; !reflect.DeepEqual(got, []string{"looper:review", "looper:review-extra"}) {
+					t.Fatalf("canonical reviewer trigger labels = %#v, want %#v", got, []string{"looper:review", "looper:review-extra"})
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil {
+					t.Fatalf("legacy reviewer trigger labels should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.labelMode",
+			value: "any",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.LabelMode == nil || *partial.Roles.Reviewer.Discovery.Triggers.LabelMode != config.LabelModeAny {
+					t.Fatalf("canonical reviewer trigger labelMode missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.LabelMode != nil {
+					t.Fatalf("legacy reviewer trigger labelMode should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.specReview.includeReviewingLabel",
+			value: "false",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.SpecReview == nil || partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel == nil || *partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel {
+					t.Fatalf("canonical reviewer specReview missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil {
+					t.Fatalf("legacy reviewer specReview should be cleared: %#v", partial.Roles.Reviewer.SpecReview)
+				}
+			},
+		},
+		{
 			key:   "roles.reviewer.discovery.specReview.reviewingLabel",
 			value: "looper:spec-reviewing",
 			assert: func(t *testing.T, partial config.PartialConfig) {
@@ -1277,10 +1333,14 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 				"discovery": map[string]any{
 					"autoDiscovery": true,
 					"triggers": map[string]any{
+						"includeDrafts":        true,
 						"requireReviewRequest": true,
+						"labels":               []string{"looper:review", "looper:review-extra"},
+						"labelMode":            "any",
 					},
 					"specReview": map[string]any{
-						"reviewingLabel": "looper:spec-reviewing",
+						"includeReviewingLabel": true,
+						"reviewingLabel":        "looper:spec-reviewing",
 					},
 				},
 			},
@@ -1289,7 +1349,11 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 
 	for _, key := range []string{
 		"roles.reviewer.discovery.autoDiscovery",
+		"roles.reviewer.discovery.triggers.includeDrafts",
 		"roles.reviewer.discovery.triggers.requireReviewRequest",
+		"roles.reviewer.discovery.triggers.labels",
+		"roles.reviewer.discovery.triggers.labelMode",
+		"roles.reviewer.discovery.specReview.includeReviewingLabel",
 		"roles.reviewer.discovery.specReview.reviewingLabel",
 	} {
 		exitCode, stdout, stderr := runApp(t, "config", "unset", key, "--config", configPath)
@@ -1316,6 +1380,18 @@ func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testi
 	}
 	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest != nil {
 		t.Fatalf("canonical reviewer trigger still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts != nil {
+		t.Fatalf("canonical reviewer includeDrafts still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.Labels != nil {
+		t.Fatalf("canonical reviewer labels still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.LabelMode != nil {
+		t.Fatalf("canonical reviewer labelMode still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel != nil {
+		t.Fatalf("canonical reviewer includeReviewingLabel still set: %#v", partial.Roles.Reviewer.Discovery.SpecReview)
 	}
 	if partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != nil {
 		t.Fatalf("canonical reviewer specReview still set: %#v", partial.Roles.Reviewer.Discovery.SpecReview)
