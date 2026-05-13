@@ -1596,6 +1596,15 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	if work.ExecutionMode == "create-pr" && checkpoint.PullRequest == nil {
+		pr, ok, err := r.lifecycleAgentCreatedPullRequest(ctx, work.Repo, checkpoint.Lifecycle, worktree.Branch, work.BaseBranch, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if ok {
+			checkpoint.PullRequest = &pr
+		}
+	}
 	if work.ExecutionMode == "create-pr" && (checkpoint.PullRequest != nil || input.Loop.PRNumber != nil) {
 		if checkpoint.PullRequest == nil {
 			checkpoint.PullRequest = &checkpointPullPR{Number: derefInt64(input.Loop.PRNumber), URL: stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])}
@@ -1618,7 +1627,12 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			pushedByFallback = true
 		}
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, shouldForceWorkerPullRequestDisclosure(checkpoint.Lifecycle)); err != nil {
+		if shouldPersistPullRequestReference(input.Loop, *checkpoint.PullRequest) {
+			if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, *checkpoint.PullRequest); err != nil {
+				return checkpoint, err
+			}
+		}
+		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1640,7 +1654,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, work.PRNumber, input.Project.RepoPath, shouldForceWorkerPullRequestDisclosure(checkpoint.Lifecycle)); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, work.PRNumber, input.Project.RepoPath, false); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
@@ -2697,8 +2711,42 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
 }
 
-func shouldForceWorkerPullRequestDisclosure(state *lifecycle.State) bool {
-	return state != nil && state.Actions.PR == lifecycle.ActionSourceAgent && !state.PRAdopted
+func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, repo string, state *lifecycle.State, expectedBranch, expectedBaseBranch, cwd string) (checkpointPullPR, bool, error) {
+	if r.github == nil || state == nil || state.Actions.PR != lifecycle.ActionSourceAgent || state.PRNumber <= 0 {
+		return checkpointPullPR{}, false, nil
+	}
+	if expectedBranch = strings.TrimSpace(expectedBranch); expectedBranch != "" {
+		if branch := strings.TrimSpace(state.Branch); branch != "" && branch != expectedBranch {
+			return checkpointPullPR{}, false, nil
+		}
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
+	if err != nil {
+		return checkpointPullPR{}, false, err
+	}
+	if prState := strings.TrimSpace(detail.State); prState != "" && !strings.EqualFold(prState, "open") {
+		return checkpointPullPR{}, false, nil
+	}
+	if expectedBranch != "" && strings.TrimSpace(detail.HeadRefName) != expectedBranch {
+		return checkpointPullPR{}, false, nil
+	}
+	if expectedBaseBranch = strings.TrimSpace(expectedBaseBranch); expectedBaseBranch != "" && strings.TrimSpace(detail.BaseRefName) != expectedBaseBranch {
+		return checkpointPullPR{}, false, nil
+	}
+	return checkpointPullPR{Number: detail.Number, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL))}, true, nil
+}
+
+func shouldPersistPullRequestReference(loop storage.LoopRecord, pr checkpointPullPR) bool {
+	if pr.Number <= 0 {
+		return false
+	}
+	if derefInt64(loop.PRNumber) != pr.Number {
+		return true
+	}
+	if stringFromAnyDefault(parseJSONObject(loop.MetadataJSON)["prUrl"]) != pr.URL {
+		return true
+	}
+	return derefString(loop.TargetID) != fmt.Sprintf("pr:%s:%d", derefString(loop.Repo), pr.Number)
 }
 
 func (r *Runner) stampPullRequestDisclosure(body string) string {

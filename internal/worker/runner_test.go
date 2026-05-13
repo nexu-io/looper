@@ -2809,7 +2809,7 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	prNumber := int64(555)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/555", Body: "## Summary\n\nLifecycle-created body", BaseRefName: "main", HeadRefName: "feature/pr-555"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/555", State: "open", Body: "## Summary\n\nLifecycle-created body", BaseRefName: "main", HeadRefName: "feature/pr-555"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -2818,11 +2818,18 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queueItem, err)
+	}
 	checkpoint := workerCheckpoint{
-		Work:        &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
-		Worktree:    &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
-		Validation:  &ValidationResult{Passed: true, Summary: "ok"},
-		PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/555"},
+		Work:       &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
 			PolicyVersion: lifecycle.PolicyVersion,
@@ -2834,7 +2841,7 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
 		},
 	}
-	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1"}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+	input := stepInput{Project: *project, Loop: *loop, QueueItem: *queueItem, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
 
 	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
 	if err != nil {
@@ -2853,13 +2860,20 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber {
 		t.Fatalf("checkpointAfter.PullRequest = %#v, want preserved PR", checkpointAfter.PullRequest)
 	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID(updated) = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.PRNumber == nil || *updatedLoop.PRNumber != prNumber {
+		t.Fatalf("updatedLoop.PRNumber = %#v, want %d", updatedLoop.PRNumber, prNumber)
+	}
 }
 
-func TestRunOpenPRStepStampsPushExistingAgentPRWithoutExistingFooter(t *testing.T) {
+func TestRunOpenPRStepLeavesPushExistingAgentPRBodyUntouchedWithoutExistingFooter(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	prNumber := int64(556)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/556", Title: "Existing PR", Body: "## Summary\n\nAgent-created body", BaseRefName: "main", HeadRefName: "feature/pr-556"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/556", State: "open", Title: "Existing PR", Body: "## Summary\n\nAgent-created body", BaseRefName: "main", HeadRefName: "feature/pr-556"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -2890,14 +2904,8 @@ func TestRunOpenPRStepStampsPushExistingAgentPRWithoutExistingFooter(t *testing.
 		t.Fatalf("runOpenPRStep() error = %v", err)
 	}
 	github := runner.github.(*fakeGitHubGateway)
-	if len(github.updatePRBodyCalls) != 1 {
-		t.Fatalf("updatePRBodyCalls = %#v, want one disclosure rewrite", github.updatePRBodyCalls)
-	}
-	if !strings.Contains(github.updatePRBodyCalls[0].Body, disclosure.Marker) {
-		t.Fatalf("updated body = %q, want disclosure marker", github.updatePRBodyCalls[0].Body)
-	}
-	if !strings.Contains(github.updatePRBodyCalls[0].Body, "runner=worker") {
-		t.Fatalf("updated body = %q, want worker disclosure footer", github.updatePRBodyCalls[0].Body)
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for push-existing PR", github.updatePRBodyCalls)
 	}
 	if checkpointAfter.Lifecycle == nil || checkpointAfter.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
 		t.Fatalf("checkpointAfter.Lifecycle = %#v, want agent PR action preserved", checkpointAfter.Lifecycle)
