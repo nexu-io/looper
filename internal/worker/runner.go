@@ -2698,7 +2698,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 }
 
 func shouldForceWorkerPullRequestDisclosure(state *lifecycle.State) bool {
-	return state != nil && state.Actions.PR == lifecycle.ActionSourceAgent
+	return state != nil && state.Actions.PR == lifecycle.ActionSourceAgent && !state.PRAdopted
 }
 
 func (r *Runner) stampPullRequestDisclosure(body string) string {

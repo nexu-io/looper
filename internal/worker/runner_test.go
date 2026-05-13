@@ -2904,6 +2904,50 @@ func TestRunOpenPRStepStampsPushExistingAgentPRWithoutExistingFooter(t *testing.
 	}
 }
 
+func TestRunOpenPRStepPreservesAdoptedPushExistingPRWithoutExistingFooter(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(557)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/557", Title: "Existing PR", Body: "## Summary\n\nHuman-authored body", BaseRefName: "main", HeadRefName: "feature/pr-557"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR adopted", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-557"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-557", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_557"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-557",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/557",
+			PRAdopted:     true,
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1", Repo: stringPtr("acme/looper"), TargetType: "pull_request", PRNumber: &prNumber}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for adopted PR", github.updatePRBodyCalls)
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.PRAdopted {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want adopted PR preserved", checkpointAfter.Lifecycle)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
