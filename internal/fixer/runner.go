@@ -4110,6 +4110,25 @@ func skippedFollowupThreadIDs(fixItems []FixItem, resolvedComments []checkpointR
 	return canonicalizeStringSlice(threadIDs), reason
 }
 
+func skippedNoEvidenceThreadIDs(fixItems []FixItem, resolvedComments []checkpointResolvedComment) []string {
+	threadIDs := make([]string, 0)
+	for _, item := range fixItems {
+		if item.Type != "comment" {
+			continue
+		}
+		for _, resolved := range resolvedComments {
+			if resolved.FixItemID != item.ID && (resolved.ThreadID == "" || resolved.ThreadID != item.ThreadID) {
+				continue
+			}
+			if resolved.Status == "skipped_no_evidence" {
+				threadIDs = append(threadIDs, item.ThreadID)
+			}
+			break
+		}
+	}
+	return canonicalizeStringSlice(threadIDs)
+}
+
 func resolveCommentCommitSHA(checkpoint fixerCheckpoint, evidence *fixEvidence, verifiedEvidence bool) string {
 	commitSHA := ""
 	if checkpoint.ReconcileCommits != nil {
