@@ -170,6 +170,24 @@ type AddReviewThreadReplyInput struct {
 	CWD      string
 }
 
+// CompareCommitsInput asks the gateway to compare two commits on a remote
+// repository (e.g. via the GitHub compare API). Used by the fixer to detect
+// whether a previously-pushed fix commit is still reachable from the live PR
+// head, which distinguishes safe upstream additions from history-rewriting
+// rebases / force-pushes that erase the fix.
+type CompareCommitsInput struct {
+	Repo string
+	Base string
+	Head string
+	CWD  string
+}
+
+// CompareCommitsResult mirrors the GitHub compare API status field.
+// Valid values: "identical", "ahead", "behind", "diverged".
+type CompareCommitsResult struct {
+	Status string
+}
+
 type IssueCommentInput struct {
 	Repo        string
 	IssueNumber int64
@@ -205,6 +223,7 @@ type GitHubGateway interface {
 	ViewReviewThread(context.Context, ViewReviewThreadInput) (ReviewThread, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
+	CompareCommits(context.Context, CompareCommitsInput) (CompareCommitsResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -1951,6 +1970,32 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if err != nil {
 		return checkpoint, err
 	}
+	// Ancestor guard: if we previously pushed a fix commit, make sure the
+	// live PR head still descends from it. If a collaborator force-pushed or
+	// rebased and dropped our commit, replying and resolving threads would
+	// be acknowledging code that no longer exists in the PR. Bail out and
+	// let the next discover round re-derive everything from scratch.
+	//
+	// "identical" or "ahead" means the fix commit is still reachable from
+	// the live head (possibly with extra commits stacked on top from CI
+	// bots, the author, or other collaborators) — that is harmless and we
+	// proceed. "behind" or "diverged" means history was rewritten such
+	// that the fix commit is no longer an ancestor of the head; we must
+	// abandon this round.
+	if expectedHead := resolveCommentsExpectedHeadSHA(checkpoint); expectedHead != "" && liveDetail.HeadSHA != "" && liveDetail.HeadSHA != expectedHead {
+		cmp, cmpErr := r.github.CompareCommits(ctx, CompareCommitsInput{Repo: input.Repo, Base: expectedHead, Head: liveDetail.HeadSHA, CWD: input.Project.RepoPath})
+		if cmpErr != nil {
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			return checkpoint, &loopError{message: fmt.Sprintf("Failed to verify fix commit %s is reachable from PR head %s: %v", expectedHead, liveDetail.HeadSHA, cmpErr), kind: FailureRetryableAfterResume}
+		}
+		switch strings.ToLower(strings.TrimSpace(cmp.Status)) {
+		case "identical", "ahead":
+			// fix commit still in head's history; safe to continue
+		default:
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head %s no longer descends from fix commit %s (compare status %q); will rediscover", liveDetail.HeadSHA, expectedHead, cmp.Status), kind: FailureRetryableAfterResume}
+		}
+	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	fixItems := collectFixItems(liveDetail)
 	checkpoint.FixItems = fixItems
@@ -1973,6 +2018,23 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	driftCount := 0
 	mutationFailureCount := 0
+	// If the agent's reply explanations were captured against a different
+	// fix-items snapshot than the live PR shows, the underlying threads or
+	// comments have changed since the agent ran. Treat the whole step as
+	// thread drift and rediscover, instead of marking each thread as
+	// skipped_agent_declined (which would silently bypass the drift path).
+	if len(commentItems) > 0 && checkpoint.Repair != nil && len(checkpoint.Repair.ReplyExplanations) > 0 && !agentResolveReplyExplanationsValid(checkpoint) {
+		for _, item := range commentItems {
+			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+				continue
+			}
+			driftCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "Fix-items snapshot changed since the agent recorded reply explanations", UpdatedAt: r.nowISO()})
+		}
+		r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: fmt.Sprintf("Fix-items snapshot drifted; will rediscover %d thread(s)", driftCount), kind: FailureRetryableAfterResume}
+	}
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -2024,7 +2086,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because new human comments arrived during the fixer run", driftCount), kind: FailureRetryableAfterResume}
 	}
 	if mutationFailureCount > 0 {
-		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
 	}
 	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {

@@ -467,6 +467,14 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
+func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
+	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
+	if err != nil {
+		return fixer.CompareCommitsResult{}, err
+	}
+	return fixer.CompareCommitsResult{Status: out.Status}, nil
+}
+
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
 	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})

@@ -349,6 +349,17 @@ type AddReviewThreadReplyInput struct {
 	CWD      string
 }
 
+type CompareCommitsInput struct {
+	Repo string
+	Base string
+	Head string
+	CWD  string
+}
+
+type CompareCommitsResult struct {
+	Status string
+}
+
 type GetPullRequestDiffInput struct {
 	Repo     string
 	PRNumber int64
@@ -901,6 +912,25 @@ func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThrea
 		return fmt.Errorf("failed to add review thread reply %s", input.ThreadID)
 	}
 	return nil
+}
+
+// CompareCommits returns the GitHub compare API status between Base and Head
+// (one of "identical", "ahead", "behind", "diverged"). It is used by the
+// fixer to decide whether a previously-pushed fix commit is still reachable
+// from the live PR head.
+func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput) (CompareCommitsResult, error) {
+	if input.Repo == "" || input.Base == "" || input.Head == "" {
+		return CompareCommitsResult{}, fmt.Errorf("compare commits requires repo, base, and head")
+	}
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/compare/%s...%s", input.Repo, input.Base, input.Head))
+	if err != nil {
+		return CompareCommitsResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return CompareCommitsResult{}, err
+	}
+	return CompareCommitsResult{Status: asString(row["status"])}, nil
 }
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
