@@ -925,11 +925,18 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
+	recoveredQueueItems, err := r.recoverLegacyNoopFollowupLoops(ctx, *project, input.Repo, policy, currentUser)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	for _, item := range recoveredQueueItems {
+		appendDiscoveryQueueItem(&result.QueueItems, item)
+	}
 	for _, pr := range openPRs {
 		if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
 			result.Skipped++
@@ -990,9 +997,19 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		result.QueueItems = append(result.QueueItems, queueItem)
+		appendDiscoveryQueueItem(&result.QueueItems, queueItem)
 	}
 	return result, nil
+}
+
+func appendDiscoveryQueueItem(items *[]storage.QueueItemRecord, item storage.QueueItemRecord) {
+	for i, existing := range *items {
+		if existing.ID == item.ID {
+			(*items)[i] = item
+			return
+		}
+	}
+	*items = append(*items, item)
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
@@ -1964,6 +1981,22 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Push != nil && checkpoint.Push.Pushed && hasCommentFixItems(roundFixItems) && !roundEvidenceVerified {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: "resolve-comments refused because verified fix evidence is missing or stale; leaving review threads unresolved", kind: FailureRetryableAfterResume}
+	}
+	if shouldBlockResolveWithoutFix(checkpoint, fixItems, roundEvidenceVerified) && !hasRecoverableThreadEvidence(input.Loop.MetadataJSON, fixItems) {
+		if checkpoint.ResolvedComments == nil {
+			checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
+		}
+		for _, item := range fixItems {
+			if item.Type != "comment" || alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+				continue
+			}
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
+		}
+		if _, err := r.recordFixerFollowupState(ctx, input.Loop, fixerFollowupReasonMissingEvidence, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash, skippedNoEvidenceThreadIDs(fixItems, checkpoint.ResolvedComments.Items), r.now()); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
 	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
@@ -2939,6 +2972,163 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
 }
 
+func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentUser string) ([]storage.QueueItemRecord, error) {
+	loopsList, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	queueItems := make([]storage.QueueItemRecord, 0)
+	seenTargets := make(map[string]struct{})
+	busyTargets := make(map[string]bool)
+	for _, loop := range loopsList {
+		if loop.Type != "fixer" || loop.ProjectID != project.ID || derefString(loop.Repo) != repo || loop.PRNumber == nil {
+			continue
+		}
+		targetKey := buildPullRequestTargetID(repo, *loop.PRNumber)
+		if _, seen := seenTargets[targetKey]; seen {
+			continue
+		}
+		busy, ok := busyTargets[targetKey]
+		if !ok {
+			busy, err = r.legacyRecoveryTargetBusy(ctx, loopsList, project.ID, repo, *loop.PRNumber)
+			if err != nil {
+				return nil, err
+			}
+			busyTargets[targetKey] = busy
+		}
+		if busy {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		if loop.Status == "paused" || loop.Status == "running" {
+			continue
+		}
+		if r.hasActivePRLock(ctx, repo, *loop.PRNumber) {
+			continue
+		}
+		metadata := parseJSONObject(loop.MetadataJSON)
+		if _, ok := parseFixerFollowupState(metadata); ok {
+			continue
+		}
+		legacy, ok := parseLegacyFixerNoopFollowup(loop, metadata, r.now())
+		if !ok {
+			continue
+		}
+		activeQueue, err := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if err != nil {
+			return nil, err
+		}
+		if activeQueue != nil {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		if activeRun, err := r.hasActiveRunningRun(ctx, loop.ID); err != nil {
+			return nil, err
+		} else if activeRun {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
+		if err != nil {
+			return nil, err
+		}
+		if normalizePRState(detail.State) != "open" {
+			seenTargets[targetKey] = struct{}{}
+			if _, err := r.clearFixerFollowupMetadata(ctx, loop); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if (!policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		fixItems := collectFixItems(detail)
+		threadIDs := unresolvedThreadIDs(fixItems)
+		if len(threadIDs) == 0 {
+			seenTargets[targetKey] = struct{}{}
+			if _, err := r.clearFixerFollowupMetadata(ctx, loop); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		liveStateHash := hashFixItemsState(fixItems)
+		liveFixItemsHash := hashFixItems(fixItems)
+		availableAt := r.now()
+		updatedLoop := loop
+		if detail.HeadSHA == legacy.HeadSHA && (legacy.FixItemsStateHash == liveStateHash || legacy.FixItemsStateHash == liveFixItemsHash) {
+			availableAt = legacy.AvailableAt
+			followup := fixerFollowupState{
+				Reason:                 string(fixerFollowupReasonMissingEvidence),
+				HeadSHA:                detail.HeadSHA,
+				FixItemsStateHash:      liveStateHash,
+				UnresolvedThreadIDs:    threadIDs,
+				AttemptsForFingerprint: 1,
+				LastAttemptAt:          legacy.LastAttemptAt,
+				NextEligibleAt:         eventlog.FormatJavaScriptISOString(availableAt.UTC()),
+			}
+			updatedLoop, err = r.persistFixerFollowupState(ctx, loop, followup)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			updatedLoop, err = r.clearFixerFollowupMetadata(ctx, loop)
+			if err != nil {
+				return nil, err
+			}
+		}
+		availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
+		updatedLoop, err = r.updateLoop(ctx, updatedLoop, func(updated *storage.LoopRecord) {
+			updated.Status = "queued"
+			updated.NextRunAt = &availableAtISO
+		})
+		if err != nil {
+			return nil, err
+		}
+		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: updatedLoop.ProjectID, LoopID: updatedLoop.ID, Repo: repo, PRNumber: *updatedLoop.PRNumber, HeadSHA: detail.HeadSHA, FixItemsHash: liveStateHash, AvailableAt: availableAt})
+		if err != nil {
+			return nil, err
+		}
+		seenTargets[targetKey] = struct{}{}
+		queueItems = append(queueItems, queueItem)
+	}
+	return queueItems, nil
+}
+
+func (r *Runner) legacyRecoveryTargetBusy(ctx context.Context, loopsList []storage.LoopRecord, projectID, repo string, prNumber int64) (bool, error) {
+	for _, loop := range loopsList {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		if loop.Status == "paused" || loop.Status == "running" {
+			return true, nil
+		}
+		activeQueue, err := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if activeQueue != nil {
+			return true, nil
+		}
+		activeRun, err := r.hasActiveRunningRun(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if activeRun {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
 	runs, err := r.repos.Runs.ListByLoop(ctx, loopID)
 	if err != nil {
@@ -3061,6 +3251,20 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	return updated, nil
 }
 
+func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, loop := range loops {
+		if loop.Type == "fixer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+			matched := loop
+			return &matched, nil
+		}
+	}
+	return nil, nil
+}
+
 func (r *Runner) clearFixerFollowupStateForPR(ctx context.Context, projectID, repo string, prNumber int64) error {
 	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
 	if err != nil || loop == nil {
@@ -3099,23 +3303,8 @@ func (r *Runner) cancelQueuedFixerItemsForLoop(ctx context.Context, loopID strin
 	return nil
 }
 
-func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {
-	loops, err := r.repos.Loops.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, loop := range loops {
-		if loop.Type == "fixer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
-			matched := loop
-			return &matched, nil
-		}
-	}
-	return nil, nil
-}
-
 func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
-	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
-		updated := loop
+	apply := func(updated *storage.LoopRecord) error {
 		meta := parseJSONObject(updated.MetadataJSON)
 		delete(meta, "fixerFollowup")
 		delete(meta, "lastNoopResolveHeadSha")
@@ -3124,84 +3313,85 @@ func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.Lo
 		delete(meta, "lastNoopResolveAt")
 		encoded, err := json.Marshal(meta)
 		if err != nil {
-			return storage.LoopRecord{}, err
+			return err
 		}
 		metadataJSON := string(encoded)
 		updated.MetadataJSON = &metadataJSON
+		return nil
+	}
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		updated := loop
+		if err := apply(&updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
 		return updated, nil
 	}
-	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
+	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
+}
+
+func (r *Runner) persistFixerFollowupState(ctx context.Context, loop storage.LoopRecord, state fixerFollowupState) (storage.LoopRecord, error) {
+	apply := func(updated *storage.LoopRecord) error {
 		meta := parseJSONObject(updated.MetadataJSON)
-		delete(meta, "fixerFollowup")
-		delete(meta, "lastNoopResolveHeadSha")
-		delete(meta, "lastNoopResolveFixItemsHash")
-		delete(meta, "lastNoopResolveStateHash")
-		delete(meta, "lastNoopResolveAt")
-		encoded, _ := json.Marshal(meta)
+		state.UnresolvedThreadIDs = canonicalizeStringSlice(state.UnresolvedThreadIDs)
+		meta["fixerFollowup"] = state
+		meta["lastNoopResolveHeadSha"] = state.HeadSHA
+		meta["lastNoopResolveFixItemsHash"] = state.FixItemsStateHash
+		meta["lastNoopResolveStateHash"] = state.FixItemsStateHash
+		meta["lastNoopResolveAt"] = state.LastAttemptAt
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
 		metadataJSON := string(encoded)
 		updated.MetadataJSON = &metadataJSON
+		return nil
+	}
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		updated := loop
+		if err := apply(&updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return updated, nil
+	}
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
 	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
 }
 
 func (r *Runner) recordFixerFollowupState(ctx context.Context, loop storage.LoopRecord, reason fixerFollowupReason, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string, now time.Time) (storage.LoopRecord, error) {
-	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
-		updated := loop
-		meta := parseJSONObject(updated.MetadataJSON)
-		previous, ok := parseFixerFollowupState(meta)
-		attempts := 1
-		if ok && !previous.Terminal && previous.HeadSHA == headSHA && previous.FixItemsStateHash == fixItemsStateHash && sameStringSlices(previous.UnresolvedThreadIDs, unresolvedThreadIDs) {
-			attempts = previous.AttemptsForFingerprint + 1
-		}
-		state := fixerFollowupState{Reason: string(reason), HeadSHA: headSHA, FixItemsStateHash: fixItemsStateHash, UnresolvedThreadIDs: canonicalizeStringSlice(unresolvedThreadIDs), AttemptsForFingerprint: attempts, LastAttemptAt: eventlog.FormatJavaScriptISOString(now.UTC())}
-		if attempts > len(fixerFollowupBackoffSchedule) {
-			state.Reason = string(fixerFollowupReasonManualIntervention)
-			state.Terminal = true
-		} else {
-			state.NextEligibleAt = eventlog.FormatJavaScriptISOString(now.Add(fixerFollowupBackoffSchedule[attempts-1]).UTC())
-		}
-		meta["fixerFollowup"] = state
-		meta["lastNoopResolveHeadSha"] = headSHA
-		meta["lastNoopResolveFixItemsHash"] = fixItemsStateHash
-		meta["lastNoopResolveStateHash"] = fixItemsStateHash
-		meta["lastNoopResolveAt"] = state.LastAttemptAt
-		encoded, err := json.Marshal(meta)
-		if err != nil {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		if current, err := r.repos.Loops.GetByID(ctx, loop.ID); err != nil {
 			return storage.LoopRecord{}, err
+		} else if current != nil {
+			loop = *current
 		}
-		metadataJSON := string(encoded)
-		updated.MetadataJSON = &metadataJSON
-		return updated, nil
 	}
-	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		meta := parseJSONObject(updated.MetadataJSON)
-		previous, ok := parseFixerFollowupState(meta)
-		attempts := 1
-		if ok && !previous.Terminal && previous.HeadSHA == headSHA && previous.FixItemsStateHash == fixItemsStateHash && sameStringSlices(previous.UnresolvedThreadIDs, unresolvedThreadIDs) {
-			attempts = previous.AttemptsForFingerprint + 1
-		}
-		state := fixerFollowupState{
-			Reason:                 string(reason),
-			HeadSHA:                headSHA,
-			FixItemsStateHash:      fixItemsStateHash,
-			UnresolvedThreadIDs:    canonicalizeStringSlice(unresolvedThreadIDs),
-			AttemptsForFingerprint: attempts,
-			LastAttemptAt:          eventlog.FormatJavaScriptISOString(now.UTC()),
-		}
-		if attempts > len(fixerFollowupBackoffSchedule) {
-			state.Reason = string(fixerFollowupReasonManualIntervention)
-			state.Terminal = true
-		} else {
-			state.NextEligibleAt = eventlog.FormatJavaScriptISOString(now.Add(fixerFollowupBackoffSchedule[attempts-1]).UTC())
-		}
-		meta["fixerFollowup"] = state
-		meta["lastNoopResolveHeadSha"] = headSHA
-		meta["lastNoopResolveFixItemsHash"] = fixItemsStateHash
-		meta["lastNoopResolveStateHash"] = fixItemsStateHash
-		meta["lastNoopResolveAt"] = state.LastAttemptAt
-		encoded, _ := json.Marshal(meta)
-		metadataJSON := string(encoded)
-		updated.MetadataJSON = &metadataJSON
-	})
+	meta := parseJSONObject(loop.MetadataJSON)
+	previous, ok := parseFixerFollowupState(meta)
+	attempts := 1
+	if ok && !previous.Terminal && previous.HeadSHA == headSHA && previous.FixItemsStateHash == fixItemsStateHash && sameStringSlices(previous.UnresolvedThreadIDs, unresolvedThreadIDs) {
+		attempts = previous.AttemptsForFingerprint + 1
+	}
+	state := fixerFollowupState{Reason: string(reason), HeadSHA: headSHA, FixItemsStateHash: fixItemsStateHash, UnresolvedThreadIDs: canonicalizeStringSlice(unresolvedThreadIDs), AttemptsForFingerprint: attempts, LastAttemptAt: eventlog.FormatJavaScriptISOString(now.UTC())}
+	if attempts > len(fixerFollowupBackoffSchedule) {
+		state.Reason = string(fixerFollowupReasonManualIntervention)
+		state.Terminal = true
+	} else {
+		state.NextEligibleAt = eventlog.FormatJavaScriptISOString(now.Add(fixerFollowupBackoffSchedule[attempts-1]).UTC())
+	}
+	return r.persistFixerFollowupState(ctx, loop, state)
 }
 
 func (r *Runner) mergeLoopMetadata(ctx context.Context, loop storage.LoopRecord, updates map[string]any) (storage.LoopRecord, error) {
@@ -4826,6 +5016,38 @@ func decideRediscoveryAfterNoopResolve(loop storage.LoopRecord, headSHA, fixItem
 	return rediscoveryDecision{Action: rediscoveryActionEnqueue}
 }
 
+type legacyFixerNoopFollowup struct {
+	HeadSHA           string
+	FixItemsStateHash string
+	LastAttemptAt     string
+	AvailableAt       time.Time
+}
+
+func parseLegacyFixerNoopFollowup(loop storage.LoopRecord, metadata map[string]any, now time.Time) (legacyFixerNoopFollowup, bool) {
+	legacyHeadSHA, _ := stringFromAny(metadata["lastNoopResolveHeadSha"])
+	legacyStateHash, _ := stringFromAny(metadata["lastNoopResolveStateHash"])
+	if legacyStateHash == "" {
+		legacyStateHash, _ = stringFromAny(metadata["lastNoopResolveFixItemsHash"])
+	}
+	if legacyHeadSHA == "" || legacyStateHash == "" {
+		return legacyFixerNoopFollowup{}, false
+	}
+	lastAttemptAt, _ := stringFromAny(metadata["lastNoopResolveAt"])
+	if strings.TrimSpace(lastAttemptAt) == "" {
+		lastAttemptAt = loop.UpdatedAt
+	}
+	lastAttempt := parseRFC3339OrZero(lastAttemptAt)
+	if lastAttempt.IsZero() {
+		lastAttempt = now
+		lastAttemptAt = eventlog.FormatJavaScriptISOString(now.UTC())
+	}
+	availableAt := lastAttempt.Add(fixerFollowupBackoffSchedule[0])
+	if !now.Before(availableAt) {
+		availableAt = now
+	}
+	return legacyFixerNoopFollowup{HeadSHA: legacyHeadSHA, FixItemsStateHash: legacyStateHash, LastAttemptAt: lastAttemptAt, AvailableAt: availableAt}, true
+}
+
 func hasRecoverableThreadEvidence(loopMetadataJSON *string, fixItems []FixItem) bool {
 	if len(fixItems) == 0 {
 		return false
@@ -4916,8 +5138,8 @@ func sameStringSlices(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for index := range left {
-		if left[index] != right[index] {
+	for i := range left {
+		if left[i] != right[i] {
 			return false
 		}
 	}

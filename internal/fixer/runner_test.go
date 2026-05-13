@@ -764,6 +764,35 @@ func TestDiscoverPullRequestsDefersRepeatedNoopResolveRediscoveryBeforeCooldown(
 	}
 }
 
+func TestEnqueueMovesExistingDelayedFixerItemEarlierForSameDedupeKey(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	projectID := "project_1"
+	loopID := "loop_1"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	dedupeKey := buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-1", "hash-1")
+	later := eventlog.FormatJavaScriptISOString(fixture.now().Add(5 * time.Minute))
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_1", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: later, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	item, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: projectID, LoopID: loopID, Repo: repo, PRNumber: prNumber, HeadSHA: "head-1", FixItemsHash: "hash-1", AvailableAt: fixture.now()})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	if item.AvailableAt != fixture.nowISO() {
+		t.Fatalf("AvailableAt = %q, want %q", item.AvailableAt, fixture.nowISO())
+	}
+}
+
 func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.T) {
 	t.Parallel()
 
@@ -861,6 +890,164 @@ func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
+	}
+}
+
+func TestDiscoverPullRequestsRecoversLegacyNoopLoopWithoutOpenPRListing(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_recovery", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: nil, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovered legacy queue item", result.QueueItems)
+	}
+	if github.viewIndex != 1 {
+		t.Fatalf("viewIndex = %d, want direct recovery PR view", github.viewIndex)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_recovery")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" || persisted.NextRunAt == nil || *persisted.NextRunAt != fixture.nowISO() {
+		t.Fatalf("persisted = %#v, want immediately queued recovered loop", persisted)
+	}
+	followup, ok := parseFixerFollowupState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parseFixerFollowupState() = false, want migrated follow-up metadata")
+	}
+	if followup.HeadSHA != "head-1" || followup.FixItemsStateHash == "" || !sameStringSlices(followup.UnresolvedThreadIDs, []string{"t1"}) {
+		t.Fatalf("followup = %#v, want migrated live recovery state", followup)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), "loop_fixer_legacy_recovery")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.AvailableAt != fixture.nowISO() {
+		t.Fatalf("activeQueue = %#v, want immediately runnable recovered queue item", activeQueue)
+	}
+}
+
+func TestDiscoverPullRequestsRecoversLegacyNoopLoopAfterCooldownWhenPRListingMissesIt(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	legacyAt := fixture.nowISO()
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_cooldown", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one delayed recovered queue item", result.QueueItems)
+	}
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_cooldown")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.NextRunAt == nil || *persisted.NextRunAt != wantAvailableAt {
+		t.Fatalf("persisted = %#v, want delayed NextRunAt %q", persisted, wantAvailableAt)
+	}
+}
+
+func TestDiscoverPullRequestsRecoverySkipsLegacyNoopLoopWhenPRLocked(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": fixture.nowISO()})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_locked", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	if acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "other-fixer", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	} else if !acquired {
+		t.Fatal("Locks.Acquire() = false, want active competing lock")
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none while PR lock is active", result.QueueItems)
+	}
+	if github.viewIndex != 0 {
+		t.Fatalf("viewIndex = %d, want no recovery PR view while locked", github.viewIndex)
+	}
+}
+
+func TestDiscoverPullRequestsRecoveryClearsLegacyNoopMetadataWhenFingerprintChanged(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "old-head", "lastNoopResolveStateHash": "old-hash", "lastNoopResolveAt": fixture.nowISO()})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_changed", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want immediate recovery queue item", result.QueueItems)
+	}
+	if result.QueueItems[0].AvailableAt != fixture.nowISO() {
+		t.Fatalf("AvailableAt = %q, want immediate requeue at %q", result.QueueItems[0].AvailableAt, fixture.nowISO())
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_changed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup = %#v, want cleared migrated metadata for changed fingerprint", meta["fixerFollowup"])
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("legacy noop metadata still present in %#v", meta)
 	}
 }
 
