@@ -2126,8 +2126,23 @@ func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
 	return out
 }
 
-func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]string {
+// agentResolveReplyExplanationsValid reports whether the agent-provided
+// reply explanations were captured against the same fix-items snapshot
+// represented by the current checkpoint. When the snapshot drifted (e.g.
+// rebase, new comments) the explanations no longer describe the threads
+// we are about to handle and must not be used as resolve authority.
+func agentResolveReplyExplanationsValid(checkpoint fixerCheckpoint) bool {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
+		return false
+	}
+	if checkpoint.Repair.FixItemsHash != "" && checkpoint.FixItemsHash != "" && checkpoint.Repair.FixItemsHash != checkpoint.FixItemsHash {
+		return false
+	}
+	return true
+}
+
+func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]string {
+	if !agentResolveReplyExplanationsValid(checkpoint) {
 		return nil
 	}
 	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
@@ -2148,7 +2163,7 @@ func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]strin
 }
 
 func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]string {
-	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
+	if !agentResolveReplyExplanationsValid(checkpoint) {
 		return nil
 	}
 	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
@@ -2181,6 +2196,9 @@ func hasNonLooperCommentSince(thread ReviewThread, rawSince string) bool {
 		if isLooperReviewThreadComment(comment) {
 			continue
 		}
+		if isBotReviewThreadComment(comment) {
+			continue
+		}
 		return true
 	}
 	return false
@@ -2192,6 +2210,18 @@ func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
 		return false
 	}
 	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
+}
+
+// isBotReviewThreadComment reports whether the comment was authored by a
+// GitHub bot account (e.g. chatgpt-codex-connector[bot], coderabbitai[bot],
+// github-actions[bot]). Bot comments must not be treated as new human
+// reviewer feedback for drift detection.
+func isBotReviewThreadComment(comment ReviewThreadComment) bool {
+	login := strings.ToLower(strings.TrimSpace(comment.Author))
+	if login == "" {
+		return false
+	}
+	return strings.HasSuffix(login, "[bot]")
 }
 
 func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
