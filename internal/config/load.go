@@ -435,6 +435,8 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalReviewerCleanOverrideSet := false
+	canonicalReviewerBlockingOverrideSet := false
+	canonicalReviewerLoopEnabledOverrideSet := false
 	canonicalReviewerEnableSelfReviewOverrideSet := false
 	canonicalFixerAuthorFilterOverrideSet := false
 
@@ -740,6 +742,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-behavior-loop-enabled-by-default: %q is not a boolean", value)
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			canonicalReviewerLoopEnabledOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--reviewer-loop-enabled"):
 			value, nextIndex, err := takeValue(index, "--reviewer-loop-enabled")
@@ -750,7 +753,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
 			}
-			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			if !canonicalReviewerLoopEnabledOverrideSet {
+				ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			}
 			index = nextIndex
 		case matchesFlag(arg, "--roles-reviewer-discovery-triggers-enable-self-review"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-discovery-triggers-enable-self-review")
@@ -783,7 +788,12 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, err
 			}
 			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-blocking") {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+				canonicalReviewerBlockingOverrideSet = true
+			} else if !canonicalReviewerBlockingOverrideSet {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+			}
 			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-quiet-period-seconds", "--reviewer-quiet-period-seconds"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-quiet-period-seconds")

@@ -540,6 +540,46 @@ func TestCanonicalReviewerEnableSelfReviewCLIOverrideWinsOverLegacyAliasRegardle
 	}
 }
 
+func TestCanonicalReviewerBlockingCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"blocking":"COMMENT"}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-blocking=COMMENT",
+		"--reviewer-blocking-review-event=REQUEST_CHANGES",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventComment {
+		t.Fatalf("blocking review event with canonical then legacy flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-blocking-review-event=REQUEST_CHANGES",
+		"--roles-reviewer-behavior-review-events-blocking=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventComment {
+		t.Fatalf("blocking review event with legacy then canonical flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestCanonicalReviewerLoopEnabledCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"loop":{"enabledByDefault":true}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--reviewer-loop-enabled=true",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.Loop.EnabledByDefault; got {
+		t.Fatalf("loop enabled with canonical then legacy flags = %v, want false", got)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-loop-enabled=true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.Loop.EnabledByDefault; got {
+		t.Fatalf("loop enabled with legacy then canonical flags = %v, want false", got)
+	}
+}
+
 func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
 	testCases := []struct {
 		name         string
