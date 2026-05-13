@@ -442,8 +442,9 @@ type ProcessResult struct {
 type fixerFollowupReason string
 
 const (
-	fixerFollowupReasonMissingEvidence    fixerFollowupReason = "missing_evidence"
-	fixerFollowupReasonManualIntervention fixerFollowupReason = "manual_intervention"
+	fixerFollowupReasonMissingEvidence     fixerFollowupReason = "missing_evidence"
+	fixerFollowupReasonMissingConfirmation fixerFollowupReason = "missing_confirmation"
+	fixerFollowupReasonManualIntervention  fixerFollowupReason = "manual_intervention"
 )
 
 var fixerFollowupBackoffSchedule = []time.Duration{
@@ -692,11 +693,12 @@ const maxReplyExplanationLength = 500
 
 // parseReplyExplanations extracts the optional review_thread_replies array from
 // the final __LOOPER_RESULT__ JSON line. Failure to parse is not an error: the
-// runner falls back to the generic reply body. Entries are filtered against the
-// current fixItems snapshot (keyed by fixItemId, with a defensive threadId
-// cross-check), deduplicated keeping the first valid occurrence, and truncated.
-// Disclosure markers, @mentions, and HTML tags are stripped so the adapter
-// remains the only path that stamps and templates the reply.
+// runner simply treats the affected threads as lacking agent confirmation for
+// auto-reply/resolve. Entries are filtered against the current fixItems snapshot
+// (keyed by fixItemId, with a defensive threadId cross-check), deduplicated
+// keeping the first valid occurrence, and truncated. Disclosure markers,
+// @mentions, and HTML tags are stripped so the adapter remains the only path
+// that stamps and templates the reply.
 func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyExplanationEntry {
 	combined := stdout + "\n" + stderr
 	if strings.TrimSpace(combined) == "" {
@@ -1991,13 +1993,19 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
 			continue
 		}
+		if strings.TrimSpace(threadEvidence.Explanation) == "" {
+			threadEvidence.ResolveState = "skipped_no_confirmation"
+			threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
+			if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
+				return checkpoint, err
+			}
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_confirmation", Message: "No agent confirmation was captured for this thread", UpdatedAt: r.nowISO()})
+			continue
+		}
 		commitSHA := firstNonEmpty(threadEvidence.CommitSHA, lastNonEmptyString(threadEvidence.CommitSHAs, threadEvidence.EvidenceHeadSHA))
 		explanation := threadEvidence.Explanation
 		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanation, checkpoint.ResolvedComments.Items)
 		threadEvidence.ReplyState = replyState
-		if replyState == "sent" && strings.TrimSpace(threadEvidence.Explanation) == "" {
-			threadEvidence.Explanation = explanation
-		}
 		threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
 		if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
 			return checkpoint, err
@@ -2065,9 +2073,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, lastNonEmptyString(roundEvidenceCommitSHAs(roundEvidence), ""), buildThreadResolveReplyExplanations(threadStore, fixItems))
 	}
 	if failedCount == 0 {
-		skippedThreadIDs := skippedNoEvidenceThreadIDs(fixItems, checkpoint.ResolvedComments.Items)
+		skippedThreadIDs, followupReason := skippedFollowupThreadIDs(fixItems, checkpoint.ResolvedComments.Items)
 		if len(skippedThreadIDs) > 0 {
-			if _, err := r.recordFixerFollowupState(ctx, input.Loop, fixerFollowupReasonMissingEvidence, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash, skippedThreadIDs, r.now()); err != nil {
+			if _, err := r.recordFixerFollowupState(ctx, input.Loop, followupReason, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash, skippedThreadIDs, r.now()); err != nil {
 				return checkpoint, err
 			}
 		} else if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
@@ -2160,8 +2168,8 @@ func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput
 // explanation, but only when the explanations were captured against the same
 // fix-items snapshot represented by the current checkpoint. If the snapshot
 // changed (e.g. PR rebased, new comments arrived), the agent's explanations no
-// longer describe the threads we are about to reply to and we fall back to the
-// generic body.
+// longer describe the threads we are about to handle, so they do not count as
+// durable confirmation for auto-reply/resolve.
 func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
 		return nil
@@ -3770,7 +3778,8 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		`  - "fixItemId": the exact "id" of the fix item you addressed`,
 		`  - "threadId": the exact "threadId" of the same fix item`,
 		`  - "explanation": one or two sentences (max ~500 chars) describing what you changed and, when relevant, which file(s) or test(s) cover it. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		"Looper posts the reply itself; do not call any GitHub API or invent URLs. Omit `review_thread_replies` (or any individual entry) if you cannot truthfully describe the fix for that item.",
+		"Before including an entry, re-read the relevant review thread/comment context and only include items you can confidently confirm are actually addressed by the current branch state. If anything is ambiguous, partially fixed, or still pending, omit that entry.",
+		"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",
 	}, "\n")
 }
 
@@ -3880,8 +3889,9 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	return false
 }
 
-func skippedNoEvidenceThreadIDs(fixItems []FixItem, resolvedComments []checkpointResolvedComment) []string {
+func skippedFollowupThreadIDs(fixItems []FixItem, resolvedComments []checkpointResolvedComment) ([]string, fixerFollowupReason) {
 	threadIDs := make([]string, 0)
+	reason := fixerFollowupReason("")
 	for _, item := range fixItems {
 		if item.Type != "comment" {
 			continue
@@ -3891,14 +3901,23 @@ func skippedNoEvidenceThreadIDs(fixItems []FixItem, resolvedComments []checkpoin
 			if resolved.FixItemID != item.ID && (resolved.ThreadID == "" || resolved.ThreadID != item.ThreadID) {
 				continue
 			}
-			matched = resolved.Status == "skipped_no_evidence"
+			switch resolved.Status {
+			case "skipped_no_evidence":
+				matched = true
+				reason = fixerFollowupReasonMissingEvidence
+			case "skipped_no_confirmation":
+				matched = true
+				if reason == "" {
+					reason = fixerFollowupReasonMissingConfirmation
+				}
+			}
 			break
 		}
 		if matched {
 			threadIDs = append(threadIDs, item.ThreadID)
 		}
 	}
-	return canonicalizeStringSlice(threadIDs)
+	return canonicalizeStringSlice(threadIDs), reason
 }
 
 func resolveCommentCommitSHA(checkpoint fixerCheckpoint, evidence *fixEvidence, verifiedEvidence bool) string {
@@ -4825,6 +4844,9 @@ func hasRecoverableThreadEvidence(loopMetadataJSON *string, fixItems []FixItem) 
 				continue
 			}
 			if !entry.ProducedNewCommits || strings.TrimSpace(entry.EvidenceHeadSHA) == "" || strings.TrimSpace(entry.ValidationHeadSHA) == "" {
+				continue
+			}
+			if strings.TrimSpace(entry.Explanation) == "" {
 				continue
 			}
 			if entry.ResolveState == "resolved" || entry.ResolveState == "already_resolved" {

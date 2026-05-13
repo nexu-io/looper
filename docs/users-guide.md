@@ -166,7 +166,7 @@ Fixer will:
 - create a worktree and apply fixes
 - run validation
 - push back to the same PR branch
-- try to resolve handled review threads
+- after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
