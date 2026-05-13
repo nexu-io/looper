@@ -446,6 +446,39 @@ func TestShouldBreakAutoUpgradeLockBreaksWhenProcessStartTimeChanges(t *testing.
 	}
 }
 
+func TestShouldBreakAutoUpgradeLockBreaksLegacyPIDLockForDifferentProcess(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	lockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatalf("WriteFile(lockPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir, RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+		_ = ctx
+		_ = timeout
+		if command != "ps" {
+			t.Fatalf("RunCommand command = %q, want ps", command)
+		}
+		switch strings.Join(args, " ") {
+		case fmt.Sprintf("-p %d -o command=", os.Getpid()):
+			return commandExecutionResult{Stdout: "/usr/bin/vim /tmp/note.txt\n", ExitCode: 0}, nil
+		case fmt.Sprintf("-p %d -o etime=", os.Getpid()):
+			return commandExecutionResult{Stdout: "0:10\n", ExitCode: 0}, nil
+		default:
+			t.Fatalf("RunCommand args = %q, want ps query for command or elapsed time", strings.Join(args, " "))
+			return commandExecutionResult{}, nil
+		}
+	}}), nil)
+	if !runtime.shouldBreakAutoUpgradeLock(lockPath) {
+		t.Fatal("shouldBreakAutoUpgradeLock() = false, want true")
+	}
+}
+
 func TestParsePSElapsedSeconds(t *testing.T) {
 	t.Parallel()
 

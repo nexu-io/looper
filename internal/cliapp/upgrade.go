@@ -433,6 +433,13 @@ func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
 	if !r.isProcessAlive(lock.PID) {
 		return true
 	}
+	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
+	if err != nil {
+		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
+	}
+	if !r.isBackgroundAutoUpgradeProcess(process) {
+		return true
+	}
 	if lock.Executable == "" || lock.Command == "" || lock.ObservedAt == "" {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
@@ -440,11 +447,7 @@ func (r *commandRuntime) shouldBreakAutoUpgradeLock(path string) bool {
 	if err != nil {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
-	process, err := r.readAutoUpgradeLockProcess(context.Background(), lock.PID)
-	if err != nil {
-		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
-	}
-	if process.Executable == "" || process.Command == "" || process.ElapsedSeconds < 0 {
+	if process.ElapsedSeconds < 0 {
 		return time.Since(info.ModTime()) >= autoUpgradeBusyRetryDelay
 	}
 	if process.Executable != lock.Executable || process.Command != lock.Command {
@@ -503,6 +506,30 @@ func (r *commandRuntime) readAutoUpgradeLockProcess(ctx context.Context, pid int
 		return autoUpgradeLockProcessState{}, nil
 	}
 	return autoUpgradeLockProcessState{Executable: filepath.Base(tokens[0]), Command: command, ElapsedSeconds: elapsedSeconds}, nil
+}
+
+func (r *commandRuntime) isBackgroundAutoUpgradeProcess(process autoUpgradeLockProcessState) bool {
+	if process.Executable == "" || process.Command == "" {
+		return false
+	}
+	if process.Executable != r.autoUpgradeLockExecutable() {
+		return false
+	}
+	tokens := splitProcessCommand(process.Command)
+	if len(tokens) < 3 {
+		return false
+	}
+	hasUpgrade := false
+	hasBackgroundAuto := false
+	for _, token := range tokens[1:] {
+		switch token {
+		case "upgrade":
+			hasUpgrade = true
+		case "--background-auto":
+			hasBackgroundAuto = true
+		}
+	}
+	return hasUpgrade && hasBackgroundAuto
 }
 
 func (r *commandRuntime) readProcessElapsedSeconds(ctx context.Context, pid int) (int, error) {
@@ -610,7 +637,7 @@ func (r *commandRuntime) shouldClearAutoUpgradeInFlight(ctx context.Context, sta
 	if err != nil || result.ExitCode != 0 {
 		return false
 	}
-	return !strings.Contains(result.Stdout, "--background-auto")
+	return !r.isBackgroundAutoUpgradeProcess(autoUpgradeLockProcessState{Executable: r.autoUpgradeLockExecutable(), Command: result.Stdout})
 }
 
 func (r *commandRuntime) clearAutoUpgradeReadyState(ctx context.Context) error {
