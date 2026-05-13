@@ -100,6 +100,7 @@ jobs:
               - 'internal/fixer/**'
               - 'internal/reviewer/**'
               - 'internal/api/**'
+              - 'internal/infra/git/**'
               - 'internal/worktree*/**'
               - 'internal/e2e/invariant_worktree_test.go'
 
