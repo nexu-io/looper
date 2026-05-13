@@ -17,15 +17,29 @@ jobs:
       SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
 
     steps:
+      - name: Resolve sandbox repository target
+        id: sandbox-repo
+        shell: bash
+        run: |
+          repo="${SANDBOX_REPO}"
+          owner="${repo%%/*}"
+          name="${repo#*/}"
+          if [ -z "$owner" ] || [ -z "$name" ] || [ "$owner" = "$repo" ]; then
+            printf 'SANDBOX_REPO must use owner/repo format, got %s\n' "$repo" >&2
+            exit 1
+          fi
+          printf 'owner=%s\n' "$owner" >> "$GITHUB_OUTPUT"
+          printf 'repo=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
       - name: Mint sandbox GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
           private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
-          owner: nexu-io
+          owner: ${{ steps.sandbox-repo.outputs.owner }}
           repositories: |
-            looper-sandbox
+            ${{ steps.sandbox-repo.outputs.repo }}
 
       - name: Close stale sandbox issues and pull requests
         env:
