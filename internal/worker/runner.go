@@ -1601,7 +1601,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if err != nil {
 			var loopErr *loopError
 			if errors.As(err, &loopErr) {
-				if loopErr.kind != FailureManualIntervention && input.Loop.PRNumber != nil {
+				if input.Loop.PRNumber != nil {
 					loopErr = nil
 				} else {
 					if loopErr.kind == FailureManualIntervention {
@@ -2797,6 +2797,8 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	if r.github == nil || state == nil || state.Actions.PR != lifecycle.ActionSourceAgent || state.PRNumber <= 0 {
 		return checkpointPullPR{}, "", false, nil
 	}
+	expectedBranch = strings.TrimSpace(expectedBranch)
+	expectedBaseBranch = strings.TrimSpace(expectedBaseBranch)
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
 	if err != nil {
 		return checkpointPullPR{}, "", false, err
@@ -2805,27 +2807,38 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	headBranch := strings.TrimSpace(detail.HeadRefName)
 	baseBranch := strings.TrimSpace(detail.BaseRefName)
 	agentBranch := firstNonEmpty(state.AgentBranch, headBranch)
-	migratedBranch := strings.TrimSpace(expectedBranch) != "" && headBranch != "" && !strings.EqualFold(headBranch, strings.TrimSpace(expectedBranch))
+	migratedBranch := expectedBranch != "" && headBranch != "" && !strings.EqualFold(headBranch, expectedBranch)
 	reject := func(reason string) (checkpointPullPR, string, bool, error) {
 		message := fmt.Sprintf("Agent created PR #%d on branch %s but worker could not adopt it: %s", prNumber, firstNonEmpty(headBranch, agentBranch, "unknown"), reason)
 		return checkpointPullPR{}, "", false, &loopError{message: message, kind: FailureManualIntervention}
 	}
+	if !migratedBranch {
+		if prState := strings.TrimSpace(detail.State); prState != "" && !strings.EqualFold(prState, "open") {
+			return checkpointPullPR{}, "", false, nil
+		}
+		if expectedBaseBranch != "" {
+			if reportedBase := strings.TrimSpace(state.AgentBaseBranch); reportedBase != "" && !strings.EqualFold(reportedBase, expectedBaseBranch) {
+				return checkpointPullPR{}, "", false, nil
+			}
+			if baseBranch != "" && !strings.EqualFold(baseBranch, expectedBaseBranch) {
+				return checkpointPullPR{}, "", false, nil
+			}
+		}
+		return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL))}, firstNonEmpty(headBranch, expectedBranch), true, nil
+	}
 	if prState := strings.TrimSpace(detail.State); prState != "" && !strings.EqualFold(prState, "open") {
 		return reject(fmt.Sprintf("PR is %s", prState))
 	}
-	if expectedBranch = strings.TrimSpace(expectedBranch); migratedBranch && agentBranch != "" && strings.EqualFold(agentBranch, expectedBranch) && headBranch != "" && !strings.EqualFold(headBranch, expectedBranch) {
+	if agentBranch != "" && strings.EqualFold(agentBranch, expectedBranch) && headBranch != "" && !strings.EqualFold(headBranch, expectedBranch) {
 		return reject(fmt.Sprintf("expected head branch %s, got %s", expectedBranch, firstNonEmpty(headBranch, "unknown")))
 	}
-	if expectedBaseBranch = strings.TrimSpace(expectedBaseBranch); expectedBaseBranch != "" {
+	if expectedBaseBranch != "" {
 		if reportedBase := strings.TrimSpace(state.AgentBaseBranch); reportedBase != "" && !strings.EqualFold(reportedBase, expectedBaseBranch) {
 			return reject(fmt.Sprintf("expected base %s, got %s", expectedBaseBranch, reportedBase))
 		}
 		if baseBranch != "" && !strings.EqualFold(baseBranch, expectedBaseBranch) {
 			return reject(fmt.Sprintf("expected base %s, got %s", expectedBaseBranch, firstNonEmpty(baseBranch, "unknown")))
 		}
-	}
-	if !migratedBranch {
-		return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL))}, firstNonEmpty(headBranch, expectedBranch), true, nil
 	}
 	if len(state.CommitSHAs) == 0 {
 		return reject("missing lifecycle commit evidence")
