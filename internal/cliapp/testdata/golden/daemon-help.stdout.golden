@@ -40,8 +40,8 @@ Global Flags:
   --roles-reviewer-behavior-loop-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering
   --roles-reviewer-behavior-loop-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
   --roles-reviewer-behavior-loop-quiet-period-seconds <seconds> Reviewer loop quiet period
-  --roles-reviewer-behavior-review-events-blocking <event> Reviewer event for blocking findings: COMMENT, APPROVE, or REQUEST_CHANGES
-  --roles-reviewer-behavior-review-events-clean <event> Reviewer event for clean runs: COMMENT, APPROVE, or REQUEST_CHANGES
+  --roles-reviewer-behavior-review-events-blocking <event> Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES
+  --roles-reviewer-behavior-review-events-clean <event> Reviewer event for clean runs: COMMENT or APPROVE
   --roles-reviewer-discovery-triggers-enable-self-review <bool> Allow reviewer triggers to process self-authored pull requests
   --worker-agent-timeout-seconds <seconds> Worker agent execution timeout
 
