@@ -64,12 +64,12 @@ var configFieldRegistry = map[string]configField{
 	"roles.worker.triggers.requireAssigneeCurrentUser": boolField("roles.worker.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Worker.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialWorkerTriggers(p).RequireAssigneeCurrentUser
 	}),
-	"roles.reviewer.discovery.autoDiscovery": reviewerDiscoveryBoolField("roles.reviewer.discovery.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
+	"roles.reviewer.discovery.autoDiscovery": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.autoDiscovery", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleDiscovery(p).AutoDiscovery
 	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRole(p).AutoDiscovery
 	}),
-	"roles.reviewer.autoDiscovery": reviewerDiscoveryBoolField("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
+	"roles.reviewer.autoDiscovery": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleDiscovery(p).AutoDiscovery
 	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRole(p).AutoDiscovery
@@ -519,7 +519,11 @@ func stringField(key, env, flag string, get func(config.Config) any, target func
 }
 
 func reviewerDiscoveryBoolField(key, env, flag string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **bool, legacyTarget func(*config.PartialConfig) **bool) configField {
-	return configField{key: key, valueType: "boolean", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+	return reviewerDiscoveryBoolFieldWithAlias(key, env, "", flag, "", get, canonicalTarget, legacyTarget)
+}
+
+func reviewerDiscoveryBoolFieldWithAlias(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **bool, legacyTarget func(*config.PartialConfig) **bool) configField {
+	return configField{key: key, valueType: "boolean", env: env, envAlias: envAlias, flag: flag, flagAlias: flagAlias, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value, err := parseConfigBool(raw)
 		if err != nil {
 			return fmt.Errorf("invalid value for %s: %q is not a boolean (use true or false)", key, raw)

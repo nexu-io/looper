@@ -2066,6 +2066,30 @@ func TestLoadFileLegacyDefaultConfigJSONEmitsMigrationNote(t *testing.T) {
 	})
 }
 
+func TestLoadFileIgnoresConfigLoadNoticeHomeResolutionErrors(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	original := defaultLooperHomeForNotices
+	defaultLooperHomeForNotices = func() (string, error) {
+		return "", fmt.Errorf("home unavailable")
+	}
+	defer func() {
+		defaultLooperHomeForNotices = original
+	}()
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got, want := loaded.Config.Server.Port, 7400; got != want {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", got, want)
+	}
+	assertNoticesEqual(t, loaded.Notices, nil)
+}
+
 func TestLoadFileDoesNotEmitMigrationNoteForNonLegacyDefaultJSON(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

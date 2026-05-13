@@ -1581,6 +1581,26 @@ func TestConfigShowSourceDetectsCanonicalReviewerBehaviorOverrides(t *testing.T)
 	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "cli")
 }
 
+func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{"autoDiscovery": false},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "true")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.autoDiscovery", "env")
+}
+
 func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
 	t.Parallel()
 
@@ -1819,6 +1839,15 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "warning: --roles-reviewer-behavior-review-events-clean is set") {
 		t.Fatalf("stderr = %q, want canonical flag override warning", stderr)
+	}
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "true")
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.discovery.autoDiscovery", "false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.discovery.autoDiscovery with env override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY is set") {
+		t.Fatalf("stderr = %q, want canonical reviewer discovery env override warning", stderr)
 	}
 }
 

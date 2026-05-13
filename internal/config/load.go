@@ -18,6 +18,8 @@ var supportedDefaultConfigNames = []string{"config.toml", "config.yaml", "config
 
 var supportedConfigSuffixes = []string{".toml", ".yaml", ".yml", ".json"}
 
+var defaultLooperHomeForNotices = DefaultLooperHome
+
 type EnvLookupFunc func(string) (string, bool)
 
 type LoadFileMetadata struct {
@@ -151,9 +153,9 @@ func collectConfigLoadNotices(resolvedConfigPath string, present bool) ([]string
 	if !present {
 		return nil, nil
 	}
-	looperHome, err := DefaultLooperHome()
+	looperHome, err := defaultLooperHomeForNotices()
 	if err != nil {
-		return nil, err
+		return nil, nil
 	}
 	legacyDefaultPath := filepath.Join(looperHome, "config.json")
 	canonicalDefaultPath := filepath.Join(looperHome, "config.toml")
