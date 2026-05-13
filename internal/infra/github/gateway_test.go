@@ -1088,6 +1088,28 @@ func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	}
 }
 
+func TestGatewayGetCurrentUserLoginReturnsEmptyForIntegrationTokens(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api user --jq .login" {
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	login, err := gateway.GetCurrentUserLogin(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+	}
+	if login != "" {
+		t.Fatalf("GetCurrentUserLogin() = %q, want empty login for integration token", login)
+	}
+}
+
 func TestGatewayIsAuthenticatedScopesStatusToHostname(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

@@ -22,7 +22,50 @@ env:
   LOOPER_BUILD_MIN_DAEMON_FOR_CLI: "0.2.0"
 
 jobs:
+  sandbox-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOOPER_E2E_GITHUB: "1"
+      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/release-sandbox-preflight
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Mint sandbox GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+          owner: nexu-io
+          repositories: |
+            looper-sandbox
+
+      - name: Run GitHub sandbox preflight E2E
+        env:
+          LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+
+      - name: Upload sandbox preflight artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sandbox-preflight-artifacts
+          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          if-no-files-found: ignore
+
   prepare-go-release:
+    needs: sandbox-preflight
     runs-on: ubuntu-latest
 
     outputs:
@@ -140,6 +183,7 @@ jobs:
 
   build-looper:
     needs:
+      - sandbox-preflight
       - prepare-go-release
       - create-draft-release
     strategy:
@@ -220,6 +264,7 @@ jobs:
 
   build-looperd:
     needs:
+      - sandbox-preflight
       - prepare-go-release
       - create-draft-release
     strategy:

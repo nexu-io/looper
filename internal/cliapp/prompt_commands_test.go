@@ -132,6 +132,8 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"PR handoff contract: Looper provides a minimal PR seed by default",
+		"Local checkout contract: when Looper starts a reviewer agent in a prepared worktree, treat that working directory as the canonical local checkout.",
+		"Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
 		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",

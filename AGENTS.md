@@ -35,3 +35,6 @@
 - Report every issue found. Do not prioritize, triage, or omit.
 - Continue reviewing after finding issues. Early termination is a defect.
 - Review systematically across correctness, performance, maintainability, and style.
+- Treat missing regression coverage for a P0/P1 bug fix as a review blocker.
+- For cross-component lifecycle, worktree, GitHub command, daemon boot, and resolve-comments regressions, prefer contract/invariant integration coverage over unit-only tests.
+- Escalate only real GitHub auth, scope, thread mutation, or rate-limit regressions to sandbox E2E.

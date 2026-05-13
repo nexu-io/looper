@@ -105,15 +105,6 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 
 	toolDetection := DetectToolPaths(config.Tools, options.LookPath)
 	config.Tools = toolDetection.Paths
-	if err := validateConfiguredToolPath(config.Tools.GitPath, "tools.gitPath"); err != nil {
-		return LoadedFileConfig{}, err
-	}
-	if err := validateConfiguredToolPath(config.Tools.GHPath, "tools.ghPath"); err != nil {
-		return LoadedFileConfig{}, err
-	}
-	if err := validateConfiguredToolPath(config.Tools.OsascriptPath, "tools.osascriptPath"); err != nil {
-		return LoadedFileConfig{}, err
-	}
 	if config.Notifications.Osascript.Enabled && isNilOrEmptyString(config.Tools.OsascriptPath) {
 		return LoadedFileConfig{}, &ConfigValidationError{Issues: []ValidationIssue{{
 			Path:    "tools.osascriptPath",

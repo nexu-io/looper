@@ -270,19 +270,14 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				short:           "Loop commands",
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
 				helpWhenNoArgs:  true,
-				persistentFlags: []flagSpec{
-					stringFlag("id", "id", "Loop id"),
-					stringFlag("type", "type", "Loop type"),
-					stringFlag("pr", "repo#number", "Pull request reference"),
-				},
 				exampleLines: []string{
 					"$ looper loop list",
 					"$ looper loop start --type reviewer --pr acme/looper#42",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List loops", runE: runtime.loopList}),
-					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
-					newCommand(commandSpec{use: "pause", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause}),
+					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
+					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
 				},
 			}),
 			newCommand(commandSpec{

@@ -29,7 +29,7 @@ real sandbox E2E（真实 GitHub sandbox）
 1. 明确 Looper 的三层测试职责：unit、contract/invariant integration、sandbox E2E。
 2. 用少量高价值 integration / E2E 覆盖 Looper 的核心安全不变量。
 3. 在 PR CI 中快速发现：daemon 无法启动、真实 `gh` 命令不兼容、agent 写入用户 cwd、worktree 缺失等致命问题。
-4. 为 GitHub mutation 和 comment resolution 建立可选的 sandbox E2E，供 main/nightly/release 前运行。
+4. 为 GitHub mutation 和 comment resolution 建立可选的 sandbox E2E，供 main/release/手动触发前运行。
 5. 让每个 P0/P1 regression fix 都能留下可复现的失败用例。
 6. 避免把 E2E 做成庞大、慢、不稳定的全流程系统测试。
 
@@ -433,7 +433,10 @@ sandbox 要求：
 - Phase 3 已落地并通过：fixture-driven gh schema（含 `issue list` / `pr list` / `pr view` allowlist）、unsupported `--json` failure、`gh api`/GraphQL contract、repo form coverage、反向字段契约、PR #261 detail fallback、opt-in real-gh smoke 已实现；并已将 `internal/infra/github/**` 映射到 gh contract E2E job。
 - Phase 4 已部分落地并通过：已覆盖 fresh schedule worktree isolation、cwd evidence、user repo unchanged、isolated commit、worker reuse / active loop、bad checkpoint safe reject、fixer isolation 等价路径；仅剩 worktree restore 路径待补充或澄清产品语义。
 - Phase 5 已落地：fake-gh 已支持基于 bare origin 的 PR head、thread state 持久化、resolve/unresolve mutation、closed/open target state、no-push rerun 所需状态种子；并已覆盖 stale-head-after-push、no-push-rerun-stale-head、no-new-commit-unresolved、closed-PR skip、resumed-closed-target、worker no-diff/no-PR 场景。
-- Phase 6 已基本落地：PR 默认 `Contract/invariant integration smoke` 已接入；高风险路径使用 centralized changed-files path filter 路由到 daemon boot / gh contract / resolve-comments / worktree E2E；`go.mod` / `go.sum` 与 path-filter 失败会 fallback 全跑；E2E job 已统一 `-count=1`、超时与失败 artifact 上传（含 temp HOME、config、sqlite DB、looperd logs、fake gh invocation log、fake agent cwd evidence、bare origin refs、worktree list）。main/nightly/release + sandbox 编排仍待 Phase 7 衔接。
+- Phase 6 已落地：PR 默认 `Contract/invariant integration smoke` 已接入；高风险路径使用 centralized changed-files path filter 路由到 daemon boot / gh contract / resolve-comments / worktree E2E；`go.mod` / `go.sum` 与 path-filter 失败会 fallback 全跑；E2E job 已统一 `-count=1`、超时与失败 artifact 上传（含 temp HOME、config、sqlite DB、looperd logs、fake gh invocation log、fake agent cwd evidence、bare origin refs、worktree list）；main/release 现已衔接 sandbox workflow。
+- Phase 7 已落地：已创建 `nexu-io/looper-sandbox`；新增 `LOOPER_E2E_GITHUB=1` / `LOOPER_E2E_SANDBOX_REPO` / `LOOPER_E2E_GITHUB_TOKEN` 运行约定，并在 CI 侧改用 GitHub App（`LOOPER_E2E_GITHUB_APP_ID` repo var + `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY` secret）通过 `actions/create-github-app-token@v3` 按需铸造 repo-scoped 短期 token；新增真实 GitHub sandbox E2E（issue→worker→PR、PR review thread→fixer resolve、worker no-diff、fixer no-new-commit）；新增 `sandbox-e2e.yml`（main + manual）、release preflight 与 24h cleanup workflow；测试命令新增 rate-limit/retry backoff；本地与 CI 均采用 non-interactive git/auth 路径，真实 sandbox suite 已通过。
+- Phase 8 已落地：PR template、code review checklist、review blocker policy、历史回归映射与 regression coverage tracking 均已补齐。
+- Phase 10 已落地：`go test ./internal/e2e -count=1`、`go test ./internal/e2e/githubcontract -count=1`、`go test ./...`、`go vet ./...`、`go build ./...` 已验证通过；daemon boot smoke、worktree bad-checkpoint regression、unsupported-field gh contract、agent malformed/no-marker parsing、CI path-filter fallback 均已手动验证。
 
 ### Phase 1：Integration harness skeleton
 
@@ -457,11 +460,11 @@ sandbox 要求：
 
 ### Phase 6：CI path filter
 
-把高风险路径变更映射到对应 E2E job，并配置 artifact 上传与 fallback 全跑；当前已落地 PR smoke、centralized path filter、`go.mod`/`go.sum` 全跑、失败 artifacts，剩余是 main/nightly/release + sandbox 编排。
+把高风险路径变更映射到对应 E2E job，并配置 artifact 上传与 fallback 全跑；当前已落地 PR smoke、centralized path filter、`go.mod`/`go.sum` 全跑、失败 artifacts，以及 main/release + sandbox 编排。
 
 ### Phase 7：GitHub sandbox E2E
 
-建立真实 GitHub mutation 的 nightly/release 测试与 cleanup workflow。
+建立真实 GitHub mutation 的 main/release 测试与 cleanup workflow；当前已接入 main/manual sandbox workflow、release preflight、24h cleanup workflow，并补上真实 GitHub worker/fixer/no-diff 场景、GitHub App token、non-interactive git/auth 配置与 rate-limit/retry backoff，真实 sandbox suite 已验证通过。
 
 ---
 
@@ -485,4 +488,4 @@ Stretch：增加一条 resolve-comments stale-head-after-push，使用 temp bare
 3. `looperd` 启动失败无法通过 PR smoke。
 4. 最近 resolve-comments P0/P1 回归都有固定 scenario test。
 5. 默认 PR integration smoke 耗时稳定在约 60 秒，path-filter integration 稳定在 1-2 分钟内。
-6. Nightly sandbox E2E 失败时能直接定位到 GitHub mutation、thread resolution 或 auth/scope 问题。
+6. Main/release sandbox E2E 失败时能直接定位到 GitHub mutation、thread resolution 或 auth/scope 问题。

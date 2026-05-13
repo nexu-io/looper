@@ -189,42 +189,43 @@
 - [x] 确保 sandbox 不进入普通 PR 必跑链路
 - [x] 普通 PR 跑 unit tests + small integration smoke
 - [x] 高风险路径 PR 跑 unit tests + targeted integration tests
-- [ ] main/nightly/release 跑 unit tests + integration tests + sandbox E2E
+- [x] main/release 跑 unit tests + integration tests + sandbox E2E
 
 ## Phase 7 - GitHub sandbox E2E
 
-- [ ] 创建或指定 sandbox repo，例如 `nexu-io/looper-sandbox`
-- [ ] 配置 `LOOPER_E2E_GITHUB=1` env gate
-- [ ] 配置 `LOOPER_E2E_SANDBOX_REPO` secret/env
-- [ ] 配置 `LOOPER_E2E_GITHUB_TOKEN` secret
-- [ ] token 使用 GitHub App 或 fine-grained PAT，不使用 maintainer 个人 token
-- [ ] token 限制到 sandbox repo
-- [ ] token 最小权限包含 metadata read
-- [ ] token 最小权限包含 issues read/write
-- [ ] token 最小权限包含 pull requests read/write
-- [ ] token 最小权限包含 contents read/write
-- [ ] 定义 sandbox 测试标题/label/branch 前缀：`looper-e2e:<run-id>`
-- [ ] 实现测试资源清理逻辑
-- [ ] 实现超过 24h 资源 cleanup scheduled workflow
-- [ ] 添加 issue 创建与 worker trigger sandbox test
-- [ ] 添加 PR review comment 创建与 fixer resolve sandbox test
-- [ ] 添加 no-diff / no-new-commit sandbox test
-- [ ] 添加 auth/scope 缺失时的清晰 skip/fail 规则
-- [ ] 添加 rate limit / retry 策略
-- [ ] sandbox 失败时输出 issue/PR/branch URL
-- [ ] 接入 nightly workflow
-- [ ] 接入 release preflight workflow
+- [x] 创建或指定 sandbox repo，例如 `nexu-io/looper-sandbox`
+- [x] 配置 `LOOPER_E2E_GITHUB=1` env gate
+- [x] 配置 `LOOPER_E2E_SANDBOX_REPO` secret/env
+- [x] 配置 `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY` secret
+- [x] 配置 `LOOPER_E2E_GITHUB_APP_ID` repo var
+- [x] token 使用 GitHub App 或 fine-grained PAT，不使用 maintainer 个人 token
+- [x] token 限制到 sandbox repo
+- [x] token 最小权限包含 metadata read
+- [x] token 最小权限包含 issues read/write
+- [x] token 最小权限包含 pull requests read/write
+- [x] token 最小权限包含 contents read/write
+- [x] 定义 sandbox 测试标题/label/branch 前缀：`looper-e2e:<run-id>`
+- [x] 实现测试资源清理逻辑
+- [x] 实现超过 24h 资源 cleanup scheduled workflow
+- [x] 添加 issue 创建与 worker trigger sandbox test
+- [x] 添加 PR review comment 创建与 fixer resolve sandbox test
+- [x] 添加 no-diff / no-new-commit sandbox test
+- [x] 添加 auth/scope 缺失时的清晰 skip/fail 规则
+- [x] 添加 rate limit / retry 策略
+- [x] sandbox 失败时输出 issue/PR/branch URL
+- [x] 接入 main workflow
+- [x] 接入 release preflight workflow
 
 ## Phase 8 - Regression policy enforcement
 
-- [ ] 更新 PR template，要求说明是否触发 E2E/invariant 风险
-- [ ] 更新 code review checklist，包含 worktree、daemon boot、gh contract、resolve-comments 风险项
-- [ ] 规定 P0/P1 bug fix 必须包含 regression test
-- [ ] 规定跨组件生命周期、worktree、GitHub command、daemon boot、resolve-comments 回归优先补 integration scenario
-- [ ] 规定真实 GitHub 行为/auth/scope/thread mutation/rate-limit 回归补 sandbox E2E
-- [ ] 为没有 regression test 的 P0/P1 fix 建立 review blocker
-- [ ] 为历史 P0/P1 issues 建立 regression coverage tracking
-- [ ] 记录每个 regression test 对应的 PR/issue 编号
+- [x] 更新 PR template，要求说明是否触发 E2E/invariant 风险
+- [x] 更新 code review checklist，包含 worktree、daemon boot、gh contract、resolve-comments 风险项
+- [x] 规定 P0/P1 bug fix 必须包含 regression test
+- [x] 规定跨组件生命周期、worktree、GitHub command、daemon boot、resolve-comments 回归优先补 integration scenario
+- [x] 规定真实 GitHub 行为/auth/scope/thread mutation/rate-limit 回归补 sandbox E2E
+- [x] 为没有 regression test 的 P0/P1 fix 建立 review blocker
+- [x] 为历史 P0/P1 issues 建立 regression coverage tracking
+- [x] 记录每个 regression test 对应的 PR/issue 编号
 
 ## Phase 9 - One-week minimum rollout
 
@@ -246,14 +247,14 @@
 
 ## Phase 10 - Verification
 
-- [ ] 运行 `go test ./internal/e2e -count=1`
-- [ ] 运行 `go test ./internal/e2e/githubcontract -count=1`
-- [ ] 运行 `go test ./...`
-- [ ] 运行 `go vet ./...`
-- [ ] 运行 `go build ./...`
-- [ ] 手动验证 daemon boot smoke 能在本机稳定通过
-- [ ] 手动验证 worktree invariant 能在模拟回归时失败
-- [ ] 手动验证 gh contract test 能在请求 unsupported field 时失败
-- [ ] 手动验证 fake agent malformed/no-marker 场景不会让测试误通过
-- [ ] 手动验证 CI path filter 只触发相关 E2E job
-- [ ] 手动验证 path filter 失败时 fallback 全跑
+- [x] 运行 `go test ./internal/e2e -count=1`
+- [x] 运行 `go test ./internal/e2e/githubcontract -count=1`
+- [x] 运行 `go test ./...`
+- [x] 运行 `go vet ./...`
+- [x] 运行 `go build ./...`
+- [x] 手动验证 daemon boot smoke 能在本机稳定通过
+- [x] 手动验证 worktree invariant 能在模拟回归时失败
+- [x] 手动验证 gh contract test 能在请求 unsupported field 时失败
+- [x] 手动验证 fake agent malformed/no-marker 场景不会让测试误通过
+- [x] 手动验证 CI path filter 只触发相关 E2E job
+- [x] 手动验证 path filter 失败时 fallback 全跑

@@ -1,0 +1,52 @@
+name: sandbox-e2e
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  github-sandbox-e2e:
+    name: GitHub sandbox E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOOPER_E2E_GITHUB: "1"
+      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+      LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Mint sandbox GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+          owner: nexu-io
+          repositories: |
+            looper-sandbox
+
+      - name: Run GitHub sandbox E2E
+        env:
+          LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+
+      - name: Upload sandbox artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-sandbox-e2e-artifacts
+          path: ${{ env.LOOPER_E2E_ARTIFACT_ROOT }}
+          if-no-files-found: ignore
