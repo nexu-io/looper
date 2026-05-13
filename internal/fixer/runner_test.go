@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
@@ -583,8 +584,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "completed" {
-		t.Fatalf("loop = %#v, want completed loop", loop)
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop with scheduled retry", loop)
 	}
 	loopMeta := parseJSONObject(loop.MetadataJSON)
 	if got, _ := stringFromAny(loopMeta["lastNoopResolveHeadSha"]); got != "base-head" {
@@ -592,6 +593,16 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	}
 	if got, _ := stringFromAny(loopMeta["lastNoopResolveFixItemsHash"]); got == "" {
 		t.Fatal("lastNoopResolveFixItemsHash = empty, want captured fix-item snapshot")
+	}
+	activeFollowup, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeFollowup == nil || activeFollowup.ID == claim.ID || activeFollowup.Status != "queued" {
+		t.Fatalf("active follow-up queue item = %#v, want delayed queued retry distinct from original claim", activeFollowup)
+	}
+	if *loop.NextRunAt != activeFollowup.AvailableAt {
+		t.Fatalf("loop.NextRunAt = %q, want %q", *loop.NextRunAt, activeFollowup.AvailableAt)
 	}
 }
 
@@ -693,7 +704,7 @@ func TestProcessClaimedItemAllowsNoCommitWhenCommentsAlreadyResolved(t *testing.
 	}
 }
 
-func TestDiscoverPullRequestsSkipsRepeatedNoopResolveRediscovery(t *testing.T) {
+func TestDiscoverPullRequestsDefersRepeatedNoopResolveRediscoveryBeforeCooldown(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -702,8 +713,8 @@ func TestDiscoverPullRequestsSkipsRepeatedNoopResolveRediscovery(t *testing.T) {
 	nowISO := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
-	fixItemsHash := hashFixItems(collectFixItems(detail))
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveFixItemsHash": fixItemsHash})
+	fixItemsStateHash := hashFixItemsState(collectFixItems(detail))
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveStateHash": fixItemsStateHash, "lastNoopResolveAt": nowISO})
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -716,11 +727,48 @@ func TestDiscoverPullRequestsSkipsRepeatedNoopResolveRediscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
 	}
-	if len(result.QueueItems) != 0 {
-		t.Fatalf("QueueItems = %#v, want no repeated queue item for unchanged no-op resolve state", result.QueueItems)
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want delayed retry queue item for unchanged no-op resolve state", result.QueueItems)
 	}
-	if result.Skipped == 0 {
-		t.Fatalf("result = %#v, want skipped discovery count", result)
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.NextRunAt == nil || *persisted.NextRunAt != wantAvailableAt {
+		t.Fatalf("persisted loop = %#v, want NextRunAt %q", persisted, wantAvailableAt)
+	}
+}
+
+func TestEnqueueMovesExistingDelayedFixerItemEarlierForSameDedupeKey(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	projectID := "project_1"
+	loopID := "loop_1"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	dedupeKey := buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-1", "hash-1")
+	later := eventlog.FormatJavaScriptISOString(fixture.now().Add(5 * time.Minute))
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_1", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: later, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	item, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: projectID, LoopID: loopID, Repo: repo, PRNumber: prNumber, HeadSHA: "head-1", FixItemsHash: "hash-1", AvailableAt: fixture.now()})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	if item.AvailableAt != fixture.nowISO() {
+		t.Fatalf("AvailableAt = %q, want %q", item.AvailableAt, fixture.nowISO())
 	}
 }
 
@@ -741,7 +789,7 @@ func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.
 			prNumber := int64(42)
 			nowISO := fixture.nowISO()
 			baseline := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
-			metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveFixItemsHash": hashFixItems(collectFixItems(baseline))})
+			metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(baseline)), "lastNoopResolveAt": nowISO})
 			loopTarget := buildPullRequestTargetID(repo, prNumber)
 			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Loops.Upsert() error = %v", err)
@@ -758,6 +806,132 @@ func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.
 				t.Fatalf("QueueItems = %#v, want one queue item after state change", result.QueueItems)
 			}
 		})
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHashMatches(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue on thread-set change", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue after cooldown expiry", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue on new signal despite terminal prior state", decision)
+	}
+}
+
+func TestDiscoverPullRequestsClearsFollowupStateWhenNoUnresolvedCommentsRemain(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": "same-hash", "lastNoopResolveAt": nowISO})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_noop"
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	delayedAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_followup", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:followup", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: delayedAt, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	resolvedDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "done", "isResolved": true}}}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: resolvedDetail.HeadSHA}}, viewResponses: []PullRequestDetail{resolvedDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none when comments are resolved", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("legacy noop metadata still present in %#v", meta)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue != nil {
+		t.Fatalf("activeQueue = %#v, want cleared delayed queue item", activeQueue)
+	}
+}
+
+func TestRecordFixerFollowupStateTransitionsToManualInterventionAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_fixer_followup", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	for range fixerFollowupBackoffSchedule {
+		fixture.advance(time.Minute)
+		if _, err := runner.recordFixerFollowupState(context.Background(), loop, fixerFollowupReasonMissingEvidence, "head-1", "same-hash", []string{"t1"}, fixture.now()); err != nil {
+			t.Fatalf("recordFixerFollowupState() error = %v", err)
+		}
+	}
+	fixture.advance(time.Minute)
+	if _, err := runner.recordFixerFollowupState(context.Background(), loop, fixerFollowupReasonMissingEvidence, "head-1", "same-hash", []string{"t1"}, fixture.now()); err != nil {
+		t.Fatalf("recordFixerFollowupState() terminal error = %v", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	followup, ok := parseFixerFollowupState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parseFixerFollowupState() = false, want follow-up metadata")
+	}
+	if !followup.Terminal || followup.Reason != string(fixerFollowupReasonManualIntervention) {
+		t.Fatalf("followup = %#v, want terminal manual intervention", followup)
 	}
 }
 
@@ -1533,6 +1707,19 @@ func TestRunResolveCommentsStepPersistsNoopResolveMetadataWhenAllThreadsSkipForM
 	}
 	if got, _ := stringFromAny(meta["lastNoopResolveStateHash"]); got != hashFixItemsState(liveFixItems) {
 		t.Fatalf("lastNoopResolveStateHash = %q, want %q", got, hashFixItemsState(liveFixItems))
+	}
+	followup, ok := parseFixerFollowupState(meta)
+	if !ok {
+		t.Fatalf("parseFixerFollowupState() = false, want follow-up metadata")
+	}
+	if followup.Reason != string(fixerFollowupReasonMissingEvidence) {
+		t.Fatalf("followup.Reason = %q, want %q", followup.Reason, fixerFollowupReasonMissingEvidence)
+	}
+	if !sameStringSlices(followup.UnresolvedThreadIDs, []string{"t2"}) {
+		t.Fatalf("followup.UnresolvedThreadIDs = %#v, want [t2]", followup.UnresolvedThreadIDs)
+	}
+	if followup.AttemptsForFingerprint != 1 {
+		t.Fatalf("followup.AttemptsForFingerprint = %d, want 1", followup.AttemptsForFingerprint)
 	}
 }
 
