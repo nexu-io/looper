@@ -1618,6 +1618,25 @@ func TestConfigShowSourceDetectsCanonicalEnableFlagOverrides(t *testing.T) {
 	assertConfigFieldSource(t, stdout, "package.autoUpgradeEnabled", "cli")
 }
 
+func TestConfigShowSourceDetectsFixerAuthorFilterCLIOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"fixer": map[string]any{
+				"triggers": map[string]any{"authorFilter": "current_user"},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--roles-fixer-triggers-author-filter=any", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-fixer-triggers-author-filter]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.fixer.triggers.authorFilter", "cli")
+}
+
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{

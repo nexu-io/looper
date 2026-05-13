@@ -653,7 +653,7 @@ func reviewerDiscoveryLabelModeFieldWithAlias(key, env, envAlias string, get fun
 }
 
 func fixerAuthorFilterField() configField {
-	return configField{key: "roles.fixer.triggers.authorFilter", valueType: "string", env: "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER", get: func(c config.Config) any { return c.Roles.Fixer.Triggers.AuthorFilter }, set: func(p *config.PartialConfig, raw string) error {
+	return configField{key: "roles.fixer.triggers.authorFilter", valueType: "string", env: "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER", flag: "roles-fixer-triggers-author-filter", flagAlias: "fix-all-pull-requests", get: func(c config.Config) any { return c.Roles.Fixer.Triggers.AuthorFilter }, set: func(p *config.PartialConfig, raw string) error {
 		filter := config.FixerAuthorFilter(strings.TrimSpace(raw))
 		switch filter {
 		case config.FixerAuthorFilterCurrentUser, config.FixerAuthorFilterAny:

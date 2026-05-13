@@ -464,6 +464,26 @@ func TestLegacyAndCanonicalReviewerCLIOverridesResolveIdenticallyAndBeatFileConf
 	}
 }
 
+func TestCanonicalReviewerCleanCLIOverrideWinsOverAllowAutoApproveRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+		"--allow-auto-approve=true",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with canonical then legacy flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--allow-auto-approve=true",
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with legacy then canonical flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
 func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
 	testCases := []struct {
 		name         string

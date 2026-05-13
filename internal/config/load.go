@@ -434,6 +434,7 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
+	canonicalReviewerCleanOverrideSet := false
 
 	takeValue := func(index int, flag string) (string, int, error) {
 		current := args[index]
@@ -673,6 +674,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
 			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-clean") {
+				canonicalReviewerCleanOverrideSet = true
+			}
 			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-approve"):
 			value, nextIndex, err := takeValue(index, "--allow-auto-approve")
@@ -684,11 +688,13 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-approve: %q is not a boolean", value)
 			}
 			ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
-			event := ReviewerReviewEventComment
-			if *parsedValue {
-				event = ReviewerReviewEventApprove
+			if !canonicalReviewerCleanOverrideSet {
+				event := ReviewerReviewEventComment
+				if *parsedValue {
+					event = ReviewerReviewEventApprove
+				}
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
 			}
-			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
 			index = nextIndex
 		case matchesFlag(arg, "--roles-fixer-triggers-author-filter"):
 			value, nextIndex, err := takeValue(index, "--roles-fixer-triggers-author-filter")
