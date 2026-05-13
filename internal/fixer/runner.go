@@ -150,8 +150,11 @@ type ReviewThread struct {
 }
 
 type ReviewThreadComment struct {
-	ID   string
-	Body string
+	ID        string
+	Body      string
+	Author    string
+	CreatedAt string
+	UpdatedAt string
 }
 
 type ResolveReviewThreadInput struct {
@@ -1944,64 +1947,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Push == nil {
 		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
 	}
-	roundCheckpoint := checkpoint
-	roundFixItems := cloneFixItems(checkpoint.FixItems)
-	roundFixItemsHash := checkpoint.FixItemsHash
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	fixItems := collectFixItems(liveDetail)
-	currentFixItemsStateHash := hashFixItemsState(fixItems)
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
-	threadStore := loadFixEvidenceStoreV2(input.Loop.MetadataJSON)
-	roundEvidence := resolveFixEvidence(roundCheckpoint, input.Loop.MetadataJSON, roundFixItemsHash)
-	roundEvidenceVerified := false
-	if roundEvidence != nil && hasCommentFixItems(roundFixItems) {
-		roundEvidenceVerified, err = r.verifyFixEvidence(ctx, input, roundCheckpoint, roundEvidence, liveDetail)
-		if err != nil {
-			return checkpoint, err
-		}
-		if roundEvidenceVerified {
-			validationBound, verifyErr := r.validationMatchesEvidence(ctx, input, roundCheckpoint, roundEvidence)
-			if verifyErr != nil {
-				return checkpoint, verifyErr
-			}
-			if !validationBound {
-				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-				return checkpoint, &loopError{message: "resolve-comments requires validation bound to verified fix evidence head", kind: FailureRetryableAfterResume}
-			}
-			if isSameRoundPushEvidence(roundEvidence) || (roundCheckpoint.Push != nil && roundCheckpoint.Push.Pushed && roundCheckpoint.Push.Evidence == nil && roundProducedNewCommits(&roundCheckpoint)) {
-				threadStore = mergeFixEvidenceStoreV2(threadStore, buildFixEvidenceStoreV2(roundCheckpoint, roundEvidence, input.Run.ID))
-			}
-		}
-	}
-	if checkpoint.Push != nil && checkpoint.Push.Pushed && hasCommentFixItems(roundFixItems) && !roundEvidenceVerified {
-		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: "resolve-comments refused because verified fix evidence is missing or stale; leaving review threads unresolved", kind: FailureRetryableAfterResume}
-	}
-	if shouldBlockResolveWithoutFix(checkpoint, fixItems, roundEvidenceVerified) && !hasRecoverableThreadEvidence(input.Loop.MetadataJSON, fixItems) {
-		if checkpoint.ResolvedComments == nil {
-			checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
-		}
-		for _, item := range fixItems {
-			if item.Type != "comment" || alreadyResolved(checkpoint.ResolvedComments.Items, item) {
-				continue
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
-		}
-		if _, err := r.recordFixerFollowupState(ctx, input.Loop, fixerFollowupReasonMissingEvidence, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash, skippedNoEvidenceThreadIDs(fixItems, checkpoint.ResolvedComments.Items), r.now()); err != nil {
-			return checkpoint, err
-		}
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
-		return checkpoint, nil
-	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
-	failedCount := 0
 	resolvedCount := 0
 	commentItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
@@ -2009,114 +1965,64 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			commentItems = append(commentItems, item)
 		}
 	}
+	repliesByItemID := agentResolveRepliesByFixItemID(checkpoint)
+	repliesByThreadID := agentResolveRepliesByThreadID(checkpoint)
+	commitSHA := resolveCommentCommitSHA(checkpoint, nil, false)
+	if commitSHA == "" {
+		commitSHA = resolveCommentsExpectedHeadSHA(checkpoint)
+	}
+	driftCount := 0
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
 		}
-		threadEvidence, hasEvidence := findThreadFixEvidence(threadStore, item)
-		if !hasEvidence {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
+		explanation := repliesByItemID[item.ID]
+		if explanation == "" && item.ThreadID != "" {
+			explanation = repliesByThreadID[item.ThreadID]
+		}
+		if strings.TrimSpace(explanation) == "" {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_agent_declined", Message: "Agent did not include this thread in review_thread_replies", UpdatedAt: r.nowISO()})
 			continue
 		}
-		verifiedEvidence, verifyErr := r.verifyThreadEvidence(ctx, input, checkpoint, liveDetail, threadEvidence)
-		if verifyErr != nil {
-			return checkpoint, verifyErr
-		}
-		if !verifiedEvidence {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_evidence", Message: "No verified pushed fix evidence available for this thread", UpdatedAt: r.nowISO()})
-			continue
-		}
-		if strings.TrimSpace(threadEvidence.Explanation) == "" {
-			threadEvidence.ResolveState = "skipped_no_confirmation"
-			threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-			if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
-				return checkpoint, err
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_no_confirmation", Message: "No agent confirmation was captured for this thread", UpdatedAt: r.nowISO()})
-			continue
-		}
-		commitSHA := firstNonEmpty(threadEvidence.CommitSHA, lastNonEmptyString(threadEvidence.CommitSHAs, threadEvidence.EvidenceHeadSHA))
-		explanation := threadEvidence.Explanation
-		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanation, checkpoint.ResolvedComments.Items)
-		threadEvidence.ReplyState = replyState
-		threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-		if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
+		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
+		if err != nil {
 			return checkpoint, err
 		}
-		if replyState == "failed" {
-			failedCount++
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "reply_failed", Message: "Failed to post fixer auto-reply", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+		if thread.IsResolved {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
 			continue
 		}
+		if hasNonLooperCommentSince(thread, input.Run.StartedAt) {
+			driftCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
+			continue
+		}
+		replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, explanation, checkpoint.ResolvedComments.Items)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
 			return checkpoint, err
 		}
-		resolveState, resolveDetail, resolveErr := r.refreshResolveCommentState(ctx, input, checkpoint, threadEvidence, item)
-		if resolveErr != nil {
-			return checkpoint, resolveErr
-		}
-		switch resolveState {
-		case "already_resolved":
-			threadEvidence.ResolveState = "already_resolved"
-			threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-			if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
-				return checkpoint, err
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-			continue
-		case "stale":
-			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-			failedCount++
-			threadEvidence.ResolveState = "stale"
-			threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-			if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
-				return checkpoint, err
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "stale_state", Message: "PR head or review thread changed before resolve", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-			continue
-		case "ok":
-			checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, resolveDetail)
-		}
 		if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
 			message := err.Error()
-			status := "failed"
+			status := "failed_mutation_terminal"
 			if strings.Contains(strings.ToLower(message), "already") {
 				status = "already_resolved"
-			} else {
-				failedCount++
-			}
-			threadEvidence.ResolveState = status
-			threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-			if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
-				return checkpoint, err
 			}
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: status, Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			continue
 		}
 		resolvedCount++
-		threadEvidence.ResolveState = "resolved"
-		threadStore = upsertThreadFixEvidence(threadStore, threadEvidence)
-		if err := r.persistFixEvidenceStoreV2(ctx, input.Loop, threadStore); err != nil {
-			return checkpoint, err
-		}
 		upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
-	if failedCount == 0 && resolvedCount > 0 {
-		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, lastNonEmptyString(roundEvidenceCommitSHAs(roundEvidence), ""), buildThreadResolveReplyExplanations(threadStore, fixItems))
+	if resolvedCount > 0 {
+		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, repliesByItemID)
 	}
-	if failedCount == 0 {
-		skippedThreadIDs, followupReason := skippedFollowupThreadIDs(fixItems, checkpoint.ResolvedComments.Items)
-		if len(skippedThreadIDs) > 0 {
-			if _, err := r.recordFixerFollowupState(ctx, input.Loop, followupReason, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash, skippedThreadIDs, r.now()); err != nil {
-				return checkpoint, err
-			}
-		} else if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
-			return checkpoint, err
-		}
+	if driftCount > 0 {
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because new human comments arrived during the fixer run", driftCount), kind: FailureRetryableAfterResume}
 	}
-	if failedCount > 0 {
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s)", failedCount), kind: FailureRetryableAfterResume}
+	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
+		return checkpoint, err
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -2218,6 +2124,74 @@ func lookupReplyExplanations(checkpoint fixerCheckpoint) map[string]string {
 		out[entry.FixItemID] = entry.Explanation
 	}
 	return out
+}
+
+func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]string {
+	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
+	for _, entry := range checkpoint.Repair.ReplyExplanations {
+		fixItemID := strings.TrimSpace(entry.FixItemID)
+		explanation := strings.TrimSpace(entry.Explanation)
+		if fixItemID == "" || explanation == "" {
+			continue
+		}
+		if _, exists := out[fixItemID]; !exists {
+			out[fixItemID] = explanation
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]string {
+	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(checkpoint.Repair.ReplyExplanations))
+	for _, entry := range checkpoint.Repair.ReplyExplanations {
+		threadID := strings.TrimSpace(entry.ThreadID)
+		explanation := strings.TrimSpace(entry.Explanation)
+		if threadID == "" || explanation == "" {
+			continue
+		}
+		if _, exists := out[threadID]; !exists {
+			out[threadID] = explanation
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func hasNonLooperCommentSince(thread ReviewThread, rawSince string) bool {
+	since := parseRFC3339OrZero(rawSince)
+	if since.IsZero() {
+		return false
+	}
+	for _, comment := range thread.Comments {
+		createdAt := parseRFC3339OrZero(comment.CreatedAt)
+		if createdAt.IsZero() || !createdAt.After(since) {
+			continue
+		}
+		if isLooperReviewThreadComment(comment) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
+	body := strings.TrimSpace(comment.Body)
+	if body == "" {
+		return false
+	}
+	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
 }
 
 func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {

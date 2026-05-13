@@ -439,7 +439,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 	for _, thread := range threads {
 		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 		}
 		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
 	}
@@ -453,7 +453,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 	}
 	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
 }
