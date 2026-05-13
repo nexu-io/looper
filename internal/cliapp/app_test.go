@@ -1553,6 +1553,77 @@ func TestConfigUnsetLegacyReviewerReviewEventKeysClearsLegacyAndCanonicalFields(
 	}
 }
 
+func TestConfigSetCanonicalReviewerReviewEventClearsLegacyField(t *testing.T) {
+	tests := []struct {
+		name        string
+		key         string
+		value       string
+		assertClean bool
+	}{
+		{name: "clean", key: "roles.reviewer.behavior.reviewEvents.clean", value: "APPROVE", assertClean: true},
+		{name: "blocking", key: "roles.reviewer.behavior.reviewEvents.blocking", value: "REQUEST_CHANGES", assertClean: false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+				"notifications": map[string]any{
+					"osascript": map[string]any{"enabled": false},
+				},
+				"reviewer": map[string]any{
+					"loop": map[string]any{"enabledByDefault": false},
+					"reviewEvents": map[string]any{
+						"clean":    "COMMENT",
+						"blocking": "COMMENT",
+					},
+				},
+			})
+
+			exitCode, stdout, stderr := runApp(t, "config", "set", tc.key, tc.value, "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([config set %s %s]) exit code = %d, want 0; stderr=%q", tc.key, tc.value, exitCode, stderr)
+			}
+			if !strings.Contains(stdout, "Set "+tc.key) {
+				t.Fatalf("stdout = %q, want set confirmation for %s", stdout, tc.key)
+			}
+
+			partial, present, err := config.ReadPartialConfigFile(configPath)
+			if err != nil {
+				t.Fatalf("ReadPartialConfigFile() error = %v", err)
+			}
+			if !present {
+				t.Fatalf("ReadPartialConfigFile() present = false, want true")
+			}
+			if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+				t.Fatalf("legacy reviewer loop missing after set: %#v", partial.LegacyReviewer)
+			}
+			if partial.LegacyReviewer.ReviewEvents == nil {
+				t.Fatalf("legacy reviewer reviewEvents missing after set: %#v", partial.LegacyReviewer)
+			}
+			if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil || partial.Roles.Reviewer.Behavior.ReviewEvents == nil {
+				t.Fatalf("canonical reviewer reviewEvents missing after set: %#v", partial.Roles)
+			}
+
+			if tc.assertClean {
+				if partial.LegacyReviewer.ReviewEvents.Clean != nil {
+					t.Fatalf("legacy reviewer clean event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+				}
+				if got := partial.Roles.Reviewer.Behavior.ReviewEvents.Clean; got == nil || *got != config.ReviewerReviewEventApprove {
+					t.Fatalf("canonical reviewer clean event = %#v, want %q", got, config.ReviewerReviewEventApprove)
+				}
+			} else {
+				if partial.LegacyReviewer.ReviewEvents.Blocking != nil {
+					t.Fatalf("legacy reviewer blocking event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+				}
+				if got := partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got == nil || *got != config.ReviewerReviewEventRequestChanges {
+					t.Fatalf("canonical reviewer blocking event = %#v, want %q", got, config.ReviewerReviewEventRequestChanges)
+				}
+			}
+		})
+	}
+}
+
 func TestConfigValidateAndShowSource(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
@@ -1951,6 +2022,12 @@ func TestConfigEditCreatesCanonicalTemplateAtSelectedTOMLPath(t *testing.T) {
 	if strings.Contains(text, "[reviewer]") {
 		t.Fatalf("generated TOML = %q, did not expect legacy reviewer root", text)
 	}
+	if strings.Contains(text, "allowAutoApprove") {
+		t.Fatalf("generated TOML = %q, did not expect deprecated defaults.allowAutoApprove", text)
+	}
+	if strings.Contains(text, "fixAllPullRequests") {
+		t.Fatalf("generated TOML = %q, did not expect deprecated defaults.fixAllPullRequests", text)
+	}
 
 	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
 	if err != nil {
@@ -1958,6 +2035,9 @@ func TestConfigEditCreatesCanonicalTemplateAtSelectedTOMLPath(t *testing.T) {
 	}
 	if !loaded.Metadata.ConfigFilePresent {
 		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if len(loaded.Warnings) != 0 {
+		t.Fatalf("LoadFile().Warnings = %#v, want none", loaded.Warnings)
 	}
 }
 

@@ -1,6 +1,7 @@
 package cliapp
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -398,7 +399,11 @@ func (r *commandRuntime) writeDefaultConfigTemplate(path string, cfg config.Conf
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	raw, err := config.MarshalConfigFile(path, cfg)
+	templateValue, err := canonicalConfigTemplateValue(cfg)
+	if err != nil {
+		return err
+	}
+	raw, err := config.MarshalConfigFile(path, templateValue)
 	if err != nil {
 		return err
 	}
@@ -406,6 +411,21 @@ func (r *commandRuntime) writeDefaultConfigTemplate(path string, cfg config.Conf
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+func canonicalConfigTemplateValue(cfg config.Config) (map[string]any, error) {
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("normalize config template: %w", err)
+	}
+	var normalized map[string]any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return nil, fmt.Errorf("normalize config template: %w", err)
+	}
+	defaults, _ := normalized["defaults"].(map[string]any)
+	delete(defaults, "allowAutoApprove")
+	delete(defaults, "fixAllPullRequests")
+	return normalized, nil
 }
 
 func (r *commandRuntime) validateConfigFile(path string) error {
@@ -707,6 +727,7 @@ func reviewerReviewEventField(key, env, envAlias, flag, flagAlias string, get fu
 		default:
 			return fmt.Errorf("unsupported review event config key %q", key)
 		}
+		clearReviewerReviewEventField(p, key)
 		*target(p) = &value
 		return nil
 	}, unset: func(p *config.PartialConfig) {
