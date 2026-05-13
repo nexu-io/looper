@@ -1599,7 +1599,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if work.ExecutionMode == "create-pr" && checkpoint.PullRequest == nil {
 		pr, ok, err := r.lifecycleAgentCreatedPullRequest(ctx, work.Repo, checkpoint.Lifecycle, worktree.Branch, work.BaseBranch, input.Project.RepoPath)
 		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			if input.Loop.PRNumber == nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
 		}
 		if ok {
 			checkpoint.PullRequest = &pr

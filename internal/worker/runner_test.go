@@ -2912,6 +2912,66 @@ func TestRunOpenPRStepLeavesPushExistingAgentPRBodyUntouchedWithoutExistingFoote
 	}
 }
 
+func TestRunOpenPRStepUsesPersistedPRWhenLifecycleLookupFailsOnResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(558)
+	now := fixture.nowISO()
+	loopTarget := "pr:acme/looper:558"
+	loopMeta := `{"worker":{"title":"Existing PR lifecycle error","repo":"acme/looper","baseBranch":"main"},"prUrl":"https://example/pr/558"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	viewErr := errors.New("temporary gh failure")
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{viewPRErr: viewErr}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, Disclosure: &disclosureCfg})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queueItem, err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR lifecycle error", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-558"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-558", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_558"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-558",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/558",
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: *loop, QueueItem: *queueItem, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber || checkpointAfter.PullRequest.URL != "https://example/pr/558" {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want persisted PR reference", checkpointAfter.PullRequest)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.viewPRCalls) != 1 {
+		t.Fatalf("viewPRCalls = %#v, want single lifecycle lookup", github.viewPRCalls)
+	}
+}
+
 func TestRunOpenPRStepPreservesAdoptedPushExistingPRWithoutExistingFooter(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3014,6 +3074,7 @@ type fakeGitHubGateway struct {
 	openPRIndex             int
 	prDetail                PullRequestDetail
 	prDetailResponses       []PullRequestDetail
+	viewPRErr               error
 	viewPRIndex             int
 	issueDetail             IssueDetail
 	issueDetailResponses    []IssueDetail
@@ -3067,6 +3128,9 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRe
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	f.viewPRCalls = append(f.viewPRCalls, input)
+	if f.viewPRErr != nil {
+		return PullRequestDetail{}, f.viewPRErr
+	}
 	detail := f.prDetail
 	if f.viewPRIndex < len(f.prDetailResponses) {
 		detail = f.prDetailResponses[f.viewPRIndex]
