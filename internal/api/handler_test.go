@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -55,6 +56,45 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	if _, ok := storageInfo["dbPath"].(string); !ok {
 		t.Fatalf("data.storage.dbPath missing/invalid: %#v", storageInfo["dbPath"])
 	}
+}
+
+func TestHandlerReviewerRepairInvokesContextAndTriggersScheduler(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	var gotInput reviewer.RepairInput
+	triggered := 0
+	h := NewHandler(Context{
+		Config: cfg,
+		RepairReviewer: func(_ context.Context, input reviewer.RepairInput) (reviewer.RepairResult, error) {
+			gotInput = input
+			return reviewer.RepairResult{Repo: input.Repo, PRNumber: input.PRNumber, ProjectID: input.ProjectID, Apply: input.Apply, Applied: true, AppliedChanges: 1}, nil
+		},
+		TriggerSchedulerTick: func() { triggered++ },
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/reviewer/repair", strings.NewReader(`{"projectId":"project_1","repo":"acme/looper","prNumber":42,"apply":true}`))
+	req.Header.Set("x-request-id", "repair-request-id")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if gotInput.Repo != "acme/looper" || gotInput.PRNumber != 42 || gotInput.ProjectID != "project_1" || !gotInput.Apply {
+		t.Fatalf("RepairReviewer input = %#v, want requested repo/pr/project/apply", gotInput)
+	}
+	if triggered != 1 {
+		t.Fatalf("scheduler trigger count = %d, want 1", triggered)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["repo"], "acme/looper")
+	assertEqual(t, data["applied"], true)
 }
 
 func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {

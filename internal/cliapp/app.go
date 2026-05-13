@@ -343,7 +343,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				short:           "Create a reviewer task for a pull request",
 				args:            cobra.ExactArgs(1),
 				runE:            runtime.reviewCreate,
-				helpSubcommands: []helpSubcommand{{name: "submit", description: "Submit a validated PR review payload"}},
+				helpSubcommands: []helpSubcommand{{name: "submit", description: "Submit a validated PR review payload"}, {name: "repair", description: "Diagnose and repair reviewer local state"}},
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
@@ -353,11 +353,14 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy")}}),
+					newCommand(commandSpec{use: "repair <pr>", short: "Diagnose and repair reviewer local state", args: cobra.ExactArgs(1), runE: runtime.reviewRepair, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), boolFlag("apply", "Apply planned local repair actions")}}),
 				},
 				exampleLines: []string{
 					"$ looper review 123",
 					"$ looper review acme/looper#42 --loop",
 					"$ looper review submit acme/looper#42 --event COMMENT --commit-id abc123 < review.json",
+					"$ looper review repair acme/looper#42",
+					"$ looper review repair acme/looper#42 --apply",
 				},
 			}),
 			newCommand(commandSpec{

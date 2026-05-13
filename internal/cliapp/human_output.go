@@ -88,6 +88,47 @@ type loopOutput struct {
 	Status     string  `json:"status"`
 }
 
+type reviewRepairOutput struct {
+	Repo           string `json:"repo"`
+	PRNumber       int64  `json:"prNumber"`
+	ProjectID      string `json:"projectId"`
+	LoopID         string `json:"loopId"`
+	LoopSeq        int64  `json:"loopSeq"`
+	Apply          bool   `json:"apply"`
+	Applied        bool   `json:"applied"`
+	AppliedChanges int    `json:"appliedChanges"`
+	GitHub         struct {
+		CurrentLogin         string   `json:"currentLogin"`
+		State                string   `json:"state"`
+		IsDraft              bool     `json:"isDraft"`
+		HasConflicts         bool     `json:"hasConflicts"`
+		ReviewDecision       string   `json:"reviewDecision"`
+		HeadSHA              string   `json:"headSha"`
+		ReviewRequests       []string `json:"reviewRequests"`
+		CurrentUserRequested bool     `json:"currentUserRequested"`
+		CurrentUserReviewed  bool     `json:"currentUserReviewed"`
+	} `json:"github"`
+	Local struct {
+		Status               string `json:"status"`
+		CleanPolicy          string `json:"cleanPolicy"`
+		BlockingPolicy       string `json:"blockingPolicy"`
+		LastPublishedHeadSHA string `json:"lastPublishedHeadSha"`
+		LastReviewEvent      string `json:"lastReviewEvent"`
+		LastFilterSkipKind   string `json:"lastFilterSkipKind"`
+		LastFilterSkipReason string `json:"lastFilterSkipReason"`
+		HasActiveRun         bool   `json:"hasActiveRun"`
+		HasActiveQueue       bool   `json:"hasActiveQueue"`
+		LatestQueueStatus    string `json:"latestQueueStatus"`
+	} `json:"local"`
+	Diagnoses []reviewRepairLine `json:"diagnoses"`
+	Actions   []reviewRepairLine `json:"actions"`
+}
+
+type reviewRepairLine struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 type pullRequestsListOutput struct {
 	Items []pullRequestOutput `json:"items"`
 }
@@ -322,6 +363,41 @@ func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopSetting st
 	}
 	printSection(w, "Reviewer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}, {"loop", loopSetting}})
 	return nil
+}
+
+func writeHumanReviewRepair(w io.Writer, payload json.RawMessage) error {
+	var data reviewRepairOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode reviewer repair response: %w", err)
+	}
+
+	mode := "dry-run"
+	if data.Apply {
+		mode = "apply"
+	}
+	printSection(w, "Reviewer repair", [][2]any{{"pr", fmt.Sprintf("%s#%d", data.Repo, data.PRNumber)}, {"projectId", data.ProjectID}, {"loopId", data.LoopID}, {"loopSeq", data.LoopSeq}, {"mode", mode}, {"applied", data.Applied}, {"appliedChanges", data.AppliedChanges}})
+	fmt.Fprintln(w)
+	printSection(w, "GitHub", [][2]any{{"currentLogin", data.GitHub.CurrentLogin}, {"state", data.GitHub.State}, {"headSha", data.GitHub.HeadSHA}, {"reviewDecision", data.GitHub.ReviewDecision}, {"reviewRequests", joinOrNone(data.GitHub.ReviewRequests)}, {"currentUserRequested", data.GitHub.CurrentUserRequested}, {"currentUserReviewed", data.GitHub.CurrentUserReviewed}, {"draft", data.GitHub.IsDraft}, {"conflicts", data.GitHub.HasConflicts}})
+	fmt.Fprintln(w)
+	printSection(w, "Local", [][2]any{{"status", data.Local.Status}, {"cleanPolicy", data.Local.CleanPolicy}, {"blockingPolicy", data.Local.BlockingPolicy}, {"lastPublishedHeadSha", data.Local.LastPublishedHeadSHA}, {"lastReviewEvent", data.Local.LastReviewEvent}, {"lastFilterSkipKind", data.Local.LastFilterSkipKind}, {"lastFilterSkipReason", data.Local.LastFilterSkipReason}, {"activeRun", data.Local.HasActiveRun}, {"activeQueue", data.Local.HasActiveQueue}, {"latestQueueStatus", data.Local.LatestQueueStatus}})
+	fmt.Fprintln(w)
+	printReviewRepairLines(w, "Diagnoses", data.Diagnoses, "No reviewer state issues detected.")
+	fmt.Fprintln(w)
+	printReviewRepairLines(w, "Actions", data.Actions, "No repair actions needed.")
+	return nil
+}
+
+func printReviewRepairLines(w io.Writer, title string, lines []reviewRepairLine, empty string) {
+	_, _ = fmt.Fprintln(w, title)
+	if len(lines) == 0 {
+		_, _ = fmt.Fprintf(w, "  %s\n", empty)
+		return
+	}
+	rows := make([]tableRow, 0, len(lines))
+	for _, line := range lines {
+		rows = append(rows, tableRow{"code": line.Code, "message": line.Message})
+	}
+	printTable(w, []string{"code", "message"}, rows)
 }
 
 func writeHumanFixCreate(w io.Writer, payload json.RawMessage) error {

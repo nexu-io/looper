@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/sweeper"
@@ -126,6 +127,7 @@ type Context struct {
 	RecoverySummary      func() any
 	StopLoop             func(context.Context, string, string) (any, error)
 	StopAll              func(context.Context, string) (any, error)
+	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
 }
 
@@ -332,6 +334,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/sweeper/stats":
 		payload, err := h.buildSweeperStatsResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/reviewer/repair":
+		payload, err := h.buildReviewerRepairRouteResponse(r)
 		if err != nil {
 			var typed apiError
 			if !asAPIError(err, &typed) {

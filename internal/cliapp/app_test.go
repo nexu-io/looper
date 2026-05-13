@@ -2971,6 +2971,80 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 }
 
+func TestReviewRepairPostsReviewerRepairRequest(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repos/looper", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/reviewer/repair":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_1"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			if got, want := body["repo"], "acme/looper"; got != want {
+				t.Fatalf("body.repo = %#v, want %#v", got, want)
+			}
+			if got, want := body["prNumber"], float64(42); got != want {
+				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			if got, want := body["apply"], true; got != want {
+				t.Fatalf("body.apply = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_repair", map[string]any{
+				"repo":           "acme/looper",
+				"prNumber":       42,
+				"projectId":      "project_1",
+				"loopId":         "loop_1",
+				"loopSeq":        7,
+				"apply":          true,
+				"applied":        true,
+				"appliedChanges": 1,
+				"github": map[string]any{
+					"currentLogin":         "octocat",
+					"state":                "OPEN",
+					"headSha":              "abc123",
+					"reviewRequests":       []string{"octocat"},
+					"currentUserRequested": true,
+					"currentUserReviewed":  false,
+				},
+				"local": map[string]any{
+					"status":               "completed",
+					"cleanPolicy":          "COMMENT",
+					"blockingPolicy":       "COMMENT",
+					"lastPublishedHeadSha": "abc123",
+				},
+				"diagnoses": []map[string]any{{"code": "stale_local_published_head", "message": "local suppressor is stale"}},
+				"actions":   []map[string]any{{"code": "clear_local_published_head", "message": "clear local suppressors"}},
+			}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "review", "repair", "acme/looper#42", "--apply", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([review repair ...]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([review repair ...]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Reviewer repair", "acme/looper#42", "stale_local_published_head", "clear_local_published_head"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([review repair ...]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestWorkCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 
