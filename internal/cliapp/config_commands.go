@@ -710,8 +710,27 @@ func reviewerReviewEventField(key, env, envAlias, flag, flagAlias string, get fu
 		*target(p) = &value
 		return nil
 	}, unset: func(p *config.PartialConfig) {
-		*target(p) = nil
+		clearReviewerReviewEventField(p, key)
 	}}
+}
+
+func clearReviewerReviewEventField(partial *config.PartialConfig, key string) {
+	switch key {
+	case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
+		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil {
+			partial.Roles.Reviewer.Behavior.ReviewEvents.Clean = nil
+		}
+		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil {
+			partial.LegacyReviewer.ReviewEvents.Clean = nil
+		}
+	case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
+		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil {
+			partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking = nil
+		}
+		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil {
+			partial.LegacyReviewer.ReviewEvents.Blocking = nil
+		}
+	}
 }
 
 func parseConfigBool(raw string) (bool, error) {

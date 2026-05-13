@@ -1490,6 +1490,69 @@ func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	}
 }
 
+func TestConfigUnsetLegacyReviewerReviewEventKeysClearsLegacyAndCanonicalFields(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"loop": map[string]any{"enabledByDefault": false},
+			"reviewEvents": map[string]any{
+				"clean":    "APPROVE",
+				"blocking": "REQUEST_CHANGES",
+			},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"behavior": map[string]any{
+					"reviewEvents": map[string]any{
+						"clean":    "COMMENT",
+						"blocking": "COMMENT",
+					},
+				},
+			},
+		},
+	})
+
+	for _, key := range []string{"reviewer.reviewEvents.clean", "reviewer.reviewEvents.blocking"} {
+		exitCode, stdout, stderr := runApp(t, "config", "unset", key, "--config", configPath)
+		if exitCode != 0 {
+			t.Fatalf("Run([config unset %s]) exit code = %d, want 0; stderr=%q", key, exitCode, stderr)
+		}
+		if !strings.Contains(stdout, "Unset "+key) {
+			t.Fatalf("stdout = %q, want unset confirmation for %s", stdout, key)
+		}
+	}
+
+	partial, present, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadPartialConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatalf("ReadPartialConfigFile() present = false, want true")
+	}
+	if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+		t.Fatalf("legacy reviewer loop missing after unset: %#v", partial.LegacyReviewer)
+	}
+	if partial.LegacyReviewer.ReviewEvents != nil {
+		if partial.LegacyReviewer.ReviewEvents.Clean != nil {
+			t.Fatalf("legacy reviewer clean event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+		}
+		if partial.LegacyReviewer.ReviewEvents.Blocking != nil {
+			t.Fatalf("legacy reviewer blocking event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+		}
+	}
+	if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil || partial.Roles.Reviewer.Behavior.ReviewEvents == nil {
+		t.Fatalf("canonical reviewer reviewEvents missing after unset: %#v", partial.Roles)
+	}
+	if partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil {
+		t.Fatalf("canonical reviewer clean event still set: %#v", partial.Roles.Reviewer.Behavior.ReviewEvents)
+	}
+	if partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking != nil {
+		t.Fatalf("canonical reviewer blocking event still set: %#v", partial.Roles.Reviewer.Behavior.ReviewEvents)
+	}
+}
+
 func TestConfigValidateAndShowSource(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{

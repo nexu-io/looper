@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	config, err := DefaultConfig(cwd)
 	if err != nil {
@@ -7,6 +9,9 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	}
 
 	for _, partial := range partials {
+		if issues := validateLegacyProjectInstructionRoleKeys(partial); len(issues) > 0 {
+			return Config{}, &ConfigValidationError{Issues: issues}
+		}
 		mergeConfig(&config, normalizeLayerPartial(partial))
 	}
 
@@ -63,6 +68,27 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	}
 
 	return normalized
+}
+
+func validateLegacyProjectInstructionRoleKeys(partial PartialConfig) []ValidationIssue {
+	if partial.Projects == nil {
+		return nil
+	}
+
+	issues := make([]ValidationIssue, 0)
+	for index, project := range *partial.Projects {
+		for role := range project.Instructions {
+			if isValidInstructionRole(role) {
+				continue
+			}
+			issues = append(issues, ValidationIssue{
+				Path:    fmt.Sprintf("projects[%d].instructions.%s", index, role),
+				Message: "role must be one of: planner, worker, reviewer, fixer, sweeper",
+			})
+		}
+	}
+
+	return issues
 }
 
 func normalizeReviewerRoleLegacyShape(reviewer *PartialReviewerRoleConfig) {

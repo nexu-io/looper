@@ -1694,6 +1694,27 @@ func TestCanonicalProjectRoleInstructionsBeatLegacyProjectInstructionMap(t *test
 	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
 }
 
+func TestLoadFileRejectsUnknownLegacyProjectInstructionRole(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","instructions":{"reveiwer":"legacy"}}]}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "projects[0].instructions.reveiwer", "role must be one of: planner, worker, reviewer, fixer, sweeper")
+}
+
 func TestValidateProjectReviewerLabelCanBeClearedWhenDisabled(t *testing.T) {
 	falseValue := false
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
