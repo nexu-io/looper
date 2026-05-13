@@ -435,6 +435,7 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalReviewerCleanOverrideSet := false
+	canonicalReviewerEnableSelfReviewOverrideSet := false
 	canonicalFixerAuthorFilterOverrideSet := false
 
 	takeValue := func(index int, flag string) (string, int, error) {
@@ -761,6 +762,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-discovery-triggers-enable-self-review: %q is not a boolean", value)
 			}
 			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			canonicalReviewerEnableSelfReviewOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--reviewer-enable-self-review"):
 			value, nextIndex, err := takeValue(index, "--reviewer-enable-self-review")
@@ -771,7 +773,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-enable-self-review: %q is not a boolean", value)
 			}
-			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			if !canonicalReviewerEnableSelfReviewOverrideSet {
+				ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			}
 			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-blocking", "--reviewer-blocking-review-event"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-blocking")

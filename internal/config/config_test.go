@@ -520,6 +520,26 @@ func TestCanonicalFixerAuthorFilterCLIOverrideWinsOverFixAllPullRequestsRegardle
 	}
 }
 
+func TestCanonicalReviewerEnableSelfReviewCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":true}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-discovery-triggers-enable-self-review=false",
+		"--reviewer-enable-self-review=true",
+	})
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); got {
+		t.Fatalf("enableSelfReview with canonical then legacy flags = %v, want false", got)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-enable-self-review=true",
+		"--roles-reviewer-discovery-triggers-enable-self-review=false",
+	})
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); got {
+		t.Fatalf("enableSelfReview with legacy then canonical flags = %v, want false", got)
+	}
+}
+
 func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
 	testCases := []struct {
 		name         string
