@@ -580,6 +580,46 @@ func TestCanonicalReviewerLoopEnabledCLIOverrideWinsOverLegacyAliasRegardlessOfO
 	}
 }
 
+func TestCanonicalInstructionsEnabledCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"instructions":{"enabled":false}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--instructions-enabled=true",
+		"--no-custom-instructions=true",
+	})
+	if got := loaded.Config.Instructions.Enabled; !got {
+		t.Fatal("instructions enabled with canonical then legacy flags = false, want true")
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--no-custom-instructions=true",
+		"--instructions-enabled=true",
+	})
+	if got := loaded.Config.Instructions.Enabled; !got {
+		t.Fatal("instructions enabled with legacy then canonical flags = false, want true")
+	}
+}
+
+func TestCanonicalPackageAutoUpgradeCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"package":{"autoUpgradeEnabled":false}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--package-auto-upgrade-enabled=true",
+		"--no-auto-upgrade=true",
+	})
+	if got := loaded.Config.Package.AutoUpgradeEnabled; !got {
+		t.Fatal("package autoUpgradeEnabled with canonical then legacy flags = false, want true")
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--no-auto-upgrade=true",
+		"--package-auto-upgrade-enabled=true",
+	})
+	if got := loaded.Config.Package.AutoUpgradeEnabled; !got {
+		t.Fatal("package autoUpgradeEnabled with legacy then canonical flags = false, want true")
+	}
+}
+
 func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
 	testCases := []struct {
 		name         string

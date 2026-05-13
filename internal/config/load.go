@@ -434,6 +434,8 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
+	canonicalInstructionsEnabledOverrideSet := false
+	canonicalPackageAutoUpgradeOverrideSet := false
 	canonicalReviewerCleanOverrideSet := false
 	canonicalReviewerBlockingOverrideSet := false
 	canonicalReviewerLoopEnabledOverrideSet := false
@@ -487,7 +489,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 					index++
 				}
 			}
-			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+			if !canonicalInstructionsEnabledOverrideSet {
+				ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+			}
 		case matchesFlag(arg, "--instructions-enabled"):
 			value, nextIndex, err := takeValue(index, "--instructions-enabled")
 			if err != nil {
@@ -498,6 +502,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --instructions-enabled: %q is not a boolean", value)
 			}
 			ensureInstructionsConfig(&parsed.overrides).Enabled = parsedValue
+			canonicalInstructionsEnabledOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--no-auto-upgrade"):
 			disable := true
@@ -513,7 +518,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 					index++
 				}
 			}
-			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
+			if !canonicalPackageAutoUpgradeOverrideSet {
+				ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
+			}
 		case matchesFlag(arg, "--package-auto-upgrade-enabled"):
 			value, nextIndex, err := takeValue(index, "--package-auto-upgrade-enabled")
 			if err != nil {
@@ -524,6 +531,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
 			}
 			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = parsedValue
+			canonicalPackageAutoUpgradeOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--host"):
 			value, nextIndex, err := takeValue(index, "--host")
