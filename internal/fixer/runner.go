@@ -2173,6 +2173,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		case string(replyActionDeclined):
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
+			if replyState == "failed" {
+				mutationFailureCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+				continue
+			}
 			if replyState == "sent" {
 				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
 			}

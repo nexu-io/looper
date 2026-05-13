@@ -1517,11 +1517,14 @@ func TestRunResolveCommentsStepDoesNotPersistDeclinedFingerprintWhenReplyFails(t
 	}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
-	if err != nil {
-		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "Failed to resolve") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable mutation failure error", err)
 	}
-	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].ReplyState != "failed" {
-		t.Fatalf("resolved comments = %#v, want failed reply state", updated.ResolvedComments)
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "failed_mutation_retry" || updated.ResolvedComments.Items[0].ReplyState != "failed" {
+		t.Fatalf("resolved comments = %#v, want failed_mutation_retry with failed reply state", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyReplayStep {
+		t.Fatalf("updated.ResumePolicy = %q, want replay_step", updated.ResumePolicy)
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil {
