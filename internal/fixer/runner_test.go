@@ -727,6 +727,49 @@ func TestDiscoverPullRequestsRequeuesDeclinedThreadWhenHeadChanges(t *testing.T)
 	}
 }
 
+func TestDiscoverPullRequestsKeepsPausedZeroProgressLoopWhenOnlySuppressedDeclinesDiffer(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(80)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-80", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}, {"id": "c2", "threadId": "t2", "body": "please fix too", "threadFingerprint": "thread-hash-2"}}}
+	allFixItems := collectFixItems(detail)
+	declinedFingerprint := buildDeclinedThreadFingerprint(allFixItems[0], detail.HeadSHA)
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": zeroProgressPauseReason,
+		"fixerZeroProgress": map[string]any{
+			"headSha":           detail.HeadSHA,
+			"fixItemsHash":      hashFixItems(allFixItems),
+			"fixItemsStateHash": hashFixItemsState(allFixItems),
+			"consecutiveCount":  3,
+			"recordedAt":        nowISO,
+		},
+		"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already declined"}},
+	})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_declined_mixed", Seq: 94, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none when full fix-item state is unchanged", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_declined_mixed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused loop to remain paused", persisted)
+	}
+}
+
 func TestProcessClaimedItemAllowsNoCommitWhenCommentsAlreadyResolved(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1489,6 +1532,64 @@ func TestRunResolveCommentsStepDoesNotPersistDeclinedFingerprintWhenReplyFails(t
 	}
 	if got := suppressDeclinedFixItems(persisted.MetadataJSON, "new-head", fixItems); len(got) != 1 || got[0].ID != "c1" {
 		t.Fatalf("suppressDeclinedFixItems() = %#v, want original fix item after failed reply", got)
+	}
+}
+
+func TestRunResolveCommentsStepTreatsUnknownActionAsContractViolation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_invalid_action", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{FixItemsHash: hashFixItems(fixItems), ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: "decliend", Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %#v, want none for invalid action", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, agentInvalidThreadDecisionExplanation) {
+		t.Fatalf("reply calls = %#v, want invalid-action decline reply", github.replyCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if got := int(int64FromAny(meta["fixerContractViolationCount"])); got != 1 {
+		t.Fatalf("fixerContractViolationCount = %d, want 1", got)
 	}
 }
 
@@ -4143,6 +4244,15 @@ func TestParseReplyExplanationsPreservesDeclinedAction(t *testing.T) {
 	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
 	if len(got) != 1 || got[0].Action != string(replyActionDeclined) {
 		t.Fatalf("parseReplyExplanations() = %#v, want declined action", got)
+	}
+}
+
+func TestParseReplyExplanationsPreservesUnknownActionForContractViolationHandling(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"decliend","explanation":"already implemented"}]}`
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Action != "decliend" {
+		t.Fatalf("parseReplyExplanations() = %#v, want preserved unknown action", got)
 	}
 }
 

@@ -738,6 +738,7 @@ const maxReplyExplanationLength = 500
 
 const (
 	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
+	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
 	maxDeclinedThreadRecords              = 200
 	zeroProgressPauseReason               = "agent_zero_progress"
 )
@@ -801,7 +802,7 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		if threadID != "" && item.ThreadID != "" && threadID != item.ThreadID {
 			continue
 		}
-		action := normalizeReplyAction(raw.Action)
+		action := canonicalizeReplyAction(raw.Action)
 		if action == "" {
 			action = string(replyActionFixed)
 		}
@@ -830,6 +831,28 @@ func normalizeReplyAction(raw string) string {
 	default:
 		return ""
 	}
+}
+
+func parseReplyAction(raw string) (string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return "", true
+	}
+	action := normalizeReplyAction(raw)
+	if action == "" {
+		return "", false
+	}
+	return action, true
+}
+
+func canonicalizeReplyAction(raw string) string {
+	action, ok := parseReplyAction(raw)
+	if ok {
+		if action == "" {
+			return string(replyActionFixed)
+		}
+		return action
+	}
+	return strings.TrimSpace(raw)
 }
 
 // extractCompletionMarkerPayload mirrors the agent core's last-line scan but
@@ -1029,16 +1052,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		allFixItemsStateHash := hashFixItemsState(allFixItems)
 		fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, pr.Number), detail.HeadSHA, allFixItems)
 		if len(fixItems) == 0 {
-			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, hashFixItemsState(allFixItems)); err != nil {
+			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
 				return DiscoveryResult{}, err
 			}
 			result.Skipped++
 			continue
 		}
 		fixItemsHash := hashFixItems(fixItems)
-		fixItemsStateHash := hashFixItemsState(fixItems)
+		fixItemsStateHash := allFixItemsStateHash
 		unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
 		if len(unresolvedThreadIDs) == 0 {
 			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
@@ -2128,6 +2152,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if !ok {
 			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentMissingThreadDecisionExplanation}
 			contractViolationCount++
+		} else if _, validAction := parseReplyAction(decision.Action); !validAction {
+			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentInvalidThreadDecisionExplanation}
+			contractViolationCount++
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -2347,7 +2374,7 @@ func normalizeReplyExplanationActions(entries []replyExplanationEntry) []replyEx
 	}
 	out := make([]replyExplanationEntry, 0, len(entries))
 	for _, entry := range entries {
-		entry.Action = firstNonEmpty(normalizeReplyAction(entry.Action), string(replyActionFixed))
+		entry.Action = canonicalizeReplyAction(entry.Action)
 		out = append(out, entry)
 	}
 	return out
@@ -2380,7 +2407,7 @@ func agentResolveRepliesByFixItemID(checkpoint fixerCheckpoint) map[string]reply
 			continue
 		}
 		if _, exists := out[fixItemID]; !exists {
-			entry.Action = firstNonEmpty(normalizeReplyAction(entry.Action), string(replyActionFixed))
+			entry.Action = canonicalizeReplyAction(entry.Action)
 			out[fixItemID] = entry
 		}
 	}
@@ -2402,7 +2429,7 @@ func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]replyE
 			continue
 		}
 		if _, exists := out[threadID]; !exists {
-			entry.Action = firstNonEmpty(normalizeReplyAction(entry.Action), string(replyActionFixed))
+			entry.Action = canonicalizeReplyAction(entry.Action)
 			out[threadID] = entry
 		}
 	}
