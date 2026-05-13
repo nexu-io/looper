@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -52,12 +51,11 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 		Params: loaded.Config.Agent.Params,
 		Env:    loaded.Config.Agent.Env,
 	}
-	command, commandArgs := agent.ResolveSpawn(agentCfg, prompt)
-
 	cwd, err := r.getwd()
 	if err != nil {
 		return fmt.Errorf("resolve working directory: %w", err)
 	}
+	command, commandArgs := agent.ResolveSpawn(agentCfg, cwd, prompt)
 
 	runCtx, cancel := context.WithTimeout(cmd.Context(), feedbackCommandTimeout)
 	defer cancel()
@@ -68,14 +66,7 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 	process.Dir = cwd
 	process.Stdout = stdout
 	process.Stderr = stderr
-	process.Env = os.Environ()
-	for key, value := range loaded.Config.Agent.Env {
-		process.Env = append(process.Env, key+"="+value)
-	}
-	process.Env = append(process.Env,
-		"LOOPER_PROMPT="+prompt,
-		"LOOPER_COMPLETION_MARKER="+agent.CompletionMarkerPrefix,
-	)
+	process.Env = agent.BuildCommandEnv(cwd, prompt, loaded.Config.Agent.Env)
 
 	if err := process.Run(); err != nil {
 		return feedbackRunError(err, stdout.String(), stderr.String())

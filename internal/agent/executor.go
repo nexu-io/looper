@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +26,25 @@ const (
 	maxPersistedLogReadBytes = 16 * 1024 * 1024
 	completionMarkerEnv      = "LOOPER_COMPLETION_MARKER"
 )
+
+var unsafeAgentEnvKeys = []string{
+	"OLDPWD",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_CONFIG",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_COUNT",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_IMPLICIT_WORK_TREE",
+	"GIT_GRAFT_FILE",
+	"GIT_COMMON_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_NO_REPLACE_OBJECTS",
+	"GIT_REPLACE_REF_BASE",
+	"GIT_PREFIX",
+	"GIT_SHALLOW_FILE",
+}
 
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
@@ -200,22 +221,12 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
-	command, args := ResolveSpawnWithNativeResume(e.config, spawnPrompt, resume.SessionID, resume.Enabled)
+	command, args := ResolveSpawnWithNativeResume(e.config, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = os.Environ()
-	for key, value := range e.config.Env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	for key, value := range input.Env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	cmd.Env = append(cmd.Env,
-		"LOOPER_PROMPT="+spawnPrompt,
-		completionMarkerEnv+"="+CompletionMarkerPrefix,
-	)
+	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -253,21 +264,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
-			command, args = ResolveSpawn(e.config, input.Prompt)
+			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			cmd.Env = os.Environ()
-			for key, value := range e.config.Env {
-				cmd.Env = append(cmd.Env, key+"="+value)
-			}
-			for key, value := range input.Env {
-				cmd.Env = append(cmd.Env, key+"="+value)
-			}
-			cmd.Env = append(cmd.Env,
-				"LOOPER_PROMPT="+input.Prompt,
-				completionMarkerEnv+"="+CompletionMarkerPrefix,
-			)
+			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -606,21 +607,11 @@ func normalizeNativeResumeErrorLine(line string) string {
 }
 
 func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
-	command, args := ResolveSpawn(x.executor.config, x.input.Prompt)
+	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = os.Environ()
-	for key, value := range x.executor.config.Env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	for key, value := range x.input.Env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	cmd.Env = append(cmd.Env,
-		"LOOPER_PROMPT="+x.input.Prompt,
-		completionMarkerEnv+"="+CompletionMarkerPrefix,
-	)
+	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
@@ -1080,18 +1071,18 @@ func (w *streamCapture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func ResolveSpawn(cfg ExecutorConfig, prompt string) (string, []string) {
+func ResolveSpawn(cfg ExecutorConfig, workingDirectory string, prompt string) (string, []string) {
 	command := resolveCommand(cfg)
-	args := resolveArgs(cfg, prompt)
+	args := resolveArgs(cfg, workingDirectory, prompt)
 	return command, args
 }
 
-func ResolveSpawnWithNativeResume(cfg ExecutorConfig, prompt string, sessionID string, enabled bool) (string, []string) {
+func ResolveSpawnWithNativeResume(cfg ExecutorConfig, workingDirectory string, prompt string, sessionID string, enabled bool) (string, []string) {
 	if !enabled || strings.TrimSpace(sessionID) == "" || !nativeResumeSupported(cfg.Vendor) {
-		return ResolveSpawn(cfg, prompt)
+		return ResolveSpawn(cfg, workingDirectory, prompt)
 	}
 	command := resolveCommand(cfg)
-	args := resolveNativeResumeArgs(cfg, stringArgs(cfg.Params["args"]), strings.TrimSpace(sessionID), prompt)
+	args := resolveNativeResumeArgs(cfg, workingDirectory, stringArgs(cfg.Params["args"]), strings.TrimSpace(sessionID), prompt)
 	return command, args
 }
 
@@ -1109,7 +1100,7 @@ func resolveCommand(cfg ExecutorConfig) string {
 	}
 }
 
-func resolveArgs(cfg ExecutorConfig, prompt string) []string {
+func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []string {
 	resolvedArgs := stringArgs(cfg.Params["args"])
 	switch cfg.Vendor {
 	case config.AgentVendorClaudeCode:
@@ -1117,7 +1108,7 @@ func resolveArgs(cfg ExecutorConfig, prompt string) []string {
 	case config.AgentVendorCodex:
 		return resolveCodexArgs(cfg, resolvedArgs, prompt)
 	case config.AgentVendorOpenCode:
-		return resolveOpenCodeArgs(cfg, resolvedArgs, prompt)
+		return resolveOpenCodeArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	case config.AgentVendorCursorCLI:
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
 	default:
@@ -1148,10 +1139,13 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	return append(withModel, prompt)
 }
 
-func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
 	resolved := append([]string{}, args...)
 	if !containsArg(resolved, "run") {
 		resolved = append([]string{"run"}, resolved...)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
+		resolved = appendDirFlag(resolved, workingDirectory)
 	}
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-p", "--prompt", "-f", "--file"}) {
@@ -1168,7 +1162,7 @@ func resolveCursorArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 	return append(resolved, "--print", prompt)
 }
 
-func resolveNativeResumeArgs(cfg ExecutorConfig, args []string, sessionID string, prompt string) []string {
+func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
 	switch cfg.Vendor {
 	case config.AgentVendorClaudeCode:
 		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
@@ -1194,11 +1188,14 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, args []string, sessionID string
 		return append(base, prompt)
 	case config.AgentVendorOpenCode:
 		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model", "-m"})
-		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
-			resolved = append(resolved, "--session", sessionID)
-		}
 		if !containsArg(resolved, "run") {
 			resolved = append([]string{"run"}, resolved...)
+		}
+		if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
+			resolved = appendDirFlag(resolved, workingDirectory)
+		}
+		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
+			resolved = append(resolved, "--session", sessionID)
 		}
 		if !hasAnyFlag(resolved, []string{"-p", "--prompt", "-f", "--file"}) {
 			resolved = append(resolved, prompt)
@@ -1216,6 +1213,63 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, args []string, sessionID string
 	default:
 		return append([]string{}, args...)
 	}
+}
+
+func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
+	envMap := envSliceToMap(os.Environ())
+	for _, source := range envSources {
+		maps.Copy(envMap, source)
+	}
+	for _, key := range unsafeAgentEnvKeys {
+		delete(envMap, key)
+	}
+	if strings.TrimSpace(workingDirectory) != "" {
+		envMap["PWD"] = workingDirectory
+	}
+	envMap["LOOPER_PROMPT"] = prompt
+	envMap[completionMarkerEnv] = CompletionMarkerPrefix
+	return envMapToSlice(envMap)
+}
+
+func BuildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
+	return buildCommandEnv(workingDirectory, prompt, envSources...)
+}
+
+func envSliceToMap(env []string) map[string]string {
+	envMap := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		envMap[key] = value
+	}
+	return envMap
+}
+
+func envMapToSlice(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	resolved := make([]string, 0, len(keys))
+	for _, key := range keys {
+		resolved = append(resolved, key+"="+env[key])
+	}
+	return resolved
+}
+
+func appendDirFlag(args []string, workingDirectory string) []string {
+	for idx, arg := range args {
+		if arg != "run" {
+			continue
+		}
+		resolved := append([]string{}, args[:idx+1]...)
+		resolved = append(resolved, "--dir", workingDirectory)
+		return append(resolved, args[idx+1:]...)
+	}
+	return append([]string{"--dir", workingDirectory}, args...)
 }
 
 func prependModelFlag(args []string, model *string, flag string, recognizedFlags []string) []string {

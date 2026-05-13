@@ -19,7 +19,8 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	t.Parallel()
 
 	model := "gpt-5"
-	command, args := ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorClaudeCode, Model: &model}, "hello")
+	workDir := "/tmp/looper-worktree"
+	command, args := ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorClaudeCode, Model: &model}, workDir, "hello")
 	if command != "claude" {
 		t.Fatalf("claude command = %q, want claude", command)
 	}
@@ -27,7 +28,7 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 		t.Fatalf("claude args = %#v, want --model <model> --print <prompt>", args)
 	}
 
-	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex, Model: &model}, "hello")
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex, Model: &model}, workDir, "hello")
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
@@ -35,15 +36,15 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 		t.Fatalf("codex args = %#v, want exec --model <model> <prompt>", args)
 	}
 
-	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorOpenCode, Model: &model}, "hello")
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorOpenCode, Model: &model}, workDir, "hello")
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if len(args) < 4 || args[0] != "run" || args[1] != "--model" || args[len(args)-1] != "hello" {
-		t.Fatalf("opencode args = %#v, want run --model <model> <prompt>", args)
+	if len(args) < 6 || args[0] != "run" || args[1] != "--model" || args[3] != "--dir" || args[4] != workDir || args[len(args)-1] != "hello" {
+		t.Fatalf("opencode args = %#v, want run --model <model> --dir <cwd> <prompt>", args)
 	}
 
-	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCursorCLI, Model: &model}, "hello")
+	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCursorCLI, Model: &model}, workDir, "hello")
 	if command != "agent" {
 		t.Fatalf("cursor command = %q, want agent", command)
 	}
@@ -60,7 +61,7 @@ func TestResolveSpawnCodexDoesNotDuplicateExecSubcommand(t *testing.T) {
 		Vendor: config.AgentVendorCodex,
 		Model:  &model,
 		Params: map[string]any{"args": []any{"--profile", "test", "exec"}},
-	}, "hello")
+	}, "/tmp/looper-worktree", "hello")
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
@@ -77,12 +78,12 @@ func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 		Vendor: config.AgentVendorOpenCode,
 		Model:  &model,
 		Params: map[string]any{"args": []any{"--profile", "test", "run"}},
-	}, "hello")
+	}, "/tmp/looper-worktree", "hello")
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if strings.Join(args, " ") != "--model gpt-5 --profile test run hello" {
-		t.Fatalf("opencode args = %#v, want single run subcommand preserved", args)
+	if strings.Join(args, " ") != "--model gpt-5 --profile test run --dir /tmp/looper-worktree hello" {
+		t.Fatalf("opencode args = %#v, want single run subcommand preserved with --dir", args)
 	}
 }
 
@@ -96,14 +97,14 @@ func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
 	}{
 		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello --dangerously-skip-permissions"},
 		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
-		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --session session-123 hello"},
+		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --session session-123 hello"},
 		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, args := ResolveSpawnWithNativeResume(ExecutorConfig{Vendor: tc.vendor}, "hello", "session-123", true)
+			_, args := ResolveSpawnWithNativeResume(ExecutorConfig{Vendor: tc.vendor}, "/tmp/looper-worktree", "hello", "session-123", true)
 			if got := strings.Join(args, " "); got != tc.want {
 				t.Fatalf("args = %q, want %q", got, tc.want)
 			}
@@ -119,7 +120,7 @@ func TestResolveSpawnWithNativeResumeCodexPreservesExecOptions(t *testing.T) {
 		Vendor: config.AgentVendorCodex,
 		Model:  &model,
 		Params: map[string]any{"args": []any{"exec", "--json", "--sandbox", "workspace-write"}},
-	}, "hello", "session-123", true)
+	}, "/tmp/looper-worktree", "hello", "session-123", true)
 	if got, want := strings.Join(args, " "), "exec --model gpt-5 --json --sandbox workspace-write resume session-123 hello"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
@@ -133,9 +134,103 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 		Vendor: config.AgentVendorOpenCode,
 		Model:  &model,
 		Params: map[string]any{"args": []any{"run", "--model=gpt-4", "--session=existing", "--prompt=from-args"}},
-	}, "hello", "session-123", true)
-	if got, want := strings.Join(args, " "), "run --model=gpt-4 --session=existing --prompt=from-args"; got != want {
+	}, "/tmp/looper-worktree", "hello", "session-123", true)
+	if got, want := strings.Join(args, " "), "run --dir /tmp/looper-worktree --model=gpt-4 --session=existing --prompt=from-args"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestBuildCommandEnvSanitizesInheritedCWDAndGitOverrides(t *testing.T) {
+	t.Setenv("PWD", "/Users/mrc/Projects/looper")
+	t.Setenv("OLDPWD", "/Users/mrc")
+	t.Setenv("GIT_DIR", "/tmp/unsafe-git-dir")
+	t.Setenv("GIT_WORK_TREE", "/tmp/unsafe-git-worktree")
+	t.Setenv("GIT_PREFIX", "unsafe-prefix")
+	t.Setenv("KEEP_ME", "1")
+
+	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{"CONFIG_ONLY": "true", "PWD": "/tmp/config-override", "GIT_DIR": "/tmp/config-git-dir"}, map[string]string{"INPUT_ONLY": "yes", "OLDPWD": "/tmp/input-oldpwd"}))
+
+	if got := env["PWD"]; got != "/tmp/worktree" {
+		t.Fatalf("PWD = %q, want /tmp/worktree", got)
+	}
+	for _, key := range unsafeAgentEnvKeys {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s present in sanitized env, want removed", key)
+		}
+	}
+	if got := env["KEEP_ME"]; got != "1" {
+		t.Fatalf("KEEP_ME = %q, want inherited value", got)
+	}
+	if got := env["CONFIG_ONLY"]; got != "true" {
+		t.Fatalf("CONFIG_ONLY = %q, want true", got)
+	}
+	if got := env["INPUT_ONLY"]; got != "yes" {
+		t.Fatalf("INPUT_ONLY = %q, want yes", got)
+	}
+	if got := env["LOOPER_PROMPT"]; got != "hello" {
+		t.Fatalf("LOOPER_PROMPT = %q, want hello", got)
+	}
+	if got := env[completionMarkerEnv]; got != CompletionMarkerPrefix {
+		t.Fatalf("%s = %q, want %q", completionMarkerEnv, got, CompletionMarkerPrefix)
+	}
+}
+
+func TestExecutorStartSanitizesChildEnvAndUsesWorkingDirectory(t *testing.T) {
+	t.Setenv("PWD", "/Users/mrc/Projects/looper")
+	t.Setenv("OLDPWD", "/Users/mrc")
+	t.Setenv("GIT_DIR", "/tmp/unsafe-git-dir")
+	t.Setenv("GIT_PREFIX", "unsafe-prefix")
+
+	workDir := t.TempDir()
+	scriptDir := t.TempDir()
+	outputPath := filepath.Join(scriptDir, "child.json")
+	scriptPath := filepath.Join(scriptDir, "dump-env")
+	script := "#!/bin/sh\nactual_cwd=$(pwd)\nprintf '{\"pwd\":\"%s\",\"oldpwd\":\"%s\",\"git_dir\":\"%s\",\"looper_prompt\":\"%s\",\"cwd\":\"%s\"}\n' \"$PWD\" \"$OLDPWD\" \"$GIT_DIR\" \"$LOOPER_PROMPT\" \"$actual_cwd\" > \"$OUTPUT_PATH\"\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\n'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": scriptPath}}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_env", WorkingDirectory: workDir, Prompt: "ignored", Timeout: time.Second, Env: map[string]string{"OUTPUT_PATH": outputPath, "PWD": "/tmp/input-override", "GIT_DIR": "/tmp/input-git-dir", "OLDPWD": "/tmp/input-oldpwd"}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result.Status = %q, want completed", result.Status)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(outputPath) error = %v", err)
+	}
+	var observed struct {
+		PWD          string `json:"pwd"`
+		OLDPWD       string `json:"oldpwd"`
+		GitDir       string `json:"git_dir"`
+		LooperPrompt string `json:"looper_prompt"`
+		CWD          string `json:"cwd"`
+	}
+	if err := json.Unmarshal(data, &observed); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v, data=%q", err, string(data))
+	}
+	if observed.PWD != workDir {
+		t.Fatalf("child PWD = %q, want %q", observed.PWD, workDir)
+	}
+	if observed.CWD != workDir {
+		t.Fatalf("child cwd = %q, want %q", observed.CWD, workDir)
+	}
+	if observed.OLDPWD != "" {
+		t.Fatalf("child OLDPWD = %q, want empty", observed.OLDPWD)
+	}
+	if observed.GitDir != "" {
+		t.Fatalf("child GIT_DIR = %q, want empty", observed.GitDir)
+	}
+	if observed.LooperPrompt != "ignored" {
+		t.Fatalf("child LOOPER_PROMPT = %q, want ignored", observed.LooperPrompt)
 	}
 }
 
