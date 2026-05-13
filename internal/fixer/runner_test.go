@@ -4225,6 +4225,56 @@ func TestClearFixerFollowupMetadataPreservesZeroProgressPauseReason(t *testing.T
 	}
 }
 
+func TestRecordZeroProgressSuccessResetsCountWhenFixItemStateChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(82)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_zero_progress_state_reset", Seq: 96, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: baseItems, FixItemsHash: hashFixItems(baseItems)}
+	for i := 0; i < 2; i++ {
+		paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, checkpoint)
+		if err != nil {
+			t.Fatalf("recordZeroProgressSuccess() error = %v", err)
+		}
+		if paused {
+			t.Fatalf("recordZeroProgressSuccess() paused early on run %d", i+1)
+		}
+	}
+
+	changedItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-2"}}
+	changedCheckpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: changedItems, FixItemsHash: hashFixItems(changedItems)}
+	paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, changedCheckpoint)
+	if err != nil {
+		t.Fatalf("recordZeroProgressSuccess() changed state error = %v", err)
+	}
+	if paused {
+		t.Fatal("recordZeroProgressSuccess() = true, want streak reset when fix-item state changes")
+	}
+
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseZeroProgressState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatal("parseZeroProgressState() = false, want persisted zero-progress state")
+	}
+	if state.ConsecutiveCount != 1 {
+		t.Fatalf("ConsecutiveCount = %d, want 1 after state change", state.ConsecutiveCount)
+	}
+	if state.FixItemsStateHash != hashFixItemsState(changedItems) {
+		t.Fatalf("FixItemsStateHash = %q, want %q", state.FixItemsStateHash, hashFixItemsState(changedItems))
+	}
+}
+
 func TestParseReplyExplanationsMalformedFallsBack(t *testing.T) {
 	t.Parallel()
 	if got := parseReplyExplanations("__LOOPER_RESULT__={bad json}", "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}); got != nil {

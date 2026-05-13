@@ -3814,7 +3814,7 @@ func (r *Runner) recordZeroProgressSuccess(ctx context.Context, loop storage.Loo
 		ConsecutiveCount:  1,
 		RecordedAt:        r.nowISO(),
 	}
-	if previous.HeadSHA == current.HeadSHA && previous.FixItemsHash == current.FixItemsHash {
+	if previous.HeadSHA == current.HeadSHA && previous.FixItemsHash == current.FixItemsHash && previous.FixItemsStateHash == current.FixItemsStateHash {
 		current.ConsecutiveCount = previous.ConsecutiveCount + 1
 	}
 	updatedLoop, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerZeroProgress": current})
