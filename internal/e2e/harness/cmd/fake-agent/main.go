@@ -69,6 +69,23 @@ func main() {
 		mustRun(gitPath, "commit", "-m", "fake agent commit")
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
 		printCompletion(marker, map[string]any{"summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}})
+	case "commit-with-review-replies":
+		path := envOr(envFakeAgentWriteFile, "fix-target.txt")
+		mustWriteFile(path, []byte("fixed by fake agent\n"))
+		gitPath := envOr(envFakeAgentGitPath, "git")
+		mustRun(gitPath, "add", path)
+		mustRun(gitPath, "commit", "-m", "fake agent commit")
+		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
+		printCompletion(marker, map[string]any{
+			"summary":      "fake agent committed changes",
+			"changedFiles": []string{path},
+			"commits":      []string{sha},
+			"review_thread_replies": []map[string]any{{
+				"fixItemId":   "comment-1",
+				"threadId":    "thread-1",
+				"explanation": "Updated fix-target.txt to address the review feedback.",
+			}},
+		})
 	case "transient-failure":
 		statePath := strings.TrimSpace(os.Getenv(envFakeAgentStatePath))
 		if firstRun(statePath) {

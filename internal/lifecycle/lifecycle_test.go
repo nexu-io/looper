@@ -36,7 +36,7 @@ func TestMergeAgentPreservesFallbackMetadata(t *testing.T) {
 	state.Actions.PR = ActionSourceFallback
 	state.PRNumber = 84
 
-	agent := &State{CommitSHAs: []string{"abc123"}, Pushed: true, Actions: Actions{Commit: ActionSourceAgent, Push: ActionSourceAgent}}
+	agent := &State{Branch: "fix/test", BaseBranch: "main", CommitSHAs: []string{"abc123"}, Pushed: true, Actions: Actions{Commit: ActionSourceAgent, Push: ActionSourceAgent}}
 	state.MergeAgent(agent, "2026-04-26T00:00:00.000Z")
 
 	if state.Actions.PR != ActionSourceFallback || state.PRNumber != 84 {
@@ -44,6 +44,19 @@ func TestMergeAgentPreservesFallbackMetadata(t *testing.T) {
 	}
 	if state.Actions.Commit != ActionSourceAgent || state.Actions.Push != ActionSourceAgent || state.AgentIngestedAt == "" {
 		t.Fatalf("merged agent metadata = %#v, want agent commit/push", state)
+	}
+	if state.PlannedBranch != "looper/test" || state.AgentBranch != "fix/test" || state.ActiveBranch != "looper/test" || state.BranchProvenance != BranchProvenancePlanned {
+		t.Fatalf("merged branch provenance = %#v, want planned branch preserved alongside agent branch", state)
+	}
+}
+
+func TestStateSetActiveBranchMarksAgentMigration(t *testing.T) {
+	state := NewState(AgentManagedWithFallbackPolicy("worker", true), "looper/test", "main")
+	state.RecordAgentBranch("fix/test", "main")
+	state.SetActiveBranch("fix/test", "main", BranchProvenanceAgentMigrated)
+
+	if state.PlannedBranch != "looper/test" || state.AgentBranch != "fix/test" || state.ActiveBranch != "fix/test" || state.BranchProvenance != BranchProvenanceAgentMigrated {
+		t.Fatalf("state = %#v, want migrated active branch with provenance", state)
 	}
 }
 

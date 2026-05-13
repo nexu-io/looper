@@ -2537,6 +2537,128 @@ func TestProcessClaimedItemFindsExistingPRAfterPushAndStampsWorkerDisclosure(t *
 	}
 }
 
+func TestProcessClaimedItemAdoptsAgentCreatedPROnMigratedBranch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	plannedBranch := "looper/feature"
+	agentBranch := "fix/migrated-branch"
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: plannedBranch, BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: agentBranch, BaseRefName: "main", HeadSHA: "agentsha"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: agentBranch, BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 311 {
+		t.Fatalf("result = %#v, want success with adopted PR 311", result)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 || len(github.compareCalls) != 0 {
+		t.Fatalf("push/createPR/compare = %d/%d/%d, want 0/0/0 after lifecycle adoption", len(git.pushCalls), len(github.createPRCalls), len(github.compareCalls))
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if checkpoint.Lifecycle == nil || checkpoint.Lifecycle.PlannedBranch != plannedBranch || checkpoint.Lifecycle.AgentBranch != agentBranch || checkpoint.Lifecycle.ActiveBranch != agentBranch || checkpoint.Lifecycle.BranchProvenance != lifecycle.BranchProvenanceAgentMigrated || !checkpoint.Lifecycle.Pushed || checkpoint.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
+		t.Fatalf("checkpoint lifecycle = %#v, want adopted migrated branch lifecycle", checkpoint.Lifecycle)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint.SkipReason = %q, want empty", checkpoint.SkipReason)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.PRNumber == nil || *loop.PRNumber != 311 {
+		t.Fatalf("loop = %#v, want adopted PR persisted", loop)
+	}
+}
+
+func TestProcessClaimedItemFailsWithSpecificReasonWhenMigratedPRBaseMismatches(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: "fix/migrated-branch", BaseRefName: "release", HeadSHA: "agentsha"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: "fix/migrated-branch", BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "Agent created PR #311 on branch fix/migrated-branch but worker could not adopt it: expected base main, got release") {
+		t.Fatalf("result = %#v, want specific manual-intervention adoption failure", result)
+	}
+	if strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result.Summary = %q, want migrated-PR adoption reason instead of no-ahead skip", result.Summary)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 || len(github.compareCalls) != 0 {
+		t.Fatalf("push/createPR/compare = %d/%d/%d, want 0/0/0 after rejection", len(git.pushCalls), len(github.createPRCalls), len(github.compareCalls))
+	}
+}
+
+func TestProcessClaimedItemFailsWithSpecificReasonWhenMigratedPRHeadSHAMismatches(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "OPEN", HeadRefName: "fix/migrated-branch", BaseRefName: "main", HeadSHA: "unexpected"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", Lifecycle: &lifecycle.State{Branch: "fix/migrated-branch", BaseBranch: "main", CommitSHAs: []string{"agentsha"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "PR head unexpected does not match lifecycle commits") {
+		t.Fatalf("result = %#v, want specific SHA-mismatch adoption failure", result)
+	}
+	if strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result.Summary = %q, want migrated-PR adoption reason instead of no-ahead skip", result.Summary)
+	}
+}
+
+func TestLifecycleAgentCreatedPullRequestSkipsHardFailureForSameBranchRejectedPRs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		detail PullRequestDetail
+		state  *lifecycle.State
+	}{
+		{
+			name:   "closed PR",
+			detail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "closed", HeadRefName: "feature/pr-311", BaseRefName: "main"},
+			state:  &lifecycle.State{PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}},
+		},
+		{
+			name:   "base mismatch",
+			detail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "open", HeadRefName: "feature/pr-311", BaseRefName: "release"},
+			state:  &lifecycle.State{PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runner := New(Options{GitHub: &fakeGitHubGateway{prDetail: tt.detail}, Git: &fakeGitGateway{}})
+			pr, branch, ok, err := runner.lifecycleAgentCreatedPullRequest(context.Background(), "loop-1", "acme/looper", tt.state, "feature/pr-311", "main", t.TempDir())
+			if err != nil {
+				t.Fatalf("lifecycleAgentCreatedPullRequest() error = %v", err)
+			}
+			if ok {
+				t.Fatalf("lifecycleAgentCreatedPullRequest() ok = true, want false with pr=%#v branch=%q", pr, branch)
+			}
+		})
+	}
+}
+
 func TestProcessClaimedItemFailsWhenCreatedPRNumberIsMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2827,7 +2949,7 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	prNumber := int64(555)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/555", Body: "## Summary\n\nLifecycle-created body", BaseRefName: "main", HeadRefName: "feature/pr-555"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/555", State: "open", Body: "## Summary\n\nLifecycle-created body", BaseRefName: "main", HeadRefName: "feature/pr-555"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -2836,11 +2958,18 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queueItem, err)
+	}
 	checkpoint := workerCheckpoint{
-		Work:        &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
-		Worktree:    &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
-		Validation:  &ValidationResult{Passed: true, Summary: "ok"},
-		PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/555"},
+		Work:       &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
 			PolicyVersion: lifecycle.PolicyVersion,
@@ -2852,7 +2981,7 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
 		},
 	}
-	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1"}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+	input := stepInput{Project: *project, Loop: *loop, QueueItem: *queueItem, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
 
 	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
 	if err != nil {
@@ -2870,6 +2999,219 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	}
 	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber {
 		t.Fatalf("checkpointAfter.PullRequest = %#v, want preserved PR", checkpointAfter.PullRequest)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID(updated) = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.PRNumber == nil || *updatedLoop.PRNumber != prNumber {
+		t.Fatalf("updatedLoop.PRNumber = %#v, want %d", updatedLoop.PRNumber, prNumber)
+	}
+}
+
+func TestRunOpenPRStepLeavesPushExistingAgentPRBodyUntouchedWithoutExistingFooter(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(556)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/556", State: "open", Title: "Existing PR", Body: "## Summary\n\nAgent-created body", BaseRefName: "main", HeadRefName: "feature/pr-556"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR agent-created", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-556"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-556", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_556"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-556",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/556",
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1", Repo: stringPtr("acme/looper"), TargetType: "pull_request", PRNumber: &prNumber}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for push-existing PR", github.updatePRBodyCalls)
+	}
+	if checkpointAfter.Lifecycle == nil || checkpointAfter.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want agent PR action preserved", checkpointAfter.Lifecycle)
+	}
+}
+
+func TestRunOpenPRStepUsesPersistedPRWhenLifecycleLookupFailsOnResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(558)
+	now := fixture.nowISO()
+	loopTarget := "pr:acme/looper:558"
+	loopMeta := `{"worker":{"title":"Existing PR lifecycle error","repo":"acme/looper","baseBranch":"main"},"prUrl":"https://example/pr/558"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	viewErr := errors.New("temporary gh failure")
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{viewPRErr: viewErr}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, Disclosure: &disclosureCfg})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queueItem, err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR lifecycle error", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-558"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-558", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_558"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-558",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/558",
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: *loop, QueueItem: *queueItem, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber || checkpointAfter.PullRequest.URL != "https://example/pr/558" {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want persisted PR reference", checkpointAfter.PullRequest)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.viewPRCalls) != 1 {
+		t.Fatalf("viewPRCalls = %#v, want single lifecycle lookup", github.viewPRCalls)
+	}
+}
+
+func TestRunOpenPRStepUsesPersistedPRWhenLifecycleAdoptionRejectsOnResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(559)
+	now := fixture.nowISO()
+	loopTarget := "pr:acme/looper:559"
+	loopMeta := `{"worker":{"title":"Existing PR lifecycle rejection","repo":"acme/looper","baseBranch":"main"},"prUrl":"https://example/pr/559"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_559", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/559", State: "open", HeadRefName: "fix/migrated-pr-559", BaseRefName: "release", HeadSHA: "agentsha"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, Disclosure: &disclosureCfg})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_559", LoopID: "loop_worker_559", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_559")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queueItem, err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR lifecycle rejection", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-559"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-559", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_559"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-559",
+			BaseBranch:    "main",
+			CommitSHAs:    []string{"agentsha"},
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/559",
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: *loop, QueueItem: *queueItem, Run: storage.RunRecord{ID: "run_worker_559"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != prNumber || checkpointAfter.PullRequest.URL != "https://example/pr/559" {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want persisted PR reference", checkpointAfter.PullRequest)
+	}
+	if checkpointAfter.SkipReason != "" {
+		t.Fatalf("checkpointAfter.SkipReason = %q, want empty", checkpointAfter.SkipReason)
+	}
+}
+
+func TestRunOpenPRStepPreservesAdoptedPushExistingPRWithoutExistingFooter(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(557)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{prDetail: PullRequestDetail{Number: prNumber, URL: "https://example/pr/557", Title: "Existing PR", Body: "## Summary\n\nHuman-authored body", BaseRefName: "main", HeadRefName: "feature/pr-557"}}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepOpenPR)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR adopted", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-557"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-557", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_557"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-557",
+			BaseBranch:    "main",
+			Pushed:        true,
+			PRNumber:      prNumber,
+			PRURL:         "https://example/pr/557",
+			PRAdopted:     true,
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent},
+		},
+	}
+	input := stepInput{Project: *project, Loop: storage.LoopRecord{ID: "loop_worker_1", ProjectID: "project_1", Repo: stringPtr("acme/looper"), TargetType: "pull_request", PRNumber: &prNumber}, Run: storage.RunRecord{ID: "run_worker_1"}, Checkpoint: checkpoint}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	github := runner.github.(*fakeGitHubGateway)
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for adopted PR", github.updatePRBodyCalls)
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.PRAdopted {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want adopted PR preserved", checkpointAfter.Lifecycle)
 	}
 }
 
@@ -2931,6 +3273,7 @@ type fakeGitHubGateway struct {
 	openPRIndex             int
 	prDetail                PullRequestDetail
 	prDetailResponses       []PullRequestDetail
+	viewPRErr               error
 	viewPRIndex             int
 	issueDetail             IssueDetail
 	issueDetailResponses    []IssueDetail
@@ -2984,6 +3327,9 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRe
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	f.viewPRCalls = append(f.viewPRCalls, input)
+	if f.viewPRErr != nil {
+		return PullRequestDetail{}, f.viewPRErr
+	}
 	detail := f.prDetail
 	if f.viewPRIndex < len(f.prDetailResponses) {
 		detail = f.prDetailResponses[f.viewPRIndex]

@@ -61,7 +61,7 @@ func TestScenarioResolveCommentsRefreshesPRHeadAfterPush(t *testing.T) {
 			},
 		},
 	})
-	cfg := fixerConfigWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, port, "commit")
+	cfg := fixerConfigWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, port, "commit-with-review-replies")
 	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
 	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, fakeGH.EnvMap(), cfg.Server.Host, cfg.Server.Port)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -164,7 +164,7 @@ func TestScenarioResolveCommentsSkipsClosedPullRequest(t *testing.T) {
 	proc.Stop(context.Background())
 }
 
-func TestScenarioResolveCommentsFailsWhenNoNewCommitLeavesThreadsUnresolved(t *testing.T) {
+func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	home := harness.NewTempHome(t)
 	repo := harness.CreateSeededRepo(t, "git")
@@ -221,12 +221,12 @@ func TestScenarioResolveCommentsFailsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 	}
 	client.post(t, "/api/v1/loops", map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": "acme/looper", "prNumber": 42}, &created)
 	run := waitForRunTerminal(t, client, created.ID, 30*time.Second)
-	if run.Status != "failed" {
-		t.Fatalf("run status = %s, want failed no-op resolve path (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
+	if run.Status != "success" {
+		t.Fatalf("run status = %s, want success no-op resolve path (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
 	}
 	checkpoint := parseJSONObject(t, run.CheckpointJSON)
-	if got, _ := checkpoint["resumePolicy"].(string); got != "restart_from_discover" {
-		t.Fatalf("resumePolicy = %q, want restart_from_discover", got)
+	if got, _ := checkpoint["resumePolicy"].(string); got != "advance_from_checkpoint" {
+		t.Fatalf("resumePolicy = %q, want advance_from_checkpoint", got)
 	}
 	push, _ := checkpoint["push"].(map[string]any)
 	if push == nil || push["pushed"] != false {
@@ -235,19 +235,18 @@ func TestScenarioResolveCommentsFailsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 	if reason, _ := push["skippedReason"].(string); !strings.Contains(reason, "No new commits") {
 		t.Fatalf("push.skippedReason = %q, want no-new-commits skip", reason)
 	}
-	if checkpoint["resolvedComments"] != nil {
-		t.Fatalf("resolvedComments = %#v, want unresolved threads left untouched", checkpoint["resolvedComments"])
+	resolvedComments, _ := checkpoint["resolvedComments"].(map[string]any)
+	items, _ := resolvedComments["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
+	}
+	first, _ := items[0].(map[string]any)
+	if first["status"] != "skipped_agent_declined" {
+		t.Fatalf("resolvedComments item = %#v, want skipped_agent_declined", first)
 	}
 	loop := loadSingleLoop(t, client, created.ID)
-	if loop.Status != "queued" {
-		t.Fatalf("loop status = %s, want queued for rediscovery retry", loop.Status)
-	}
-	loopMeta := parseJSONObject(t, loop.MetadataJSON)
-	if got, _ := loopMeta["lastNoopResolveHeadSha"].(string); got != featureHead {
-		t.Fatalf("lastNoopResolveHeadSha = %q, want %s", got, featureHead)
-	}
-	if got, _ := loopMeta["lastNoopResolveFixItemsHash"].(string); got == "" {
-		t.Fatal("lastNoopResolveFixItemsHash = empty, want captured unresolved-thread snapshot")
+	if loop.Status != "completed" {
+		t.Fatalf("loop status = %s, want completed after no-op resolve", loop.Status)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]
@@ -257,7 +256,7 @@ func TestScenarioResolveCommentsFailsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 	proc.Stop(context.Background())
 }
 
-func TestScenarioResolveCommentsFailsWhenNoPushRerunHasStaleHead(t *testing.T) {
+func TestScenarioResolveCommentsIgnoresStaleNoPushMetadataAndLeavesThreadsUnresolved(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	home := harness.NewTempHome(t)
 	repo := harness.CreateSeededRepo(t, "git")
@@ -330,19 +329,29 @@ func TestScenarioResolveCommentsFailsWhenNoPushRerunHasStaleHead(t *testing.T) {
 	}
 	client.post(t, "/api/v1/loops/"+created.ID+"/start", nil, &started)
 	run := waitForRunTerminal(t, client, created.ID, 30*time.Second)
-	if run.Status != "failed" {
-		t.Fatalf("run status = %s, want stale-head failure (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
-	}
-	if run.ErrorMessage == nil || !strings.Contains(*run.ErrorMessage, "PR head changed before resolving comments") {
-		t.Fatalf("error message = %v, want stale-head resolve-comments failure", run.ErrorMessage)
+	if run.Status != "success" {
+		t.Fatalf("run status = %s, want success for stale no-push metadata (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
 	}
 	checkpoint := parseJSONObject(t, run.CheckpointJSON)
-	if checkpoint["resolvedComments"] != nil {
-		t.Fatalf("resolvedComments = %#v, want no resolved threads on stale head", checkpoint["resolvedComments"])
+	push, _ := checkpoint["push"].(map[string]any)
+	if push == nil || push["pushed"] != false {
+		t.Fatalf("checkpoint.push = %#v, want pushed=false", push)
+	}
+	if reason, _ := push["skippedReason"].(string); !strings.Contains(reason, "No new commits") {
+		t.Fatalf("push.skippedReason = %q, want no-new-commits skip", reason)
+	}
+	resolvedComments, _ := checkpoint["resolvedComments"].(map[string]any)
+	items, _ := resolvedComments["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
+	}
+	first, _ := items[0].(map[string]any)
+	if first["status"] != "skipped_agent_declined" {
+		t.Fatalf("resolvedComments item = %#v, want skipped_agent_declined", first)
 	}
 	loop := loadSingleLoop(t, client, created.ID)
-	if loop.Status != "queued" {
-		t.Fatalf("loop status = %s, want queued after stale-head retry", loop.Status)
+	if loop.Status != "completed" {
+		t.Fatalf("loop status = %s, want completed after stale no-push metadata", loop.Status)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]

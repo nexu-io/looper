@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -207,26 +206,29 @@ func (r *commandRuntime) download(ctx context.Context, url string, accept string
 	if err != nil {
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
 		return nil, resp, fmt.Errorf("status %s", resp.Status)
 	}
 
-	reader := resp.Body
+	reader := io.ReadCloser(resp.Body)
+	downloadSucceeded := false
 	if progress != nil && strings.TrimSpace(progressName) != "" {
-		tracker := newDownloadProgress(progress, progressName, resp.ContentLength)
-		defer tracker.finish()
-		reader = struct {
-			io.Reader
-			io.Closer
-		}{Reader: io.TeeReader(resp.Body, tracker), Closer: resp.Body}
+		factory, owned := ensureDownloadProgressFactory(progress)
+		if owned {
+			defer factory.close()
+		}
+		tracker := factory.newTracker(progressName, resp.ContentLength)
+		defer func() { tracker.finish(downloadSucceeded) }()
+		reader = tracker.wrap(resp.Body)
 	}
+	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, nil, err
 	}
+	downloadSucceeded = true
 	return data, resp, nil
 }
 
@@ -236,141 +238,6 @@ func (r *commandRuntime) downloadBinary(ctx context.Context, url string, name st
 		return nil, fmt.Errorf("Failed to download release binary from %s (%v)", url, err)
 	}
 	return data, nil
-}
-
-type downloadProgress struct {
-	w        io.Writer
-	name     string
-	total    int64
-	read     int64
-	last     time.Time
-	mode     downloadProgressMode
-	finished bool
-}
-
-type downloadProgressMode uint8
-
-const (
-	downloadProgressModeLive downloadProgressMode = iota
-	downloadProgressModeSummary
-)
-
-type downloadProgressModeWriter interface {
-	io.Writer
-	downloadProgressMode() downloadProgressMode
-}
-
-func newDownloadProgress(w io.Writer, name string, total int64) *downloadProgress {
-	mode := downloadProgressModeLive
-	if writer, ok := w.(downloadProgressModeWriter); ok {
-		mode = writer.downloadProgressMode()
-	}
-	p := &downloadProgress{w: w, name: name, total: total, mode: mode}
-	p.print(true)
-	return p
-}
-
-func (p *downloadProgress) Write(data []byte) (int, error) {
-	p.read += int64(len(data))
-	if p.mode == downloadProgressModeSummary {
-		return len(data), nil
-	}
-	if time.Since(p.last) >= 200*time.Millisecond {
-		p.print(false)
-	}
-	return len(data), nil
-}
-
-func (p *downloadProgress) finish() {
-	if p.finished {
-		return
-	}
-	p.finished = true
-	p.print(false)
-	if p.mode == downloadProgressModeSummary {
-		return
-	}
-	_, _ = fmt.Fprintln(p.w)
-}
-
-func (p *downloadProgress) print(initial bool) {
-	p.last = time.Now()
-	var line string
-	if p.total > 0 {
-		percent := 0
-		if p.total > 0 {
-			percent = int((p.read * 100) / p.total)
-		}
-		line = fmt.Sprintf("Downloading %s: %s%s / %s (%d%%)", p.name, renderProgressBar(percent, downloadProgressBarWidth), formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
-	} else if p.read > 0 {
-		line = fmt.Sprintf("Downloading %s: %s downloaded", p.name, formatDownloadBytes(p.read))
-	} else {
-		line = fmt.Sprintf("Downloading %s...", p.name)
-	}
-	if initial {
-		if p.mode == downloadProgressModeSummary {
-			_, _ = fmt.Fprintln(p.w, line)
-			return
-		}
-		_, _ = fmt.Fprint(p.w, line)
-		return
-	}
-	if p.mode == downloadProgressModeSummary {
-		_, _ = fmt.Fprintln(p.w, line)
-		return
-	}
-	_, _ = fmt.Fprintf(p.w, "\r%s", line)
-}
-
-// downloadProgressBarWidth is the inner width of the textual progress bar
-// printed alongside byte counters. A small fixed width keeps output readable
-// on narrow terminals and stable in non-TTY logs.
-const downloadProgressBarWidth = 20
-
-// renderProgressBar returns a "[####------] " style bar string for the given
-// percentage. An empty string is returned when width is non-positive so the
-// renderer can be disabled by callers without conditional logic at the call
-// site.
-func renderProgressBar(percent int, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-	filled := (percent * width) / 100
-	if filled > width {
-		filled = width
-	}
-	var builder strings.Builder
-	builder.Grow(width + 3)
-	builder.WriteByte('[')
-	for i := 0; i < filled; i++ {
-		builder.WriteByte('#')
-	}
-	for i := filled; i < width; i++ {
-		builder.WriteByte('-')
-	}
-	builder.WriteString("] ")
-	return builder.String()
-}
-
-func formatDownloadBytes(value int64) string {
-	const unit = 1024
-	if value < unit {
-		return fmt.Sprintf("%d B", value)
-	}
-	divisor := int64(unit)
-	unitIndex := 0
-	for n := value / unit; n >= unit && unitIndex < 3; n /= unit {
-		divisor *= unit
-		unitIndex++
-	}
-	number := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", float64(value)/float64(divisor)), "0"), ".")
-	return fmt.Sprintf("%s %ciB", number, "KMGT"[unitIndex])
 }
 
 func (r *commandRuntime) httpClient() *http.Client {

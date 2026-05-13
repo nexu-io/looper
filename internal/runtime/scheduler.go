@@ -439,7 +439,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 	for _, thread := range threads {
 		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 		}
 		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
 	}
@@ -453,7 +453,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 	}
 	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body})
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
 }
@@ -465,6 +465,14 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
 	body := a.stamper.ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
+	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
+	if err != nil {
+		return fixer.CompareCommitsResult{}, err
+	}
+	return fixer.CompareCommitsResult{Status: out.Status}, nil
 }
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {

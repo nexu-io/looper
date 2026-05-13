@@ -67,9 +67,41 @@ func mustEvalPath(tb testing.TB, path string) string {
 	if err == nil && resolved != "" {
 		return resolved
 	}
+	if filepath.IsAbs(path) {
+		resolvedFromParent, ok := resolveFromExistingParent(path)
+		if ok {
+			return resolvedFromParent
+		}
+	}
 	absolute, absErr := filepath.Abs(path)
 	if absErr != nil {
 		tb.Fatalf("resolve path %s: %v", path, absErr)
 	}
+	if resolvedFromParent, ok := resolveFromExistingParent(absolute); ok {
+		return resolvedFromParent
+	}
 	return absolute
+}
+
+func resolveFromExistingParent(path string) (string, bool) {
+	parent := filepath.Clean(path)
+	missing := make([]string, 0, 4)
+	for {
+		if info, err := os.Stat(parent); err == nil && info.IsDir() {
+			resolvedParent, err := filepath.EvalSymlinks(parent)
+			if err != nil || resolvedParent == "" {
+				return "", false
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolvedParent = filepath.Join(resolvedParent, missing[i])
+			}
+			return resolvedParent, true
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", false
+		}
+		missing = append(missing, filepath.Base(parent))
+		parent = next
+	}
 }
