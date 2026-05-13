@@ -241,8 +241,8 @@ func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
 	}
 	first, _ := items[0].(map[string]any)
-	if first["status"] != "skipped_agent_declined" {
-		t.Fatalf("resolvedComments item = %#v, want skipped_agent_declined", first)
+	if first["status"] != "agent_declined" {
+		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
 	}
 	loop := loadSingleLoop(t, client, created.ID)
 	if loop.Status != "completed" {
@@ -346,8 +346,8 @@ func TestScenarioResolveCommentsIgnoresStaleNoPushMetadataAndLeavesThreadsUnreso
 		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
 	}
 	first, _ := items[0].(map[string]any)
-	if first["status"] != "skipped_agent_declined" {
-		t.Fatalf("resolvedComments item = %#v, want skipped_agent_declined", first)
+	if first["status"] != "agent_declined" {
+		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
 	}
 	loop := loadSingleLoop(t, client, created.ID)
 	if loop.Status != "completed" {
