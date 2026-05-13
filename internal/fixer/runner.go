@@ -3,6 +3,7 @@ package fixer
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -589,12 +590,15 @@ type checkpointRepair struct {
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
 // auto-reply posted before resolving the review thread. Stored on the repair
 // checkpoint so resume/retry reuses the same explanation if it still maps to
-// the current fix items snapshot.
+// the current fix items snapshot. ThreadCommentsObserved is optional: when the
+// agent supplies it, resolve-comments verifies the live thread still contains
+// exactly the same comment IDs before auto-resolving.
 type replyExplanationEntry struct {
-	FixItemID   string `json:"fixItemId"`
-	ThreadID    string `json:"threadId,omitempty"`
-	Action      string `json:"action,omitempty"`
-	Explanation string `json:"explanation"`
+	FixItemID              string `json:"fixItemId"`
+	ThreadID               string `json:"threadId,omitempty"`
+	Action                 string `json:"action,omitempty"`
+	Explanation            string `json:"explanation"`
+	ThreadCommentsObserved string `json:"threadCommentsObserved,omitempty"`
 }
 
 type checkpointReconcileCommits struct {
@@ -774,10 +778,11 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 	}
 	var parsed struct {
 		ReviewThreadReplies []struct {
-			FixItemID   string `json:"fixItemId"`
-			ThreadID    string `json:"threadId"`
-			Action      string `json:"action"`
-			Explanation string `json:"explanation"`
+			FixItemID              string `json:"fixItemId"`
+			ThreadID               string `json:"threadId"`
+			Action                 string `json:"action"`
+			Explanation            string `json:"explanation"`
+			ThreadCommentsObserved string `json:"threadCommentsObserved"`
 		} `json:"review_thread_replies"`
 	}
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
@@ -813,7 +818,7 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 			continue
 		}
 		seen[fixItemID] = struct{}{}
-		out = append(out, replyExplanationEntry{FixItemID: fixItemID, ThreadID: item.ThreadID, Action: action, Explanation: explanation})
+		out = append(out, replyExplanationEntry{FixItemID: fixItemID, ThreadID: item.ThreadID, Action: action, Explanation: explanation, ThreadCommentsObserved: normalizeThreadCommentsObserved(raw.ThreadCommentsObserved)})
 	}
 	if len(out) == 0 {
 		return nil
@@ -2163,6 +2168,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
 			continue
 		}
+		if threadCommentsObservedDrifted(decision, thread) {
+			driftCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "Review thread changed since the fixer inspected it", UpdatedAt: r.nowISO()})
+			continue
+		}
 		switch normalizeReplyAction(decision.Action) {
 		case string(replyActionDeclined):
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
@@ -2211,7 +2221,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because new human comments arrived during the fixer run", driftCount), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: FailureRetryableAfterResume}
 	}
 	if mutationFailureCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
@@ -2378,6 +2388,10 @@ func normalizeReplyExplanationActions(entries []replyExplanationEntry) []replyEx
 	return out
 }
 
+func normalizeThreadCommentsObserved(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
 // agentResolveReplyExplanationsValid reports whether the agent-provided
 // reply explanations exist on the checkpoint and can be consulted as the
 // per-item reply authority. Per-thread drift (a new human comment posted
@@ -2436,6 +2450,30 @@ func agentResolveRepliesByThreadID(checkpoint fixerCheckpoint) map[string]replyE
 		return nil
 	}
 	return out
+}
+
+func threadCommentsObservedDrifted(decision replyExplanationEntry, thread ReviewThread) bool {
+	observed := normalizeThreadCommentsObserved(decision.ThreadCommentsObserved)
+	if observed == "" {
+		return false
+	}
+	return observed != hashReviewThreadCommentIDs(thread)
+}
+
+func hashReviewThreadCommentIDs(thread ReviewThread) string {
+	ids := make([]string, 0, len(thread.Comments))
+	for _, comment := range thread.Comments {
+		if isLooperReviewThreadComment(comment) {
+			continue
+		}
+		id := strings.TrimSpace(comment.ID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(ids, "|")))
+	return hex.EncodeToString(sum[:])
 }
 
 func hasNonLooperCommentSince(thread ReviewThread, rawSince string) bool {
@@ -4513,6 +4551,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		`  - "threadId": the exact "threadId" of the same fix item`,
 		`  - "action": "fixed" or "declined"`,
 		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+		`  - "threadCommentsObserved": sha256 of the non-Looper review-thread comment IDs you observed, in thread order, joined with "|" (example: sha256("c1|c2|c3")). Exclude prior Looper-generated replies. If you only saw comment c1, hash just "c1".`,
 		"Before including an entry, re-read the relevant review thread/comment context.",
 		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
 		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",

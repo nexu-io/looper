@@ -1709,7 +1709,7 @@ func TestRunResolveCommentsStepSkipsThreadWhenHumanCommentArrivesAfterRunStart(t
 	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix."}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err == nil || !strings.Contains(err.Error(), "new human comments") {
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want thread drift retry", err)
 	}
 	if len(github.replyCalls) != 0 {
@@ -1723,6 +1723,59 @@ func TestRunResolveCommentsStepSkipsThreadWhenHumanCommentArrivesAfterRunStart(t
 	}
 	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
 		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepSkipsThreadWhenObservedThreadSnapshotDriftsDuringRepair(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T12:10:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t1",
+			"body":     "also handle edge case",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "c2", Body: "also handle edge case", Author: "alice", CreatedAt: "2026-04-11T12:05:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadCommentIDs(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: "2026-04-11T12:30:00Z"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retry after observed-thread drift", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 after observed-thread drift", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after observed-thread drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+	if len(updated.FixItems) != 2 || updated.FixItems[1].ID != "c2" {
+		t.Fatalf("updated.FixItems = %#v, want live unresolved comments to include c2 for rediscover", updated.FixItems)
 	}
 }
 
@@ -1750,7 +1803,7 @@ func TestRunResolveCommentsStepDetectsDriftFromEditedComment(t *testing.T) {
 	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix."}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err == nil || !strings.Contains(err.Error(), "new human comments") {
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want thread drift retry from edited comment", err)
 	}
 	if len(github.resolveCalls) != 0 {
@@ -1795,7 +1848,7 @@ func TestRunResolveCommentsStepFlagsThreadDriftWhenCommentEdited(t *testing.T) {
 	}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err == nil || !strings.Contains(err.Error(), "new human comments") {
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want per-thread drift retry", err)
 	}
 	if len(github.resolveCalls) != 0 {
@@ -1869,6 +1922,40 @@ func TestRunResolveCommentsStepRecordsMutationFailureAsRetryable(t *testing.T) {
 	}
 	if updated.ResumePolicy != loops.ResumePolicyReplayStep {
 		t.Fatalf("updated.ResumePolicy = %q, want replay_step", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepRetriesResolveAfterPriorLooperReply(t *testing.T) {
+	t.Parallel()
+
+	item := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}, {ID: "reply-1", Body: buildFixerReplyBody(item, "fix-head", "Applied the requested fix.")}}}},
+	}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{
+		FixItems:         []FixItem{item},
+		FixItemsHash:     hashFixItems([]FixItem{item}),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadCommentIDs(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}})}}},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionFixed), Status: "failed_mutation_retry", ReplyState: "sent"}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable resolve to proceed", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %#v, want 0 because prior Looper reply should be reused", github.replyCalls)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want 1 retry resolve for t1", github.resolveCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved after retrying with prior Looper reply", updated.ResolvedComments)
 	}
 }
 
@@ -1954,7 +2041,7 @@ func TestRunResolveCommentsStepDriftAnchorsToRepairCompletionOnReplay(t *testing
 	}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: retryRunStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err == nil || !strings.Contains(err.Error(), "new human comments") {
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want drift retry anchored to Repair.CompletedAt", err)
 	}
 	if len(github.resolveCalls) != 0 {
@@ -1965,6 +2052,64 @@ func TestRunResolveCommentsStepDriftAnchorsToRepairCompletionOnReplay(t *testing
 	}
 	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
 		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepOnlySkipsDriftedObservedThread(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T12:10:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t1",
+			"body":     "also handle edge case",
+		}, {
+			"id":       "c3",
+			"threadId": "t2",
+			"body":     "rename helper",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "c2", Body: "also handle edge case", Author: "alice", CreatedAt: "2026-04-11T12:05:00Z"}}}, {ID: "t2", Comments: []ReviewThreadComment{{ID: "c3", Body: "rename helper", Author: "alice", CreatedAt: "2026-04-11T11:58:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}, {Type: "comment", ID: "c3", ThreadID: "t2", Summary: "rename helper"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadCommentIDs(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}, {FixItemID: "c3", ThreadID: "t2", Explanation: "Renamed the helper.", ThreadCommentsObserved: hashReviewThreadCommentIDs(ReviewThread{Comments: []ReviewThreadComment{{ID: "c3"}}})}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: "2026-04-11T12:30:00Z"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retry after one observed thread drifted", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t2" {
+		t.Fatalf("resolve calls = %#v, want only t2 resolved", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 1 || github.replyCalls[0].ThreadID != "t2" {
+		t.Fatalf("reply calls = %#v, want only t2 replied", github.replyCalls)
+	}
+	statusByThread := map[string]string{}
+	for _, item := range updated.ResolvedComments.Items {
+		statusByThread[item.ThreadID] = item.Status
+	}
+	if statusByThread["t1"] != "skipped_thread_drift" {
+		t.Fatalf("t1 status = %q, want skipped_thread_drift", statusByThread["t1"])
+	}
+	if statusByThread["t2"] != "resolved" {
+		t.Fatalf("t2 status = %q, want resolved", statusByThread["t2"])
 	}
 }
 
@@ -4175,10 +4320,10 @@ func TestParseReplyExplanationsValid(t *testing.T) {
 	t.Parallel()
 	stdout := strings.Join([]string{
 		"some agent log line",
-		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Replaced strings.Title with cases.Title."}]}`,
+		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Replaced strings.Title with cases.Title.","threadCommentsObserved":"ABC123"}]}`,
 	}, "\n")
 	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
-	if len(got) != 1 || got[0].FixItemID != "c1" || !strings.Contains(got[0].Explanation, "cases.Title") {
+	if len(got) != 1 || got[0].FixItemID != "c1" || !strings.Contains(got[0].Explanation, "cases.Title") || got[0].ThreadCommentsObserved != "abc123" {
 		t.Fatalf("parseReplyExplanations() = %#v", got)
 	}
 }
