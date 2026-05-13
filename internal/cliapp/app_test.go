@@ -708,8 +708,8 @@ func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if stderr != "" {
-		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-loop-enabled" is accepted for now; use "--roles-reviewer-behavior-loop-enabled-by-default" instead`) {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want deprecation warning", stderr)
 	}
 }
 
@@ -729,8 +729,8 @@ func TestStatusAcceptsReviewerEnableSelfReviewConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-enable-self-review=true]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if stderr != "" {
-		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want empty string", stderr)
+	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-enable-self-review" is accepted for now; use "--roles-reviewer-discovery-triggers-enable-self-review" instead`) {
+		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want deprecation warning", stderr)
 	}
 }
 
@@ -2063,6 +2063,25 @@ func TestEmitConfigLoadNoticesPrintsEachNoticeOncePerRuntime(t *testing.T) {
 
 	if got := stderr.String(); got != "note: migrate me\n" {
 		t.Fatalf("stderr = %q, want one emitted notice", got)
+	}
+}
+
+func TestEmitConfigLoadNoticesPrintsWarningsAndDeduplicatesByLevel(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
+	loaded := config.LoadedFileConfig{Warnings: []string{"deprecated reviewer path"}, Notices: []string{"legacy default config"}}
+
+	runtime.emitConfigLoadNotices(loaded)
+	runtime.emitConfigLoadNotices(loaded)
+
+	if got := stderr.String(); got != "warning: deprecated reviewer path\nnote: legacy default config\n" {
+		t.Fatalf("stderr = %q, want one emitted warning and notice", got)
+	}
+
+	stderr.Reset()
+	runtime.emitConfigLoadNotices(config.LoadedFileConfig{Warnings: []string{"same text"}, Notices: []string{"same text"}})
+	if got := stderr.String(); got != "warning: same text\nnote: same text\n" {
+		t.Fatalf("stderr = %q, want warning and note tracked separately", got)
 	}
 }
 

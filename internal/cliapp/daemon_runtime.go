@@ -749,11 +749,21 @@ func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
 }
 
 func (r *commandRuntime) emitConfigLoadNotices(loaded config.LoadedFileConfig) {
-	for _, notice := range loaded.Notices {
-		if _, ok := r.emittedConfigNotes[notice]; ok {
+	for _, warning := range loaded.Warnings {
+		key := "warning:" + warning
+		if _, ok := r.emittedConfigNotes[key]; ok {
 			continue
 		}
-		r.emittedConfigNotes[notice] = struct{}{}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "warning: %s\n", warning)
+	}
+
+	for _, notice := range loaded.Notices {
+		key := "note:" + notice
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
 		_, _ = fmt.Fprintf(r.app.stderr(), "note: %s\n", notice)
 	}
 }
