@@ -78,7 +78,7 @@ func main() {
 		mustRun(gitPath, "commit", "-m", "fake agent commit")
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
 		payload := map[string]any{"summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}}
-		if replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", false, false); len(replies) > 0 {
+		if replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", false, true); len(replies) > 0 {
 			payload["review_thread_replies"] = replies
 		}
 		printCompletion(marker, payload)

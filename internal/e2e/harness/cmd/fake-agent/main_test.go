@@ -16,6 +16,17 @@ func TestPromptReviewThreadRepliesUsesPromptFixItemIDs(t *testing.T) {
 	}
 }
 
+func TestPromptReviewThreadRepliesIncludesObservedHashWhenRequested(t *testing.T) {
+	t.Setenv(envLooperPrompt, "Fix items:\n- {\"type\":\"comment\",\"id\":\"comment-abc\",\"threadId\":\"thread-xyz\"}")
+	replies := promptReviewThreadReplies("done", false, true)
+	if len(replies) != 1 {
+		t.Fatalf("len(replies) = %d, want 1", len(replies))
+	}
+	if got, want := replies[0]["threadCommentsObserved"], hashCommentIDs("comment-abc"); got != want {
+		t.Fatalf("threadCommentsObserved = %#v, want %q", got, want)
+	}
+}
+
 func TestPromptReviewThreadRepliesFallsBackWhenRequested(t *testing.T) {
 	t.Setenv(envLooperPrompt, "")
 	replies := promptReviewThreadReplies("done", true, false)
