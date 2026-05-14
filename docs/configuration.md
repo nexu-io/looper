@@ -114,6 +114,70 @@ All role-specific config lives under `roles.<role>`.
 - discovery policy lives at `roles.<role>.discovery.*`
 - runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
 
+## Coordinator config reference
+
+Coordinator is the proactive, stateless issue-intake role. In slice 2 it owns Triage end-to-end; Dispatch remains scaffolded for the next slice, but its config shape is already present.
+
+### Triage settings
+
+Coordinator triage lives under `roles.coordinator.triage.*`:
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.enabled` | Turns Coordinator on for the project or globally | `false` |
+| `roles.coordinator.pollInterval` | Minimum delay between Coordinator ticks for the same project | `"5m"` |
+| `roles.coordinator.triage.triagedLabel` | Durability-commit label written last after comment posting succeeds | `"triaged"` |
+| `roles.coordinator.triage.maxIssueAgeDays` | Bootstrap guard for fresh issues only | `7` |
+| `roles.coordinator.triage.maxPerTick` | Per-tick cap on issues processed for triage | `5` |
+| `roles.coordinator.triage.disposition.outOfScopeLabel` | Label reused for `out-of-scope` | `"wontfix"` |
+| `roles.coordinator.triage.disposition.unclearLabel` | Label used for `unclear` | `"needs-info"` |
+| `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
+
+Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes `triaged` last.
+
+### Dispatch settings (scaffolded for slice 3)
+
+The full Coordinator config shape already includes `roles.coordinator.dispatch.*` so project overrides remain stable across slices:
+
+- `roles.coordinator.dispatch.mode`
+- `roles.coordinator.dispatch.humanGate.slashCommands`
+- `roles.coordinator.dispatch.humanGate.allowedUsers`
+- `roles.coordinator.dispatch.autonomous.delayMinutes`
+- `roles.coordinator.dispatch.autonomous.holdLabel`
+- `roles.coordinator.dispatch.assignTo`
+
+Slice 2 does not execute Dispatch yet, but these fields remain part of the canonical config and merge the same way as other project-level role overrides.
+
+Coordinator example:
+
+```toml
+[roles.coordinator]
+enabled = true
+pollInterval = "5m"
+
+[roles.coordinator.triage]
+triagedLabel = "triaged"
+maxIssueAgeDays = 7
+maxPerTick = 5
+
+[roles.coordinator.triage.disposition]
+outOfScopeLabel = "wontfix"
+unclearLabel = "needs-info"
+reTriageOnAuthorReply = true
+
+[roles.coordinator.dispatch]
+mode = "human-gated"
+assignTo = ""
+
+[roles.coordinator.dispatch.humanGate]
+slashCommands = ["/plan", "/implement"]
+allowedUsers = []
+
+[roles.coordinator.dispatch.autonomous]
+delayMinutes = 30
+holdLabel = "looper:hold"
+```
+
 Reviewer is the main migration example:
 
 - legacy top-level `reviewer.*` is compatibility input only
@@ -300,6 +364,32 @@ addSnapshotMode = "async"
 
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
+
+[roles.coordinator]
+enabled = false
+pollInterval = "5m"
+
+[roles.coordinator.triage]
+triagedLabel = "triaged"
+maxIssueAgeDays = 7
+maxPerTick = 5
+
+[roles.coordinator.triage.disposition]
+outOfScopeLabel = "wontfix"
+unclearLabel = "needs-info"
+reTriageOnAuthorReply = true
+
+[roles.coordinator.dispatch]
+mode = "human-gated"
+assignTo = ""
+
+[roles.coordinator.dispatch.humanGate]
+slashCommands = ["/plan", "/implement"]
+allowedUsers = []
+
+[roles.coordinator.dispatch.autonomous]
+delayMinutes = 30
+holdLabel = "looper:hold"
 
 [roles.planner.discovery]
 autoDiscovery = true

@@ -198,6 +198,10 @@ func handleAPI(mode string, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, `{"data":{}}`)
 		return nil
 	}
+	if strings.HasSuffix(route, "/comments") && strings.EqualFold(flagValue(args, "--method"), "POST") {
+		_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"html_url":"https://example.test/issues/comments/1"}`)
+		return nil
+	}
 	if payload, ok := st.Routes[route]; ok {
 		_, _ = os.Stdout.Write(payload)
 		if len(payload) == 0 || payload[len(payload)-1] != '\n' {

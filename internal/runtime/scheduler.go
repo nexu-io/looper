@@ -952,7 +952,17 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
 	})
-	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{Config: &cfg, Now: now})
+	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
+		Repos:  repos,
+		GitHub: githubGateway,
+		Config: &cfg,
+		Logger: logger,
+		Now:    now,
+		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
+			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
+			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
+		),
+	})
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
