@@ -518,10 +518,18 @@ func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwr
 		return "", err
 	}
 	if !overwrites {
-		if err := os.Link(tmpPath, path); err != nil {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
 			if os.IsExist(err) {
 				return "", fmt.Errorf("destination config file already exists at %s; rerun with --force to overwrite it after creating a backup, or set --to to choose another path", path)
 			}
+			return "", fmt.Errorf("create config without overwrite: %w", err)
+		}
+		if _, err := file.WriteString(preview); err != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("create config without overwrite: %w", err)
+		}
+		if err := file.Close(); err != nil {
 			return "", fmt.Errorf("create config without overwrite: %w", err)
 		}
 		return "", nil
