@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,7 +82,7 @@ func (r *Runner) pollInterval(projectID string) time.Duration {
 		return 0
 	}
 	roleCfg := config.ProjectRoleConfigs(*r.config, projectID).Coordinator
-	interval, err := time.ParseDuration(roleCfg.PollInterval)
+	interval, err := time.ParseDuration(strings.TrimSpace(roleCfg.PollInterval))
 	if err != nil {
 		return 0
 	}

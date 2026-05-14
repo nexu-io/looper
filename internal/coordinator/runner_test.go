@@ -46,6 +46,35 @@ func TestDiscoverIssuesRespectsPollInterval(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesRespectsTrimmedPollInterval(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.PollInterval = " 1m "
+	now := time.Date(2026, time.May, 14, 10, 0, 0, 0, time.UTC)
+	runner := New(Options{Config: &cfg, Now: func() time.Time { return now }})
+
+	first, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "demo", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if !first.Ticked || first.Skipped {
+		t.Fatalf("first DiscoverIssues() = %#v, want first coordinator tick to run", first)
+	}
+
+	second, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "demo", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if !second.Skipped || second.Ticked {
+		t.Fatalf("second DiscoverIssues() = %#v, want poll interval gate to skip", second)
+	}
+}
+
 func TestShouldSkipIssueForSweeperManagedLabels(t *testing.T) {
 	t.Parallel()
 
