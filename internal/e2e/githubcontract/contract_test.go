@@ -28,7 +28,8 @@ func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
 	fakeGH := harness.NewFakeGH(t, bins, schema)
 	writeFakeState(t, fakeGH.StatePath, fakeGHState{
 		Routes: map[string]json.RawMessage{
-			"repos/acme/looper/issues/7": json.RawMessage(`{"number":7,"title":"Issue title","body":"body","html_url":"https://github.com/acme/looper/issues/7","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"octocat"}],"labels":[{"name":"bug"}]}`),
+			"repos/acme/looper/issues/7":          json.RawMessage(`{"number":7,"title":"Issue title","body":"body","html_url":"https://github.com/acme/looper/issues/7","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"octocat"}],"labels":[{"name":"bug"}]}`),
+			"repos/acme/looper/issues/7/comments": json.RawMessage(`[]`),
 		},
 		GraphQL: map[string]json.RawMessage{
 			"default":             json.RawMessage(`{"data":{"node":{"id":"thread-1","isResolved":false,"path":"foo.go","line":7,"comments":{"nodes":[{"id":"comment-1","body":"please fix","author":{"login":"octocat"},"createdAt":"2026-05-12T00:00:00Z","updatedAt":"2026-05-12T00:00:00Z","path":"foo.go","line":7,"originalCommit":{"oid":"base-head"},"commit":{"oid":"head-1"},"url":"https://example.test/thread-1"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`),
@@ -120,6 +121,7 @@ func TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation(t *testing.
 				"author_association": "MEMBER",
 				"labels":             []map[string]any{},
 			},
+			"repos/acme/looper/issues/42/comments": []map[string]any{},
 		},
 	})
 	root := t.TempDir()
@@ -171,7 +173,8 @@ func TestInvariantGatewaySupportsRepoForms(t *testing.T) {
 	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
 	writeFakeState(t, fakeGH.StatePath, fakeGHState{
 		Routes: map[string]json.RawMessage{
-			"repos/acme/looper/issues/11": json.RawMessage(`{"number":11,"title":"Issue title","body":"body","html_url":"https://example.test/acme/looper/issues/11","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"}}`),
+			"repos/acme/looper/issues/11":          json.RawMessage(`{"number":11,"title":"Issue title","body":"body","html_url":"https://example.test/acme/looper/issues/11","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"}}`),
+			"repos/acme/looper/issues/11/comments": json.RawMessage(`[]`),
 		},
 	})
 	root := t.TempDir()
