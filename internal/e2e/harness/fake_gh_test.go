@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -48,6 +49,30 @@ func TestFakeGHPaginatedAPIDefaultsToEmptyArray(t *testing.T) {
 	}
 	if strings.TrimSpace(string(output)) != "[]" {
 		t.Fatalf("fake gh paginated output = %q, want empty array", string(output))
+	}
+}
+
+func TestFakeGHPRViewSupportsCreatedAtAndClosedAt(t *testing.T) {
+	bins := MustBinaries(t)
+	gh := NewFakeGH(t, bins, GHSchema{JSONFieldAllowlist: map[string][]string{"pr view": {"number", "createdAt", "closedAt"}}})
+	gh.WriteState(t, GHState{PullRequests: map[string]GHPullRequest{
+		"acme/looper#42": {Number: 42, Repo: "acme/looper", CreatedAt: "2026-05-01T00:00:00Z", ClosedAt: "2026-05-03T00:00:00Z"},
+	}})
+	cmd := exec.Command(gh.Path, "pr", "view", "42", "--repo", "acme/looper", "--json", "number,createdAt,closedAt")
+	cmd.Env = append(os.Environ(), flattenEnv(gh.EnvMap())...)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run fake gh pr view: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(output, &got); err != nil {
+		t.Fatalf("decode fake gh output: %v", err)
+	}
+	if got["createdAt"] != "2026-05-01T00:00:00Z" {
+		t.Fatalf("createdAt = %v, want seeded value", got["createdAt"])
+	}
+	if got["closedAt"] != "2026-05-03T00:00:00Z" {
+		t.Fatalf("closedAt = %v, want seeded value", got["closedAt"])
 	}
 }
 

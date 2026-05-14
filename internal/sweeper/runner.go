@@ -896,9 +896,6 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 			}
 		}
 		if proposal == nil {
-			if _, _, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale); err != nil {
-				return payload, "failed", "", err
-			}
 			proposal, fingerprintJSON, err = r.proposeAgentDecision(ctx, project, queueItem, target, caseRecord, payload, roleCfg, "close", category, rationale)
 			if err != nil {
 				return payload, "failed", "", err

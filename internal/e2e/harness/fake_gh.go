@@ -59,7 +59,9 @@ type GHPullRequest struct {
 	Body              string           `json:"body,omitempty"`
 	URL               string           `json:"url,omitempty"`
 	State             string           `json:"state,omitempty"`
+	CreatedAt         string           `json:"createdAt,omitempty"`
 	UpdatedAt         string           `json:"updatedAt,omitempty"`
+	ClosedAt          string           `json:"closedAt,omitempty"`
 	IsDraft           bool             `json:"isDraft,omitempty"`
 	ReviewDecision    string           `json:"reviewDecision,omitempty"`
 	Labels            []string         `json:"labels,omitempty"`
