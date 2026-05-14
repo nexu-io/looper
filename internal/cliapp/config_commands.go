@@ -320,6 +320,11 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 			"preview":    plan.Preview,
 		}
 		if plan.DryRun {
+			tmpPath, err := r.prepareMigratedConfigFile(plan.To, plan.Preview)
+			if err != nil {
+				return err
+			}
+			defer os.Remove(tmpPath)
 			payload["updated"] = false
 			return writeJSON(cmd.OutOrStdout(), payload)
 		}
@@ -336,13 +341,18 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 	}
 
 	if plan.DryRun {
+		tmpPath, err := r.prepareMigratedConfigFile(plan.To, plan.Preview)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(tmpPath)
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Dry run: would migrate config %s -> %s\n", plan.From, plan.To); err != nil {
 			return err
 		}
 		if err := writeMigrationChangeSummary(cmd, plan.Changes); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "\n--- canonical preview ---\n%s", plan.Preview)
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "\n--- canonical preview ---\n%s", plan.Preview)
 		return err
 	}
 
@@ -421,6 +431,12 @@ func (r *commandRuntime) resolveConfigMigrationPlan(cmd *cobra.Command) (configM
 	if filepath.Clean(from) == filepath.Clean(to) {
 		return configMigrationPlan{}, fmt.Errorf("source and destination config paths must differ; use --to to choose a different destination")
 	}
+	if _, statErr := os.Stat(from); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return configMigrationPlan{}, fmt.Errorf("source config file not found: %s", from)
+		}
+		return configMigrationPlan{}, fmt.Errorf("check source config file at %s: %w", from, statErr)
+	}
 	overwrites := false
 	if info, statErr := os.Stat(to); statErr == nil && !info.IsDir() {
 		overwrites = true
@@ -463,6 +479,35 @@ func normalizeConfigMigrationValue(partial config.PartialConfig) map[string]any 
 	return normalized
 }
 
+func (r *commandRuntime) prepareMigratedConfigFile(path string, preview string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("create config directory: %w", err)
+	}
+	tmpPattern := ".config-*" + filepath.Ext(path)
+	if filepath.Ext(path) == "" {
+		tmpPattern = ".config-*.tmp"
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
+	if err != nil {
+		return "", fmt.Errorf("create temporary config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.WriteString(preview); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("write temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("close temporary config: %w", err)
+	}
+	if err := r.validateMigratedConfigFile(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	return tmpPath, nil
+}
+
 func pruneEmptyMaps(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -494,29 +539,11 @@ func pruneEmptyMaps(value any) any {
 }
 
 func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwrites bool) (string, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", fmt.Errorf("create config directory: %w", err)
-	}
-	tmpPattern := ".config-*" + filepath.Ext(path)
-	if filepath.Ext(path) == "" {
-		tmpPattern = ".config-*.tmp"
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
+	tmpPath, err := r.prepareMigratedConfigFile(path, preview)
 	if err != nil {
-		return "", fmt.Errorf("create temporary config: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.WriteString(preview); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("write temporary config: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close temporary config: %w", err)
-	}
-	if err := r.validateMigratedConfigFile(tmpPath); err != nil {
 		return "", err
 	}
+	defer os.Remove(tmpPath)
 	if !overwrites {
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err != nil {

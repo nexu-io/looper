@@ -2409,6 +2409,68 @@ func TestConfigMigrateDryRunAllowsExistingDestinationWithoutForce(t *testing.T) 
 	}
 }
 
+func TestConfigMigrateDryRunFailsWhenDestinationDirectoryCannotBePrepared(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destDir := filepath.Join(t.TempDir(), "locked")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(destDir) error = %v", err)
+	}
+	if err := os.Chmod(destDir, 0o555); err != nil {
+		t.Fatalf("os.Chmod(destDir) error = %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(destDir, 0o755)
+	}()
+
+	destPath := filepath.Join(destDir, "canonical.toml")
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath, "--dry-run")
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "create temporary config") {
+		t.Fatalf("stderr = %q, want destination preparation error", stderr)
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want destination not created", destPath, err)
+	}
+}
+
+func TestConfigMigrateReportsMissingSourceBeforeOverwriteGuidance(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "missing.json")
+	destPath := filepath.Join(t.TempDir(), "config.toml")
+	before := "[defaults]\nallowRiskyFixes = false\n"
+	if err := os.WriteFile(destPath, []byte(before), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(destPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate missing source]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "source config file not found") {
+		t.Fatalf("stderr = %q, want missing-source guidance", stderr)
+	}
+	if strings.Contains(stderr, "--force") {
+		t.Fatalf("stderr = %q, did not expect overwrite guidance", stderr)
+	}
+	after, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(destPath) error = %v", err)
+	}
+	if string(after) != before {
+		t.Fatalf("destination changed unexpectedly\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 func TestConfigMigrateRejectsSameSourceAndDestinationPath(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(configPath, []byte("[defaults]\nallowRiskyFixes = true\n"), 0o644); err != nil {
