@@ -895,24 +895,21 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	owner, repoName := splitRepoOwnerName(repo)
-	query := "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { closedByPullRequestsReferences(first: 20) { nodes { number state mergedAt mergeCommit { oid } } } } } }"
-	args := []string{"api", "graphql", "-f", "query=" + query, "-F", "owner=" + owner, "-F", "repo=" + repoName, "-F", fmt.Sprintf("number=%d", input.IssueNumber)}
-	if strings.TrimSpace(hostname) != "" {
-		args = append(args, "--hostname", hostname)
-	}
-	result, err := g.runGh(ctx, input.CWD, "", args...)
-	if err != nil {
-		return nil, err
-	}
-	row, err := decodeJSONObject(result.Stdout)
-	if err != nil {
-		return nil, err
-	}
-	nodes := digNodes(row, "data", "repository", "issue", "closedByPullRequestsReferences")
-	out := make([]LinkedPullRequest, 0, len(nodes))
-	for _, node := range nodes {
-		mergeCommit, _ := node["mergeCommit"].(map[string]any)
-		out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+	out := make([]LinkedPullRequest, 0, 20)
+	cursor := ""
+	for {
+		nodes, nextCursor, hasNextPage, err := g.fetchLinkedPullRequestsPage(ctx, input.CWD, hostname, owner, repoName, input.IssueNumber, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, node := range nodes {
+			mergeCommit, _ := node["mergeCommit"].(map[string]any)
+			out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+		}
+		if !hasNextPage || nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
 	}
 	return out, nil
 }
@@ -2092,6 +2089,55 @@ func decodeReviewThreadsResponse(stdout string) ([]any, string, bool, error) {
 	threadsRow, _ := prRow["reviewThreads"].(map[string]any)
 	nodes, _ := threadsRow["nodes"].([]any)
 	pageInfo, _ := threadsRow["pageInfo"].(map[string]any)
+	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
+}
+
+func (g *Gateway) fetchLinkedPullRequestsPage(ctx context.Context, cwd, hostname, owner, repo string, issueNumber int64, cursor string) ([]map[string]any, string, bool, error) {
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
+		"query($owner: String!, $repo: String!, $number: Int!, $after: String) {",
+		"  repository(owner: $owner, name: $repo) {",
+		"    issue(number: $number) {",
+		"      closedByPullRequestsReferences(first: 20, after: $after) {",
+		"        nodes {",
+		"          number",
+		"          state",
+		"          mergedAt",
+		"          mergeCommit { oid }",
+		"        }",
+		"        pageInfo { hasNextPage endCursor }",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "owner=" + owner, "-F", "repo=" + repo, "-F", fmt.Sprintf("number=%d", issueNumber)}
+	if cursor != "" {
+		args = append(args, "-F", "after="+cursor)
+	}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return nil, "", false, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, "", false, err
+	}
+	data, _ := row["data"].(map[string]any)
+	repository, _ := data["repository"].(map[string]any)
+	issue, _ := repository["issue"].(map[string]any)
+	refs, _ := issue["closedByPullRequestsReferences"].(map[string]any)
+	nodesAny, _ := refs["nodes"].([]any)
+	nodes := make([]map[string]any, 0, len(nodesAny))
+	for _, node := range nodesAny {
+		nodeRow, _ := node.(map[string]any)
+		if nodeRow == nil {
+			continue
+		}
+		nodes = append(nodes, nodeRow)
+	}
+	pageInfo, _ := refs["pageInfo"].(map[string]any)
 	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
 }
 

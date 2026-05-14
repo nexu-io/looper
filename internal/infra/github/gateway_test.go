@@ -1173,7 +1173,7 @@ func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
 		if !strings.Contains(args, "api graphql") || !strings.Contains(args, "-F owner=acme") || !strings.Contains(args, "-F repo=looper") || !strings.Contains(args, "--hostname github.example.com") || strings.Contains(args, "github.example.com/acme") {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":42,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}]}}}}}`}, nil
+		return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":42,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	prs, err := gateway.ListLinkedPullRequests(context.Background(), LinkedPullRequestsInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
@@ -1182,6 +1182,37 @@ func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
 	}
 	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergeCommitSHA != "abc123" {
 		t.Fatalf("ListLinkedPullRequests() = %#v, want parsed linked PRs", prs)
+	}
+}
+
+func TestGatewayListLinkedPullRequestsPaginates(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "closedByPullRequestsReferences(first: 20, after: $after)") && strings.Contains(args, "-F after=cursor-1"):
+			return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":22,"state":"CLOSED","mergedAt":"","mergeCommit":{"oid":""}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.Contains(args, "closedByPullRequestsReferences(first: 20, after: $after)"):
+			return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":21,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListLinkedPullRequests(context.Background(), LinkedPullRequestsInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListLinkedPullRequests() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("ListLinkedPullRequests() len = %d, want 2", len(prs))
+	}
+	if prs[0].Number != 21 || !prs[0].Merged || prs[0].MergeCommitSHA != "abc123" {
+		t.Fatalf("ListLinkedPullRequests()[0] = %#v, want merged first page result", prs[0])
+	}
+	if prs[1].Number != 22 || prs[1].Merged || prs[1].MergeCommitSHA != "" {
+		t.Fatalf("ListLinkedPullRequests()[1] = %#v, want unmerged second page result", prs[1])
 	}
 }
 
