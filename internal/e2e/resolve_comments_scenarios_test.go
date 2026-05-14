@@ -221,12 +221,12 @@ func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 	}
 	client.post(t, "/api/v1/loops", map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": "acme/looper", "prNumber": 42}, &created)
 	run := waitForRunTerminal(t, client, created.ID, 30*time.Second)
-	if run.Status != "success" {
-		t.Fatalf("run status = %s, want success no-op resolve path (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
+	if run.Status != "failed" {
+		t.Fatalf("run status = %s, want failed no-op resolve path (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
 	}
 	checkpoint := parseJSONObject(t, run.CheckpointJSON)
-	if got, _ := checkpoint["resumePolicy"].(string); got != "advance_from_checkpoint" {
-		t.Fatalf("resumePolicy = %q, want advance_from_checkpoint", got)
+	if got, _ := checkpoint["resumePolicy"].(string); got != "manual_intervention" {
+		t.Fatalf("resumePolicy = %q, want manual_intervention", got)
 	}
 	push, _ := checkpoint["push"].(map[string]any)
 	if push == nil || push["pushed"] != false {
@@ -243,10 +243,6 @@ func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 	first, _ := items[0].(map[string]any)
 	if first["status"] != "agent_declined" {
 		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
-	}
-	loop := loadSingleLoop(t, client, created.ID)
-	if loop.Status != "completed" {
-		t.Fatalf("loop status = %s, want completed after no-op resolve", loop.Status)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]
@@ -329,8 +325,8 @@ func TestScenarioResolveCommentsIgnoresStaleNoPushMetadataAndLeavesThreadsUnreso
 	}
 	client.post(t, "/api/v1/loops/"+created.ID+"/start", nil, &started)
 	run := waitForRunTerminal(t, client, created.ID, 30*time.Second)
-	if run.Status != "success" {
-		t.Fatalf("run status = %s, want success for stale no-push metadata (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
+	if run.Status != "failed" {
+		t.Fatalf("run status = %s, want failed for stale no-push metadata (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
 	}
 	checkpoint := parseJSONObject(t, run.CheckpointJSON)
 	push, _ := checkpoint["push"].(map[string]any)
@@ -348,10 +344,6 @@ func TestScenarioResolveCommentsIgnoresStaleNoPushMetadataAndLeavesThreadsUnreso
 	first, _ := items[0].(map[string]any)
 	if first["status"] != "agent_declined" {
 		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
-	}
-	loop := loadSingleLoop(t, client, created.ID)
-	if loop.Status != "completed" {
-		t.Fatalf("loop status = %s, want completed after stale no-push metadata", loop.Status)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]
