@@ -23,6 +23,7 @@ const (
 	envFakeAgentModifyFile  = "LOOPER_E2E_FAKE_AGENT_MODIFY_FILE"
 	envFakeAgentSleepMS     = "LOOPER_E2E_FAKE_AGENT_SLEEP_MS"
 	envFakeAgentGitPath     = "LOOPER_E2E_FAKE_AGENT_GIT_PATH"
+	envFakeAgentGHPath      = "LOOPER_E2E_FAKE_AGENT_GH_PATH"
 	defaultCompletionMarker = "__LOOPER_RESULT__="
 )
 
@@ -30,6 +31,26 @@ type promptFixItem struct {
 	Type     string `json:"type"`
 	ID       string `json:"id"`
 	ThreadID string `json:"threadId"`
+}
+
+type ghThreadCommentsResponse struct {
+	Data struct {
+		Node struct {
+			Comments struct {
+				Nodes    []ghThreadComment `json:"nodes"`
+				PageInfo struct {
+					EndCursor   string `json:"endCursor"`
+					HasNextPage bool   `json:"hasNextPage"`
+				} `json:"pageInfo"`
+			} `json:"comments"`
+		} `json:"node"`
+	} `json:"data"`
+}
+
+type ghThreadComment struct {
+	ID        string `json:"id"`
+	Body      string `json:"body"`
+	UpdatedAt string `json:"updatedAt"`
 }
 
 type evidence struct {
@@ -127,7 +148,7 @@ func writeEvidence(dir string, mode string) error {
 }
 
 func collectEnv() map[string]string {
-	keys := []string{"HOME", completionMarkerEnv, envFakeAgentMode, envFakeAgentArtifactDir, envFakeAgentStatePath, envFakeAgentWriteFile, envFakeAgentModifyFile, envFakeAgentGitPath}
+	keys := []string{"HOME", completionMarkerEnv, envFakeAgentMode, envFakeAgentArtifactDir, envFakeAgentStatePath, envFakeAgentWriteFile, envFakeAgentModifyFile, envFakeAgentGitPath, envFakeAgentGHPath}
 	result := make(map[string]string, len(keys))
 	for _, key := range keys {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
@@ -139,6 +160,31 @@ func collectEnv() map[string]string {
 
 func hashCommentIDs(ids ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(ids, "|")))
+	return hex.EncodeToString(sum[:])
+}
+
+func hashObservedThreadComments(comments []ghThreadComment) string {
+	type observedThreadComment struct {
+		ID        string `json:"id"`
+		UpdatedAt string `json:"updatedAt,omitempty"`
+	}
+	observed := make([]observedThreadComment, 0, len(comments))
+	for _, comment := range comments {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round") || strings.Contains(body, "<!-- looper:stamp v=1 -->") {
+			continue
+		}
+		id := strings.TrimSpace(comment.ID)
+		if id == "" {
+			continue
+		}
+		observed = append(observed, observedThreadComment{ID: id, UpdatedAt: strings.TrimSpace(comment.UpdatedAt)})
+	}
+	payload, err := json.Marshal(observed)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }
 
@@ -214,10 +260,9 @@ func printCompletion(marker string, payload map[string]any) {
 	_, _ = fmt.Printf("%s%s\n", marker, string(encoded))
 }
 
-func promptReviewThreadReplies(explanation string, fallback bool, includeObserved bool) []map[string]any {
-	prompt := os.Getenv(envLooperPrompt)
+func parsePromptFixItems(prompt string) []promptFixItem {
 	lines := strings.Split(prompt, "\n")
-	replies := make([]map[string]any, 0)
+	items := make([]promptFixItem, 0)
 	seen := map[string]struct{}{}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -235,13 +280,72 @@ func promptReviewThreadReplies(explanation string, fallback bool, includeObserve
 			continue
 		}
 		seen[item.ID] = struct{}{}
+		items = append(items, item)
+	}
+	return items
+}
+
+func fetchObservedThreadHashes(items []promptFixItem) map[string]string {
+	threadHashes := make(map[string]string, len(items))
+	for _, item := range items {
+		threadID := strings.TrimSpace(item.ThreadID)
+		if threadID == "" {
+			continue
+		}
+		if _, ok := threadHashes[threadID]; ok {
+			continue
+		}
+		comments := make([]ghThreadComment, 0, 8)
+		cursor := ""
+		for {
+			query := strings.Join([]string{
+				"query($threadId: ID!, $after: String) {",
+				"  node(id: $threadId) {",
+				"    ... on PullRequestReviewThread {",
+				"      comments(first: 100, after: $after) {",
+				"        nodes { id body updatedAt }",
+				"        pageInfo { hasNextPage endCursor }",
+				"      }",
+				"    }",
+				"  }",
+				"}",
+			}, "\n")
+			args := []string{"api", "graphql", "-f", "query=" + query, "-F", "threadId=" + threadID}
+			if cursor != "" {
+				args = append(args, "-F", "after="+cursor)
+			}
+			ghPath := envOr(envFakeAgentGHPath, "gh")
+			output := mustOutput(ghPath, args...)
+			var response ghThreadCommentsResponse
+			if err := json.Unmarshal([]byte(output), &response); err != nil {
+				panic(err)
+			}
+			comments = append(comments, response.Data.Node.Comments.Nodes...)
+			if !response.Data.Node.Comments.PageInfo.HasNextPage || strings.TrimSpace(response.Data.Node.Comments.PageInfo.EndCursor) == "" {
+				break
+			}
+			cursor = response.Data.Node.Comments.PageInfo.EndCursor
+		}
+		threadHashes[threadID] = hashObservedThreadComments(comments)
+	}
+	return threadHashes
+}
+
+func buildReviewThreadReplies(items []promptFixItem, explanation string, fallback bool, observedByThread map[string]string) []map[string]any {
+	replies := make([]map[string]any, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		seen[item.ID] = struct{}{}
 		reply := map[string]any{
 			"fixItemId":   item.ID,
 			"threadId":    item.ThreadID,
 			"explanation": explanation,
 		}
-		if includeObserved {
-			reply["threadCommentsObserved"] = hashCommentIDs(item.ID)
+		if observed := strings.TrimSpace(observedByThread[item.ThreadID]); observed != "" {
+			reply["threadCommentsObserved"] = observed
 		}
 		replies = append(replies, reply)
 	}
@@ -251,10 +355,21 @@ func promptReviewThreadReplies(explanation string, fallback bool, includeObserve
 			"threadId":    "thread-1",
 			"explanation": explanation,
 		}
-		if includeObserved {
+		if observed := strings.TrimSpace(observedByThread["thread-1"]); observed != "" {
+			reply["threadCommentsObserved"] = observed
+		} else if len(observedByThread) > 0 {
 			reply["threadCommentsObserved"] = hashCommentIDs("comment-1")
 		}
 		return []map[string]any{reply}
 	}
 	return replies
+}
+
+func promptReviewThreadReplies(explanation string, fallback bool, includeObserved bool) []map[string]any {
+	items := parsePromptFixItems(os.Getenv(envLooperPrompt))
+	observedByThread := map[string]string(nil)
+	if includeObserved {
+		observedByThread = fetchObservedThreadHashes(items)
+	}
+	return buildReviewThreadReplies(items, explanation, fallback, observedByThread)
 }

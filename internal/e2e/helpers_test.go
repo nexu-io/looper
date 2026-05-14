@@ -254,7 +254,7 @@ func loopLogsPath(home harness.TempHome) string {
 
 func configWithFakeTools(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeGH harness.FakeGH, fakeAgent harness.FakeAgent, port int) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig("write-file", bins.LooperPath)
+	vendor, command, agentEnv := fakeAgent.AgentConfig("write-file", bins.LooperPath, "")
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

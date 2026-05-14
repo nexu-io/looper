@@ -72,7 +72,7 @@ func TestInvariantWorkerCommitStaysOffUserBranch(t *testing.T) {
 	port := harness.MustFreePort(t)
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("commit", "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig("commit", "git", "")
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -131,7 +131,7 @@ func TestInvariantWorkerRejectsCheckpointWorktreePathAtUserRepo(t *testing.T) {
 	port := harness.MustFreePort(t)
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("write-file", bins.LooperPath)
+	vendor, command, agentEnv := fakeAgent.AgentConfig("write-file", bins.LooperPath, "")
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

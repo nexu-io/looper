@@ -307,7 +307,7 @@ func ensureSandboxLabel(tb testing.TB, sb sandboxConfig) {
 
 func workerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "")
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: "gh", Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -328,7 +328,7 @@ func workerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness
 
 func fixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "")
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: "gh", Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

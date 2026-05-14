@@ -16,6 +16,7 @@ const (
 	envFakeAgentModifyFile  = "LOOPER_E2E_FAKE_AGENT_MODIFY_FILE"
 	envFakeAgentSleepMS     = "LOOPER_E2E_FAKE_AGENT_SLEEP_MS"
 	envFakeAgentGitPath     = "LOOPER_E2E_FAKE_AGENT_GIT_PATH"
+	envFakeAgentGHPath      = "LOOPER_E2E_FAKE_AGENT_GH_PATH"
 )
 
 type FakeAgent struct {
@@ -34,7 +35,7 @@ func NewFakeAgent(tb testing.TB, bins BuiltBinaries) FakeAgent {
 	return FakeAgent{Path: bins.FakeAgentPath, ArtifactDir: artifactDir, StatePath: statePath}
 }
 
-func (f FakeAgent) AgentConfig(mode string, gitPath string) (*config.AgentVendor, string, map[string]string) {
+func (f FakeAgent) AgentConfig(mode string, gitPath string, ghPath string) (*config.AgentVendor, string, map[string]string) {
 	vendor := config.AgentVendorCodex
 	env := map[string]string{
 		envFakeAgentMode:        mode,
@@ -43,6 +44,9 @@ func (f FakeAgent) AgentConfig(mode string, gitPath string) (*config.AgentVendor
 	}
 	if gitPath != "" {
 		env[envFakeAgentGitPath] = gitPath
+	}
+	if ghPath != "" {
+		env[envFakeAgentGHPath] = ghPath
 	}
 	return &vendor, f.Path, env
 }

@@ -112,6 +112,83 @@ func TestScenarioResolveCommentsRefreshesPRHeadAfterPush(t *testing.T) {
 	proc.Stop(context.Background())
 }
 
+func TestScenarioResolveCommentsRefreshesPRHeadAfterPushWithMultiCommentThread(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	home := harness.NewTempHome(t)
+	repo := harness.CreateSeededRepo(t, "git")
+	originPath := harness.CreateBareOrigin(t, "git", repo.Path)
+	featureHead := harness.CreateBranchCommitAndPush(t, "git", repo.Path, "feature/fix-42", "fix-target.txt", "needs fix\n")
+	port := harness.MustFreePort(t)
+	fakeAgent := harness.NewFakeAgent(t, bins)
+	fakeGH := harness.NewFakeGH(t, bins, loadGHSchemaFixture(t))
+	fakeGH.WriteState(t, harness.GHState{
+		CurrentUserLogin: "looper",
+		PullRequests: map[string]harness.GHPullRequest{
+			"acme/looper#42": {
+				Number:           42,
+				Repo:             "acme/looper",
+				Title:            "Fix review feedback",
+				Author:           "looper",
+				State:            "OPEN",
+				HeadRefName:      "feature/fix-42",
+				BaseRefName:      "main",
+				HeadRef:          "refs/heads/feature/fix-42",
+				BaseRef:          "refs/heads/main",
+				GitDir:           originPath,
+				MergeStateStatus: "CLEAN",
+				Threads: []harness.GHThread{{
+					ID:         "thread-1",
+					IsResolved: false,
+					Path:       "fix-target.txt",
+					Line:       1,
+					Comments: []harness.GHThreadComment{{
+						ID:                "comment-1",
+						Body:              "please fix this",
+						Author:            "alice",
+						Path:              "fix-target.txt",
+						Line:              1,
+						CommitOID:         featureHead,
+						OriginalCommitOID: featureHead,
+						URL:               "https://example.test/thread-1",
+					}, {
+						ID:                "comment-2",
+						Body:              "and handle the edge case",
+						Author:            "alice",
+						Path:              "fix-target.txt",
+						Line:              1,
+						CommitOID:         featureHead,
+						OriginalCommitOID: featureHead,
+						URL:               "https://example.test/thread-1",
+					}},
+				}},
+			},
+		},
+	})
+	cfg := fixerConfigWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, port, "commit-with-review-replies")
+	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, fakeGH.EnvMap(), cfg.Server.Host, cfg.Server.Port)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		t.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	var created struct {
+		ID string `json:"id"`
+	}
+	client.post(t, "/api/v1/loops", map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": "acme/looper", "prNumber": 42}, &created)
+	run := waitForRunTerminal(t, client, created.ID, 60*time.Second)
+	if run.Status != "success" {
+		t.Fatalf("run status = %s, want success (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
+	}
+	state := loadFakeGHStateFile(t, fakeGH.StatePath)
+	pr := state.PullRequests["acme/looper#42"]
+	if len(pr.Threads) != 1 || !pr.Threads[0].IsResolved {
+		t.Fatalf("thread state = %#v, want resolved thread", pr.Threads)
+	}
+	proc.Stop(context.Background())
+}
+
 func TestScenarioResolveCommentsSkipsClosedPullRequest(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	home := harness.NewTempHome(t)
@@ -362,7 +439,7 @@ func TestScenarioWorkerNoDiffBranchDoesNotCreatePullRequest(t *testing.T) {
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, loadGHSchemaFixture(t))
 	fakeGH.WriteState(t, harness.GHState{CurrentUserLogin: "looper"})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path)
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -430,7 +507,7 @@ func TestScenarioResumedFixerStopsWhenPullRequestCloses(t *testing.T) {
 			},
 		},
 	})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path)
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -493,7 +570,7 @@ func TestScenarioResumedFixerStopsWhenPullRequestCloses(t *testing.T) {
 
 func fixerConfigWithFakeTools(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeGH harness.FakeGH, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git")
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", fakeGH.Path)
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

@@ -2457,7 +2457,7 @@ func threadCommentsObservedDrifted(decision replyExplanationEntry, thread Review
 	if observed == "" {
 		return false
 	}
-	return observed != hashReviewThreadCommentIDs(thread)
+	return observed != hashReviewThreadComments(thread)
 }
 
 func fixedDecisionMissingThreadSnapshot(decision replyExplanationEntry) bool {
@@ -2468,8 +2468,12 @@ func fixedDecisionMissingThreadSnapshot(decision replyExplanationEntry) bool {
 	return normalizeThreadCommentsObserved(decision.ThreadCommentsObserved) == ""
 }
 
-func hashReviewThreadCommentIDs(thread ReviewThread) string {
-	ids := make([]string, 0, len(thread.Comments))
+func hashReviewThreadComments(thread ReviewThread) string {
+	type observedThreadComment struct {
+		ID        string `json:"id"`
+		UpdatedAt string `json:"updatedAt,omitempty"`
+	}
+	comments := make([]observedThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
 		if isLooperReviewThreadComment(comment) {
 			continue
@@ -2478,9 +2482,13 @@ func hashReviewThreadCommentIDs(thread ReviewThread) string {
 		if id == "" {
 			continue
 		}
-		ids = append(ids, id)
+		comments = append(comments, observedThreadComment{
+			ID:        id,
+			UpdatedAt: strings.TrimSpace(comment.UpdatedAt),
+		})
 	}
-	sum := sha256.Sum256([]byte(strings.Join(ids, "|")))
+	payload, _ := json.Marshal(comments)
+	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
 }
 
@@ -4565,7 +4573,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		`  - "threadId": the exact "threadId" of the same fix item`,
 		`  - "action": "fixed" or "declined"`,
 		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		`  - "threadCommentsObserved": sha256 of the non-Looper review-thread comment IDs you observed, in thread order, joined with "|" (example: sha256("c1|c2|c3")). Exclude prior Looper-generated replies. If you only saw comment c1, hash just "c1".`,
+		`  - "threadCommentsObserved": sha256 of the JSON array of non-Looper review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. Exclude prior Looper-generated replies.`,
 		"Before including an entry, re-read the relevant review thread/comment context.",
 		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
 		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",

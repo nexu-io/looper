@@ -6,8 +6,8 @@ import (
 )
 
 func TestPromptReviewThreadRepliesUsesPromptFixItemIDs(t *testing.T) {
-	t.Setenv(envLooperPrompt, "Fix items:\n- {\"type\":\"comment\",\"id\":\"comment-abc\",\"threadId\":\"thread-xyz\"}\n- {\"type\":\"check\",\"id\":\"check-1\"}")
-	replies := promptReviewThreadReplies("done", false, false)
+	items := parsePromptFixItems("Fix items:\n- {\"type\":\"comment\",\"id\":\"comment-abc\",\"threadId\":\"thread-xyz\"}\n- {\"type\":\"check\",\"id\":\"check-1\"}")
+	replies := buildReviewThreadReplies(items, "done", false, nil)
 	if len(replies) != 1 {
 		t.Fatalf("len(replies) = %d, want 1", len(replies))
 	}
@@ -17,12 +17,12 @@ func TestPromptReviewThreadRepliesUsesPromptFixItemIDs(t *testing.T) {
 }
 
 func TestPromptReviewThreadRepliesIncludesObservedHashWhenRequested(t *testing.T) {
-	t.Setenv(envLooperPrompt, "Fix items:\n- {\"type\":\"comment\",\"id\":\"comment-abc\",\"threadId\":\"thread-xyz\"}")
-	replies := promptReviewThreadReplies("done", false, true)
+	items := parsePromptFixItems("Fix items:\n- {\"type\":\"comment\",\"id\":\"comment-abc\",\"threadId\":\"thread-xyz\"}\n- {\"type\":\"comment\",\"id\":\"comment-def\",\"threadId\":\"thread-xyz\"}")
+	replies := buildReviewThreadReplies(items[:1], "done", false, map[string]string{"thread-xyz": "thread-hash"})
 	if len(replies) != 1 {
 		t.Fatalf("len(replies) = %d, want 1", len(replies))
 	}
-	if got, want := replies[0]["threadCommentsObserved"], hashCommentIDs("comment-abc"); got != want {
+	if got, want := replies[0]["threadCommentsObserved"], "thread-hash"; got != want {
 		t.Fatalf("threadCommentsObserved = %#v, want %q", got, want)
 	}
 }
