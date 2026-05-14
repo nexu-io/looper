@@ -15,6 +15,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/fixer"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
@@ -66,26 +67,32 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 
 	plannerRunner := &stubPlannerScheduler{}
+	coordinatorRunner := &stubCoordinatorScheduler{}
 	reviewerRunner := &stubReviewerScheduler{}
 	fixerRunner := &stubFixerScheduler{}
 	workerRunner := &stubWorkerScheduler{}
 	sweeperRunner := &stubSweeperScheduler{}
 
 	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
-		Repos:             repos,
-		Now:               func() time.Time { return now },
-		MaxConcurrentRuns: 1,
-		Planner:           plannerRunner,
-		Reviewer:          reviewerRunner,
-		Fixer:             fixerRunner,
-		Worker:            workerRunner,
-		Sweeper:           sweeperRunner,
+		Repos:              repos,
+		Now:                func() time.Time { return now },
+		MaxConcurrentRuns:  1,
+		Planner:            plannerRunner,
+		Coordinator:        coordinatorRunner,
+		CoordinatorEnabled: func(string) bool { return true },
+		Reviewer:           reviewerRunner,
+		Fixer:              fixerRunner,
+		Worker:             workerRunner,
+		Sweeper:            sweeperRunner,
 	})
 	if err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
 	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "looper" || plannerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("planner discover calls = %#v, want stored project discovery", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 1 || coordinatorRunner.discoverCalls[0].Repo != "nexu-io/looper" {
+		t.Fatalf("coordinator discover calls = %#v, want stored project repo", coordinatorRunner.discoverCalls)
 	}
 	if len(reviewerRunner.discoverCalls) != 1 || reviewerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("reviewer discover calls = %#v, want stored project repo", reviewerRunner.discoverCalls)
@@ -150,6 +157,31 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	}
 	if !plannerRunner.checkedClaimedStatus {
 		t.Fatal("planner discovery did not verify claimed queue item status")
+	}
+}
+
+func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinatorDB := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-coordinator-disabled.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinatorDB.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	runner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:              repos,
+		Now:                func() time.Time { return now },
+		Coordinator:        runner,
+		CoordinatorEnabled: func(string) bool { return false },
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(runner.discoverCalls) != 0 {
+		t.Fatalf("coordinator discover calls = %#v, want none when disabled", runner.discoverCalls)
 	}
 }
 
@@ -823,6 +855,12 @@ type stubPlannerScheduler struct {
 	processErr     error
 }
 
+type stubCoordinatorScheduler struct {
+	mu            sync.Mutex
+	discoverCalls []coordinator.DiscoveryInput
+	discoverErr   error
+}
+
 type immediateSchedulerRunner struct{}
 
 func (immediateSchedulerRunner) Go(fn func()) { fn() }
@@ -981,6 +1019,13 @@ func (s *stubPlannerScheduler) processItemCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.processedItems)
+}
+
+func (s *stubCoordinatorScheduler) DiscoverIssues(_ context.Context, input coordinator.DiscoveryInput) (coordinator.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
+	return coordinator.DiscoveryResult{Ticked: true}, s.discoverErr
 }
 
 type stubReviewerScheduler struct {

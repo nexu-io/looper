@@ -146,6 +146,49 @@ func TestDiscoverIssuesSkipsExcludedLabelBeforeAuthorAssociationLookup(t *testin
 	}
 }
 
+func TestDiscoverIssuesSkipsCoordinatorManagedExemptLabels(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		label string
+	}{
+		{name: "dispatch prefix", label: "dispatch/plan"},
+		{name: "needs info", label: "needs-info"},
+		{name: "hold", label: "looper:hold"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Title: "stale bug", Body: "needs cleanup", Author: "octo", Labels: []string{tc.label}}}
+
+			result, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+			if err != nil {
+				t.Fatalf("DiscoverIssues() error = %v", err)
+			}
+			if len(result.QueueItems) != 0 || result.Skipped != 1 {
+				t.Fatalf("DiscoverIssues() = %#v, want exempt label to be skipped", result)
+			}
+		})
+	}
+}
+
+func TestHasLabelSupportsPrefixWithoutBreakingExactMatch(t *testing.T) {
+	t.Parallel()
+
+	labels := []string{"dispatch/plan", "needs-info", "looper:hold"}
+	if !hasLabel(labels, "dispatch/*") {
+		t.Fatal("hasLabel(dispatch/*) = false, want true")
+	}
+	if !hasLabel(labels, "needs-info") {
+		t.Fatal("hasLabel(needs-info) = false, want true")
+	}
+	if hasLabel(labels, "dispatch") {
+		t.Fatal("hasLabel(dispatch) = true, want false for non-prefix exact mismatch")
+	}
+}
+
 func TestDiscoverPullRequestsSkipsExcludedAuthorBeforeAuthorAssociationLookup(t *testing.T) {
 	t.Parallel()
 

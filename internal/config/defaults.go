@@ -136,6 +136,32 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
+			Coordinator: CoordinatorRoleConfig{
+				Enabled:      false,
+				PollInterval: "5m",
+				Triage: CoordinatorTriageConfig{
+					TriagedLabel:    "triaged",
+					MaxIssueAgeDays: 7,
+					MaxPerTick:      5,
+					Disposition: CoordinatorTriageDispositionConfig{
+						OutOfScopeLabel:       "wontfix",
+						UnclearLabel:          "needs-info",
+						ReTriageOnAuthorReply: true,
+					},
+				},
+				Dispatch: CoordinatorDispatchConfig{
+					Mode: "human-gated",
+					HumanGate: CoordinatorDispatchHumanGateConfig{
+						SlashCommands: []string{"/plan", "/implement"},
+						AllowedUsers:  []string{},
+					},
+					Autonomous: CoordinatorDispatchAutonomousConfig{
+						DelayMinutes: 30,
+						HoldLabel:    "looper:hold",
+					},
+					AssignTo: "",
+				},
+			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
@@ -214,7 +240,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					IncludeIssues:             true,
 					IncludePullRequests:       true,
 					IncludeDrafts:             false,
-					ExcludeLabels:             []string{"pinned", "security", "looper:sweep-keep"},
+					ExcludeLabels:             []string{"pinned", "security", "looper:sweep-keep", "dispatch/*", "needs-info", "looper:hold"},
 					ExcludeAuthors:            []string{},
 					ExcludeAuthorAssociations: []string{"OWNER", "MEMBER", "COLLABORATOR"},
 					LooperInternalLabels:      []string{"looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"},

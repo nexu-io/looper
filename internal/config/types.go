@@ -422,12 +422,50 @@ type SweeperRoleConfig struct {
 	Instructions  string                  `json:"instructions,omitempty"`
 }
 
+type CoordinatorTriageDispositionConfig struct {
+	OutOfScopeLabel       string `json:"outOfScopeLabel"`
+	UnclearLabel          string `json:"unclearLabel"`
+	ReTriageOnAuthorReply bool   `json:"reTriageOnAuthorReply"`
+}
+
+type CoordinatorTriageConfig struct {
+	TriagedLabel    string                             `json:"triagedLabel"`
+	MaxIssueAgeDays int                                `json:"maxIssueAgeDays"`
+	MaxPerTick      int                                `json:"maxPerTick"`
+	Disposition     CoordinatorTriageDispositionConfig `json:"disposition"`
+}
+
+type CoordinatorDispatchHumanGateConfig struct {
+	SlashCommands []string `json:"slashCommands"`
+	AllowedUsers  []string `json:"allowedUsers"`
+}
+
+type CoordinatorDispatchAutonomousConfig struct {
+	DelayMinutes int    `json:"delayMinutes"`
+	HoldLabel    string `json:"holdLabel"`
+}
+
+type CoordinatorDispatchConfig struct {
+	Mode       string                              `json:"mode"`
+	HumanGate  CoordinatorDispatchHumanGateConfig  `json:"humanGate"`
+	Autonomous CoordinatorDispatchAutonomousConfig `json:"autonomous"`
+	AssignTo   string                              `json:"assignTo"`
+}
+
+type CoordinatorRoleConfig struct {
+	Enabled      bool                      `json:"enabled"`
+	PollInterval string                    `json:"pollInterval"`
+	Triage       CoordinatorTriageConfig   `json:"triage"`
+	Dispatch     CoordinatorDispatchConfig `json:"dispatch"`
+}
+
 type RoleConfigs struct {
-	Planner  PlannerRoleConfig  `json:"planner"`
-	Reviewer ReviewerRoleConfig `json:"reviewer"`
-	Fixer    FixerRoleConfig    `json:"fixer"`
-	Worker   WorkerRoleConfig   `json:"worker"`
-	Sweeper  SweeperRoleConfig  `json:"sweeper"`
+	Planner     PlannerRoleConfig     `json:"planner"`
+	Reviewer    ReviewerRoleConfig    `json:"reviewer"`
+	Fixer       FixerRoleConfig       `json:"fixer"`
+	Worker      WorkerRoleConfig      `json:"worker"`
+	Sweeper     SweeperRoleConfig     `json:"sweeper"`
+	Coordinator CoordinatorRoleConfig `json:"coordinator"`
 }
 
 type ProjectRefConfig struct {
@@ -763,12 +801,50 @@ type PartialSweeperRoleConfig struct {
 	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
+type PartialCoordinatorTriageDispositionConfig struct {
+	OutOfScopeLabel       *string `json:"outOfScopeLabel,omitempty"`
+	UnclearLabel          *string `json:"unclearLabel,omitempty"`
+	ReTriageOnAuthorReply *bool   `json:"reTriageOnAuthorReply,omitempty"`
+}
+
+type PartialCoordinatorTriageConfig struct {
+	TriagedLabel    *string                                    `json:"triagedLabel,omitempty"`
+	MaxIssueAgeDays *int                                       `json:"maxIssueAgeDays,omitempty"`
+	MaxPerTick      *int                                       `json:"maxPerTick,omitempty"`
+	Disposition     *PartialCoordinatorTriageDispositionConfig `json:"disposition,omitempty"`
+}
+
+type PartialCoordinatorDispatchHumanGateConfig struct {
+	SlashCommands *[]string `json:"slashCommands,omitempty"`
+	AllowedUsers  *[]string `json:"allowedUsers,omitempty"`
+}
+
+type PartialCoordinatorDispatchAutonomousConfig struct {
+	DelayMinutes *int    `json:"delayMinutes,omitempty"`
+	HoldLabel    *string `json:"holdLabel,omitempty"`
+}
+
+type PartialCoordinatorDispatchConfig struct {
+	Mode       *string                                     `json:"mode,omitempty"`
+	HumanGate  *PartialCoordinatorDispatchHumanGateConfig  `json:"humanGate,omitempty"`
+	Autonomous *PartialCoordinatorDispatchAutonomousConfig `json:"autonomous,omitempty"`
+	AssignTo   *string                                     `json:"assignTo,omitempty"`
+}
+
+type PartialCoordinatorRoleConfig struct {
+	Enabled      *bool                             `json:"enabled,omitempty"`
+	PollInterval *string                           `json:"pollInterval,omitempty"`
+	Triage       *PartialCoordinatorTriageConfig   `json:"triage,omitempty"`
+	Dispatch     *PartialCoordinatorDispatchConfig `json:"dispatch,omitempty"`
+}
+
 type PartialRoleConfigs struct {
-	Planner  *PartialPlannerRoleConfig  `json:"planner,omitempty"`
-	Reviewer *PartialReviewerRoleConfig `json:"reviewer,omitempty"`
-	Fixer    *PartialFixerRoleConfig    `json:"fixer,omitempty"`
-	Worker   *PartialWorkerRoleConfig   `json:"worker,omitempty"`
-	Sweeper  *PartialSweeperRoleConfig  `json:"sweeper,omitempty"`
+	Planner     *PartialPlannerRoleConfig     `json:"planner,omitempty"`
+	Reviewer    *PartialReviewerRoleConfig    `json:"reviewer,omitempty"`
+	Fixer       *PartialFixerRoleConfig       `json:"fixer,omitempty"`
+	Worker      *PartialWorkerRoleConfig      `json:"worker,omitempty"`
+	Sweeper     *PartialSweeperRoleConfig     `json:"sweeper,omitempty"`
+	Coordinator *PartialCoordinatorRoleConfig `json:"coordinator,omitempty"`
 }
 
 type PartialConfig struct {

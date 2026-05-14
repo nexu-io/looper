@@ -1014,6 +1014,18 @@ func hasLabel(labels []string, want string) bool {
 	if want == "" {
 		return false
 	}
+	if strings.HasSuffix(want, "*") {
+		prefix := strings.TrimSuffix(want, "*")
+		if prefix == "" {
+			return false
+		}
+		for _, label := range labels {
+			if strings.HasPrefix(label, prefix) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, label := range labels {
 		if label == want {
 			return true

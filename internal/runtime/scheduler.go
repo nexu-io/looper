@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -30,6 +31,10 @@ type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
+}
+
+type coordinatorScheduler interface {
+	DiscoverIssues(context.Context, coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error)
 }
 
 type reviewerScheduler interface {
@@ -76,12 +81,14 @@ type defaultSchedulerTickInput struct {
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
+	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
 	Worker                   workerScheduler
 	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
 	PlannerDiscoveryEnabled  *bool
+	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
@@ -834,6 +841,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	}
 
 	var plannerRunner plannerScheduler
+	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
@@ -884,6 +892,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
 	})
+	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{Config: &cfg, Now: now})
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
@@ -1000,12 +1009,14 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			AsyncRunner:              runner,
 			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
+			Coordinator:              coordinatorRunner,
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
 			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
@@ -1113,6 +1124,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		} else if input.Planner != nil && input.Logger != nil {
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
+		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
+			_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			appendErr(wrapSchedulerError("coordinator discovery", project.ID, repo, err))
+		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
 			result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
 			trackRunnableDiscovery(result.QueueItems)
@@ -1178,6 +1193,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 
 func discoveryEnabled(value *bool) bool {
 	return value == nil || *value
+}
+
+func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID string) bool {
+	if input.CoordinatorEnabled == nil {
+		return false
+	}
+	return input.CoordinatorEnabled(projectID)
 }
 
 func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now func() time.Time) []string {

@@ -673,6 +673,9 @@ func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstruct
 }
 
 func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
+	if partial.Coordinator != nil {
+		mergeCoordinatorRoleConfig(&config.Coordinator, *partial.Coordinator)
+	}
 	if partial.Planner != nil {
 		mergePlannerRoleConfig(&config.Planner, *partial.Planner)
 	}
@@ -687,6 +690,81 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	}
 	if partial.Sweeper != nil {
 		mergeSweeperRoleConfig(&config.Sweeper, *partial.Sweeper)
+	}
+}
+
+func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.PollInterval != nil {
+		config.PollInterval = *partial.PollInterval
+	}
+	if partial.Triage != nil {
+		mergeCoordinatorTriageConfig(&config.Triage, *partial.Triage)
+	}
+	if partial.Dispatch != nil {
+		mergeCoordinatorDispatchConfig(&config.Dispatch, *partial.Dispatch)
+	}
+}
+
+func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {
+	if partial.TriagedLabel != nil {
+		config.TriagedLabel = *partial.TriagedLabel
+	}
+	if partial.MaxIssueAgeDays != nil {
+		config.MaxIssueAgeDays = *partial.MaxIssueAgeDays
+	}
+	if partial.MaxPerTick != nil {
+		config.MaxPerTick = *partial.MaxPerTick
+	}
+	if partial.Disposition != nil {
+		mergeCoordinatorTriageDispositionConfig(&config.Disposition, *partial.Disposition)
+	}
+}
+
+func mergeCoordinatorTriageDispositionConfig(config *CoordinatorTriageDispositionConfig, partial PartialCoordinatorTriageDispositionConfig) {
+	if partial.OutOfScopeLabel != nil {
+		config.OutOfScopeLabel = *partial.OutOfScopeLabel
+	}
+	if partial.UnclearLabel != nil {
+		config.UnclearLabel = *partial.UnclearLabel
+	}
+	if partial.ReTriageOnAuthorReply != nil {
+		config.ReTriageOnAuthorReply = *partial.ReTriageOnAuthorReply
+	}
+}
+
+func mergeCoordinatorDispatchConfig(config *CoordinatorDispatchConfig, partial PartialCoordinatorDispatchConfig) {
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+	if partial.HumanGate != nil {
+		mergeCoordinatorDispatchHumanGateConfig(&config.HumanGate, *partial.HumanGate)
+	}
+	if partial.Autonomous != nil {
+		mergeCoordinatorDispatchAutonomousConfig(&config.Autonomous, *partial.Autonomous)
+	}
+	if partial.AssignTo != nil {
+		config.AssignTo = *partial.AssignTo
+	}
+}
+
+func mergeCoordinatorDispatchHumanGateConfig(config *CoordinatorDispatchHumanGateConfig, partial PartialCoordinatorDispatchHumanGateConfig) {
+	if partial.SlashCommands != nil {
+		config.SlashCommands = cloneStrings(*partial.SlashCommands)
+	}
+	if partial.AllowedUsers != nil {
+		config.AllowedUsers = cloneStrings(*partial.AllowedUsers)
+	}
+}
+
+func mergeCoordinatorDispatchAutonomousConfig(config *CoordinatorDispatchAutonomousConfig, partial PartialCoordinatorDispatchAutonomousConfig) {
+	if partial.DelayMinutes != nil {
+		config.DelayMinutes = *partial.DelayMinutes
+	}
+	if partial.HoldLabel != nil {
+		config.HoldLabel = *partial.HoldLabel
 	}
 }
 
@@ -1135,6 +1213,38 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			worker.Triggers = &triggers
 		}
 		cloned.Worker = &worker
+	}
+	if configs.Coordinator != nil {
+		coordinator := *configs.Coordinator
+		if configs.Coordinator.Triage != nil {
+			triage := *configs.Coordinator.Triage
+			if configs.Coordinator.Triage.Disposition != nil {
+				disposition := *configs.Coordinator.Triage.Disposition
+				triage.Disposition = &disposition
+			}
+			coordinator.Triage = &triage
+		}
+		if configs.Coordinator.Dispatch != nil {
+			dispatch := *configs.Coordinator.Dispatch
+			if configs.Coordinator.Dispatch.HumanGate != nil {
+				humanGate := *configs.Coordinator.Dispatch.HumanGate
+				if humanGate.SlashCommands != nil {
+					slashCommands := cloneStrings(*humanGate.SlashCommands)
+					humanGate.SlashCommands = &slashCommands
+				}
+				if humanGate.AllowedUsers != nil {
+					allowedUsers := cloneStrings(*humanGate.AllowedUsers)
+					humanGate.AllowedUsers = &allowedUsers
+				}
+				dispatch.HumanGate = &humanGate
+			}
+			if configs.Coordinator.Dispatch.Autonomous != nil {
+				autonomous := *configs.Coordinator.Dispatch.Autonomous
+				dispatch.Autonomous = &autonomous
+			}
+			coordinator.Dispatch = &dispatch
+		}
+		cloned.Coordinator = &coordinator
 	}
 	if configs.Reviewer != nil {
 		reviewer := *configs.Reviewer

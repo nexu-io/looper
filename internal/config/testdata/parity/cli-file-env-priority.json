@@ -183,6 +183,35 @@
         "addSnapshotMode": "async"
       },
       "roles": {
+        "coordinator": {
+          "enabled": false,
+          "pollInterval": "5m",
+          "triage": {
+            "triagedLabel": "triaged",
+            "maxIssueAgeDays": 7,
+            "maxPerTick": 5,
+            "disposition": {
+              "outOfScopeLabel": "wontfix",
+              "unclearLabel": "needs-info",
+              "reTriageOnAuthorReply": true
+            }
+          },
+          "dispatch": {
+            "mode": "human-gated",
+            "humanGate": {
+              "slashCommands": [
+                "/plan",
+                "/implement"
+              ],
+              "allowedUsers": []
+            },
+            "autonomous": {
+              "delayMinutes": 30,
+              "holdLabel": "looper:hold"
+            },
+            "assignTo": ""
+          }
+        },
         "planner": {
           "autoDiscovery": true,
           "triggers": {
@@ -263,7 +292,10 @@
             "excludeLabels": [
               "pinned",
               "security",
-              "looper:sweep-keep"
+              "looper:sweep-keep",
+              "dispatch/*",
+              "needs-info",
+              "looper:hold"
             ],
             "excludeAuthors": [],
             "excludeAuthorAssociations": [

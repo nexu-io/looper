@@ -1513,6 +1513,130 @@ func TestLoadFileSupportsSweeperCustomInstructions(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRoleProjectOverrideAffectsRoleHelpers(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {
+			"coordinator": {
+				"enabled": false,
+				"pollInterval": "5m",
+				"triage": {
+					"triagedLabel": "triaged",
+					"maxIssueAgeDays": 7,
+					"maxPerTick": 5,
+					"disposition": {
+						"outOfScopeLabel": "wontfix",
+						"unclearLabel": "needs-info",
+						"reTriageOnAuthorReply": true
+					}
+				},
+				"dispatch": {
+					"mode": "human-gated",
+					"humanGate": {"slashCommands": ["/plan"], "allowedUsers": []},
+					"autonomous": {"delayMinutes": 30, "holdLabel": "looper:hold"},
+					"assignTo": ""
+				}
+			}
+		},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"roles": {
+				"coordinator": {
+					"enabled": true,
+					"pollInterval": "2m",
+					"triage": {"maxPerTick": 3},
+					"dispatch": {"autonomous": {"holdLabel": "project:hold"}}
+				}
+			}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	globalRoles := ProjectRoleConfigs(loaded.Config, "missing")
+	if globalRoles.Coordinator.Enabled {
+		t.Fatal("global coordinator enabled = true, want false")
+	}
+	if globalRoles.Coordinator.PollInterval != "5m" || globalRoles.Coordinator.Triage.MaxPerTick != 5 {
+		t.Fatalf("global coordinator = %#v, want configured global defaults", globalRoles.Coordinator)
+	}
+
+	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
+	if !projectRoles.Coordinator.Enabled {
+		t.Fatal("project coordinator enabled = false, want true from project override")
+	}
+	if projectRoles.Coordinator.PollInterval != "2m" || projectRoles.Coordinator.Triage.MaxPerTick != 3 || projectRoles.Coordinator.Dispatch.Autonomous.HoldLabel != "project:hold" {
+		t.Fatalf("project coordinator = %#v, want project overrides merged", projectRoles.Coordinator)
+	}
+	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "coordinator") {
+		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(coordinator) = false, want true from project enablement")
+	}
+}
+
+func TestValidateRejectsInvalidCoordinatorConfig(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {
+			"coordinator": {
+				"enabled": true,
+				"pollInterval": "",
+				"triage": {
+					"triagedLabel": "",
+					"maxIssueAgeDays": 0,
+					"maxPerTick": 0,
+					"disposition": {
+						"outOfScopeLabel": "",
+						"unclearLabel": " needs-info "
+					}
+				},
+				"dispatch": {
+					"mode": "robot",
+					"humanGate": {"slashCommands": [], "allowedUsers": [""]},
+					"autonomous": {"delayMinutes": 0, "holdLabel": ""},
+					"assignTo": " octo "
+				}
+			}
+		},
+		"projects": [{"id": "demo", "name": "Demo", "repoPath": "/repos/demo"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssueForPaths(t, validationErr.Issues, []string{
+		"roles.coordinator.pollInterval",
+		"roles.coordinator.triage.triagedLabel",
+		"roles.coordinator.triage.maxIssueAgeDays",
+		"roles.coordinator.triage.maxPerTick",
+		"roles.coordinator.triage.disposition.outOfScopeLabel",
+		"roles.coordinator.triage.disposition.unclearLabel",
+		"roles.coordinator.dispatch.mode",
+		"roles.coordinator.dispatch.humanGate.slashCommands",
+		"roles.coordinator.dispatch.autonomous.delayMinutes",
+		"roles.coordinator.dispatch.autonomous.holdLabel",
+		"roles.coordinator.dispatch.assignTo",
+	})
+	assertValidationIssueForPathPrefix(t, validationErr.Issues, "roles.coordinator.dispatch.humanGate.allowedUsers")
+}
+
 func TestValidateRejectsInvalidSweeperTriggerThresholdAndAssociationConfig(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
