@@ -622,6 +622,7 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	payload.Repo = derefString(queueItem.Repo)
 	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
 	if err != nil {
 		return payload, "failed", "", err
@@ -651,7 +652,6 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	payload.Category = category
 	payload.Confidence = confidence
 	payload.Rationale = rationale
-	payload.Repo = derefString(queueItem.Repo)
 	payload.TargetType = queueItem.TargetType
 	payload.TargetNumber = target.Number
 	payload.PendingLabel = roleCfg.Lifecycle.PendingLabel
@@ -827,12 +827,12 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	payload.Repo = derefString(queueItem.Repo)
 	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
 	if err != nil {
 		return payload, "failed", "", err
 	}
 	payload.Phase = "close"
-	payload.Repo = derefString(queueItem.Repo)
 	payload.TargetType = queueItem.TargetType
 	payload.TargetNumber = target.Number
 	payload.PendingLabel = roleCfg.Lifecycle.PendingLabel
@@ -1098,6 +1098,7 @@ func (r *Runner) processReconcile(ctx context.Context, queueItem storage.QueueIt
 	if err != nil {
 		return payload, "failed", "", err
 	}
+	payload.Repo = derefString(queueItem.Repo)
 	caseRecord, err := r.ensureCase(ctx, derefString(queueItem.ProjectID), target, payload, roleCfg)
 	if err != nil {
 		return payload, "failed", "", err

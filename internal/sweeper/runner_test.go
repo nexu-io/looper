@@ -377,6 +377,44 @@ func TestProcessWarnPostsWarningAndMarksPending(t *testing.T) {
 	}
 }
 
+func TestProcessWarnSetsRepoBeforeEnsuringCase(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = true
+	queueItem := storage.QueueItemRecord{ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#142", Repo: stringPtr("acme/looper")}
+	fixture.github.issueDetails["acme/looper#142"] = githubinfra.IssueDetail{Number: 142, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo"}
+
+	payload, status, _, err := fixture.runner.processWarn(context.Background(), queueItem, sweeperPayload{})
+	if err != nil {
+		t.Fatalf("processWarn() error = %v", err)
+	}
+	if status != "skipped" {
+		t.Fatalf("processWarn() status = %q, want skipped", status)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 142)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil {
+		t.Fatal("caseRecord = nil, want repo-scoped case")
+	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), payload.ProposalID)
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	if proposal == nil || proposal.Repo != "acme/looper" {
+		t.Fatalf("proposal = %#v, want repo-scoped proposal", proposal)
+	}
+	bundle, err := parseFactBundle(proposal.FactBundleJSON)
+	if err != nil {
+		t.Fatalf("parseFactBundle() error = %v", err)
+	}
+	if bundle.Repo != "acme/looper" {
+		t.Fatalf("bundle.Repo = %q, want acme/looper", bundle.Repo)
+	}
+}
+
 func TestProcessWarnKeepsUnrelatedDryRunOnly(t *testing.T) {
 	t.Parallel()
 
@@ -1648,6 +1686,44 @@ func TestProcessCloseSkipsStaleProposal(t *testing.T) {
 	}
 }
 
+func TestProcessCloseSetsRepoBeforeEnsuringCase(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = true
+	queueItem := storage.QueueItemRecord{ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#153", Repo: stringPtr("acme/looper")}
+	fixture.github.issueDetails["acme/looper#153"] = githubinfra.IssueDetail{Number: 153, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+
+	payload, status, _, err := fixture.runner.processClose(context.Background(), queueItem, sweeperPayload{})
+	if err != nil {
+		t.Fatalf("processClose() error = %v", err)
+	}
+	if status != "skipped" {
+		t.Fatalf("processClose() status = %q, want skipped", status)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 153)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil {
+		t.Fatal("caseRecord = nil, want repo-scoped case")
+	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), payload.ProposalID)
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	if proposal == nil || proposal.Repo != "acme/looper" {
+		t.Fatalf("proposal = %#v, want repo-scoped proposal", proposal)
+	}
+	bundle, err := parseFactBundle(proposal.FactBundleJSON)
+	if err != nil {
+		t.Fatalf("parseFactBundle() error = %v", err)
+	}
+	if bundle.Repo != "acme/looper" {
+		t.Fatalf("bundle.Repo = %q, want acme/looper", bundle.Repo)
+	}
+}
+
 func TestProcessReconcileCancelsWhenPendingLabelRemoved(t *testing.T) {
 	t.Parallel()
 
@@ -1769,6 +1845,46 @@ func TestProcessReconcileLegacyProposalIDCreatesNewCancelProposal(t *testing.T) 
 	}
 	if proposal == nil || proposal.Decision != "cancel" || proposal.ID == "proposal_warn_legacy_reconcile" {
 		t.Fatalf("proposal = %#v, want new cancel proposal created from legacy proposal_id payload", proposal)
+	}
+}
+
+func TestProcessReconcileSetsRepoBeforePersistingProposal(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	category := categoryStale
+	confidence := int64(80)
+	rationale := "open item matched stale sweeper heuristics"
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_reconcile_repo", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 171, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_repo", CaseID: "case_reconcile_repo", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 171, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: `{"hash":"warn-repo"}`, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryStale, ConfidenceScore: 80, Rationale: &rationale, ValidationStatus: stringPtr("passed"), ApplyStatus: stringPtr("completed_warned"), CreatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperProposals.Insert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ProjectID: &fixture.projectID, Type: QueueTypeReconcile, TargetType: "issue", TargetID: "acme/looper#171", Repo: stringPtr("acme/looper")}
+	fixture.github.issueDetails["acme/looper#171"] = githubinfra.IssueDetail{Number: 171, Title: "Bug", Body: "stale", State: "open", UpdatedAt: fixture.now.Add(-91 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: nil}
+
+	payload, status, _, err := fixture.runner.processReconcile(context.Background(), queueItem, sweeperPayload{CaseID: "case_reconcile_repo"})
+	if err != nil {
+		t.Fatalf("processReconcile() error = %v", err)
+	}
+	if status != "completed" {
+		t.Fatalf("processReconcile() status = %q, want completed", status)
+	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), payload.ProposalID)
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	if proposal == nil || proposal.CaseID != "case_reconcile_repo" || proposal.Repo != "acme/looper" {
+		t.Fatalf("proposal = %#v, want reconcile proposal persisted on repo-scoped case", proposal)
+	}
+	bundle, err := parseFactBundle(proposal.FactBundleJSON)
+	if err != nil {
+		t.Fatalf("parseFactBundle() error = %v", err)
+	}
+	if bundle.Repo != "acme/looper" {
+		t.Fatalf("bundle.Repo = %q, want acme/looper", bundle.Repo)
 	}
 }
 
