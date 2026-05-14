@@ -157,7 +157,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "config",
 				short:           "Inspect and edit the active config file",
-				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}},
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}, {name: "migrate", description: "Migrate a config file to canonical format"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper config get roles.reviewer.behavior.reviewEvents.clean",
@@ -165,6 +165,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper config unset roles.reviewer.behavior.reviewEvents.clean",
 					"$ looper config validate",
 					"$ looper config show --source",
+					"$ looper config migrate --dry-run",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "get <key>", short: "Get a config value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
@@ -174,6 +175,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "lint", short: "Lint the active config file", runE: runtime.configValidate}),
 					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
 					newCommand(commandSpec{use: "edit", short: "Edit the active config file", runE: runtime.configEdit}),
+					newCommand(commandSpec{use: "migrate", short: "Migrate a config file to canonical format", runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path (defaults to ~/.looper/config.json)"), stringFlag("to", "path", "Destination config path (defaults to canonical TOML path)"), boolFlag("dry-run", "Preview the migrated canonical config without writing files"), boolFlag("force", "Overwrite an existing destination after creating a backup")}}),
 				},
 			}),
 			newCommand(commandSpec{

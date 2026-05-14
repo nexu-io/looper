@@ -53,8 +53,22 @@ Default-path discovery checks, in order:
 Behavior:
 
 - if exactly one supported default config file exists, Looper loads it
-- if multiple supported default config files exist, Looper fails clearly instead of guessing
+- if both `~/.looper/config.toml` and legacy `~/.looper/config.json` exist, Looper prefers `config.toml`
+- any other multiple-default-file combination fails clearly instead of guessing
 - if none exist, Looper continues with built-in defaults and treats `~/.looper/config.toml` as the canonical path for newly generated config
+
+To migrate the legacy default JSON config explicitly, run:
+
+```bash
+looper config migrate
+```
+
+Useful migration flags:
+
+- `--from <path>` to read a non-default source config file
+- `--to <path>` to write somewhere other than the default canonical TOML path
+- `--dry-run` to preview the canonical output without touching user files
+- `--force` to overwrite an existing destination after creating a backup
 
 Custom config path examples:
 
@@ -87,6 +101,8 @@ Looper's frozen canonical top-level config roots are:
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.
+
+`looper config migrate` is the only product-supported file-writing migration path. Normal CLI and daemon startup never rewrite config files implicitly.
 
 ## Minimal setup
 

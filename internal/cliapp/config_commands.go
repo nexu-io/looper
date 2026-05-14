@@ -292,6 +292,323 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 	return err
 }
 
+type configMigrationPlan struct {
+	From          string
+	To            string
+	DryRun        bool
+	Force         bool
+	Overwrites    bool
+	Changes       []string
+	Preview       string
+	SourcePresent bool
+}
+
+func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error {
+	plan, err := r.buildConfigMigrationPlan(cmd)
+	if err != nil {
+		return err
+	}
+
+	if getBoolFlag(cmd, "json") {
+		payload := map[string]any{
+			"from":       plan.From,
+			"to":         plan.To,
+			"dryRun":     plan.DryRun,
+			"force":      plan.Force,
+			"overwrites": plan.Overwrites,
+			"changes":    plan.Changes,
+			"preview":    plan.Preview,
+		}
+		if plan.DryRun {
+			payload["updated"] = false
+			return writeJSON(cmd.OutOrStdout(), payload)
+		}
+		backupPath, err := r.writeMigratedConfig(plan.To, plan.Preview, plan.Overwrites)
+		if err != nil {
+			return err
+		}
+		payload["updated"] = true
+		payload["sourcePreserved"] = true
+		if backupPath != "" {
+			payload["backupPath"] = backupPath
+		}
+		return writeJSON(cmd.OutOrStdout(), payload)
+	}
+
+	if plan.DryRun {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Dry run: would migrate config %s -> %s\n", plan.From, plan.To); err != nil {
+			return err
+		}
+		if err := writeMigrationChangeSummary(cmd, plan.Changes); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "\n--- canonical preview ---\n%s", plan.Preview)
+		return err
+	}
+
+	backupPath, err := r.writeMigratedConfig(plan.To, plan.Preview, plan.Overwrites)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Migrated config %s -> %s\n", plan.From, plan.To); err != nil {
+		return err
+	}
+	if err := writeMigrationChangeSummary(cmd, plan.Changes); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Source preserved at %s\n", plan.From); err != nil {
+		return err
+	}
+	if backupPath != "" {
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "Backup created at %s\n", backupPath)
+		return err
+	}
+	return nil
+}
+
+func (r *commandRuntime) buildConfigMigrationPlan(cmd *cobra.Command) (configMigrationPlan, error) {
+	plan, err := r.resolveConfigMigrationPlan(cmd)
+	if err != nil {
+		return configMigrationPlan{}, err
+	}
+	partial, present, err := config.ReadPartialConfigFile(plan.From)
+	if err != nil {
+		return configMigrationPlan{}, err
+	}
+	if !present {
+		return configMigrationPlan{}, fmt.Errorf("source config file not found: %s", plan.From)
+	}
+	plan.SourcePresent = true
+	plan.Changes = detectConfigMigrationChanges(partial, plan.From, plan.To)
+	if err := r.validatePartialConfig(partial); err != nil {
+		return configMigrationPlan{}, err
+	}
+	canonicalPartial := config.CanonicalizePartialForMigration(partial)
+	if err := r.validatePartialConfig(canonicalPartial); err != nil {
+		return configMigrationPlan{}, err
+	}
+	preview, err := marshalCanonicalMigrationPreview(plan.To, canonicalPartial)
+	if err != nil {
+		return configMigrationPlan{}, err
+	}
+	plan.Preview = preview
+	return plan, nil
+}
+
+func (r *commandRuntime) resolveConfigMigrationPlan(cmd *cobra.Command) (configMigrationPlan, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return configMigrationPlan{}, fmt.Errorf("determine current working directory: %w", err)
+	}
+	fromFlag := strings.TrimSpace(getStringFlag(cmd, "from"))
+	toFlag := strings.TrimSpace(getStringFlag(cmd, "to"))
+	looperHome, err := config.DefaultLooperHome()
+	if err != nil {
+		return configMigrationPlan{}, fmt.Errorf("determine looper home: %w", err)
+	}
+	defaultFrom := filepath.Join(looperHome, "config.json")
+	defaultTo := filepath.Join(looperHome, "config.toml")
+	from := defaultFrom
+	if fromFlag != "" {
+		from = config.ResolveConfigPath(fromFlag, cwd)
+	}
+	to := defaultTo
+	if toFlag != "" {
+		to = config.ResolveConfigPath(toFlag, cwd)
+	} else if fromFlag != "" {
+		to = filepath.Join(filepath.Dir(from), strings.TrimSuffix(filepath.Base(from), filepath.Ext(from))+".toml")
+	}
+	if filepath.Clean(from) == filepath.Clean(to) {
+		return configMigrationPlan{}, fmt.Errorf("source and destination config paths must differ; use --to to choose a different destination")
+	}
+	overwrites := false
+	if info, statErr := os.Stat(to); statErr == nil && !info.IsDir() {
+		overwrites = true
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return configMigrationPlan{}, fmt.Errorf("check destination config file at %s: %w", to, statErr)
+	}
+	force := getBoolFlag(cmd, "force")
+	if overwrites && !force && !getBoolFlag(cmd, "dry-run") {
+		if filepath.Clean(from) == filepath.Clean(defaultFrom) && filepath.Clean(to) == filepath.Clean(defaultTo) && fromFlag == "" && toFlag == "" {
+			return configMigrationPlan{}, fmt.Errorf("default migration target already exists at %s; rerun with --force to overwrite it after creating a backup, or set --to to choose another path", to)
+		}
+		return configMigrationPlan{}, fmt.Errorf("destination config file already exists at %s; rerun with --force to overwrite it after creating a backup, or set --to to choose another path", to)
+	}
+	return configMigrationPlan{
+		From:       from,
+		To:         to,
+		DryRun:     getBoolFlag(cmd, "dry-run"),
+		Force:      force,
+		Overwrites: overwrites,
+	}, nil
+}
+
+func marshalCanonicalMigrationPreview(path string, partial config.PartialConfig) (string, error) {
+	raw, err := config.MarshalConfigFile(path, pruneEmptyMaps(normalizeConfigMigrationValue(partial)))
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func normalizeConfigMigrationValue(partial config.PartialConfig) map[string]any {
+	raw, err := json.Marshal(partial)
+	if err != nil {
+		return map[string]any{}
+	}
+	var normalized map[string]any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return map[string]any{}
+	}
+	return normalized
+}
+
+func pruneEmptyMaps(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		pruned := make(map[string]any, len(typed))
+		for key, item := range typed {
+			next := pruneEmptyMaps(item)
+			if next == nil {
+				continue
+			}
+			pruned[key] = next
+		}
+		if len(pruned) == 0 {
+			return nil
+		}
+		return pruned
+	case []any:
+		items := make([]any, 0, len(typed))
+		for _, item := range typed {
+			next := pruneEmptyMaps(item)
+			if next == nil {
+				continue
+			}
+			items = append(items, next)
+		}
+		return items
+	default:
+		return value
+	}
+}
+
+func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwrites bool) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("create config directory: %w", err)
+	}
+	tmpPattern := ".config-*" + filepath.Ext(path)
+	if filepath.Ext(path) == "" {
+		tmpPattern = ".config-*.tmp"
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
+	if err != nil {
+		return "", fmt.Errorf("create temporary config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.WriteString(preview); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("write temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close temporary config: %w", err)
+	}
+	if err := r.validateMigratedConfigFile(tmpPath); err != nil {
+		return "", err
+	}
+	if !overwrites {
+		if err := os.Link(tmpPath, path); err != nil {
+			if os.IsExist(err) {
+				return "", fmt.Errorf("destination config file already exists at %s; rerun with --force to overwrite it after creating a backup, or set --to to choose another path", path)
+			}
+			return "", fmt.Errorf("create config without overwrite: %w", err)
+		}
+		return "", nil
+	}
+	backupPath := ""
+	if overwrites {
+		backupPath, err = backupConfigFileWithPath(path)
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return "", fmt.Errorf("replace config: %w", err)
+	}
+	return backupPath, nil
+}
+
+func writeMigrationChangeSummary(cmd *cobra.Command, changes []string) error {
+	if len(changes) == 0 {
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "Changes: none; source already uses canonical schema/format")
+		return err
+	}
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Changes:"); err != nil {
+		return err
+	}
+	for _, change := range changes {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func detectConfigMigrationChanges(partial config.PartialConfig, from string, to string) []string {
+	changes := make([]string, 0, 8)
+	fromExt := strings.ToLower(filepath.Ext(from))
+	toExt := strings.ToLower(filepath.Ext(to))
+	if fromExt != toExt {
+		changes = append(changes, fmt.Sprintf("rewrite config format from %s to %s", strings.TrimPrefix(fromExt, "."), strings.TrimPrefix(toExt, ".")))
+	}
+	if partial.LegacyReviewer != nil {
+		changes = append(changes, "move legacy top-level reviewer.* settings to roles.reviewer.behavior.*")
+	}
+	if partial.Defaults != nil && partial.Defaults.AllowAutoApprove != nil {
+		changes = append(changes, "replace defaults.allowAutoApprove with roles.reviewer.behavior.reviewEvents.clean")
+	}
+	if partial.Defaults != nil && partial.Defaults.FixAllPullRequests != nil {
+		changes = append(changes, "replace defaults.fixAllPullRequests with roles.fixer.triggers.authorFilter")
+	}
+	if hasLegacyReviewerDiscoveryAliases(partial.Roles) {
+		changes = append(changes, "move legacy reviewer discovery aliases to roles.reviewer.discovery.*")
+	}
+	if partial.Projects != nil {
+		for _, project := range *partial.Projects {
+			if project.Path != "" {
+				changes = append(changes, "replace projects[].path with projects[].repoPath")
+				break
+			}
+		}
+		hasProjectInstructions := false
+		hasProjectReviewerAliases := false
+		for _, project := range *partial.Projects {
+			if len(project.Instructions) > 0 {
+				hasProjectInstructions = true
+			}
+			if project.Roles != nil && hasLegacyReviewerDiscoveryAliases(project.Roles) {
+				hasProjectReviewerAliases = true
+			}
+		}
+		if hasProjectInstructions {
+			changes = append(changes, "move projects[].instructions.<role> entries to projects[].roles.<role>.instructions")
+		}
+		if hasProjectReviewerAliases {
+			changes = append(changes, "move legacy project reviewer discovery aliases to projects[].roles.reviewer.discovery.*")
+		}
+	}
+	return changes
+}
+
+func hasLegacyReviewerDiscoveryAliases(roles *config.PartialRoleConfigs) bool {
+	if roles == nil || roles.Reviewer == nil {
+		return false
+	}
+	reviewer := roles.Reviewer
+	return reviewer.AutoDiscovery != nil || reviewer.Triggers != nil || reviewer.SpecReview != nil
+}
+
 func (r *commandRuntime) loadConfigForEdit() (config.LoadedFileConfig, error) {
 	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
 	if err != nil {
@@ -433,6 +750,15 @@ func (r *commandRuntime) validateConfigFile(path string) error {
 	return err
 }
 
+func (r *commandRuntime) validateMigratedConfigFile(path string) error {
+	_, err := config.LoadFile(config.LoadFileOptions{
+		Args:      []string{"--config", path},
+		LookupEnv: func(string) (string, bool) { return "", false },
+		LookPath:  r.lookPath(),
+	})
+	return err
+}
+
 func (r *commandRuntime) validatePartialConfig(partial config.PartialConfig) error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -446,18 +772,23 @@ func (r *commandRuntime) validatePartialConfig(partial config.PartialConfig) err
 }
 
 func backupConfigFile(path string) error {
+	_, err := backupConfigFileWithPath(path)
+	return err
+}
+
+func backupConfigFileWithPath(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return "", nil
 		}
-		return fmt.Errorf("read config for backup: %w", err)
+		return "", fmt.Errorf("read config for backup: %w", err)
 	}
 	backupPath := fmt.Sprintf("%s.%s.bak", path, time.Now().UTC().Format("20060102150405.000000000"))
 	if err := os.WriteFile(backupPath, raw, 0o600); err != nil {
-		return fmt.Errorf("write config backup: %w", err)
+		return "", fmt.Errorf("write config backup: %w", err)
 	}
-	return nil
+	return backupPath, nil
 }
 
 func (r *commandRuntime) warnConfigOverrides(cmd *cobra.Command, field configField) {

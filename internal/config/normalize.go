@@ -18,6 +18,38 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	return config, nil
 }
 
+func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
+	normalized := normalizeLayerPartial(partial)
+	normalized.LegacyReviewer = nil
+
+	if normalized.Defaults != nil {
+		normalized.Defaults.AllowAutoApprove = nil
+		normalized.Defaults.FixAllPullRequests = nil
+	}
+
+	if normalized.Roles != nil && normalized.Roles.Reviewer != nil {
+		normalized.Roles.Reviewer.AutoDiscovery = nil
+		normalized.Roles.Reviewer.Triggers = nil
+		normalized.Roles.Reviewer.SpecReview = nil
+	}
+
+	if normalized.Projects != nil {
+		projects := *normalized.Projects
+		for i := range projects {
+			projects[i].Path = ""
+			projects[i].Instructions = nil
+			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
+				projects[i].Roles.Reviewer.AutoDiscovery = nil
+				projects[i].Roles.Reviewer.Triggers = nil
+				projects[i].Roles.Reviewer.SpecReview = nil
+			}
+		}
+		normalized.Projects = &projects
+	}
+
+	return normalized
+}
+
 func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	normalized := partial
 

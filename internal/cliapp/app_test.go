@@ -62,7 +62,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file", "migrate   Migrate a config file to canonical format"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
@@ -2193,6 +2193,275 @@ func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyDefaultPath); err != nil {
 		t.Fatalf("os.Stat(%q) error = %v, want legacy config file preserved", legacyDefaultPath, err)
+	}
+}
+
+func TestConfigMigrateDryRunCanonicalizesLegacyJSONWithoutWritingDestination(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"reviewEvents":{"clean":"COMMENT"}},"defaults":{"allowAutoApprove":true},"projects":[{"id":"repo","name":"Repo","path":"/tmp/repo","instructions":{"reviewer":"check carefully"}}]}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	destPath := filepath.Join(filepath.Dir(configPath), "canonical.toml")
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", configPath, "--to", destPath, "--dry-run")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	for _, want := range []string{
+		"Dry run: would migrate config ",
+		"rewrite config format from json to toml",
+		"move legacy top-level reviewer.* settings to roles.reviewer.behavior.*",
+		"[roles.reviewer.behavior.reviewEvents]",
+		"clean = 'COMMENT'",
+		"[projects.roles.reviewer]",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	}
+	for _, unwanted := range []string{"[reviewer]", "path = '/tmp/repo'", "[projects.instructions]", "allowAutoApprove ="} {
+		if strings.Contains(stdout, unwanted) {
+			t.Fatalf("stdout = %q, did not expect %q", stdout, unwanted)
+		}
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want destination not created", destPath, err)
+	}
+	if _, err := os.Stat(configPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want source preserved", configPath, err)
+	}
+}
+
+func TestConfigMigrateFailsWhenDestinationExistsWithoutForce(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destPath := filepath.Join(filepath.Dir(sourcePath), "config.toml")
+	before := "[defaults]\nallowRiskyFixes = false\n"
+	if err := os.WriteFile(destPath, []byte(before), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(destPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "destination config file already exists") || !strings.Contains(stderr, "--force") {
+		t.Fatalf("stderr = %q, want overwrite guidance", stderr)
+	}
+	after, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(destPath) error = %v", err)
+	}
+	if string(after) != before {
+		t.Fatalf("destination changed unexpectedly\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestConfigMigrateForceOverwritesExistingDestinationAndCreatesBackup(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"reviewer":{"reviewEvents":{"clean":"APPROVE"}},"defaults":{"fixAllPullRequests":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destPath := filepath.Join(filepath.Dir(sourcePath), "canonical.toml")
+	before := "[defaults]\nallowRiskyFixes = false\n"
+	if err := os.WriteFile(destPath, []byte(before), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(destPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath, "--force")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --force]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Backup created at ") || !strings.Contains(stdout, "Source preserved at "+sourcePath) {
+		t.Fatalf("stdout = %q, want backup and source-preserved messages", stdout)
+	}
+	raw, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(destPath) error = %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "[roles.reviewer.behavior.reviewEvents]") || !strings.Contains(text, "[roles.fixer.triggers]") {
+		t.Fatalf("migrated TOML = %q, want canonical reviewer/fixer sections", text)
+	}
+	if strings.Contains(text, "fixAllPullRequests") || strings.Contains(text, "[reviewer]") {
+		t.Fatalf("migrated TOML = %q, did not expect legacy surfaces", text)
+	}
+	entries, err := os.ReadDir(filepath.Dir(destPath))
+	if err != nil {
+		t.Fatalf("os.ReadDir() error = %v", err)
+	}
+	backupFound := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), filepath.Base(destPath)+".") && strings.HasSuffix(entry.Name(), ".bak") {
+			backupFound = true
+			backupRaw, err := os.ReadFile(filepath.Join(filepath.Dir(destPath), entry.Name()))
+			if err != nil {
+				t.Fatalf("os.ReadFile(backup) error = %v", err)
+			}
+			if string(backupRaw) != before {
+				t.Fatalf("backup contents = %q, want original destination contents %q", backupRaw, before)
+			}
+		}
+	}
+	if !backupFound {
+		t.Fatal("expected destination backup to be created")
+	}
+}
+
+func TestConfigMigrateDefaultPathCreatesCanonicalTOMLAndPreservesLegacyJSON(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyPath := filepath.Join(looperHome, "config.json")
+	canonicalPath := filepath.Join(looperHome, "config.toml")
+	if err := os.WriteFile(legacyPath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(legacyPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Migrated config "+legacyPath+" -> "+canonicalPath) {
+		t.Fatalf("stdout = %q, want default migration message", stdout)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want source preserved", legacyPath, err)
+	}
+	raw, err := os.ReadFile(canonicalPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", canonicalPath, err)
+	}
+	if !strings.Contains(string(raw), "allowRiskyFixes = true") {
+		t.Fatalf("canonical TOML = %q, want migrated defaults.allowRiskyFixes", raw)
+	}
+}
+
+func TestConfigMigrateDefaultPathFailsClearlyWhenCanonicalDefaultAlreadyExists(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(looperHome, "config.json"), []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(config.json) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(looperHome, "config.toml"), []byte("[defaults]\nallowRiskyFixes = false\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(config.toml) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate")
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "default migration target already exists") || !strings.Contains(stderr, "--force") {
+		t.Fatalf("stderr = %q, want default-target conflict guidance", stderr)
+	}
+}
+
+func TestConfigMigrateDryRunAllowsExistingDestinationWithoutForce(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.yaml")
+	if err := os.WriteFile(sourcePath, []byte("defaults:\n  allowRiskyFixes: true\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destPath := filepath.Join(filepath.Dir(sourcePath), "canonical.toml")
+	if err := os.WriteFile(destPath, []byte("[defaults]\nallowRiskyFixes = false\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(destPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath, "--dry-run")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Dry run: would migrate config") || !strings.Contains(stdout, "allowRiskyFixes = true") {
+		t.Fatalf("stdout = %q, want dry-run preview", stdout)
+	}
+	raw, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(destPath) error = %v", err)
+	}
+	if string(raw) != "[defaults]\nallowRiskyFixes = false\n" {
+		t.Fatalf("destination changed during dry-run: %q", raw)
+	}
+}
+
+func TestConfigMigrateRejectsSameSourceAndDestinationPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[defaults]\nallowRiskyFixes = true\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(configPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate --from config.toml]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "source and destination config paths must differ") {
+		t.Fatalf("stderr = %q, want same-path guidance", stderr)
+	}
+}
+
+func TestConfigMigrateRejectsInvalidLegacyProjectInstructionRole(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(configPath, []byte(`{"projects":[{"id":"repo","name":"Repo","path":"/tmp/repo","instructions":{"bad-role":"nope"}}]}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(configPath) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", configPath, "--to", filepath.Join(filepath.Dir(configPath), "canonical.toml"))
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate invalid project role]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "projects[0].instructions.bad-role") {
+		t.Fatalf("stderr = %q, want legacy role validation error", stderr)
+	}
+}
+
+func TestConfigMigrateIgnoresUnrelatedEnvironmentOverridesDuringWriteValidation(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destPath := filepath.Join(filepath.Dir(sourcePath), "canonical.toml")
+	t.Setenv("LOOPER_PORT", "not-an-int")
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate with invalid env override]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Migrated config "+sourcePath+" -> "+destPath) {
+		t.Fatalf("stdout = %q, want success migration message", stdout)
 	}
 }
 
