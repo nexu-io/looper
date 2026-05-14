@@ -563,6 +563,8 @@ func TestProcessWarnAgentApplyRetryReusesExistingAgentProposal(t *testing.T) {
 	if stored.AvailableAt == fixture.nowISO {
 		t.Fatalf("stored queue item available_at = %q, want retry backoff", stored.AvailableAt)
 	}
+	fixture.github.issueDetails["acme/looper#62"] = githubinfra.IssueDetail{Number: 62, Title: "Stale bug", Body: "needs cleanup", State: "open", UpdatedAt: fixture.now.Add(-100 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Comments: []githubinfra.CommentInfo{{ID: 1, Body: fixture.github.createdComments[0].Body}}}
+	fixture.github.addIssueLabelsErr = nil
 
 	result, err = fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
 	if err != nil {
@@ -1276,6 +1278,56 @@ func TestProcessWarnResumesFromMarkerWithoutDuplicateComment(t *testing.T) {
 	payload := fixture.runner.readPayload(*stored)
 	if payload.CaseID != "case_resume" || payload.ProposalID != "proposal_resume" || payload.WarningCommentID != 0 || payload.Outcome != "" {
 		t.Fatalf("payload = %#v, want lean resume metadata", payload)
+	}
+}
+
+func TestProcessWarnRecreatesMissingPersistedWarningComment(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	marker := "sweeper_marker_missing"
+	warningCommentID := int64(777)
+	staleWarnedAt := fixture.now.Add(-14 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	staleCloseDueAt := fixture.now.Add(-7 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	fixture.github.issueDetails["acme/looper#47"] = githubinfra.IssueDetail{Number: 47, Title: "Bug", Body: "already fixed by #9", State: "open", Author: "octo"}
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_missing_comment", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 47, Status: "pending", CurrentPhase: "warn", WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &staleWarnedAt, CloseDueAt: &staleCloseDueAt, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_missing_comment"})
+	queueID := "queue_sweeper_warn_missing_comment"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeWarn, TargetType: "issue", TargetID: "acme/looper#47", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:warn:acme/looper#47", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeWarn})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
+	}
+	if len(fixture.github.createdComments) != 1 {
+		t.Fatalf("createdComments = %#v, want warning comment recreated", fixture.github.createdComments)
+	}
+	if !strings.Contains(fixture.github.createdComments[0].Body, marker) {
+		t.Fatalf("created comment body = %q, want marker %q", fixture.github.createdComments[0].Body, marker)
+	}
+	if !containsString(fixture.github.addedLabels["acme/looper#47"], "looper:sweep-pending") {
+		t.Fatalf("added labels = %#v, want pending label added", fixture.github.addedLabels)
+	}
+	if strings.Contains(fixture.github.createdComments[0].Body, staleCloseDueAt) {
+		t.Fatalf("created comment body = %q, want recreated warning to drop stale close-by %q", fixture.github.createdComments[0].Body, staleCloseDueAt)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 47)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil || caseRecord.WarnedAt == nil || caseRecord.CloseDueAt == nil {
+		t.Fatalf("caseRecord = %#v, want recreated warning timestamps checkpointed", caseRecord)
+	}
+	if *caseRecord.WarnedAt == staleWarnedAt || *caseRecord.CloseDueAt == staleCloseDueAt {
+		t.Fatalf("caseRecord = %#v, want recreated warning to refresh stale timestamps", caseRecord)
 	}
 }
 

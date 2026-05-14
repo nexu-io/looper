@@ -893,10 +893,14 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 }
 
 func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
-	_, repo := splitRepoHostname(input.Repo)
+	hostname, repo := splitRepoHostname(input.Repo)
 	owner, repoName := splitRepoOwnerName(repo)
 	query := "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { closedByPullRequestsReferences(first: 20) { nodes { number state mergedAt mergeCommit { oid } } } } } }"
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "repo="+repoName, "-F", fmt.Sprintf("number=%d", input.IssueNumber))
+	args := []string{"api", "graphql", "-f", "query=" + query, "-F", "owner=" + owner, "-F", "repo=" + repoName, "-F", fmt.Sprintf("number=%d", input.IssueNumber)}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return nil, err
 	}

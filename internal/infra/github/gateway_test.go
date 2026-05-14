@@ -1170,7 +1170,7 @@ func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if !strings.Contains(args, "api graphql") || !strings.Contains(args, "-F owner=acme") || !strings.Contains(args, "-F repo=looper") || strings.Contains(args, "github.example.com/acme") {
+		if !strings.Contains(args, "api graphql") || !strings.Contains(args, "-F owner=acme") || !strings.Contains(args, "-F repo=looper") || !strings.Contains(args, "--hostname github.example.com") || strings.Contains(args, "github.example.com/acme") {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":42,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}]}}}}}`}, nil

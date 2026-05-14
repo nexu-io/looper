@@ -737,7 +737,7 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 	} else if strings.TrimSpace(payload.WarningMarkerUUID) == "" {
 		payload.WarningMarkerUUID = NewMarkerUUID()
 	}
-	haveWarningComment := payload.WarningCommentID > 0
+	haveWarningComment := false
 	if existingComment := markerComment(target.IssueComments, payload.WarningMarkerUUID); existingComment != nil {
 		payload.WarningCommentID = existingComment.ID
 		if strings.TrimSpace(payload.WarningPostedAt) == "" {
@@ -747,6 +747,10 @@ func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRec
 			payload.CloseBy = warningCommentCloseBy(existingComment.Body)
 		}
 		haveWarningComment = true
+	} else {
+		payload.WarningCommentID = 0
+		payload.WarningPostedAt = ""
+		payload.CloseBy = ""
 	}
 	if strings.TrimSpace(payload.WarningPostedAt) == "" {
 		payload.WarningPostedAt = r.nowISO()
