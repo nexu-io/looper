@@ -886,11 +886,14 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 				payload.Outcome = outcomeNoAction
 				payload.Summary = "sweeper agent proposal required"
 				_ = r.updateProposalApplyReceipt(ctx, applyProposal.ID, "skipped_schema_obsolete", payload.Summary, nil, false)
-				return payload, "skipped", payload.Summary, nil
+				applyProposal = nil
+				payload.ProposalID = ""
+			} else {
+				proposal = applyProposal
+				fingerprintJSON = applyProposal.FingerprintJSON
 			}
-			proposal = applyProposal
-			fingerprintJSON = applyProposal.FingerprintJSON
-		} else {
+		}
+		if proposal == nil {
 			if _, _, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale); err != nil {
 				return payload, "failed", "", err
 			}

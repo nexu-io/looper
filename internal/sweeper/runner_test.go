@@ -1736,6 +1736,66 @@ func TestProcessCloseCreatesCloseProposalBeforeCheckingWarnFingerprint(t *testin
 	}
 }
 
+func TestProcessCloseRegeneratesObsoleteAgentProposal(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	fixture.cfg.Roles.Sweeper.Proposer.Mode = config.SweeperProposerModeAgentApply
+	category := categoryAlreadyFixed
+	confidence := int64(90)
+	marker := "marker_close_obsolete"
+	warningCommentID := int64(41)
+	warnedAt := fixture.now.Add(-20 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	closeDueAt := fixture.now.Add(-24 * time.Hour).Format(javaScriptISOStringUTC)
+	validation := "passed"
+	rationale := "target appears already fixed"
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_close_obsolete_agent", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 188, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_close_obsolete_agent"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_close_obsolete_agent", CaseID: "case_close_obsolete_agent", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 188, SchemaVersion: 1, ProposerKind: proposerKindAgentV1, FactBundleJSON: "{}", FingerprintJSON: `{"hash":"close-obsolete"}`, ProposalJSON: `{"schemaVersion":1,"decision":"close","category":"already_fixed","confidenceScore":90,"summary":"obsolete close","rationale":"target appears already fixed"}`, Decision: "close", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, ValidationStatus: &validation, ApplyStatus: stringPtr("pending"), CreatedAt: warnedAt}); err != nil {
+		t.Fatalf("SweeperProposals.Insert() error = %v", err)
+	}
+	fixture.github.issueDetails["acme/looper#188"] = githubinfra.IssueDetail{Number: 188, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	fixture.agent.results = []AgentResult{{Status: "completed", Stdout: `{"schemaVersion":2,"decision":"close","category":"already_fixed","confidenceScore":93,"summary":"agent close","rationale":"agent confirmed fix landed"}`}}
+	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: "case_close_obsolete_agent"})
+	queueID := "queue_sweeper_close_obsolete_agent"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#188", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#188", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := fixture.runner.ProcessClaimedQueueItem(context.Background(), storage.QueueItemRecord{ID: queueID, Type: QueueTypeClose})
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
+	}
+	if len(fixture.agent.calls) != 1 {
+		t.Fatalf("agent calls = %d, want 1 regenerated close proposal", len(fixture.agent.calls))
+	}
+	if len(fixture.github.closedIssues) != 1 {
+		t.Fatalf("closedIssues = %#v, want close to proceed after regenerating proposal", fixture.github.closedIssues)
+	}
+	obsolete, err := fixture.repos.SweeperProposals.GetByID(context.Background(), "proposal_close_obsolete_agent")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() obsolete error = %v", err)
+	}
+	if obsolete == nil || obsolete.ApplyStatus == nil || *obsolete.ApplyStatus != "skipped_schema_obsolete" {
+		t.Fatalf("obsolete proposal = %#v, want skipped_schema_obsolete receipt", obsolete)
+	}
+	latest, err := fixture.repos.SweeperProposals.GetLatestByCaseID(context.Background(), "case_close_obsolete_agent")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetLatestByCaseID() error = %v", err)
+	}
+	if latest == nil || latest.ID == "proposal_close_obsolete_agent" || latest.ProposerKind != proposerKindAgentV1 || latest.Decision != "close" {
+		t.Fatalf("latest proposal = %#v, want fresh agent close proposal", latest)
+	}
+	if latest.ApplyStatus == nil || *latest.ApplyStatus != "completed_closed" {
+		t.Fatalf("latest proposal = %#v, want completed close receipt", latest)
+	}
+}
+
 func TestProcessCloseSetsRepoBeforeEnsuringCase(t *testing.T) {
 	t.Parallel()
 
