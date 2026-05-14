@@ -868,31 +868,12 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	if strings.TrimSpace(payload.CommentBody) == "" && payload.Category != "" && payload.Rationale != "" && payload.CloseBy != "" {
 		payload.CommentBody = buildWarningComment(target, payload, gracePeriodForCategory(payload.Category, roleCfg))
 	}
-	applyStatus := ""
-	if applyProposal != nil && applyProposal.ApplyStatus != nil {
-		applyStatus = *applyProposal.ApplyStatus
-	}
-	stale, priorProposal, fingerprintJSON, err := r.staleProposalStatusForApply(target, caseRecord, roleCfg, applyProposal)
-	if err != nil {
-		return payload, "failed", "", err
-	}
-	if stale {
-		payload.Outcome = outcomeNoAction
-		payload.Summary = "sweeper stale proposal"
-		if priorProposal != nil {
-			payload.ProposalID = priorProposal.ID
-		}
-		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_stale_proposal", payload.Summary, nil, false); err != nil {
-			return payload, "failed", "", err
-		}
-		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, priorProposal, fingerprintJSON, roleCfg); err != nil {
-			return payload, "failed", "", err
-		}
-		return payload, "skipped", payload.Summary, nil
-	}
 	category, confidence, rationale := classifyTarget(target, roleCfg, r.now())
 	decision := categoryDecisionForPhase("close", category)
-	var proposal *storage.SweeperProposalRecord
+	var (
+		proposal        *storage.SweeperProposalRecord
+		fingerprintJSON string
+	)
 	if diagnosticModeEnabled(roleCfg) && r.agentApplyEnabled(roleCfg) && agentEligibleCategory(category) {
 		if _, _, err = r.persistProposal(ctx, derefString(queueItem.ProjectID), target, payload, caseRecord, roleCfg, decision, category, confidence, rationale); err != nil {
 			return payload, "failed", "", err
@@ -934,6 +915,28 @@ func (r *Runner) processClose(ctx context.Context, queueItem storage.QueueItemRe
 	}
 	if proposal != nil {
 		payload.ProposalID = proposal.ID
+	}
+	applyStatus := ""
+	if proposal != nil && proposal.ApplyStatus != nil {
+		applyStatus = *proposal.ApplyStatus
+	}
+	stale, priorProposal, fingerprintJSON, err := r.staleProposalStatusForApply(target, caseRecord, roleCfg, proposal)
+	if err != nil {
+		return payload, "failed", "", err
+	}
+	if stale {
+		payload.Outcome = outcomeNoAction
+		payload.Summary = "sweeper stale proposal"
+		if priorProposal != nil {
+			payload.ProposalID = priorProposal.ID
+		}
+		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_stale_proposal", payload.Summary, nil, false); err != nil {
+			return payload, "failed", "", err
+		}
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, priorProposal, fingerprintJSON, roleCfg); err != nil {
+			return payload, "failed", "", err
+		}
+		return payload, "skipped", payload.Summary, nil
 	}
 	if strings.EqualFold(target.State, "closed") {
 		if err := r.removePendingLabel(ctx, roleCfg, payload.Repo, target.Number); err != nil {
@@ -1144,7 +1147,10 @@ func (r *Runner) processReconcile(ctx context.Context, queueItem storage.QueueIt
 		if err := r.updateProposalApplyReceipt(ctx, payload.ProposalID, "skipped_no_action", payload.Summary, nil, false); err != nil {
 			return payload, "failed", "", err
 		}
-		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, payload, proposal, fingerprintJSON, roleCfg); err != nil {
+		syncPayload := payload
+		syncPayload.Phase = "warn"
+		syncPayload.Outcome = outcomePending
+		if err := r.syncCase(ctx, derefString(queueItem.ProjectID), target, syncPayload, proposal, fingerprintJSON, roleCfg); err != nil {
 			return payload, "failed", "", err
 		}
 		return payload, "skipped", payload.Summary, nil

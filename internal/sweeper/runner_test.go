@@ -1634,7 +1634,7 @@ func TestProcessCloseRemovesPendingLabelWhenReclassificationCancelsClose(t *test
 	}
 }
 
-func TestProcessCloseSkipsStaleProposal(t *testing.T) {
+func TestStaleProposalStatusForApplyDetectsFingerprintDrift(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -1652,7 +1652,7 @@ func TestProcessCloseSkipsStaleProposal(t *testing.T) {
 	validation := "passed"
 	applyStatus := "pending"
 	rationale := "target appears already fixed"
-	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_stale", CaseID: caseRecord.ID, ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 52, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: oldFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: "already_fixed", ConfidenceScore: 90, Rationale: &rationale, ValidationStatus: &validation, ApplyStatus: &applyStatus, CreatedAt: fixture.nowISO}); err != nil {
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_stale", CaseID: caseRecord.ID, ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 52, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: oldFingerprint, ProposalJSON: `{"decision":"close"}`, Decision: "close", Category: "already_fixed", ConfidenceScore: 90, Rationale: &rationale, ValidationStatus: &validation, ApplyStatus: &applyStatus, CreatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("SweeperProposals.Insert() error = %v", err)
 	}
 	caseRecord.LastProposalID = stringPtr("proposal_stale")
@@ -1660,10 +1660,57 @@ func TestProcessCloseSkipsStaleProposal(t *testing.T) {
 	if err := fixture.repos.SweeperCases.Upsert(context.Background(), *caseRecord); err != nil {
 		t.Fatalf("SweeperCases.Upsert() error = %v", err)
 	}
+	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), "proposal_stale")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	stale, priorProposal, fingerprintJSON, err := fixture.runner.staleProposalStatusForApply(liveTarget{Number: 52, State: "open", Title: "Bug", Body: "already fixed by #9", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}, caseRecord, fixture.cfg.Roles.Sweeper, proposal)
+	if err != nil {
+		t.Fatalf("staleProposalStatusForApply() error = %v", err)
+	}
+	if !stale {
+		t.Fatal("staleProposalStatusForApply() stale = false, want true")
+	}
+	if priorProposal == nil || priorProposal.ID != "proposal_stale" {
+		t.Fatalf("priorProposal = %#v, want proposal_stale", priorProposal)
+	}
+	if fingerprintJSON == oldFingerprint {
+		t.Fatalf("fingerprintJSON = %q, want refreshed fingerprint", fingerprintJSON)
+	}
+}
+
+func TestProcessCloseCreatesCloseProposalBeforeCheckingWarnFingerprint(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Roles.Sweeper.DryRun = false
+	category := categoryAlreadyFixed
+	confidence := int64(90)
+	marker := "marker_close_from_warn"
+	warningCommentID := int64(99)
+	warnedAt := fixture.now.Add(-20 * 24 * time.Hour).Format(javaScriptISOStringUTC)
+	closeDueAt := fixture.now.Add(-24 * time.Hour).Format(javaScriptISOStringUTC)
+	validation := "passed"
+	rationale := "target appears already fixed"
+	if err := fixture.repos.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_close_from_warn", ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 154, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, WarningCommentID: &warningCommentID, WarningMarkerUUID: &marker, WarnedAt: &warnedAt, CloseDueAt: &closeDueAt, LastProposalID: stringPtr("proposal_warn_close_from_warn"), CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert() error = %v", err)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 154)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	oldTarget := liveTarget{Number: 154, State: "open", Title: "Bug", Body: "already fixed by #9", UpdatedAt: fixture.now.Add(-20 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	oldFingerprint, err := BuildFingerprint(fixture.runner.buildFactBundle(oldTarget, caseRecord, fixture.cfg.Roles.Sweeper))
+	if err != nil {
+		t.Fatalf("BuildFingerprint() error = %v", err)
+	}
+	if err := fixture.repos.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_warn_close_from_warn", CaseID: caseRecord.ID, ProjectID: fixture.projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 154, SchemaVersion: 2, ProposerKind: "heuristic_v1", FactBundleJSON: "{}", FingerprintJSON: oldFingerprint, ProposalJSON: `{"decision":"warn"}`, Decision: "warn", Category: categoryAlreadyFixed, ConfidenceScore: 90, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_warned"), AppliedAt: &warnedAt, CreatedAt: warnedAt}); err != nil {
+		t.Fatalf("SweeperProposals.Insert() error = %v", err)
+	}
 	payloadJSON := mustMarshalPayload(sweeperPayload{CaseID: caseRecord.ID})
-	fixture.github.issueDetails["acme/looper#52"] = githubinfra.IssueDetail{Number: 52, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
-	queueID := "queue_sweeper_close_stale"
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#52", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#52", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
+	fixture.github.issueDetails["acme/looper#154"] = githubinfra.IssueDetail{Number: 154, Title: "Bug", Body: "already fixed by #9", State: "open", UpdatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339), Author: "octo", Labels: []string{"looper:sweep-pending"}}
+	queueID := "queue_sweeper_close_from_warn"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: &fixture.projectID, Type: QueueTypeClose, TargetType: "issue", TargetID: "acme/looper#154", Repo: stringPtr("acme/looper"), DedupeKey: "sweeper:close:acme/looper#154", Priority: 1, Status: "running", AvailableAt: fixture.nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
@@ -1671,18 +1718,21 @@ func TestProcessCloseSkipsStaleProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "skipped" {
-		t.Fatalf("ProcessClaimedQueueItem() = %#v, want skipped stale result", result)
+	if result == nil || result.Status != "completed" {
+		t.Fatalf("ProcessClaimedQueueItem() = %#v, want completed result", result)
 	}
-	if len(fixture.github.closedIssues) != 0 {
-		t.Fatalf("closedIssues = %#v, want no close when stale proposal detected", fixture.github.closedIssues)
+	if len(fixture.github.closedIssues) != 1 {
+		t.Fatalf("closedIssues = %#v, want close to proceed", fixture.github.closedIssues)
 	}
-	proposal, err := fixture.repos.SweeperProposals.GetByID(context.Background(), "proposal_stale")
+	latest, err := fixture.repos.SweeperProposals.GetLatestByCaseID(context.Background(), caseRecord.ID)
 	if err != nil {
-		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+		t.Fatalf("SweeperProposals.GetLatestByCaseID() error = %v", err)
 	}
-	if proposal == nil || proposal.ApplyStatus == nil || *proposal.ApplyStatus != "skipped_stale_proposal" {
-		t.Fatalf("proposal = %#v, want skipped_stale_proposal receipt", proposal)
+	if latest == nil || latest.Decision != "close" || latest.ID == "proposal_warn_close_from_warn" {
+		t.Fatalf("latest proposal = %#v, want fresh close proposal", latest)
+	}
+	if latest.ApplyStatus == nil || *latest.ApplyStatus != "completed_closed" {
+		t.Fatalf("latest proposal = %#v, want completed close receipt", latest)
 	}
 }
 
@@ -1801,6 +1851,13 @@ func TestProcessReconcileKeepsWarnPhaseWhilePendingLabelRemains(t *testing.T) {
 	}
 	if payload := fixture.runner.readPayload(*stored); payload.CaseID == "" || payload.ProposalID == "" || payload.Phase != "" || payload.Outcome != "" {
 		t.Fatalf("payload = %#v, want lean queue metadata preserved", payload)
+	}
+	caseRecord, err := fixture.repos.SweeperCases.GetByProjectRepoTarget(context.Background(), fixture.projectID, "acme/looper", "issue", 7)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseRecord == nil || caseRecord.Status != "pending" || caseRecord.CurrentPhase != "warn" {
+		t.Fatalf("caseRecord = %#v, want warn/pending case preserved", caseRecord)
 	}
 	if len(fixture.github.updatedComments) != 0 {
 		t.Fatalf("updatedComments = %#v, want none while pending label remains", fixture.github.updatedComments)
