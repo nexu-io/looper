@@ -538,6 +538,15 @@ func pruneEmptyMaps(value any) any {
 	}
 }
 
+type configWriteFile interface {
+	WriteString(s string) (n int, err error)
+	Close() error
+}
+
+var openExclusiveConfigWriteFile = func(path string) (configWriteFile, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+}
+
 func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwrites bool) (string, error) {
 	tmpPath, err := r.prepareMigratedConfigFile(path, preview)
 	if err != nil {
@@ -545,7 +554,7 @@ func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwr
 	}
 	defer os.Remove(tmpPath)
 	if !overwrites {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		file, err := openExclusiveConfigWriteFile(path)
 		if err != nil {
 			if os.IsExist(err) {
 				return "", fmt.Errorf("destination config file already exists at %s; rerun with --force to overwrite it after creating a backup, or set --to to choose another path", path)
@@ -554,9 +563,11 @@ func (r *commandRuntime) writeMigratedConfig(path string, preview string, overwr
 		}
 		if _, err := file.WriteString(preview); err != nil {
 			_ = file.Close()
+			_ = os.Remove(path)
 			return "", fmt.Errorf("create config without overwrite: %w", err)
 		}
 		if err := file.Close(); err != nil {
+			_ = os.Remove(path)
 			return "", fmt.Errorf("create config without overwrite: %w", err)
 		}
 		return "", nil
