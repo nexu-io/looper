@@ -33,20 +33,20 @@ type Issue struct {
 }
 
 type Config struct {
-	Mode                string
-	TriagedLabel        string
-	HoldLabel           string
-	AutonomousDelay     time.Duration
-	AllowedUsers        []string
-	SlashCommands       []string
-	AssignTo            string
-	PlannerTriggerLabel string
-	WorkerTriggerLabel  string
+	Mode                 string
+	TriagedLabel         string
+	HoldLabel            string
+	AutonomousDelay      time.Duration
+	AllowedUsers         []string
+	SlashCommands        []string
+	AssignTo             string
+	PlannerTriggerLabels []string
+	WorkerTriggerLabels  []string
 }
 
 type Action struct {
 	NoOp               bool
-	TriggerLabel       string
+	TriggerLabels      []string
 	AssignTo           string
 	ReactionCommentID  int64
 	ReactionContent    string
@@ -79,18 +79,19 @@ func decideHumanGated(issue Issue, cfg Config) Action {
 		return fail(action, "Coordinator can't dispatch because the slash command does not match triage.")
 	}
 
-	triggerLabel := triggerLabelForDispatch(dispatchLabel, cfg)
-	if strings.TrimSpace(triggerLabel) == "" {
+	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
+	if len(triggerLabels) == 0 {
 		return fail(action, "Coordinator can't dispatch because the trigger label is not configured.")
 	}
-	if hasLabel(issue.Labels, triggerLabel) {
+	missingLabels := missingLabels(issue.Labels, triggerLabels)
+	if len(missingLabels) == 0 {
 		action.NoOp = true
 		action.ReactionContent = ReactionSuccess
 		return action
 	}
 
 	action.AssignTo = strings.TrimSpace(cfg.AssignTo)
-	action.TriggerLabel = triggerLabel
+	action.TriggerLabels = missingLabels
 	action.ReactionContent = ReactionSuccess
 	return action
 }
@@ -103,17 +104,17 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time) Action {
 	if !ok {
 		return Action{NoOp: true}
 	}
-	triggerLabel := triggerLabelForDispatch(dispatchLabel, cfg)
-	if strings.TrimSpace(triggerLabel) == "" {
+	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
+	if len(triggerLabels) == 0 {
 		return Action{NoOp: true}
 	}
-	if hasLabel(issue.Labels, strings.TrimSpace(cfg.HoldLabel)) || hasLabel(issue.Labels, triggerLabel) {
+	if hasLabel(issue.Labels, strings.TrimSpace(cfg.HoldLabel)) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
 		return Action{NoOp: true}
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
 		return Action{NoOp: true}
 	}
-	return Action{AssignTo: strings.TrimSpace(cfg.AssignTo), TriggerLabel: triggerLabel}
+	return Action{AssignTo: strings.TrimSpace(cfg.AssignTo), TriggerLabels: missingLabels(issue.Labels, triggerLabels)}
 }
 
 func fail(action Action, body string) Action {
@@ -205,15 +206,36 @@ func singleDispatchLabel(labels []string) (string, bool) {
 	return match, match != ""
 }
 
-func triggerLabelForDispatch(dispatchLabel string, cfg Config) string {
+func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
 	switch dispatchLabel {
 	case DispatchPlan:
-		return strings.TrimSpace(cfg.PlannerTriggerLabel)
+		return compactLabels(cfg.PlannerTriggerLabels)
 	case DispatchImplement:
-		return strings.TrimSpace(cfg.WorkerTriggerLabel)
+		return compactLabels(cfg.WorkerTriggerLabels)
 	default:
-		return ""
+		return nil
 	}
+}
+
+func compactLabels(labels []string) []string {
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" {
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
+func missingLabels(existing []string, want []string) []string {
+	missing := make([]string, 0, len(want))
+	for _, label := range want {
+		if !hasLabel(existing, label) {
+			missing = append(missing, label)
+		}
+	}
+	return missing
 }
 
 func commandDispatchLabel(command string) string {

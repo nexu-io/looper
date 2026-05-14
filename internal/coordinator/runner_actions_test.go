@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -133,6 +134,42 @@ func TestRunnerAutonomousDispatchAppliesConfiguredPlannerTrigger(t *testing.T) {
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:my-custom-plan"})
 }
 
+func TestRunnerAutonomousDispatchAppliesAllConfiguredPlannerTriggersWhenLabelModeAll(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Roles.Planner.Triggers.Labels = []string{"my-custom-plan", "team:planner"}
+	fixture.runner.config.Roles.Planner.Triggers.LabelMode = config.LabelModeAll
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:my-custom-plan,team:planner"})
+}
+
+func TestRunnerDiscoverIssuesPropagatesRepositoryPermissionFailures(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.permissionErr = errors.New("permission lookup failed")
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+
+	_, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err == nil || !strings.Contains(err.Error(), "permission lookup failed") {
+		t.Fatalf("DiscoverIssues() error = %v, want propagated repository permission failure", err)
+	}
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %v, want no dispatch side effects after permission failure", fixture.github.ops)
+	}
+}
+
 type coordinatorFixture struct {
 	runner    *Runner
 	github    *stubCoordinatorGitHub
@@ -186,6 +223,7 @@ type stubCoordinatorGitHub struct {
 	details       map[int64]githubinfra.IssueDetail
 	comments      map[int64][][]githubinfra.CommentInfo
 	timeline      map[int64][]map[string]any
+	permissionErr error
 	ops           []string
 	createdBodies []string
 	updatedBodies []string
@@ -223,6 +261,9 @@ func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githu
 	return s.timeline[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {
+	if s.permissionErr != nil {
+		return "", s.permissionErr
+	}
 	if input.User == "octo" {
 		return "write", nil
 	}

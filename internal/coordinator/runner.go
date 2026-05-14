@@ -177,7 +177,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 }
 
 func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
-	return action.ReactionCommentID != 0 || action.TriggerLabel != "" || action.FailureCommentBody != ""
+	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
 // ShouldSkipIssue reserves the structural cross-role boundary with Sweeper.
@@ -247,8 +247,9 @@ func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd strin
 			return err
 		}
 	}
-	if strings.TrimSpace(action.TriggerLabel) != "" && !hasExactLabel(issue.Labels, action.TriggerLabel) {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{action.TriggerLabel}, CWD: cwd}); err != nil {
+	labelsToAdd := removeExistingLabels(action.TriggerLabels, issue.Labels)
+	if len(labelsToAdd) > 0 {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
 			return err
 		}
 	}
@@ -344,23 +345,26 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, issueNumber in
 
 func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles config.RoleConfigs) dispatch.Config {
 	return dispatch.Config{
-		Mode:                roleCfg.Dispatch.Mode,
-		TriagedLabel:        roleCfg.Triage.TriagedLabel,
-		HoldLabel:           roleCfg.Dispatch.Autonomous.HoldLabel,
-		AutonomousDelay:     time.Duration(roleCfg.Dispatch.Autonomous.DelayMinutes) * time.Minute,
-		AllowedUsers:        append([]string(nil), roleCfg.Dispatch.HumanGate.AllowedUsers...),
-		SlashCommands:       append([]string(nil), roleCfg.Dispatch.HumanGate.SlashCommands...),
-		AssignTo:            roleCfg.Dispatch.AssignTo,
-		PlannerTriggerLabel: firstRoleTrigger(roles.Planner.Triggers.Labels),
-		WorkerTriggerLabel:  firstRoleTrigger(roles.Worker.Triggers.Labels),
+		Mode:                 roleCfg.Dispatch.Mode,
+		TriagedLabel:         roleCfg.Triage.TriagedLabel,
+		HoldLabel:            roleCfg.Dispatch.Autonomous.HoldLabel,
+		AutonomousDelay:      time.Duration(roleCfg.Dispatch.Autonomous.DelayMinutes) * time.Minute,
+		AllowedUsers:         append([]string(nil), roleCfg.Dispatch.HumanGate.AllowedUsers...),
+		SlashCommands:        append([]string(nil), roleCfg.Dispatch.HumanGate.SlashCommands...),
+		AssignTo:             roleCfg.Dispatch.AssignTo,
+		PlannerTriggerLabels: requiredTriggerLabels(roles.Planner.Triggers),
+		WorkerTriggerLabels:  requiredTriggerLabels(roles.Worker.Triggers),
 	}
 }
 
-func firstRoleTrigger(labels []string) string {
-	if len(labels) == 0 {
-		return ""
+func requiredTriggerLabels(cfg config.IssueRoleTriggersConfig) []string {
+	if cfg.LabelMode == config.LabelModeAll {
+		return append([]string(nil), cfg.Labels...)
 	}
-	return labels[0]
+	if len(cfg.Labels) == 0 {
+		return nil
+	}
+	return []string{cfg.Labels[0]}
 }
 
 func (r *Runner) dispatchIssue(ctx context.Context, repo, cwd string, issue triage.Issue, triagedLabel string, cfg dispatch.Config) (dispatch.Issue, error) {
@@ -407,7 +411,7 @@ func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author st
 	}
 	permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{Repo: repo, User: author, CWD: cwd})
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	allowed := permission == "admin" || permission == "maintain" || permission == "write"
 	cache[strings.ToLower(author)] = allowed
@@ -490,6 +494,16 @@ func removeExactLabels(labels []string, target string) []string {
 		}
 	}
 	return result
+}
+
+func removeExistingLabels(labels []string, existing []string) []string {
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if !hasExactLabel(existing, label) {
+			out = append(out, label)
+		}
+	}
+	return out
 }
 
 func labelMatchesPattern(label string, pattern string) bool {
