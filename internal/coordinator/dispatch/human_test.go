@@ -37,6 +37,17 @@ func TestHumanGatedPlanFromNonAllowedUserDoesNothing(t *testing.T) {
 	}
 }
 
+func TestHumanGatedSkipsNewerUnauthorizedCommandAttempt(t *testing.T) {
+	t.Parallel()
+	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{
+		{ID: 44, Author: "octo", HasWriteAccess: true, Body: "/plan"},
+		{ID: 45, Author: "outsider", Body: "/implement"},
+	}}, testConfig(), time.Now())
+	if action.TriggerLabel != "looper:plan" || action.AssignTo != "octocat" || action.ReactionCommentID != 44 || action.ReactionContent != ReactionSuccess {
+		t.Fatalf("action = %#v, want latest authorized command to dispatch", action)
+	}
+}
+
 func TestHumanGatedTriggerAlreadyPresentIsIdempotent(t *testing.T) {
 	t.Parallel()
 	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan, "looper:plan"}, Comments: []Comment{{ID: 45, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now())

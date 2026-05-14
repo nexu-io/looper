@@ -1901,11 +1901,11 @@ func (g *Gateway) getViewerLogin(ctx context.Context, cwd string, hostname strin
 	}
 	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	row, err := decodeJSONObject(result.Stdout)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	data, _ := row["data"].(map[string]any)
 	viewer, _ := data["viewer"].(map[string]any)

@@ -61,11 +61,8 @@ func Decide(issue Issue, cfg Config, now time.Time) Action {
 }
 
 func decideHumanGated(issue Issue, cfg Config) Action {
-	comment, command, ok := latestCommandAttempt(issue.Comments, cfg.SlashCommands)
+	comment, command, ok := latestCommandAttempt(issue.Comments, cfg.SlashCommands, cfg.AllowedUsers)
 	if !ok {
-		return Action{NoOp: true}
-	}
-	if !isAllowedUser(comment, cfg.AllowedUsers) {
 		return Action{NoOp: true}
 	}
 
@@ -126,11 +123,14 @@ func fail(action Action, body string) Action {
 	return action
 }
 
-func latestCommandAttempt(comments []Comment, slashCommands []string) (Comment, string, bool) {
+func latestCommandAttempt(comments []Comment, slashCommands []string, allowedUsers []string) (Comment, string, bool) {
 	for index := len(comments) - 1; index >= 0; index-- {
 		comment := comments[index]
 		command, ok := ParseSlashCommand(comment.Body, slashCommands)
 		if !ok {
+			continue
+		}
+		if !isAllowedUser(comment, allowedUsers) {
 			continue
 		}
 		return comment, command, true
