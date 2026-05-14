@@ -37,6 +37,20 @@ func TestFakeGHValidatesJSONFieldsAndLogsInvocations(t *testing.T) {
 	}
 }
 
+func TestFakeGHPaginatedAPIDefaultsToEmptyArray(t *testing.T) {
+	bins := MustBinaries(t)
+	gh := NewFakeGH(t, bins, GHSchema{JSONFieldAllowlist: map[string][]string{}})
+	cmd := exec.Command(gh.Path, "api", "--paginate", "--slurp", "repos/acme/looper/issues/77/comments")
+	cmd.Env = append(os.Environ(), flattenEnv(gh.EnvMap())...)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run fake gh paginated api: %v", err)
+	}
+	if strings.TrimSpace(string(output)) != "[]" {
+		t.Fatalf("fake gh paginated output = %q, want empty array", string(output))
+	}
+}
+
 func flattenEnv(env map[string]string) []string {
 	items := make([]string, 0, len(env))
 	for key, value := range env {

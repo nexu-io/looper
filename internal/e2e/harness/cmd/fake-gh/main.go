@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -200,6 +201,10 @@ func handleAPI(mode string, st state, stdin string) error {
 		if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 			_, _ = fmt.Fprintln(os.Stdout)
 		}
+		return nil
+	}
+	if slices.Contains(args, "--paginate") {
+		_, _ = fmt.Fprintln(os.Stdout, `[]`)
 		return nil
 	}
 	if strings.Contains(route, "/compare/") {
