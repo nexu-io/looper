@@ -380,7 +380,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.now)
+		}, r.TriggerSchedulerTick, r.now)
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
@@ -876,9 +876,9 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			return RecoverySummary{}, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
+			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -1079,9 +1079,9 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 			return requeued, err
 		}
 		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Reviewer.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Reviewer.Loop.StopOnReadyLabel,
+			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
+			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		}
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -1684,12 +1684,10 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
-	if checkpoint.ResumePolicy == "manual_intervention" {
-		return false
-	}
 	queueKind := derefString(latestQueue.LastErrorKind)
 	queueMessage := derefString(latestQueue.LastError)
-	if queueKind == "manual_intervention" {
+	resumePolicy := loops.NormalizeResumePolicy(queueKind, checkpoint.ResumePolicy)
+	if loops.SuppressesAutonomousRecovery(queueKind, resumePolicy) {
 		return false
 	}
 	if checkpoint.Detail == nil {
@@ -1712,7 +1710,7 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)
-	return (queueKind == "retryable_after_resume" && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+	return (queueKind == loops.FailureKindRetryableAfterResume && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
 }
 
 func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories *storage.Repositories, loopID string, latestQueue *storage.QueueItemRecord, queuedAt string) (int64, error) {

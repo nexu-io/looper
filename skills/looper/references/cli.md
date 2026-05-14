@@ -101,6 +101,15 @@ looper jump <id>
 looper stop <id>
 ```
 
+Manual fixer trigger:
+
+```bash
+looper fix owner/repo#42
+looper fix 42
+```
+
+Use `looper fix` when you want to trigger the fixer pipeline for a specific pull request on demand instead of waiting for automatic pickup.
+
 Upgrade commands:
 
 ```bash

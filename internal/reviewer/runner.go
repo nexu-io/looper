@@ -26,8 +26,10 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
@@ -55,6 +57,11 @@ var reviewerStepSequence = []ReviewerStep{
 var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
 var reviewHumanHTMLCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
 var reviewHumanReferenceDefinitionPattern = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
+
+const (
+	reviewerNativeResumeMetadataKey      = "reviewerNativeResume"
+	reviewerNativeResumeReasonHeadChange = "head_change"
+)
 
 type ReviewerStep string
 
@@ -144,6 +151,8 @@ type CreateWorktreeResult struct {
 }
 
 type PrepareWorktreeInput struct {
+	RepoPath        string
+	WorktreeRoot    string
 	WorktreePath    string
 	Branch          string
 	Ref             string
@@ -159,6 +168,7 @@ type PrepareWorktreeResult struct {
 type CleanupWorktreeInput struct {
 	ProjectID         string
 	RepoPath          string
+	WorktreeRoot      string
 	WorktreePath      string
 	Branch            string
 	ProtectedBranches []string
@@ -369,6 +379,7 @@ type Options struct {
 	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
+	NativeResume            config.ReviewerNativeResumeConfig
 	ThreadResolution        config.ReviewerThreadResolutionConfig
 	Disclosure              *config.DisclosureConfig
 	CustomInstructions      *config.Config
@@ -409,6 +420,7 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
+	nativeResume            config.ReviewerNativeResumeConfig
 	threadResolution        config.ReviewerThreadResolutionConfig
 	disclosure              config.DisclosureConfig
 	customInstructions      config.Config
@@ -608,6 +620,7 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
+		nativeResume:            options.NativeResume,
 		threadResolution:        threadResolution,
 		disclosure:              disclosureCfg,
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
@@ -890,7 +903,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.AutoDiscovery, IncludeDrafts: roles.Reviewer.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Triggers.Labels...), LabelMode: roles.Reviewer.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.SpecReview.ReviewingLabel}
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel}
 }
 
 func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {
@@ -987,7 +1000,7 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
@@ -1098,14 +1111,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				if resumePolicy != "restart_from_discover" && resumePolicy != "rerun_review" {
-					resumePolicy = "advance_from_checkpoint"
+				if resumePolicy != loops.ResumePolicyRestartFromDiscover && resumePolicy != "rerun_review" {
+					resumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 				}
 			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
+				resumePolicy = loops.ResumePolicyManualIntervention
 			default:
 				if resumePolicy == "" {
-					resumePolicy = "replay_step"
+					resumePolicy = loops.ResumePolicyReplayStep
 				}
 			}
 			latest.ResumePolicy = resumePolicy
@@ -1150,7 +1163,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
@@ -1610,9 +1623,6 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if reviewerWorktreePrepared(checkpoint) {
-		return checkpoint, nil
-	}
 	if r.git == nil {
 		return checkpoint, fmt.Errorf("reviewer git gateway is not configured")
 	}
@@ -1633,6 +1643,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 		worktreeRoot = resolvedRoot
+	}
+	if checkpoint.Worktree != nil {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+			checkpoint.Worktree = nil
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+		} else if reviewerWorktreePrepared(checkpoint) {
+			return checkpoint, nil
+		}
 	}
 	protectedBranches := make([]string, 0, 2)
 	if candidate := strings.TrimSpace(checkpoint.Detail.BaseRefName); candidate != "" {
@@ -1655,7 +1673,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 	}
-	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 		if errors.As(err, &remoteHeadChanged) {
@@ -1694,6 +1712,9 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	}
 	if checkpoint.Detail == nil || checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR detail or snapshot checkpoint for thread resolution step", kind: FailureRetryableTransient}
+	}
+	if r.hasPendingHeadChangeNativeResume(ctx, input.Loop.ID) {
+		return checkpoint, nil
 	}
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		return checkpoint, nil
@@ -1942,6 +1963,7 @@ func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, th
 Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify whether each requested change is objectively addressed at the current head.
 
 Safety rules:
+- The current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout. Reuse it for git fetch, git checkout, diff inspection, and local verification. Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.
 - Return objectively_fixed only for concrete, verifiable code or documentation changes that are present in the worktree.
 - Return needs_human for subjective, product, design, security-sensitive, ambiguous, or partially addressed feedback.
 - Do not treat an author reply like "fixed" as evidence by itself.
@@ -2061,20 +2083,26 @@ func latestThreadFeedbackCommitOID(thread ReviewThread) string {
 type reviewerHeadChangeMonitor struct {
 	cancel func()
 	done   chan struct{}
-	reason chan string
+	signal chan reviewerHeadChangeSignal
 }
 
-func (m reviewerHeadChangeMonitor) stop() string {
+type reviewerHeadChangeSignal struct {
+	OldHeadSHA string
+	NewHeadSHA string
+	Reason     string
+}
+
+func (m reviewerHeadChangeMonitor) stop() reviewerHeadChangeSignal {
 	if m.cancel == nil {
-		return ""
+		return reviewerHeadChangeSignal{}
 	}
 	m.cancel()
 	<-m.done
 	select {
-	case reason := <-m.reason:
-		return reason
+	case signal := <-m.signal:
+		return signal
 	default:
-		return ""
+		return reviewerHeadChangeSignal{}
 	}
 }
 
@@ -2084,7 +2112,7 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 		return reviewerHeadChangeMonitor{}
 	}
 	monitorCtx, cancel := context.WithCancel(ctx)
-	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), reason: make(chan string, 1)}
+	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), signal: make(chan reviewerHeadChangeSignal, 1)}
 	go func() {
 		defer close(monitor.done)
 		ticker := time.NewTicker(r.headChangePollInterval)
@@ -2105,10 +2133,11 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 					continue
 				}
 				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, headSHA)
+				signal := reviewerHeadChangeSignal{OldHeadSHA: expectedHead, NewHeadSHA: headSHA, Reason: reason}
 				r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.interrupted", "review", executionID, map[string]any{"headSha": expectedHead, "newHeadSha": headSHA, "reason": reason})
 				r.logInfo("reviewer agent interrupted for newer PR head", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": headSHA})
 				select {
-				case monitor.reason <- reason:
+				case monitor.signal <- signal:
 				default:
 				}
 				if err := execution.Kill(reason); err != nil {
@@ -2137,6 +2166,16 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
+	if reviewerWorktreePrepared(checkpoint) {
+		worktreeRoot, rootErr := reviewerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+			checkpoint.Worktree = nil
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+		}
+	}
 	if !reviewerWorktreePrepared(checkpoint) {
 		checkpoint, err = r.runPrepareWorktreeStep(ctx, input)
 		if err != nil {
@@ -2157,10 +2196,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
-	nativeResumePrompt := ""
-	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
-		nativeResumePrompt = nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
-	}
+	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -2181,11 +2217,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
 	result, err := execution.Wait(ctx)
-	headChangeReason := headMonitor.stop()
-	if headChangeReason != "" {
+	headChange := headMonitor.stop()
+	if headChange.Reason != "" {
+		if r.nativeResume.OnHeadChange {
+			r.markAgentExecutionNativeResumePendingForHeadChange(ctx, executionID, input, headChange)
+		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "restart_from_discover"
-		return checkpoint, &loopError{message: headChangeReason, kind: FailureRetryableAfterResume, interrupted: true}
+		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
@@ -2214,7 +2253,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if isGitHubSelfApprovalFailure(message) {
 			kind = FailureNonRetryable
 		} else if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
+			kind = FailureRetryableTransient
 		}
 		if kind == FailureRetryableTransient {
 			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
@@ -3147,7 +3186,8 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if latestQueue.LastErrorKind != nil {
 		queueKind = *latestQueue.LastErrorKind
 	}
-	if queueKind == string(FailureManualIntervention) || checkpoint.ResumePolicy == "manual_intervention" {
+	resumePolicy := loops.NormalizeResumePolicy(queueKind, checkpoint.ResumePolicy)
+	if loops.SuppressesAutonomousRecovery(queueKind, resumePolicy) {
 		return false, "", "manual_intervention", nil
 	}
 	approvedByCurrentUser := func() (bool, error) {
@@ -3160,7 +3200,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		}
 		return hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA), nil
 	}
-	if queueKind == string(FailureRetryableAfterResume) && (checkpoint.ResumePolicy == "restart_from_discover" || checkpoint.ResumePolicy == "rerun_review") {
+	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review") {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
 			return false, "", "", err
@@ -3449,16 +3489,91 @@ func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx c
 	return true
 }
 
-func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
-	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.Context, executionID string, input stepInput, signal reviewerHeadChangeSignal) bool {
+	if strings.TrimSpace(executionID) == "" || strings.TrimSpace(signal.Reason) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
 		return false
+	}
+	record, err := r.repos.AgentExecutions.GetByID(ctx, executionID)
+	if err != nil {
+		r.logWarn("reviewer native resume head-change source lookup failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	if record == nil || record.NativeSessionID == nil || strings.TrimSpace(*record.NativeSessionID) == "" {
+		return false
+	}
+	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if currentVendor != "" && (!nativeResumeSupportedForReviewer(currentVendor) || record.Vendor != string(currentVendor)) {
+		return false
+	}
+	metadata := parseJSONObject(record.MetadataJSON)
+	metadata[reviewerNativeResumeMetadataKey] = map[string]any{
+		"reason":     reviewerNativeResumeReasonHeadChange,
+		"phase":      "review",
+		"repo":       input.Repo,
+		"prNumber":   input.PRNumber,
+		"oldHeadSha": signal.OldHeadSHA,
+		"newHeadSha": signal.NewHeadSHA,
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		r.logWarn("reviewer native resume head-change metadata marshal failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	record.MetadataJSON = stringPtr(string(metadataJSON))
+	record.NativeResumeMode = stringPtr("native_resume")
+	record.NativeResumeStatus = stringPtr("pending")
+	record.NativeResumeError = stringPtr(strings.TrimSpace(signal.Reason))
+	record.UpdatedAt = r.nowISO()
+	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
+		r.logWarn("reviewer native resume head-change source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	r.logInfo("reviewer native resume re-review queued", map[string]any{"executionId": executionID, "loopId": derefString(record.LoopID), "runId": derefString(record.RunID), "oldHeadSha": signal.OldHeadSHA, "newHeadSha": signal.NewHeadSHA})
+	return true
+}
+
+func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storage.AgentExecutionRecord {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+		return nil
 	}
 	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
+		return nil
+	}
+	if !r.isResumableNativeSession(latest) {
+		return nil
+	}
+	return latest
+}
+
+func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
+	return r.pendingNativeResume(ctx, loopID) != nil
+}
+
+func (r *Runner) hasPendingHeadChangeNativeResume(ctx context.Context, loopID string) bool {
+	if !r.nativeResume.OnHeadChange && !r.nativeResume.ReReviewPromptOnHeadChange {
 		return false
 	}
-	return r.isResumableNativeSession(latest)
+	record := r.pendingNativeResume(ctx, loopID)
+	if record == nil {
+		return false
+	}
+	_, ok := reviewerNativeResumeHeadChange(record)
+	return ok
+}
+
+func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string) string {
+	record := r.pendingNativeResume(ctx, input.Loop.ID)
+	if record == nil {
+		return ""
+	}
+	if r.nativeResume.ReReviewPromptOnHeadChange {
+		if headChange, ok := reviewerNativeResumeHeadChange(record); ok && headChange.matches(input.Repo, input.PRNumber) {
+			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey)
+		}
+	}
+	return nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, currentHeadSHA, idempotencyKey)
 }
 
 func (r *Runner) shouldSkipTransientRetryDelayForNativeResume(ctx context.Context, loopID string, err error) bool {
@@ -3529,6 +3644,40 @@ func isRecoverableReviewerNativeResumeSource(status string, resumeStatus *string
 	}
 }
 
+type reviewerNativeResumeHeadChangeInfo struct {
+	Repo       string
+	PRNumber   int64
+	OldHeadSHA string
+	NewHeadSHA string
+}
+
+func (h reviewerNativeResumeHeadChangeInfo) matches(repo string, prNumber int64) bool {
+	return strings.TrimSpace(h.Repo) == strings.TrimSpace(repo) && h.PRNumber == prNumber
+}
+
+func reviewerNativeResumeHeadChange(record *storage.AgentExecutionRecord) (reviewerNativeResumeHeadChangeInfo, bool) {
+	if record == nil {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	metadata := parseJSONObject(record.MetadataJSON)
+	raw, _ := metadata[reviewerNativeResumeMetadataKey].(map[string]any)
+	if raw == nil {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	reason, _ := stringFromAny(raw["reason"])
+	if reason != reviewerNativeResumeReasonHeadChange {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	repo, _ := stringFromAny(raw["repo"])
+	oldHeadSHA, _ := stringFromAny(raw["oldHeadSha"])
+	newHeadSHA, _ := stringFromAny(raw["newHeadSha"])
+	prNumber := int64(intFromAny(raw["prNumber"]))
+	if repo == "" || prNumber == 0 || oldHeadSHA == "" || newHeadSHA == "" {
+		return reviewerNativeResumeHeadChangeInfo{}, false
+	}
+	return reviewerNativeResumeHeadChangeInfo{Repo: repo, PRNumber: prNumber, OldHeadSHA: oldHeadSHA, NewHeadSHA: newHeadSHA}, true
+}
+
 func nativeResumeContinuationPrompt(phase string, repo string, prNumber int64, headSHA string, idempotencyKey string) string {
 	return fmt.Sprintf(`Continue the existing Looper reviewer %s task in this resumed native session.
 
@@ -3540,6 +3689,23 @@ Before any GitHub side effect, re-check the current PR/head/idempotency guards f
 - idempotency key: %s
 
 If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
+}
+
+func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string) string {
+	return fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session, but treat it as a PR update re-review.
+
+The pull request changed while the prior review was running:
+- PR: %s#%d
+- previous reviewed head SHA: %s
+- head SHA observed at interruption: %s
+- current expected head SHA for this run: %s
+- idempotency key for this run: %s
+
+Use the prior session context only as background. Re-review the current expected head before publishing anything. Discard findings, assumptions, anchors, or conclusions that only apply to the previous head. Keep only findings that are still concrete, actionable, and valid against the current head.
+
+Before any GitHub side effect, re-check that the PR is open, the current head SHA still matches the current expected head SHA, and the current-user review-request/idempotency guards from the existing instructions still pass.
+
+If a matching review for the current expected head and idempotency key was already posted, report the existing completion marker instead of posting a duplicate.`, repo, prNumber, oldHeadSHA, interruptedHeadSHA, currentHeadSHA, idempotencyKey)
 }
 
 func transientProviderMessageFromAgentResult(result AgentResult) string {
@@ -4380,6 +4546,7 @@ func seededPullRequestRepoParts(repo string) (host string, path string) {
 func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
+		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
 		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
 		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
@@ -4594,7 +4761,12 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	if baseBranch := strings.TrimSpace(derefString(project.BaseBranch)); baseBranch != "" {
 		protectedBranches = append(protectedBranches, baseBranch)
 	}
-	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: protectedBranches}); err != nil {
+	worktreeRoot, rootErr := reviewerWorktreeRoot(project)
+	if rootErr != nil {
+		r.logWarn("reviewer worktree cleanup skipped", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "error": rootErr.Error()})
+		return
+	}
+	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: protectedBranches}); err != nil {
 		r.logWarn("reviewer worktree cleanup failed", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "error": err.Error()})
 		return
 	}
@@ -4606,6 +4778,15 @@ func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error)
 		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
 	}
 	return checkpoint.Worktree, nil
+}
+
+func reviewerWorktreeRoot(project storage.ProjectRecord) (string, error) {
+	projectMetadata := parseJSONObject(project.MetadataJSON)
+	worktreeRoot, _ := stringFromAny(projectMetadata["worktreeRoot"])
+	if worktreeRoot != "" {
+		return worktreeRoot, nil
+	}
+	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
 }
 
 func reviewerWorktreePrepared(checkpoint reviewerCheckpoint) bool {

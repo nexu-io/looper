@@ -1,6 +1,6 @@
 # Configuration guide
 
-This document explains how `looper` and `looperd` configuration works, where the config file lives, which values can be overridden by environment variables and CLI flags, and what a complete config file looks like.
+This document explains Looper's canonical config taxonomy, default config location, supported file formats, project override rules, and the legacy-to-canonical migration story.
 
 ## Install layout notes
 
@@ -22,18 +22,71 @@ The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`
 3. environment variables
 4. CLI flags
 
-Later layers override earlier ones.
+Later layers override earlier ones. Objects are merged deeply, arrays are replaced as a whole, and omitted fields keep the previous-layer value.
 
-Default config file path:
+## Supported formats and default path
 
-- `~/.looper/config.json`
+Looper accepts config files in these formats:
 
-You can point to a different file with either:
+- `.toml`
+- `.yaml`
+- `.yml`
+- `.json`
 
-- `LOOPER_CONFIG=/absolute/or/relative/path/to/config.json`
-- `looperd --config /absolute/or/relative/path/to/config.json`
+Canonical default path:
+
+- `~/.looper/config.toml`
+
+Config source selection precedence is:
+
+1. `--config`
+2. `LOOPER_CONFIG`
+3. default-path discovery
+
+Default-path discovery checks, in order:
+
+1. `~/.looper/config.toml`
+2. `~/.looper/config.yaml`
+3. `~/.looper/config.yml`
+4. `~/.looper/config.json`
+
+Behavior:
+
+- if exactly one supported default config file exists, Looper loads it
+- if multiple supported default config files exist, Looper fails clearly instead of guessing
+- if none exist, Looper continues with built-in defaults and treats `~/.looper/config.toml` as the canonical path for newly generated config
+
+Custom config path examples:
+
+- `LOOPER_CONFIG=/absolute/or/relative/path/to/config.toml`
+- `looperd --config /absolute/or/relative/path/to/config.toml`
 
 Relative config paths are resolved from the current working directory used to start `looperd`.
+
+## Canonical taxonomy
+
+Looper's frozen canonical top-level config roots are:
+
+| Root | Purpose |
+| --- | --- |
+| `server` | network-facing API/server configuration |
+| `daemon` | daemon lifecycle, runtime paths, and local process behavior |
+| `storage` | sqlite/database/backups/history retention and storage-specific settings |
+| `scheduler` | loop scheduling, concurrency, polling, and timing policy that is not role-specific |
+| `agent` | model/provider/executor defaults that apply across roles unless overridden more locally |
+| `logging` | logs, verbosity, sinks, and diagnostic controls |
+| `notifications` | user notifications such as osascript or future notifier integrations |
+| `disclosure` | disclosure/stamping policy for outward-facing automation output |
+| `tools` | external tool paths and tool-specific execution settings such as `git`, `gh`, and `osascript` |
+| `package` | packaging, upgrade, and distribution policy |
+| `defaults` | user-facing default policy that does not belong to a narrower domain |
+| `instructions` | global instruction-system settings that are not role-specific instruction content |
+| `roles` | role-specific config grouped by role name, for example `roles.<role>` |
+| `projects` | per-project metadata and supported project-scoped overrides |
+
+Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
+
+Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.
 
 ## Minimal setup
 
@@ -41,203 +94,400 @@ In the simplest setup, you can rely on defaults and only create a config file wh
 
 `agent.vendor` does not have a built-in default. If you want planner / reviewer / fixer / worker loops to run, set it explicitly.
 
-Example minimal `~/.looper/config.json`:
+Example minimal `~/.looper/config.toml`:
 
-```json
-{
-  "agent": {
-    "vendor": "opencode"
-  },
-  "projects": [
-    {
-      "id": "looper",
-      "name": "Looper",
-      "repoPath": "/absolute/path/to/repo"
-    }
-  ]
-}
+```toml
+[agent]
+vendor = "opencode"
+
+[[projects]]
+id = "looper"
+name = "Looper"
+repoPath = "/absolute/path/to/repo"
 ```
 
-## Full example
+## Role model guidance
+
+All role-specific config lives under `roles.<role>`.
+
+- shared role instructions live at `roles.<role>.instructions`
+- discovery policy lives at `roles.<role>.discovery.*`
+- runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
+
+Reviewer is the main migration example:
+
+- legacy top-level `reviewer.*` is compatibility input only
+- legacy reviewer discovery paths such as `roles.reviewer.autoDiscovery`, `roles.reviewer.triggers.*`, and `roles.reviewer.specReview.*` are compatibility input only
+- canonical reviewer discovery lives at `roles.reviewer.discovery.*`
+- canonical reviewer behavior lives at `roles.reviewer.behavior.*`
+
+Canonical reviewer example:
+
+This is a standalone reviewer-only snippet. Do not paste it together with the full config example below as a single TOML file, or table headers such as `[roles.reviewer.behavior.reviewEvents]` would be duplicated.
+
+```toml
+[roles.reviewer]
+instructions = "Review for correctness, regressions, and migration safety."
+
+[roles.reviewer.discovery]
+autoDiscovery = true
+
+[roles.reviewer.discovery.triggers]
+includeDrafts = false
+requireReviewRequest = true
+enableSelfReview = false
+labels = []
+labelMode = "all"
+
+[roles.reviewer.discovery.specReview]
+includeReviewingLabel = true
+reviewingLabel = "looper:spec-reviewing"
+
+[roles.reviewer.behavior]
+scope = "changed_ranges"
+publishMode = "single_review"
+
+[roles.reviewer.behavior.loop]
+enabledByDefault = true
+quietPeriodSeconds = 60
+minPublishIntervalSeconds = 300
+
+[roles.reviewer.behavior.reviewEvents]
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
+
+[roles.reviewer.behavior.nativeResume]
+onHeadChange = false
+reReviewPromptOnHeadChange = false
+```
+
+The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+## Project override rules
+
+Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
+
+Project entries are split into:
+
+- **project metadata**: `id`, `name`, `repoPath`, `baseBranch`, `worktreeRoot`
+- **project-scoped override config**: canonical override-bearing domains such as `roles.<role>...`
+- **project-local role instructions**: `projects[].roles.<role>.instructions`
+
+Project override rules:
+
+- if a field is overrideable per project, the project path uses the same local canonical shape as the global path
+- project overrides remain part of the config-file layer; they do not create a new precedence layer above environment variables or CLI flags
+- omitted project fields inherit the effective global value
+- project-local role instructions may be set to an empty string to clear inherited global role instructions for that project
+- legacy project reviewer discovery paths are compatibility-only; canonical reviewer project overrides live under `projects[].roles.reviewer.discovery.*`
+
+Canonical project override example:
+
+```toml
+[[projects]]
+id = "looper"
+name = "Looper"
+repoPath = "/absolute/path/to/looper"
+baseBranch = "main"
+worktreeRoot = "/Users/you/.looper/worktrees/looper"
+
+[projects.roles.worker.discovery]
+autoDiscovery = false
+
+[projects.roles.reviewer]
+instructions = "Project-specific reviewer guidance"
+
+[projects.roles.reviewer.discovery.triggers]
+labels = ["needs-review"]
+labelMode = "any"
+requireReviewRequest = false
+```
+
+## Full canonical example
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 17310
+authMode = "local-token"
+localToken = "replace-me"
+
+[daemon]
+mode = "foreground"
+restartPolicy = "on-failure"
+restartThrottleSeconds = 10
+logDir = "/Users/you/.looper/logs"
+workingDirectory = "/absolute/path/to/where/you/start/looperd"
+shutdownTimeoutMs = 1000
+
+[daemon.environment]
+EXAMPLE_FLAG = "1"
+
+[storage]
+mode = "sqlite"
+dbPath = "/Users/you/.looper/looper.sqlite"
+backupDir = "/Users/you/.looper/backups"
+
+[scheduler]
+pollIntervalSeconds = 30
+maxConcurrentRuns = 3
+retryMaxAttempts = 5
+retryBaseDelayMs = 5000
+
+[agent]
+vendor = "opencode"
+model = "your-model-if-needed"
+
+[agent.params]
+reasoning = "medium"
+
+[agent.env]
+OPENAI_API_KEY = "replace-me"
+
+[agent.nativeResume]
+enabled = true
+
+[agent.timeouts]
+plannerSeconds = 1800
+workerSeconds = 3600
+reviewerSeconds = 1800
+fixerSeconds = 1800
+
+[logging]
+level = "info"
+maxSizeMB = 10
+maxFiles = 5
+
+[notifications]
+inApp = true
+
+[notifications.osascript]
+enabled = true
+soundForLevels = ["action_required", "failure"]
+throttleWindowSeconds = 60
+
+[disclosure]
+enabled = true
+includeAgent = true
+includeOS = false
+
+[disclosure.channels]
+gitCommit = true
+pullRequest = true
+issueComment = true
+reviewComment = true
+inlineCommentVisible = true
+
+[tools]
+gitPath = "/usr/bin/git"
+ghPath = "/opt/homebrew/bin/gh"
+osascriptPath = "/usr/bin/osascript"
+
+[package]
+distribution = "github-release"
+autoMigrateOnStartup = true
+requireBackupBeforeMigrate = false
+
+[defaults]
+baseBranch = "main"
+allowAutoCommit = true
+allowAutoPush = true
+allowAutoApprove = true
+allowAutoMerge = false
+allowRiskyFixes = false
+openPrStrategy = "all_done"
+addSnapshotMode = "async"
+
+# `allowAutoApprove` is a legacy compatibility alias.
+# Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
+
+[roles.planner.discovery]
+autoDiscovery = true
+
+[roles.planner.discovery.triggers]
+labels = ["looper:plan"]
+labelMode = "all"
+requireAssigneeCurrentUser = true
+
+[roles.reviewer]
+instructions = "Review for correctness, regressions, and migration safety."
+
+[roles.reviewer.discovery]
+autoDiscovery = true
+
+[roles.reviewer.discovery.triggers]
+includeDrafts = false
+requireReviewRequest = true
+enableSelfReview = false
+labels = []
+labelMode = "all"
+
+[roles.reviewer.discovery.specReview]
+includeReviewingLabel = true
+reviewingLabel = "looper:spec-reviewing"
+
+[roles.reviewer.behavior]
+scope = "changed_ranges"
+publishMode = "single_review"
+
+[roles.reviewer.behavior.loop]
+enabledByDefault = true
+quietPeriodSeconds = 60
+minPublishIntervalSeconds = 300
+
+[roles.reviewer.behavior.reviewEvents]
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
+
+[roles.reviewer.behavior.nativeResume]
+onHeadChange = false
+reReviewPromptOnHeadChange = false
+
+[roles.fixer.discovery]
+autoDiscovery = true
+
+[roles.fixer.discovery.triggers]
+includeDrafts = false
+authorFilter = "current_user"
+labels = []
+labelMode = "all"
+
+[roles.worker.discovery]
+autoDiscovery = true
+
+[roles.worker.discovery.triggers]
+labels = ["looper:worker-ready"]
+labelMode = "all"
+requireAssigneeCurrentUser = true
+
+[roles.sweeper.discovery]
+autoDiscovery = false
+
+[roles.sweeper.behavior]
+dryRun = true
+
+[roles.sweeper.discovery.triggers]
+includeIssues = true
+includePullRequests = true
+includeDrafts = false
+excludeLabels = ["pinned", "security", "looper:sweep-keep"]
+excludeAuthors = []
+excludeAuthorAssociations = ["OWNER", "MEMBER", "COLLABORATOR"]
+looperInternalLabels = ["looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"]
+reopenCooldownDays = 30
+maxPerTick = 10
+
+[roles.sweeper.behavior.lifecycle]
+pendingLabel = "looper:sweep-pending"
+closedLabel = "looper:swept"
+keepLabel = "looper:sweep-keep"
+
+[roles.sweeper.behavior.limits]
+maxWarningsPerRepoPerDay = 25
+maxClosesPerRepoPerDay = 25
+globalKillSwitch = false
+
+[roles.sweeper.behavior.security]
+quarantineLabel = "looper:sweeper-route-security"
+notifyAssignees = []
+
+[[projects]]
+id = "looper"
+name = "Looper"
+repoPath = "/absolute/path/to/looper"
+baseBranch = "main"
+worktreeRoot = "/Users/you/.looper/worktrees/looper"
+
+[projects.roles.worker.discovery]
+autoDiscovery = false
+
+[projects.roles.reviewer]
+instructions = "Project-specific reviewer guidance"
+
+[projects.roles.reviewer.discovery.triggers]
+labels = ["team:alpha", "needs-review"]
+labelMode = "any"
+requireReviewRequest = false
+```
+
+## Migration guide
+
+This refactor is a warning-only migration release.
+
+- Looper does **not** add `looper config migrate` in this change set.
+- Looper does **not** rewrite, rename, convert, or delete user config files during startup.
+- Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path.
+- Accepted legacy config paths, legacy environment variable names, and legacy CLI flags still load during this release, but they emit actionable replacement guidance.
+
+### Deprecated reviewer migration example
+
+Deprecated legacy JSON:
 
 ```json
 {
-  "server": {
-    "host": "127.0.0.1",
-    "port": 17310,
-    "authMode": "local-token",
-    "localToken": "replace-me"
-  },
-  "storage": {
-    "mode": "sqlite",
-    "dbPath": "/Users/you/.looper/looper.sqlite",
-    "backupDir": "/Users/you/.looper/backups"
-  },
-  "scheduler": {
-    "pollIntervalSeconds": 30,
-    "maxConcurrentRuns": 3,
-    "retryMaxAttempts": 5,
-    "retryBaseDelayMs": 5000
-  },
-  "agent": {
-    "vendor": "opencode",
-    "model": "your-model-if-needed",
-    "params": {
-      "reasoning": "medium"
-    },
-    "env": {
-      "OPENAI_API_KEY": "replace-me"
-    },
-    "timeouts": {
-      "plannerSeconds": 1800,
-      "workerSeconds": 3600,
-      "reviewerSeconds": 1800,
-      "fixerSeconds": 1800
-    }
-  },
-  "logging": {
-    "level": "info",
-    "maxSizeMB": 10,
-    "maxFiles": 5
-  },
-  "notifications": {
-    "inApp": true,
-    "osascript": {
-      "enabled": true,
-      "soundForLevels": ["action_required", "failure"],
-      "throttleWindowSeconds": 60
-    }
-  },
-  "disclosure": {
-    "enabled": true,
-    "includeAgent": true,
-    "includeOS": false,
-    "channels": {
-      "gitCommit": true,
-      "pullRequest": true,
-      "issueComment": true,
-      "reviewComment": true,
-      "inlineCommentVisible": false
-    }
-  },
-  "tools": {
-    "gitPath": "/usr/bin/git",
-    "ghPath": "/opt/homebrew/bin/gh",
-    "osascriptPath": "/usr/bin/osascript"
-  },
-  "daemon": {
-    "mode": "foreground",
-    "restartPolicy": "on-failure",
-    "restartThrottleSeconds": 10,
-    "logDir": "/Users/you/.looper/logs",
-    "workingDirectory": "/absolute/path/to/where/you/start/looperd",
-    "environment": {
-      "EXAMPLE_FLAG": "1"
-    }
-  },
-  "package": {
-    "distribution": "github-release",
-    "autoMigrateOnStartup": true,
-    "requireBackupBeforeMigrate": false
-  },
-  "defaults": {
-    "baseBranch": "main",
-    "allowAutoCommit": true,
-    "allowAutoPush": true,
-    "allowAutoApprove": false,
-    "allowAutoMerge": false,
-    "allowRiskyFixes": false,
-    "openPrStrategy": "all_done",
-    "addSnapshotMode": "async"
-  },
   "reviewer": {
+    "scope": "changed_files",
+    "publishMode": "single_review",
     "reviewEvents": {
-      "clean": "COMMENT",
-      "blocking": "COMMENT"
+      "clean": "APPROVE",
+      "blocking": "REQUEST_CHANGES"
     }
   },
   "roles": {
-    "planner": {
-      "autoDiscovery": true,
-      "triggers": {
-        "labels": ["looper:plan"],
-        "labelMode": "all",
-        "requireAssigneeCurrentUser": true
-      }
-    },
     "reviewer": {
       "autoDiscovery": true,
       "triggers": {
-        "includeDrafts": false,
-        "requireReviewRequest": true,
-        "enableSelfReview": false,
-        "labels": [],
-        "labelMode": "all"
+        "requireReviewRequest": true
       },
       "specReview": {
-        "includeReviewingLabel": true,
         "reviewingLabel": "looper:spec-reviewing"
-      }
-    },
-    "fixer": {
-      "autoDiscovery": true,
-      "triggers": {
-        "includeDrafts": false,
-        "authorFilter": "current_user",
-        "labels": [],
-        "labelMode": "all"
-      }
-    },
-    "worker": {
-      "autoDiscovery": true,
-      "triggers": {
-        "labels": ["looper:worker-ready"],
-        "labelMode": "all",
-        "requireAssigneeCurrentUser": true
-      }
-    },
-    "sweeper": {
-      "autoDiscovery": false,
-      "dryRun": true,
-      "triggers": {
-        "includeIssues": true,
-        "includePullRequests": true,
-        "includeDrafts": false,
-        "excludeLabels": ["pinned", "security", "looper:sweep-keep"],
-        "excludeAuthors": [],
-        "excludeAuthorAssociations": ["OWNER", "MEMBER", "COLLABORATOR"],
-        "looperInternalLabels": ["looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"],
-        "reopenCooldownDays": 30,
-        "maxPerTick": 10
       },
-      "lifecycle": {
-        "pendingLabel": "looper:sweep-pending",
-        "closedLabel": "looper:swept",
-        "keepLabel": "looper:sweep-keep"
-      },
-      "limits": {
-        "maxWarningsPerRepoPerDay": 25,
-        "maxClosesPerRepoPerDay": 25,
-        "globalKillSwitch": false
-      },
-      "security": {
-        "quarantineLabel": "looper:sweeper-route-security",
-        "notifyAssignees": []
-      }
+      "instructions": "Review carefully."
     }
-  },
+  }
+}
+```
+
+Canonical replacement:
+
+```toml
+[roles.reviewer]
+instructions = "Review carefully."
+
+[roles.reviewer.discovery]
+autoDiscovery = true
+
+[roles.reviewer.discovery.triggers]
+requireReviewRequest = true
+
+[roles.reviewer.discovery.specReview]
+reviewingLabel = "looper:spec-reviewing"
+
+[roles.reviewer.behavior]
+scope = "changed_files"
+publishMode = "single_review"
+
+[roles.reviewer.behavior.reviewEvents]
+clean = "APPROVE"
+blocking = "REQUEST_CHANGES"
+```
+
+### Deprecated project reviewer discovery example
+
+Deprecated legacy JSON:
+
+```json
+{
   "projects": [
     {
       "id": "looper",
       "name": "Looper",
       "repoPath": "/absolute/path/to/looper",
-      "baseBranch": "main",
-      "worktreeRoot": "/Users/you/.looper/worktrees/looper",
       "roles": {
-        "worker": {
+        "reviewer": {
+          "autoDiscovery": true,
           "triggers": {
-            "labels": ["team:alpha", "worker-ready"],
-            "labelMode": "any"
+            "labels": ["needs-review"]
           }
         }
       }
@@ -246,195 +496,22 @@ Example minimal `~/.looper/config.json`:
 }
 ```
 
-`roles.sweeper.autoDiscovery` defaults to `false` and `roles.sweeper.dryRun` defaults to `true`, so the sweeper role stays opt-in and observe-only until you explicitly enable it.
+Canonical replacement:
 
-## Daemon supervision
+```toml
+[[projects]]
+id = "looper"
+name = "Looper"
+repoPath = "/absolute/path/to/looper"
 
-Supervision applies only to the `looperd` daemon lifecycle. Looper does not supervise arbitrary user commands or agent subprocesses.
+[projects.roles.reviewer.discovery]
+autoDiscovery = true
 
-`daemon.mode` controls how `looper daemon start` manages `looperd`:
-
-- `foreground` (default): starts `looperd` as a detached background process. This mode writes `~/.looper/looperd.pid` and `~/.looper/looperd.state.json`, but it is not actively supervised and will not automatically restart after a crash, logout, or reboot.
-- `launchd`: on macOS, installs and bootstraps a user LaunchAgent for `looperd`. This mode can restart according to `daemon.restartPolicy` and can start again at login through launchd. On non-macOS platforms it returns an actionable unsupported-platform error.
-
-Restart options:
-
-- `daemon.restartPolicy`: `never`, `on-failure`, or `always` (default `on-failure`). For launchd, `on-failure` maps to `KeepAlive` with unsuccessful-exit semantics, and `always` maps to `KeepAlive=true`.
-- `daemon.restartThrottleSeconds`: positive integer throttle passed to the supervisor to avoid tight crash loops (default `10`).
-- `daemon.plistPath`: optional macOS LaunchAgent plist path. If omitted, Looper uses `~/Library/LaunchAgents/io.nexu.looper.looperd.plist`.
-
-Runtime diagnostics are discoverable from `looper daemon status` and `looper daemon status --json`:
-
-- state file: `~/.looper/looperd.state.json`
-- compatibility pid file: `~/.looper/looperd.pid`
-- main daemon log: `~/.looper/logs/looperd.log`
-- startup logs: `~/.looper/logs/startup/`
-- launchd stdout/stderr logs: `~/.looper/logs/launchd/looperd.stdout.log` and `~/.looper/logs/launchd/looperd.stderr.log`
-
-`looper daemon status` reports mode, PID, start time, supervisor source, restart policy, stale/exited process detection, last exit reason when known or inferred, and log paths. Some abnormal exits, such as SIGKILL, OOM, or reboot, cannot be recorded by the exiting process; the next status command infers them from stale state/PID records.
-
-Use `looper daemon logs` for the main retained daemon log and `looper daemon logs --startup` for recent startup logs.
-
-## Field reference
-
-### `server`
-
-- `host`: bind host, default `127.0.0.1`
-- `port`: bind port, default `17310`
-- `authMode`: `none` or `local-token`
-- `localToken`: required when `authMode` is `local-token`
-
-### `storage`
-
-- `mode`: currently must be `sqlite`
-- `dbPath`: SQLite database path
-- `backupDir`: backup output directory
-
-Default storage paths:
-
-- DB: `~/.looper/looper.sqlite`
-- backups: `~/.looper/backups`
-
-### `scheduler`
-
-- `pollIntervalSeconds`: queue poll interval, must be an integer `>= 10`
-- `maxConcurrentRuns`: positive integer
-- `retryMaxAttempts`: positive integer
-- `retryBaseDelayMs`: positive integer
-
-### `agent`
-
-- `vendor`: one of `claude-code`, `codex`, `opencode`, `cursor-cli`
-- `model`: optional model identifier
-- `params`: free-form vendor-specific parameters
-- `env`: environment variables passed to the agent process
-- `nativeResume.enabled`: enables local-machine native session resume after daemon restart; defaults to `true`
-- `timeouts`: role-specific agent execution timeout seconds; defaults are planner `1800`, worker `3600`, reviewer `1800`, fixer `1800`
-
-`vendor` is required for agent-driven loops. If it is omitted, the daemon can still run, but planner / reviewer / fixer / worker loops cannot be created or started.
-
-All timeout values must be positive integers. If a run exceeds its configured role timeout, Looper uses the existing timeout failure and retry behavior.
-
-Native resume is intentionally local-machine only. When supported vendors expose a session/chat identifier (`claude-code`, `codex`, `opencode`, or `cursor-cli`), Looper persists that identifier in SQLite and, after `looperd` recovery, prefers the vendor's resume command before falling back to the normal checkpoint restart path. Vendor session stores are not portable across hosts or users, and resume can still fall back if the underlying CLI cannot reattach. Session capture depends on vendor CLI output that includes a structured session/chat id; use vendor-specific JSON or streaming output flags in `agent.params.args` if the default CLI output does not expose one. Set `LOOPER_AGENT_NATIVE_RESUME_ENABLED=false` to disable native resume via the environment.
-
-### `logging`
-
-- `level`: one of `debug`, `info`, `warn`, `error`
-- `maxSizeMB`: positive integer log rotation size
-- `maxFiles`: positive integer retained file count, including the active `looperd.log`
-
-When `looperd.log` would exceed `maxSizeMB`, `looperd` rotates it to `looperd.log.1`, shifts older archives to `.2`, `.3`, and so on, and keeps at most `maxFiles` total log files.
-
-### `notifications`
-
-- `inApp`: enables in-app notifications
-- `osascript.enabled`: enables macOS notifications
-- `osascript.soundForLevels`: subset of `action_required`, `failure`
-- `osascript.throttleWindowSeconds`: positive integer
-
-Default behavior:
-
-- on macOS, `notifications.osascript.enabled` defaults to `true`
-- on non-macOS platforms, it defaults to `false`
-
-If `notifications.osascript.enabled` is `true`, `tools.osascriptPath` must resolve.
-
-### `disclosure`
-
-`looperd` adds local text attribution to externally visible content it generates so collaborators can distinguish agent-assisted actions from human-authored actions. This is only a footer or Git trailer written into GitHub text / commit messages; it is not telemetry and does not send additional machine data anywhere.
-
-- `enabled`: enables disclosure stamps, default `true`
-- `includeAgent`: includes the configured agent vendor and configured model, default `true`
-- `includeOS`: includes only the OS family (`macOS`, `Linux`, or `Windows`), default `false`
-- `channels.gitCommit`: add a `Generated-By:` trailer to generated commit bodies without changing commit subjects
-- `channels.pullRequest`: add a Markdown footer to generated PR bodies
-- `channels.issueComment`: add a Markdown footer to generated issue / PR comments
-- `channels.reviewComment`: disclose generated review summaries and inline review comments
-- `channels.inlineCommentVisible`: when `false`, inline review comments receive only the hidden marker; when `true`, they receive the visible Markdown footer
-
-Disclosure stamps use an explicit allowlist: product (`looper`), version, runner role, configured agent vendor, configured agent model, and optionally OS family. They do not include hostnames, usernames, local paths, IP or MAC addresses, detailed kernel versions, environment variables, tokens, endpoints, or machine identifiers.
-
-### `tools`
-
-- `gitPath`
-- `ghPath`
-- `osascriptPath`
-
-If these are omitted, `looperd` tries to detect them from `PATH`. Startup validation fails when required tools cannot be resolved.
-
-### `daemon`
-
-- `mode`: `foreground` or `launchd`
-- `restartPolicy`: `never`, `on-failure`, or `always`; applies to supervised modes such as `launchd`
-- `restartThrottleSeconds`: positive supervisor restart throttle in seconds
-- `plistPath`: optional macOS user LaunchAgent plist path for `launchd` mode
-- `logDir`: daemon log directory
-- `shutdownTimeoutMs`: graceful shutdown timeout in milliseconds
-- `workingDirectory`: working directory used by the daemon
-- `environment`: reserved daemon environment map; currently part of the config surface, but not a primary user-facing runtime control in the documented flow
-
-`foreground` starts a detached process only and does not survive crashes or reboot. `launchd` is the supported supervised mode on macOS; unsupported platforms return an actionable error instead of silently falling back.
-
-Defaults:
-
-- `mode`: `foreground`
-- `restartPolicy`: `on-failure`
-- `restartThrottleSeconds`: `10`
-- `logDir`: `~/.looper/logs`
-- `shutdownTimeoutMs`: `1000`
-- `workingDirectory`: current working directory when config is loaded
-
-### `package`
-
-- `distribution`: install-channel metadata; current supported installs use `github-release`
-- `autoMigrateOnStartup`: run DB migrations on startup
-- `requireBackupBeforeMigrate`: require a backup before migrations
-
-### `defaults`
-
-- `baseBranch`: default project branch, usually `main`
-- `allowAutoCommit`
-- `allowAutoPush`
-- `allowAutoApprove`
-- `allowAutoMerge`
-- `allowRiskyFixes`
-- `openPrStrategy`: `all_done`, `first_commit`, or `manual`
-- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
-
-`defaults.allowAutoApprove=true` is a legacy alias for reviewer clean approvals. If `reviewer.reviewEvents.clean` is not explicitly configured, it maps clean reviewer outcomes to `APPROVE`; an explicit `reviewer.reviewEvents.clean` value wins.
-
-Default values:
-
-- `baseBranch`: `main`
-- `allowAutoCommit`: `true`
-- `allowAutoPush`: `true`
-- `allowAutoApprove`: `false`
-- `allowAutoMerge`: `false`
-- `allowRiskyFixes`: `false`
-- `fixAllPullRequests`: `false`; legacy fixer discovery switch. Prefer `roles.fixer.triggers.authorFilter` for new config.
-- `openPrStrategy`: `all_done`
-- `addSnapshotMode`: `async`
-
-### `reviewer`
-
-- `reviewEvents.clean`: review event for clean reviewer outcomes. Allowed values: `COMMENT`, `APPROVE`. Default: `COMMENT`.
-- `reviewEvents.blocking`: review event for blocking reviewer outcomes. Allowed values: `COMMENT`, `REQUEST_CHANGES`. Default: `COMMENT`.
-- Reviewer loop budget options (`maxIterationsPerPR`, `maxIterationsPerHead`, `maxWallClockSeconds`, `maxConsecutiveFailures`, and `maxAgentExecutionsPerPR`) are deprecated and ignored by the reviewer filter. Reviewer loops keep following PR updates until a clear terminal product state such as the PR closing/merging, an approved Looper review for the current head, or the ready label.
-
-Default reviewer behavior is safe and comment-only:
-
-```json
-{
-  "reviewer": {
-    "reviewEvents": {
-      "clean": "COMMENT",
-      "blocking": "COMMENT"
-    }
-  }
-}
+[projects.roles.reviewer.discovery.triggers]
+labels = ["needs-review"]
 ```
 
-To allow reviewer decision reviews:
+## Environment variables and CLI flags
 
 ```json
 {
@@ -547,188 +624,22 @@ Sweeper categories currently exposed in config are `stale`, `alreadyFixed`, `sup
 
 For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 
+Canonical environment variables and CLI flags override the config-file layer. Legacy names remain accepted only as compatibility aliases during the migration window.
+
 Examples:
 
-```json
-{
-  "roles": {
-    "planner": {
-      "triggers": {
-        "labels": ["team:alpha", "needs-plan"],
-        "labelMode": "any",
-        "requireAssigneeCurrentUser": false
-      }
-    }
-  }
-}
-```
-
-```json
-{
-  "roles": {
-    "reviewer": {
-      "autoDiscovery": false
-    },
-    "fixer": {
-      "triggers": {
-        "authorFilter": "any"
-      }
-    }
-  }
-}
-```
-
-`defaults.fixAllPullRequests=true` remains supported and maps to `roles.fixer.triggers.authorFilter=any` when `roles.fixer.triggers.authorFilter` is not explicitly configured. If both are present, `roles.fixer.triggers.authorFilter` wins.
-
-Project entries can override supported role settings with `projects[].roles`. Looper resolves these values as built-in defaults → global config/env/CLI `roles` → matching `projects[].roles`; fields omitted from a project role fall back to the effective global role value. Set a project role `instructions` value to an empty string to clear inherited global role instructions for that project.
-
-Supported project role keys match the global role keys for the built-in roles: `planner`, `worker`, `reviewer`, `fixer`, and `sweeper`. Unknown role keys are rejected during config loading. The initially role-overridable settings are auto-discovery, trigger settings, reviewer spec-review label settings, and role instructions. Project role overrides affect scheduler auto-discovery and the role-specific eligibility checks that use those same trigger settings for the matching project.
-
-### `projects`
-
-Each entry registers a repo that `looper` can target.
-
-- `id`: stable project identifier; must be unique
-- `name`: display name
-- `repoPath`: absolute repository path
-- `baseBranch`: optional per-project override
-- `worktreeRoot`: optional per-project worktree root
-- `roles`: optional per-project role overrides for `planner`, `worker`, `reviewer`, `fixer`, and `sweeper`; absent fields fall back to global `roles`
-
-Example:
-
-```json
-{
-  "projects": [
-    {
-      "id": "looper",
-      "name": "Looper",
-      "repoPath": "/Users/you/src/looper",
-      "baseBranch": "main",
-      "worktreeRoot": "/Users/you/.looper/worktrees/looper",
-      "roles": {
-        "reviewer": {
-          "triggers": {
-            "labels": ["needs-review"],
-            "requireReviewRequest": false
-          }
-        },
-        "worker": {
-          "autoDiscovery": false
-        }
-      }
-    }
-  ]
-}
-```
-
-## Environment variable overrides
-
-Supported environment overrides:
-
-- `LOOPER_CONFIG`
-- `LOOPER_HOST`
-- `LOOPER_PORT`
-- `LOOPER_DB_PATH`
-- `LOOPER_LOG_DIR`
-- `LOOPER_DAEMON_MODE`
-- `LOOPER_DAEMON_RESTART_POLICY`
-- `LOOPER_DAEMON_RESTART_THROTTLE_SECONDS`
-- `LOOPER_WORKING_DIRECTORY`
-- `LOOPER_GIT_PATH`
-- `LOOPER_GH_PATH`
-- `LOOPER_OSASCRIPT_PATH`
-- `LOOPER_OSASCRIPT_ENABLED`
-- `LOOPER_IN_APP_NOTIFICATIONS`
-- `LOOPER_AGENT_TIMEOUTS_PLANNER_SECONDS`
-- `LOOPER_AGENT_TIMEOUTS_WORKER_SECONDS`
-- `LOOPER_AGENT_TIMEOUTS_REVIEWER_SECONDS`
-- `LOOPER_AGENT_TIMEOUTS_FIXER_SECONDS`
-- `LOOPER_ALLOW_AUTO_COMMIT`
-- `LOOPER_ALLOW_AUTO_PUSH`
-- `LOOPER_ALLOW_AUTO_APPROVE`
-- `LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN`
-- `LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING`
-- `LOOPER_FIX_ALL_PULL_REQUESTS`
-- `LOOPER_ROLES_PLANNER_AUTO_DISCOVERY`
-- `LOOPER_ROLES_PLANNER_TRIGGERS_LABELS`
-- `LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE`
-- `LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
-- `LOOPER_ROLES_WORKER_AUTO_DISCOVERY`
-- `LOOPER_ROLES_WORKER_TRIGGERS_LABELS`
-- `LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE`
-- `LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER`
-- `LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY`
-- `LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS`
-- `LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST`
-- `LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW`
-- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS`
-- `LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE`
-- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL`
-- `LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL`
-- `LOOPER_ROLES_FIXER_AUTO_DISCOVERY`
-- `LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS`
-- `LOOPER_ROLES_FIXER_TRIGGERS_LABELS`
-- `LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE`
-- `LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER`
-
-Boolean environment variables accept:
-
-- truthy: `1`, `true`, `yes`, `on`
-- falsy: `0`, `false`, `no`, `off`
-
-Example:
-
 ```bash
-LOOPER_CONFIG="$HOME/custom-looper/config.json" \
+LOOPER_CONFIG="$HOME/custom-looper/config.toml" \
 LOOPER_PORT=4321 \
-LOOPER_ALLOW_AUTO_PUSH=false \
+LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW=true \
 looperd
 ```
 
-Migration note: the default looperd port changed from `4310` to `17310` to reduce conflicts with other local services. Existing config files, `LOOPER_PORT`, and `--port` values continue to take precedence, so users with an explicit port setting keep their current port.
-
-Example precedence:
-
-- if the config file sets port `4310`
-- and `LOOPER_PORT=5000` is exported
-- and `looperd --port 6000` is passed
-
-then the daemon uses port `6000`.
-
-## CLI flag overrides
-
-Supported `looperd` flags:
-
-- `--config`
-- `--host`
-- `--port`
-- `--db-path`
-- `--log-dir`
-- `--daemon-mode`
-- `--daemon-restart-policy`
-- `--daemon-restart-throttle-seconds`
-- `--git-path`
-- `--gh-path`
-- `--osascript-path`
-- `--planner-agent-timeout-seconds`
-- `--worker-agent-timeout-seconds`
-- `--reviewer-agent-timeout-seconds`
-- `--fixer-agent-timeout-seconds`
-- `--allow-auto-commit`
-- `--allow-auto-push`
-- `--allow-auto-approve`
-- `--reviewer-enable-self-review`
-- `--reviewer-clean-review-event`
-- `--reviewer-blocking-review-event`
-
-Example:
-
 ```bash
 looperd \
-  --config "$HOME/custom-looper/config.json" \
+  --config "$HOME/custom-looper/config.toml" \
   --port 4321 \
-  --allow-auto-push=false
+  --roles-reviewer-discovery-triggers-enable-self-review=true
 ```
 
 ## Validation rules and startup failures
@@ -745,19 +656,13 @@ looperd \
 - `daemon.logDir` must be writable
 - `daemon.workingDirectory` must be writable
 - the default worktree root must be writable
-
-## Merge behavior details
-
-- objects are merged deeply
-- arrays are replaced as a whole, not merged item-by-item
-- omitted fields keep their previous-layer value
-
-That means if you set `projects` in the config file, the entire projects array comes from that layer.
+- required tool paths must resolve
+- `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 
 ## Recommended first-time setup
 
 1. Install `git` and `gh`
-2. Create `~/.looper/config.json`
+2. Create `~/.looper/config.toml`
 3. Add at least one project in `projects`
 4. Set `agent.vendor`
 5. Start the daemon with your installed `looperd` (or `go run ./cmd/looperd` while developing)
@@ -778,14 +683,9 @@ Either:
 - install or expose `osascript`, or
 - disable macOS notifications with:
 
-```json
-{
-  "notifications": {
-    "osascript": {
-      "enabled": false
-    }
-  }
-}
+```toml
+[notifications.osascript]
+enabled = false
 ```
 
 ### A runtime path is not writable

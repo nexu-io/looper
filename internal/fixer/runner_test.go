@@ -2,17 +2,21 @@ package fixer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -76,6 +80,95 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	}
 	if strings.Contains(prompt, "gh pr diff -- <path>") {
 		t.Fatalf("prompt contains unsupported gh pr diff pathspec instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildFixerPromptCommentReplyInstructionRequiresVerificationWithoutRemoteMutation(t *testing.T) {
+	t.Parallel()
+
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{
+		"Before including an entry, re-read the relevant review thread/comment context",
+		"only include items you can confidently confirm are actually addressed by the current branch state",
+		"Read-only GitHub fetches are allowed for that verification.",
+		"Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action",
+		"Looper owns those remote review-state changes after validation and push.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			Worktree: &checkpointWorktree{Path: repoPath, Branch: "feature/fix-42", PreparedAt: "stale"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
+	stdout := `__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Applied the requested fix."}]}` + "\n"
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			Worktree: &checkpointWorktree{Path: legacyPath, Branch: "feature/fix-42", PreparedAt: "stale"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if checkpoint.Worktree.Path == legacyPath {
+		t.Fatalf("checkpoint.Worktree.Path = %q, want recreated path outside legacy prepared worktree", checkpoint.Worktree.Path)
+	}
+	if git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
 	}
 }
 
@@ -377,9 +470,9 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 		viewResponses: []PullRequestDetail{
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
 		},
 	}
 	git := &fakeGitGateway{
@@ -391,7 +484,8 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 			{HeadSHA: "new-head"},
 		},
 	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -479,8 +573,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "produced no new commits") {
-		t.Fatalf("result = %#v, want manual intervention failure for no-op repair", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed manual-intervention completion", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
 		t.Fatalf("commit calls=%d push calls=%d resolve calls=%d, want 0/0/0 after no-op repair", len(git.commitCalls), len(git.pushCalls), len(github.resolveCalls))
@@ -489,15 +583,190 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
-	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepResolveComments) {
-		t.Fatalf("run = %#v, want failed run at resolve-comments step", run)
+	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepRecheck) {
+		t.Fatalf("run = %#v, want failed run at recheck", run)
 	}
 	checkpoint := parseCheckpoint(run.CheckpointJSON)
 	if checkpoint.Push == nil || checkpoint.Push.Pushed || checkpoint.Push.SkippedReason == "" {
 		t.Fatalf("checkpoint.Push = %#v, want recorded no-op push", checkpoint.Push)
 	}
-	if checkpoint.ResolvedComments != nil {
-		t.Fatalf("checkpoint.ResolvedComments = %#v, want unresolved comments left untouched", checkpoint.ResolvedComments)
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+	if checkpoint.ResolvedComments == nil || len(checkpoint.ResolvedComments.Items) == 0 || checkpoint.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("checkpoint.ResolvedComments = %#v, want agent_declined marker", checkpoint.ResolvedComments)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, agentMissingThreadDecisionExplanation) {
+		t.Fatalf("reply calls = %#v, want synthetic decline reply", github.replyCalls)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want manual_intervention queue item", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop without scheduled retry", loop)
+	}
+	activeFollowup, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeFollowup != nil {
+		t.Fatalf("active follow-up queue item = %#v, want none", activeFollowup)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsFailedFixerLoopWhenFingerprintUnchanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(77)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-77", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	fingerprint := buildFixerDiscoveryFingerprint(repo, prNumber, detail.HeadSHA, hashFixItems(collectFixItems(detail)))
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_failed_same_fp", Seq: 90, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "same-head"}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for unchanged failed fingerprint", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesFailedFixerLoopWhenFingerprintChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(78)
+	nowISO := fixture.nowISO()
+	oldDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "old-head", HeadRefName: "feature/fix-78", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	newDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-78", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	fingerprint := buildFixerDiscoveryFingerprint(repo, prNumber, oldDetail.HeadSHA, hashFixItems(collectFixItems(oldDetail)))
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_failed_changed_fp", Seq: 91, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "new-head"}}, viewResponses: []PullRequestDetail{newDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one queue item after fingerprint change", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsDeclinedThreadWhenFingerprintMatches(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(79)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-79", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}}}
+	fixItems := collectFixItems(detail)
+	declinedFingerprint := buildDeclinedThreadFingerprint(fixItems[0], detail.HeadSHA)
+	metadata := mustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_declined_same_fp", Seq: 92, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for declined fingerprint match", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesDeclinedThreadWhenHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(80)
+	nowISO := fixture.nowISO()
+	oldDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "old-head", HeadRefName: "feature/fix-80", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}}}
+	oldFixItems := collectFixItems(oldDetail)
+	declinedFingerprint := buildDeclinedThreadFingerprint(oldFixItems[0], oldDetail.HeadSHA)
+	metadata := mustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_declined_changed_head", Seq: 93, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	newDetail := oldDetail
+	newDetail.HeadSHA = "new-head"
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: newDetail.HeadSHA}}, viewResponses: []PullRequestDetail{newDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one queue item after head change", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsPausedZeroProgressLoopWhenOnlySuppressedDeclinesDiffer(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(80)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-80", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}, {"id": "c2", "threadId": "t2", "body": "please fix too", "threadFingerprint": "thread-hash-2"}}}
+	allFixItems := collectFixItems(detail)
+	declinedFingerprint := buildDeclinedThreadFingerprint(allFixItems[0], detail.HeadSHA)
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": zeroProgressPauseReason,
+		"fixerZeroProgress": map[string]any{
+			"headSha":           detail.HeadSHA,
+			"fixItemsHash":      hashFixItems(allFixItems),
+			"fixItemsStateHash": hashFixItemsState(allFixItems),
+			"consecutiveCount":  3,
+			"recordedAt":        nowISO,
+		},
+		"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already declined"}},
+	})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_declined_mixed", Seq: 94, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none when full fix-item state is unchanged", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_declined_mixed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused loop to remain paused", persisted)
 	}
 }
 
@@ -548,10 +817,520 @@ func TestProcessClaimedItemAllowsNoCommitWhenCommentsAlreadyResolved(t *testing.
 	}
 }
 
-func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
+func TestDiscoverPullRequestsDefersRepeatedNoopResolveRediscoveryBeforeCooldown(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{GitHub: &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	fixItemsStateHash := hashFixItemsState(collectFixItems(detail))
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveStateHash": fixItemsStateHash, "lastNoopResolveAt": nowISO})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want delayed retry queue item for unchanged no-op resolve state", result.QueueItems)
+	}
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.NextRunAt == nil || *persisted.NextRunAt != wantAvailableAt {
+		t.Fatalf("persisted loop = %#v, want NextRunAt %q", persisted, wantAvailableAt)
+	}
+}
+
+func TestEnqueueMovesExistingDelayedFixerItemEarlierForSameDedupeKey(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	projectID := "project_1"
+	loopID := "loop_1"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	dedupeKey := buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-1", "hash-1")
+	later := eventlog.FormatJavaScriptISOString(fixture.now().Add(5 * time.Minute))
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_1", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: later, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	item, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: projectID, LoopID: loopID, Repo: repo, PRNumber: prNumber, HeadSHA: "head-1", FixItemsHash: "hash-1", AvailableAt: fixture.now()})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	if item.AvailableAt != fixture.nowISO() {
+		t.Fatalf("AvailableAt = %q, want %q", item.AvailableAt, fixture.nowISO())
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		detail PullRequestDetail
+	}{
+		{name: "head changes", detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-2", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		{name: "fix items change", detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}, {"id": "c2", "threadId": "t2", "body": "also fix this"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			baseline := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+			metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(baseline)), "lastNoopResolveAt": nowISO})
+			loopTarget := buildPullRequestTargetID(repo, prNumber)
+			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: tc.detail.HeadSHA}}, viewResponses: []PullRequestDetail{tc.detail}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+			result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			if len(result.QueueItems) != 1 {
+				t.Fatalf("QueueItems = %#v, want one queue item after state change", result.QueueItems)
+			}
+		})
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenRecoverableEvidenceExists(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "body": "please fix"}}}
+	fixItems := collectFixItems(detail)
+	metadata := mustJSON(t, map[string]any{
+		"lastNoopResolveHeadSha":   detail.HeadSHA,
+		"lastNoopResolveStateHash": hashFixItemsState(fixItems),
+		"fixEvidenceStoreV2": &fixEvidenceStoreV2{Version: 2, Threads: map[string][]threadFixEvidence{
+			"t1": {{ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1", EvidenceHeadSHA: "head-1", ValidationHeadSHA: "head-1", CommitSHA: "head-1", ProducedNewCommits: true, Explanation: "Confirmed fix.", ResolveState: "pending"}},
+		}},
+	})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_recoverable_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovery rediscovery to enqueue", result.QueueItems)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHashMatches(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:01:00Z|count=1"}}, []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue on thread-set change", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue after cooldown expiry", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
+	}
+}
+
+func TestDiscoverPullRequestsRecoversLegacyNoopLoopWithoutOpenPRListing(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_recovery", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: nil, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovered legacy queue item", result.QueueItems)
+	}
+	if github.viewIndex != 1 {
+		t.Fatalf("viewIndex = %d, want direct recovery PR view", github.viewIndex)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_recovery")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" || persisted.NextRunAt == nil || *persisted.NextRunAt != fixture.nowISO() {
+		t.Fatalf("persisted = %#v, want immediately queued recovered loop", persisted)
+	}
+	followup, ok := parseFixerFollowupState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parseFixerFollowupState() = false, want migrated follow-up metadata")
+	}
+	if followup.HeadSHA != "head-1" || followup.FixItemsStateHash == "" || !sameStringSlices(followup.UnresolvedThreadIDs, []string{"t1"}) {
+		t.Fatalf("followup = %#v, want migrated live recovery state", followup)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), "loop_fixer_legacy_recovery")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.AvailableAt != fixture.nowISO() {
+		t.Fatalf("activeQueue = %#v, want immediately runnable recovered queue item", activeQueue)
+	}
+}
+
+func TestDiscoverPullRequestsRecoversLegacyNoopLoopAfterCooldownWhenPRListingMissesIt(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	legacyAt := fixture.nowISO()
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_cooldown", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one delayed recovered queue item", result.QueueItems)
+	}
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_cooldown")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.NextRunAt == nil || *persisted.NextRunAt != wantAvailableAt {
+		t.Fatalf("persisted = %#v, want delayed NextRunAt %q", persisted, wantAvailableAt)
+	}
+}
+
+func TestDiscoverPullRequestsRecoverySkipsLegacyNoopLoopWhenPRLocked(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": fixture.nowISO()})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_locked", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	if acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "other-fixer", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	} else if !acquired {
+		t.Fatal("Locks.Acquire() = false, want active competing lock")
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none while PR lock is active", result.QueueItems)
+	}
+	if github.viewIndex != 0 {
+		t.Fatalf("viewIndex = %d, want no recovery PR view while locked", github.viewIndex)
+	}
+}
+
+func TestDiscoverPullRequestsRecoveryClearsLegacyNoopMetadataWhenFingerprintChanged(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "old-head", "lastNoopResolveStateHash": "old-hash", "lastNoopResolveAt": fixture.nowISO()})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_changed", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want immediate recovery queue item", result.QueueItems)
+	}
+	if result.QueueItems[0].AvailableAt != fixture.nowISO() {
+		t.Fatalf("AvailableAt = %q, want immediate requeue at %q", result.QueueItems[0].AvailableAt, fixture.nowISO())
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_legacy_changed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup = %#v, want cleared migrated metadata for changed fingerprint", meta["fixerFollowup"])
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("legacy noop metadata still present in %#v", meta)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionEnqueue {
+		t.Fatalf("decision = %#v, want enqueue on new signal despite terminal prior state", decision)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveIgnoresMismatchedThreadFingerprintEvidence(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=old-comment|updated=2026-04-11T11:59:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "pending"}}}}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer when only mismatched thread evidence exists", decision)
+	}
+	if decision.NextEligibleAt != "2026-04-11T12:05:00.000Z" {
+		t.Fatalf("NextEligibleAt = %q, want followup cooldown", decision.NextEligibleAt)
+	}
+}
+
+func TestDecideRediscoveryAfterNoopResolveDefersMissingConfirmationDuringCooldown(t *testing.T) {
+	t.Parallel()
+
+	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_confirmation", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "skipped_no_confirmation"}}}}})
+	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
+	if decision.Action != rediscoveryActionDefer {
+		t.Fatalf("decision = %#v, want defer for missing confirmation during cooldown", decision)
+	}
+	if decision.Reason != string(fixerFollowupReasonMissingConfirmation) {
+		t.Fatalf("decision.Reason = %q, want %q", decision.Reason, fixerFollowupReasonMissingConfirmation)
+	}
+}
+
+func TestDiscoverPullRequestsClearsFollowupStateWhenNoUnresolvedCommentsRemain(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": "same-hash", "lastNoopResolveAt": nowISO})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_noop"
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	delayedAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_followup", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:followup", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: delayedAt, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	resolvedDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "done", "isResolved": true}}}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: resolvedDetail.HeadSHA}}, viewResponses: []PullRequestDetail{resolvedDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none when comments are resolved", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("legacy noop metadata still present in %#v", meta)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), "loop_fixer_noop")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue != nil {
+		t.Fatalf("activeQueue = %#v, want cleared delayed queue item", activeQueue)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsQueuedAttemptsForNonCommentFixItemsWithoutThreads(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_checks", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_fixer_checks"
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	delayedAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_followup", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:followup", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: delayedAt, Attempts: 2, MaxAttempts: 3, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want reused queued item for non-comment fix item", result.QueueItems)
+	}
+	if result.QueueItems[0].ID != "queue_followup" {
+		t.Fatalf("queue item ID = %q, want existing queued fixer item", result.QueueItems[0].ID)
+	}
+	if result.QueueItems[0].Attempts != 2 {
+		t.Fatalf("Attempts = %d, want preserved retry state", result.QueueItems[0].Attempts)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.ID != "queue_followup" || activeQueue.Attempts != 2 {
+		t.Fatalf("activeQueue = %#v, want preserved queued fixer item with attempts", activeQueue)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
+	}
+}
+
+func TestRecordFixerFollowupStateTransitionsToManualInterventionAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_fixer_followup", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	for range fixerFollowupBackoffSchedule {
+		fixture.advance(time.Minute)
+		if _, err := runner.recordFixerFollowupState(context.Background(), loop, fixerFollowupReasonMissingEvidence, "head-1", "same-hash", []string{"t1"}, fixture.now()); err != nil {
+			t.Fatalf("recordFixerFollowupState() error = %v", err)
+		}
+	}
+	fixture.advance(time.Minute)
+	if _, err := runner.recordFixerFollowupState(context.Background(), loop, fixerFollowupReasonMissingEvidence, "head-1", "same-hash", []string{"t1"}, fixture.now()); err != nil {
+		t.Fatalf("recordFixerFollowupState() terminal error = %v", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	followup, ok := parseFixerFollowupState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parseFixerFollowupState() = false, want follow-up metadata")
+	}
+	if !followup.Terminal || followup.Reason != string(fixerFollowupReasonManualIntervention) {
+		t.Fatalf("followup = %#v, want terminal manual intervention", followup)
+	}
+}
+
+func TestRunResolveCommentsStepSkipsWithoutVerifiedPushEvidence(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	loop := storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
 		Number:      42,
 		State:       "OPEN",
 		HeadSHA:     "base-head",
@@ -563,7 +1342,8 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 			"threadId": "t1",
 			"body":     "please fix",
 		}},
-	}}}})
+	}}}
+	runner := New(Options{Repos: fixture.repos, GitHub: github, Now: fixture.now})
 	checkpoint := fixerCheckpoint{
 		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
@@ -577,63 +1357,54 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 		},
 	}
 
-	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
-		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       loop,
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: checkpoint,
 	})
-	if err == nil {
-		t.Fatal("runResolveCommentsStep() error = nil, want manual intervention")
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 without agent reply explanation", len(github.resolveCalls))
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 1 || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
 	}
-	if !contains(loopErr.Error(), "produced no new commits") {
-		t.Fatalf("error = %q, want no-new-commits message", loopErr.Error())
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, agentMissingThreadDecisionExplanation) {
+		t.Fatalf("reply calls = %#v, want synthetic decline reply", github.replyCalls)
+	}
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
 	}
 }
 
-func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
+func TestRunResolveCommentsStepResolvesUsingRepairReplyExplanations(t *testing.T) {
 	t.Parallel()
 
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
-		{
-			Number:      42,
-			State:       "OPEN",
-			HeadSHA:     "base-head",
-			HeadRefName: "feature/fix-42",
-			BaseRefName: "main",
-			BaseSHA:     "base-1",
-			Comments: []map[string]any{{
-				"id":       "c1",
-				"threadId": "t1",
-				"body":     "please fix",
-			}},
-		},
-		{
-			Number:      42,
-			State:       "OPEN",
-			HeadSHA:     "new-head",
-			HeadRefName: "feature/fix-42",
-			BaseRefName: "main",
-			BaseSHA:     "base-1",
-			Comments: []map[string]any{{
-				"id":       "c1",
-				"threadId": "t1",
-				"body":     "please fix",
-			}},
-		},
-	}}
-	runner := New(Options{GitHub: github, Sleep: func(time.Duration) {}})
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	checkpoint := fixerCheckpoint{
-		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
-		Validation: &ValidationResult{Passed: true, Summary: "ok"},
-		Push:       &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		FixItems:     fixItems,
+		FixItemsHash: hashFixItems(fixItems),
+		Validation:   &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:         &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
 		ReconcileCommits: &checkpointReconcileCommits{
 			BaseHeadSHA:      "base-head",
 			FinalHeadSHA:     "base-head",
@@ -642,30 +1413,819 @@ func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
 		},
 	}
 
-	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
 		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: checkpoint,
 	})
-	if err == nil {
-		t.Fatal("runResolveCommentsStep() error = nil, want stale-head retry")
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+	if github.viewIndex != 1 {
+		t.Fatalf("github.viewIndex = %d, want one live PR refresh", github.viewIndex)
 	}
-	if loopErr.kind != FailureRetryableAfterResume {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableAfterResume)
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1", len(github.resolveCalls))
 	}
-	if !contains(loopErr.Error(), "PR head changed before resolving comments") {
-		t.Fatalf("error = %q, want stale-head message", loopErr.Error())
+	if updated.Detail == nil || updated.Detail.HeadSHA != "new-head" {
+		t.Fatalf("updated.Detail = %#v, want refreshed new-head detail", updated.Detail)
 	}
-	if github.viewIndex < 2 {
-		t.Fatalf("github.viewIndex = %d, want live refresh plus head check before no-fix block", github.viewIndex)
+	if len(github.replyCalls) != 1 || !contains(github.replyCalls[0].Body, "base-hea") {
+		t.Fatalf("reply calls = %#v, want reply referencing resolved commit head", github.replyCalls)
+	}
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepPostsDeclinedReplyWithoutResolving(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
 	}
 	if len(github.resolveCalls) != 0 {
-		t.Fatalf("resolve calls = %d, want none on stale head", len(github.resolveCalls))
+		t.Fatalf("resolve calls = %#v, want none for declined reply", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, "Out of scope for this PR.") {
+		t.Fatalf("reply calls = %#v, want declined explanation reply", github.replyCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepDoesNotPersistDeclinedFingerprintWhenReplyFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_decline_reply_failure", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}, replyErr: errors.New("reply failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "Failed to resolve") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable mutation failure error", err)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "failed_mutation_retry" || updated.ResolvedComments.Items[0].ReplyState != "failed" {
+		t.Fatalf("resolved comments = %#v, want failed_mutation_retry with failed reply state", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyReplayStep {
+		t.Fatalf("updated.ResumePolicy = %q, want replay_step", updated.ResumePolicy)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if records := parseDeclinedThreadRecords(parseJSONObject(persisted.MetadataJSON)); len(records) != 0 {
+		t.Fatalf("declined thread records = %#v, want none after failed reply", records)
+	}
+	if got := suppressDeclinedFixItems(persisted.MetadataJSON, "new-head", fixItems); len(got) != 1 || got[0].ID != "c1" {
+		t.Fatalf("suppressDeclinedFixItems() = %#v, want original fix item after failed reply", got)
+	}
+}
+
+func TestRunResolveCommentsStepTreatsUnknownActionAsContractViolation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_invalid_action", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: "decliend", Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %#v, want none for invalid action", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, agentInvalidThreadDecisionExplanation) {
+		t.Fatalf("reply calls = %#v, want invalid-action decline reply", github.replyCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if got := int(int64FromAny(meta["fixerContractViolationCount"])); got != 1 {
+		t.Fatalf("fixerContractViolationCount = %d, want 1", got)
+	}
+}
+
+func TestRunResolveCommentsStepHandlesNewThreadAsContractViolationWithoutSkippingExisting(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t2",
+			"body":     "new feedback",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}, {ID: "t2", Comments: []ReviewThreadComment{{ID: "c2", Body: "new feedback"}}}}}
+	// fixItems mirrors the snapshot the agent saw: only c1/t1.
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	// Live PR has gained thread t2/c2 since the agent ran. The agent's
+	// existing decision for c1 must still be honoured (reply + resolve);
+	// the unknown thread t2 falls through to the contract-violation path
+	// and receives a synthetic-decline reply without being resolved.
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_new_thread_contract", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       repo,
+		PRNumber:   prNumber,
+		Loop:       loop,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want nil", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want exactly 1 resolve for t1", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 2 {
+		t.Fatalf("reply calls = %d, want 2 (fixed reply for t1, synthetic decline for t2)", len(github.replyCalls))
+	}
+	var (
+		t1Reply *AddReviewThreadReplyInput
+		t2Reply *AddReviewThreadReplyInput
+	)
+	for i, call := range github.replyCalls {
+		switch call.ThreadID {
+		case "t1":
+			t1Reply = &github.replyCalls[i]
+		case "t2":
+			t2Reply = &github.replyCalls[i]
+		}
+	}
+	if t1Reply == nil || !strings.Contains(t1Reply.Body, "Applied the requested fix.") {
+		t.Fatalf("t1 reply = %#v, want fixed explanation", t1Reply)
+	}
+	if t2Reply == nil || !strings.Contains(t2Reply.Body, agentMissingThreadDecisionExplanation) {
+		t.Fatalf("t2 reply = %#v, want synthetic decline reply", t2Reply)
+	}
+	statusByThread := map[string]string{}
+	for _, item := range updated.ResolvedComments.Items {
+		statusByThread[item.ThreadID] = item.Status
+	}
+	if statusByThread["t1"] != "resolved" {
+		t.Fatalf("t1 status = %q, want resolved", statusByThread["t1"])
+	}
+	if statusByThread["t2"] != "agent_declined" {
+		t.Fatalf("t2 status = %q, want agent_declined", statusByThread["t2"])
+	}
+}
+
+func TestRunResolveCommentsStepSkipsThreadWhenHumanCommentArrivesAfterRunStart(t *testing.T) {
+	t.Parallel()
+
+	runStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "reply-2", Body: "one more thing", CreatedAt: "2026-04-11T12:05:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want thread drift retry", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 after thread drift", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after thread drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepSkipsThreadWhenObservedThreadSnapshotDriftsDuringRepair(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T12:10:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t1",
+			"body":     "also handle edge case",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "c2", Body: "also handle edge case", Author: "alice", CreatedAt: "2026-04-11T12:05:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: "2026-04-11T12:30:00Z"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retry after observed-thread drift", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 after observed-thread drift", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after observed-thread drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+	if len(updated.FixItems) != 2 || updated.FixItems[1].ID != "c2" {
+		t.Fatalf("updated.FixItems = %#v, want live unresolved comments to include c2 for rediscover", updated.FixItems)
+	}
+}
+
+func TestRunResolveCommentsStepRequiresObservedThreadSnapshotForFixedDecision(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T12:10:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t1",
+			"body":     "also handle edge case",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "c2", Body: "also handle edge case", Author: "alice", CreatedAt: "2026-04-11T12:05:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix."}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: "2026-04-11T12:30:00Z"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retry after missing thread snapshot", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 after missing thread snapshot", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after missing thread snapshot", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepAllowsDeclinedDecisionWithoutObservedThreadSnapshot(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want declined path without snapshot", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 for declined decision", len(github.resolveCalls))
+	}
+	if len(github.replyCalls) != 1 || github.replyCalls[0].ThreadID != "t1" {
+		t.Fatalf("reply calls = %#v, want one declined reply on t1", github.replyCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepDetectsDriftFromEditedComment(t *testing.T) {
+	t.Parallel()
+
+	runStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Body: "please fix (edited)", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z", UpdatedAt: "2026-04-11T12:05:00Z"},
+	}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want thread drift retry from edited comment", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 after edited-comment drift", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift for edited comment", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepFlagsThreadDriftWhenCommentEdited(t *testing.T) {
+	t.Parallel()
+
+	runStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix (edited)",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Body: "please fix (edited)", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z", UpdatedAt: "2026-04-11T12:05:00Z"},
+	}}}}
+	runner := New(Options{GitHub: github})
+	originalFixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         originalFixItems,
+		FixItemsHash:     hashFixItems(originalFixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want per-thread drift retry", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when the thread comment was edited after run start", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepIgnoresBotCommentForDrift(t *testing.T) {
+	t.Parallel()
+
+	runStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Body: "please fix", CreatedAt: "2026-04-11T11:59:00Z"},
+		{ID: "bot-1", Body: "automated nitpick", Author: "chatgpt-codex-connector[bot]", CreatedAt: "2026-04-11T12:05:00Z"},
+	}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}, {ID: "bot-1", Author: "chatgpt-codex-connector[bot]"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: runStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want resolve through bot comment", err)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (bot comment must not block resolve)", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved despite bot comment", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepRecordsMutationFailureAsRetryable(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}},
+		resolveErr:    errors.New("graphql mutation failed"),
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "Failed to resolve") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable mutation failure error", err)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "failed_mutation_retry" {
+		t.Fatalf("resolved comments = %#v, want failed_mutation_retry", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyReplayStep {
+		t.Fatalf("updated.ResumePolicy = %q, want replay_step", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepRetriesResolveAfterPriorLooperReply(t *testing.T) {
+	t.Parallel()
+
+	item := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}, {ID: "reply-1", Body: buildFixerReplyBody(item, "fix-head", "Applied the requested fix.")}}}},
+	}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{
+		FixItems:         []FixItem{item},
+		FixItemsHash:     hashFixItems([]FixItem{item}),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}})}}},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionFixed), Status: "failed_mutation_retry", ReplyState: "sent"}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retryable resolve to proceed", err)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %#v, want 0 because prior Looper reply should be reused", github.replyCalls)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want 1 retry resolve for t1", github.resolveCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved after retrying with prior Looper reply", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepProceedsWhenFixCommitStillReachable(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "live-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}},
+		compareStatus: "ahead",
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-commit"}, Push: &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "fix-commit"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "fix-commit", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want resolve when fix commit is still reachable", err)
+	}
+	if len(github.compareCalls) != 1 || github.compareCalls[0].Base != "fix-commit" || github.compareCalls[0].Head != "live-head" {
+		t.Fatalf("compare calls = %#v, want one call comparing fix-commit...live-head", github.compareCalls)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 when fix commit still reachable", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved when fix commit still reachable", updated.ResolvedComments)
+	}
+}
+
+func TestRunResolveCommentsStepAbortsWhenFixCommitNoLongerReachable(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "rebased-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}},
+		compareStatus: "diverged",
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-commit"}, Push: &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "fix-commit"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "fix-commit", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "no longer descends") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want abort when fix commit is no longer reachable", err)
+	}
+	if len(github.compareCalls) != 1 {
+		t.Fatalf("compare calls = %d, want 1", len(github.compareCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when fix commit no longer reachable", len(github.resolveCalls))
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %d, want 0 when fix commit no longer reachable", len(github.replyCalls))
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepDriftAnchorsToRepairCompletionOnReplay(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T11:00:00Z"
+	humanReplyAt := "2026-04-11T11:30:00Z"
+	retryRunStartedAt := "2026-04-11T12:00:00Z"
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+			{ID: "c1", Body: "please fix", CreatedAt: "2026-04-11T10:00:00Z"},
+			{ID: "reply-2", Body: "actually also fix this", Author: "alice", CreatedAt: humanReplyAt},
+		}}},
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: retryRunStartedAt}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want drift retry anchored to Repair.CompletedAt", err)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 when reviewer commented after repair completion", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("resolved comments = %#v, want skipped_thread_drift on replay", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
+func TestRunResolveCommentsStepOnlySkipsDriftedObservedThread(t *testing.T) {
+	t.Parallel()
+
+	repairCompletedAt := "2026-04-11T12:10:00Z"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}, {
+			"id":       "c2",
+			"threadId": "t1",
+			"body":     "also handle edge case",
+		}, {
+			"id":       "c3",
+			"threadId": "t2",
+			"body":     "rename helper",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix", Author: "alice", CreatedAt: "2026-04-11T11:59:00Z"}, {ID: "c2", Body: "also handle edge case", Author: "alice", CreatedAt: "2026-04-11T12:05:00Z"}}}, {ID: "t2", Comments: []ReviewThreadComment{{ID: "c3", Body: "rename helper", Author: "alice", CreatedAt: "2026-04-11T11:58:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}, {Type: "comment", ID: "c3", ThreadID: "t2", Summary: "rename helper"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}, {FixItemID: "c3", ThreadID: "t2", Explanation: "Renamed the helper.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c3"}}})}}, CompletedAt: repairCompletedAt},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Run: storage.RunRecord{StartedAt: "2026-04-11T12:30:00Z"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want retry after one observed thread drifted", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t2" {
+		t.Fatalf("resolve calls = %#v, want only t2 resolved", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 1 || github.replyCalls[0].ThreadID != "t2" {
+		t.Fatalf("reply calls = %#v, want only t2 replied", github.replyCalls)
+	}
+	statusByThread := map[string]string{}
+	for _, item := range updated.ResolvedComments.Items {
+		statusByThread[item.ThreadID] = item.Status
+	}
+	if statusByThread["t1"] != "skipped_thread_drift" {
+		t.Fatalf("t1 status = %q, want skipped_thread_drift", statusByThread["t1"])
+	}
+	if statusByThread["t2"] != "resolved" {
+		t.Fatalf("t2 status = %q, want resolved", statusByThread["t2"])
+	}
+}
+
+func TestRunResolveCommentsStepReplyFailureDoesNotBlockResolve(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		threads:       []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}},
+		replyErr:      errors.New("reply failed"),
+	}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	checkpoint := fixerCheckpoint{FixItems: fixItems, FixItemsHash: hashFixItems(fixItems), Validation: &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"}, Push: &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 despite reply failure", len(github.resolveCalls))
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" || updated.ResolvedComments.Items[0].ReplyState != "failed" {
+		t.Fatalf("resolved comments = %#v, want resolved with failed reply state", updated.ResolvedComments)
 	}
 }
 
@@ -679,14 +2239,22 @@ func TestRunResolveCommentsStepUsesRefreshedPushHeadSHA(t *testing.T) {
 		HeadRefName: "feature/fix-42",
 		BaseRefName: "main",
 		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+		}},
 	}}}
 	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	checkpoint := fixerCheckpoint{
-		Detail:     &checkpointDetail{HeadSHA: "old-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
-		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
-		Validation: &ValidationResult{Passed: true, Summary: "ok"},
-		Push:       &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "new-head"},
-		Lifecycle:  &lifecycle.State{Pushed: true},
+		Detail:       &checkpointDetail{HeadSHA: "old-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		FixItems:     fixItems,
+		FixItemsHash: hashFixItems(fixItems),
+		Validation:   &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:         &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "new-head"},
+		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
+		Lifecycle:    &lifecycle.State{Pushed: true},
 		ReconcileCommits: &checkpointReconcileCommits{
 			BaseHeadSHA:      "base-head",
 			FinalHeadSHA:     "old-head",
@@ -829,6 +2397,645 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentUserErr: errors.New("github timeout")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_ownership_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_ownership_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	_, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err == nil || !strings.Contains(err.Error(), "github timeout") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want github timeout", err)
+	}
+	latest, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), loop.ID)
+	if err != nil || latest == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want run", latest, err)
+	}
+	if latest.Status != "failed" || latest.EndedAt == nil {
+		t.Fatalf("latest run = %#v, want failed terminal run", latest)
+	}
+	if latest.CurrentStep == nil || *latest.CurrentStep != string(stepDiscoverPR) {
+		t.Fatalf("latest.CurrentStep = %#v, want discover-pr", latest.CurrentStep)
+	}
+	checkpoint := parseCheckpoint(latest.CheckpointJSON)
+	if checkpoint.RunStartedAt != "" || checkpoint.RunStartedRunID != "" {
+		t.Fatalf("checkpoint start marker = (%q, %q), want no start marker before ownership failure", checkpoint.RunStartedAt, checkpoint.RunStartedRunID)
+	}
+	if checkpoint.RunPreStartAt == "" || checkpoint.RunPreStartRunID != latest.ID {
+		t.Fatalf("checkpoint pre-start marker = (%q, %q), want current run marker", checkpoint.RunPreStartAt, checkpoint.RunPreStartRunID)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "run", latest.ID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType == "run.started" {
+			t.Fatalf("events = %#v, want no run.started before ownership failure", events)
+		}
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() retry error = %v", err)
+	}
+	if resumed.Run.ID == latest.ID || resumed.Run.Status != "running" {
+		t.Fatalf("resumed.Run = %#v, want new running run", resumed.Run)
+	}
+}
+
+func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_legacy_markerless", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	active := storage.RunRecord{ID: "run_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable legacy markerless error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
+	if err != nil || preservedRun == nil {
+		t.Fatalf("Runs.GetByID(active) = (%#v, %v), want run", preservedRun, err)
+	}
+	if preservedRun.Status != "running" || preservedRun.EndedAt != nil {
+		t.Fatalf("preservedRun = %#v, want still-running legacy markerless run", preservedRun)
+	}
+}
+
+func TestCreateRunContextInterruptsLegacyMarkerlessRunAfterGrace(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	staleISO := fixture.current.Add(-25 * time.Hour).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_stale_legacy_markerless", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	orphan := storage.RunRecord{ID: "run_stale_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleISO, LastHeartbeatAt: &staleISO, CreatedAt: staleISO, UpdatedAt: staleISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted stale legacy markerless run", oldRun)
+	}
+}
+
+func TestCreateRunContextTreatsFreshMarkerlessRunAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_fresh_markerless", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	active := storage.RunRecord{ID: "run_fresh_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable fresh-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+}
+
+func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_active_agent_execution", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	orphan := storage.RunRecord{ID: "run_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := orphan.ID
+	loopID := loop.ID
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_active_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable active-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(active) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running active run", activeRun)
+	}
+}
+
+func TestCreateRunContextTreatsFreshPreStartRunAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_fresh_prestart", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: nowISO, RunPreStartRunID: "run_fresh_prestart"})
+	preStartRun := storage.RunRecord{ID: "run_fresh_prestart", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), preStartRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable pre-start error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), preStartRun.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(preStart) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running pre-start run", activeRun)
+	}
+}
+
+func TestCreateRunContextInterruptsStalePreStartRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	stalePreStartAt := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_stale_prestart", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: stalePreStartAt, RunPreStartRunID: "run_stale_prestart"})
+	orphan := storage.RunRecord{ID: "run_stale_prestart", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: stalePreStartAt, LastHeartbeatAt: &stalePreStartAt, CreatedAt: stalePreStartAt, UpdatedAt: stalePreStartAt}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted stale pre-start run", oldRun)
+	}
+}
+
+func TestCreateRunContextTreatsOlderActiveAgentExecutionAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	activeStartedAt := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_older_active_agent_execution", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	orphan := storage.RunRecord{ID: "run_older_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: activeStartedAt, LastHeartbeatAt: &activeStartedAt, CreatedAt: activeStartedAt, UpdatedAt: activeStartedAt}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := orphan.ID
+	loopID := loop.ID
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_older_active_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "running", StartedAt: activeStartedAt, CreatedAt: activeStartedAt, UpdatedAt: activeStartedAt}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(active) error = %v", err)
+	}
+	endedAt := nowISO
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_newer_terminal_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "completed", StartedAt: nowISO, EndedAt: &endedAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(terminal) error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable active-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(active) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running active run", activeRun)
+	}
+}
+
+func TestCreateRunContextTreatsMarkerlessRunWithTerminalAgentExecutionAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_terminal_agent_execution", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	active := storage.RunRecord{ID: "run_terminal_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := active.ID
+	loopID := loop.ID
+	endedAt := nowISO
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_terminal_execution", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "completed", StartedAt: nowISO, EndedAt: &endedAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
+	if err != nil || preservedRun == nil {
+		t.Fatalf("Runs.GetByID(active) = (%#v, %v), want run", preservedRun, err)
+	}
+	if preservedRun.Status != "running" || preservedRun.EndedAt != nil {
+		t.Fatalf("preservedRun = %#v, want still-running markerless run", preservedRun)
+	}
+}
+
+func TestProcessClaimedQueueItemRequeuesWhenActiveRunHasAgentExecution(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_active_agent_execution_queue", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	activeRun := storage.RunRecord{ID: "run_active_agent_execution_queue", LoopID: "loop_active_agent_execution_queue", Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), activeRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runID := activeRun.ID
+	loopID := activeRun.LoopID
+	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_active_execution_queue", LoopID: &loopID, RunID: &runID, Vendor: "opencode", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_active_agent_execution", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:active-agent-execution", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "already has a running fixer run") {
+		t.Fatalf("result = %#v, want retryable_transient active-run recovery", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 0 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want requeued retryable_transient active-run failure without consuming attempts", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want loop requeued for retry", loop)
+	}
+	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), activeRun.ID)
+	if err != nil || preservedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want active run", preservedRun, err)
+	}
+	if preservedRun.Status != "running" || preservedRun.EndedAt != nil {
+		t.Fatalf("preservedRun = %#v, want original run preserved", preservedRun)
+	}
+}
+
+func TestProcessClaimedQueueItemRequeuesLegacyMarkerlessRunWithoutConsumingAttempts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_legacy_markerless_queue", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	activeRun := storage.RunRecord{ID: "run_legacy_markerless_queue", LoopID: "loop_legacy_markerless_queue", Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), activeRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := activeRun.LoopID
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_legacy_markerless", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:legacy-markerless", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "markerless running fixer run") {
+		t.Fatalf("result = %#v, want retryable_transient markerless active-run recovery", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 1 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want requeued markerless active-run failure without consuming attempts", queue)
+	}
+	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), activeRun.ID)
+	if err != nil || preservedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want active run", preservedRun, err)
+	}
+	if preservedRun.Status != "running" || preservedRun.EndedAt != nil {
+		t.Fatalf("preservedRun = %#v, want original run preserved", preservedRun)
+	}
+}
+
+func TestCreateRunContextPreservesMarkerlessRunDespiteStartedEvent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_started_run", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	startedRun := storage.RunRecord{ID: "run_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	entityType := "run"
+	entityID := startedRun.ID
+	if err := fixture.repos.Events.Append(context.Background(), storage.EventLogRecord{ID: "event_started_run", EventType: "run.started", LoopID: &loop.ID, RunID: &startedRun.ID, EntityType: &entityType, EntityID: &entityID, PayloadJSON: "{}", CreatedAt: nowISO}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	preserved, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
+	if err != nil || preserved == nil {
+		t.Fatalf("Runs.GetByID(started) = (%#v, %v), want run", preserved, err)
+	}
+	if preserved.Status != "running" || preserved.EndedAt != nil {
+		t.Fatalf("preserved = %#v, want markerless run preserved despite best-effort event", preserved)
+	}
+}
+
+func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_started_run_missing_event", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO, RunStartedRunID: "run_started_missing_event"})
+	startedRun := storage.RunRecord{ID: "run_started_missing_event", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable started-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
+	if err != nil || activeRun == nil {
+		t.Fatalf("Runs.GetByID(started) = (%#v, %v), want run", activeRun, err)
+	}
+	if activeRun.Status != "running" || activeRun.EndedAt != nil {
+		t.Fatalf("activeRun = %#v, want still-running started run", activeRun)
+	}
+	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), loop.ID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v), want preserved run", latestRun, err)
+	}
+	if latestRun.ID != startedRun.ID {
+		t.Fatalf("latestRun.ID = %q, want preserved run %q", latestRun.ID, startedRun.ID)
+	}
+}
+
+func TestCreateRunContextTreatsLegacyStartedRunAsRetryable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_legacy_started_run", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO})
+	startedRun := storage.RunRecord{ID: "run_legacy_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	_, err := runner.createRunContext(context.Background(), loop)
+	if err == nil {
+		t.Fatal("createRunContext() error = nil, want retryable legacy started-run error")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	}
+}
+
+func TestCreateRunContextInterruptsLegacyStaleStartedMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ClaimTTL: time.Minute})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	createdAt := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	staleStartedAt := fixture.current.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_legacy_stale_started", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt})
+	orphan := storage.RunRecord{ID: "run_legacy_stale_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: createdAt, LastHeartbeatAt: &createdAt, CreatedAt: createdAt, UpdatedAt: createdAt}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted legacy stale-start run", oldRun)
+	}
+}
+
+func TestCreateRunContextInterruptsResumedRunWithStaleStartMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	staleStartedAt := fixture.current.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	loop := storage.LoopRecord{ID: "loop_stale_started_run", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt, RunStartedRunID: "previous_run"})
+	orphan := storage.RunRecord{ID: "run_stale_started_marker", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleStartedAt, LastHeartbeatAt: &staleStartedAt, CreatedAt: staleStartedAt, UpdatedAt: staleStartedAt}
+	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Run.ID == orphan.ID || created.Run.Status != "running" {
+		t.Fatalf("created.Run = %#v, want replacement running run", created.Run)
+	}
+	if created.Checkpoint.RunStartedAt != "" || created.Checkpoint.RunStartedRunID != "" {
+		t.Fatalf("created.Checkpoint = %#v, want cleared start marker", created.Checkpoint)
+	}
+	if created.Checkpoint.RunPreStartAt == "" || created.Checkpoint.RunPreStartRunID != created.Run.ID {
+		t.Fatalf("created.Checkpoint = %#v, want current pre-start marker", created.Checkpoint)
+	}
+	oldRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
+	if err != nil || oldRun == nil {
+		t.Fatalf("Runs.GetByID(orphan) = (%#v, %v), want run", oldRun, err)
+	}
+	if oldRun.Status != "interrupted" || oldRun.EndedAt == nil {
+		t.Fatalf("oldRun = %#v, want interrupted stale pre-start run", oldRun)
+	}
+}
+
 func TestProcessClaimedItemFailsWhenRepairCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -934,7 +3141,7 @@ func TestProcessClaimedItemPersistsCheckpointWhenRepairReturnsNonCompleted(t *te
 	}
 }
 
-func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testing.T) {
+func TestProcessClaimedItemTreatsAgentSetupFailureAsRetryableTransient(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
@@ -961,15 +3168,22 @@ func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "requires a newer version") {
-		t.Fatalf("result = %#v, want manual_intervention with real agent error", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
+		t.Fatalf("result = %#v, want retryable_transient with real agent error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention failure", queue)
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want queued retryable_transient failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop awaiting retry", loop)
 	}
 }
 
@@ -1085,7 +3299,7 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 	}
 }
 
-func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
+func TestCreateRunContextRestartsFromDiscoverForRediscoverableCheckpoint(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -1109,7 +3323,7 @@ func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
-		ResumePolicy: "manual_intervention",
+		ResumePolicy: "restart_from_discover",
 		Detail: &checkpointDetail{
 			State:       "OPEN",
 			HeadSHA:     "head-1",
@@ -1344,7 +3558,8 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
 		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
 	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
 	validationCalls := 0
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true}, inspectResults: []InspectHeadResult{{HeadSHA: "base-head"}, {HeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}}, {HeadSHA: "new-head"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowRiskyFixes: true, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
@@ -1500,8 +3715,8 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" || !contains(result.Summary, "Auto push disabled") {
-		t.Fatalf("result = %#v, want skipped auto-push summary", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
+		t.Fatalf("result = %#v, want manual-intervention auto-push summary", result)
 	}
 	if len(git.pushCalls) != 0 {
 		t.Fatalf("len(git.pushCalls) = %d, want 0", len(git.pushCalls))
@@ -1510,15 +3725,152 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "completed" {
-		t.Fatalf("queue = %#v, want completed", queue)
+	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want failed manual_intervention queue item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
-	if run == nil || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepPush) {
-		t.Fatalf("run = %#v, want lastCompletedStep=push", run)
+	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepPush) {
+		t.Fatalf("run = %#v, want failed push step run", run)
+	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+	if checkpoint.Push == nil || checkpoint.Push.SkippedReason != "Auto push disabled" {
+		t.Fatalf("checkpoint.Push = %#v, want recorded auto-push-disabled checkpoint", checkpoint.Push)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused hard-hold loop", loop)
+	}
+}
+
+func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: false}}})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
+	})
+	if err == nil {
+		t.Fatal("runPrepareWorktreeStep() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AllowRiskyFixes: false})
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			FixItems: []FixItem{{Type: "conflict", Summary: "merge conflict"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("runRepairStep() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+	if !contains(loopErr.Error(), "risky conflict fixes require manual intervention") {
+		t.Fatalf("error = %q, want risky conflict summary", loopErr.Error())
+	}
+}
+
+func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:       &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			FixItems:     []FixItem{{ID: "fix-1", Summary: "repair disclosure"}},
+			Worktree:     &checkpointWorktree{Path: legacyPath, Branch: "feature/fix-42", PreparedAt: "stale"},
+			FixItemsHash: "hash-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("runRepairStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
+	}
+	if git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	if agent.starts[0].WorkingDirectory != git.createResult.WorktreePath {
+		t.Fatalf("agent WorkingDirectory = %q, want rebuilt worktree %q", agent.starts[0].WorkingDirectory, git.createResult.WorktreePath)
+	}
+	if checkpoint.Repair == nil || checkpoint.Repair.Summary != "applied fixes" {
+		t.Fatalf("checkpoint.Repair = %#v, want completed repair after worktree recovery", checkpoint.Repair)
+	}
+}
+
+func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirty(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{Git: &fakeGitGateway{inspectResults: []InspectHeadResult{{HeadSHA: "head-1", HasUncommittedChanges: true, ChangedFiles: []string{"file.txt"}}}}, AllowAutoCommit: false})
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
+	checkpoint, err := runner.reconcileCommits(context.Background(), project, fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "head-1"}}, "fix: test")
+	if err == nil {
+		t.Fatal("reconcileCommits() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
 	}
 }
 
@@ -1644,21 +3996,27 @@ func (f *runnerFixture) nowISO() string {
 
 type fakeGitHubGateway struct {
 	currentUser           string
+	currentUserErr        error
 	listOpen              []PullRequestSummary
 	listOpenByLabel       map[string][]PullRequestSummary
 	listCalls             []ListOpenPullRequestsInput
 	viewResponses         []PullRequestDetail
+	threads               []ReviewThread
 	viewIndex             int
 	resolveCalls          []ResolveReviewThreadInput
 	addLabelCalls         []PullRequestLabelsInput
 	removeLabelCalls      []PullRequestLabelsInput
 	replyCalls            []AddReviewThreadReplyInput
 	replyErr              error
+	resolveErr            error
 	createIssueComments   []IssueCommentInput
 	updateIssueComments   []UpdateIssueCommentInput
 	createIssueCommentErr error
 	updateIssueCommentErr error
 	nextIssueCommentID    int64
+	compareCalls          []CompareCommitsInput
+	compareStatus         string
+	compareErr            error
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1676,6 +4034,9 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 }
 
 func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	if f.currentUserErr != nil {
+		return "", f.currentUserErr
+	}
 	return firstNonEmpty(f.currentUser, "looper"), nil
 }
 
@@ -1704,16 +4065,64 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	if result.Author == "" {
 		result.Author = firstNonEmpty(f.currentUser, "looper")
 	}
+	for i := range result.Comments {
+		if _, ok := stringFromAny(result.Comments[i]["threadFingerprint"]); ok {
+			continue
+		}
+		threadID, _ := stringFromAny(result.Comments[i]["threadId"])
+		commentID, _ := stringFromAny(result.Comments[i]["id"])
+		result.Comments[i]["threadFingerprint"] = normalizeThreadFingerprint("", threadID, commentID)
+	}
 	return result, nil
+}
+
+func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThreadsInput) ([]ReviewThread, error) {
+	if f.threads != nil {
+		return append([]ReviewThread(nil), f.threads...), nil
+	}
+	threads := make([]ReviewThread, 0)
+	if f.viewIndex == 0 || len(f.viewResponses) == 0 {
+		return threads, nil
+	}
+	idx := f.viewIndex - 1
+	if idx >= len(f.viewResponses) {
+		idx = len(f.viewResponses) - 1
+	}
+	for _, comment := range f.viewResponses[idx].Comments {
+		threadID, _ := stringFromAny(comment["threadId"])
+		commentID, _ := stringFromAny(comment["id"])
+		body, _ := stringFromAny(comment["body"])
+		if threadID == "" {
+			threadID = commentID
+		}
+		threads = append(threads, ReviewThread{ID: threadID, Comments: []ReviewThreadComment{{ID: commentID, Body: body}}})
+	}
+	return threads, nil
+}
+
+func (f *fakeGitHubGateway) ViewReviewThread(_ context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
+	threads, _ := f.ListReviewThreads(context.Background(), ListReviewThreadsInput{})
+	for _, thread := range threads {
+		if thread.ID == input.ThreadID {
+			return thread, nil
+		}
+	}
+	return ReviewThread{ID: input.ThreadID}, nil
 }
 
 func (f *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input ResolveReviewThreadInput) error {
 	f.resolveCalls = append(f.resolveCalls, input)
-	return nil
+	return f.resolveErr
 }
 
 func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
 	f.replyCalls = append(f.replyCalls, input)
+	for i := range f.threads {
+		if f.threads[i].ID == input.ThreadID {
+			f.threads[i].Comments = append(f.threads[i].Comments, ReviewThreadComment{ID: fmt.Sprintf("reply-%d", len(f.replyCalls)), Body: input.Body})
+			return f.replyErr
+		}
+	}
 	return f.replyErr
 }
 
@@ -1745,11 +4154,28 @@ func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input Pul
 	return nil
 }
 
+func (f *fakeGitHubGateway) CompareCommits(_ context.Context, input CompareCommitsInput) (CompareCommitsResult, error) {
+	f.compareCalls = append(f.compareCalls, input)
+	if f.compareErr != nil {
+		return CompareCommitsResult{}, f.compareErr
+	}
+	status := f.compareStatus
+	if status == "" {
+		status = "identical"
+	}
+	return CompareCommitsResult{Status: status}, nil
+}
+
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
 	prepareResult  PrepareWorktreeResult
 	inspectResults []InspectHeadResult
 	inspectIndex   int
+	ancestor       map[string]bool
+	ancestorErr    error
+	fetchErrors    []error
+	fetchIndex     int
+	fetchErr       error
 	pushErrors     []error
 	pushIndex      int
 
@@ -1758,6 +4184,7 @@ type fakeGitGateway struct {
 	inspectCalls []InspectHeadInput
 	commitCalls  []CommitInput
 	pushCalls    []PushInput
+	fetchCalls   []string
 	cleanupCalls []CleanupWorktreeInput
 }
 
@@ -1766,6 +4193,8 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
+	} else if input.WorktreeRoot != "" {
+		result.WorktreePath = filepath.Join(input.WorktreeRoot, filepath.Base(result.WorktreePath))
 	}
 	if result.Branch == "" {
 		result.Branch = input.Branch
@@ -1773,6 +4202,7 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if result.HeadSHA == "" {
 		result.HeadSHA = "base-head"
 	}
+	f.createResult = result
 	return result, nil
 }
 
@@ -1818,6 +4248,26 @@ func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 	return nil
 }
 
+func (f *fakeGitGateway) FetchBranch(_ context.Context, repoPath, remote, branch string) error {
+	f.fetchCalls = append(f.fetchCalls, repoPath+"|"+remote+"|"+branch)
+	if f.fetchIndex < len(f.fetchErrors) {
+		err := f.fetchErrors[f.fetchIndex]
+		f.fetchIndex++
+		return err
+	}
+	return f.fetchErr
+}
+
+func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, descendant string) (bool, error) {
+	if f.ancestorErr != nil {
+		return false, f.ancestorErr
+	}
+	if f.ancestor == nil {
+		return ancestor == descendant, nil
+	}
+	return f.ancestor[ancestor+"->"+descendant], nil
+}
+
 func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
 	return nil
@@ -1854,6 +4304,15 @@ func (*testLogger) Warn(string, map[string]any)  {}
 func (*testLogger) Error(string, map[string]any) {}
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return string(encoded)
+}
 
 func TestBuildFixerReplyBodyMentionsAuthorAndCommit(t *testing.T) {
 	t.Parallel()
@@ -1902,9 +4361,9 @@ func TestProcessClaimedItemRepliesToAuthorBeforeResolving(t *testing.T) {
 		viewResponses: []PullRequestDetail{
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
 		},
 	}
 	git := &fakeGitGateway{
@@ -1916,7 +4375,8 @@ func TestProcessClaimedItemRepliesToAuthorBeforeResolving(t *testing.T) {
 			{HeadSHA: "new-head"},
 		},
 	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -1952,10 +4412,10 @@ func TestParseReplyExplanationsValid(t *testing.T) {
 	t.Parallel()
 	stdout := strings.Join([]string{
 		"some agent log line",
-		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Replaced strings.Title with cases.Title."}]}`,
+		`__LOOPER_RESULT__={"summary":"applied","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Replaced strings.Title with cases.Title.","threadCommentsObserved":"ABC123"}]}`,
 	}, "\n")
 	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
-	if len(got) != 1 || got[0].FixItemID != "c1" || !strings.Contains(got[0].Explanation, "cases.Title") {
+	if len(got) != 1 || got[0].FixItemID != "c1" || !strings.Contains(got[0].Explanation, "cases.Title") || got[0].ThreadCommentsObserved != "abc123" {
 		t.Fatalf("parseReplyExplanations() = %#v", got)
 	}
 }
@@ -1996,6 +4456,162 @@ func TestParseReplyExplanationsDropsUnknownAndMismatchedThread(t *testing.T) {
 	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
 	if len(got) != 1 || got[0].Explanation != "good" {
 		t.Fatalf("parseReplyExplanations() = %#v, want only the first valid entry", got)
+	}
+}
+
+func TestParseReplyExplanationsDefaultsMissingActionToFixed(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"good"}]}`
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Action != string(replyActionFixed) {
+		t.Fatalf("parseReplyExplanations() = %#v, want default fixed action", got)
+	}
+}
+
+func TestParseReplyExplanationsPreservesDeclinedAction(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"declined","explanation":"already implemented"}]}`
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Action != string(replyActionDeclined) {
+		t.Fatalf("parseReplyExplanations() = %#v, want declined action", got)
+	}
+}
+
+func TestParseReplyExplanationsPreservesUnknownActionForContractViolationHandling(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"decliend","explanation":"already implemented"}]}`
+	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
+	if len(got) != 1 || got[0].Action != "decliend" {
+		t.Fatalf("parseReplyExplanations() = %#v, want preserved unknown action", got)
+	}
+}
+
+func TestRecordZeroProgressSuccessPausesAfterThreeRunsAndResumesOnStateChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(81)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_zero_progress", Seq: 94, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-hash-1"}}, FixItemsHash: "fix-hash-1"}
+	for i := 0; i < 2; i++ {
+		paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, checkpoint)
+		if err != nil {
+			t.Fatalf("recordZeroProgressSuccess() error = %v", err)
+		}
+		if paused {
+			t.Fatalf("recordZeroProgressSuccess() paused early on run %d", i+1)
+		}
+	}
+	paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, checkpoint)
+	if err != nil {
+		t.Fatalf("recordZeroProgressSuccess() third run error = %v", err)
+	}
+	if !paused {
+		t.Fatal("recordZeroProgressSuccess() = false, want paused on third zero-progress run")
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", persisted)
+	}
+	resumed, _, err := runner.resumePausedZeroProgressLoop(context.Background(), *persisted, "head-2", hashFixItemsState([]FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-hash-1"}}))
+	if err != nil {
+		t.Fatalf("resumePausedZeroProgressLoop() error = %v", err)
+	}
+	if !resumed {
+		t.Fatal("resumePausedZeroProgressLoop() = false, want resume on head change")
+	}
+}
+
+func TestClearFixerFollowupMetadataPreservesZeroProgressPauseReason(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(81)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{
+		"fixerFollowup":            map[string]any{"reason": "missing_evidence"},
+		"lastNoopResolveHeadSha":   "head-1",
+		"lastNoopResolveStateHash": "same-hash",
+		"lastNoopResolveAt":        fixture.nowISO(),
+		"pauseReason":              zeroProgressPauseReason,
+	})
+	loop := storage.LoopRecord{ID: "loop_zero_progress_cleanup", Seq: 95, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	updated, err := runner.clearFixerFollowupMetadata(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("clearFixerFollowupMetadata() error = %v", err)
+	}
+	meta := parseJSONObject(updated.MetadataJSON)
+	if _, ok := meta["fixerFollowup"]; ok {
+		t.Fatalf("fixerFollowup still present in %#v", meta)
+	}
+	if _, ok := meta["lastNoopResolveHeadSha"]; ok {
+		t.Fatalf("lastNoopResolveHeadSha still present in %#v", meta)
+	}
+	if got, _ := stringFromAny(meta["pauseReason"]); got != zeroProgressPauseReason {
+		t.Fatalf("pauseReason = %q, want %q", got, zeroProgressPauseReason)
+	}
+}
+
+func TestRecordZeroProgressSuccessResetsCountWhenFixItemStateChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(82)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_zero_progress_state_reset", Seq: 96, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: baseItems, FixItemsHash: hashFixItems(baseItems)}
+	for i := 0; i < 2; i++ {
+		paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, checkpoint)
+		if err != nil {
+			t.Fatalf("recordZeroProgressSuccess() error = %v", err)
+		}
+		if paused {
+			t.Fatalf("recordZeroProgressSuccess() paused early on run %d", i+1)
+		}
+	}
+
+	changedItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-2"}}
+	changedCheckpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: changedItems, FixItemsHash: hashFixItems(changedItems)}
+	paused, err := runner.recordZeroProgressSuccess(context.Background(), loop, changedCheckpoint)
+	if err != nil {
+		t.Fatalf("recordZeroProgressSuccess() changed state error = %v", err)
+	}
+	if paused {
+		t.Fatal("recordZeroProgressSuccess() = true, want streak reset when fix-item state changes")
+	}
+
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseZeroProgressState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatal("parseZeroProgressState() = false, want persisted zero-progress state")
+	}
+	if state.ConsecutiveCount != 1 {
+		t.Fatalf("ConsecutiveCount = %d, want 1 after state change", state.ConsecutiveCount)
+	}
+	if state.FixItemsStateHash != hashFixItemsState(changedItems) {
+		t.Fatalf("FixItemsStateHash = %q, want %q", state.FixItemsStateHash, hashFixItemsState(changedItems))
 	}
 }
 
@@ -2045,37 +4661,26 @@ func TestSummarizeFixItemSanitizesFallbackSummary(t *testing.T) {
 	}
 }
 
-func TestLookupReplyExplanationsRejectsStaleSnapshot(t *testing.T) {
+func TestLookupReplyExplanationsReturnsExplanationsAndSkipsEmpty(t *testing.T) {
 	t.Parallel()
+	// Per-thread drift detection (hasNonLooperCommentSince) handles
+	// reviewer comments added after the agent's decision; the round
+	// summary and evidence records surface the agent's explanations
+	// regardless of how the fix-items snapshot has shifted, and entries
+	// without a fix item id or explanation text are dropped so summary
+	// rendering does not emit blanks.
 	checkpoint := fixerCheckpoint{
-		FixItemsHash: "hash-current",
 		Repair: &checkpointRepair{
-			FixItemsHash: "hash-old",
-			ReplyExplanations: []replyExplanationEntry{
-				{FixItemID: "c1", Explanation: "stale"},
-			},
-		},
-	}
-	if got := lookupReplyExplanations(checkpoint); got != nil {
-		t.Fatalf("lookupReplyExplanations() = %#v, want nil on stale snapshot", got)
-	}
-}
-
-func TestLookupReplyExplanationsReturnsCurrent(t *testing.T) {
-	t.Parallel()
-	checkpoint := fixerCheckpoint{
-		FixItemsHash: "h1",
-		Repair: &checkpointRepair{
-			FixItemsHash: "h1",
 			ReplyExplanations: []replyExplanationEntry{
 				{FixItemID: "c1", Explanation: "good"},
 				{FixItemID: "", Explanation: "skip"},
+				{FixItemID: "c2", Explanation: ""},
 			},
 		},
 	}
 	got := lookupReplyExplanations(checkpoint)
 	if len(got) != 1 || got["c1"] != "good" {
-		t.Fatalf("lookupReplyExplanations() = %#v", got)
+		t.Fatalf("lookupReplyExplanations() = %#v, want only c1=good", got)
 	}
 }
 
@@ -2087,9 +4692,9 @@ func TestProcessClaimedItemUsesAgentExplanationInReplyBody(t *testing.T) {
 		viewResponses: []PullRequestDetail{
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice"}}},
 		},
 	}
 	git := &fakeGitGateway{
@@ -2101,7 +4706,7 @@ func TestProcessClaimedItemUsesAgentExplanationInReplyBody(t *testing.T) {
 			{HeadSHA: "new-head"},
 		},
 	}
-	stdout := `__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Switched the loop bound to len(items)-1 and added a regression test in foo_test.go."}]}` + "\n"
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Switched the loop bound to len(items)-1 and added a regression test in foo_test.go.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: "runtime log", Stderr: stdout}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
@@ -2253,9 +4858,9 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 		viewResponses: []PullRequestDetail{
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
-			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1"},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix off-by-one", "author": "alice", "url": "https://example/threads/t1", "path": "foo.go", "line": float64(7)}}},
 		},
 	}
 	git := &fakeGitGateway{
@@ -2267,7 +4872,7 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 			{HeadSHA: "new-head"},
 		},
 	}
-	stdout := `__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Capped loop bound and added regression test."}]}` + "\n"
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Capped loop bound and added regression test.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
@@ -2309,7 +4914,7 @@ func TestPublishRoundSummaryCommentUpdatesExistingSummaryFromGraphQLID(t *testin
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := fixerCheckpoint{
 		Detail:           &checkpointDetail{IssueComments: []map[string]any{{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": fixerRoundSummaryMarker("new-head") + "\nold summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}}}},
-		Push:             &checkpointPush{Pushed: true},
+		Push:             &checkpointPush{Pushed: true, HeadSHA: "new-head", Evidence: &fixEvidence{Valid: true, HeadSHA: "new-head", FixItemsHash: "fix-items-hash", Source: "fallback_push", ProducedNewCommits: true}},
 		ReconcileCommits: &checkpointReconcileCommits{FinalHeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
 		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "resolved", ReplyState: "sent"}}},
 		FixItemsHash:     "fix-items-hash",
@@ -2363,5 +4968,147 @@ func TestProcessClaimedItemSkipsSummaryWhenNoNewCommits(t *testing.T) {
 	}
 	if len(github.createIssueComments) != 0 {
 		t.Fatalf("createIssueComments calls = %d, want 0 when no new commits", len(github.createIssueComments))
+	}
+}
+
+func TestRunPushStepAdoptsAgentLifecyclePushEvidence(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "agent-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}
+	git := &fakeGitGateway{prepareResult: PrepareWorktreeResult{HeadSHA: "agent-head", Clean: true}, inspectResults: []InspectHeadResult{{HeadSHA: "agent-head"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, ValidationRunner: passValidation, AllowAutoPush: true, Now: fixture.now, Logger: fixture.logger})
+	checkpoint := fixerCheckpoint{
+		Detail:           &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		Worktree:         &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"},
+		FixItemsHash:     "fix-hash",
+		Repair:           &checkpointRepair{Status: "completed", Lifecycle: &lifecycle.State{Branch: "feature/fix-42", CommitSHAs: []string{"agent-head"}, Pushed: true, Actions: lifecycle.Actions{Push: lifecycle.ActionSourceAgent}}},
+		Validation:       &ValidationResult{Passed: true, HeadSHA: "base-head"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+	updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMetadata}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPushStep() error = %v", err)
+	}
+	if updated.Push == nil || !updated.Push.Pushed || updated.Push.HeadSHA != "agent-head" || updated.Push.Evidence == nil || updated.Push.Evidence.Source != "agent_push" {
+		t.Fatalf("updated.Push = %#v, want adopted agent evidence", updated.Push)
+	}
+	if updated.Lifecycle == nil || updated.Lifecycle.Actions.Push != lifecycle.ActionSourceAgent {
+		t.Fatalf("updated.Lifecycle = %#v, want preserved agent push source", updated.Lifecycle)
+	}
+	if github.viewIndex != 1 {
+		t.Fatalf("viewIndex = %d, want 1", github.viewIndex)
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("prepare calls = %d, want 1 validation-bound reprepare", len(git.prepareCalls))
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("push calls = %d, want 0 after adoption", len(git.pushCalls))
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop != nil && loop.MetadataJSON != nil && !strings.Contains(*loop.MetadataJSON, `"lastFixHeadSha":"agent-head"`) {
+		t.Fatalf("loop metadata = %v, want adopted head persisted", *loop.MetadataJSON)
+	}
+}
+
+func TestRunPushStepDoesNotAdoptAgentLifecyclePushEvidenceOnLiveHeadMismatch(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "other-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}
+	git := &fakeGitGateway{}
+	runner := New(Options{GitHub: github, Git: git, AllowAutoPush: true})
+	checkpoint := fixerCheckpoint{
+		Detail:           &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		Worktree:         &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"},
+		FixItemsHash:     "fix-hash",
+		Repair:           &checkpointRepair{Status: "completed", Lifecycle: &lifecycle.State{Branch: "feature/fix-42", CommitSHAs: []string{"agent-head"}, Pushed: true, Actions: lifecycle.Actions{Push: lifecycle.ActionSourceAgent}}},
+		Validation:       &ValidationResult{Passed: true, HeadSHA: "agent-head"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+	updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPushStep() error = %v", err)
+	}
+	if updated.Push == nil || updated.Push.Pushed {
+		t.Fatalf("updated.Push = %#v, want no adoption", updated.Push)
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("push calls = %d, want 0", len(git.pushCalls))
+	}
+}
+
+func TestRunPushStepDoesNotAdoptAgentLifecyclePushEvidenceOnBranchOrPRMismatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		lifecycle *lifecycle.State
+	}{
+		{name: "branch mismatch", lifecycle: &lifecycle.State{Branch: "other-branch", CommitSHAs: []string{"agent-head"}, Pushed: true, Actions: lifecycle.Actions{Push: lifecycle.ActionSourceAgent}}},
+		{name: "pr mismatch", lifecycle: &lifecycle.State{Branch: "feature/fix-42", PRNumber: 41, CommitSHAs: []string{"agent-head"}, Pushed: true, Actions: lifecycle.Actions{Push: lifecycle.ActionSourceAgent}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			github := &fakeGitHubGateway{}
+			runner := New(Options{GitHub: github, Git: &fakeGitGateway{}, AllowAutoPush: true})
+			checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}, Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"}, FixItemsHash: "fix-hash", Repair: &checkpointRepair{Status: "completed", Lifecycle: tc.lifecycle}, Validation: &ValidationResult{Passed: true, HeadSHA: "agent-head"}, ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true}}
+			updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+			if err != nil {
+				t.Fatalf("runPushStep() error = %v", err)
+			}
+			if updated.Push == nil || updated.Push.Pushed {
+				t.Fatalf("updated.Push = %#v, want no adoption", updated.Push)
+			}
+			if github.viewIndex != 0 {
+				t.Fatalf("viewIndex = %d, want 0", github.viewIndex)
+			}
+		})
+	}
+}
+
+func TestPublishRoundSummaryCommentPostsForAgentEvidenceWithoutLocalNewCommits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger})
+	checkpoint := fixerCheckpoint{
+		Validation:       &ValidationResult{Passed: true, HeadSHA: "agent-head"},
+		Push:             &checkpointPush{Pushed: true, HeadSHA: "agent-head", Evidence: &fixEvidence{Valid: true, HeadSHA: "agent-head", FixItemsHash: "fix-hash", Source: "agent_push", ProducedNewCommits: true}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head"},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "resolved", ReplyState: "sent"}}},
+		FixItemsHash:     "fix-hash",
+	}
+	runner.publishRoundSummaryComment(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42, Project: storage.ProjectRecord{RepoPath: t.TempDir()}}, &checkpoint, []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1", Author: "alice", URL: "https://example/threads/t1"}}, "base-head", map[string]string{"c1": "Applied the reviewer-requested fix."})
+	if len(github.createIssueComments) != 1 {
+		t.Fatalf("createIssueComments calls = %d, want 1", len(github.createIssueComments))
+	}
+	if !strings.Contains(github.createIssueComments[0].Body, fixerRoundSummaryMarker("agent-head")) {
+		t.Fatalf("summary body = %q, want adopted evidence head marker", github.createIssueComments[0].Body)
+	}
+}
+
+func TestSkippedNoEvidenceThreadIDs(t *testing.T) {
+	t.Parallel()
+	fixItems := []FixItem{
+		{ID: "c1", Type: "comment", ThreadID: "t1"},
+		{ID: "c2", Type: "comment", ThreadID: "t2"},
+		{ID: "c3", Type: "task", ThreadID: "t3"},
+		{ID: "c4", Type: "comment", ThreadID: "t1"},
+	}
+	resolved := []checkpointResolvedComment{
+		{FixItemID: "c1", ThreadID: "t1", Status: "skipped_no_evidence"},
+		{FixItemID: "c2", ThreadID: "t2", Status: "resolved"},
+		{FixItemID: "c4", ThreadID: "t1", Status: "skipped_no_evidence"},
+	}
+	got := skippedNoEvidenceThreadIDs(fixItems, resolved)
+	want := []string{"t1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("skippedNoEvidenceThreadIDs() = %v, want %v", got, want)
 	}
 }

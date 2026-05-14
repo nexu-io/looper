@@ -1,36 +1,187 @@
 package config
 
+import "fmt"
+
 func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	config, err := DefaultConfig(cwd)
 	if err != nil {
 		return Config{}, err
 	}
 
-	explicitReviewerCleanReviewEvent := hasExplicitReviewerCleanReviewEvent(partials)
-	fixerAuthorFilterExplicit := false
 	for _, partial := range partials {
-		if partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.AuthorFilter != nil {
-			fixerAuthorFilterExplicit = true
+		if issues := validateLegacyProjectInstructionRoleKeys(partial); len(issues) > 0 {
+			return Config{}, &ConfigValidationError{Issues: issues}
 		}
-		mergeConfig(&config, partial)
-	}
-	if config.Defaults.AllowAutoApprove && !explicitReviewerCleanReviewEvent {
-		config.Reviewer.ReviewEvents.Clean = ReviewerReviewEventApprove
-	}
-	if !fixerAuthorFilterExplicit && config.Defaults.FixAllPullRequests {
-		config.Roles.Fixer.Triggers.AuthorFilter = FixerAuthorFilterAny
+		mergeConfig(&config, normalizeLayerPartial(partial))
 	}
 
 	return config, nil
 }
 
-func hasExplicitReviewerCleanReviewEvent(partials []PartialConfig) bool {
-	for _, partial := range partials {
-		if partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil {
-			return true
+func normalizeLayerPartial(partial PartialConfig) PartialConfig {
+	normalized := partial
+
+	if normalized.LegacyReviewer != nil {
+		reviewer := ensureReviewerRoleConfig(&normalized)
+		reviewer.Behavior = mergePartialReviewerConfigWithCanonicalPriority(reviewer.Behavior, normalized.LegacyReviewer)
+	}
+
+	if normalized.Roles != nil && normalized.Roles.Reviewer != nil {
+		normalizeReviewerRoleLegacyShape(normalized.Roles.Reviewer)
+	}
+
+	if normalized.Projects != nil {
+		projects := *normalized.Projects
+		for i := range projects {
+			if projects[i].RepoPath == "" {
+				projects[i].RepoPath = projects[i].Path
+			}
+			projects[i].Roles = mergeLegacyProjectInstructionsIntoRoles(projects[i].Roles, projects[i].Instructions)
+			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
+				normalizeReviewerRoleLegacyShape(projects[i].Roles.Reviewer)
+			}
+		}
+		normalized.Projects = &projects
+	}
+
+	if normalized.Defaults != nil {
+		if normalized.Defaults.AllowAutoApprove != nil {
+			reviewEvents := ensureReviewerReviewEventsConfig(&normalized)
+			if reviewEvents.Clean == nil {
+				event := ReviewerReviewEventComment
+				if *normalized.Defaults.AllowAutoApprove {
+					event = ReviewerReviewEventApprove
+				}
+				reviewEvents.Clean = &event
+			}
+		}
+		if normalized.Defaults.FixAllPullRequests != nil {
+			triggers := ensureFixerRoleTriggersConfig(&normalized)
+			if triggers.AuthorFilter == nil {
+				authorFilter := FixerAuthorFilterCurrentUser
+				if *normalized.Defaults.FixAllPullRequests {
+					authorFilter = FixerAuthorFilterAny
+				}
+				triggers.AuthorFilter = &authorFilter
+			}
 		}
 	}
-	return false
+
+	return normalized
+}
+
+func validateLegacyProjectInstructionRoleKeys(partial PartialConfig) []ValidationIssue {
+	if partial.Projects == nil {
+		return nil
+	}
+
+	issues := make([]ValidationIssue, 0)
+	for index, project := range *partial.Projects {
+		for role := range project.Instructions {
+			if isValidInstructionRole(role) {
+				continue
+			}
+			issues = append(issues, ValidationIssue{
+				Path:    fmt.Sprintf("projects[%d].instructions.%s", index, role),
+				Message: "role must be one of: planner, worker, reviewer, fixer, sweeper",
+			})
+		}
+	}
+
+	return issues
+}
+
+func normalizeReviewerRoleLegacyShape(reviewer *PartialReviewerRoleConfig) {
+	if reviewer == nil {
+		return
+	}
+	reviewer.Discovery = mergePartialReviewerRoleDiscoveryWithCanonicalPriority(reviewer.Discovery, reviewer.AutoDiscovery, reviewer.Triggers, reviewer.SpecReview)
+}
+
+func mergePartialReviewerConfigWithCanonicalPriority(canonical *PartialReviewerConfig, legacy *PartialReviewerConfig) *PartialReviewerConfig {
+	if canonical == nil {
+		return legacy
+	}
+	if legacy == nil {
+		return canonical
+	}
+	if canonical.Loop == nil {
+		canonical.Loop = legacy.Loop
+	}
+	if canonical.Scope == nil {
+		canonical.Scope = legacy.Scope
+	}
+	if canonical.PublishMode == nil {
+		canonical.PublishMode = legacy.PublishMode
+	}
+	if canonical.ReviewEvents == nil {
+		canonical.ReviewEvents = legacy.ReviewEvents
+	} else if legacy.ReviewEvents != nil {
+		if canonical.ReviewEvents.Clean == nil {
+			canonical.ReviewEvents.Clean = legacy.ReviewEvents.Clean
+		}
+		if canonical.ReviewEvents.Blocking == nil {
+			canonical.ReviewEvents.Blocking = legacy.ReviewEvents.Blocking
+		}
+		if canonical.ReviewEvents.Clean == nil && canonical.ReviewEvents.Blocking == nil {
+			canonical.ReviewEvents = legacy.ReviewEvents
+		}
+	}
+	if canonical.DetectDuplicateFindings == nil {
+		canonical.DetectDuplicateFindings = legacy.DetectDuplicateFindings
+	}
+	if canonical.DedupeFindings == nil {
+		canonical.DedupeFindings = legacy.DedupeFindings
+	}
+	if canonical.NativeResume == nil {
+		canonical.NativeResume = legacy.NativeResume
+	}
+	if canonical.ThreadResolution == nil {
+		canonical.ThreadResolution = legacy.ThreadResolution
+	}
+	return canonical
+}
+
+func mergePartialReviewerRoleDiscoveryWithCanonicalPriority(canonical *PartialReviewerRoleDiscoveryConfig, legacyAutoDiscovery *bool, legacyTriggers *PartialReviewerRoleTriggersConfig, legacySpecReview *PartialReviewerSpecReviewConfig) *PartialReviewerRoleDiscoveryConfig {
+	if canonical == nil && legacyAutoDiscovery == nil && legacyTriggers == nil && legacySpecReview == nil {
+		return nil
+	}
+	if canonical == nil {
+		canonical = &PartialReviewerRoleDiscoveryConfig{}
+	}
+	if canonical.AutoDiscovery == nil {
+		canonical.AutoDiscovery = legacyAutoDiscovery
+	}
+	if canonical.Triggers == nil {
+		canonical.Triggers = legacyTriggers
+	} else if legacyTriggers != nil {
+		if canonical.Triggers.IncludeDrafts == nil {
+			canonical.Triggers.IncludeDrafts = legacyTriggers.IncludeDrafts
+		}
+		if canonical.Triggers.RequireReviewRequest == nil {
+			canonical.Triggers.RequireReviewRequest = legacyTriggers.RequireReviewRequest
+		}
+		if canonical.Triggers.EnableSelfReview == nil {
+			canonical.Triggers.EnableSelfReview = legacyTriggers.EnableSelfReview
+		}
+		if canonical.Triggers.Labels == nil {
+			canonical.Triggers.Labels = legacyTriggers.Labels
+		}
+		if canonical.Triggers.LabelMode == nil {
+			canonical.Triggers.LabelMode = legacyTriggers.LabelMode
+		}
+	}
+	if canonical.SpecReview == nil {
+		canonical.SpecReview = legacySpecReview
+	} else if legacySpecReview != nil {
+		if canonical.SpecReview.IncludeReviewingLabel == nil {
+			canonical.SpecReview.IncludeReviewingLabel = legacySpecReview.IncludeReviewingLabel
+		}
+		if canonical.SpecReview.ReviewingLabel == nil {
+			canonical.SpecReview.ReviewingLabel = legacySpecReview.ReviewingLabel
+		}
+	}
+	return canonical
 }
 
 func mergeConfig(config *Config, partial PartialConfig) {
@@ -78,8 +229,8 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeDefaultsConfig(&config.Defaults, *partial.Defaults)
 	}
 
-	if partial.Reviewer != nil {
-		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
+	if partial.LegacyReviewer != nil {
+		mergeReviewerConfig(&config.Roles.Reviewer.Behavior, *partial.LegacyReviewer)
 	}
 
 	if partial.Instructions != nil {
@@ -423,8 +574,20 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	} else if partial.DedupeFindings != nil {
 		config.DetectDuplicateFindings = *partial.DedupeFindings
 	}
+	if partial.NativeResume != nil {
+		mergeReviewerNativeResumeConfig(&config.NativeResume, *partial.NativeResume)
+	}
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+}
+
+func mergeReviewerNativeResumeConfig(config *ReviewerNativeResumeConfig, partial PartialReviewerNativeResumeConfig) {
+	if partial.OnHeadChange != nil {
+		config.OnHeadChange = *partial.OnHeadChange
+	}
+	if partial.ReReviewPromptOnHeadChange != nil {
+		config.ReReviewPromptOnHeadChange = *partial.ReReviewPromptOnHeadChange
 	}
 }
 
@@ -552,6 +715,25 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 }
 
 func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewerRoleConfig) {
+	if partial.AutoDiscovery != nil || partial.Triggers != nil || partial.SpecReview != nil {
+		mergeReviewerRoleDiscoveryConfig(&config.Discovery, PartialReviewerRoleDiscoveryConfig{
+			AutoDiscovery: partial.AutoDiscovery,
+			Triggers:      partial.Triggers,
+			SpecReview:    partial.SpecReview,
+		})
+	}
+	if partial.Discovery != nil {
+		mergeReviewerRoleDiscoveryConfig(&config.Discovery, *partial.Discovery)
+	}
+	if partial.Behavior != nil {
+		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeReviewerRoleDiscoveryConfig(config *ReviewerRoleDiscoveryConfig, partial PartialReviewerRoleDiscoveryConfig) {
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
@@ -560,9 +742,6 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	}
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
-	}
-	if partial.Instructions != nil {
-		config.Instructions = *partial.Instructions
 	}
 }
 
@@ -885,20 +1064,22 @@ func cloneStrings(values []string) []string {
 	return cloned
 }
 
-func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
+func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 	if projects == nil {
 		return nil
 	}
 
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
+		roles := mergeLegacyProjectInstructionsIntoRoles(clonePartialRoleConfigs(project.Roles), project.Instructions)
+		repoPath := firstNonEmpty(project.RepoPath, project.Path)
+
 		cloned[index] = ProjectRefConfig{
-			ID:           project.ID,
-			Name:         project.Name,
-			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
-			Path:         project.Path,
-			Instructions: cloneStringMap(project.Instructions),
-			Roles:        clonePartialRoleConfigs(project.Roles),
+			ID:       project.ID,
+			Name:     project.Name,
+			RepoPath: repoPath,
+			Path:     project.Path,
+			Roles:    roles,
 		}
 
 		if project.BaseBranch != nil {
@@ -911,6 +1092,55 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instructions map[string]string) *PartialRoleConfigs {
+	if len(instructions) == 0 {
+		return roles
+	}
+	if roles == nil {
+		roles = &PartialRoleConfigs{}
+	}
+	for role, text := range instructions {
+		switch role {
+		case "planner":
+			if roles.Planner == nil {
+				roles.Planner = &PartialPlannerRoleConfig{}
+			}
+			if roles.Planner.Instructions == nil {
+				roles.Planner.Instructions = stringPtr(text)
+			}
+		case "worker":
+			if roles.Worker == nil {
+				roles.Worker = &PartialWorkerRoleConfig{}
+			}
+			if roles.Worker.Instructions == nil {
+				roles.Worker.Instructions = stringPtr(text)
+			}
+		case "reviewer":
+			if roles.Reviewer == nil {
+				roles.Reviewer = &PartialReviewerRoleConfig{}
+			}
+			if roles.Reviewer.Instructions == nil {
+				roles.Reviewer.Instructions = stringPtr(text)
+			}
+		case "fixer":
+			if roles.Fixer == nil {
+				roles.Fixer = &PartialFixerRoleConfig{}
+			}
+			if roles.Fixer.Instructions == nil {
+				roles.Fixer.Instructions = stringPtr(text)
+			}
+		case "sweeper":
+			if roles.Sweeper == nil {
+				roles.Sweeper = &PartialSweeperRoleConfig{}
+			}
+			if roles.Sweeper.Instructions == nil {
+				roles.Sweeper.Instructions = stringPtr(text)
+			}
+		}
+	}
+	return roles
 }
 
 func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
@@ -944,6 +1174,22 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Reviewer != nil {
 		reviewer := *configs.Reviewer
+		if configs.Reviewer.Discovery != nil {
+			discovery := *configs.Reviewer.Discovery
+			if configs.Reviewer.Discovery.Triggers != nil {
+				triggers := *configs.Reviewer.Discovery.Triggers
+				if triggers.Labels != nil {
+					labels := cloneStrings(*triggers.Labels)
+					triggers.Labels = &labels
+				}
+				discovery.Triggers = &triggers
+			}
+			if configs.Reviewer.Discovery.SpecReview != nil {
+				specReview := *configs.Reviewer.Discovery.SpecReview
+				discovery.SpecReview = &specReview
+			}
+			reviewer.Discovery = &discovery
+		}
 		if configs.Reviewer.Triggers != nil {
 			triggers := *configs.Reviewer.Triggers
 			if triggers.Labels != nil {
@@ -955,6 +1201,26 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		if configs.Reviewer.SpecReview != nil {
 			specReview := *configs.Reviewer.SpecReview
 			reviewer.SpecReview = &specReview
+		}
+		if configs.Reviewer.Behavior != nil {
+			behavior := *configs.Reviewer.Behavior
+			if configs.Reviewer.Behavior.Loop != nil {
+				loop := *configs.Reviewer.Behavior.Loop
+				behavior.Loop = &loop
+			}
+			if configs.Reviewer.Behavior.ReviewEvents != nil {
+				reviewEvents := *configs.Reviewer.Behavior.ReviewEvents
+				behavior.ReviewEvents = &reviewEvents
+			}
+			if configs.Reviewer.Behavior.NativeResume != nil {
+				nativeResume := *configs.Reviewer.Behavior.NativeResume
+				behavior.NativeResume = &nativeResume
+			}
+			if configs.Reviewer.Behavior.ThreadResolution != nil {
+				threadResolution := *configs.Reviewer.Behavior.ThreadResolution
+				behavior.ThreadResolution = &threadResolution
+			}
+			reviewer.Behavior = &behavior
 		}
 		cloned.Reviewer = &reviewer
 	}

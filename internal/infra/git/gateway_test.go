@@ -8,12 +8,89 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "prepare", run: func() error {
+			_, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "main"})
+			return err
+		}},
+		{name: "commit", run: func() error {
+			_, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Message: "test"})
+			return err
+		}},
+		{name: "push", run: func() error {
+			return gateway.Push(ctx, PushInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "feature/test"})
+		}},
+		{name: "cleanup", run: func() error {
+			return gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "feature/test"})
+		}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.run()
+			if err == nil || !strings.Contains(err.Error(), "must not equal project repo path") {
+				t.Fatalf("error = %v, want repo-path safety failure", err)
+			}
+		})
+	}
+}
+
+func TestGatewayRejectsMutationWorktreeOutsideRoot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	outsidePath := filepath.Join(fixture.rootDir, "outside-worktree")
+	mustMkdirAll(t, outsidePath)
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "prepare", run: func() error {
+			_, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: outsidePath, Branch: "feature/test"})
+			return err
+		}},
+		{name: "commit", run: func() error {
+			_, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: outsidePath, Message: "test"})
+			return err
+		}},
+		{name: "push", run: func() error {
+			return gateway.Push(ctx, PushInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: outsidePath, Branch: "feature/test"})
+		}},
+		{name: "cleanup", run: func() error {
+			return gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: outsidePath, Branch: "feature/test"})
+		}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.run()
+			if err == nil || !strings.Contains(err.Error(), "must be under worktree root") {
+				t.Fatalf("error = %v, want worktree-root safety failure", err)
+			}
+		})
+	}
+}
 
 func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing.T) {
 	ctx := context.Background()

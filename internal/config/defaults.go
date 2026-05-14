@@ -23,7 +23,7 @@ func DefaultConfigPath() (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(looperHome, "config.json"), nil
+	return filepath.Join(looperHome, "config.toml"), nil
 }
 
 func DefaultWorktreeRoot() (string, error) {
@@ -127,41 +127,12 @@ func DefaultConfig(cwd string) (Config, error) {
 			BaseBranch:         "main",
 			AllowAutoCommit:    true,
 			AllowAutoPush:      true,
-			AllowAutoApprove:   false,
+			AllowAutoApprove:   true,
 			AllowAutoMerge:     false,
 			AllowRiskyFixes:    false,
 			FixAllPullRequests: false,
 			OpenPRStrategy:     OpenPRStrategyAllDone,
 			AddSnapshotMode:    AddSnapshotModeAsync,
-		},
-		Reviewer: ReviewerConfig{
-			Loop: ReviewerLoopConfig{
-				EnabledByDefault:          true,
-				QuietPeriodSeconds:        60,
-				MinPublishIntervalSeconds: 300,
-				MaxIterationsPerPR:        20,
-				MaxIterationsPerHead:      1,
-				MaxWallClockSeconds:       0,
-				MaxConsecutiveFailures:    3,
-				MaxAgentExecutionsPerPR:   25,
-				StopOnApproved:            true,
-				StopOnReadyLabel:          true,
-				StopOnIdenticalOutput:     true,
-			},
-			Scope:                   ReviewerScopeChangedRanges,
-			PublishMode:             ReviewerPublishModeSingleReview,
-			ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventComment, Blocking: ReviewerReviewEventComment},
-			DetectDuplicateFindings: true,
-			ThreadResolution: ReviewerThreadResolutionConfig{
-				Enabled:                     false,
-				Mode:                        ReviewerThreadResolutionModeReportOnly,
-				Scope:                       ReviewerThreadResolutionScopeLooperAuthoredOnly,
-				AutoResolve:                 ReviewerThreadResolutionAutoResolveObjectiveOnly,
-				RequireAuditComment:         true,
-				RequireNewHeadSinceThread:   true,
-				RequireCurrentReviewRequest: true,
-				MaxThreadsPerRun:            10,
-			},
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
@@ -174,17 +145,49 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 			},
 			Reviewer: ReviewerRoleConfig{
-				AutoDiscovery: true,
-				Triggers: ReviewerRoleTriggersConfig{
-					IncludeDrafts:        false,
-					RequireReviewRequest: true,
-					EnableSelfReview:     false,
-					Labels:               []string{},
-					LabelMode:            LabelModeAll,
+				Discovery: ReviewerRoleDiscoveryConfig{
+					AutoDiscovery: true,
+					Triggers: ReviewerRoleTriggersConfig{
+						IncludeDrafts:        false,
+						RequireReviewRequest: true,
+						EnableSelfReview:     false,
+						Labels:               []string{},
+						LabelMode:            LabelModeAll,
+					},
+					SpecReview: ReviewerSpecReviewConfig{
+						IncludeReviewingLabel: true,
+						ReviewingLabel:        "looper:spec-reviewing",
+					},
 				},
-				SpecReview: ReviewerSpecReviewConfig{
-					IncludeReviewingLabel: true,
-					ReviewingLabel:        "looper:spec-reviewing",
+				Behavior: ReviewerConfig{
+					Loop: ReviewerLoopConfig{
+						EnabledByDefault:          true,
+						QuietPeriodSeconds:        60,
+						MinPublishIntervalSeconds: 300,
+						MaxIterationsPerPR:        20,
+						MaxIterationsPerHead:      1,
+						MaxWallClockSeconds:       0,
+						MaxConsecutiveFailures:    3,
+						MaxAgentExecutionsPerPR:   25,
+						StopOnApproved:            true,
+						StopOnReadyLabel:          true,
+						StopOnIdenticalOutput:     true,
+					},
+					Scope:                   ReviewerScopeChangedRanges,
+					PublishMode:             ReviewerPublishModeSingleReview,
+					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventApprove, Blocking: ReviewerReviewEventRequestChanges},
+					DetectDuplicateFindings: true,
+					NativeResume:            ReviewerNativeResumeConfig{OnHeadChange: false, ReReviewPromptOnHeadChange: false},
+					ThreadResolution: ReviewerThreadResolutionConfig{
+						Enabled:                     false,
+						Mode:                        ReviewerThreadResolutionModeReportOnly,
+						Scope:                       ReviewerThreadResolutionScopeLooperAuthoredOnly,
+						AutoResolve:                 ReviewerThreadResolutionAutoResolveObjectiveOnly,
+						RequireAuditComment:         true,
+						RequireNewHeadSinceThread:   true,
+						RequireCurrentReviewRequest: true,
+						MaxThreadsPerRun:            10,
+					},
 				},
 			},
 			Fixer: FixerRoleConfig{

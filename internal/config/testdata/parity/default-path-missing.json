@@ -115,38 +115,6 @@
         "openPrStrategy": "all_done",
         "addSnapshotMode": "async"
       },
-      "reviewer": {
-        "loop": {
-          "enabledByDefault": true,
-          "quietPeriodSeconds": 60,
-          "minPublishIntervalSeconds": 300,
-          "maxIterationsPerPR": 20,
-          "maxIterationsPerHead": 1,
-          "maxWallClockSeconds": 0,
-          "maxConsecutiveFailures": 3,
-          "maxAgentExecutionsPerPR": 25,
-          "stopOnApproved": true,
-          "stopOnReadyLabel": true,
-          "stopOnIdenticalOutput": true
-        },
-        "scope": "changed_ranges",
-        "publishMode": "single_review",
-        "reviewEvents": {
-          "clean": "APPROVE",
-          "blocking": "COMMENT"
-        },
-        "detectDuplicateFindings": true,
-        "threadResolution": {
-          "autoResolve": "objective_only",
-          "enabled": false,
-          "maxThreadsPerRun": 10,
-          "mode": "report_only",
-          "requireAuditComment": true,
-          "requireCurrentReviewRequest": true,
-          "requireNewHeadSinceThread": true,
-          "scope": "looper_authored_only"
-        }
-      },
       "instructions": {
         "enabled": true,
         "maxBytes": 8192
@@ -163,16 +131,54 @@
           }
         },
         "reviewer": {
-          "autoDiscovery": true,
-          "triggers": {
-            "includeDrafts": false,
-            "requireReviewRequest": true,
-            "labels": [],
-            "labelMode": "all"
+          "behavior": {
+            "loop": {
+              "enabledByDefault": true,
+              "quietPeriodSeconds": 60,
+              "minPublishIntervalSeconds": 300,
+              "maxIterationsPerPR": 20,
+              "maxIterationsPerHead": 1,
+              "maxWallClockSeconds": 0,
+              "maxConsecutiveFailures": 3,
+              "maxAgentExecutionsPerPR": 25,
+              "stopOnApproved": true,
+              "stopOnReadyLabel": true,
+              "stopOnIdenticalOutput": true
+            },
+            "scope": "changed_ranges",
+            "publishMode": "single_review",
+            "reviewEvents": {
+              "clean": "APPROVE",
+              "blocking": "REQUEST_CHANGES"
+            },
+            "detectDuplicateFindings": true,
+            "nativeResume": {
+              "onHeadChange": false,
+              "reReviewPromptOnHeadChange": false
+            },
+            "threadResolution": {
+              "autoResolve": "objective_only",
+              "enabled": false,
+              "maxThreadsPerRun": 10,
+              "mode": "report_only",
+              "requireAuditComment": true,
+              "requireCurrentReviewRequest": true,
+              "requireNewHeadSinceThread": true,
+              "scope": "looper_authored_only"
+            }
           },
-          "specReview": {
-            "includeReviewingLabel": true,
-            "reviewingLabel": "looper:spec-reviewing"
+          "discovery": {
+            "autoDiscovery": true,
+            "triggers": {
+              "includeDrafts": false,
+              "requireReviewRequest": true,
+              "labels": [],
+              "labelMode": "all"
+            },
+            "specReview": {
+              "includeReviewingLabel": true,
+              "reviewingLabel": "looper:spec-reviewing"
+            }
           }
         },
         "fixer": {

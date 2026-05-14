@@ -78,6 +78,7 @@ type defaultSchedulerTickInput struct {
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
 	AsyncRunner              schedulerAsyncRunner
+	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
@@ -218,7 +219,7 @@ func (a plannerGitAdapter) CreateWorktree(ctx context.Context, input planner.Cre
 }
 
 func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.InspectHeadInput) (planner.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return planner.InspectHeadResult{}, err
 	}
@@ -227,7 +228,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "planner")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return planner.CommitResult{}, err
 	}
@@ -235,7 +236,7 @@ func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput
 }
 
 func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
 type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
@@ -373,7 +374,7 @@ func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.C
 }
 
 func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.PrepareWorktreeInput) (reviewer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return reviewer.PrepareWorktreeResult{}, err
 	}
@@ -381,7 +382,7 @@ func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.
 }
 
 func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.CleanupWorktreeInput) error {
-	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
@@ -473,6 +474,34 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 	return out
 }
 
+func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.ReviewThread, 0, len(threads))
+	for _, thread := range threads {
+		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
+		for _, comment := range thread.Comments {
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+		}
+		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
+	}
+	return out, nil
+}
+
+func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
+	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD})
+	if err != nil {
+		return fixer.ReviewThread{}, err
+	}
+	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
+	for _, comment := range thread.Comments {
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+	}
+	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
+}
+
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
@@ -480,6 +509,14 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
 	body := a.stamper.ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
+	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
+	if err != nil {
+		return fixer.CompareCommitsResult{}, err
+	}
+	return fixer.CompareCommitsResult{Status: out.Status}, nil
 }
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
@@ -518,7 +555,7 @@ func (a fixerGitAdapter) CreateWorktree(ctx context.Context, input fixer.CreateW
 }
 
 func (a fixerGitAdapter) PrepareWorktree(ctx context.Context, input fixer.PrepareWorktreeInput) (fixer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return fixer.PrepareWorktreeResult{}, err
 	}
@@ -526,7 +563,7 @@ func (a fixerGitAdapter) PrepareWorktree(ctx context.Context, input fixer.Prepar
 }
 
 func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHeadInput) (fixer.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return fixer.InspectHeadResult{}, err
 	}
@@ -535,7 +572,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "fixer")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return fixer.CommitResult{}, err
 	}
@@ -543,11 +580,19 @@ func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (f
 }
 
 func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+}
+
+func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, branch string) error {
+	return a.gateway.FetchBranch(ctx, repoPath, remote, branch)
+}
+
+func (a fixerGitAdapter) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
+	return a.gateway.IsAncestor(ctx, repoPath, ancestor, descendant)
 }
 
 func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.CleanupWorktreeInput) error {
-	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
 type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
@@ -645,6 +690,14 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
 }
 
+func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
+	comparison, err := a.gateway.CompareBranches(ctx, githubinfra.CompareBranchesInput{Repo: input.Repo, BaseBranch: input.BaseBranch, HeadBranch: input.HeadBranch, CWD: input.CWD})
+	if err != nil {
+		return worker.CompareBranchesResult{}, err
+	}
+	return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
+}
+
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
 	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
@@ -684,7 +737,7 @@ func (a workerGitAdapter) RestoreWorktree(ctx context.Context, input worker.Rest
 }
 
 func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
 	if err != nil {
 		return worker.PrepareWorktreeResult{}, err
 	}
@@ -692,7 +745,7 @@ func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.Prep
 }
 
 func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
@@ -701,7 +754,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 
 func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
 	message := a.stamper.CommitMessage(input.Message, "worker")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return worker.CommitResult{}, err
 	}
@@ -709,7 +762,7 @@ func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) 
 }
 
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
 type workerAgentExecutorAdapter struct {
@@ -748,7 +801,7 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, now func() time.Time) RunSchedulerTickFunc {
+func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time) RunSchedulerTickFunc {
 	if now == nil {
 		now = time.Now
 	}
@@ -900,21 +953,22 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
-		ReviewEvents:     cfg.Reviewer.ReviewEvents,
-		LoopConfig:       cfg.Reviewer.Loop,
+		ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
+		LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
 		DiscoveryPolicy: reviewer.DiscoveryPolicy{
-			AutoDiscovery:             cfg.Roles.Reviewer.AutoDiscovery,
-			IncludeDrafts:             cfg.Roles.Reviewer.Triggers.IncludeDrafts,
-			RequireReviewRequest:      cfg.Roles.Reviewer.Triggers.RequireReviewRequest,
-			EnableSelfReview:          cfg.Roles.Reviewer.Triggers.EnableSelfReview,
-			Labels:                    append([]string(nil), cfg.Roles.Reviewer.Triggers.Labels...),
-			LabelMode:                 cfg.Roles.Reviewer.Triggers.LabelMode,
-			IncludeSpecReviewingLabel: cfg.Roles.Reviewer.SpecReview.IncludeReviewingLabel,
-			SpecReviewingLabel:        cfg.Roles.Reviewer.SpecReview.ReviewingLabel,
+			AutoDiscovery:             cfg.Roles.Reviewer.Discovery.AutoDiscovery,
+			IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+			RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
+			EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+			Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
+			LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
+			IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
+			SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
 		},
-		Scope:                   cfg.Reviewer.Scope,
-		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
-		ThreadResolution:        cfg.Reviewer.ThreadResolution,
+		Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
+		DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
+		NativeResume:            cfg.Roles.Reviewer.Behavior.NativeResume,
+		ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
 		CustomInstructions:      &cfg,
@@ -1004,6 +1058,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Now:                      now,
 			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
 			AsyncRunner:              runner,
+			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
@@ -1076,6 +1131,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			errs = append(errs, err)
 		}
 	}
+	discoveredRunnableIDs := make(map[string]struct{})
+	trackRunnableDiscovery := func(queueItems []storage.QueueItemRecord) {
+		for _, id := range runnableSchedulerQueueItemIDs(queueItems, now) {
+			discoveredRunnableIDs[id] = struct{}{}
+		}
+	}
 
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
 	if err != nil {
@@ -1083,7 +1144,8 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		availableSlots = 0
 	}
 	if availableSlots > 0 && input.Repos.Queue != nil {
-		appendErr(claimAndRunScheduledQueueItems(ctx, availableSlots, input))
+		_, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		appendErr(err)
 	}
 
 	projectsList, err := input.Repos.Projects.List(ctx)
@@ -1106,28 +1168,56 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
-			_, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("planner discovery", project.ID, repo, err))
 		} else if input.Planner != nil && input.Logger != nil {
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
-			_, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("reviewer discovery", project.ID, repo, err))
 		} else if input.Reviewer != nil && input.Logger != nil {
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			_, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("fixer discovery", project.ID, repo, err))
 		} else if input.Fixer != nil && input.Logger != nil {
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			_, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+			trackRunnableDiscovery(result.QueueItems)
 			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		}
+	}
+
+	availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+	if err != nil {
+		appendErr(err)
+		availableSlots = 0
+	}
+	if availableSlots > 0 && input.Repos.Queue != nil {
+		claimedItems, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		appendErr(err)
+		requestWakeForClaimedDiscovery(claimedItems, discoveredRunnableIDs, input.RequestSchedulerWake)
+	}
+
+	for _, project := range projectsList {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if project.Archived {
+			continue
+		}
+		repo := repoFromProjectMetadata(project.MetadataJSON)
+		if repo == "" {
+			continue
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
 			appendErr(applySweeperBackpressure(ctx, input, project, repo))
@@ -1152,6 +1242,35 @@ func discoveryEnabled(value *bool) bool {
 	return value == nil || *value
 }
 
+func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now func() time.Time) []string {
+	if len(queueItems) == 0 {
+		return nil
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	ids := make([]string, 0, len(queueItems))
+	for _, item := range queueItems {
+		if item.Status == "queued" && item.AvailableAt <= nowISO {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
+}
+
+func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discoveredRunnableIDs map[string]struct{}, requestWake func()) {
+	if requestWake == nil || len(claimedItems) == 0 || len(discoveredRunnableIDs) == 0 {
+		return
+	}
+	for _, item := range claimedItems {
+		if _, ok := discoveredRunnableIDs[item.ID]; ok {
+			requestWake()
+			return
+		}
+	}
+}
+
 func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, maxConcurrentRuns int) (int, error) {
 	if repos == nil || repos.Queue == nil {
 		return 0, nil
@@ -1170,9 +1289,9 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
-func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) error {
+func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
-		return nil
+		return nil, nil
 	}
 	now := input.Now
 	if now == nil {
@@ -1182,18 +1301,18 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return queueItems, err
 		}
 		item, err := input.Repos.Queue.ClaimNext(ctx, nowISO, "scheduler")
 		if err != nil {
-			return err
+			return queueItems, err
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	return runScheduledQueueItems(ctx, queueItems, input)
+	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {

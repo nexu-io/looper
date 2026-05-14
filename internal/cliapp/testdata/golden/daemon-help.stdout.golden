@@ -16,31 +16,33 @@ Flags:
   --startup                   Show daemon startup logs instead of main logs
 
 Global Flags:
-  --config <path>             Config path
+  --config <path>             Config path (`~/.looper/config.toml` by default; also supports .yaml, .yml, and .json)
   --daemon-mode <mode>        Daemon mode
   --daemon-restart-policy <policy> Daemon supervisor restart policy: never, on-failure, or always
   --daemon-restart-throttle-seconds <seconds> Daemon supervisor restart throttle
   --db-path <path>            Database path
-  --fix-all-pull-requests <bool> Allow fixer to inspect and fix PRs created by any author
   --fixer-agent-timeout-seconds <seconds> Fixer agent execution timeout
   --gh-path <path>            GitHub CLI path
   --git-path <path>           Git binary path
   --host <host>               Server host
+  --instructions-enabled <bool> Enable custom instructions
   --json                      Emit JSON output
   --log-dir <path>            Daemon log directory
   --looper-path <path>        Looper CLI path
-  --no-auto-upgrade           Disable automatic upgrade checks for this command
-  --no-custom-instructions    Disable custom instructions for debugging
   --osascript-path <path>     osascript binary path
+  --package-auto-upgrade-enabled <bool> Enable automatic upgrade checks for this command
   --planner-agent-timeout-seconds <seconds> Planner agent execution timeout
   --port <port>               Server port
   --reviewer-agent-timeout-seconds <seconds> Reviewer agent execution timeout
-  --reviewer-enable-self-review <bool> Allow reviewer triggers to process self-authored pull requests
-  --reviewer-loop-enabled <bool> Enable reviewer follow-up loops by default
-  --reviewer-max-iterations-per-head <count> Deprecated; ignored by reviewer loop filtering
-  --reviewer-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering
-  --reviewer-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
-  --reviewer-quiet-period-seconds <seconds> Reviewer loop quiet period
+  --roles-fixer-triggers-author-filter <filter> Fixer author filter: current-user or any
+  --roles-reviewer-behavior-loop-enabled-by-default <bool> Enable reviewer follow-up loops by default
+  --roles-reviewer-behavior-loop-max-iterations-per-head <count> Deprecated; ignored by reviewer loop filtering
+  --roles-reviewer-behavior-loop-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering
+  --roles-reviewer-behavior-loop-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
+  --roles-reviewer-behavior-loop-quiet-period-seconds <seconds> Reviewer loop quiet period
+  --roles-reviewer-behavior-review-events-blocking <event> Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES
+  --roles-reviewer-behavior-review-events-clean <event> Reviewer event for clean runs: COMMENT or APPROVE
+  --roles-reviewer-discovery-triggers-enable-self-review <bool> Allow reviewer triggers to process self-authored pull requests
   --worker-agent-timeout-seconds <seconds> Worker agent execution timeout
 
 Examples:

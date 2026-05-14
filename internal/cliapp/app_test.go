@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -61,7 +62,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config file value", "set       Set a config file value", "unset     Unset a config file value", "validate  Validate the config file", "show      Show active config", "edit      Edit the config file"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
@@ -91,6 +92,110 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			if got, want := r.Method, http.MethodPost; got != want {
+				t.Fatalf("request method = %q, want %q", got, want)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["projectId"], "project_1"; got != want {
+				t.Fatalf("body.projectId = %#v, want %#v", got, want)
+			}
+			if got, want := body["type"], "fixer"; got != want {
+				t.Fatalf("body.type = %#v, want %#v", got, want)
+			}
+			if got, want := body["repo"], "acme/looper"; got != want {
+				t.Fatalf("body.repo = %#v, want %#v", got, want)
+			}
+			if got, want := body["prNumber"], float64(123); got != want {
+				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"fix", "123", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([fix 123]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([fix 123]) stderr = %q, want empty string", got)
+	}
+	if got := stdout.String(); !strings.Contains(got, "Fixer started") || !strings.Contains(got, "acme/looper#123") {
+		t.Fatalf("Run([fix 123]) stdout = %q, want fixer summary for %q", got, "acme/looper#123")
+	}
+}
+
+func TestFixCreateRequiresExplicitProjectWhenCurrentProjectIsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	repoPath := filepath.Join(rootPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper A", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}, {"id": "project_2", "name": "Looper B", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:01:00.000Z"}}}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		Getwd: func() (string, error) {
+			return repoPath, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"fix", "123", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([fix 123]) exit code = 0, want non-zero")
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("Run([fix 123]) stdout = %q, want empty string", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "--project is required") {
+		t.Fatalf("Run([fix 123]) stderr = %q, want to contain %q", got, "--project is required")
 	}
 }
 
@@ -277,6 +382,29 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	} {
 		if !strings.Contains(stdout, syntax) {
 			t.Fatalf("Run([--help]) stdout = %q, want to contain %q", stdout, syntax)
+		}
+	}
+	if !strings.Contains(stdout, "Config path (`~/.looper/config.toml` by default; also supports .yaml, .yml, and .json)") {
+		t.Fatalf("Run([--help]) stdout = %q, want canonical config flag description", stdout)
+	}
+}
+
+func TestConfigHelpUsesCanonicalReviewerExamples(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "config", "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([config --help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config --help]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{
+		"roles.reviewer.behavior.reviewEvents.clean",
+		"$ looper config set roles.reviewer.behavior.reviewEvents.clean APPROVE",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([config --help]) stdout = %q, want to contain %q", stdout, want)
 		}
 	}
 }
@@ -508,6 +636,39 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 	}
 }
 
+func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
+	t.Parallel()
+
+	got := ExtractConfigArgs([]string{
+		"status",
+		"--package-auto-upgrade-enabled=false",
+		"--roles-fixer-triggers-author-filter",
+		"any",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-discovery-triggers-enable-self-review",
+		"true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--instructions-enabled=true",
+		"--project",
+		"demo",
+	})
+
+	want := []string{
+		"--package-auto-upgrade-enabled=false",
+		"--roles-fixer-triggers-author-filter",
+		"any",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-discovery-triggers-enable-self-review",
+		"true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--instructions-enabled=true",
+	}
+
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ExtractConfigArgs() = %#v, want %#v", got, want)
+	}
+}
+
 func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
 	t.Parallel()
 
@@ -547,8 +708,8 @@ func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if stderr != "" {
-		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-loop-enabled" is accepted for now; use "--roles-reviewer-behavior-loop-enabled-by-default" instead`) {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want deprecation warning", stderr)
 	}
 }
 
@@ -568,8 +729,38 @@ func TestStatusAcceptsReviewerEnableSelfReviewConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-enable-self-review=true]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
+	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-enable-self-review" is accepted for now; use "--roles-reviewer-discovery-triggers-enable-self-review" instead`) {
+		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want deprecation warning", stderr)
+	}
+}
+
+func TestStatusAcceptsCanonicalReviewerConfigOverrideFlags(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t,
+		"status",
+		"--roles-reviewer-discovery-triggers-enable-self-review=true",
+		"--roles-reviewer-behavior-review-events-clean=APPROVE",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--roles-fixer-triggers-author-filter=any",
+		"--package-auto-upgrade-enabled=false",
+		"--instructions-enabled=true",
+		"--config", configPath,
+	)
+	if exitCode != 0 {
+		t.Fatalf("Run([status canonical config flags]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
 	if stderr != "" {
-		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want empty string", stderr)
+		t.Fatalf("Run([status canonical config flags]) stderr = %q, want empty string", stderr)
 	}
 }
 
@@ -996,6 +1187,273 @@ func TestConfigSetUnsetInstructionKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSetSupportsCanonicalReviewerDiscoveryKeys(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"autoDiscovery": false,
+			},
+		},
+	})
+
+	tests := []struct {
+		key    string
+		value  string
+		assert func(t *testing.T, partial config.PartialConfig)
+	}{
+		{
+			key:   "roles.reviewer.discovery.autoDiscovery",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.AutoDiscovery == nil || !*partial.Roles.Reviewer.Discovery.AutoDiscovery {
+					t.Fatalf("canonical reviewer autoDiscovery missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.AutoDiscovery != nil {
+					t.Fatalf("legacy reviewer autoDiscovery should be cleared: %#v", partial.Roles.Reviewer)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.requireReviewRequest",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil || !*partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+					t.Fatalf("canonical reviewer trigger missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.RequireReviewRequest != nil {
+					t.Fatalf("legacy reviewer trigger should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.includeDrafts",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts == nil || !*partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts {
+					t.Fatalf("canonical reviewer trigger missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil {
+					t.Fatalf("legacy reviewer trigger should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.enableSelfReview",
+			value: "true",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview == nil || !*partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview {
+					t.Fatalf("canonical reviewer trigger missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil {
+					t.Fatalf("legacy reviewer trigger should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.labels",
+			value: "looper:review,looper:review-extra",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.Labels == nil {
+					t.Fatalf("canonical reviewer trigger labels missing: %#v", partial.Roles)
+				}
+				if got := *partial.Roles.Reviewer.Discovery.Triggers.Labels; !reflect.DeepEqual(got, []string{"looper:review", "looper:review-extra"}) {
+					t.Fatalf("canonical reviewer trigger labels = %#v, want %#v", got, []string{"looper:review", "looper:review-extra"})
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil {
+					t.Fatalf("legacy reviewer trigger labels should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.triggers.labelMode",
+			value: "any",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.Triggers == nil || partial.Roles.Reviewer.Discovery.Triggers.LabelMode == nil || *partial.Roles.Reviewer.Discovery.Triggers.LabelMode != config.LabelModeAny {
+					t.Fatalf("canonical reviewer trigger labelMode missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.LabelMode != nil {
+					t.Fatalf("legacy reviewer trigger labelMode should be cleared: %#v", partial.Roles.Reviewer.Triggers)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.specReview.includeReviewingLabel",
+			value: "false",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.SpecReview == nil || partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel == nil || *partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel {
+					t.Fatalf("canonical reviewer specReview missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil {
+					t.Fatalf("legacy reviewer specReview should be cleared: %#v", partial.Roles.Reviewer.SpecReview)
+				}
+			},
+		},
+		{
+			key:   "roles.reviewer.discovery.specReview.reviewingLabel",
+			value: "looper:spec-reviewing",
+			assert: func(t *testing.T, partial config.PartialConfig) {
+				t.Helper()
+				if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil || partial.Roles.Reviewer.Discovery.SpecReview == nil || partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel == nil || *partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+					t.Fatalf("canonical reviewer specReview missing: %#v", partial.Roles)
+				}
+				if partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.ReviewingLabel != nil {
+					t.Fatalf("legacy reviewer specReview should be cleared: %#v", partial.Roles.Reviewer.SpecReview)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.key, func(t *testing.T) {
+			exitCode, stdout, stderr := runApp(t, "config", "set", testCase.key, testCase.value, "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([config set %s]) exit code = %d, want 0; stderr=%q", testCase.key, exitCode, stderr)
+			}
+			if !strings.Contains(stdout, "Set "+testCase.key) {
+				t.Fatalf("stdout = %q, want set confirmation for %s", stdout, testCase.key)
+			}
+
+			partial, present, err := config.ReadPartialConfigFile(configPath)
+			if err != nil {
+				t.Fatalf("ReadPartialConfigFile() error = %v", err)
+			}
+			if !present {
+				t.Fatalf("ReadPartialConfigFile() present = false, want true")
+			}
+			testCase.assert(t, partial)
+		})
+	}
+}
+
+func TestConfigUnsetCanonicalReviewerDiscoveryKeysClearsCanonicalFields(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{
+					"autoDiscovery": true,
+					"triggers": map[string]any{
+						"includeDrafts":        true,
+						"requireReviewRequest": true,
+						"labels":               []string{"looper:review", "looper:review-extra"},
+						"labelMode":            "any",
+					},
+					"specReview": map[string]any{
+						"includeReviewingLabel": true,
+						"reviewingLabel":        "looper:spec-reviewing",
+					},
+				},
+			},
+		},
+	})
+
+	for _, key := range []string{
+		"roles.reviewer.discovery.autoDiscovery",
+		"roles.reviewer.discovery.triggers.includeDrafts",
+		"roles.reviewer.discovery.triggers.requireReviewRequest",
+		"roles.reviewer.discovery.triggers.enableSelfReview",
+		"roles.reviewer.discovery.triggers.labels",
+		"roles.reviewer.discovery.triggers.labelMode",
+		"roles.reviewer.discovery.specReview.includeReviewingLabel",
+		"roles.reviewer.discovery.specReview.reviewingLabel",
+	} {
+		exitCode, stdout, stderr := runApp(t, "config", "unset", key, "--config", configPath)
+		if exitCode != 0 {
+			t.Fatalf("Run([config unset %s]) exit code = %d, want 0; stderr=%q", key, exitCode, stderr)
+		}
+		if !strings.Contains(stdout, "Unset "+key) {
+			t.Fatalf("stdout = %q, want unset confirmation for %s", stdout, key)
+		}
+	}
+
+	partial, present, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadPartialConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatalf("ReadPartialConfigFile() present = false, want true")
+	}
+	if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Discovery == nil {
+		t.Fatalf("reviewer discovery missing after unset: %#v", partial.Roles)
+	}
+	if partial.Roles.Reviewer.Discovery.AutoDiscovery != nil {
+		t.Fatalf("canonical reviewer autoDiscovery still set: %#v", partial.Roles.Reviewer.Discovery)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest != nil {
+		t.Fatalf("canonical reviewer trigger still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts != nil {
+		t.Fatalf("canonical reviewer includeDrafts still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil {
+		t.Fatalf("canonical reviewer enableSelfReview still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.Labels != nil {
+		t.Fatalf("canonical reviewer labels still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.LabelMode != nil {
+		t.Fatalf("canonical reviewer labelMode still set: %#v", partial.Roles.Reviewer.Discovery.Triggers)
+	}
+	if partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel != nil {
+		t.Fatalf("canonical reviewer includeReviewingLabel still set: %#v", partial.Roles.Reviewer.Discovery.SpecReview)
+	}
+	if partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != nil {
+		t.Fatalf("canonical reviewer specReview still set: %#v", partial.Roles.Reviewer.Discovery.SpecReview)
+	}
+}
+
+func TestConfigSetPreservesLegacyReviewerRootWhenWritingUnrelatedKey(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"loop":  map[string]any{"enabledByDefault": false},
+			"scope": "changed_files",
+		},
+	})
+
+	exitCode, _, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set defaults.allowRiskyFixes]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"reviewer"`) {
+		t.Fatalf("config = %s, want legacy reviewer root preserved", raw)
+	}
+
+	partial, present, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadPartialConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatalf("ReadPartialConfigFile() present = false, want true")
+	}
+	if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+		t.Fatalf("legacy reviewer loop missing after write: %#v", partial.LegacyReviewer)
+	}
+	if partial.LegacyReviewer.Scope == nil || *partial.LegacyReviewer.Scope != config.ReviewerScopeChangedFiles {
+		t.Fatalf("legacy reviewer scope missing after write: %#v", partial.LegacyReviewer)
+	}
+}
+
 func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	configPath := writeEditableCLIConfig(t)
 
@@ -1029,6 +1487,140 @@ func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "reviewer.reviewEvents.blocking") || !strings.Contains(stderr, "COMMENT, REQUEST_CHANGES") {
 		t.Fatalf("stderr = %q, want blocking review event enum error", stderr)
+	}
+}
+
+func TestConfigUnsetLegacyReviewerReviewEventKeysClearsLegacyAndCanonicalFields(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"loop": map[string]any{"enabledByDefault": false},
+			"reviewEvents": map[string]any{
+				"clean":    "APPROVE",
+				"blocking": "REQUEST_CHANGES",
+			},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"behavior": map[string]any{
+					"reviewEvents": map[string]any{
+						"clean":    "COMMENT",
+						"blocking": "COMMENT",
+					},
+				},
+			},
+		},
+	})
+
+	for _, key := range []string{"reviewer.reviewEvents.clean", "reviewer.reviewEvents.blocking"} {
+		exitCode, stdout, stderr := runApp(t, "config", "unset", key, "--config", configPath)
+		if exitCode != 0 {
+			t.Fatalf("Run([config unset %s]) exit code = %d, want 0; stderr=%q", key, exitCode, stderr)
+		}
+		if !strings.Contains(stdout, "Unset "+key) {
+			t.Fatalf("stdout = %q, want unset confirmation for %s", stdout, key)
+		}
+	}
+
+	partial, present, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadPartialConfigFile() error = %v", err)
+	}
+	if !present {
+		t.Fatalf("ReadPartialConfigFile() present = false, want true")
+	}
+	if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+		t.Fatalf("legacy reviewer loop missing after unset: %#v", partial.LegacyReviewer)
+	}
+	if partial.LegacyReviewer.ReviewEvents != nil {
+		if partial.LegacyReviewer.ReviewEvents.Clean != nil {
+			t.Fatalf("legacy reviewer clean event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+		}
+		if partial.LegacyReviewer.ReviewEvents.Blocking != nil {
+			t.Fatalf("legacy reviewer blocking event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+		}
+	}
+	if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil || partial.Roles.Reviewer.Behavior.ReviewEvents == nil {
+		t.Fatalf("canonical reviewer reviewEvents missing after unset: %#v", partial.Roles)
+	}
+	if partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil {
+		t.Fatalf("canonical reviewer clean event still set: %#v", partial.Roles.Reviewer.Behavior.ReviewEvents)
+	}
+	if partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking != nil {
+		t.Fatalf("canonical reviewer blocking event still set: %#v", partial.Roles.Reviewer.Behavior.ReviewEvents)
+	}
+}
+
+func TestConfigSetCanonicalReviewerReviewEventClearsLegacyField(t *testing.T) {
+	tests := []struct {
+		name        string
+		key         string
+		value       string
+		assertClean bool
+	}{
+		{name: "clean", key: "roles.reviewer.behavior.reviewEvents.clean", value: "APPROVE", assertClean: true},
+		{name: "blocking", key: "roles.reviewer.behavior.reviewEvents.blocking", value: "REQUEST_CHANGES", assertClean: false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+				"notifications": map[string]any{
+					"osascript": map[string]any{"enabled": false},
+				},
+				"reviewer": map[string]any{
+					"loop": map[string]any{"enabledByDefault": false},
+					"reviewEvents": map[string]any{
+						"clean":    "COMMENT",
+						"blocking": "COMMENT",
+					},
+				},
+			})
+
+			exitCode, stdout, stderr := runApp(t, "config", "set", tc.key, tc.value, "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([config set %s %s]) exit code = %d, want 0; stderr=%q", tc.key, tc.value, exitCode, stderr)
+			}
+			if !strings.Contains(stdout, "Set "+tc.key) {
+				t.Fatalf("stdout = %q, want set confirmation for %s", stdout, tc.key)
+			}
+
+			partial, present, err := config.ReadPartialConfigFile(configPath)
+			if err != nil {
+				t.Fatalf("ReadPartialConfigFile() error = %v", err)
+			}
+			if !present {
+				t.Fatalf("ReadPartialConfigFile() present = false, want true")
+			}
+			if partial.LegacyReviewer == nil || partial.LegacyReviewer.Loop == nil || partial.LegacyReviewer.Loop.EnabledByDefault == nil || *partial.LegacyReviewer.Loop.EnabledByDefault {
+				t.Fatalf("legacy reviewer loop missing after set: %#v", partial.LegacyReviewer)
+			}
+			if partial.LegacyReviewer.ReviewEvents == nil {
+				t.Fatalf("legacy reviewer reviewEvents missing after set: %#v", partial.LegacyReviewer)
+			}
+			if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil || partial.Roles.Reviewer.Behavior.ReviewEvents == nil {
+				t.Fatalf("canonical reviewer reviewEvents missing after set: %#v", partial.Roles)
+			}
+
+			if tc.assertClean {
+				if partial.LegacyReviewer.ReviewEvents.Clean != nil {
+					t.Fatalf("legacy reviewer clean event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+				}
+				if got := partial.Roles.Reviewer.Behavior.ReviewEvents.Clean; got == nil || *got != config.ReviewerReviewEventApprove {
+					t.Fatalf("canonical reviewer clean event = %#v, want %q", got, config.ReviewerReviewEventApprove)
+				}
+			} else {
+				if partial.LegacyReviewer.ReviewEvents.Blocking != nil {
+					t.Fatalf("legacy reviewer blocking event still set: %#v", partial.LegacyReviewer.ReviewEvents)
+				}
+				if got := partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got == nil || *got != config.ReviewerReviewEventRequestChanges {
+					t.Fatalf("canonical reviewer blocking event = %#v, want %q", got, config.ReviewerReviewEventRequestChanges)
+				}
+			}
+		})
 	}
 }
 
@@ -1109,6 +1701,178 @@ func TestConfigValidateAndShowSource(t *testing.T) {
 	if got, want := instructionsEnabled["value"], true; got != want {
 		t.Fatalf("instructions.enabled value = %#v, want %#v", got, want)
 	}
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerBehaviorOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"behavior": map[string]any{
+					"reviewEvents": map[string]any{"clean": "COMMENT"},
+				},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "APPROVE")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "env")
+
+	os.Unsetenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--roles-reviewer-behavior-review-events-clean=APPROVE", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-reviewer-behavior-review-events-clean]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "cli")
+}
+
+func TestConfigShowSourceDetectsLegacyReviewerReviewEventsAsConfigFileSources(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"reviewer": map[string]any{
+			"reviewEvents": map[string]any{
+				"clean":    "APPROVE",
+				"blocking": "REQUEST_CHANGES",
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.clean", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.behavior.reviewEvents.blocking", "config-file")
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{"autoDiscovery": false},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "true")
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.autoDiscovery", "env")
+}
+
+func TestConfigShowSourceDetectsCanonicalEnableFlagOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"instructions": map[string]any{"enabled": false},
+		"package":      map[string]any{"autoUpgradeEnabled": true},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--instructions-enabled=true", "--package-auto-upgrade-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --instructions-enabled --package-auto-upgrade-enabled]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "instructions.enabled", "cli")
+	assertConfigFieldSource(t, stdout, "package.autoUpgradeEnabled", "cli")
+}
+
+func TestConfigShowSourceDetectsFixerAuthorFilterCLIOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"fixer": map[string]any{
+				"triggers": map[string]any{"authorFilter": "current_user"},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--roles-fixer-triggers-author-filter=any", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-fixer-triggers-author-filter]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.fixer.triggers.authorFilter", "cli")
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{
+					"triggers": map[string]any{
+						"enableSelfReview":     false,
+						"includeDrafts":        false,
+						"requireReviewRequest": false,
+						"labels":               []string{"looper:review"},
+						"labelMode":            "all",
+					},
+					"specReview": map[string]any{
+						"includeReviewingLabel": false,
+						"reviewingLabel":        "looper:reviewing",
+					},
+				},
+			},
+		},
+	})
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", "looper:review,looper:extra")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE", "any")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "true")
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "looper:canonical")
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.enableSelfReview", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.includeDrafts", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.requireReviewRequest", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labels", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.labelMode", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.includeReviewingLabel", "env")
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.specReview.reviewingLabel", "env")
+}
+
+func TestConfigShowSourceDetectsCanonicalReviewerEnableSelfReviewCLIOverride(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"roles": map[string]any{
+			"reviewer": map[string]any{
+				"discovery": map[string]any{
+					"triggers": map[string]any{"enableSelfReview": false},
+				},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--roles-reviewer-discovery-triggers-enable-self-review=true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --roles-reviewer-discovery-triggers-enable-self-review]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "roles.reviewer.discovery.triggers.enableSelfReview", "cli")
 }
 
 func TestConfigValidateRejectsEnabledOsascriptNotificationsWithoutResolvedPath(t *testing.T) {
@@ -1226,6 +1990,93 @@ EOF
 	}
 }
 
+func TestConfigEditCreatesCanonicalTemplateAtSelectedTOMLPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "generated.toml")
+	editorPath := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write editor script: %v", err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	exitCode, stdout, stderr := runApp(t, "config", "edit", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config edit --config generated.toml]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid: "+configPath) {
+		t.Fatalf("stdout = %q, want config-valid output for %q", stdout, configPath)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{"[server]", "[daemon]", "[storage]", "[defaults]", "[instructions]", "[roles.planner]"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated TOML = %q, want to contain %q", text, want)
+		}
+	}
+	if strings.Contains(text, "[reviewer]") {
+		t.Fatalf("generated TOML = %q, did not expect legacy reviewer root", text)
+	}
+	if strings.Contains(text, "allowAutoApprove") {
+		t.Fatalf("generated TOML = %q, did not expect deprecated defaults.allowAutoApprove", text)
+	}
+	if strings.Contains(text, "fixAllPullRequests") {
+		t.Fatalf("generated TOML = %q, did not expect deprecated defaults.fixAllPullRequests", text)
+	}
+
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if len(loaded.Warnings) != 0 {
+		t.Fatalf("LoadFile().Warnings = %#v, want none", loaded.Warnings)
+	}
+}
+
+func TestConfigSetPreservesSelectedYAMLFormat(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "selected.yaml")
+	exitCode, stdout, stderr := runApp(t, "config", "set", "defaults.allowRiskyFixes", "true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set ... --config selected.yaml]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Set defaults.allowRiskyFixes in "+configPath) {
+		t.Fatalf("stdout = %q, want set confirmation for %q", stdout, configPath)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(configPath) error = %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "defaults:") || !strings.Contains(text, "allowRiskyFixes: true") {
+		t.Fatalf("generated YAML = %q, want defaults.allowRiskyFixes field", text)
+	}
+	if strings.Contains(text, "\"defaults\"") {
+		t.Fatalf("generated YAML = %q, did not expect JSON formatting", text)
+	}
+
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Defaults.AllowRiskyFixes {
+		t.Fatalf("loaded config allowRiskyFixes = %t, want true", loaded.Config.Defaults.AllowRiskyFixes)
+	}
+}
+
 func invalidOsascriptNotificationConfigPayload(allowRiskyFixes bool) map[string]any {
 	return map[string]any{
 		"notifications": map[string]any{
@@ -1254,6 +2105,126 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "warning: --no-custom-instructions is set") {
 		t.Fatalf("stderr = %q, want instructions override warning", stderr)
+	}
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "APPROVE")
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.behavior.reviewEvents.clean", "COMMENT", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.behavior.reviewEvents.clean with env override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN is set") {
+		t.Fatalf("stderr = %q, want canonical env override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.behavior.reviewEvents.clean", "COMMENT", "--roles-reviewer-behavior-review-events-clean=APPROVE", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.behavior.reviewEvents.clean with canonical flag override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --roles-reviewer-behavior-review-events-clean is set") {
+		t.Fatalf("stderr = %q, want canonical flag override warning", stderr)
+	}
+
+	t.Setenv("LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "true")
+	exitCode, _, stderr = runApp(t, "config", "set", "roles.reviewer.discovery.autoDiscovery", "false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set roles.reviewer.discovery.autoDiscovery with env override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY is set") {
+		t.Fatalf("stderr = %q, want canonical reviewer discovery env override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "instructions.enabled", "false", "--instructions-enabled=true", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set instructions.enabled with canonical override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --instructions-enabled is set") {
+		t.Fatalf("stderr = %q, want canonical instructions flag override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "package.autoUpgradeEnabled", "true", "--package-auto-upgrade-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set package.autoUpgradeEnabled with canonical override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --package-auto-upgrade-enabled is set") {
+		t.Fatalf("stderr = %q, want canonical package flag override warning", stderr)
+	}
+}
+
+func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	field, ok := fields[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want object", key, fields[key])
+	}
+	if got := field["source"]; got != wantSource {
+		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
+	}
+}
+
+func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "validate")
+	if exitCode != 0 {
+		t.Fatalf("Run([config validate]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Config valid: "+legacyDefaultPath) {
+		t.Fatalf("stdout = %q, want config-valid output for %q", stdout, legacyDefaultPath)
+	}
+	if !strings.Contains(stderr, "note: legacy default config file ") || !strings.Contains(stderr, legacyDefaultPath) || !strings.Contains(stderr, filepath.Join(looperHome, "config.toml")) || !strings.Contains(stderr, "docs/configuration.md") {
+		t.Fatalf("stderr = %q, want migration note", stderr)
+	}
+	if _, err := os.Stat(legacyDefaultPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want legacy config file preserved", legacyDefaultPath, err)
+	}
+}
+
+func TestEmitConfigLoadNoticesPrintsEachNoticeOncePerRuntime(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
+	loaded := config.LoadedFileConfig{Notices: []string{"migrate me"}}
+
+	runtime.emitConfigLoadNotices(loaded)
+	runtime.emitConfigLoadNotices(loaded)
+
+	if got := stderr.String(); got != "note: migrate me\n" {
+		t.Fatalf("stderr = %q, want one emitted notice", got)
+	}
+}
+
+func TestEmitConfigLoadNoticesPrintsWarningsAndDeduplicatesByLevel(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
+	loaded := config.LoadedFileConfig{Warnings: []string{"deprecated reviewer path"}, Notices: []string{"legacy default config"}}
+
+	runtime.emitConfigLoadNotices(loaded)
+	runtime.emitConfigLoadNotices(loaded)
+
+	if got := stderr.String(); got != "warning: deprecated reviewer path\nnote: legacy default config\n" {
+		t.Fatalf("stderr = %q, want one emitted warning and notice", got)
+	}
+
+	stderr.Reset()
+	runtime.emitConfigLoadNotices(config.LoadedFileConfig{Warnings: []string{"same text"}, Notices: []string{"same text"}})
+	if got := stderr.String(); got != "warning: same text\nnote: same text\n" {
+		t.Fatalf("stderr = %q, want warning and note tracked separately", got)
 	}
 }
 
@@ -2268,6 +3239,85 @@ func TestLoopStartRequiresExplicitProjectWhenRepoMatchesMultipleProjects(t *test
 	}
 	if !strings.Contains(stderr, "--project is required") {
 		t.Fatalf("Run([loop start ...]) stderr = %q, want to contain %q", stderr, "--project is required")
+	}
+}
+
+func TestLoopPauseHelpOnlyShowsSupportedIDForms(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "loop", "pause", "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([loop pause --help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([loop pause --help]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Usage:\n  looper loop pause [id]", "--id <id>"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([loop pause --help]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	for _, unwanted := range []string{"--type <type>", "--pr <repo#number>"} {
+		if strings.Contains(stdout, unwanted) {
+			t.Fatalf("Run([loop pause --help]) stdout = %q, want not to contain %q", stdout, unwanted)
+		}
+	}
+}
+
+func TestLoopPauseRequiresID(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "loop", "pause")
+	if exitCode == 0 {
+		t.Fatalf("Run([loop pause]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("Run([loop pause]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "loop pause requires [id] or --id <id>") {
+		t.Fatalf("Run([loop pause]) stderr = %q, want missing id error", stderr)
+	}
+}
+
+func TestLoopPauseAcceptsPositionalAndFlagID(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantPath string
+	}{
+		{name: "positional", args: []string{"loop", "pause", "loop_123"}, wantPath: "/api/v1/loops/loop_123/pause"},
+		{name: "flag", args: []string{"loop", "pause", "--id", "loop_456"}, wantPath: "/api/v1/loops/loop_456/pause"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got, want := r.Method, http.MethodPost; got != want {
+					t.Fatalf("request method = %q, want %q", got, want)
+				}
+				if got, want := r.URL.Path, tc.wantPath; got != want {
+					t.Fatalf("request path = %q, want %q", got, want)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_loop_pause", map[string]any{"id": strings.TrimSuffix(strings.TrimPrefix(tc.wantPath, "/api/v1/loops/"), "/pause"), "status": "paused"}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			args := append(tc.args, "--config", configPath)
+			exitCode, stdout, stderr := runApp(t, args...)
+			if exitCode != 0 {
+				t.Fatalf("Run(%v) exit code = %d, want 0", args, exitCode)
+			}
+			if stderr != "" {
+				t.Fatalf("Run(%v) stderr = %q, want empty string", args, stderr)
+			}
+			if !strings.Contains(stdout, "Loop paused") {
+				t.Fatalf("Run(%v) stdout = %q, want pause success output", args, stdout)
+			}
+		})
 	}
 }
 

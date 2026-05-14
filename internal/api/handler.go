@@ -726,7 +726,6 @@ type configResponse struct {
 	Daemon        configDaemonResponse      `json:"daemon"`
 	Package       config.PackageConfig      `json:"package"`
 	Defaults      config.DefaultsConfig     `json:"defaults"`
-	Reviewer      config.ReviewerConfig     `json:"reviewer"`
 	Roles         config.RoleConfigs        `json:"roles"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
 }
@@ -777,7 +776,6 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Package:  cfg.Package,
 		Defaults: cfg.Defaults,
-		Reviewer: cfg.Reviewer,
 		Roles:    cfg.Roles,
 		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
 	}
@@ -2917,7 +2915,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	now := h.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
-		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Reviewer, target, nowISO)
+		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO)
 		if err != nil {
 			return loopResponse{}, err
 		}

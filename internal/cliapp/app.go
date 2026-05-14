@@ -91,6 +91,7 @@ type flagSpec struct {
 	valueName   string
 	description string
 	kind        flagKind
+	hidden      bool
 }
 
 type flagKind int
@@ -106,7 +107,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -155,24 +156,24 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			}),
 			newCommand(commandSpec{
 				use:             "config",
-				short:           "Config commands",
-				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config file value"}, {name: "set", description: "Set a config file value"}, {name: "unset", description: "Unset a config file value"}, {name: "validate", description: "Validate the config file"}, {name: "lint", description: "Lint the config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the config file"}},
+				short:           "Inspect and edit the active config file",
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
-					"$ looper config get defaults.allowRiskyFixes",
-					"$ looper config set defaults.allowRiskyFixes true",
-					"$ looper config unset defaults.allowRiskyFixes",
+					"$ looper config get roles.reviewer.behavior.reviewEvents.clean",
+					"$ looper config set roles.reviewer.behavior.reviewEvents.clean APPROVE",
+					"$ looper config unset roles.reviewer.behavior.reviewEvents.clean",
 					"$ looper config validate",
 					"$ looper config show --source",
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "get <key>", short: "Get a config file value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
-					newCommand(commandSpec{use: "set <key> <value>", short: "Set a config file value", args: cobra.ExactArgs(2), runE: runtime.configSet}),
-					newCommand(commandSpec{use: "unset <key>", short: "Unset a config file value", args: cobra.ExactArgs(1), runE: runtime.configUnset}),
-					newCommand(commandSpec{use: "validate", short: "Validate the config file", runE: runtime.configValidate}),
-					newCommand(commandSpec{use: "lint", short: "Lint the config file", runE: runtime.configValidate}),
+					newCommand(commandSpec{use: "get <key>", short: "Get a config value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
+					newCommand(commandSpec{use: "set <key> <value>", short: "Set a config value", args: cobra.ExactArgs(2), runE: runtime.configSet}),
+					newCommand(commandSpec{use: "unset <key>", short: "Unset a config value", args: cobra.ExactArgs(1), runE: runtime.configUnset}),
+					newCommand(commandSpec{use: "validate", short: "Validate the active config file", runE: runtime.configValidate}),
+					newCommand(commandSpec{use: "lint", short: "Lint the active config file", runE: runtime.configValidate}),
 					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
-					newCommand(commandSpec{use: "edit", short: "Edit the config file", runE: runtime.configEdit}),
+					newCommand(commandSpec{use: "edit", short: "Edit the active config file", runE: runtime.configEdit}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -221,6 +222,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					boolFlag("check", "Check available CLI and daemon updates"),
 					boolFlag("cli", "Upgrade the looper CLI binary when self-upgrade is allowed"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
+					hiddenBoolFlag("background-auto", "Run the auto-upgrade worker in the background"),
 				},
 				exampleLines: []string{
 					"$ looper upgrade --check",
@@ -270,19 +272,14 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				short:           "Loop commands",
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
 				helpWhenNoArgs:  true,
-				persistentFlags: []flagSpec{
-					stringFlag("id", "id", "Loop id"),
-					stringFlag("type", "type", "Loop type"),
-					stringFlag("pr", "repo#number", "Pull request reference"),
-				},
 				exampleLines: []string{
 					"$ looper loop list",
 					"$ looper loop start --type reviewer --pr acme/looper#42",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List loops", runE: runtime.loopList}),
-					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
-					newCommand(commandSpec{use: "pause", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause}),
+					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
+					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -326,6 +323,19 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "list", short: "List pull requests", runE: runtime.pullRequestList}),
 					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow}),
 					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "fix <pr>",
+				short: "Create a fixer task for a pull request",
+				args:  cobra.ExactArgs(1),
+				runE:  runtime.fixCreate,
+				localFlags: []flagSpec{
+					stringFlag("project", "projectId", "Project id"),
+				},
+				exampleLines: []string{
+					"$ looper fix 42",
+					"$ looper fix acme/looper#42",
 				},
 			}),
 			newCommand(commandSpec{
@@ -489,6 +499,9 @@ func addFlags(flagSet *pflag.FlagSet, flags []flagSpec) {
 		if defined != nil && flag.valueName != "" {
 			defined.Annotations = map[string][]string{"looperValueName": {flag.valueName}}
 		}
+		if defined != nil {
+			defined.Hidden = flag.hidden
+		}
 	}
 }
 
@@ -496,8 +509,16 @@ func boolFlag(name, description string) flagSpec {
 	return flagSpec{name: name, description: description, kind: flagKindBool}
 }
 
+func hiddenBoolFlag(name, description string) flagSpec {
+	return flagSpec{name: name, description: description, kind: flagKindBool, hidden: true}
+}
+
 func stringFlag(name, valueName, description string) flagSpec {
 	return flagSpec{name: name, valueName: valueName, description: description, kind: flagKindString}
+}
+
+func hiddenStringFlag(name, valueName, description string) flagSpec {
+	return flagSpec{name: name, valueName: valueName, description: description, kind: flagKindString, hidden: true}
 }
 
 func renderHelp(w io.Writer, cmd *cobra.Command, listedSubcommands []helpSubcommand) {
@@ -584,8 +605,9 @@ func collectFlags(flagSet *pflag.FlagSet) []string {
 func globalFlags() []flagSpec {
 	return []flagSpec{
 		boolFlag("json", "Emit JSON output"),
-		boolFlag("no-auto-upgrade", "Disable automatic upgrade checks for this command"),
-		stringFlag("config", "path", "Config path"),
+		hiddenBoolFlag("no-auto-upgrade", "Disable automatic upgrade checks for this command"),
+		stringFlag("package-auto-upgrade-enabled", "bool", "Enable automatic upgrade checks for this command"),
+		stringFlag("config", "path", "Config path (`~/.looper/config.toml` by default; also supports .yaml, .yml, and .json)"),
 		stringFlag("host", "host", "Server host"),
 		stringFlag("port", "port", "Server port"),
 		stringFlag("db-path", "path", "Database path"),
@@ -601,14 +623,27 @@ func globalFlags() []flagSpec {
 		stringFlag("worker-agent-timeout-seconds", "seconds", "Worker agent execution timeout"),
 		stringFlag("reviewer-agent-timeout-seconds", "seconds", "Reviewer agent execution timeout"),
 		stringFlag("fixer-agent-timeout-seconds", "seconds", "Fixer agent execution timeout"),
-		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
-		stringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
-		stringFlag("reviewer-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
-		stringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
-		stringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
-		stringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
-		stringFlag("reviewer-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
-		boolFlag("no-custom-instructions", "Disable custom instructions for debugging"),
+		stringFlag("roles-fixer-triggers-author-filter", "filter", "Fixer author filter: current-user or any"),
+		hiddenStringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
+		stringFlag("roles-reviewer-behavior-loop-enabled-by-default", "bool", "Enable reviewer follow-up loops by default"),
+		hiddenStringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
+		stringFlag("roles-reviewer-discovery-triggers-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
+		hiddenStringFlag("reviewer-enable-self-review", "bool", "Allow reviewer triggers to process self-authored pull requests"),
+		stringFlag("roles-reviewer-behavior-review-events-clean", "event", "Reviewer event for clean runs: COMMENT or APPROVE"),
+		hiddenStringFlag("allow-auto-approve", "bool", "Legacy alias for reviewer clean approvals"),
+		hiddenStringFlag("reviewer-clean-review-event", "event", "Reviewer event for clean runs: COMMENT or APPROVE"),
+		stringFlag("roles-reviewer-behavior-review-events-blocking", "event", "Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES"),
+		hiddenStringFlag("reviewer-blocking-review-event", "event", "Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES"),
+		stringFlag("roles-reviewer-behavior-loop-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		hiddenStringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		stringFlag("roles-reviewer-behavior-loop-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		hiddenStringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
+		hiddenStringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
+		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
+		hiddenStringFlag("reviewer-max-iterations-per-head", "count", "Deprecated; ignored by reviewer loop filtering"),
+		stringFlag("instructions-enabled", "bool", "Enable custom instructions"),
+		hiddenBoolFlag("no-custom-instructions", "Disable custom instructions for debugging"),
 	}
 }
 
@@ -655,31 +690,45 @@ func (a *App) stderr() io.Writer {
 }
 
 var configFlagNames = map[string]struct{}{
-	"config":                                {},
-	"no-auto-upgrade":                       {},
-	"host":                                  {},
-	"port":                                  {},
-	"db-path":                               {},
-	"log-dir":                               {},
-	"daemon-mode":                           {},
-	"daemon-restart-policy":                 {},
-	"daemon-restart-throttle-seconds":       {},
-	"git-path":                              {},
-	"gh-path":                               {},
-	"looper-path":                           {},
-	"osascript-path":                        {},
-	"planner-agent-timeout-seconds":         {},
-	"worker-agent-timeout-seconds":          {},
-	"reviewer-agent-timeout-seconds":        {},
-	"fixer-agent-timeout-seconds":           {},
-	"fix-all-pull-requests":                 {},
-	"reviewer-loop-enabled":                 {},
-	"reviewer-enable-self-review":           {},
-	"reviewer-quiet-period-seconds":         {},
-	"reviewer-min-publish-interval-seconds": {},
-	"reviewer-max-iterations-per-pr":        {},
-	"reviewer-max-iterations-per-head":      {},
-	"no-custom-instructions":                {},
+	"config":                             {},
+	"no-auto-upgrade":                    {},
+	"package-auto-upgrade-enabled":       {},
+	"host":                               {},
+	"port":                               {},
+	"db-path":                            {},
+	"log-dir":                            {},
+	"daemon-mode":                        {},
+	"daemon-restart-policy":              {},
+	"daemon-restart-throttle-seconds":    {},
+	"git-path":                           {},
+	"gh-path":                            {},
+	"looper-path":                        {},
+	"osascript-path":                     {},
+	"planner-agent-timeout-seconds":      {},
+	"worker-agent-timeout-seconds":       {},
+	"reviewer-agent-timeout-seconds":     {},
+	"fixer-agent-timeout-seconds":        {},
+	"roles-fixer-triggers-author-filter": {},
+	"fix-all-pull-requests":              {},
+	"allow-auto-approve":                 {},
+	"roles-reviewer-behavior-review-events-clean":               {},
+	"reviewer-clean-review-event":                               {},
+	"roles-reviewer-behavior-review-events-blocking":            {},
+	"reviewer-blocking-review-event":                            {},
+	"roles-reviewer-behavior-loop-enabled-by-default":           {},
+	"reviewer-loop-enabled":                                     {},
+	"roles-reviewer-discovery-triggers-enable-self-review":      {},
+	"reviewer-enable-self-review":                               {},
+	"roles-reviewer-behavior-loop-quiet-period-seconds":         {},
+	"reviewer-quiet-period-seconds":                             {},
+	"roles-reviewer-behavior-loop-min-publish-interval-seconds": {},
+	"reviewer-min-publish-interval-seconds":                     {},
+	"roles-reviewer-behavior-loop-max-iterations-per-pr":        {},
+	"reviewer-max-iterations-per-pr":                            {},
+	"roles-reviewer-behavior-loop-max-iterations-per-head":      {},
+	"reviewer-max-iterations-per-head":                          {},
+	"instructions-enabled":                                      {},
+	"no-custom-instructions":                                    {},
 }
 
 var configBoolFlagNames = map[string]struct{}{

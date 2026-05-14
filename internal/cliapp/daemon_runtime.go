@@ -502,7 +502,11 @@ func (r *commandRuntime) daemonRestart(cmd *cobra.Command, args []string) error 
 	}
 
 	r.skipAPIStartProbe = stopped
-	return r.daemonStart(cmd, nil)
+	if err := r.daemonStart(cmd, nil); err != nil {
+		return err
+	}
+	_ = r.clearAutoUpgradeReadyState(cmd.Context())
+	return nil
 }
 
 func (r *commandRuntime) daemonStop(cmd *cobra.Command, args []string) error {
@@ -740,7 +744,32 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
-	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
+	if err != nil {
+		return config.LoadedFileConfig{}, err
+	}
+	r.emitConfigLoadNotices(loaded)
+	return loaded, nil
+}
+
+func (r *commandRuntime) emitConfigLoadNotices(loaded config.LoadedFileConfig) {
+	for _, warning := range loaded.Warnings {
+		key := "warning:" + warning
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "warning: %s\n", warning)
+	}
+
+	for _, notice := range loaded.Notices {
+		key := "note:" + notice
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "note: %s\n", notice)
+	}
 }
 
 func (r *commandRuntime) getJSONWithClient(ctx context.Context, client *DaemonAPIClient, path string) (json.RawMessage, error) {
@@ -1243,11 +1272,16 @@ func (r *commandRuntime) spawnDetached(command string, args []string, cwd string
 	}
 	defer devNull.Close()
 
-	startupLog, err := os.OpenFile(r.startupOutputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return 0, err
+	startupLog := devNull
+	if r.startupOutputPath == "" {
+		startupLog = devNull
+	} else {
+		startupLog, err = os.OpenFile(r.startupOutputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return 0, err
+		}
+		defer startupLog.Close()
 	}
-	defer startupLog.Close()
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = cwd

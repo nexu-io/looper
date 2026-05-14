@@ -155,13 +155,13 @@ func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 
 func TestValidateReviewSubmitEventAllowedRejectsApproveWhenDisabled(t *testing.T) {
 	t.Parallel()
-	if err := validateReviewSubmitEventAllowed("APPROVE", commentOnlyReviewPolicy); err == nil || !strings.Contains(err.Error(), "reviewer.reviewEvents.clean=APPROVE") {
+	if err := validateReviewSubmitEventAllowed("APPROVE", commentOnlyReviewPolicy); err == nil || !strings.Contains(err.Error(), "roles.reviewer.behavior.reviewEvents.clean=APPROVE") {
 		t.Fatalf("validateReviewSubmitEventAllowed(APPROVE,commentOnly) error = %v, want policy rejection", err)
 	}
 	if err := validateReviewSubmitEventAllowed("APPROVE", decisionReviewPolicy); err != nil {
 		t.Fatalf("validateReviewSubmitEventAllowed(APPROVE,decision) error = %v", err)
 	}
-	if err := validateReviewSubmitEventAllowed("REQUEST_CHANGES", commentOnlyReviewPolicy); err == nil || !strings.Contains(err.Error(), "reviewer.reviewEvents.blocking=REQUEST_CHANGES") {
+	if err := validateReviewSubmitEventAllowed("REQUEST_CHANGES", commentOnlyReviewPolicy); err == nil || !strings.Contains(err.Error(), "roles.reviewer.behavior.reviewEvents.blocking=REQUEST_CHANGES") {
 		t.Fatalf("validateReviewSubmitEventAllowed(REQUEST_CHANGES,commentOnly) error = %v, want policy rejection", err)
 	}
 	if err := validateReviewSubmitEventAllowed("REQUEST_CHANGES", decisionReviewPolicy); err != nil {

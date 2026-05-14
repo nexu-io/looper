@@ -235,10 +235,16 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
 		t.Fatalf("planner role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Reviewer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || !got.Triggers.RequireReviewRequest || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 || !got.SpecReview.IncludeReviewingLabel || got.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
 		t.Fatalf("reviewer role defaults = %#v", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Triggers); got {
+	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("reviewer clean review event default = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+		t.Fatalf("reviewer blocking review event default = %q, want %q", got, ReviewerReviewEventRequestChanges)
+	}
+	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("reviewer enableSelfReview default = %v, want false", got)
 	}
 	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
@@ -247,7 +253,7 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
 		t.Fatalf("worker role defaults = %#v", got)
 	}
-	if got := cfg.Reviewer.Loop.MaxWallClockSeconds; got != 0 {
+	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxWallClockSeconds; got != 0 {
 		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
 	}
 }
@@ -339,6 +345,663 @@ func TestLegacyFixAllPullRequestsMapsToFixerAuthorFilter(t *testing.T) {
 	}
 }
 
+func TestLegacyAndCanonicalConfigSurfacesProduceEquivalentTargets(t *testing.T) {
+	testCases := []struct {
+		name      string
+		legacy    string
+		canonical string
+		extract   func(t *testing.T, cfg Config) any
+	}{
+		{
+			name:      "reviewer behavior root",
+			legacy:    `{"reviewer":{"reviewEvents":{"clean":"APPROVE","blocking":"REQUEST_CHANGES"},"loop":{"enabledByDefault":true,"quietPeriodSeconds":45,"minPublishIntervalSeconds":120},"nativeResume":{"onHeadChange":true,"reReviewPromptOnHeadChange":false}}}`,
+			canonical: `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"APPROVE","blocking":"REQUEST_CHANGES"},"loop":{"enabledByDefault":true,"quietPeriodSeconds":45,"minPublishIntervalSeconds":120},"nativeResume":{"onHeadChange":true,"reReviewPromptOnHeadChange":false}}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return toJSONValue(t, cfg.Roles.Reviewer.Behavior)
+			},
+		},
+		{
+			name:      "allowAutoApprove alias",
+			legacy:    `{"defaults":{"allowAutoApprove":true}}`,
+			canonical: `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"APPROVE"}}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return map[string]any{"clean": cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean, "blocking": cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking}
+			},
+		},
+		{
+			name:      "fixAllPullRequests alias",
+			legacy:    `{"defaults":{"fixAllPullRequests":true}}`,
+			canonical: `{"roles":{"fixer":{"triggers":{"authorFilter":"any"}}}}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				return cfg.Roles.Fixer.Triggers.AuthorFilter
+			},
+		},
+		{
+			name:      "project path alias",
+			legacy:    `{"projects":[{"id":"demo","name":"Demo","path":"/repos/demo"}]}`,
+			canonical: `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo"}]}`,
+			extract: func(t *testing.T, cfg Config) any {
+				t.Helper()
+				if len(cfg.Projects) != 1 {
+					t.Fatalf("len(cfg.Projects) = %d, want 1", len(cfg.Projects))
+				}
+				return cfg.Projects[0].RepoPath
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy := loadConfigFromJSONFixture(t, tc.legacy)
+			canonical := loadConfigFromJSONFixture(t, tc.canonical)
+
+			legacyValue := tc.extract(t, legacy.Config)
+			canonicalValue := tc.extract(t, canonical.Config)
+			if !reflect.DeepEqual(legacyValue, canonicalValue) {
+				t.Fatalf("legacy target = %#v, canonical target = %#v", legacyValue, canonicalValue)
+			}
+		})
+	}
+}
+
+func TestLegacyAndCanonicalFixerEnvOverridesProduceEquivalentTargets(t *testing.T) {
+	legacy := loadConfigWithEnvFixture(t, map[string]string{"LOOPER_FIX_ALL_PULL_REQUESTS": "true"})
+	canonical := loadConfigWithEnvFixture(t, map[string]string{"LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER": "any"})
+
+	if legacy.Config.Roles.Fixer.Triggers.AuthorFilter != canonical.Config.Roles.Fixer.Triggers.AuthorFilter {
+		t.Fatalf("legacy fixer authorFilter = %q, canonical fixer authorFilter = %q", legacy.Config.Roles.Fixer.Triggers.AuthorFilter, canonical.Config.Roles.Fixer.Triggers.AuthorFilter)
+	}
+}
+
+func TestLegacyAndCanonicalReviewerEnvOverridesResolveIdenticallyAndBeatFileConfig(t *testing.T) {
+	cleanFile := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+	legacyClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, map[string]string{"LOOPER_ALLOW_AUTO_APPROVE": "true"}, nil)
+	canonicalClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, map[string]string{"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN": "APPROVE"}, nil)
+
+	if got := legacyClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := canonicalClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("canonical env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	selfReviewFile := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":false}}}}}`
+	legacySelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, map[string]string{"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true"}, nil)
+	canonicalSelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, map[string]string{"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW": "true"}, nil)
+
+	if got := reviewerEnableSelfReviewValue(t, legacySelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("legacy env reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, canonicalSelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("canonical env reviewer enableSelfReview = %v, want true", got)
+	}
+}
+
+func TestLegacyAndCanonicalReviewerCLIOverridesResolveIdenticallyAndBeatFileConfig(t *testing.T) {
+	cleanFile := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+	legacyClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, nil, []string{"--allow-auto-approve=true"})
+	canonicalClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, nil, []string{"--roles-reviewer-behavior-review-events-clean=APPROVE"})
+
+	if got := legacyClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("legacy cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	if got := canonicalClean.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("canonical cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+
+	selfReviewFile := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":false}}}}}`
+	legacySelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, nil, []string{"--reviewer-enable-self-review=true"})
+	canonicalSelfReview := loadConfigFromJSONWithEnvAndArgsFixture(t, selfReviewFile, nil, []string{"--roles-reviewer-discovery-triggers-enable-self-review=true"})
+
+	if got := reviewerEnableSelfReviewValue(t, legacySelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("legacy cli reviewer enableSelfReview = %v, want true", got)
+	}
+	if got := reviewerEnableSelfReviewValue(t, canonicalSelfReview.Config.Roles.Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("canonical cli reviewer enableSelfReview = %v, want true", got)
+	}
+}
+
+func TestCanonicalReviewerCleanCLIOverrideWinsOverAllowAutoApproveRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+		"--allow-auto-approve=true",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with canonical then legacy flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--allow-auto-approve=true",
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with legacy then canonical flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+		"--reviewer-clean-review-event=APPROVE",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with canonical then legacy alias = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-clean-review-event=APPROVE",
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event with legacy alias then canonical = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestCanonicalFixerAuthorFilterCLIOverrideWinsOverFixAllPullRequestsRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"fixer":{"triggers":{"authorFilter":"current_user"}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-fixer-triggers-author-filter=current_user",
+		"--fix-all-pull-requests=true",
+	})
+	if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("author filter with canonical then legacy flags = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--fix-all-pull-requests=true",
+		"--roles-fixer-triggers-author-filter=current_user",
+	})
+	if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("author filter with legacy then canonical flags = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
+}
+
+func TestCanonicalReviewerEnableSelfReviewCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"discovery":{"triggers":{"enableSelfReview":true}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-discovery-triggers-enable-self-review=false",
+		"--reviewer-enable-self-review=true",
+	})
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); got {
+		t.Fatalf("enableSelfReview with canonical then legacy flags = %v, want false", got)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-enable-self-review=true",
+		"--roles-reviewer-discovery-triggers-enable-self-review=false",
+	})
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); got {
+		t.Fatalf("enableSelfReview with legacy then canonical flags = %v, want false", got)
+	}
+}
+
+func TestCanonicalReviewerBlockingCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"blocking":"COMMENT"}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-review-events-blocking=COMMENT",
+		"--reviewer-blocking-review-event=REQUEST_CHANGES",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventComment {
+		t.Fatalf("blocking review event with canonical then legacy flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-blocking-review-event=REQUEST_CHANGES",
+		"--roles-reviewer-behavior-review-events-blocking=COMMENT",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventComment {
+		t.Fatalf("blocking review event with legacy then canonical flags = %q, want %q", got, ReviewerReviewEventComment)
+	}
+}
+
+func TestCanonicalReviewerLoopEnabledCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"roles":{"reviewer":{"behavior":{"loop":{"enabledByDefault":true}}}}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--reviewer-loop-enabled=true",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.Loop.EnabledByDefault; got {
+		t.Fatalf("loop enabled with canonical then legacy flags = %v, want false", got)
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--reviewer-loop-enabled=true",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+	})
+	if got := loaded.Config.Roles.Reviewer.Behavior.Loop.EnabledByDefault; got {
+		t.Fatalf("loop enabled with legacy then canonical flags = %v, want false", got)
+	}
+}
+
+func TestCanonicalInstructionsEnabledCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"instructions":{"enabled":false}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--instructions-enabled=true",
+		"--no-custom-instructions=true",
+	})
+	if got := loaded.Config.Instructions.Enabled; !got {
+		t.Fatal("instructions enabled with canonical then legacy flags = false, want true")
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--no-custom-instructions=true",
+		"--instructions-enabled=true",
+	})
+	if got := loaded.Config.Instructions.Enabled; !got {
+		t.Fatal("instructions enabled with legacy then canonical flags = false, want true")
+	}
+}
+
+func TestCanonicalPackageAutoUpgradeCLIOverrideWinsOverLegacyAliasRegardlessOfOrder(t *testing.T) {
+	file := `{"package":{"autoUpgradeEnabled":false}}`
+
+	loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--package-auto-upgrade-enabled=true",
+		"--no-auto-upgrade=true",
+	})
+	if got := loaded.Config.Package.AutoUpgradeEnabled; !got {
+		t.Fatal("package autoUpgradeEnabled with canonical then legacy flags = false, want true")
+	}
+
+	loaded = loadConfigFromJSONWithEnvAndArgsFixture(t, file, nil, []string{
+		"--no-auto-upgrade=true",
+		"--package-auto-upgrade-enabled=true",
+	})
+	if got := loaded.Config.Package.AutoUpgradeEnabled; !got {
+		t.Fatal("package autoUpgradeEnabled with legacy then canonical flags = false, want true")
+	}
+}
+
+func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *testing.T) {
+	testCases := []struct {
+		name         string
+		fileName     string
+		contents     string
+		assertConfig func(t *testing.T, loaded LoadedFileConfig)
+		wantWarnings []string
+	}{
+		{
+			name:     "legacy reviewer root loses to canonical behavior",
+			fileName: "config.json",
+			contents: `{"reviewer":{"reviewEvents":{"clean":"APPROVE"}},"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+					t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventComment)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "reviewer" is accepted for now; use "roles.reviewer.behavior" instead`},
+		},
+		{
+			name:     "legacy reviewer discovery root loses to canonical discovery",
+			fileName: "config.toml",
+			contents: "[roles.reviewer]\nautoDiscovery = false\n\n[roles.reviewer.discovery]\nautoDiscovery = true\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if !loaded.Config.Roles.Reviewer.Discovery.AutoDiscovery {
+					t.Fatal("reviewer discovery autoDiscovery = false, want true")
+				}
+			},
+			wantWarnings: []string{`deprecated config path "roles.reviewer.autoDiscovery" is accepted for now; use "roles.reviewer.discovery.autoDiscovery" instead`},
+		},
+		{
+			name:     "legacy defaults alias loses to canonical fixer target",
+			fileName: "config.yaml",
+			contents: "defaults:\n  fixAllPullRequests: true\nroles:\n  fixer:\n    triggers:\n      authorFilter: current_user\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+					t.Fatalf("fixer authorFilter = %q, want %q", got, FixerAuthorFilterCurrentUser)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "defaults.fixAllPullRequests" is accepted for now; use "roles.fixer.triggers.authorFilter" instead`},
+		},
+		{
+			name:     "legacy project instructions lose to canonical project role instructions",
+			fileName: "config.json",
+			contents: `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","instructions":{"worker":"legacy"},"roles":{"worker":{"instructions":"canonical"}}}]}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+				if !strings.Contains(block.Text, "canonical") || strings.Contains(block.Text, "legacy") {
+					t.Fatalf("custom instruction block = %q, want canonical project instructions to win", block.Text)
+				}
+			},
+			wantWarnings: []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`},
+		},
+		{
+			name:     "legacy project reviewer discovery loses to canonical discovery",
+			fileName: "config.toml",
+			contents: "[[projects]]\nid = \"demo\"\nname = \"Demo\"\nrepoPath = \"/repos/demo\"\n\n[projects.roles.reviewer]\nautoDiscovery = false\n\n[projects.roles.reviewer.discovery]\nautoDiscovery = true\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if !ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.AutoDiscovery {
+					t.Fatal("project reviewer discovery autoDiscovery = false, want true")
+				}
+			},
+			wantWarnings: []string{`deprecated config path "projects[].roles.reviewer.autoDiscovery" is accepted for now; use "projects[].roles.reviewer.discovery.autoDiscovery" instead`},
+		},
+		{
+			name:     "legacy project path alias is preserved when it matches repoPath",
+			fileName: "config.yaml",
+			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/demo\n    repoPath: /repos/demo\n",
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if got := loaded.Config.Projects[0].RepoPath; got != "/repos/demo" {
+					t.Fatalf("project repoPath = %q, want %q", got, "/repos/demo")
+				}
+			},
+			wantWarnings: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			loaded := loadConfigFixture(t, tc.fileName, tc.contents, nil, nil)
+			tc.assertConfig(t, loaded)
+			assertWarningsEqual(t, loaded.Warnings, tc.wantWarnings)
+		})
+	}
+}
+
+func TestMixedSchemaEnvAndCLIOverridesStillBeatFileBackedValues(t *testing.T) {
+	file := `{"defaults":{"allowAutoApprove":true},"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
+
+	envLoaded := loadConfigFixture(t, "config.json", file, map[string]string{"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN": "APPROVE"}, nil)
+	if got := envLoaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("env clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	assertWarningsEqual(t, envLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
+
+	cliLoaded := loadConfigFixture(t, "config.json", file, nil, []string{"--roles-reviewer-behavior-review-events-clean=APPROVE"})
+	if got := cliLoaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+		t.Fatalf("cli clean review event = %q, want %q", got, ReviewerReviewEventApprove)
+	}
+	assertWarningsEqual(t, cliLoaded.Warnings, []string{`deprecated config path "defaults.allowAutoApprove" is accepted for now; use "roles.reviewer.behavior.reviewEvents.clean" instead`})
+}
+
+func TestLoadFileRejectsMismatchedProjectPathAndRepoPathAfterNormalization(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"projects":[{"id":"demo","name":"Demo","path":"/repos/legacy","repoPath":"/repos/canonical"}]}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "projects[0].path", "must match repoPath when both path and repoPath are set")
+}
+
+func TestDeprecatedAliasWarningsDeduplicateAndUseExactReplacementNames(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"projects": [
+			{"id":"demo-a","name":"Demo A","repoPath":"/repos/demo-a","instructions":{"worker":"legacy a"}},
+			{"id":"demo-b","name":"Demo B","repoPath":"/repos/demo-b","instructions":{"worker":"legacy b"}}
+		]
+	}`, map[string]string{
+		"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}, []string{
+		"--reviewer-enable-self-review=true",
+		"--reviewer-enable-self-review=false",
+	})
+
+	assertWarningsEqual(t, loaded.Warnings, []string{
+		`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`,
+		`deprecated environment variable "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW" is accepted for now; use "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW" instead`,
+		`deprecated CLI flag "--reviewer-enable-self-review" is accepted for now; use "--roles-reviewer-discovery-triggers-enable-self-review" instead`,
+	})
+}
+
+func TestLoadFileRejectsUnsupportedConfigSuffixWithExactMessage(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.txt")
+	if err := os.WriteFile(configPath, []byte("server:\n  port: 6101\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	want := fmt.Sprintf("unsupported config file suffix %q at %s; supported suffixes: .toml, .yaml, .yml, .json", ".txt", configPath)
+	if got := err.Error(); got != want {
+		t.Fatalf("LoadFile() error = %q, want %q", got, want)
+	}
+}
+
+func TestLegacyReviewerConfigStillValidatesAgainstCanonicalRules(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"reviewer":{"scope":"bad-scope","loop":{"quietPeriodSeconds":-1}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
+}
+
+func TestMixedSchemaConfigRejectsStructurallyIncompatibleTargets(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"reviewer":{"reviewEvents":{"clean":"APPROVE"}},"roles":{"reviewer":{"behavior":{"reviewEvents":"COMMENT"}}}}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `reviewEvents`) {
+		t.Fatalf("LoadFile() error = %q, want reviewEvents incompatibility", err)
+	}
+}
+
+func TestNormalizeLayersProduceEquivalentEffectiveConfigAcrossCanonicalLegacyAndMixedInputs(t *testing.T) {
+	legacyFile := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove:   boolPtr(true),
+			FixAllPullRequests: boolPtr(true),
+		},
+		LegacyReviewer: &PartialReviewerConfig{
+			Loop: &PartialReviewerLoopConfig{EnabledByDefault: boolPtr(true)},
+		},
+		Roles: &PartialRoleConfigs{
+			Reviewer: &PartialReviewerRoleConfig{
+				AutoDiscovery: boolPtr(false),
+				Triggers:      &PartialReviewerRoleTriggersConfig{Labels: &[]string{"legacy-file"}, LabelMode: labelModePtr(LabelModeAll)},
+			},
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:           "demo",
+			Name:         "Demo",
+			Path:         "/repos/demo",
+			Instructions: map[string]string{"worker": "legacy worker instructions"},
+			Roles:        &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoDiscovery: boolPtr(false)}},
+		}},
+	}
+	canonicalFile := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove:   boolPtr(true),
+			FixAllPullRequests: boolPtr(true),
+		},
+		Roles: &PartialRoleConfigs{
+			Reviewer: &PartialReviewerRoleConfig{
+				Behavior:  &PartialReviewerConfig{Loop: &PartialReviewerLoopConfig{EnabledByDefault: boolPtr(true)}},
+				Discovery: &PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(false), Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"legacy-file"}, LabelMode: labelModePtr(LabelModeAll)}},
+			},
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:       "demo",
+			Name:     "Demo",
+			RepoPath: "/repos/demo",
+			Roles: &PartialRoleConfigs{
+				Worker:   &PartialWorkerRoleConfig{Instructions: stringPtr("legacy worker instructions")},
+				Reviewer: &PartialReviewerRoleConfig{Discovery: &PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(false)}},
+			},
+		}},
+	}
+
+	legacyEnv, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+		"LOOPER_ALLOW_AUTO_APPROVE":                         "false",
+		"LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}))
+	if err != nil {
+		t.Fatalf("buildEnvOverrides(legacy) error = %v", err)
+	}
+	canonicalEnv, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+		"LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN":          "COMMENT",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW": "true",
+	}))
+	if err != nil {
+		t.Fatalf("buildEnvOverrides(canonical) error = %v", err)
+	}
+
+	legacyCLI, err := parseCLIArgs([]string{"--reviewer-loop-enabled=true", "--reviewer-enable-self-review=false", "--fix-all-pull-requests=false"})
+	if err != nil {
+		t.Fatalf("parseCLIArgs(legacy) error = %v", err)
+	}
+	canonicalCLI, err := parseCLIArgs([]string{"--roles-reviewer-behavior-loop-enabled-by-default=true", "--roles-reviewer-discovery-triggers-enable-self-review=false", "--roles-fixer-triggers-author-filter=current_user"})
+	if err != nil {
+		t.Fatalf("parseCLIArgs(canonical) error = %v", err)
+	}
+
+	cwd := t.TempDir()
+	legacyConfig, err := Normalize(cwd, legacyFile, legacyEnv, legacyCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(legacy layers) error = %v", err)
+	}
+	canonicalConfig, err := Normalize(cwd, canonicalFile, canonicalEnv, canonicalCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(canonical layers) error = %v", err)
+	}
+	mixedConfig, err := Normalize(cwd, legacyFile, canonicalEnv, legacyCLI.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(mixed layers) error = %v", err)
+	}
+
+	legacyEffective := map[string]any{
+		"clean":             legacyConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": legacyConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       legacyConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  legacyConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    legacyConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   legacyConfig.Projects[0].RepoPath,
+		"projectWorkerText": *legacyConfig.Projects[0].Roles.Worker.Instructions,
+	}
+	canonicalEffective := map[string]any{
+		"clean":             canonicalConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": canonicalConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       canonicalConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  canonicalConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    canonicalConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   canonicalConfig.Projects[0].RepoPath,
+		"projectWorkerText": *canonicalConfig.Projects[0].Roles.Worker.Instructions,
+	}
+	mixedEffective := map[string]any{
+		"clean":             mixedConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean,
+		"fixerAuthorFilter": mixedConfig.Roles.Fixer.Triggers.AuthorFilter,
+		"loopEnabled":       mixedConfig.Roles.Reviewer.Behavior.Loop.EnabledByDefault,
+		"enableSelfReview":  mixedConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		"reviewerLabels":    mixedConfig.Roles.Reviewer.Discovery.Triggers.Labels,
+		"projectRepoPath":   mixedConfig.Projects[0].RepoPath,
+		"projectWorkerText": *mixedConfig.Projects[0].Roles.Worker.Instructions,
+	}
+
+	if !reflect.DeepEqual(legacyEffective, canonicalEffective) {
+		t.Fatalf("legacy effective = %#v, canonical effective = %#v", legacyEffective, canonicalEffective)
+	}
+	if !reflect.DeepEqual(mixedEffective, canonicalEffective) {
+		t.Fatalf("mixed effective = %#v, canonical effective = %#v", mixedEffective, canonicalEffective)
+	}
+	if got := canonicalConfig.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventComment)
+	}
+	if got := canonicalConfig.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+		t.Fatalf("fixer authorFilter = %q, want %q", got, FixerAuthorFilterCurrentUser)
+	}
+	if got := canonicalConfig.Roles.Reviewer.Discovery.Triggers.EnableSelfReview; got {
+		t.Fatalf("reviewer enableSelfReview = %v, want false", got)
+	}
+	if got := canonicalConfig.Projects[0].RepoPath; got != "/repos/demo" {
+		t.Fatalf("project repoPath = %q, want %q", got, "/repos/demo")
+	}
+	if got := canonicalConfig.Projects[0].Roles.Worker.Instructions; got == nil || *got != "legacy worker instructions" {
+		t.Fatalf("project worker instructions = %v, want %q", got, "legacy worker instructions")
+	}
+}
+
+func TestNormalizeLayersKeepDeepMergeForObjectsAndArrayReplacementForArrays(t *testing.T) {
+	config, err := Normalize(t.TempDir(),
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"file": true}, "fileOnly": "file"}},
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"file-a", "file-b"}, LabelMode: labelModePtr(LabelModeAll)}}},
+		},
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"env": true}, "envOnly": "env"}},
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Discovery: &PartialReviewerRoleDiscoveryConfig{Triggers: &PartialReviewerRoleTriggersConfig{Labels: &[]string{"env-only"}, LabelMode: labelModePtr(LabelModeAny)}}}},
+		},
+		PartialConfig{
+			Agent: &PartialAgentConfig{Params: map[string]any{"shared": map[string]any{"cli": true}, "cliOnly": "cli"}},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	shared, ok := config.Agent.Params["shared"].(map[string]any)
+	if !ok {
+		t.Fatalf("shared params type = %T, want map[string]any", config.Agent.Params["shared"])
+	}
+	if !reflect.DeepEqual(shared, map[string]any{"file": true, "env": true, "cli": true}) {
+		t.Fatalf("shared params = %#v", shared)
+	}
+	if got := config.Agent.Params["fileOnly"]; got != "file" {
+		t.Fatalf("fileOnly = %#v, want %q", got, "file")
+	}
+	if got := config.Agent.Params["envOnly"]; got != "env" {
+		t.Fatalf("envOnly = %#v, want %q", got, "env")
+	}
+	if got := config.Agent.Params["cliOnly"]; got != "cli" {
+		t.Fatalf("cliOnly = %#v, want %q", got, "cli")
+	}
+	if !reflect.DeepEqual(config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"env-only"}) {
+		t.Fatalf("reviewer labels = %#v, want %#v", config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"env-only"})
+	}
+	if got := config.Roles.Reviewer.Discovery.Triggers.LabelMode; got != LabelModeAny {
+		t.Fatalf("reviewer labelMode = %q, want %q", got, LabelModeAny)
+	}
+}
+
 func TestRoleEnvironmentOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	loaded, err := LoadFile(LoadFileOptions{
@@ -371,11 +1034,11 @@ func TestRoleEnvironmentOverrides(t *testing.T) {
 	if loaded.Config.Roles.Planner.Triggers.LabelMode != LabelModeAny || loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("planner triggers = %#v", loaded.Config.Roles.Planner.Triggers)
 	}
-	if !loaded.Config.Roles.Reviewer.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Triggers.RequireReviewRequest {
-		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Triggers)
+	if !loaded.Config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts || loaded.Config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("reviewer triggers = %#v", loaded.Config.Roles.Reviewer.Discovery.Triggers)
 	}
-	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.SpecReview.IncludeReviewingLabel {
-		t.Fatalf("reviewer config = %#v", loaded.Config.Roles.Reviewer)
+	if !reflectStringSlicesEqual(loaded.Config.Roles.Reviewer.Discovery.Triggers.Labels, []string{"needs-review", "spec"}) || loaded.Config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel {
+		t.Fatalf("reviewer discovery = %#v", loaded.Config.Roles.Reviewer)
 	}
 	if loaded.Config.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(loaded.Config.Roles.Fixer.Triggers.Labels, []string{"bugfix"}) {
 		t.Fatalf("fixer config = %#v", loaded.Config.Roles.Fixer)
@@ -392,6 +1055,64 @@ func reflectStringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func loadConfigFromJSONFixture(t *testing.T, contents string) LoadedFileConfig {
+	t.Helper()
+	return loadConfigFixture(t, "config.json", contents, nil, nil)
+}
+
+func loadConfigFixture(t *testing.T, fileName string, contents string, env map[string]string, args []string) LoadedFileConfig {
+	t.Helper()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, fileName)
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	lookupEnv := emptyEnvLookup
+	if env != nil {
+		lookupEnv = mapEnvLookup(env)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: lookupEnv, Args: args, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	return loaded
+}
+
+func loadConfigWithEnvFixture(t *testing.T, env map[string]string) LoadedFileConfig {
+	t.Helper()
+
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: filepath.Join(cwd, "missing.json"), LookupEnv: mapEnvLookup(env), LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	return loaded
+}
+
+func loadConfigFromJSONWithEnvAndArgsFixture(t *testing.T, contents string, env map[string]string, args []string) LoadedFileConfig {
+	t.Helper()
+	return loadConfigFixture(t, "config.json", contents, env, args)
+}
+
+func assertWarningsEqual(t *testing.T, got []string, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("warnings = %#v, want %#v", got, want)
+	}
+}
+
+func assertNoticesEqual(t *testing.T, got []string, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("notices = %#v, want %#v", got, want)
+	}
 }
 
 func roleConfigMapFromRoles(t *testing.T, roles any, role string) (map[string]any, bool) {
@@ -611,7 +1332,7 @@ func TestLoadFileSupportsCustomInstructions(t *testing.T) {
 		t.Fatalf("project repo path = %q", got)
 	}
 	block := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
-	if !strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
+	if strings.Contains(block.Text, "Keep specs scoped.") || !strings.Contains(block.Text, "Respect local config precedence.") {
 		t.Fatalf("custom block missing instructions: %s", block.Text)
 	}
 }
@@ -621,16 +1342,20 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
 		"roles": {
+			"planner": {"autoDiscovery": false, "triggers": {"labels": ["needs-plan"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global planner guidance."},
 			"worker": {"autoDiscovery": false, "triggers": {"labels": ["global"], "labelMode": "all", "requireAssigneeCurrentUser": true}, "instructions": "Global worker guidance."},
-			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "enableSelfReview": false, "labels": ["review"], "labelMode": "all"}}
+			"reviewer": {"triggers": {"includeDrafts": false, "requireReviewRequest": true, "enableSelfReview": false, "labels": ["review"], "labelMode": "all"}},
+			"fixer": {"autoDiscovery": false, "triggers": {"includeDrafts": false, "authorFilter": "current_user", "labels": ["needs-fix"], "labelMode": "all"}, "instructions": "Global fixer guidance."}
 		},
 		"projects": [{
 			"id": "demo",
 			"name": "Demo",
 			"repoPath": "/repos/demo",
 			"roles": {
+				"planner": {"autoDiscovery": true, "triggers": {"labels": ["project-plan"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project planner guidance."},
 				"worker": {"autoDiscovery": true, "triggers": {"labels": ["project"], "labelMode": "any", "requireAssigneeCurrentUser": false}, "instructions": "Project worker guidance."},
-				"reviewer": {"triggers": {"includeDrafts": true, "enableSelfReview": true}}
+				"reviewer": {"triggers": {"includeDrafts": true, "enableSelfReview": true}},
+				"fixer": {"autoDiscovery": true, "triggers": {"includeDrafts": true, "authorFilter": "any", "labels": ["project-fix"], "labelMode": "any"}, "instructions": "Project fixer guidance."}
 			}
 		}]
 	}`
@@ -643,21 +1368,33 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	}
 
 	global := ProjectRoleConfigs(loaded.Config, "missing")
+	if global.Planner.AutoDiscovery || !reflectStringSlicesEqual(global.Planner.Triggers.Labels, []string{"needs-plan"}) || !global.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("global planner roles = %#v", global.Planner)
+	}
 	if global.Worker.AutoDiscovery || !reflectStringSlicesEqual(global.Worker.Triggers.Labels, []string{"global"}) || !global.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("global worker roles = %#v", global.Worker)
 	}
+	if global.Fixer.AutoDiscovery || global.Fixer.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || !reflectStringSlicesEqual(global.Fixer.Triggers.Labels, []string{"needs-fix"}) {
+		t.Fatalf("global fixer roles = %#v", global.Fixer)
+	}
 
 	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
+	if !projectRoles.Planner.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Planner.Triggers.Labels, []string{"project-plan"}) || projectRoles.Planner.Triggers.LabelMode != LabelModeAny || projectRoles.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatalf("project planner roles = %#v", projectRoles.Planner)
+	}
 	if !projectRoles.Worker.AutoDiscovery || !reflectStringSlicesEqual(projectRoles.Worker.Triggers.Labels, []string{"project"}) || projectRoles.Worker.Triggers.LabelMode != LabelModeAny || projectRoles.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatalf("project worker roles = %#v", projectRoles.Worker)
 	}
-	if !projectRoles.Reviewer.Triggers.IncludeDrafts || !projectRoles.Reviewer.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Triggers.Labels, []string{"review"}) {
-		t.Fatalf("project reviewer roles = %#v", projectRoles.Reviewer)
+	if !projectRoles.Reviewer.Discovery.Triggers.IncludeDrafts || !projectRoles.Reviewer.Discovery.Triggers.RequireReviewRequest || !reflectStringSlicesEqual(projectRoles.Reviewer.Discovery.Triggers.Labels, []string{"review"}) {
+		t.Fatalf("project reviewer triggers = %#v", projectRoles.Reviewer)
 	}
-	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Triggers); got {
+	if !projectRoles.Fixer.AutoDiscovery || projectRoles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny || !reflectStringSlicesEqual(projectRoles.Fixer.Triggers.Labels, []string{"project-fix"}) || projectRoles.Fixer.Triggers.LabelMode != LabelModeAny {
+		t.Fatalf("project fixer roles = %#v", projectRoles.Fixer)
+	}
+	if got := reviewerEnableSelfReviewValue(t, global.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want false", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, projectRoles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, projectRoles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("project reviewer enableSelfReview = %v, want true", got)
 	}
 	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "worker") {
@@ -667,6 +1404,14 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
 	if strings.Contains(block.Text, "Global worker guidance.") || !strings.Contains(block.Text, "Project worker guidance.") {
 		t.Fatalf("custom instruction block did not use project role override: %s", block.Text)
+	}
+	plannerBlock := BuildCustomInstructionBlock(loaded.Config, "demo", "planner")
+	if strings.Contains(plannerBlock.Text, "Global planner guidance.") || !strings.Contains(plannerBlock.Text, "Project planner guidance.") {
+		t.Fatalf("planner custom instruction block did not use project role override: %s", plannerBlock.Text)
+	}
+	fixerBlock := BuildCustomInstructionBlock(loaded.Config, "demo", "fixer")
+	if strings.Contains(fixerBlock.Text, "Global fixer guidance.") || !strings.Contains(fixerBlock.Text, "Project fixer guidance.") {
+		t.Fatalf("fixer custom instruction block did not use project role override: %s", fixerBlock.Text)
 	}
 }
 
@@ -763,8 +1508,8 @@ func TestLoadFileSupportsSweeperCustomInstructions(t *testing.T) {
 	if !strings.Contains(block.Text, "Project demo sweeper role instruction") {
 		t.Fatalf("custom instruction block did not include project sweeper role override: %q", block.Text)
 	}
-	if !strings.Contains(block.Text, "Project demo sweeper instructions") {
-		t.Fatalf("custom instruction block did not include project sweeper map instruction: %q", block.Text)
+	if strings.Contains(block.Text, "Project demo sweeper instructions") || strings.Contains(block.Text, "Project sweeper map instruction.") {
+		t.Fatalf("custom instruction block kept deprecated project instruction map instead of canonical project role instructions: %q", block.Text)
 	}
 }
 
@@ -854,10 +1599,10 @@ func TestLoadFileSupportsReviewerEnableSelfReviewOverride(t *testing.T) {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); got {
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.Triggers); got {
 		t.Fatalf("project reviewer enableSelfReview = %v, want false", got)
 	}
 }
@@ -890,18 +1635,18 @@ func TestEnvOverrideReviewerEnableSelfReviewBeatsProjectConfig(t *testing.T) {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Triggers); !got {
+	if got := reviewerEnableSelfReviewValue(t, loaded.Config.Roles.Reviewer.Discovery.Triggers); !got {
 		t.Fatalf("global reviewer enableSelfReview = %v, want true", got)
 	}
-	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Triggers); !got {
-		t.Fatalf("project reviewer enableSelfReview = %v, want true from env override", got)
+	if got := reviewerEnableSelfReviewValue(t, ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.Triggers); !got {
+		t.Fatalf("project reviewer enableSelfReview = %v, want true", got)
 	}
 }
 
 func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
 		Roles:    &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("Global worker guidance.")}},
-		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("")}}}},
+		Projects: &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("")}}}},
 	})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
@@ -912,25 +1657,68 @@ func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
 	}
 }
 
-func TestValidateProjectRoleInstructionAggregateBytes(t *testing.T) {
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Instructions: &PartialInstructionsConfig{MaxBytes: intPtr(8)},
-		Projects:     &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{Instructions: stringPtr("12345")}}, Instructions: map[string]string{"worker": "6789"}}},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
+func TestLegacyProjectInstructionsNormalizeToCanonicalProjectRoleInstructions(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"worker": "Legacy project worker guidance."}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if !strings.Contains(block.Text, "Legacy project worker guidance.") {
+		t.Fatalf("custom instruction block = %q, want normalized legacy project instruction", block.Text)
 	}
-	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-	var validationErr *ConfigValidationError
-	if err == nil || !errors.As(err, &validationErr) || !hasValidationIssue(validationErr.Issues, "projects[0].instructions.worker") {
-		t.Fatalf("ValidateWithOptions() error = %v, issues = %#v, want aggregate project instruction validation", err, validationErr)
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
+}
+
+func TestCanonicalProjectRoleInstructionsBeatLegacyProjectInstructionMap(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"worker": "Legacy worker guidance."},
+			"roles": {"worker": {"instructions": "Canonical worker guidance."}}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if !strings.Contains(block.Text, "Canonical worker guidance.") || strings.Contains(block.Text, "Legacy worker guidance.") {
+		t.Fatalf("custom instruction block = %q, want canonical project role instructions to win", block.Text)
 	}
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
+}
+
+func TestLoadFileRejectsUnknownLegacyProjectInstructionRole(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","instructions":{"reveiwer":"legacy"}}]}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want config validation error")
+	}
+
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+
+	assertValidationIssue(t, validationErr, "projects[0].instructions.reveiwer", "role must be one of: planner, worker, reviewer, fixer, sweeper")
 }
 
 func TestValidateProjectReviewerLabelCanBeClearedWhenDisabled(t *testing.T) {
 	falseValue := false
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Projects: &[]ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{SpecReview: &PartialReviewerSpecReviewConfig{IncludeReviewingLabel: &falseValue, ReviewingLabel: stringPtr("")}}}}},
+		Projects: &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: "/repos/demo", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{SpecReview: &PartialReviewerSpecReviewConfig{IncludeReviewingLabel: &falseValue, ReviewingLabel: stringPtr("")}}}}},
 	})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
@@ -1000,6 +1788,13 @@ func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
 }
 
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
 	loaded, err := LoadFile(LoadFileOptions{
 		CWD:      t.TempDir(),
 		LookPath: fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
@@ -1015,6 +1810,91 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 
 	if loaded.Metadata.ConfigPath != defaultConfigPath {
 		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+	}
+}
+
+func TestLoadFileLoadsSupportedConfigFormats(t *testing.T) {
+	cwd := t.TempDir()
+	lookPath := fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"})
+
+	tests := []struct {
+		name     string
+		suffix   string
+		contents string
+		port     int
+	}{
+		{name: "json", suffix: ".json", contents: `{"server":{"port":6101}}`, port: 6101},
+		{name: "yaml", suffix: ".yaml", contents: "server:\n  port: 6102\n", port: 6102},
+		{name: "yml", suffix: ".yml", contents: "server:\n  port: 6103\n", port: 6103},
+		{name: "toml", suffix: ".toml", contents: "[server]\nport = 6104\n", port: 6104},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(cwd, "config"+tt.suffix)
+			if err := os.WriteFile(configPath, []byte(tt.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+
+			loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: lookPath})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+
+			if loaded.Config.Server.Port != tt.port {
+				t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, tt.port)
+			}
+			if !loaded.Metadata.ConfigFilePresent {
+				t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+			}
+		})
+	}
+}
+
+func TestLoadFileNullEmptyAndOmittedShapesProduceEquivalentDefaultsAcrossFormats(t *testing.T) {
+	lookPath := fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})
+	cwd := t.TempDir()
+	tests := []struct {
+		name     string
+		fileName string
+		contents string
+	}{
+		{name: "json null", fileName: "config.json", contents: `null`},
+		{name: "json empty object", fileName: "config.json", contents: `{}`},
+		{name: "yaml null", fileName: "config.yaml", contents: "null\n"},
+		{name: "yaml empty object", fileName: "config.yaml", contents: "{}\n"},
+		{name: "yaml omitted", fileName: "config.yaml", contents: ""},
+		{name: "toml omitted", fileName: "config.toml", contents: ""},
+	}
+
+	var baselineConfig any
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(cwd, tt.fileName)
+			if err := os.WriteFile(configPath, []byte(tt.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+
+			loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: lookPath})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+			if !loaded.Metadata.ConfigFilePresent {
+				t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+			}
+			if loaded.Partial != (PartialConfig{}) {
+				t.Fatalf("LoadFile().Partial = %#v, want empty partial config", loaded.Partial)
+			}
+
+			current := toJSONValue(t, loaded.Config)
+			if baselineConfig == nil {
+				baselineConfig = current
+				return
+			}
+			if !reflect.DeepEqual(current, baselineConfig) {
+				t.Fatalf("effective config mismatch\ncurrent: %#v\nbaseline: %#v", current, baselineConfig)
+			}
+		})
 	}
 }
 
@@ -1248,6 +2128,186 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
 	})
 }
 
+func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenDiscoveredDefault(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
+	cwd := t.TempDir()
+	cliConfigPath := filepath.Join(cwd, "cli.yaml")
+	envConfigPath := filepath.Join(cwd, "env.json")
+	defaultConfigPath := filepath.Join(looperHome, "config.toml")
+
+	for path, contents := range map[string]string{
+		cliConfigPath:     "server:\n  port: 7100\n",
+		envConfigPath:     `{"server":{"port":7200}}`,
+		defaultConfigPath: "[server]\nport = 7300\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+	}
+
+	t.Run("cli beats env and discovered default", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:       cwd,
+			Args:      []string{"--config", cliConfigPath},
+			LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != cliConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, cliConfigPath)
+		}
+		if loaded.Config.Server.Port != 7100 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7100)
+		}
+	})
+
+	t.Run("env beats discovered default when cli absent", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{
+			CWD:       cwd,
+			LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": envConfigPath}),
+		})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != envConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, envConfigPath)
+		}
+		if loaded.Config.Server.Port != 7200 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7200)
+		}
+	})
+
+	t.Run("discovered default used when cli and env absent", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: cwd, LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+
+		if loaded.Metadata.ConfigPath != defaultConfigPath {
+			t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, defaultConfigPath)
+		}
+		if loaded.Config.Server.Port != 7300 {
+			t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", loaded.Config.Server.Port, 7300)
+		}
+	})
+}
+
+func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+
+	for _, name := range []string{"config.toml", "config.json"} {
+		if err := os.WriteFile(filepath.Join(looperHome, name), []byte("{}"), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
+		}
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: emptyEnvLookup})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want error")
+	}
+
+	if got := err.Error(); !strings.Contains(got, "multiple default config files found") || !strings.Contains(got, "config.toml") || !strings.Contains(got, "config.json") {
+		t.Fatalf("LoadFile() error = %q, want multiple-default-files error", got)
+	}
+}
+
+func TestLoadFileLegacyDefaultConfigJSONEmitsMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	canonicalDefaultPath := filepath.Join(looperHome, "config.toml")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	wantNotices := []string{legacyDefaultConfigMigrationNote(legacyDefaultPath, canonicalDefaultPath)}
+
+	t.Run("discovered default path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+
+	t.Run("explicit env path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: mapEnvLookup(map[string]string{"LOOPER_CONFIG": legacyDefaultPath})})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+
+	t.Run("explicit cli path", func(t *testing.T) {
+		loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), Args: []string{"--config", legacyDefaultPath}, LookupEnv: emptyEnvLookup})
+		if err != nil {
+			t.Fatalf("LoadFile() error = %v", err)
+		}
+		assertNoticesEqual(t, loaded.Notices, wantNotices)
+	})
+}
+
+func TestLoadFileIgnoresConfigLoadNoticeHomeResolutionErrors(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	original := defaultLooperHomeForNotices
+	defaultLooperHomeForNotices = func() (string, error) {
+		return "", fmt.Errorf("home unavailable")
+	}
+	defer func() {
+		defaultLooperHomeForNotices = original
+	}()
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), ConfigPath: configPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got, want := loaded.Config.Server.Port, 7400; got != want {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want %d", got, want)
+	}
+	assertNoticesEqual(t, loaded.Notices, nil)
+}
+
+func TestLoadFileDoesNotEmitMigrationNoteForNonLegacyDefaultJSON(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	otherJSONPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(otherJSONPath, []byte(`{"server":{"port":7500}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), ConfigPath: otherJSONPath, LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	assertNoticesEqual(t, loaded.Notices, nil)
+}
+
 func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -1271,7 +2331,7 @@ func TestLoadFileReviewerLoopPrecedenceDefaultsFileEnvCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	loop := loaded.Config.Reviewer.Loop
+	loop := loaded.Config.Roles.Reviewer.Behavior.Loop
 	if !loop.EnabledByDefault || loop.QuietPeriodSeconds != 45 || loop.MinPublishIntervalSeconds != 1200 || loop.MaxIterationsPerPR != 11 || loop.MaxIterationsPerHead != 3 {
 		t.Fatalf("reviewer loop config = %#v, want cli/env/file precedence applied", loop)
 	}
@@ -1297,11 +2357,47 @@ func TestLoadFileReviewerReviewEventsPrecedenceDefaultsFileEnvCLI(t *testing.T) 
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if got := loaded.Config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
 		t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventApprove)
 	}
-	if got := loaded.Config.Reviewer.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
+	if got := loaded.Config.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
 		t.Fatalf("blocking review event = %q, want %q", got, ReviewerReviewEventRequestChanges)
+	}
+}
+
+func TestLoadFileReviewerNativeResumeOnHeadChangeEnvOverride(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE": "true"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
+		t.Fatalf("reviewer.nativeResume.onHeadChange = false, want true")
+	}
+	if loaded.Config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = true, want false")
+	}
+}
+
+func TestLoadFileReviewerNativeResumeReReviewPromptOnHeadChangeEnvOverride(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE": "true"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatalf("reviewer.nativeResume.reReviewPromptOnHeadChange = false, want true")
+	}
+	if loaded.Config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
+		t.Fatalf("reviewer.nativeResume.onHeadChange = true, want false")
 	}
 }
 
@@ -1312,15 +2408,15 @@ func TestNormalizeAllowAutoApproveLegacyAliasRespectsExplicitReviewerCleanEvent(
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
-	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
+	if got := config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
 		t.Fatalf("legacy clean review event = %q, want %q", got, ReviewerReviewEventApprove)
 	}
 
-	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, Reviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
+	config, err = Normalize("/tmp", PartialConfig{Defaults: &PartialDefaultsConfig{AllowAutoApprove: &trueValue}, LegacyReviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &comment}}})
 	if err != nil {
 		t.Fatalf("Normalize(explicit) error = %v", err)
 	}
-	if got := config.Reviewer.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+	if got := config.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
 		t.Fatalf("explicit clean review event = %q, want %q", got, ReviewerReviewEventComment)
 	}
 }
@@ -1330,8 +2426,8 @@ func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	cfg.Reviewer.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
-	cfg.Reviewer.ReviewEvents.Blocking = ReviewerReviewEventApprove
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = ReviewerReviewEventRequestChanges
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = ReviewerReviewEventApprove
 	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "config validation failed") {
 		t.Fatalf("ValidateWithOptions() error = %v, want validation failure", err)
@@ -1431,10 +2527,10 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
 	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
-	assertValidationIssue(t, validationErr, "reviewer.loop.quietPeriodSeconds", "must be an integer >= 0")
-	assertValidationIssue(t, validationErr, "reviewer.loop.minPublishIntervalSeconds", "must be an integer >= 0")
-	assertValidationIssue(t, validationErr, "reviewer.scope", "must be one of: full_pr, changed_files, changed_ranges")
-	assertValidationIssue(t, validationErr, "reviewer.publishMode", "must be single_review")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.minPublishIntervalSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.publishMode", "must be single_review")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
 }
@@ -1721,6 +2817,13 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Agent maps = %#v / %#v, want empty maps", config.Agent.Params, config.Agent.Env)
 	}
 
+	if config.Roles.Reviewer.Behavior.NativeResume.OnHeadChange {
+		t.Fatal("DefaultConfig().Reviewer.NativeResume.OnHeadChange = true, want false")
+	}
+	if config.Roles.Reviewer.Behavior.NativeResume.ReReviewPromptOnHeadChange {
+		t.Fatal("DefaultConfig().Reviewer.NativeResume.ReReviewPromptOnHeadChange = true, want false")
+	}
+
 	if len(config.Projects) != 0 {
 		t.Fatalf("DefaultConfig().Projects len = %d, want 0", len(config.Projects))
 	}
@@ -1746,7 +2849,7 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 	repoBaseBranch := "stable"
 	worktreeRoot := "/tmp/worktrees/project-a"
 
-	projects := []ProjectRefConfig{{
+	projects := []PartialProjectRefConfig{{
 		ID:           "project-a",
 		Name:         "Project A",
 		RepoPath:     "/repos/project-a",
@@ -1930,7 +3033,7 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 func TestNormalizeReplacesArraysAndClonesMaps(t *testing.T) {
 	soundLevels := []NotificationSoundLevel{}
-	projects := []ProjectRefConfig{{ID: "project-b", Name: "Project B", RepoPath: "/repos/project-b"}}
+	projects := []PartialProjectRefConfig{{ID: "project-b", Name: "Project B", RepoPath: "/repos/project-b"}}
 	params := map[string]any{"reasoning": "high"}
 	env := map[string]string{"FOO": "bar"}
 	environment := map[string]string{"BAR": "baz"}
@@ -1982,7 +3085,7 @@ func TestNormalizeAppliesLayersInOrder(t *testing.T) {
 	overriddenPort := 7000
 	baseParams := map[string]any{"reasoning": map[string]any{"level": "high", "mode": "careful"}}
 	overrideParams := map[string]any{"reasoning": map[string]any{"mode": "fast"}, "verbosity": "low"}
-	projects := []ProjectRefConfig{}
+	projects := []PartialProjectRefConfig{}
 
 	config, err := Normalize("/tmp/cwd",
 		PartialConfig{
@@ -2040,8 +3143,8 @@ func TestDefaultPathHelpersMatchTSLayout(t *testing.T) {
 		t.Fatalf("DefaultConfigPath() error = %v", err)
 	}
 
-	if configPath != filepath.Join(homeDir, ".looper", "config.json") {
-		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, filepath.Join(homeDir, ".looper", "config.json"))
+	if configPath != filepath.Join(homeDir, ".looper", "config.toml") {
+		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, filepath.Join(homeDir, ".looper", "config.toml"))
 	}
 
 	worktreeRoot, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo")
@@ -2156,5 +3259,9 @@ func emptyEnvLookup(string) (string, bool) {
 }
 
 func intPtr(value int) *int {
+	return &value
+}
+
+func labelModePtr(value LabelMode) *LabelMode {
 	return &value
 }

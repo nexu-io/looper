@@ -1,0 +1,84 @@
+name: sandbox-cleanup
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup-sandbox-resources:
+    name: Cleanup stale sandbox resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+
+    steps:
+      - name: Resolve sandbox repository target
+        id: sandbox-repo
+        shell: bash
+        run: |
+          repo="${SANDBOX_REPO}"
+          owner="${repo%%/*}"
+          name="${repo#*/}"
+          if [ -z "$owner" ] || [ -z "$name" ] || [ "$owner" = "$repo" ]; then
+            printf 'SANDBOX_REPO must use owner/repo format, got %s\n' "$repo" >&2
+            exit 1
+          fi
+          printf 'owner=%s\n' "$owner" >> "$GITHUB_OUTPUT"
+          printf 'repo=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Mint sandbox GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          private-key: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ steps.sandbox-repo.outputs.owner }}
+          repositories: |
+            ${{ steps.sandbox-repo.outputs.repo }}
+
+      - name: Close stale sandbox issues and pull requests
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_PROMPT_DISABLED: '1'
+        run: |
+          python <<'PY'
+          import json, os, subprocess, sys
+          from datetime import datetime, timedelta, timezone
+
+          repo = os.environ["SANDBOX_REPO"]
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+
+          def run(*args):
+              result = subprocess.run(args, check=True, text=True, capture_output=True)
+              return result.stdout
+
+          def parse_when(value):
+              return datetime.fromisoformat(value.replace('Z', '+00:00'))
+
+          issues = json.loads(run("gh", "issue", "list", "--repo", repo, "--state", "open", "--label", "looper-e2e", "--limit", "200", "--json", "number,title,createdAt,url"))
+          for issue in issues:
+              if not issue["title"].startswith("looper-e2e:"):
+                  continue
+              if parse_when(issue["createdAt"]) >= cutoff:
+                  continue
+              print(f"closing issue {issue['url']}")
+              subprocess.run(["gh", "issue", "close", str(issue["number"]), "--repo", repo], check=True)
+
+          prs = json.loads(run("gh", "pr", "list", "--repo", repo, "--state", "open", "--label", "looper-e2e", "--limit", "200", "--json", "number,title,createdAt,url,headRefName"))
+          for pr in prs:
+              if not pr["title"].startswith("looper-e2e:"):
+                  continue
+              if parse_when(pr["createdAt"]) >= cutoff:
+                  continue
+              print(f"closing pr {pr['url']}")
+              subprocess.run(["gh", "pr", "close", str(pr["number"]), "--repo", repo, "--delete-branch"], check=True)
+              branch = pr.get("headRefName", "")
+              if branch.startswith("looper-e2e-"):
+                  ref = f"heads/{branch}"
+                  subprocess.run(["gh", "api", f"repos/{repo}/git/refs/{ref}", "--method", "DELETE"], check=False)
+          PY

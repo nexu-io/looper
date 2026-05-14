@@ -1043,6 +1043,19 @@ func (r *AgentExecutionsRepository) GetLatestByRunID(ctx context.Context, runID 
 	return &record, nil
 }
 
+func (r *AgentExecutionsRepository) GetLatestActiveByRunID(ctx context.Context, runID string) (*AgentExecutionRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE run_id = ? AND status IN ('running', 'cancelling') ORDER BY started_at DESC, id DESC LIMIT 1`, runID)
+	record, err := scanAgentExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest active agent execution by run id: %w", err)
+	}
+
+	return &record, nil
+}
+
 func (r *AgentExecutionsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*AgentExecutionRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
 	record, err := scanAgentExecution(row)
@@ -1209,6 +1222,24 @@ func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, err
 	}
 
 	return &record, nil
+}
+
+func (r *LocksRepository) Refresh(ctx context.Context, record LockRecord) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE locks
+		SET reason = ?, expires_at = ?, updated_at = ?
+		WHERE key = ? AND owner = ?
+	`, record.Reason, record.ExpiresAt, record.UpdatedAt, record.Key, record.Owner)
+	if err != nil {
+		return false, fmt.Errorf("refresh lock: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read refresh lock rows affected: %w", err)
+	}
+
+	return affected > 0, nil
 }
 
 func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]LockRecord, error) {

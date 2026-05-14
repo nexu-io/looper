@@ -19,7 +19,9 @@ type configField struct {
 	key       string
 	valueType string
 	env       string
+	envAlias  string
 	flag      string
+	flagAlias string
 	get       func(config.Config) any
 	set       func(*config.PartialConfig, string) error
 	unset     func(*config.PartialConfig)
@@ -34,13 +36,19 @@ var configFieldRegistry = map[string]configField{
 	"defaults.allowRiskyFixes":    boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
 	"defaults.fixAllPullRequests": boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
 	"defaults.openPrStrategy":     openPRStrategyField(),
-	"instructions.enabled":        boolField("instructions.enabled", "", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
-	"package.autoUpgradeEnabled":  boolField("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
+	"instructions.enabled":        boolFieldWithAlias("instructions.enabled", "", "", "instructions-enabled", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
+	"package.autoUpgradeEnabled":  boolFieldWithAlias("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "", "package-auto-upgrade-enabled", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
 	"instructions.maxBytes":       positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
-	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"roles.reviewer.behavior.reviewEvents.clean": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.clean", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "roles-reviewer-behavior-review-events-clean", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
-	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", "roles-reviewer-behavior-review-events-clean", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Clean
+	}),
+	"roles.reviewer.behavior.reviewEvents.blocking": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.blocking", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "roles-reviewer-behavior-review-events-blocking", "reviewer-blocking-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
+		return &ensurePartialReviewerReviewEvents(p).Blocking
+	}),
+	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", "roles-reviewer-behavior-review-events-blocking", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Blocking
 	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
@@ -57,24 +65,93 @@ var configFieldRegistry = map[string]configField{
 	"roles.worker.triggers.requireAssigneeCurrentUser": boolField("roles.worker.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Worker.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialWorkerTriggers(p).RequireAssigneeCurrentUser
 	}),
-	"roles.reviewer.autoDiscovery":          boolField("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Reviewer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRole(p).AutoDiscovery }),
-	"roles.reviewer.instructions":           stringField("roles.reviewer.instructions", "", "", func(c config.Config) any { return c.Roles.Reviewer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerRole(p).Instructions }),
-	"roles.reviewer.triggers.includeDrafts": boolField("roles.reviewer.triggers.includeDrafts", "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRoleTriggers(p).IncludeDrafts }),
-	"roles.reviewer.triggers.requireReviewRequest": boolField("roles.reviewer.triggers.requireReviewRequest", "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.RequireReviewRequest }, func(p *config.PartialConfig) **bool {
+	"roles.reviewer.discovery.autoDiscovery": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.autoDiscovery", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscovery(p).AutoDiscovery
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRole(p).AutoDiscovery
+	}),
+	"roles.reviewer.autoDiscovery": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscovery(p).AutoDiscovery
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRole(p).AutoDiscovery
+	}),
+	"roles.reviewer.instructions": stringField("roles.reviewer.instructions", "", "", func(c config.Config) any { return c.Roles.Reviewer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerRole(p).Instructions }),
+	"roles.reviewer.discovery.triggers.includeDrafts": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.triggers.includeDrafts", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).IncludeDrafts
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).IncludeDrafts
+	}),
+	"roles.reviewer.triggers.includeDrafts": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.triggers.includeDrafts", "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).IncludeDrafts
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).IncludeDrafts
+	}),
+	"roles.reviewer.discovery.triggers.requireReviewRequest": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.triggers.requireReviewRequest", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).RequireReviewRequest
+	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleTriggers(p).RequireReviewRequest
 	}),
-	"roles.reviewer.triggers.labels": stringListField("roles.reviewer.triggers.labels", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Reviewer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialReviewerRoleTriggers(p).Labels }),
-	"roles.reviewer.triggers.labelMode": labelModeField("roles.reviewer.triggers.labelMode", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Reviewer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode {
+	"roles.reviewer.triggers.requireReviewRequest": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.triggers.requireReviewRequest", "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).RequireReviewRequest
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).RequireReviewRequest
+	}),
+	"roles.reviewer.discovery.triggers.enableSelfReview": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.triggers.enableSelfReview", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "roles-reviewer-discovery-triggers-enable-self-review", "reviewer-enable-self-review", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.EnableSelfReview }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).EnableSelfReview
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).EnableSelfReview
+	}),
+	"roles.reviewer.triggers.enableSelfReview": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.triggers.enableSelfReview", "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", "reviewer-enable-self-review", "roles-reviewer-discovery-triggers-enable-self-review", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.EnableSelfReview }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).EnableSelfReview
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleTriggers(p).EnableSelfReview
+	}),
+	"roles.reviewer.discovery.triggers.labels": reviewerDiscoveryStringListFieldWithAlias("roles.reviewer.discovery.triggers.labels", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.Labels }, func(p *config.PartialConfig) **[]string {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).Labels
+	}, func(p *config.PartialConfig) **[]string {
+		return &ensurePartialReviewerRoleTriggers(p).Labels
+	}),
+	"roles.reviewer.triggers.labels": reviewerDiscoveryStringListFieldWithAlias("roles.reviewer.triggers.labels", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.Labels }, func(p *config.PartialConfig) **[]string {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).Labels
+	}, func(p *config.PartialConfig) **[]string {
+		return &ensurePartialReviewerRoleTriggers(p).Labels
+	}),
+	"roles.reviewer.discovery.triggers.labelMode": reviewerDiscoveryLabelModeFieldWithAlias("roles.reviewer.discovery.triggers.labelMode", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).LabelMode
+	}, func(p *config.PartialConfig) **config.LabelMode {
 		return &ensurePartialReviewerRoleTriggers(p).LabelMode
 	}),
-	"roles.reviewer.specReview.includeReviewingLabel": boolField("roles.reviewer.specReview.includeReviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "", func(c config.Config) any { return c.Roles.Reviewer.SpecReview.IncludeReviewingLabel }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerSpecReview(p).IncludeReviewingLabel }),
-	"roles.reviewer.specReview.reviewingLabel":        stringField("roles.reviewer.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "", func(c config.Config) any { return c.Roles.Reviewer.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerSpecReview(p).ReviewingLabel }),
-	"roles.fixer.autoDiscovery":                       boolField("roles.fixer.autoDiscovery", "LOOPER_ROLES_FIXER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Fixer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRole(p).AutoDiscovery }),
-	"roles.fixer.instructions":                        stringField("roles.fixer.instructions", "", "", func(c config.Config) any { return c.Roles.Fixer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialFixerRole(p).Instructions }),
-	"roles.fixer.triggers.includeDrafts":              boolField("roles.fixer.triggers.includeDrafts", "LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Fixer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRoleTriggers(p).IncludeDrafts }),
-	"roles.fixer.triggers.labels":                     stringListField("roles.fixer.triggers.labels", "LOOPER_ROLES_FIXER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Fixer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialFixerRoleTriggers(p).Labels }),
-	"roles.fixer.triggers.labelMode":                  labelModeField("roles.fixer.triggers.labelMode", "LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Fixer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialFixerRoleTriggers(p).LabelMode }),
-	"roles.fixer.triggers.authorFilter":               fixerAuthorFilterField(),
+	"roles.reviewer.triggers.labelMode": reviewerDiscoveryLabelModeFieldWithAlias("roles.reviewer.triggers.labelMode", "LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Reviewer.Discovery.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode {
+		return &ensurePartialReviewerRoleDiscoveryTriggers(p).LabelMode
+	}, func(p *config.PartialConfig) **config.LabelMode {
+		return &ensurePartialReviewerRoleTriggers(p).LabelMode
+	}),
+	"roles.reviewer.discovery.specReview.includeReviewingLabel": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.discovery.specReview.includeReviewingLabel", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoverySpecReview(p).IncludeReviewingLabel
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerSpecReview(p).IncludeReviewingLabel
+	}),
+	"roles.reviewer.specReview.includeReviewingLabel": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.specReview.includeReviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRoleDiscoverySpecReview(p).IncludeReviewingLabel
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerSpecReview(p).IncludeReviewingLabel
+	}),
+	"roles.reviewer.discovery.specReview.reviewingLabel": reviewerDiscoveryStringFieldWithAlias("roles.reviewer.discovery.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string {
+		return &ensurePartialReviewerRoleDiscoverySpecReview(p).ReviewingLabel
+	}, func(p *config.PartialConfig) **string {
+		return &ensurePartialReviewerSpecReview(p).ReviewingLabel
+	}),
+	"roles.reviewer.specReview.reviewingLabel": reviewerDiscoveryStringFieldWithAlias("roles.reviewer.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string {
+		return &ensurePartialReviewerRoleDiscoverySpecReview(p).ReviewingLabel
+	}, func(p *config.PartialConfig) **string {
+		return &ensurePartialReviewerSpecReview(p).ReviewingLabel
+	}),
+	"roles.fixer.autoDiscovery":          boolField("roles.fixer.autoDiscovery", "LOOPER_ROLES_FIXER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Fixer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRole(p).AutoDiscovery }),
+	"roles.fixer.instructions":           stringField("roles.fixer.instructions", "", "", func(c config.Config) any { return c.Roles.Fixer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialFixerRole(p).Instructions }),
+	"roles.fixer.triggers.includeDrafts": boolField("roles.fixer.triggers.includeDrafts", "LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Fixer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRoleTriggers(p).IncludeDrafts }),
+	"roles.fixer.triggers.labels":        stringListField("roles.fixer.triggers.labels", "LOOPER_ROLES_FIXER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Fixer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialFixerRoleTriggers(p).Labels }),
+	"roles.fixer.triggers.labelMode":     labelModeField("roles.fixer.triggers.labelMode", "LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Fixer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialFixerRoleTriggers(p).LabelMode }),
+	"roles.fixer.triggers.authorFilter":  fixerAuthorFilterField(),
 }
 
 func (r *commandRuntime) configGet(cmd *cobra.Command, args []string) error {
@@ -163,12 +240,10 @@ func (r *commandRuntime) configShowSource(cmd *cobra.Command) error {
 		if configFieldSet(loaded.Partial, key) {
 			source = "config-file"
 		}
-		if field.env != "" {
-			if _, ok := os.LookupEnv(field.env); ok {
-				source = "env"
-			}
+		if field.overrideFromEnv() {
+			source = "env"
 		}
-		if field.flag != "" && commandFlagChanged(cmd, field.flag) {
+		if field.overrideFromFlag(cmd) {
 			source = "cli"
 		}
 		values[key] = map[string]any{"value": field.get(loaded.Config), "source": source}
@@ -182,7 +257,7 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if !loaded.Metadata.ConfigFilePresent {
-		if err := r.writeConfigFile(loaded.Metadata.ConfigPath, loaded.Partial); err != nil {
+		if err := r.writeDefaultConfigTemplate(loaded.Metadata.ConfigPath, loaded.Config); err != nil {
 			return err
 		}
 	}
@@ -218,7 +293,12 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) loadConfigForEdit() (config.LoadedFileConfig, error) {
-	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv), LookPath: r.lookPath()})
+	if err != nil {
+		return config.LoadedFileConfig{}, err
+	}
+	r.emitConfigLoadNotices(loaded)
+	return loaded, nil
 }
 
 func (r *commandRuntime) loadRawConfigForEdit() (config.LoadedFileConfig, error) {
@@ -230,20 +310,16 @@ func (r *commandRuntime) loadRawConfigForEdit() (config.LoadedFileConfig, error)
 	if err != nil {
 		return config.LoadedFileConfig{}, err
 	}
-	raw, err := os.ReadFile(configPath)
+	partial, present, err := config.ReadPartialConfigFile(configPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return config.LoadedFileConfig{}, fmt.Errorf("failed to read config file at %s: %w", configPath, err)
-		}
+		return config.LoadedFileConfig{}, err
+	}
+	if !present {
 		full, normErr := config.Normalize(cwd)
 		if normErr != nil {
 			return config.LoadedFileConfig{}, normErr
 		}
 		return config.LoadedFileConfig{Config: full, Partial: config.PartialConfig{}, Metadata: config.LoadFileMetadata{ConfigPath: configPath, ConfigFilePresent: false}}, nil
-	}
-	var partial config.PartialConfig
-	if err := json.Unmarshal(raw, &partial); err != nil {
-		return config.LoadedFileConfig{}, fmt.Errorf("failed to read config file at %s: %w", configPath, err)
 	}
 	full, err := config.Normalize(cwd, partial)
 	if err != nil {
@@ -269,7 +345,7 @@ func resolveConfigPathFromArgs(argv []string, cwd string) (string, error) {
 	if envPath, ok := os.LookupEnv("LOOPER_CONFIG"); ok {
 		return config.ResolveConfigPath(envPath, cwd), nil
 	}
-	defaultPath, err := config.DefaultConfigPath()
+	defaultPath, err := config.DiscoverDefaultConfigPath()
 	if err != nil {
 		return "", fmt.Errorf("determine default config path: %w", err)
 	}
@@ -283,12 +359,15 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	raw, err := json.MarshalIndent(partial, "", "  ")
+	raw, err := config.MarshalConfigFile(path, partial)
 	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return err
 	}
-	raw = append(raw, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
+	tmpPattern := ".config-*" + filepath.Ext(path)
+	if filepath.Ext(path) == "" {
+		tmpPattern = ".config-*.tmp"
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
 	if err != nil {
 		return fmt.Errorf("create temporary config: %w", err)
 	}
@@ -311,6 +390,42 @@ func (r *commandRuntime) writeConfigFile(path string, partial config.PartialConf
 		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
+}
+
+func (r *commandRuntime) writeDefaultConfigTemplate(path string, cfg config.Config) error {
+	if err := config.Validate(cfg); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	templateValue, err := canonicalConfigTemplateValue(cfg)
+	if err != nil {
+		return err
+	}
+	raw, err := config.MarshalConfigFile(path, templateValue)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+func canonicalConfigTemplateValue(cfg config.Config) (map[string]any, error) {
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("normalize config template: %w", err)
+	}
+	var normalized map[string]any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return nil, fmt.Errorf("normalize config template: %w", err)
+	}
+	defaults, _ := normalized["defaults"].(map[string]any)
+	delete(defaults, "allowAutoApprove")
+	delete(defaults, "fixAllPullRequests")
+	return normalized, nil
 }
 
 func (r *commandRuntime) validateConfigFile(path string) error {
@@ -346,14 +461,44 @@ func backupConfigFile(path string) error {
 }
 
 func (r *commandRuntime) warnConfigOverrides(cmd *cobra.Command, field configField) {
-	if field.env != "" {
-		if _, ok := os.LookupEnv(field.env); ok {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is set, so %s from the config file may not take effect\n", field.env, field.key)
+	if env := field.activeOverrideEnv(); env != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s is set, so %s from the config file may not take effect\n", env, field.key)
+	}
+	if flag := field.activeOverrideFlag(cmd); flag != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: --%s is set, so %s from the config file may not take effect\n", flag, field.key)
+	}
+}
+
+func (f configField) activeOverrideEnv() string {
+	if f.env != "" {
+		if _, ok := os.LookupEnv(f.env); ok {
+			return f.env
 		}
 	}
-	if field.flag != "" && commandFlagChanged(cmd, field.flag) {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: --%s is set, so %s from the config file may not take effect\n", field.flag, field.key)
+	if f.envAlias != "" {
+		if _, ok := os.LookupEnv(f.envAlias); ok {
+			return f.envAlias
+		}
 	}
+	return ""
+}
+
+func (f configField) overrideFromEnv() bool {
+	return f.activeOverrideEnv() != ""
+}
+
+func (f configField) activeOverrideFlag(cmd *cobra.Command) string {
+	if f.flag != "" && commandFlagChanged(cmd, f.flag) {
+		return f.flag
+	}
+	if f.flagAlias != "" && commandFlagChanged(cmd, f.flagAlias) {
+		return f.flagAlias
+	}
+	return ""
+}
+
+func (f configField) overrideFromFlag(cmd *cobra.Command) bool {
+	return f.activeOverrideFlag(cmd) != ""
 }
 
 func commandFlagChanged(cmd *cobra.Command, name string) bool {
@@ -379,6 +524,10 @@ func lookupConfigField(key string) (configField, error) {
 }
 
 func boolField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **bool) configField {
+	return boolFieldWithAlias(key, env, "", flag, "", get, target)
+}
+
+func boolFieldWithAlias(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, target func(*config.PartialConfig) **bool) configField {
 	return configField{key: key, valueType: "boolean", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value, err := parseConfigBool(raw)
 		if err != nil {
@@ -388,7 +537,7 @@ func boolField(key, env, flag string, get func(config.Config) any, target func(*
 		return nil
 	}, unset: func(p *config.PartialConfig) {
 		*target(p) = nil
-	}}
+	}, envAlias: envAlias, flagAlias: flagAlias}
 }
 
 func stringField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **string) configField {
@@ -401,6 +550,51 @@ func stringField(key, env, flag string, get func(config.Config) any, target func
 	}, unset: func(p *config.PartialConfig) {
 		*target(p) = nil
 	}}
+}
+
+func reviewerDiscoveryBoolField(key, env, flag string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **bool, legacyTarget func(*config.PartialConfig) **bool) configField {
+	return reviewerDiscoveryBoolFieldWithAlias(key, env, "", flag, "", get, canonicalTarget, legacyTarget)
+}
+
+func reviewerDiscoveryBoolFieldWithAlias(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **bool, legacyTarget func(*config.PartialConfig) **bool) configField {
+	return configField{key: key, valueType: "boolean", env: env, envAlias: envAlias, flag: flag, flagAlias: flagAlias, get: get, set: func(p *config.PartialConfig, raw string) error {
+		value, err := parseConfigBool(raw)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not a boolean (use true or false)", key, raw)
+		}
+		*canonicalTarget(p) = &value
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*canonicalTarget(p) = nil
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+	}}
+}
+
+func reviewerDiscoveryStringField(key, env, flag string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **string, legacyTarget func(*config.PartialConfig) **string) configField {
+	return reviewerDiscoveryStringFieldWithAlias(key, env, "", flag, "", get, canonicalTarget, legacyTarget)
+}
+
+func reviewerDiscoveryStringFieldWithAlias(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **string, legacyTarget func(*config.PartialConfig) **string) configField {
+	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("invalid value for %s: must be a non-empty string", key)
+		}
+		*canonicalTarget(p) = &raw
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*canonicalTarget(p) = nil
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+	}, envAlias: envAlias, flagAlias: flagAlias}
 }
 
 func positiveIntField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **int) configField {
@@ -440,8 +634,56 @@ func labelModeField(key, env string, get func(config.Config) any, target func(*c
 	}, unset: func(p *config.PartialConfig) { *target(p) = nil }}
 }
 
+func reviewerDiscoveryStringListField(key, env string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **[]string, legacyTarget func(*config.PartialConfig) **[]string) configField {
+	return reviewerDiscoveryStringListFieldWithAlias(key, env, "", get, canonicalTarget, legacyTarget)
+}
+
+func reviewerDiscoveryStringListFieldWithAlias(key, env, envAlias string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **[]string, legacyTarget func(*config.PartialConfig) **[]string) configField {
+	return configField{key: key, valueType: "string-list", env: env, get: get, set: func(p *config.PartialConfig, raw string) error {
+		items, err := parseConfigStringList(raw)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %v", key, err)
+		}
+		*canonicalTarget(p) = &items
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*canonicalTarget(p) = nil
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+	}, envAlias: envAlias}
+}
+
+func reviewerDiscoveryLabelModeField(key, env string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **config.LabelMode, legacyTarget func(*config.PartialConfig) **config.LabelMode) configField {
+	return reviewerDiscoveryLabelModeFieldWithAlias(key, env, "", get, canonicalTarget, legacyTarget)
+}
+
+func reviewerDiscoveryLabelModeFieldWithAlias(key, env, envAlias string, get func(config.Config) any, canonicalTarget func(*config.PartialConfig) **config.LabelMode, legacyTarget func(*config.PartialConfig) **config.LabelMode) configField {
+	return configField{key: key, valueType: "string", env: env, get: get, set: func(p *config.PartialConfig, raw string) error {
+		mode := config.LabelMode(strings.TrimSpace(raw))
+		switch mode {
+		case config.LabelModeAll, config.LabelModeAny:
+			*canonicalTarget(p) = &mode
+			if legacyTarget != nil {
+				*legacyTarget(p) = nil
+			}
+			return nil
+		default:
+			return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.LabelModeAll, config.LabelModeAny)
+		}
+	}, unset: func(p *config.PartialConfig) {
+		*canonicalTarget(p) = nil
+		if legacyTarget != nil {
+			*legacyTarget(p) = nil
+		}
+	}, envAlias: envAlias}
+}
+
 func fixerAuthorFilterField() configField {
-	return configField{key: "roles.fixer.triggers.authorFilter", valueType: "string", env: "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER", get: func(c config.Config) any { return c.Roles.Fixer.Triggers.AuthorFilter }, set: func(p *config.PartialConfig, raw string) error {
+	return configField{key: "roles.fixer.triggers.authorFilter", valueType: "string", env: "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER", flag: "roles-fixer-triggers-author-filter", flagAlias: "fix-all-pull-requests", get: func(c config.Config) any { return c.Roles.Fixer.Triggers.AuthorFilter }, set: func(p *config.PartialConfig, raw string) error {
 		filter := config.FixerAuthorFilter(strings.TrimSpace(raw))
 		switch filter {
 		case config.FixerAuthorFilterCurrentUser, config.FixerAuthorFilterAny:
@@ -470,26 +712,46 @@ func openPRStrategyField() configField {
 	}}
 }
 
-func reviewerReviewEventField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
-	return configField{key: key, valueType: "string", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+func reviewerReviewEventField(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
+	return configField{key: key, valueType: "string", env: env, envAlias: envAlias, flag: flag, flagAlias: flagAlias, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
 		switch key {
-		case "reviewer.reviewEvents.clean":
+		case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
 			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventApprove {
 				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventApprove)
 			}
-		case "reviewer.reviewEvents.blocking":
+		case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
 			if value != config.ReviewerReviewEventComment && value != config.ReviewerReviewEventRequestChanges {
 				return fmt.Errorf("invalid value for %s: must be one of: %s, %s", key, config.ReviewerReviewEventComment, config.ReviewerReviewEventRequestChanges)
 			}
 		default:
 			return fmt.Errorf("unsupported review event config key %q", key)
 		}
+		clearReviewerReviewEventField(p, key)
 		*target(p) = &value
 		return nil
 	}, unset: func(p *config.PartialConfig) {
-		*target(p) = nil
+		clearReviewerReviewEventField(p, key)
 	}}
+}
+
+func clearReviewerReviewEventField(partial *config.PartialConfig, key string) {
+	switch key {
+	case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
+		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil {
+			partial.Roles.Reviewer.Behavior.ReviewEvents.Clean = nil
+		}
+		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil {
+			partial.LegacyReviewer.ReviewEvents.Clean = nil
+		}
+	case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
+		if partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil {
+			partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking = nil
+		}
+		if partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil {
+			partial.LegacyReviewer.ReviewEvents.Blocking = nil
+		}
+	}
 }
 
 func parseConfigBool(raw string) (bool, error) {
@@ -528,13 +790,14 @@ func ensurePartialDefaults(partial *config.PartialConfig) *config.PartialDefault
 }
 
 func ensurePartialReviewerReviewEvents(partial *config.PartialConfig) *config.PartialReviewerReviewEventsConfig {
-	if partial.Reviewer == nil {
-		partial.Reviewer = &config.PartialReviewerConfig{}
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &config.PartialReviewerConfig{}
 	}
-	if partial.Reviewer.ReviewEvents == nil {
-		partial.Reviewer.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
+	if reviewer.Behavior.ReviewEvents == nil {
+		reviewer.Behavior.ReviewEvents = &config.PartialReviewerReviewEventsConfig{}
 	}
-	return partial.Reviewer.ReviewEvents
+	return reviewer.Behavior.ReviewEvents
 }
 
 func ensurePartialInstructions(partial *config.PartialConfig) *config.PartialInstructionsConfig {
@@ -598,6 +861,14 @@ func ensurePartialReviewerRole(partial *config.PartialConfig) *config.PartialRev
 	return roles.Reviewer
 }
 
+func ensurePartialReviewerRoleDiscovery(partial *config.PartialConfig) *config.PartialReviewerRoleDiscoveryConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Discovery == nil {
+		reviewer.Discovery = &config.PartialReviewerRoleDiscoveryConfig{}
+	}
+	return reviewer.Discovery
+}
+
 func ensurePartialReviewerRoleTriggers(partial *config.PartialConfig) *config.PartialReviewerRoleTriggersConfig {
 	reviewer := ensurePartialReviewerRole(partial)
 	if reviewer.Triggers == nil {
@@ -606,12 +877,28 @@ func ensurePartialReviewerRoleTriggers(partial *config.PartialConfig) *config.Pa
 	return reviewer.Triggers
 }
 
+func ensurePartialReviewerRoleDiscoveryTriggers(partial *config.PartialConfig) *config.PartialReviewerRoleTriggersConfig {
+	discovery := ensurePartialReviewerRoleDiscovery(partial)
+	if discovery.Triggers == nil {
+		discovery.Triggers = &config.PartialReviewerRoleTriggersConfig{}
+	}
+	return discovery.Triggers
+}
+
 func ensurePartialReviewerSpecReview(partial *config.PartialConfig) *config.PartialReviewerSpecReviewConfig {
 	reviewer := ensurePartialReviewerRole(partial)
 	if reviewer.SpecReview == nil {
 		reviewer.SpecReview = &config.PartialReviewerSpecReviewConfig{}
 	}
 	return reviewer.SpecReview
+}
+
+func ensurePartialReviewerRoleDiscoverySpecReview(partial *config.PartialConfig) *config.PartialReviewerSpecReviewConfig {
+	discovery := ensurePartialReviewerRoleDiscovery(partial)
+	if discovery.SpecReview == nil {
+		discovery.SpecReview = &config.PartialReviewerSpecReviewConfig{}
+	}
+	return discovery.SpecReview
 }
 
 func ensurePartialFixerRole(partial *config.PartialConfig) *config.PartialFixerRoleConfig {
@@ -678,10 +965,12 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Package != nil && partial.Package.AutoUpgradeEnabled != nil
 	case "instructions.maxBytes":
 		return partial.Instructions != nil && partial.Instructions.MaxBytes != nil
-	case "reviewer.reviewEvents.clean":
-		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil
-	case "reviewer.reviewEvents.blocking":
-		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Blocking != nil
+	case "roles.reviewer.behavior.reviewEvents.clean", "reviewer.reviewEvents.clean":
+		return (partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil) ||
+			(partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil && partial.LegacyReviewer.ReviewEvents.Clean != nil)
+	case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
+		return (partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking != nil) ||
+			(partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil && partial.LegacyReviewer.ReviewEvents.Blocking != nil)
 	case "roles.planner.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
 	case "roles.planner.instructions":
@@ -702,22 +991,24 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.LabelMode != nil
 	case "roles.worker.triggers.requireAssigneeCurrentUser":
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.RequireAssigneeCurrentUser != nil
-	case "roles.reviewer.autoDiscovery":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoDiscovery != nil
+	case "roles.reviewer.discovery.autoDiscovery", "roles.reviewer.autoDiscovery":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.AutoDiscovery != nil) || partial.Roles.Reviewer.AutoDiscovery != nil)
 	case "roles.reviewer.instructions":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Instructions != nil
-	case "roles.reviewer.triggers.includeDrafts":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil
-	case "roles.reviewer.triggers.requireReviewRequest":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.RequireReviewRequest != nil
-	case "roles.reviewer.triggers.labels":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil
-	case "roles.reviewer.triggers.labelMode":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.LabelMode != nil
-	case "roles.reviewer.specReview.includeReviewingLabel":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil
-	case "roles.reviewer.specReview.reviewingLabel":
-		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.ReviewingLabel != nil
+	case "roles.reviewer.discovery.triggers.includeDrafts", "roles.reviewer.triggers.includeDrafts":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.IncludeDrafts != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil))
+	case "roles.reviewer.discovery.triggers.requireReviewRequest", "roles.reviewer.triggers.requireReviewRequest":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.RequireReviewRequest != nil))
+	case "roles.reviewer.discovery.triggers.enableSelfReview", "roles.reviewer.triggers.enableSelfReview":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil))
+	case "roles.reviewer.discovery.triggers.labels", "roles.reviewer.triggers.labels":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.Labels != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.Labels != nil))
+	case "roles.reviewer.discovery.triggers.labelMode", "roles.reviewer.triggers.labelMode":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.LabelMode != nil) || (partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.LabelMode != nil))
+	case "roles.reviewer.discovery.specReview.includeReviewingLabel", "roles.reviewer.specReview.includeReviewingLabel":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel != nil) || (partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil))
+	case "roles.reviewer.discovery.specReview.reviewingLabel", "roles.reviewer.specReview.reviewingLabel":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != nil) || (partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.ReviewingLabel != nil))
 	case "roles.fixer.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil
 	case "roles.fixer.instructions":

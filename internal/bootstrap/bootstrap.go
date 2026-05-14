@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -68,6 +70,9 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 		LookupEnv: envLookupFromMap(options.Env),
 	})
 	if err != nil {
+		return Result{}, err
+	}
+	if err := validateConfiguredToolPaths(loadedConfig.Config, loadedConfig.Metadata.ToolDetection); err != nil {
 		return Result{}, err
 	}
 
@@ -143,6 +148,39 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 	}
 
 	return osSignalNotifier{}
+}
+
+func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
+	checks := []struct {
+		statusKey string
+		field     string
+		path      *string
+	}{
+		{statusKey: "gitPath", field: "tools.gitPath", path: cfg.Tools.GitPath},
+		{statusKey: "ghPath", field: "tools.ghPath", path: cfg.Tools.GHPath},
+		{statusKey: "osascriptPath", field: "tools.osascriptPath", path: cfg.Tools.OsascriptPath},
+	}
+	for _, check := range checks {
+		if detection[check.statusKey] != config.ToolDetectionStatusConfigured || check.path == nil {
+			continue
+		}
+		value := strings.TrimSpace(*check.path)
+		if value == "" || !filepath.IsAbs(value) {
+			continue
+		}
+		info, err := os.Stat(value)
+		if err == nil && !info.IsDir() {
+			if _, err := exec.LookPath(value); err == nil {
+				continue
+			}
+		}
+		message := "must reference an existing executable file"
+		if err == nil && info.IsDir() {
+			message = "must reference a file, not a directory"
+		}
+		return &config.ConfigValidationError{Issues: []config.ValidationIssue{{Path: check.field, Message: message}}}
+	}
+	return nil
 }
 
 func waitForShutdownWithSignals(runtime ShutdownRuntime, logger Logger, notifier SignalNotifier) {

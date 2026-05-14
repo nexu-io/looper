@@ -9,7 +9,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	toml "github.com/pelletier/go-toml/v2"
+	"gopkg.in/yaml.v3"
 )
+
+var supportedDefaultConfigNames = []string{"config.toml", "config.yaml", "config.yml", "config.json"}
+
+var supportedConfigSuffixes = []string{".toml", ".yaml", ".yml", ".json"}
+
+var defaultLooperHomeForNotices = DefaultLooperHome
 
 type EnvLookupFunc func(string) (string, bool)
 
@@ -23,6 +32,8 @@ type LoadedFileConfig struct {
 	Config   Config
 	Metadata LoadFileMetadata
 	Partial  PartialConfig
+	Warnings []string
+	Notices  []string
 }
 
 type LoadFileOptions struct {
@@ -68,16 +79,18 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
-	configPath := options.ConfigPath
+	configPath := ""
 	if parsedCLI.hasConfigPath {
 		configPath = parsedCLI.configPath
 	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok {
 		configPath = envConfigPath
-	} else if configPath == "" {
+	} else if options.ConfigPath != "" {
+		configPath = options.ConfigPath
+	} else if options.DefaultConfigPath != "" {
 		configPath = options.DefaultConfigPath
 	}
 	if configPath == "" {
-		defaultConfigPath, err := DefaultConfigPath()
+		defaultConfigPath, err := DiscoverDefaultConfigPath()
 		if err != nil {
 			return LoadedFileConfig{}, fmt.Errorf("determine default config path: %w", err)
 		}
@@ -96,6 +109,13 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
+	fileWarnings := collectMixedSchemaWarnings(partialConfig)
+	fileNotices, err := collectConfigLoadNotices(resolvedConfigPath, present)
+	if err != nil {
+		return LoadedFileConfig{}, err
+	}
+	envWarnings := collectDeprecatedEnvWarnings(lookupEnv)
+	cliWarnings := collectDeprecatedCLIWarnings(options.Args)
 	config, err := Normalize(cwd, partialConfig, envOverrides, parsedCLI.overrides)
 	if err != nil {
 		return LoadedFileConfig{}, err
@@ -117,8 +137,10 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	return LoadedFileConfig{
-		Config:  config,
-		Partial: partialConfig,
+		Config:   config,
+		Partial:  partialConfig,
+		Warnings: dedupeWarnings(fileWarnings, envWarnings, cliWarnings),
+		Notices:  fileNotices,
 		Metadata: LoadFileMetadata{
 			ConfigPath:        resolvedConfigPath,
 			ConfigFilePresent: present,
@@ -127,12 +149,90 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}, nil
 }
 
+func collectConfigLoadNotices(resolvedConfigPath string, present bool) ([]string, error) {
+	if !present {
+		return nil, nil
+	}
+	looperHome, err := defaultLooperHomeForNotices()
+	if err != nil {
+		return nil, nil
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	canonicalDefaultPath := filepath.Join(looperHome, "config.toml")
+	if filepath.Clean(resolvedConfigPath) != filepath.Clean(legacyDefaultPath) {
+		return nil, nil
+	}
+	return []string{legacyDefaultConfigMigrationNote(legacyDefaultPath, canonicalDefaultPath)}, nil
+}
+
+func DiscoverDefaultConfigPath() (string, error) {
+	looperHome, err := DefaultLooperHome()
+	if err != nil {
+		return "", err
+	}
+
+	candidates := make([]string, 0, len(supportedDefaultConfigNames))
+	found := make([]string, 0, len(supportedDefaultConfigNames))
+	for _, name := range supportedDefaultConfigNames {
+		path := filepath.Join(looperHome, name)
+		candidates = append(candidates, path)
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("check config file at %s: %w", path, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		found = append(found, path)
+	}
+
+	if len(found) > 1 {
+		return "", fmt.Errorf("multiple default config files found: %s; keep only one of %s", strings.Join(found, ", "), strings.Join(candidates, ", "))
+	}
+	if len(found) == 1 {
+		return found[0], nil
+	}
+
+	return candidates[0], nil
+}
+
+func validateConfiguredToolPath(path *string, field string) error {
+	if isNilOrEmptyString(path) {
+		return nil
+	}
+	value := strings.TrimSpace(*path)
+	if !filepath.IsAbs(value) && !strings.ContainsRune(value, os.PathSeparator) {
+		return nil
+	}
+	info, err := os.Stat(value)
+	if err == nil && !info.IsDir() {
+		return nil
+	}
+	message := "must reference an existing executable file"
+	if err == nil && info.IsDir() {
+		message = "must reference a file, not a directory"
+	}
+	return &ConfigValidationError{Issues: []ValidationIssue{{Path: field, Message: message}}}
+}
+
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
-	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Triggers == nil || partial.Roles.Reviewer.Triggers.EnableSelfReview == nil {
+	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil {
 		return
 	}
-	value := *partial.Roles.Reviewer.Triggers.EnableSelfReview
-	config.Roles.Reviewer.Triggers.EnableSelfReview = value
+	var source *PartialReviewerRoleTriggersConfig
+	if partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.Triggers != nil && partial.Roles.Reviewer.Discovery.Triggers.EnableSelfReview != nil {
+		source = partial.Roles.Reviewer.Discovery.Triggers
+	} else if partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.EnableSelfReview != nil {
+		source = partial.Roles.Reviewer.Triggers
+	}
+	if source == nil || source.EnableSelfReview == nil {
+		return
+	}
+	value := *source.EnableSelfReview
+	config.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = value
 	for i := range config.Projects {
 		if config.Projects[i].Roles == nil {
 			continue
@@ -140,14 +240,21 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 		if config.Projects[i].Roles.Reviewer == nil {
 			continue
 		}
-		if config.Projects[i].Roles.Reviewer.Triggers == nil {
-			config.Projects[i].Roles.Reviewer.Triggers = &PartialReviewerRoleTriggersConfig{}
+		if config.Projects[i].Roles.Reviewer.Discovery == nil {
+			config.Projects[i].Roles.Reviewer.Discovery = &PartialReviewerRoleDiscoveryConfig{}
 		}
-		config.Projects[i].Roles.Reviewer.Triggers.EnableSelfReview = &value
+		if config.Projects[i].Roles.Reviewer.Discovery.Triggers == nil {
+			config.Projects[i].Roles.Reviewer.Discovery.Triggers = &PartialReviewerRoleTriggersConfig{}
+		}
+		config.Projects[i].Roles.Reviewer.Discovery.Triggers.EnableSelfReview = &value
 	}
 }
 
 func readConfigFile(path string) (PartialConfig, bool, error) {
+	if err := validateConfigFileSuffix(path); err != nil {
+		return PartialConfig{}, false, err
+	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -157,16 +264,62 @@ func readConfigFile(path string) (PartialConfig, bool, error) {
 		return PartialConfig{}, false, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 
-	var partialConfig PartialConfig
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
+	partialConfig, err := decodeConfigFile(path, raw)
+	if err != nil {
 		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: trailing JSON value", path)
 	}
 
 	return partialConfig, true, nil
+}
+
+func validateConfigFileSuffix(path string) error {
+	suffix := strings.ToLower(filepath.Ext(path))
+	for _, supported := range supportedConfigSuffixes {
+		if suffix == supported {
+			return nil
+		}
+	}
+	if suffix == "" {
+		suffix = "<none>"
+	}
+	return fmt.Errorf("unsupported config file suffix %q at %s; supported suffixes: %s", suffix, path, strings.Join(supportedConfigSuffixes, ", "))
+}
+
+func decodeConfigFile(path string, raw []byte) (PartialConfig, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".json":
+		return decodeJSONConfigFile(raw)
+	case ".yaml", ".yml":
+		return decodeStructuredConfigFile(raw, func(target any) error { return yaml.Unmarshal(raw, target) })
+	case ".toml":
+		return decodeStructuredConfigFile(raw, func(target any) error { return toml.Unmarshal(raw, target) })
+	default:
+		return PartialConfig{}, fmt.Errorf("unsupported config file suffix %q", filepath.Ext(path))
+	}
+}
+
+func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
+	var partialConfig PartialConfig
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
+		return PartialConfig{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return PartialConfig{}, fmt.Errorf("trailing JSON value")
+	}
+	return partialConfig, nil
+}
+
+func decodeStructuredConfigFile(raw []byte, unmarshal func(any) error) (PartialConfig, error) {
+	var decoded map[string]any
+	if err := unmarshal(&decoded); err != nil {
+		return PartialConfig{}, err
+	}
+	normalizedRaw, err := json.Marshal(decoded)
+	if err != nil {
+		return PartialConfig{}, fmt.Errorf("normalize structured config: %w", err)
+	}
+	return decodeJSONConfigFile(normalizedRaw)
 }
 
 func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {
@@ -210,7 +363,7 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 			return decodeTopLevelConfigSection(raw, "defaults", &partialConfig.Defaults)
 		}},
 		{key: "reviewer", decode: func(raw json.RawMessage) error {
-			return decodeTopLevelConfigSection(raw, "reviewer", &partialConfig.Reviewer)
+			return decodeTopLevelConfigSection(raw, "reviewer", &partialConfig.LegacyReviewer)
 		}},
 		{key: "instructions", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "instructions", &partialConfig.Instructions)
@@ -300,6 +453,13 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
+	canonicalInstructionsEnabledOverrideSet := false
+	canonicalPackageAutoUpgradeOverrideSet := false
+	canonicalReviewerCleanOverrideSet := false
+	canonicalReviewerBlockingOverrideSet := false
+	canonicalReviewerLoopEnabledOverrideSet := false
+	canonicalReviewerEnableSelfReviewOverrideSet := false
+	canonicalFixerAuthorFilterOverrideSet := false
 
 	takeValue := func(index int, flag string) (string, int, error) {
 		current := args[index]
@@ -348,7 +508,21 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 					index++
 				}
 			}
-			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+			if !canonicalInstructionsEnabledOverrideSet {
+				ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+			}
+		case matchesFlag(arg, "--instructions-enabled"):
+			value, nextIndex, err := takeValue(index, "--instructions-enabled")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --instructions-enabled: %q is not a boolean", value)
+			}
+			ensureInstructionsConfig(&parsed.overrides).Enabled = parsedValue
+			canonicalInstructionsEnabledOverrideSet = true
+			index = nextIndex
 		case matchesFlag(arg, "--no-auto-upgrade"):
 			disable := true
 			if _, value, ok := strings.Cut(arg, "="); ok {
@@ -363,7 +537,21 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 					index++
 				}
 			}
-			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
+			if !canonicalPackageAutoUpgradeOverrideSet {
+				ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
+			}
+		case matchesFlag(arg, "--package-auto-upgrade-enabled"):
+			value, nextIndex, err := takeValue(index, "--package-auto-upgrade-enabled")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
+			}
+			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = parsedValue
+			canonicalPackageAutoUpgradeOverrideSet = true
+			index = nextIndex
 		case matchesFlag(arg, "--host"):
 			value, nextIndex, err := takeValue(index, "--host")
 			if err != nil {
@@ -510,6 +698,19 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
 			index = nextIndex
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-clean", "--reviewer-clean-review-event"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-clean")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-clean") {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+				canonicalReviewerCleanOverrideSet = true
+			} else if !canonicalReviewerCleanOverrideSet {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+			}
+			index = nextIndex
 		case matchesFlag(arg, "--allow-auto-approve"):
 			value, nextIndex, err := takeValue(index, "--allow-auto-approve")
 			if err != nil {
@@ -520,6 +721,25 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-approve: %q is not a boolean", value)
 			}
 			ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
+			if !canonicalReviewerCleanOverrideSet {
+				event := ReviewerReviewEventComment
+				if *parsedValue {
+					event = ReviewerReviewEventApprove
+				}
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--roles-fixer-triggers-author-filter"):
+			value, nextIndex, err := takeValue(index, "--roles-fixer-triggers-author-filter")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseFixerAuthorFilter(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-triggers-author-filter: must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)
+			}
+			ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = parsedValue
+			canonicalFixerAuthorFilterOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--fix-all-pull-requests"):
 			value, nextIndex, err := takeValue(index, "--fix-all-pull-requests")
@@ -531,6 +751,25 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fix-all-pull-requests: %q is not a boolean", value)
 			}
 			ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
+			if !canonicalFixerAuthorFilterOverrideSet {
+				authorFilter := FixerAuthorFilterCurrentUser
+				if *parsedValue {
+					authorFilter = FixerAuthorFilterAny
+				}
+				ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = &authorFilter
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--roles-reviewer-behavior-loop-enabled-by-default"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-enabled-by-default")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-behavior-loop-enabled-by-default: %q is not a boolean", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			canonicalReviewerLoopEnabledOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--reviewer-loop-enabled"):
 			value, nextIndex, err := takeValue(index, "--reviewer-loop-enabled")
@@ -541,7 +780,21 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
 			}
-			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			if !canonicalReviewerLoopEnabledOverrideSet {
+				ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+			}
+			index = nextIndex
+		case matchesFlag(arg, "--roles-reviewer-discovery-triggers-enable-self-review"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-discovery-triggers-enable-self-review")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-discovery-triggers-enable-self-review: %q is not a boolean", value)
+			}
+			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			canonicalReviewerEnableSelfReviewOverrideSet = true
 			index = nextIndex
 		case matchesFlag(arg, "--reviewer-enable-self-review"):
 			value, nextIndex, err := takeValue(index, "--reviewer-enable-self-review")
@@ -552,26 +805,25 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			if err != nil {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-enable-self-review: %q is not a boolean", value)
 			}
-			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			if !canonicalReviewerEnableSelfReviewOverrideSet {
+				ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+			}
 			index = nextIndex
-		case matchesFlag(arg, "--reviewer-clean-review-event"):
-			value, nextIndex, err := takeValue(index, "--reviewer-clean-review-event")
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-blocking", "--reviewer-blocking-review-event"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-blocking")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
 			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
-			index = nextIndex
-		case matchesFlag(arg, "--reviewer-blocking-review-event"):
-			value, nextIndex, err := takeValue(index, "--reviewer-blocking-review-event")
-			if err != nil {
-				return parsedCLIArgs{}, err
+			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-blocking") {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+				canonicalReviewerBlockingOverrideSet = true
+			} else if !canonicalReviewerBlockingOverrideSet {
+				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
 			}
-			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
 			index = nextIndex
-		case matchesFlag(arg, "--reviewer-quiet-period-seconds"):
-			value, nextIndex, err := takeValue(index, "--reviewer-quiet-period-seconds")
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-quiet-period-seconds", "--reviewer-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-quiet-period-seconds")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
@@ -581,8 +833,8 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
 			index = nextIndex
-		case matchesFlag(arg, "--reviewer-min-publish-interval-seconds"):
-			value, nextIndex, err := takeValue(index, "--reviewer-min-publish-interval-seconds")
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-min-publish-interval-seconds", "--reviewer-min-publish-interval-seconds"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-min-publish-interval-seconds")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
@@ -592,8 +844,8 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).MinPublishIntervalSeconds = parsedValue
 			index = nextIndex
-		case matchesFlag(arg, "--reviewer-max-iterations-per-pr"):
-			value, nextIndex, err := takeValue(index, "--reviewer-max-iterations-per-pr")
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-max-iterations-per-pr", "--reviewer-max-iterations-per-pr"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-max-iterations-per-pr")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
@@ -603,8 +855,8 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).MaxIterationsPerPR = parsedValue
 			index = nextIndex
-		case matchesFlag(arg, "--reviewer-max-iterations-per-head"):
-			value, nextIndex, err := takeValue(index, "--reviewer-max-iterations-per-head")
+		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-max-iterations-per-head", "--reviewer-max-iterations-per-head"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-max-iterations-per-head")
 			if err != nil {
 				return parsedCLIArgs{}, err
 			}
@@ -629,8 +881,55 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	return parsed, nil
 }
 
+func collectDeprecatedCLIWarnings(args []string) []string {
+	deprecated := []deprecatedSurface{}
+	add := func(flag string, replacement string) {
+		deprecated = append(deprecated, deprecatedSurface{kind: deprecatedSurfaceCLIFlag, legacy: flag, replacement: replacement})
+	}
+
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "--") {
+			continue
+		}
+
+		switch {
+		case matchesFlag(arg, "--allow-auto-approve"):
+			add("--allow-auto-approve", "--roles-reviewer-behavior-review-events-clean")
+		case matchesFlag(arg, "--fix-all-pull-requests"):
+			add("--fix-all-pull-requests", "--roles-fixer-triggers-author-filter")
+		case matchesFlag(arg, "--reviewer-loop-enabled"):
+			add("--reviewer-loop-enabled", "--roles-reviewer-behavior-loop-enabled-by-default")
+		case matchesFlag(arg, "--reviewer-enable-self-review"):
+			add("--reviewer-enable-self-review", "--roles-reviewer-discovery-triggers-enable-self-review")
+		case matchesFlag(arg, "--reviewer-clean-review-event"):
+			add("--reviewer-clean-review-event", "--roles-reviewer-behavior-review-events-clean")
+		case matchesFlag(arg, "--reviewer-blocking-review-event"):
+			add("--reviewer-blocking-review-event", "--roles-reviewer-behavior-review-events-blocking")
+		case matchesFlag(arg, "--reviewer-quiet-period-seconds"):
+			add("--reviewer-quiet-period-seconds", "--roles-reviewer-behavior-loop-quiet-period-seconds")
+		case matchesFlag(arg, "--reviewer-min-publish-interval-seconds"):
+			add("--reviewer-min-publish-interval-seconds", "--roles-reviewer-behavior-loop-min-publish-interval-seconds")
+		case matchesFlag(arg, "--reviewer-max-iterations-per-pr"):
+			add("--reviewer-max-iterations-per-pr", "--roles-reviewer-behavior-loop-max-iterations-per-pr")
+		case matchesFlag(arg, "--reviewer-max-iterations-per-head"):
+			add("--reviewer-max-iterations-per-head", "--roles-reviewer-behavior-loop-max-iterations-per-head")
+		}
+	}
+
+	return dedupeDeprecationWarnings(deprecated)
+}
+
 func matchesFlag(arg string, flag string) bool {
 	return arg == flag || strings.HasPrefix(arg, flag+"=")
+}
+
+func matchesAnyFlag(arg string, flags ...string) bool {
+	for _, flag := range flags {
+		if matchesFlag(arg, flag) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseInteger(value string) (*int, error) {
@@ -696,6 +995,17 @@ func parseFixerAuthorFilter(value string) (*FixerAuthorFilter, error) {
 
 func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	var overrides PartialConfig
+	envValue := func(primary string, aliases ...string) (string, bool) {
+		if value, ok := lookupEnv(primary); ok {
+			return value, true
+		}
+		for _, alias := range aliases {
+			if value, ok := lookupEnv(alias); ok {
+				return value, true
+			}
+		}
+		return "", false
+	}
 
 	if value, ok := lookupEnv("LOOPER_HOST"); ok {
 		ensureServerConfig(&overrides).Host = stringPtr(value)
@@ -775,6 +1085,11 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ALLOW_AUTO_APPROVE: %q is not a boolean", value)
 		}
 		ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
+		event := ReviewerReviewEventComment
+		if *parsed {
+			event = ReviewerReviewEventApprove
+		}
+		ensureReviewerReviewEventsConfig(&overrides).Clean = &event
 	}
 	if value, ok := lookupEnv("LOOPER_FIX_ALL_PULL_REQUESTS"); ok {
 		parsed, err := parseBoolean(value)
@@ -782,65 +1097,84 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_FIX_ALL_PULL_REQUESTS: %q is not a boolean", value)
 		}
 		ensureDefaultsConfig(&overrides).FixAllPullRequests = parsed
+		authorFilter := FixerAuthorFilterCurrentUser
+		if *parsed {
+			authorFilter = FixerAuthorFilterAny
+		}
+		ensureFixerRoleTriggersConfig(&overrides).AuthorFilter = &authorFilter
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_LOOP_ENABLED"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_ENABLED_BY_DEFAULT", "LOOPER_REVIEWER_LOOP_ENABLED"); ok {
 		parsed, err := parseBoolean(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_LOOP_ENABLED: %q is not a boolean", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_ENABLED_BY_DEFAULT: %q is not a boolean", value)
 		}
 		ensureReviewerLoopConfig(&overrides).EnabledByDefault = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN"); ok {
 		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
 		ensureReviewerReviewEventsConfig(&overrides).Clean = &event
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING"); ok {
 		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
 		ensureReviewerReviewEventsConfig(&overrides).Blocking = &event
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_QUIET_PERIOD_SECONDS"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS", "LOOPER_REVIEWER_QUIET_PERIOD_SECONDS"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).QuietPeriodSeconds = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS", "LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS: %q is not an integer", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).MinPublishIntervalSeconds = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_PR", "LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR: %q is not an integer", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_PR: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).MaxIterationsPerPR = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_HEAD", "LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD: %q is not an integer", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_HEAD: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).MaxIterationsPerHead = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_ON_HEAD_CHANGE", "LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE"); ok {
 		parsed, err := parseBoolean(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED: %q is not a boolean", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_ON_HEAD_CHANGE: %q is not a boolean", value)
+		}
+		ensureReviewerNativeResumeConfig(&overrides).OnHeadChange = parsed
+	}
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_RE_REVIEW_PROMPT_ON_HEAD_CHANGE", "LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_RE_REVIEW_PROMPT_ON_HEAD_CHANGE: %q is not a boolean", value)
+		}
+		ensureReviewerNativeResumeConfig(&overrides).ReReviewPromptOnHeadChange = parsed
+	}
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_ENABLED", "LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_ENABLED: %q is not a boolean", value)
 		}
 		ensureReviewerThreadResolutionConfig(&overrides).Enabled = parsed
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_MODE"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MODE", "LOOPER_REVIEWER_THREAD_RESOLUTION_MODE"); ok {
 		mode := ReviewerThreadResolutionMode(value)
 		ensureReviewerThreadResolutionConfig(&overrides).Mode = &mode
 	}
-	if value, ok := lookupEnv("LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MAX_THREADS_PER_RUN", "LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN: %q is not an integer", value)
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MAX_THREADS_PER_RUN: %q is not an integer", value)
 		}
 		ensureReviewerThreadResolutionConfig(&overrides).MaxThreadsPerRun = parsed
 	}
@@ -868,6 +1202,41 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	}
 
 	return overrides, nil
+}
+
+func collectDeprecatedEnvWarnings(lookupEnv EnvLookupFunc) []string {
+	deprecated := []deprecatedSurface{}
+	add := func(name string, replacement string) {
+		if _, ok := lookupEnv(name); !ok {
+			return
+		}
+		deprecated = append(deprecated, deprecatedSurface{kind: deprecatedSurfaceEnvVar, legacy: name, replacement: replacement})
+	}
+
+	add("LOOPER_ALLOW_AUTO_APPROVE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	add("LOOPER_FIX_ALL_PULL_REQUESTS", "LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER")
+	add("LOOPER_REVIEWER_LOOP_ENABLED", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_ENABLED_BY_DEFAULT")
+	add("LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN")
+	add("LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING")
+	add("LOOPER_REVIEWER_QUIET_PERIOD_SECONDS", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS")
+	add("LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS")
+	add("LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_PR")
+	add("LOOPER_REVIEWER_MAX_ITERATIONS_PER_HEAD", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_HEAD")
+	add("LOOPER_REVIEWER_NATIVE_RESUME_ON_HEAD_CHANGE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_ON_HEAD_CHANGE")
+	add("LOOPER_REVIEWER_NATIVE_RESUME_REREVIEW_PROMPT_ON_HEAD_CHANGE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_NATIVE_RESUME_RE_REVIEW_PROMPT_ON_HEAD_CHANGE")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_ENABLED", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_ENABLED")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_MODE", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MODE")
+	add("LOOPER_REVIEWER_THREAD_RESOLUTION_MAX_THREADS_PER_RUN", "LOOPER_ROLES_REVIEWER_BEHAVIOR_THREAD_RESOLUTION_MAX_THREADS_PER_RUN")
+	add("LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS")
+	add("LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", "LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE")
+	add("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL")
+	add("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL")
+
+	return dedupeDeprecationWarnings(deprecated)
 }
 
 func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
@@ -924,8 +1293,19 @@ func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookup
 }
 
 func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
-	boolEnv := func(name string, set func(*bool)) error {
-		value, ok := lookupEnv(name)
+	envValue := func(primary string, aliases ...string) (string, bool) {
+		if value, ok := lookupEnv(primary); ok {
+			return value, true
+		}
+		for _, alias := range aliases {
+			if value, ok := lookupEnv(alias); ok {
+				return value, true
+			}
+		}
+		return "", false
+	}
+	boolEnv := func(name string, set func(*bool), aliases ...string) error {
+		value, ok := envValue(name, aliases...)
 		if !ok {
 			return nil
 		}
@@ -936,8 +1316,8 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 		set(parsed)
 		return nil
 	}
-	listEnv := func(name string, set func(*[]string)) error {
-		value, ok := lookupEnv(name)
+	listEnv := func(name string, set func(*[]string), aliases ...string) error {
+		value, ok := envValue(name, aliases...)
 		if !ok {
 			return nil
 		}
@@ -948,8 +1328,8 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 		set(parsed)
 		return nil
 	}
-	labelModeEnv := func(name string, set func(*LabelMode)) error {
-		value, ok := lookupEnv(name)
+	labelModeEnv := func(name string, set func(*LabelMode), aliases ...string) error {
+		value, ok := envValue(name, aliases...)
 		if !ok {
 			return nil
 		}
@@ -987,28 +1367,28 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 		return err
 	}
 
-	if err := boolEnv("LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", func(v *bool) { ensureReviewerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", func(v *bool) { ensureReviewerRoleConfig(overrides).AutoDiscovery = v }, "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY"); err != nil {
 		return err
 	}
-	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).IncludeDrafts = v }); err != nil {
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).IncludeDrafts = v }, "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS"); err != nil {
 		return err
 	}
-	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).RequireReviewRequest = v }); err != nil {
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).RequireReviewRequest = v }, "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST"); err != nil {
 		return err
 	}
-	if err := boolEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).EnableSelfReview = v }); err != nil {
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW", func(v *bool) { ensureReviewerRoleTriggersConfig(overrides).EnableSelfReview = v }, "LOOPER_ROLES_REVIEWER_TRIGGERS_ENABLE_SELF_REVIEW"); err != nil {
 		return err
 	}
-	if err := listEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS", func(v *[]string) { ensureReviewerRoleTriggersConfig(overrides).Labels = v }); err != nil {
+	if err := listEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS", func(v *[]string) { ensureReviewerRoleTriggersConfig(overrides).Labels = v }, "LOOPER_ROLES_REVIEWER_TRIGGERS_LABELS"); err != nil {
 		return err
 	}
-	if err := labelModeEnv("LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensureReviewerRoleTriggersConfig(overrides).LabelMode = v }); err != nil {
+	if err := labelModeEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE", func(v *LabelMode) { ensureReviewerRoleTriggersConfig(overrides).LabelMode = v }, "LOOPER_ROLES_REVIEWER_TRIGGERS_LABEL_MODE"); err != nil {
 		return err
 	}
-	if err := boolEnv("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", func(v *bool) { ensureReviewerSpecReviewConfig(overrides).IncludeReviewingLabel = v }); err != nil {
+	if err := boolEnv("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL", func(v *bool) { ensureReviewerSpecReviewConfig(overrides).IncludeReviewingLabel = v }, "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_INCLUDE_REVIEWING_LABEL"); err != nil {
 		return err
 	}
-	if value, ok := lookupEnv("LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL"); ok {
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL"); ok {
 		ensureReviewerSpecReviewConfig(overrides).ReviewingLabel = stringPtr(strings.TrimSpace(value))
 	}
 
@@ -1126,10 +1506,11 @@ func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 }
 
 func ensureReviewerConfig(partial *PartialConfig) *PartialReviewerConfig {
-	if partial.Reviewer == nil {
-		partial.Reviewer = &PartialReviewerConfig{}
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &PartialReviewerConfig{}
 	}
-	return partial.Reviewer
+	return reviewer.Behavior
 }
 
 func ensureReviewerLoopConfig(partial *PartialConfig) *PartialReviewerLoopConfig {
@@ -1154,6 +1535,14 @@ func ensureReviewerReviewEventsConfig(partial *PartialConfig) *PartialReviewerRe
 		reviewer.ReviewEvents = &PartialReviewerReviewEventsConfig{}
 	}
 	return reviewer.ReviewEvents
+}
+
+func ensureReviewerNativeResumeConfig(partial *PartialConfig) *PartialReviewerNativeResumeConfig {
+	reviewer := ensureReviewerConfig(partial)
+	if reviewer.NativeResume == nil {
+		reviewer.NativeResume = &PartialReviewerNativeResumeConfig{}
+	}
+	return reviewer.NativeResume
 }
 
 func ensureInstructionsConfig(partial *PartialConfig) *PartialInstructionsConfig {

@@ -312,6 +312,20 @@ type CreatePullRequestResult struct {
 	URL    string
 }
 
+type CompareBranchesInput struct {
+	Repo       string
+	BaseBranch string
+	HeadBranch string
+	CWD        string
+}
+
+type CompareBranchesResult struct {
+	AheadBy      int
+	BehindBy     int
+	Status       string
+	TotalCommits int
+}
+
 type UpdatePullRequestTitleInput struct {
 	Repo     string
 	PRNumber int64
@@ -370,6 +384,11 @@ type ListReviewThreadsInput struct {
 	Limit    int
 }
 
+type ViewReviewThreadInput struct {
+	ThreadID string
+	CWD      string
+}
+
 type ReviewThread struct {
 	ID         string
 	IsResolved bool
@@ -397,6 +416,17 @@ type AddReviewThreadReplyInput struct {
 	ThreadID string
 	Body     string
 	CWD      string
+}
+
+type CompareCommitsInput struct {
+	Repo string
+	Base string
+	Head string
+	CWD  string
+}
+
+type CompareCommitsResult struct {
+	Status string
 }
 
 type GetPullRequestDiffInput struct {
@@ -970,6 +1000,30 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 	return nil
 }
 
+func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
+	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD)
+	if err != nil {
+		return ReviewThread{}, err
+	}
+	if thread == nil {
+		return ReviewThread{}, nil
+	}
+	out := ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved}
+	cursor := ""
+	for {
+		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadCommentsPage(ctx, input.CWD, input.ThreadID, cursor)
+		if err != nil {
+			return ReviewThread{}, err
+		}
+		out.Comments = appendReviewThreadComments(out.Comments, nodes)
+		if !hasNextPage {
+			break
+		}
+		cursor = nextCursor
+	}
+	return out, nil
+}
+
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
 	limit := input.Limit
 	if limit <= 0 {
@@ -1046,6 +1100,25 @@ func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThrea
 		return fmt.Errorf("failed to add review thread reply %s", input.ThreadID)
 	}
 	return nil
+}
+
+// CompareCommits returns the GitHub compare API status between Base and Head
+// (one of "identical", "ahead", "behind", "diverged"). It is used by the
+// fixer to decide whether a previously-pushed fix commit is still reachable
+// from the live PR head.
+func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput) (CompareCommitsResult, error) {
+	if input.Repo == "" || input.Base == "" || input.Head == "" {
+		return CompareCommitsResult{}, fmt.Errorf("compare commits requires repo, base, and head")
+	}
+	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/compare/%s...%s", input.Repo, input.Base, input.Head))
+	if err != nil {
+		return CompareCommitsResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return CompareCommitsResult{}, err
+	}
+	return CompareCommitsResult{Status: asString(row["status"])}, nil
 }
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
@@ -1670,6 +1743,29 @@ func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequest
 	return CreatePullRequestResult{Number: parsePRNumberFromURL(prURL), URL: prURL}, nil
 }
 
+func (g *Gateway) CompareBranches(ctx context.Context, input CompareBranchesInput) (CompareBranchesResult, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	comparison := encodeURIComponent(input.BaseBranch) + "..." + encodeURIComponent(input.HeadBranch)
+	args := []string{"api", fmt.Sprintf("repos/%s/compare/%s", repo, comparison)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return CompareBranchesResult{}, err
+	}
+	var payload struct {
+		AheadBy      int    `json:"ahead_by"`
+		BehindBy     int    `json:"behind_by"`
+		Status       string `json:"status"`
+		TotalCommits int    `json:"total_commits"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &payload); err != nil {
+		return CompareBranchesResult{}, err
+	}
+	return CompareBranchesResult{AheadBy: payload.AheadBy, BehindBy: payload.BehindBy, Status: payload.Status, TotalCommits: payload.TotalCommits}, nil
+}
+
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
 	return err
@@ -1699,9 +1795,21 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			return "", nil
+		}
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+func isUserLoginUnsupportedForCurrentToken(err error) bool {
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(strings.Join([]string{commandErr.Error(), commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")))
+	return strings.Contains(combined, "resource not accessible by integration")
 }
 
 func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (string, error) {
@@ -1836,6 +1944,25 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 		for _, node := range nodes {
 			normalized, ok := normalizeReviewThread(node)
 			if ok {
+				threadRow, _ := node.(map[string]any)
+				commentsRow, _ := threadRow["comments"].(map[string]any)
+				commentNodes, _ := commentsRow["nodes"].([]any)
+				pageInfo, _ := commentsRow["pageInfo"].(map[string]any)
+				commentCursor := asString(pageInfo["endCursor"])
+				hasMoreComments := asBool(pageInfo["hasNextPage"])
+				allCommentNodes := append([]any(nil), commentNodes...)
+				for hasMoreComments {
+					moreComments, nextCommentCursor, hasMore, err := g.fetchReviewThreadCommentsPage(ctx, cwd, asString(normalized["threadId"]), commentCursor)
+					if err != nil {
+						return nil, err
+					}
+					allCommentNodes = append(allCommentNodes, moreComments...)
+					commentCursor = nextCommentCursor
+					hasMoreComments = hasMore
+				}
+				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
+					normalized["threadFingerprint"] = fingerprint
+				}
 				out = append(out, normalized)
 			}
 		}
@@ -1892,8 +2019,9 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"          isResolved",
 		"          path",
 		"          line",
-		"          comments(first: 1) {",
-		"            nodes { id body url path line author { login } }",
+		"          comments(first: 100) {",
+		"            nodes { id body updatedAt url path line author { login } }",
+		"            pageInfo { hasNextPage endCursor }",
 		"          }",
 		"        }",
 		"        pageInfo { hasNextPage endCursor }",
@@ -2185,7 +2313,33 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
+	if fingerprint := reviewThreadFingerprintFromNodes(nodes); fingerprint != "" {
+		out["threadFingerprint"] = fingerprint
+	}
 	return out, true
+}
+
+func reviewThreadFingerprintFromNodes(nodes []any) string {
+	parts := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		comment, _ := node.(map[string]any)
+		if comment == nil {
+			continue
+		}
+		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+			continue
+		}
+		id := strings.TrimSpace(asString(comment["id"]))
+		updatedAt := strings.TrimSpace(asString(comment["updatedAt"]))
+		if id == "" && updatedAt == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s@%s", id, updatedAt))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "|")
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {
