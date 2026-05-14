@@ -1274,6 +1274,22 @@ func TestGatewayListIssueReactionsScopesAPIToHostname(t *testing.T) {
 	}
 }
 
+func TestGatewayAddIssueReactionScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/issues/comments/91/reactions --method POST -H Accept: application/vnd.github+json -f content=+1 --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.AddIssueReaction(context.Background(), CreateIssueReactionInput{Repo: "github.example.com/acme/looper", CommentID: 91, Content: "+1"}); err != nil {
+		t.Fatalf("AddIssueReaction() error = %v", err)
+	}
+}
+
 func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

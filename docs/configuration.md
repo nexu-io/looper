@@ -116,7 +116,7 @@ All role-specific config lives under `roles.<role>`.
 
 ## Coordinator config reference
 
-Coordinator is the proactive, stateless issue-intake role. In slice 2 it owns Triage end-to-end; Dispatch remains scaffolded for the next slice, but its config shape is already present.
+Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
 
 ### Triage settings
 
@@ -135,18 +135,26 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 
 Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes `triaged` last.
 
-### Dispatch settings (scaffolded for slice 3)
+### Dispatch settings
 
-The full Coordinator config shape already includes `roles.coordinator.dispatch.*` so project overrides remain stable across slices:
+Coordinator dispatch lives under `roles.coordinator.dispatch.*`:
 
-- `roles.coordinator.dispatch.mode`
-- `roles.coordinator.dispatch.humanGate.slashCommands`
-- `roles.coordinator.dispatch.humanGate.allowedUsers`
-- `roles.coordinator.dispatch.autonomous.delayMinutes`
-- `roles.coordinator.dispatch.autonomous.holdLabel`
-- `roles.coordinator.dispatch.assignTo`
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.dispatch.mode` | Chooses `human-gated` or `autonomous` dispatch | `"human-gated"` |
+| `roles.coordinator.dispatch.assignTo` | Optional GitHub assignee added before the trigger label commit | `""` |
+| `roles.coordinator.dispatch.humanGate.slashCommands` | Accepted start-of-line slash commands | `[`"/plan"`, `"/implement"`]` |
+| `roles.coordinator.dispatch.humanGate.allowedUsers` | Extra users allowed to dispatch even without repo write access | `[]` |
+| `roles.coordinator.dispatch.autonomous.delayMinutes` | Grace window after `triaged` before autonomous dispatch can commit | `30` |
+| `roles.coordinator.dispatch.autonomous.holdLabel` | Global hold / veto label for autonomous dispatch | `"looper:hold"` |
 
-Slice 2 does not execute Dispatch yet, but these fields remain part of the canonical config and merge the same way as other project-level role overrides.
+Behavior notes:
+
+- `/plan` maps to the first planner trigger label at `roles.planner.triggers.labels[0]`
+- `/implement` maps to the first worker trigger label at `roles.worker.triggers.labels[0]`
+- autonomous mode uses the existing `dispatch/*` label to choose the same derived trigger labels
+- Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
+- `roles.coordinator.dispatch.autonomous.holdLabel` is also a veto signal, alongside removing `dispatch/*` or manually applying the destination trigger label
 
 Coordinator example:
 
@@ -394,7 +402,7 @@ holdLabel = "looper:hold"
 [roles.planner.discovery]
 autoDiscovery = true
 
-[roles.planner.discovery.triggers]
+[roles.planner.triggers]
 labels = ["looper:plan"]
 labelMode = "all"
 requireAssigneeCurrentUser = true
@@ -445,7 +453,7 @@ labelMode = "all"
 [roles.worker.discovery]
 autoDiscovery = true
 
-[roles.worker.discovery.triggers]
+[roles.worker.triggers]
 labels = ["looper:worker-ready"]
 labelMode = "all"
 requireAssigneeCurrentUser = true

@@ -12,6 +12,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator/dispatch"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -21,6 +22,7 @@ import (
 const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 const triageCommentMarker = "<!-- looper:coordinator:triage -->"
+const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -->"
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -42,7 +44,12 @@ type GitHubGateway interface {
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
+	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
+	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
+	AddIssueAssignees(context.Context, githubinfra.IssueAssigneesInput) error
 	AddIssueLabels(context.Context, githubinfra.IssueLabelsInput) error
+	AddIssueReaction(context.Context, githubinfra.CreateIssueReactionInput) error
 	RemoveIssueLabels(context.Context, githubinfra.IssueLabelsInput) error
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
@@ -121,20 +128,34 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
+	dispatchCfg := roleConfigToDispatchConfig(roleCfg, config.ProjectRoleConfigs(*r.config, input.ProjectID))
 	processed := 0
 	for _, summary := range issues {
-		if processed >= triageCfg.MaxPerTick {
-			break
-		}
 		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
-			continue
-		}
-		if !mightNeedCoordinatorAction(summary, triageCfg) {
 			continue
 		}
 		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary.Number)
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		dispatchIssue, err := r.dispatchIssue(ctx, input.Repo, project.RepoPath, issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		dispatchAction := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		if r.hasDispatchWork(dispatchAction) {
+			if err := r.applyDispatchAction(ctx, input.Repo, project.RepoPath, issue, dispatchAction); err != nil {
+				return DiscoveryResult{}, err
+			}
+			if strings.TrimSpace(dispatchAction.FailureCommentBody) == "" {
+				continue
+			}
+		}
+		if processed >= triageCfg.MaxPerTick {
+			continue
+		}
+		if !mightNeedCoordinatorAction(summary, triageCfg) {
+			continue
 		}
 		if !triage.ShouldReTriage(issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(issue, triageCfg, r.now().UTC()) {
 			continue
@@ -153,6 +174,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
+	return action.ReactionCommentID != 0 || action.TriggerLabel != "" || action.FailureCommentBody != ""
 }
 
 // ShouldSkipIssue reserves the structural cross-role boundary with Sweeper.
@@ -207,12 +232,45 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	return nil
 }
 
+func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) error {
+	if strings.TrimSpace(action.FailureCommentBody) != "" {
+		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, action.FailureCommentBody); err != nil {
+			return err
+		}
+		if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
+			return r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd})
+		}
+		return nil
+	}
+	if strings.TrimSpace(action.AssignTo) != "" {
+		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(action.TriggerLabel) != "" && !hasExactLabel(issue.Labels, action.TriggerLabel) {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{action.TriggerLabel}, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
+		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	return nil
+
+}
+
 func (r *Runner) postOrEditComment(ctx context.Context, repo, cwd string, issue triage.Issue, analysisStartedAt time.Time, body string) error {
 	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issue.Number, CWD: cwd})
 	if err != nil {
 		return err
 	}
-	existing := findMarkerComment(comments)
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	existing := findMarkerComment(comments, currentLogin)
 	if hasNewHumanComment(comments, analysisStartedAt) {
 		return nil
 	}
@@ -223,6 +281,26 @@ func (r *Runner) postOrEditComment(ctx context.Context, repo, cwd string, issue 
 		return r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: repo, CommentID: existing.ID, Body: commentBody, CWD: cwd})
 	}
 	_, err = r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: issue.Number, Body: commentBody, CWD: cwd})
+	return err
+}
+
+func (r *Runner) postOrEditDispatchFailureComment(ctx context.Context, repo, cwd string, issueNumber int64, body string) error {
+	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+	if err != nil {
+		return err
+	}
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	existing := findDispatchFailureComment(comments, currentLogin)
+	commentBody := dispatchFailureCommentMarker + "\n\n" + strings.TrimSpace(body)
+	stamper := disclosure.FromConfig(*r.config)
+	commentBody = stamper.Markdown(commentBody, "coordinator", disclosure.ChannelIssueComment)
+	if existing != nil {
+		return r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: repo, CommentID: existing.ID, Body: commentBody, CWD: cwd})
+	}
+	_, err = r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: issueNumber, Body: commentBody, CWD: cwd})
 	return err
 }
 
@@ -239,10 +317,6 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, issueNumber in
 	if err != nil {
 		return triage.Issue{}, err
 	}
-	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
-	if err != nil {
-		return triage.Issue{}, err
-	}
 	timeline, err := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
 	if err != nil {
 		return triage.Issue{}, err
@@ -256,16 +330,88 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, issueNumber in
 		CreatedAt: detail.CreatedAt,
 		UpdatedAt: detail.UpdatedAt,
 		Labels:    append([]string(nil), detail.Labels...),
-		Comments:  make([]triage.Comment, 0, len(comments)),
+		Comments:  make([]triage.Comment, 0, len(detail.Comments)),
 		Timeline:  make([]triage.TimelineEvent, 0, len(timeline)),
 	}
-	for _, comment := range comments {
-		issue.Comments = append(issue.Comments, triage.Comment{ID: comment.ID, Author: comment.Author, Body: comment.Body, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+	for _, comment := range detail.Comments {
+		issue.Comments = append(issue.Comments, triage.Comment{ID: comment.ID, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, Body: comment.Body, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	for _, event := range timeline {
 		issue.Timeline = append(issue.Timeline, triage.TimelineEvent{Event: strings.TrimSpace(asString(event["event"])), CreatedAt: firstNonEmpty(asString(event["created_at"]), asString(event["createdAt"])), Label: timelineLabelName(event)})
 	}
 	return issue, nil
+}
+
+func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles config.RoleConfigs) dispatch.Config {
+	return dispatch.Config{
+		Mode:                roleCfg.Dispatch.Mode,
+		TriagedLabel:        roleCfg.Triage.TriagedLabel,
+		HoldLabel:           roleCfg.Dispatch.Autonomous.HoldLabel,
+		AutonomousDelay:     time.Duration(roleCfg.Dispatch.Autonomous.DelayMinutes) * time.Minute,
+		AllowedUsers:        append([]string(nil), roleCfg.Dispatch.HumanGate.AllowedUsers...),
+		SlashCommands:       append([]string(nil), roleCfg.Dispatch.HumanGate.SlashCommands...),
+		AssignTo:            roleCfg.Dispatch.AssignTo,
+		PlannerTriggerLabel: firstRoleTrigger(roles.Planner.Triggers.Labels),
+		WorkerTriggerLabel:  firstRoleTrigger(roles.Worker.Triggers.Labels),
+	}
+}
+
+func firstRoleTrigger(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	return labels[0]
+}
+
+func (r *Runner) dispatchIssue(ctx context.Context, repo, cwd string, issue triage.Issue, triagedLabel string, cfg dispatch.Config) (dispatch.Issue, error) {
+	out := dispatch.Issue{Number: issue.Number, Labels: append([]string(nil), issue.Labels...), Comments: make([]dispatch.Comment, 0, len(issue.Comments))}
+	permissionCache := map[string]bool{}
+	for _, comment := range issue.Comments {
+		createdAt, _ := parseCoordinatorTime(comment.CreatedAt)
+		hasWriteAccess := false
+		if cfg.Mode == dispatch.ModeHumanGated {
+			if _, ok := dispatch.ParseSlashCommand(comment.Body, cfg.SlashCommands); ok {
+				allowed, err := r.commentHasWriteAccess(ctx, repo, cwd, comment.Author, permissionCache, cfg)
+				if err != nil {
+					return dispatch.Issue{}, err
+				}
+				hasWriteAccess = allowed
+			}
+		}
+		out.Comments = append(out.Comments, dispatch.Comment{ID: comment.ID, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, HasWriteAccess: hasWriteAccess, Body: comment.Body, CreatedAt: createdAt})
+	}
+	for _, event := range issue.Timeline {
+		if event.Event != "labeled" || event.Label != triagedLabel {
+			continue
+		}
+		when, ok := parseCoordinatorTime(event.CreatedAt)
+		if ok && (out.TriagedAt.IsZero() || when.After(out.TriagedAt)) {
+			out.TriagedAt = when
+		}
+	}
+	return out, nil
+}
+
+func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author string, cache map[string]bool, cfg dispatch.Config) (bool, error) {
+	author = strings.TrimSpace(author)
+	if author == "" {
+		return false, nil
+	}
+	for _, allowed := range cfg.AllowedUsers {
+		if strings.EqualFold(strings.TrimSpace(allowed), author) {
+			return true, nil
+		}
+	}
+	if allowed, ok := cache[strings.ToLower(author)]; ok {
+		return allowed, nil
+	}
+	permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{Repo: repo, User: author, CWD: cwd})
+	if err != nil {
+		return false, nil
+	}
+	allowed := permission == "admin" || permission == "maintain" || permission == "write"
+	cache[strings.ToLower(author)] = allowed
+	return allowed, nil
 }
 
 func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.ProjectRecord, config.CoordinatorRoleConfig, config.SweeperRoleConfig, error) {
@@ -362,9 +508,24 @@ func hasExactLabel(labels []string, want string) bool {
 	return false
 }
 
-func findMarkerComment(comments []githubinfra.CommentInfo) *githubinfra.CommentInfo {
+func findMarkerComment(comments []githubinfra.CommentInfo, currentLogin string) *githubinfra.CommentInfo {
 	for index := range comments {
-		if strings.Contains(comments[index].Body, triageCommentMarker) {
+		if !strings.Contains(comments[index].Body, triageCommentMarker) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(comments[index].Author), strings.TrimSpace(currentLogin)) {
+			return &comments[index]
+		}
+	}
+	return nil
+}
+
+func findDispatchFailureComment(comments []githubinfra.CommentInfo, currentLogin string) *githubinfra.CommentInfo {
+	for index := range comments {
+		if !strings.Contains(comments[index].Body, dispatchFailureCommentMarker) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(comments[index].Author), strings.TrimSpace(currentLogin)) {
 			return &comments[index]
 		}
 	}

@@ -3,12 +3,14 @@ package coordinator
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
+	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -55,7 +57,8 @@ func TestRunnerEditsExistingMarkerComment(t *testing.T) {
 	fixture.runner.config.Roles.Coordinator.Enabled = true
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
-	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 91, Body: triageCommentMarker + "\n\nOld"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Comments: []githubinfra.CommentInfo{{ID: 91, Author: "looper", Body: triageCommentMarker + "\n\nOld", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 91, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, triageCommentMarker+"\n\nOld"), CreatedAt: fixture.now.Format(time.RFC3339)}}}
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
@@ -69,8 +72,8 @@ func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	fixture.runner.config.Roles.Coordinator.Enabled = true
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
-	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
-	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{}, {{ID: 77, Author: "human", Body: "I triaged this", CreatedAt: fixture.now.Add(time.Second).Format(time.RFC3339)}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Comments: []githubinfra.CommentInfo{{ID: 77, Author: "human", Body: "I triaged this", CreatedAt: fixture.now.Add(time.Second).Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 77, Author: "human", Body: "I triaged this", CreatedAt: fixture.now.Add(time.Second).Format(time.RFC3339)}}}
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
@@ -81,6 +84,53 @@ func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 	if countOperations(fixture.github.ops, "add:triaged") != 1 {
 		t.Fatal("triaged label not applied")
 	}
+}
+
+func TestRunnerHumanDispatchOrdersAssignLabelReact(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:looper:plan", "react:+1:11"})
+}
+
+func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-10 * 24 * time.Hour).Format(time.RFC3339), Comments: []githubinfra.CommentInfo{{ID: 12, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 12, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}, {ID: 99, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, dispatchFailureCommentMarker+"\n\nOld failure"), CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.updatedBodies) != 1 {
+		t.Fatalf("created=%d updated=%d, want updated failure comment only", len(fixture.github.createdBodies), len(fixture.github.updatedBodies))
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"update-comment", "react:confused:12"})
+}
+
+func TestRunnerAutonomousDispatchAppliesConfiguredPlannerTrigger(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:my-custom-plan"})
 }
 
 type coordinatorFixture struct {
@@ -163,11 +213,31 @@ func (s *stubCoordinatorGitHub) ListIssueComments(_ context.Context, input githu
 	s.commentReads[input.IssueNumber]++
 	return append([]githubinfra.CommentInfo(nil), batches[reads]...), nil
 }
+func (s *stubCoordinatorGitHub) GetCurrentUserLogin(context.Context, string) (string, error) {
+	return "looper", nil
+}
+func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	return "looper", nil
+}
 func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
 	return s.timeline[input.IssueNumber], nil
 }
+func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {
+	if input.User == "octo" {
+		return "write", nil
+	}
+	return "read", nil
+}
+func (s *stubCoordinatorGitHub) AddIssueAssignees(_ context.Context, input githubinfra.IssueAssigneesInput) error {
+	s.ops = append(s.ops, "assign:"+joinLabels(input.Assignees))
+	return nil
+}
 func (s *stubCoordinatorGitHub) AddIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
 	s.ops = append(s.ops, "add:"+joinLabels(input.Labels))
+	return nil
+}
+func (s *stubCoordinatorGitHub) AddIssueReaction(_ context.Context, input githubinfra.CreateIssueReactionInput) error {
+	s.ops = append(s.ops, "react:"+input.Content+":"+intToString(input.CommentID))
 	return nil
 }
 func (s *stubCoordinatorGitHub) RemoveIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
@@ -219,4 +289,12 @@ func containsAll(body string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+func intToString(value int64) string {
+	return strconv.FormatInt(value, 10)
+}
+
+func stampedCoordinatorBody(cfg *config.Config, body string) string {
+	return disclosure.FromConfig(*cfg).Markdown(body, "coordinator", disclosure.ChannelIssueComment)
 }
