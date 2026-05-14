@@ -180,48 +180,74 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
-	if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, issue.Labels, decision.ClearLabelPatterns); err != nil {
+	remainingLabels := append([]string(nil), issue.Labels...)
+	hadTriaged := hasExactLabel(remainingLabels, cfg.TriagedLabel)
+	if decision.MarkTriaged && hadTriaged {
+		if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, remainingLabels, []string{cfg.TriagedLabel}); err != nil {
+			return err
+		}
+		remainingLabels = removeExactLabels(remainingLabels, cfg.TriagedLabel)
+	}
+	clearNow, clearAfter := splitDelayedLabelPatterns(decision.ClearLabelPatterns, cfg.UnclearLabel, hadTriaged)
+	if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, issue.Labels, clearNow); err != nil {
 		return err
 	}
-	if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, issue.Labels, decision.RemoveLabels); err != nil {
+	remainingLabels = removeMatchingLabels(remainingLabels, clearNow)
+	removeNow, removeAfter := splitDelayedLabelPatterns(decision.RemoveLabels, cfg.UnclearLabel, hadTriaged)
+	if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, issue.Labels, removeNow); err != nil {
 		return err
 	}
+	remainingLabels = removeMatchingLabels(remainingLabels, removeNow)
 	applyNow := removeExactLabels(decision.ApplyLabels, cfg.TriagedLabel)
 	if len(applyNow) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, CWD: cwd}); err != nil {
 			return err
 		}
 	}
+	clearAfter = removeAppliedLabelPatterns(clearAfter, decision.ApplyLabels)
+	removeAfter = removeAppliedLabelPatterns(removeAfter, decision.ApplyLabels)
+	commentPosted := true
 	if strings.TrimSpace(decision.CommentBody) != "" {
-		if err := r.postOrEditComment(ctx, repo, cwd, issue, analysisStartedAt, decision.CommentBody); err != nil {
+		posted, err := r.postOrEditComment(ctx, repo, cwd, issue, analysisStartedAt, decision.CommentBody)
+		if err != nil {
+			return err
+		}
+		commentPosted = posted
+	}
+	shouldMarkTriaged := decision.MarkTriaged && (!hadTriaged || commentPosted)
+	if shouldMarkTriaged && !hasExactLabel(remainingLabels, cfg.TriagedLabel) {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, CWD: cwd}); err != nil {
 			return err
 		}
 	}
-	if decision.MarkTriaged && !hasExactLabel(issue.Labels, cfg.TriagedLabel) {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, CWD: cwd}); err != nil {
+	if commentPosted {
+		if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, remainingLabels, clearAfter); err != nil {
+			return err
+		}
+		if err := r.removeIssueLabels(ctx, repo, cwd, issue.Number, remainingLabels, removeAfter); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *Runner) postOrEditComment(ctx context.Context, repo, cwd string, issue triage.Issue, analysisStartedAt time.Time, body string) error {
+func (r *Runner) postOrEditComment(ctx context.Context, repo, cwd string, issue triage.Issue, analysisStartedAt time.Time, body string) (bool, error) {
 	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issue.Number, CWD: cwd})
 	if err != nil {
-		return err
+		return false, err
 	}
 	existing := findMarkerComment(comments)
-	if hasNewHumanComment(comments, analysisStartedAt) {
-		return nil
+	if hasNewHumanComment(comments, knownCommentIDs(issue.Comments), analysisStartedAt) {
+		return false, nil
 	}
 	commentBody := triageCommentMarker + "\n\n" + body
 	stamper := disclosure.FromConfig(*r.config)
 	commentBody = stamper.Markdown(commentBody, "coordinator", disclosure.ChannelIssueComment)
 	if existing != nil {
-		return r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: repo, CommentID: existing.ID, Body: commentBody, CWD: cwd})
+		return true, r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: repo, CommentID: existing.ID, Body: commentBody, CWD: cwd})
 	}
 	_, err = r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: issue.Number, Body: commentBody, CWD: cwd})
-	return err
+	return err == nil, err
 }
 
 func (r *Runner) removeIssueLabels(ctx context.Context, repo, cwd string, issueNumber int64, existing []string, patterns []string) error {
@@ -344,6 +370,55 @@ func removeExactLabels(labels []string, target string) []string {
 	return result
 }
 
+func removeMatchingLabels(labels []string, patterns []string) []string {
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if !matchesAnyLabelPattern(label, patterns) {
+			result = append(result, label)
+		}
+	}
+	return result
+}
+
+func splitDelayedLabelPatterns(patterns []string, delayedLabel string, delay bool) ([]string, []string) {
+	if !delay {
+		return append([]string(nil), patterns...), nil
+	}
+	now := make([]string, 0, len(patterns))
+	after := []string{}
+	for _, pattern := range patterns {
+		if pattern == delayedLabel {
+			after = append(after, pattern)
+			continue
+		}
+		now = append(now, pattern)
+	}
+	return now, after
+}
+
+func removeAppliedLabelPatterns(patterns []string, applied []string) []string {
+	if len(patterns) == 0 || len(applied) == 0 {
+		return patterns
+	}
+	result := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if matchesAnyLabelPattern(pattern, applied) {
+			continue
+		}
+		result = append(result, pattern)
+	}
+	return result
+}
+
+func matchesAnyLabelPattern(label string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if labelMatchesPattern(label, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func labelMatchesPattern(label string, pattern string) bool {
 	if strings.HasSuffix(pattern, "/*") {
 		return strings.HasPrefix(label, strings.TrimSuffix(pattern, "*"))
@@ -369,13 +444,28 @@ func findMarkerComment(comments []githubinfra.CommentInfo) *githubinfra.CommentI
 	return nil
 }
 
-func hasNewHumanComment(comments []githubinfra.CommentInfo, since time.Time) bool {
+func knownCommentIDs(comments []triage.Comment) map[int64]struct{} {
+	known := make(map[int64]struct{}, len(comments))
 	for _, comment := range comments {
+		if comment.ID == 0 {
+			continue
+		}
+		known[comment.ID] = struct{}{}
+	}
+	return known
+}
+
+func hasNewHumanComment(comments []githubinfra.CommentInfo, known map[int64]struct{}, since time.Time) bool {
+	since = since.UTC().Truncate(time.Second)
+	for _, comment := range comments {
+		if _, ok := known[comment.ID]; ok {
+			continue
+		}
 		if strings.Contains(comment.Body, triageCommentMarker) || disclosure.HasMarkdownStamp(comment.Body) {
 			continue
 		}
 		when, ok := parseCoordinatorTime(comment.CreatedAt)
-		if ok && when.After(since) {
+		if ok && !when.Before(since) {
 			return true
 		}
 	}

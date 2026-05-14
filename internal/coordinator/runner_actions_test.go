@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,6 +84,29 @@ func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 	}
 }
 
+func TestRunnerStaysSilentWhenHumanCommentsInSameSecond(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.now = fixture.now.Add(500 * time.Millisecond)
+	fixture.runner.now = func() time.Time { return fixture.now }
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339Nano)}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{}, {{ID: 78, Author: "human", Body: "same-second update", CreatedAt: fixture.now.Truncate(time.Second).Format(time.RFC3339)}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.updatedBodies) != 0 {
+		t.Fatal("runner posted or edited a comment after same-second human update")
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "add:triaged"})
+	if countOperations(fixture.github.ops, "add:triaged") != 1 {
+		t.Fatal("triaged label not applied")
+	}
+}
+
 func TestRunnerReTriagesStaleClarifiedIssueInSamePass(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
@@ -106,18 +130,151 @@ func TestRunnerReTriagesStaleClarifiedIssueInSamePass(t *testing.T) {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
 
-	assertOrderedOps(t, fixture.github.ops, []string{"remove:needs-info", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "create-comment"})
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "create-comment", "add:triaged", "remove:needs-info"})
+	if countOperations(fixture.github.ops, "remove:triaged") != 1 {
+		t.Fatalf("remove:triaged count = %d, want 1", countOperations(fixture.github.ops, "remove:triaged"))
+	}
 	if countOperations(fixture.github.ops, "remove:needs-info") != 1 {
 		t.Fatalf("remove:needs-info count = %d, want 1", countOperations(fixture.github.ops, "remove:needs-info"))
 	}
 	if countOperations(fixture.github.ops, "create-comment") != 1 {
 		t.Fatal("create-comment count = 0, want 1")
 	}
-	if countOperations(fixture.github.ops, "add:triaged") != 0 {
-		t.Fatal("triaged label was re-added even though the stale issue already had it")
+	if countOperations(fixture.github.ops, "add:triaged") != 1 {
+		t.Fatal("triaged label was not re-added after successful re-triage")
 	}
 	if len(fixture.github.createdBodies) != 1 || !strings.Contains(fixture.github.createdBodies[0], "Looks actionable.") {
 		t.Fatalf("createdBodies = %v, want retriage comment", fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerLeavesIssueUntriagedWhenReTriageCommentSkipped(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number:    1,
+		Title:     "Bug",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+		Labels:    []string{"needs-info", "triaged"},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{
+		{{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}},
+		{{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}, {ID: 78, Author: "human", Body: "hold on", CreatedAt: fixture.now.Add(time.Second).Format(time.RFC3339)}},
+	}
+	fixture.github.timeline[1] = []map[string]any{{
+		"event":      "labeled",
+		"created_at": fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
+		"label":      map[string]any{"name": "needs-info"},
+	}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan"})
+	if countOperations(fixture.github.ops, "create-comment") != 0 {
+		t.Fatal("comment should be skipped after concurrent human reply")
+	}
+	if countOperations(fixture.github.ops, "add:triaged") != 0 {
+		t.Fatal("triaged label should stay cleared when re-triage comment is skipped")
+	}
+}
+
+func TestRunnerIgnoresAlreadyLoadedSameSecondComment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.now = fixture.now.Add(500 * time.Millisecond)
+	fixture.runner.now = func() time.Time { return fixture.now }
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
+	sameSecondComment := githubinfra.CommentInfo{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Truncate(time.Second).Format(time.RFC3339)}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number:    1,
+		Title:     "Bug",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+		Labels:    []string{"needs-info", "triaged"},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{sameSecondComment}, {sameSecondComment}}
+	fixture.github.timeline[1] = []map[string]any{{
+		"event":      "labeled",
+		"created_at": fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
+		"label":      map[string]any{"name": "needs-info"},
+	}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "create-comment", "add:triaged", "remove:needs-info"})
+	if countOperations(fixture.github.ops, "create-comment") != 1 {
+		t.Fatal("same-second loaded comment should not block retriage comment")
+	}
+	if countOperations(fixture.github.ops, "add:triaged") != 1 {
+		t.Fatal("same-second loaded comment should still allow triaged label re-add")
+	}
+}
+
+func TestRunnerKeepsNeedsInfoWhenReTriageTriagedWriteFails(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.failAddLabels = map[string]error{"triaged": errors.New("boom")}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number:    1,
+		Title:     "Bug",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+		Labels:    []string{"needs-info", "triaged"},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{
+		"event":      "labeled",
+		"created_at": fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
+		"label":      map[string]any{"name": "needs-info"},
+	}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err == nil {
+		t.Fatal("DiscoverIssues() error = nil, want triaged write failure")
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "create-comment", "add:triaged"})
+	if countOperations(fixture.github.ops, "remove:needs-info") != 0 {
+		t.Fatal("needs-info should remain when re-triage triaged write fails")
+	}
+}
+
+func TestRunnerKeepsNeedsInfoWhenReTriageStaysUnclear(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.triageLLM = stubUnclearCoordinatorLLM{}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number:    1,
+		Title:     "Bug",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+		Labels:    []string{"needs-info", "triaged"},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{
+		"event":      "labeled",
+		"created_at": fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
+		"label":      map[string]any{"name": "needs-info"},
+	}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged", "add:needs-info", "create-comment", "add:triaged"})
+	if countOperations(fixture.github.ops, "remove:needs-info") != 0 {
+		t.Fatal("needs-info should remain when re-triage stays unclear")
 	}
 }
 
@@ -163,6 +320,12 @@ func (stubCoordinatorLLM) Complete(context.Context, triage.Request) (string, err
 	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
 }
 
+type stubUnclearCoordinatorLLM struct{}
+
+func (stubUnclearCoordinatorLLM) Complete(context.Context, triage.Request) (string, error) {
+	return `{"disposition":"unclear","comment":"Please share more detail.","labels":{"kind":[],"area":[],"complexity":[],"dispatch":[]}}`, nil
+}
+
 type stubCoordinatorInspector struct{}
 
 func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (triage.RepoContext, error) {
@@ -178,6 +341,7 @@ type stubCoordinatorGitHub struct {
 	createdBodies []string
 	updatedBodies []string
 	commentReads  map[int64]int
+	failAddLabels map[string]error
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -206,6 +370,11 @@ func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githu
 }
 func (s *stubCoordinatorGitHub) AddIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
 	s.ops = append(s.ops, "add:"+joinLabels(input.Labels))
+	if s.failAddLabels != nil {
+		if err, ok := s.failAddLabels[joinLabels(input.Labels)]; ok {
+			return err
+		}
+	}
 	return nil
 }
 func (s *stubCoordinatorGitHub) RemoveIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
