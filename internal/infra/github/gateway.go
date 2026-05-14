@@ -686,7 +686,12 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 }
 
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", input.Repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json")
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -694,11 +699,16 @@ func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInpu
 }
 
 func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
-	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.IssueNumber)
+	hostname, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.IssueNumber)
 	if input.CommentID > 0 {
-		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", input.Repo, input.CommentID)
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", repo, input.CommentID)
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", endpoint, "-H", "Accept: application/vnd.github+json")
+	args := []string{"api", "--paginate", "--slurp", endpoint, "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return nil, err
 	}

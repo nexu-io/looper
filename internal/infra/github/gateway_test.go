@@ -1163,6 +1163,58 @@ func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
 	}
 }
 
+func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api --paginate --slurp repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[[{"id":1,"event":"closed"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueTimeline() error = %v", err)
+	}
+	if len(rows) != 1 || asInt64(rows[0]["id"]) != 1 || asString(rows[0]["event"]) != "closed" {
+		t.Fatalf("ListIssueTimeline() = %#v, want parsed enterprise timeline", rows)
+	}
+}
+
+func TestGatewayListIssueReactionsScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api --paginate --slurp repos/acme/looper/issues/8/reactions -H Accept: application/vnd.github+json --hostname github.example.com":
+			return shell.Result{Stdout: `[[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]]`}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/comments/91/reactions -H Accept: application/vnd.github+json --hostname github.example.com":
+			return shell.Result{Stdout: `[[{"id":8,"content":"rocket","user":{"login":"octo"}}]]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	reactions, err := gateway.ListIssueReactions(context.Background(), IssueReactionInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueReactions(issue) error = %v", err)
+	}
+	if len(reactions) != 1 || reactions[0].ID != 7 || reactions[0].Content != "eyes" || reactions[0].UserLogin != "reviewer" {
+		t.Fatalf("ListIssueReactions(issue) = %#v, want parsed enterprise issue reactions", reactions)
+	}
+	commentReactions, err := gateway.ListIssueReactions(context.Background(), IssueReactionInput{Repo: "github.example.com/acme/looper", CommentID: 91})
+	if err != nil {
+		t.Fatalf("ListIssueReactions(comment) error = %v", err)
+	}
+	if len(commentReactions) != 1 || commentReactions[0].ID != 8 || commentReactions[0].Content != "rocket" || commentReactions[0].UserLogin != "octo" {
+		t.Fatalf("ListIssueReactions(comment) = %#v, want parsed enterprise comment reactions", commentReactions)
+	}
+}
+
 func TestGatewayIgnoresPlainPullRequestCommentsAsReviewThreads(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
