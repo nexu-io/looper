@@ -166,10 +166,8 @@ func ShouldSkipIssue(issue IssueSummary, roleCfg config.CoordinatorRoleConfig, s
 }
 
 func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
-	if triage.ShouldReTriage(issue, cfg, r.now().UTC()) {
-		return triage.ReTriageDecision(cfg), nil
-	}
-	if !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
+	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
+	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
 		return triage.NoOpDecision(), nil
 	}
 	repoCtx, err := r.inspector.Inspect(ctx, repoPath, issue)

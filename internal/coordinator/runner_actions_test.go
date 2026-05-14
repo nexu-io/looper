@@ -83,6 +83,44 @@ func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 	}
 }
 
+func TestRunnerReTriagesStaleClarifiedIssueInSamePass(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number:    1,
+		Title:     "Bug",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+		Labels:    []string{"needs-info", "triaged"},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 77, Author: "octo", Body: "Added details", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{
+		"event":      "labeled",
+		"created_at": fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
+		"label":      map[string]any{"name": "needs-info"},
+	}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:needs-info", "add:kind/bug,area/coordinator,complexity/m,dispatch/plan", "create-comment"})
+	if countOperations(fixture.github.ops, "remove:needs-info") != 1 {
+		t.Fatalf("remove:needs-info count = %d, want 1", countOperations(fixture.github.ops, "remove:needs-info"))
+	}
+	if countOperations(fixture.github.ops, "create-comment") != 1 {
+		t.Fatal("create-comment count = 0, want 1")
+	}
+	if countOperations(fixture.github.ops, "add:triaged") != 0 {
+		t.Fatal("triaged label was re-added even though the stale issue already had it")
+	}
+	if len(fixture.github.createdBodies) != 1 || !strings.Contains(fixture.github.createdBodies[0], "Looks actionable.") {
+		t.Fatalf("createdBodies = %v, want retriage comment", fixture.github.createdBodies)
+	}
+}
+
 type coordinatorFixture struct {
 	runner    *Runner
 	github    *stubCoordinatorGitHub
