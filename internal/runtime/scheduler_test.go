@@ -1263,6 +1263,10 @@ func (s schedulerTestSweeperGitHub) ViewPullRequest(context.Context, githubinfra
 	return githubinfra.PullRequestDetail{}, nil
 }
 
+func (s schedulerTestSweeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	return nil, nil
+}
+
 func (s schedulerTestSweeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
 	return nil, nil
 }
