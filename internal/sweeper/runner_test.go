@@ -129,6 +129,19 @@ func TestDiscoverPullRequestsSkipsWhenPRLaneDisabled(t *testing.T) {
 	}
 }
 
+func TestLoadTargetFailsWhenPRReviewThreadsCannotBeFetched(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	fixture.github.prDetails["acme/looper#42"] = githubinfra.PullRequestDetail{Number: 42, Title: "stale pr", State: "open", UpdatedAt: fixture.nowISO, Author: "octo"}
+	fixture.github.reviewThreadsErr = errors.New("review threads unavailable")
+
+	_, err := fixture.runner.loadTarget(context.Background(), storage.QueueItemRecord{Repo: stringPtr("acme/looper"), TargetType: "pull_request", TargetID: "acme/looper#42"})
+	if err == nil || !strings.Contains(err.Error(), "review threads unavailable") {
+		t.Fatalf("loadTarget() error = %v, want review thread fetch failure", err)
+	}
+}
+
 func TestDiscoverIssuesSkipsExcludedLabelBeforeAuthorAssociationLookup(t *testing.T) {
 	t.Parallel()
 
@@ -1679,6 +1692,61 @@ func TestStaleProposalStatusForApplyDetectsFingerprintDrift(t *testing.T) {
 	}
 }
 
+func TestStaleProposalStatusForApplyCountsReviewThreadActivity(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	target := liveTarget{
+		Number:        53,
+		State:         "open",
+		Title:         "PR with review discussion",
+		Body:          "already fixed by #9",
+		Author:        "octo",
+		Labels:        []string{"looper:sweep-pending"},
+		IsPR:          true,
+		HeadSHA:       "abc123",
+		ReviewThreads: []githubinfra.ReviewThread{{Comments: []githubinfra.ReviewThreadComment{{Author: "reviewer", CreatedAt: "2026-05-01T12:00:00Z"}}}},
+	}
+	caseRecord, err := fixture.runner.ensureCase(context.Background(), fixture.projectID, target, sweeperPayload{Repo: "acme/looper"}, fixture.cfg.Roles.Sweeper)
+	if err != nil {
+		t.Fatalf("ensureCase() error = %v", err)
+	}
+
+	withoutThread := target
+	withoutThread.ReviewThreads = nil
+	oldFingerprint, err := BuildFingerprint(fixture.runner.buildFactBundle(withoutThread, caseRecord, fixture.cfg.Roles.Sweeper))
+	if err != nil {
+		t.Fatalf("BuildFingerprint(withoutThread) error = %v", err)
+	}
+
+	withThreadBundle := fixture.runner.buildFactBundle(target, caseRecord, fixture.cfg.Roles.Sweeper)
+	if withThreadBundle.LastHumanCommentAt != "2026-05-01T12:00:00Z" {
+		t.Fatalf("LastHumanCommentAt = %q, want review thread timestamp", withThreadBundle.LastHumanCommentAt)
+	}
+	if withThreadBundle.HumanCommentCountSinceOpen != 1 {
+		t.Fatalf("HumanCommentCountSinceOpen = %d, want 1", withThreadBundle.HumanCommentCountSinceOpen)
+	}
+
+	newFingerprint, err := BuildFingerprint(withThreadBundle)
+	if err != nil {
+		t.Fatalf("BuildFingerprint(withThread) error = %v", err)
+	}
+	if newFingerprint == oldFingerprint {
+		t.Fatal("BuildFingerprint() ignored review thread activity")
+	}
+	proposal := &storage.SweeperProposalRecord{FingerprintJSON: oldFingerprint}
+	stale, _, refreshedFingerprint, err := fixture.runner.staleProposalStatusForApply(target, caseRecord, fixture.cfg.Roles.Sweeper, proposal)
+	if err != nil {
+		t.Fatalf("staleProposalStatusForApply() error = %v", err)
+	}
+	if !stale {
+		t.Fatal("staleProposalStatusForApply() stale = false, want true")
+	}
+	if refreshedFingerprint != newFingerprint {
+		t.Fatalf("refreshed fingerprint = %q, want %q", refreshedFingerprint, newFingerprint)
+	}
+}
+
 func TestProcessCloseCreatesCloseProposalBeforeCheckingWarnFingerprint(t *testing.T) {
 	t.Parallel()
 
@@ -2196,6 +2264,8 @@ type stubGitHub struct {
 	issueComments     []githubinfra.CommentInfo
 	timeline          []map[string]any
 	linkedPRs         []githubinfra.LinkedPullRequest
+	reviewThreads     []githubinfra.ReviewThread
+	reviewThreadsErr  error
 	prReviewState     githubinfra.PullRequestReviewState
 }
 
@@ -2241,6 +2311,13 @@ func (g *stubGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInp
 
 func (g *stubGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	return g.prDetails[input.Repo+"#"+itoa(input.PRNumber)], nil
+}
+
+func (g *stubGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	if g.reviewThreadsErr != nil {
+		return nil, g.reviewThreadsErr
+	}
+	return append([]githubinfra.ReviewThread(nil), g.reviewThreads...), nil
 }
 
 func (g *stubGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {

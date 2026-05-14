@@ -67,6 +67,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueReactions(context.Context, githubinfra.IssueReactionInput) ([]githubinfra.IssueReaction, error)
@@ -162,6 +163,7 @@ type liveTarget struct {
 	WarningComment      *FactWarningComment
 	Timeline            FactTimeline
 	LinkedPRs           []FactLinkedPR
+	ReviewThreads       []githubinfra.ReviewThread
 	PRReviewState       *FactPRReviewState
 }
 
@@ -1222,6 +1224,11 @@ func (r *Runner) enrichTargetFacts(ctx context.Context, repo string, target live
 		target.LinkedPRs = append(target.LinkedPRs, FactLinkedPR{Number: pr.Number, State: pr.State, Merged: pr.Merged, MergedAt: pr.MergedAt, MergeCommitSHA: pr.MergeCommitSHA})
 	}
 	if target.IsPR {
+		reviewThreads, err := r.github.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: repo, PRNumber: target.Number, Limit: int(^uint(0) >> 1)})
+		if err != nil {
+			return liveTarget{}, err
+		}
+		target.ReviewThreads = append([]githubinfra.ReviewThread(nil), reviewThreads...)
 		reviewState, _ := r.github.ListPullRequestReviewState(ctx, githubinfra.PullRequestReviewStateInput{Repo: repo, PRNumber: target.Number})
 		target.PRReviewState = &FactPRReviewState{RequestedReviewers: reviewState.RequestedReviewers, LatestReviewPerUser: reviewState.LatestReviewPerUser, LastReviewAt: reviewState.LastReviewAt}
 	}
@@ -1403,7 +1410,7 @@ func (r *Runner) syncCase(ctx context.Context, projectID string, target liveTarg
 		record.LastProposalID = &proposal.ID
 	}
 	record.LastFingerprintJSON = optionalString(fingerprintJSON)
-	lastHumanCommentAt, _ := DeriveHumanCommentStats(target.IssueComments, nil, roleCfg.Triggers.ExcludeAuthors, "")
+	lastHumanCommentAt, _ := DeriveHumanCommentStats(target.IssueComments, target.ReviewThreads, roleCfg.Triggers.ExcludeAuthors, "")
 	record.LastHumanActivityAt = optionalString(lastHumanCommentAt)
 	record.WarnedAt = optionalString(payload.WarningPostedAt)
 	record.CloseDueAt = optionalString(payload.CloseBy)
@@ -1505,7 +1512,7 @@ func warningCommentCloseBy(body string) string {
 
 func (r *Runner) buildFactBundle(target liveTarget, caseRecord *storage.SweeperCaseRecord, roleCfg config.SweeperRoleConfig) FactBundle {
 	body, truncated := TruncateFactBody(target.Body)
-	lastHumanCommentAt, humanCommentCount := DeriveHumanCommentStats(target.IssueComments, nil, roleCfg.Triggers.ExcludeAuthors, "")
+	lastHumanCommentAt, humanCommentCount := DeriveHumanCommentStats(target.IssueComments, target.ReviewThreads, roleCfg.Triggers.ExcludeAuthors, "")
 	bundle := FactBundle{
 		Repo:                       caseRecord.Repo,
 		TargetType:                 targetTypeFromBool(target.IsPR),

@@ -402,6 +402,7 @@ type ReviewThreadComment struct {
 	ID                string
 	Body              string
 	Author            string
+	AuthorAssociation string
 	CreatedAt         string
 	UpdatedAt         string
 	Path              string
@@ -1985,7 +1986,7 @@ func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name st
 		"          id isResolved path line",
 		"          comments(first: 100) {",
 		"            nodes {",
-		"              id body createdAt updatedAt path line url",
+		"              id body createdAt updatedAt path line url authorAssociation",
 		"              author { login }",
 		"              originalCommit { oid }",
 		"              commit { oid }",
@@ -2021,7 +2022,7 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"          path",
 		"          line",
 		"          comments(first: 100) {",
-		"            nodes { id body updatedAt url path line author { login } }",
+		"            nodes { id body updatedAt url path line authorAssociation author { login } }",
 		"            pageInfo { hasNextPage endCursor }",
 		"          }",
 		"        }",
@@ -2048,7 +2049,7 @@ func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, cwd, thread
 		"    ... on PullRequestReviewThread {",
 		"      comments(first: 100, after: $after) {",
 		"        nodes {",
-		"          id body createdAt updatedAt path line url",
+		"          id body createdAt updatedAt path line url authorAssociation",
 		"          author { login }",
 		"          originalCommit { oid }",
 		"          commit { oid }",
@@ -2148,7 +2149,7 @@ func appendReviewThreadComments(dst []ReviewThreadComment, nodes []any) []Review
 		if commentID == "" {
 			continue
 		}
-		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
+		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), AuthorAssociation: asString(commentRow["authorAssociation"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
 	}
 	return dst
 }

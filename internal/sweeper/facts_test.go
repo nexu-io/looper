@@ -77,11 +77,11 @@ func TestDeriveHumanCommentStatsExcludesBotsAndCountsReviewThreadComments(t *tes
 		{Author: "excluded-user", AuthorAssociation: "MEMBER", CreatedAt: "2026-04-11T12:45:00Z"},
 		{Author: "looper-bot", AuthorAssociation: "MEMBER", CreatedAt: "2026-04-11T13:00:00Z"},
 	}
-	reviewThreads := []map[string]any{
-		{"comments": []any{
-			map[string]any{"author": map[string]any{"login": "human-2"}, "authorAssociation": "MEMBER", "createdAt": "2026-04-11T13:30:00Z"},
-			map[string]any{"author": map[string]any{"login": "excluded-user"}, "authorAssociation": "MEMBER", "createdAt": "2026-04-11T13:45:00Z"},
-			map[string]any{"author": map[string]any{"login": "thread-bot"}, "authorAssociation": "BOT", "createdAt": "2026-04-11T14:00:00Z"},
+	reviewThreads := []githubinfra.ReviewThread{
+		{Comments: []githubinfra.ReviewThreadComment{
+			{Author: "human-2", AuthorAssociation: "MEMBER", CreatedAt: "2026-04-11T13:30:00Z"},
+			{Author: "excluded-user", AuthorAssociation: "MEMBER", CreatedAt: "2026-04-11T13:45:00Z"},
+			{Author: "thread-bot", AuthorAssociation: "BOT", CreatedAt: "2026-04-11T14:00:00Z"},
 		}},
 	}
 

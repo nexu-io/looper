@@ -174,7 +174,7 @@ func PolicyLabelsPresent(labels []string, roleCfg config.SweeperRoleConfig) []st
 	return out
 }
 
-func DeriveHumanCommentStats(issueComments []githubinfra.CommentInfo, reviewThreads []map[string]any, excludedAuthors []string, looperLogin string) (string, int) {
+func DeriveHumanCommentStats(issueComments []githubinfra.CommentInfo, reviewThreads []githubinfra.ReviewThread, excludedAuthors []string, looperLogin string) (string, int) {
 	excluded := map[string]struct{}{}
 	for _, author := range excludedAuthors {
 		author = strings.ToLower(strings.TrimSpace(author))
@@ -206,23 +206,8 @@ func DeriveHumanCommentStats(issueComments []githubinfra.CommentInfo, reviewThre
 		consider(comment.Author, comment.AuthorAssociation, comment.CreatedAt)
 	}
 	for _, thread := range reviewThreads {
-		comments, _ := thread["comments"].([]any)
-		for _, raw := range comments {
-			row, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			author := ""
-			if authorRow, ok := row["author"].(map[string]any); ok {
-				if login, ok := authorRow["login"].(string); ok {
-					author = login
-				} else if name, ok := authorRow["name"].(string); ok {
-					author = name
-				}
-			}
-			association, _ := row["authorAssociation"].(string)
-			createdAt, _ := row["createdAt"].(string)
-			consider(author, association, createdAt)
+		for _, comment := range thread.Comments {
+			consider(comment.Author, comment.AuthorAssociation, comment.CreatedAt)
 		}
 	}
 	return latest, count
