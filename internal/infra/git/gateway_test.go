@@ -227,6 +227,37 @@ func TestGatewayKeepsPrimaryCheckoutCleanForDetachedFixerWorktree(t *testing.T) 
 	}
 }
 
+func TestGatewayDetachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	fixture.createUnfetchedRemoteBranch(t, "release/base")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "reviewer/pr-42",
+		BaseBranch:   "release/base",
+		PRNumber:     42,
+		CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "branch", "--show-current")); got != "" {
+		t.Fatalf("detached branch name = %q, want empty", got)
+	}
+
+	remoteBaseSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/release/base"))
+	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	if worktreeHeadSHA != remoteBaseSHA {
+		t.Fatalf("detached HEAD = %q, want %q", worktreeHeadSHA, remoteBaseSHA)
+	}
+}
+
 func TestGatewayPushesHeadToRequestedRemoteBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -744,6 +775,24 @@ func (f *fixture) createRemoteRepo(t *testing.T, branch string) {
 	runGit(t, f.repoPath, "commit", "-m", "feature")
 	runGit(t, f.repoPath, "push", "-u", "origin", branch)
 	runGit(t, f.repoPath, "checkout", "main")
+}
+
+func (f *fixture) createUnfetchedRemoteBranch(t *testing.T, branch string) {
+	t.Helper()
+	clonePath := filepath.Join(f.rootDir, "remote-clone-"+sanitizeBranchName(branch))
+	runGit(t, f.rootDir, "clone", f.remotePath, clonePath)
+	configureRepo(t, clonePath)
+	runGit(t, clonePath, "checkout", "-b", branch)
+	writeFile(t, filepath.Join(clonePath, sanitizeBranchName(branch)+".txt"), "remote change\n")
+	runGit(t, clonePath, "add", ".")
+	runGit(t, clonePath, "commit", "-m", "remote branch")
+	runGit(t, clonePath, "push", "-u", "origin", branch)
+	if got := stringsTrimSpace(runGitMaybe(t, f.repoPath, "show-ref", "--verify", "refs/remotes/origin/"+branch)); got != "" {
+		t.Fatalf("remote tracking ref for %q already exists locally: %q", branch, got)
+	}
+	if got := stringsTrimSpace(runGitMaybe(t, f.repoPath, "show-ref", "--verify", "refs/heads/"+branch)); got != "" {
+		t.Fatalf("local branch %q already exists: %q", branch, got)
+	}
 }
 
 func (f *fixture) createLocalFeatureRepo(t *testing.T) {

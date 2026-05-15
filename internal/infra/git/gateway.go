@@ -685,40 +685,60 @@ func (g *Gateway) remoteBranchExists(ctx context.Context, repoPath, remote, bran
 }
 
 func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWorktreeInput) (string, error) {
-	remote := "origin"
-	hasRemote, err := g.hasRemote(ctx, input.RepoPath, remote)
+	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, input.RepoPath, input.Branch)
 	if err != nil {
 		return "", err
+	}
+	if ok {
+		return startPoint, nil
+	}
+
+	startPoint, ok, err = g.resolveDetachedStartPointRef(ctx, input.RepoPath, input.BaseBranch)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return startPoint, nil
+	}
+
+	return "", fmt.Errorf("resolve detached start point: no local or remote ref found for branch %q or base branch %q", input.Branch, input.BaseBranch)
+}
+
+func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, branch string) (string, bool, error) {
+	remote := "origin"
+	hasRemote, err := g.hasRemote(ctx, repoPath, remote)
+	if err != nil {
+		return "", false, err
 	}
 	if hasRemote {
-		remoteHeadSHA, err := g.getRemoteHeadSHA(ctx, input.RepoPath, remote, input.Branch)
+		remoteHeadSHA, err := g.getRemoteHeadSHA(ctx, repoPath, remote, branch)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if remoteHeadSHA != "" {
-			if err := g.runGit(ctx, input.RepoPath, nil, "fetch", remote, input.Branch); err != nil {
-				return "", err
+			if err := g.runGit(ctx, repoPath, nil, "fetch", remote, branch); err != nil {
+				return "", false, err
 			}
 
-			remoteBranchExists, err := g.remoteBranchExists(ctx, input.RepoPath, remote, input.Branch)
+			remoteBranchExists, err := g.remoteBranchExists(ctx, repoPath, remote, branch)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			if remoteBranchExists {
-				return remote + "/" + input.Branch, nil
+				return remote + "/" + branch, true, nil
 			}
 		}
 	}
 
-	branchExists, err := g.branchExists(ctx, input.RepoPath, input.Branch)
+	branchExists, err := g.branchExists(ctx, repoPath, branch)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if branchExists {
-		return input.Branch, nil
+		return branch, true, nil
 	}
 
-	return input.BaseBranch, nil
+	return "", false, nil
 }
 
 func (g *Gateway) hasRemote(ctx context.Context, repoPath, remote string) (bool, error) {
