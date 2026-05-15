@@ -361,7 +361,7 @@ func TestExtractDependencyIssueFallsBackToRequestedRepo(t *testing.T) {
 		"number": int64(34),
 		"title":  "blocked by",
 	}, "github.example.com/acme/looper")
-	if issue.Repository.Name != "looper" || issue.Repository.FullName != "acme/looper" {
+	if issue.Repository.Name != "looper" || issue.Repository.FullName != "github.example.com/acme/looper" {
 		t.Fatalf("issue.Repository = %#v, want repository identity parsed from requested repo", issue.Repository)
 	}
 }

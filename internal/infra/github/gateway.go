@@ -774,7 +774,7 @@ func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput
 	}
 	out := make([]DependencyIssue, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, extractDependencyIssue(row, repo))
+		out = append(out, extractDependencyIssue(row, input.Repo))
 	}
 	return out, nil
 }
@@ -2642,9 +2642,9 @@ func extractDependencyIssue(value map[string]any, defaultRepo string) Dependency
 func completeIssueRepository(repo IssueRepository, repositoryURL string, defaultRepo string) IssueRepository {
 	fullName, name := parseRepositoryIdentity(repositoryURL)
 	if fullName == "" {
-		_, fallbackRepo := splitRepoHostname(defaultRepo)
-		fullName = strings.TrimSpace(fallbackRepo)
-		_, name = splitRepoOwnerName(fullName)
+		fullName = strings.TrimSpace(defaultRepo)
+		_, fallbackRepo := splitRepoHostname(fullName)
+		_, name = splitRepoOwnerName(fallbackRepo)
 	}
 	if repo.Name == "" {
 		repo.Name = name
