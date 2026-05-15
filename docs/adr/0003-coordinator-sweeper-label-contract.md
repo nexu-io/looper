@@ -13,8 +13,8 @@ Coordinator never closes Issues. Sweeper retains exclusive close authority. The 
 - **Coordinator skips Triage** when an Issue bears Sweeper's `lifecycle.pendingLabel`, `lifecycle.closedLabel`, or `security.quarantineLabel`. Sweeper's lifecycle takes precedence.
 - **Sweeper skips retirement** when an Issue bears `dispatch/*` or `needs-info` labels. These are configured as exempt prefixes in Sweeper. Coordinator's active-work signals take precedence over staleness.
 - **`looper:hold` is a global hold.** Both Roles respect it: Coordinator skips Dispatch, Sweeper skips retirement. Single label, single semantic ("humans, leave this Issue alone").
-- **Coordinator-owned label namespace** is documented (not enforced in code): `triaged`, `kind/`, `area/`, `complexity/`, `dispatch/`, plus the configured `wont-fix` and `needs-info` labels. Coordinator clears and re-applies these on Triage rerun; no other Role writes to them.
-- **The `out-of-scope` Disposition path** is Coordinator applying `wont-fix` label + comment, then leaving the Issue open. Sweeper's existing inactivity rule eventually retires it.
+- **Coordinator-owned label namespace** is documented (not enforced in code): `triaged`, `kind/`, `area/`, `complexity/`, `dispatch/`, plus the configured `outOfScopeLabel` (default `wontfix`) and `needs-info` labels. Coordinator clears and re-applies these on Triage rerun; no other Role writes to them.
+- **The `out-of-scope` Disposition path** is Coordinator applying the configured `outOfScopeLabel` (default `wontfix`) + comment, then leaving the Issue open. Sweeper's existing inactivity rule eventually retires it.
 
 ## Considered Options
 
@@ -27,5 +27,5 @@ Coordinator never closes Issues. Sweeper retains exclusive close authority. The 
 
 - Coordinator and Sweeper config must reference each other's label values. The wiring happens at scheduler-config-load time; no runtime config-sharing infrastructure is needed.
 - Sweeper's exempt-labels mechanism is extended to support label *prefixes* (matching `dispatch/*`), which is a small but real change to Sweeper's existing config shape.
-- The `out-of-scope` path leaves the Issue open with `wont-fix` until Sweeper inactivity-retires it. This is intentional — humans get a window to dispute the Coordinator's Disposition before the Issue closes.
+- The `out-of-scope` path leaves the Issue open with the configured `outOfScopeLabel` (default `wontfix`) until Sweeper inactivity-retires it. This is intentional — humans get a window to dispute the Coordinator's Disposition before the Issue closes.
 - Spam and duplicate Dispositions are explicitly deferred to v2. v1 Dispositions are limited to `valid` / `out-of-scope` / `unclear`.
