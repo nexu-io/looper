@@ -774,7 +774,7 @@ func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput
 	}
 	out := make([]DependencyIssue, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, extractDependencyIssue(row))
+		out = append(out, extractDependencyIssue(row, repo))
 	}
 	return out, nil
 }
@@ -2622,19 +2622,53 @@ func normalizeReaction(value any) (githubReaction, bool) {
 	return githubReaction{ID: id, Content: content, UserLogin: userLogin}, true
 }
 
-func extractDependencyIssue(value map[string]any) DependencyIssue {
+func extractDependencyIssue(value map[string]any, defaultRepo string) DependencyIssue {
+	repositoryURL := asString(value["repository_url"])
 	repo := extractIssueRepository(value["repository"])
+	repo = completeIssueRepository(repo, repositoryURL, defaultRepo)
 	return DependencyIssue{
 		ID:            asInt64(value["id"]),
 		Number:        asInt64(value["number"]),
 		Title:         asString(value["title"]),
 		URL:           asString(value["url"]),
 		HTMLURL:       asString(value["html_url"]),
-		RepositoryURL: asString(value["repository_url"]),
+		RepositoryURL: repositoryURL,
 		State:         asString(value["state"]),
 		StateReason:   asString(value["state_reason"]),
 		Repository:    repo,
 	}
+}
+
+func completeIssueRepository(repo IssueRepository, repositoryURL string, defaultRepo string) IssueRepository {
+	fullName, name := parseRepositoryIdentity(repositoryURL)
+	if fullName == "" {
+		_, fallbackRepo := splitRepoHostname(defaultRepo)
+		fullName = strings.TrimSpace(fallbackRepo)
+		_, name = splitRepoOwnerName(fullName)
+	}
+	if repo.Name == "" {
+		repo.Name = name
+	}
+	if repo.FullName == "" {
+		repo.FullName = fullName
+	}
+	if repo.URL == "" {
+		repo.URL = repositoryURL
+	}
+	return repo
+}
+
+func parseRepositoryIdentity(repositoryURL string) (fullName string, name string) {
+	parsed, err := url.Parse(strings.TrimSpace(repositoryURL))
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 3 || parts[0] != "repos" {
+		return "", ""
+	}
+	fullName = parts[1] + "/" + parts[2]
+	return fullName, parts[2]
 }
 
 func extractIssueRepository(value any) IssueRepository {

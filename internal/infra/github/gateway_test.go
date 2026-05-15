@@ -341,6 +341,31 @@ func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
 	}
 }
 
+func TestExtractDependencyIssueFallsBackToRepositoryURL(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":             int64(12),
+		"number":         int64(34),
+		"title":          "blocked by",
+		"repository_url": "https://api.github.com/repos/other/repo",
+	}, "acme/looper")
+	if issue.Repository.Name != "repo" || issue.Repository.FullName != "other/repo" || issue.Repository.URL != "https://api.github.com/repos/other/repo" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from repository_url", issue.Repository)
+	}
+}
+
+func TestExtractDependencyIssueFallsBackToRequestedRepo(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":     int64(12),
+		"number": int64(34),
+		"title":  "blocked by",
+	}, "github.example.com/acme/looper")
+	if issue.Repository.Name != "looper" || issue.Repository.FullName != "acme/looper" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from requested repo", issue.Repository)
+	}
+}
+
 func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing.T) {
 	t.Parallel()
 
