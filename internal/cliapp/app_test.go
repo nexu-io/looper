@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2794,6 +2795,8 @@ func TestLogsFollowRejectsJSON(t *testing.T) {
 func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 	t.Parallel()
 
+	snapshotFlushed := make(chan struct{})
+	var flushOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: snapshot\n")
@@ -2801,6 +2804,7 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
+		flushOnce.Do(func() { close(snapshotFlushed) })
 		<-r.Context().Done()
 	}))
 	defer server.Close()
@@ -2808,6 +2812,10 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 	configPath := writeCLIConfig(t, server.URL, "")
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
+		select {
+		case <-snapshotFlushed:
+		case <-time.After(2 * time.Second):
+		}
 		time.Sleep(100 * time.Millisecond)
 		cancel()
 	}()
