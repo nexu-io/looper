@@ -283,6 +283,15 @@ func writeHumanLoopPaused(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func writeHumanLoopUnpaused(w io.Writer, payload json.RawMessage) error {
+	var data loopOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode loop response: %w", err)
+	}
+	printSection(w, "Loop unpaused", [][2]any{{"id", data.ID}, {"status", data.Status}})
+	return nil
+}
+
 func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 	var data pullRequestsListOutput
 	if err := json.Unmarshal(payload, &data); err != nil {

@@ -3321,6 +3321,66 @@ func TestLoopPauseAcceptsPositionalAndFlagID(t *testing.T) {
 	}
 }
 
+func TestTopLevelPauseAndUnpauseUseLoopSequence(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		wantMethod string
+		wantPath   string
+		wantStatus string
+		wantOutput string
+	}{
+		{name: "pause", args: []string{"pause", "12"}, wantMethod: http.MethodPost, wantPath: "/api/v1/loops/12/pause", wantStatus: "paused", wantOutput: "Loop paused"},
+		{name: "unpause", args: []string{"unpause", "12"}, wantMethod: http.MethodPost, wantPath: "/api/v1/loops/12/start", wantStatus: "running", wantOutput: "Loop unpaused"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Method; got != tc.wantMethod {
+					t.Fatalf("request method = %q, want %q", got, tc.wantMethod)
+				}
+				if got := r.URL.Path; got != tc.wantPath {
+					t.Fatalf("request path = %q, want %q", got, tc.wantPath)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_loop_status", map[string]any{"id": "loop_seq_12", "seq": 12, "status": tc.wantStatus}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			args := append(tc.args, "--config", configPath)
+			exitCode, stdout, stderr := runApp(t, args...)
+			if exitCode != 0 {
+				t.Fatalf("Run(%v) exit code = %d, want 0", args, exitCode)
+			}
+			if stderr != "" {
+				t.Fatalf("Run(%v) stderr = %q, want empty string", args, stderr)
+			}
+			if !strings.Contains(stdout, tc.wantOutput) || !strings.Contains(stdout, tc.wantStatus) {
+				t.Fatalf("Run(%v) stdout = %q, want %q and status %q", args, stdout, tc.wantOutput, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestTopLevelPauseRequiresNumericSequence(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "pause", "loop_123")
+	if exitCode == 0 {
+		t.Fatalf("Run([pause loop_123]) exit code = 0, want non-zero")
+	}
+	if stdout != "" {
+		t.Fatalf("Run([pause loop_123]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "loop sequence number must be numeric") {
+		t.Fatalf("Run([pause loop_123]) stderr = %q, want numeric sequence error", stderr)
+	}
+}
+
 func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktree(t *testing.T) {
 	repoPath := initSampleGitRepo(t)
 	runtimeRoot := t.TempDir()

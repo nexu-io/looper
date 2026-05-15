@@ -25,6 +25,8 @@ Subcommands:
   ps         Show running loops
   jump       Print shell command for a loop worktree
   logs       Show logs for a loop
+  pause      Pause a loop by sequence number
+  unpause    Resume a paused loop by sequence number
   stop       Stop an active loop
   run        Run commands
 
