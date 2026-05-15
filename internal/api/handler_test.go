@@ -2961,6 +2961,36 @@ func TestSerializePullRequestListItemUsesProvidedLoopMatches(t *testing.T) {
 	}
 }
 
+func TestSerializePullRequestListItemIncludesMergeabilityBlocker(t *testing.T) {
+	h := NewHandler(Context{})
+	payload := `{"detail":{"isDraft":false,"hasConflicts":true}}`
+	checks := "SUCCESS"
+	review := "APPROVED"
+
+	item := h.serializePullRequestListItem("acme/looper", 42, &storage.PullRequestSnapshotRecord{
+		ID:            "snapshot_1",
+		ProjectID:     "project_1",
+		Repo:          "acme/looper",
+		PRNumber:      42,
+		HeadSHA:       "head-1",
+		PayloadJSON:   &payload,
+		ChecksSummary: &checks,
+		ReviewState:   &review,
+		CapturedAt:    "2026-04-11T12:00:00.000Z",
+		CreatedAt:     "2026-04-11T12:00:00.000Z",
+	}, nil)
+
+	if item.Mergeability == nil || *item.Mergeability != "blocked" {
+		t.Fatalf("Mergeability = %v, want blocked", item.Mergeability)
+	}
+	if item.BlockingReason == nil || *item.BlockingReason != "conflicts" {
+		t.Fatalf("BlockingReason = %v, want conflicts", item.BlockingReason)
+	}
+	if item.HasConflicts == nil || !*item.HasConflicts {
+		t.Fatalf("HasConflicts = %v, want true", item.HasConflicts)
+	}
+}
+
 func TestIsPlannerPullRequestOpenReadsStructMarshaledStateKey(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

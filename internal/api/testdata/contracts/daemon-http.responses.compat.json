@@ -531,6 +531,10 @@
               "checksSummary": "green",
               "unresolvedThreadCount": 1,
               "reviewState": "changes_requested",
+              "mergeability": "blocked",
+              "blockingReason": "review",
+              "isDraft": null,
+              "hasConflicts": null,
               "capturedAt": "2026-04-11T12:00:00.000Z",
               "reviewer": "running",
               "fixer": null
@@ -558,6 +562,10 @@
           "checksSummary": "green",
           "unresolvedThreadCount": 1,
           "reviewState": "changes_requested",
+          "mergeability": "blocked",
+          "blockingReason": "review",
+          "isDraft": null,
+          "hasConflicts": null,
           "capturedAt": "2026-04-11T12:00:00.000Z",
           "reviewer": "running",
           "fixer": null

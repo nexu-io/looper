@@ -1086,6 +1086,10 @@ type pullRequestResponse struct {
 	ChecksSummary         *string `json:"checksSummary"`
 	UnresolvedThreadCount int64   `json:"unresolvedThreadCount"`
 	ReviewState           *string `json:"reviewState"`
+	Mergeability          *string `json:"mergeability"`
+	BlockingReason        *string `json:"blockingReason"`
+	IsDraft               *bool   `json:"isDraft"`
+	HasConflicts          *bool   `json:"hasConflicts"`
 	CapturedAt            *string `json:"capturedAt"`
 	Reviewer              *string `json:"reviewer"`
 	Fixer                 *string `json:"fixer"`
@@ -1865,6 +1869,7 @@ func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snap
 	if snapshot != nil && snapshot.UnresolvedThreadCount != nil {
 		unresolvedThreadCount = *snapshot.UnresolvedThreadCount
 	}
+	actionability := derivePullRequestActionability(snapshot)
 
 	return pullRequestResponse{
 		Repo:                  repo,
@@ -1879,10 +1884,115 @@ func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snap
 		ChecksSummary:         snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ChecksSummary }),
 		UnresolvedThreadCount: unresolvedThreadCount,
 		ReviewState:           snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ReviewState }),
+		Mergeability:          stringPtrOrNil(actionability.mergeability),
+		BlockingReason:        stringPtrOrNil(actionability.blockingReason),
+		IsDraft:               actionability.isDraft,
+		HasConflicts:          actionability.hasConflicts,
 		CapturedAt:            snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return &s.CapturedAt }),
 		Reviewer:              findLatestLoopStatus(loopMatches, string(domain.LoopTypeReviewer)),
 		Fixer:                 findLatestLoopStatus(loopMatches, string(domain.LoopTypeFixer)),
 	}
+}
+
+type pullRequestActionability struct {
+	mergeability   string
+	blockingReason string
+	isDraft        *bool
+	hasConflicts   *bool
+}
+
+func derivePullRequestActionability(snapshot *storage.PullRequestSnapshotRecord) pullRequestActionability {
+	if snapshot == nil {
+		return pullRequestActionability{mergeability: "unknown", blockingReason: "no snapshot"}
+	}
+
+	detail := pullRequestSnapshotDetail(snapshot.PayloadJSON)
+	isDraft := boolPtrIfPresent(detail, "isDraft")
+	hasConflicts := boolPtrIfPresent(detail, "hasConflicts")
+	if hasConflicts == nil && strings.EqualFold(stringFromMap(detail, "mergeStateStatus"), "DIRTY") {
+		hasConflicts = boolPtr(true)
+	}
+
+	if isDraft != nil && *isDraft {
+		return pullRequestActionability{mergeability: "draft", blockingReason: "draft", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if hasConflicts != nil && *hasConflicts {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "conflicts", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if checksBlockMerge(snapshot.ChecksSummary) {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "checks", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if checksPending(snapshot.ChecksSummary) {
+		return pullRequestActionability{mergeability: "waiting", blockingReason: "checks pending", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if reviewBlocksMerge(snapshot.ReviewState) {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "review", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if reviewPending(snapshot.ReviewState) {
+		return pullRequestActionability{mergeability: "waiting", blockingReason: "review pending", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	return pullRequestActionability{mergeability: "ready", blockingReason: "", isDraft: isDraft, hasConflicts: hasConflicts}
+}
+
+func pullRequestSnapshotDetail(payload *string) map[string]any {
+	if payload == nil || strings.TrimSpace(*payload) == "" {
+		return nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(*payload), &parsed); err != nil {
+		return nil
+	}
+	detail, _ := parsed["detail"].(map[string]any)
+	return detail
+}
+
+func checksBlockMerge(summary *string) bool {
+	if summary == nil {
+		return false
+	}
+	lower := strings.ToLower(*summary)
+	return strings.Contains(lower, "failure") || strings.Contains(lower, "failed") || strings.Contains(lower, "error") || strings.Contains(lower, "cancel")
+}
+
+func checksPending(summary *string) bool {
+	if summary == nil {
+		return false
+	}
+	lower := strings.ToLower(*summary)
+	return strings.Contains(lower, "pending") || strings.Contains(lower, "queued") || strings.Contains(lower, "in_progress") || strings.Contains(lower, "unknown")
+}
+
+func reviewBlocksMerge(state *string) bool {
+	return state != nil && strings.EqualFold(strings.TrimSpace(*state), "CHANGES_REQUESTED")
+}
+
+func reviewPending(state *string) bool {
+	if state == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(*state)) {
+	case "", "APPROVED":
+		return false
+	default:
+		return true
+	}
+}
+
+func boolPtrIfPresent(values map[string]any, key string) *bool {
+	value, ok := values[key].(bool)
+	if !ok {
+		return nil
+	}
+	return boolPtr(value)
+}
+
+func stringFromMap(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(storage.PullRequestSnapshotRecord) *string) *string {

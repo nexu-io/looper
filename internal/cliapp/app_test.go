@@ -157,6 +157,38 @@ func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 }
 
+func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/pull-requests"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_prs", map[string]any{"items": []map[string]any{{
+			"repo":           "acme/looper",
+			"prNumber":       42,
+			"title":          "Fix queue visibility",
+			"mergeability":   "blocked",
+			"blockingReason": "checks",
+			"reviewState":    "APPROVED",
+			"checksSummary":  "FAILURE",
+			"reviewer":       "completed",
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "pr", "list", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([pr list]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{"mergeability", "blocker", "blocked", "checks"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestFixCreateRequiresExplicitProjectWhenCurrentProjectIsAmbiguous(t *testing.T) {
 	t.Parallel()
 

@@ -99,6 +99,8 @@ type pullRequestOutput struct {
 	ChecksSummary         *string `json:"checksSummary"`
 	UnresolvedThreadCount int64   `json:"unresolvedThreadCount"`
 	ReviewState           *string `json:"reviewState"`
+	Mergeability          *string `json:"mergeability"`
+	BlockingReason        *string `json:"blockingReason"`
 	Reviewer              *string `json:"reviewer"`
 	Fixer                 *string `json:"fixer"`
 	ProjectID             *string `json:"projectId"`
@@ -291,9 +293,9 @@ func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
+		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
 	}
-	printTable(w, []string{"pr", "title", "reviewState", "checks", "reviewer", "fixer"}, rows)
+	printTable(w, []string{"pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
 	return nil
 }
 
