@@ -515,6 +515,13 @@ func New(options Options) *Gateway {
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.listOpenPullRequests(ctx, input)
+	}
+	return g.listOpenPullRequestsRaw(ctx, input)
+}
+
+func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
 	labels := prListLabels(input)
 	for _, label := range labels {
@@ -609,6 +616,13 @@ func (g *Gateway) GetPullRequestHeadAndAuthor(ctx context.Context, input ViewPul
 }
 
 func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.listOpenIssues(ctx, input)
+	}
+	return g.listOpenIssuesRaw(ctx, input)
+}
+
+func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
 	args := []string{"issue", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
 	if strings.TrimSpace(input.Assignee) != "" {
 		args = append(args, "--assignee", input.Assignee)
@@ -926,6 +940,13 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequest(ctx, input)
+	}
+	return g.viewPullRequestRaw(ctx, input)
+}
+
+func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
@@ -1868,6 +1889,13 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 }
 
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.getCurrentUserLogin(ctx, cwd)
+	}
+	return g.getCurrentUserLoginRaw(ctx, cwd)
+}
+
+func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {

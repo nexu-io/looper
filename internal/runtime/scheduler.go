@@ -79,6 +79,7 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos                    *storage.Repositories
+	GitHubGateway            *githubinfra.Gateway
 	Logger                   bootstrap.Logger
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
@@ -1086,6 +1087,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		}
 		return defaultSchedulerTickInput{
 			Repos:                    services.Repositories,
+			GitHubGateway:            githubGateway,
 			Logger:                   logger,
 			Now:                      now,
 			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
@@ -1212,6 +1214,19 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		retErr = errors.Join(errs...)
 		return retErr
 	}
+	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
+	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
+	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
+		if input.GitHubGateway == nil {
+			return nil
+		}
+		if snapshot, ok := projectSnapshots[projectID]; ok {
+			return snapshot
+		}
+		snapshot := githubinfra.NewDiscoverySnapshot(input.GitHubGateway, tickDiscoveryState, projectDiscoverySnapshotOptions(input, projectID))
+		projectSnapshots[projectID] = snapshot
+		return snapshot
+	}
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
@@ -1221,6 +1236,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		snapshot := projectSnapshot(project.ID)
 		if repo == "" {
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
@@ -1229,7 +1245,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
 			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
-				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
 				return wrapSchedulerError("planner discovery", project.ID, repo, err)
 			}))
@@ -1240,7 +1256,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
 			appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
-				_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
 			}))
 			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
@@ -1248,7 +1264,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
-				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
 				return wrapSchedulerError("reviewer discovery", project.ID, repo, err)
 			}))
@@ -1259,7 +1275,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
 			appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
-				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
 				return wrapSchedulerError("fixer discovery", project.ID, repo, err)
 			}))
@@ -1270,7 +1286,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
-				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
 				return wrapSchedulerError("worker issue discovery", project.ID, repo, err)
 			}))
@@ -1293,17 +1309,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		snapshot := projectSnapshot(project.ID)
 		if repo == "" {
 			continue
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
 			appendErr(applySweeperBackpressure(ctx, input, project, repo))
 			appendErr(runSchedulerLane(input, "sweeper issue discovery", project.ID, repo, func() error {
-				_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				return wrapSchedulerError("sweeper issue discovery", project.ID, repo, err)
 			}))
 			appendErr(runSchedulerLane(input, "sweeper pull request discovery", project.ID, repo, func() error {
-				_, err := input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				_, err := input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				return wrapSchedulerError("sweeper pull request discovery", project.ID, repo, err)
 			}))
 			appendErr(runSchedulerLane(input, "sweeper reconciliation discovery", project.ID, repo, func() error {
@@ -1333,6 +1350,28 @@ func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID str
 		return false
 	}
 	return input.CoordinatorEnabled(projectID)
+}
+
+func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
+	prLimit := 30
+	issueLimit := 30
+	if input.Coordinator != nil && coordinatorEnabledForProject(input, projectID) {
+		issueLimit = maxInt(issueLimit, 100)
+	}
+	if input.Config != nil && input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+		roles := config.ProjectRoleConfigs(*input.Config, projectID)
+		sweeperLimit := maxInt(roles.Sweeper.Triggers.MaxPerTick*6, 30)
+		prLimit = maxInt(prLimit, sweeperLimit)
+		issueLimit = maxInt(issueLimit, sweeperLimit)
+	}
+	return githubinfra.DiscoverySnapshotOptions{PullRequestLimit: prLimit, IssueLimit: issueLimit}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now func() time.Time) []string {

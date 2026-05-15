@@ -27,6 +27,7 @@ const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -
 type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
+	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -107,6 +108,7 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if !r.shouldRunTick(input.ProjectID) {
 		return DiscoveryResult{Skipped: true}, nil
 	}

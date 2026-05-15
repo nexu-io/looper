@@ -49,6 +49,7 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Limit     int
+	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -376,6 +377,7 @@ func (r *Runner) recoverClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
 	if err != nil {
 		return DiscoveryResult{}, err
@@ -471,6 +473,7 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 }
 
 func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
 	if err != nil {
 		return DiscoveryResult{}, err

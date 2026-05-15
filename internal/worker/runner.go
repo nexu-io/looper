@@ -483,6 +483,7 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Limit     int
+	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -689,6 +690,7 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.github == nil {
 		return DiscoveryResult{}, fmt.Errorf("worker discovery is not configured")
 	}
