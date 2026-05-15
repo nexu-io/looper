@@ -1122,6 +1122,59 @@ func TestGatewayGetCurrentUserLoginReturnsEmptyForIntegrationTokens(t *testing.T
 	}
 }
 
+func TestGatewayGetCurrentUserLoginForRepoPropagatesViewerLookupFailure(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			result := shell.Result{ExitCode: 1, Stderr: "gh: GraphQL request failed"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "acme/looper", "")
+	if err == nil {
+		t.Fatal("GetCurrentUserLoginForRepo() error = nil, want propagated viewer lookup failure")
+	}
+	if login != "" {
+		t.Fatalf("GetCurrentUserLoginForRepo() login = %q, want empty login on failure", login)
+	}
+}
+
+func TestGatewayGetCurrentUserLoginForRepoPropagatesViewerLookupDecodeFailure(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			return shell.Result{Stdout: "{"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "acme/looper", "")
+	if err == nil {
+		t.Fatal("GetCurrentUserLoginForRepo() error = nil, want propagated viewer decode failure")
+	}
+	if login != "" {
+		t.Fatalf("GetCurrentUserLoginForRepo() login = %q, want empty login on failure", login)
+	}
+}
+
 func TestGatewayIsAuthenticatedScopesStatusToHostname(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1271,6 +1324,22 @@ func TestGatewayListIssueReactionsScopesAPIToHostname(t *testing.T) {
 	}
 	if len(commentReactions) != 1 || commentReactions[0].ID != 8 || commentReactions[0].Content != "rocket" || commentReactions[0].UserLogin != "octo" {
 		t.Fatalf("ListIssueReactions(comment) = %#v, want parsed enterprise comment reactions", commentReactions)
+	}
+}
+
+func TestGatewayAddIssueReactionScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/issues/comments/91/reactions --method POST -H Accept: application/vnd.github+json -f content=+1 --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.AddIssueReaction(context.Background(), CreateIssueReactionInput{Repo: "github.example.com/acme/looper", CommentID: 91, Content: "+1"}); err != nil {
+		t.Fatalf("AddIssueReaction() error = %v", err)
 	}
 }
 

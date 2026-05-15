@@ -742,6 +742,7 @@ const maxReplyExplanationLength = 500
 const (
 	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
 	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
+	agentDeclinedThreadWithoutReason      = "Agent declined this thread without a substantive reason"
 	maxDeclinedThreadRecords              = 200
 	zeroProgressPauseReason               = "agent_zero_progress"
 )
@@ -2132,14 +2133,14 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// Per-thread drift detection (hasNonLooperCommentSince below) handles
 	// the case where a reviewer added or edited a comment on an existing
 	// thread after the agent recorded its decisions. New threads that
-	// appeared after the snapshot are not present in the agent's payload
-	// and fall through to the contract-violation → synthetic-decline path,
-	// which posts a visible reply without resolving the thread. Both
-	// behaviours are correct without invalidating the entire reply set on
-	// a fix-items hash mismatch — doing so threw away every successful
-	// "fixed" decision whenever a single new thread appeared, which on PRs
-	// receiving a steady stream of bot comments produced an unbreakable
-	// drift loop.
+	// appeared after the snapshot are not present in the agent's payload.
+	// Treat those missing/invalid per-thread decisions as contract
+	// violations, while still honoring any valid "fixed"/"declined"
+	// decisions the agent did provide for other threads. Invalidating the
+	// entire reply set on a fix-items hash mismatch threw away every
+	// successful "fixed" decision whenever a single new thread appeared,
+	// which on PRs receiving a steady stream of bot comments produced an
+	// unbreakable drift loop.
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -2148,12 +2149,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if !ok && item.ThreadID != "" {
 			decision, ok = repliesByThreadID[item.ThreadID]
 		}
+		decisionIssueStatus := ""
+		decisionIssueMessage := ""
 		if !ok {
-			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentMissingThreadDecisionExplanation}
-			contractViolationCount++
+			decisionIssueStatus = "skipped_missing_agent_decision"
+			decisionIssueMessage = agentMissingThreadDecisionExplanation
 		} else if _, validAction := parseReplyAction(decision.Action); !validAction {
-			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentInvalidThreadDecisionExplanation}
-			contractViolationCount++
+			decisionIssueStatus = "skipped_invalid_agent_decision"
+			decisionIssueMessage = agentInvalidThreadDecisionExplanation
+		} else if normalizeReplyAction(decision.Action) == string(replyActionDeclined) && !hasSubstantiveDeclineExplanation(decision.Explanation) {
+			decisionIssueStatus = "skipped_invalid_agent_decision"
+			decisionIssueMessage = agentDeclinedThreadWithoutReason
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -2166,6 +2172,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if hasNonLooperCommentSince(thread, driftSince) {
 			driftCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
+			continue
+		}
+		if decisionIssueStatus != "" {
+			contractViolationCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: decisionIssueStatus, Message: decisionIssueMessage, UpdatedAt: r.nowISO()})
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -2222,6 +2233,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: FailureRetryableAfterResume}
+	}
+	if contractViolationCount > 0 {
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because the fixer response omitted or invalidated thread decisions", contractViolationCount), kind: FailureRetryableAfterResume}
 	}
 	if mutationFailureCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
@@ -2398,9 +2413,9 @@ func normalizeThreadCommentsObserved(raw string) string {
 // after the agent's decision) is detected separately by
 // hasNonLooperCommentSince. We deliberately do not invalidate the whole
 // reply set when the fix-items hash differs from the snapshot the agent
-// saw: new threads simply fall through to the contract-violation path and
-// receive synthetic declines, while previously decided threads continue to
-// be replied/resolved as the agent intended.
+// saw: new threads fall through to the contract-violation retry path,
+// while previously decided threads continue to be replied/resolved as the
+// agent intended.
 func agentResolveReplyExplanationsValid(checkpoint fixerCheckpoint) bool {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
 		return false
@@ -2584,6 +2599,19 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 		b.WriteString(marker)
 	}
 	return b.String()
+}
+
+func hasSubstantiveDeclineExplanation(explanation string) bool {
+	explanation = strings.TrimSpace(explanation)
+	if explanation == "" {
+		return false
+	}
+	switch explanation {
+	case agentMissingThreadDecisionExplanation, agentInvalidThreadDecisionExplanation, agentDeclinedThreadWithoutReason:
+		return false
+	default:
+		return true
+	}
 }
 
 func fixerReplyMarker(threadID, commitSHA string) string {

@@ -23,11 +23,12 @@ const (
 )
 
 type Comment struct {
-	ID        int64
-	Author    string
-	Body      string
-	CreatedAt string
-	UpdatedAt string
+	ID                int64
+	Author            string
+	AuthorAssociation string
+	Body              string
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 type TimelineEvent struct {

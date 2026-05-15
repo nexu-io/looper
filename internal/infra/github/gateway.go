@@ -116,6 +116,18 @@ type IssueReactionInput struct {
 	CommentID   int64
 	CWD         string
 }
+type CreateIssueReactionInput struct {
+	Repo        string
+	IssueNumber int64
+	CommentID   int64
+	Content     string
+	CWD         string
+}
+type RepositoryPermissionInput struct {
+	Repo string
+	User string
+	CWD  string
+}
 type LinkedPullRequestsInput struct {
 	Repo        string
 	IssueNumber int64
@@ -756,8 +768,31 @@ func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInp
 	return out, nil
 }
 
+func (g *Gateway) AddIssueReaction(ctx context.Context, input CreateIssueReactionInput) error {
+	content := strings.TrimSpace(input.Content)
+	if content == "" {
+		return nil
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.IssueNumber)
+	if input.CommentID > 0 {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", repo, input.CommentID)
+	}
+	args := []string{"api", endpoint, "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content=" + content}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber), "--method", "POST", "-f", "body="+input.Body)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--method", "POST", "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return IssueCommentResult{}, err
 	}
@@ -769,7 +804,12 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
-	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "PATCH", "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
@@ -801,9 +841,13 @@ func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInp
 	if len(assignees) == 0 {
 		return nil
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", input.Repo, input.IssueNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", repo, input.IssueNumber), "--method", "POST"}
 	for _, assignee := range assignees {
 		args = append(args, "-f", "assignees[]="+assignee)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -816,9 +860,13 @@ func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) er
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.IssueNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", repo, input.IssueNumber), "--method", "POST"}
 	for _, label := range input.Labels {
 		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -828,8 +876,13 @@ func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput)
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	hostname, repo := splitRepoHostname(input.Repo)
 	for _, label := range input.Labels {
-		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE")
+		args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		_, err := g.runGh(ctx, input.CWD, "", args...)
 		if err == nil {
 			continue
 		}
@@ -839,6 +892,26 @@ func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput)
 		return err
 	}
 	return nil
+}
+
+func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryPermissionInput) (string, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/collaborators/%s/permission", repo, input.User)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		if shellErr, ok := err.(*shell.CommandExecutionError); ok && strings.Contains(strings.ToLower(shellErr.Result.Stderr), "404") {
+			return "", nil
+		}
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -1803,6 +1876,40 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	hostname, _ := splitRepoHostname(repo)
+	args := []string{"api", "user", "--jq", ".login"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			return g.getViewerLogin(ctx, cwd, hostname)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(result.Stdout), nil
+}
+
+func (g *Gateway) getViewerLogin(ctx context.Context, cwd string, hostname string) (string, error) {
+	args := []string{"api", "graphql", "-f", `query=query { viewer { login } }`}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	data, _ := row["data"].(map[string]any)
+	viewer, _ := data["viewer"].(map[string]any)
+	return strings.TrimSpace(asString(viewer["login"])), nil
 }
 
 func isUserLoginUnsupportedForCurrentToken(err error) bool {

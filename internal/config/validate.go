@@ -674,6 +674,11 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 	if len(config.Dispatch.HumanGate.SlashCommands) == 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.humanGate.slashCommands", Message: "must contain at least one slash command"})
 	}
+	for _, command := range config.Dispatch.HumanGate.SlashCommands {
+		if command != "/plan" && command != "/implement" {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.humanGate.slashCommands", Message: fmt.Sprintf("contains unsupported slash command: %s", command)})
+		}
+	}
 	if config.Dispatch.Autonomous.DelayMinutes <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.autonomous.delayMinutes", Message: "must be a positive integer"})
 	}

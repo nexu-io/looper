@@ -92,7 +92,7 @@ The `triaged` label means Coordinator has formed an opinion about the issue. Bec
 
 ### Re-triage loop for `needs-info`
 
-If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged`. That returns the issue to the triage candidate set on a later poll without requiring the author to know Looper's label vocabulary.
+If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged` and immediately re-runs triage in the same poll. That lets the issue move back through triage without requiring the author to know Looper's label vocabulary.
 
 ### Cross-role boundary
 
@@ -103,6 +103,51 @@ Coordinator stays out of issues already under Sweeper lifecycle control. It skip
 - `roles.sweeper.security.quarantineLabel`
 
 Sweeper, in turn, exempts active coordinator-managed issues such as `dispatch/*`, `needs-info`, and `looper:hold`.
+
+### Dispatch after triage
+
+Once an issue is already `triaged` and carries exactly one `dispatch/*` label, Coordinator can hand it off in one of two modes:
+
+- **human-gated** (default)
+- **autonomous**
+
+#### Human-gated slash commands
+
+Coordinator watches issue comments for slash commands at the **start of a line**:
+
+- `/plan` → applies the planner trigger label from `roles.planner.triggers.labels[0]`
+- `/implement` → applies the worker trigger label from `roles.worker.triggers.labels[0]`
+
+The commenter must either:
+
+- have repository permission `write`, `maintain`, or `admin`, or
+- be listed in `roles.coordinator.dispatch.humanGate.allowedUsers`
+
+On success, Coordinator:
+
+1. assigns `roles.coordinator.dispatch.assignTo` when configured
+2. applies the derived trigger label as the durability commit
+3. reacts 👍 on the slash-command comment
+
+If the trigger label is already present, Coordinator treats the command as an idempotent re-issue and still reacts 👍.
+
+If the issue is missing `triaged` or a matching `dispatch/*`, Coordinator reacts with GitHub's `confused` reaction and posts one short failure comment marked with `<!-- looper:coordinator:dispatch-failure -->`.
+
+#### Autonomous mode
+
+When `roles.coordinator.dispatch.mode = "autonomous"`, Coordinator no longer waits for a slash command. Instead it dispatches after the issue has stayed `triaged` for `roles.coordinator.dispatch.autonomous.delayMinutes`.
+
+Autonomous dispatch still derives the trigger label from Planner or Worker config and still writes that trigger label last.
+
+#### Veto signals
+
+Autonomous dispatch stops immediately when any veto signal is present:
+
+- the `dispatch/*` label is gone
+- the global hold label `looper:hold` (or the configured override) is present
+- the destination trigger label is already present because a human dispatched manually
+
+`looper:hold` is the operator-facing global hold contract for Coordinator dispatch.
 
 ## 6. Planner: from issue to spec PR
 
