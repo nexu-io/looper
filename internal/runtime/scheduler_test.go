@@ -387,9 +387,126 @@ func TestRunDefaultSchedulerTickDiscoveryWakeIsBounded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
-	if got := atomic.LoadInt32(&wakes); got != 1 {
-		t.Fatalf("scheduler wake requests = %d, want one coalesced wake for repeated enqueue events", got)
+	if got := atomic.LoadInt32(&wakes); got != 3 {
+		t.Fatalf("scheduler wake requests = %d, want one wake per claim phase that picked up discovered work", got)
 	}
+}
+
+func TestIndependentClaimPassClaimsQueuedWorkWhileDiscoveryIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-claim-pump.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	plannerRunner := &blockingPlannerDiscoveryScheduler{started: make(chan struct{}), release: make(chan struct{})}
+	workerRunner := &stubWorkerScheduler{}
+	input := defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       5,
+		ClaimMu:                 &sync.Mutex{},
+		AsyncRunner:             immediateSchedulerRunner{},
+		Planner:                 plannerRunner,
+		Worker:                  workerRunner,
+		SweeperDiscoveryEnabled: boolPtr(false),
+	}
+
+	tickDone := make(chan error, 1)
+	go func() {
+		tickDone <- runDefaultSchedulerTick(context.Background(), input)
+	}()
+
+	select {
+	case <-plannerRunner.started:
+	case <-time.After(time.Second):
+		t.Fatal("planner discovery did not block")
+	}
+
+	for i := 0; i < 5; i++ {
+		item := schedulerTestQueueItem(fmt.Sprintf("queue_worker_claim_pump_%d", i), "worker", nowISO)
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	claimDone := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := runIndependentClaimPass(context.Background(), input); err != nil {
+				claimDone <- err
+				return
+			}
+			if workerRunner.processItemCount() == 5 {
+				claimDone <- nil
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		claimDone <- fmt.Errorf("timed out waiting for independent claim pass to process all items")
+	}()
+
+	select {
+	case err := <-claimDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("independent claim pass did not finish before timeout")
+	}
+
+	close(plannerRunner.release)
+	if err := <-tickDone; err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+}
+
+func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-logs.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	logger := &capturingSchedulerLogger{}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.SlowLaneWarnThresholdMS = 1
+
+	plannerRunner := &sleepingPlannerScheduler{delay: 5 * time.Millisecond}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                    repos,
+		Logger:                   logger,
+		Now:                      func() time.Time { return now },
+		MaxConcurrentRuns:        1,
+		Config:                   &cfg,
+		Planner:                  plannerRunner,
+		ReviewerDiscoveryEnabled: boolPtr(false),
+		FixerDiscoveryEnabled:    boolPtr(false),
+		WorkerDiscoveryEnabled:   boolPtr(false),
+		SweeperDiscoveryEnabled:  boolPtr(false),
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+
+	logger.requireMessage(t, "scheduler tick start")
+	logger.requireMessage(t, "scheduler tick end")
+	logger.requireMessage(t, "scheduler tick summary")
+	logger.requireContextValue(t, "scheduler claim phase", "phase", "pre_discovery")
+	logger.requireContextValue(t, "scheduler claim phase", "phase", "post_planner_discovery")
+	logger.requireContextValue(t, "scheduler lane start", "lane", "planner discovery")
+	logger.requireContextValue(t, "scheduler lane end", "lane", "planner discovery")
+	logger.requireContextValue(t, "scheduler lane slow", "lane", "planner discovery")
 }
 
 func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
@@ -1076,6 +1193,88 @@ type queueStatusCheckingPlannerScheduler struct {
 	repos                *storage.Repositories
 	queueItemID          string
 	checkedClaimedStatus bool
+}
+
+type blockingPlannerDiscoveryScheduler struct {
+	stubPlannerScheduler
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingPlannerDiscoveryScheduler) DiscoverIssues(ctx context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.stubPlannerScheduler.DiscoverIssues(ctx, input)
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return planner.DiscoveryResult{}, nil
+}
+
+type sleepingPlannerScheduler struct {
+	stubPlannerScheduler
+	delay time.Duration
+}
+
+func (s *sleepingPlannerScheduler) DiscoverIssues(ctx context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.stubPlannerScheduler.DiscoverIssues(ctx, input)
+	time.Sleep(s.delay)
+	return planner.DiscoveryResult{}, nil
+}
+
+type capturingSchedulerLogger struct {
+	mu      sync.Mutex
+	entries []schedulerLogEntry
+}
+
+type schedulerLogEntry struct {
+	message string
+	context map[string]any
+}
+
+func (l *capturingSchedulerLogger) Debug(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Info(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Warn(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Error(message string, context map[string]any) {
+	l.append(message, context)
+}
+
+func (l *capturingSchedulerLogger) append(message string, context map[string]any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	copyContext := map[string]any{}
+	for key, value := range context {
+		copyContext[key] = value
+	}
+	l.entries = append(l.entries, schedulerLogEntry{message: message, context: copyContext})
+}
+
+func (l *capturingSchedulerLogger) requireMessage(t *testing.T, message string) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if entry.message == message {
+			return
+		}
+	}
+	t.Fatalf("logger messages = %#v, want %q", l.entries, message)
+}
+
+func (l *capturingSchedulerLogger) requireContextValue(t *testing.T, message, key string, want any) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if entry.message == message && entry.context[key] == want {
+			return
+		}
+	}
+	t.Fatalf("logger entries = %#v, want %q with %s=%v", l.entries, message, key, want)
 }
 
 func (s *queueStatusCheckingPlannerScheduler) DiscoverIssues(ctx context.Context, _ planner.DiscoveryInput) (planner.DiscoveryResult, error) {

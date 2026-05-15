@@ -2900,6 +2900,9 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if config.Scheduler.MaxConcurrentRuns != 3 {
 		t.Fatalf("DefaultConfig().Scheduler.MaxConcurrentRuns = %d, want %d", config.Scheduler.MaxConcurrentRuns, 3)
 	}
+	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
+		t.Fatalf("DefaultConfig().Scheduler.SlowLaneWarnThresholdMS = %d, want %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
+	}
 
 	if config.Logging.Level != LogLevelInfo {
 		t.Fatalf("DefaultConfig().Logging.Level = %q, want %q", config.Logging.Level, LogLevelInfo)
@@ -3056,6 +3059,10 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 	if config.Scheduler.MaxConcurrentRuns != 3 {
 		t.Fatalf("Normalize().Scheduler.MaxConcurrentRuns = %d, want default %d", config.Scheduler.MaxConcurrentRuns, 3)
+	}
+
+	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
+		t.Fatalf("Normalize().Scheduler.SlowLaneWarnThresholdMS = %d, want default %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
 	}
 
 	if config.Agent.Vendor == nil || *config.Agent.Vendor != AgentVendorOpenCode {

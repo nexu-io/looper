@@ -428,6 +428,7 @@ type Options struct {
 	OnAgentExecutionStarted         AgentExecutionStartedFunc
 	OnRunCompleted                  RunCompletedFunc
 	DiscoveryPolicy                 DiscoveryPolicy
+	OnQueueItemEnqueued             func()
 }
 
 type DiscoveryPolicy struct {
@@ -465,6 +466,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onRunCompleted          RunCompletedFunc
 	discoveryPolicy         DiscoveryPolicy
+	onQueueItemEnqueued     func()
 }
 
 type ProcessResult struct {
@@ -682,6 +684,7 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onRunCompleted:          options.OnRunCompleted,
 		discoveryPolicy:         policy,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
@@ -2268,7 +2271,14 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return queueItem, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {

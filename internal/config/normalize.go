@@ -298,6 +298,10 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 	if partial.RetryBaseDelayMS != nil {
 		config.RetryBaseDelayMS = *partial.RetryBaseDelayMS
 	}
+
+	if partial.SlowLaneWarnThresholdMS != nil {
+		config.SlowLaneWarnThresholdMS = *partial.SlowLaneWarnThresholdMS
+	}
 }
 
 func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {

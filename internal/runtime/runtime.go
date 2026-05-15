@@ -83,34 +83,36 @@ type Runtime struct {
 	syncConfiguredProjects SyncConfiguredProjectsFunc
 	runSchedulerTick       RunSchedulerTickFunc
 	defaultSchedulerTick   RunSchedulerTickFunc
+	defaultSchedulerClaim  RunSchedulerTickFunc
 	customSchedulerTick    bool
 	readProcessCommand     ReadProcessCommandFunc
 	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                sync.RWMutex
-	startedAt         *time.Time
-	recovery          RecoverySummary
-	stopped           bool
-	services          Services
-	startErr          error
-	startOnce         sync.Once
-	shutdownOnce      sync.Once
-	shutdownCh        chan struct{}
-	schedulerStop     chan struct{}
-	schedulerDone     chan struct{}
-	schedulerWake     chan struct{}
-	schedulerCancel   context.CancelFunc
-	schedulerTasks    *schedulerTaskTracker
-	recoveryCancel    context.CancelFunc
-	recoveryDone      chan struct{}
-	activeExecutions  *ActiveExecutionRegistry
-	githubGateway     *githubinfra.Gateway
-	schedulerDisabled bool
-	startupReadyOnce  sync.Once
-	startupReadyErr   error
-	ownershipAcquired bool
+	mu                 sync.RWMutex
+	startedAt          *time.Time
+	recovery           RecoverySummary
+	stopped            bool
+	services           Services
+	startErr           error
+	startOnce          sync.Once
+	shutdownOnce       sync.Once
+	shutdownCh         chan struct{}
+	schedulerStop      chan struct{}
+	schedulerDone      chan struct{}
+	schedulerWake      chan struct{}
+	schedulerClaimWake chan struct{}
+	schedulerCancel    context.CancelFunc
+	schedulerTasks     *schedulerTaskTracker
+	recoveryCancel     context.CancelFunc
+	recoveryDone       chan struct{}
+	activeExecutions   *ActiveExecutionRegistry
+	githubGateway      *githubinfra.Gateway
+	schedulerDisabled  bool
+	startupReadyOnce   sync.Once
+	startupReadyErr    error
+	ownershipAcquired  bool
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -376,11 +378,13 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		r.defaultSchedulerTick = buildDefaultSchedulerTick(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildDefaultSchedulerHandlers(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerTick, r.now)
+		}, r.TriggerSchedulerClaim, r.now)
+		r.defaultSchedulerTick = handlers.tick
+		r.defaultSchedulerClaim = handlers.claim
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
@@ -464,6 +468,7 @@ func (r *Runtime) startSchedulerLoop() {
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
+	claimWakeCh := make(chan struct{}, 1)
 	schedulerCtx, schedulerCancel := context.WithCancel(context.Background())
 	taskTracker := &schedulerTaskTracker{}
 
@@ -471,9 +476,16 @@ func (r *Runtime) startSchedulerLoop() {
 	r.schedulerStop = stopCh
 	r.schedulerDone = doneCh
 	r.schedulerWake = wakeCh
+	r.schedulerClaimWake = claimWakeCh
 	r.schedulerCancel = schedulerCancel
 	r.schedulerTasks = taskTracker
 	r.mu.Unlock()
+
+	if r.defaultSchedulerClaim != nil {
+		taskTracker.Go(func() {
+			r.runSchedulerClaimLoop(schedulerCtx, stopCh, claimWakeCh)
+		})
+	}
 
 	go func() {
 		defer close(doneCh)
@@ -516,6 +528,7 @@ func (r *Runtime) stopSchedulerLoop() {
 	r.schedulerStop = nil
 	r.schedulerDone = nil
 	r.schedulerWake = nil
+	r.schedulerClaimWake = nil
 	r.schedulerCancel = nil
 	r.mu.Unlock()
 
@@ -613,15 +626,36 @@ func (r *Runtime) TriggerSchedulerTick() {
 		return
 	}
 	wakeCh := r.schedulerWake
+	claimWakeCh := r.schedulerClaimWake
 	r.mu.RUnlock()
 
-	if wakeCh == nil {
+	if wakeCh != nil {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+	}
+	if claimWakeCh != nil {
+		select {
+		case claimWakeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *Runtime) TriggerSchedulerClaim() {
+	r.mu.RLock()
+	if r.stopped {
+		r.mu.RUnlock()
 		return
 	}
-
-	select {
-	case wakeCh <- struct{}{}:
-	default:
+	claimWakeCh := r.schedulerClaimWake
+	r.mu.RUnlock()
+	if claimWakeCh != nil {
+		select {
+		case claimWakeCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -650,6 +684,36 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 		return fmt.Errorf("default scheduler tick is not configured")
 	}
 	return tick(ctx, services)
+}
+
+func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
+	r.mu.RLock()
+	services := r.services
+	claim := r.defaultSchedulerClaim
+	r.mu.RUnlock()
+	if services.Repositories == nil || claim == nil {
+		return
+	}
+	if err := claim(ctx, services); err != nil && r.logger != nil {
+		r.logger.Warn("looperd scheduler claim pump failed", map[string]any{"error": err.Error()})
+	}
+}
+
+func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struct{}, wakeCh <-chan struct{}) {
+	const claimPumpInterval = time.Second
+	r.executeSchedulerClaimPass(ctx)
+	ticker := time.NewTicker(claimPumpInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-wakeCh:
+			r.executeSchedulerClaimPass(ctx)
+		case <-ticker.C:
+			r.executeSchedulerClaimPass(ctx)
+		}
+	}
 }
 
 func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, now time.Time) (RecoverySummary, error) {

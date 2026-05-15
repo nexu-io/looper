@@ -135,10 +135,11 @@ type StorageConfig struct {
 }
 
 type SchedulerConfig struct {
-	PollIntervalSeconds int `json:"pollIntervalSeconds"`
-	MaxConcurrentRuns   int `json:"maxConcurrentRuns"`
-	RetryMaxAttempts    int `json:"retryMaxAttempts"`
-	RetryBaseDelayMS    int `json:"retryBaseDelayMs"`
+	PollIntervalSeconds     int `json:"pollIntervalSeconds"`
+	MaxConcurrentRuns       int `json:"maxConcurrentRuns"`
+	RetryMaxAttempts        int `json:"retryMaxAttempts"`
+	RetryBaseDelayMS        int `json:"retryBaseDelayMs"`
+	SlowLaneWarnThresholdMS int `json:"slowLaneWarnThresholdMs"`
 }
 
 type AgentConfig struct {
@@ -550,10 +551,11 @@ type PartialStorageConfig struct {
 }
 
 type PartialSchedulerConfig struct {
-	PollIntervalSeconds *int `json:"pollIntervalSeconds,omitempty"`
-	MaxConcurrentRuns   *int `json:"maxConcurrentRuns,omitempty"`
-	RetryMaxAttempts    *int `json:"retryMaxAttempts,omitempty"`
-	RetryBaseDelayMS    *int `json:"retryBaseDelayMs,omitempty"`
+	PollIntervalSeconds     *int `json:"pollIntervalSeconds,omitempty"`
+	MaxConcurrentRuns       *int `json:"maxConcurrentRuns,omitempty"`
+	RetryMaxAttempts        *int `json:"retryMaxAttempts,omitempty"`
+	RetryBaseDelayMS        *int `json:"retryBaseDelayMs,omitempty"`
+	SlowLaneWarnThresholdMS *int `json:"slowLaneWarnThresholdMs,omitempty"`
 }
 
 type PartialAgentConfig struct {

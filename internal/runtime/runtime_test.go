@@ -1465,6 +1465,44 @@ func TestRuntimeTriggerSchedulerTickCoalescesWhileTickIsRunning(t *testing.T) {
 	}
 }
 
+func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.PollIntervalSeconds = 3600
+
+	var tickCount int32
+	var claimCount int32
+	rt := &Runtime{
+		config:                cfg,
+		logger:                &testLogger{},
+		runSchedulerTick:      func(context.Context, Services) error { atomic.AddInt32(&tickCount, 1); return nil },
+		defaultSchedulerClaim: func(context.Context, Services) error { atomic.AddInt32(&claimCount, 1); return nil },
+		services:              Services{Repositories: &storage.Repositories{}},
+		shutdownTimeout:       time.Second,
+	}
+
+	rt.startSchedulerLoop()
+	t.Cleanup(func() { rt.stopSchedulerLoop() })
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&claimCount) >= 1 && atomic.LoadInt32(&tickCount) >= 1
+	})
+
+	rt.TriggerSchedulerClaim()
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&claimCount) >= 2
+	})
+	if got := atomic.LoadInt32(&tickCount); got != 1 {
+		t.Fatalf("scheduler tick count = %d, want claim wake without extra discovery tick", got)
+	}
+}
+
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()
 

@@ -33,7 +33,8 @@
         "pollIntervalSeconds": 30,
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": 5,
-        "retryBaseDelayMs": 5000
+        "retryBaseDelayMs": 5000,
+        "slowLaneWarnThresholdMs": 5000
       },
       "agent": {
         "params": {},

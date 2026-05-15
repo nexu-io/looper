@@ -390,6 +390,7 @@ type Options struct {
 	RetryMaxAttempts        int64
 	HeadChangePollInterval  time.Duration
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnQueueItemEnqueued     func()
 }
 
 type DiscoveryPolicy struct {
@@ -432,6 +433,7 @@ type Runner struct {
 	retryMaxAttempts        int64
 	headChangePollInterval  time.Duration
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	onQueueItemEnqueued     func()
 }
 
 type DiscoveryInput struct {
@@ -632,6 +634,7 @@ func New(options Options) *Runner {
 		retryMaxAttempts:        retryMax,
 		headChangePollInterval:  headChangePollInterval,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
@@ -3356,6 +3359,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
 					return storage.QueueItemRecord{}, err
 				}
+				r.wakeSchedulerAfterEnqueue()
 				return updated, nil
 			}
 		}
@@ -3373,7 +3377,14 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return queueItem, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func isoTimeAfter(candidate, current string) bool {

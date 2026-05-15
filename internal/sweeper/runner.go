@@ -82,28 +82,30 @@ type GitHubGateway interface {
 }
 
 type Options struct {
-	Repos        *storage.Repositories
-	GitHub       GitHubGateway
-	Agent        AgentExecutor
-	Logger       bootstrap.Logger
-	Now          func() time.Time
-	Config       *config.Config
-	AgentRuntime string
-	AgentModel   *string
+	Repos               *storage.Repositories
+	GitHub              GitHubGateway
+	Agent               AgentExecutor
+	Logger              bootstrap.Logger
+	Now                 func() time.Time
+	Config              *config.Config
+	AgentRuntime        string
+	AgentModel          *string
+	OnQueueItemEnqueued func()
 }
 
 type Runner struct {
-	repos        *storage.Repositories
-	github       GitHubGateway
-	agent        AgentExecutor
-	logger       bootstrap.Logger
-	now          func() time.Time
-	config       *config.Config
-	agentRuntime string
-	agentModel   *string
-	claimer      string
-	maxTry       int64
-	retryDelay   time.Duration
+	repos               *storage.Repositories
+	github              GitHubGateway
+	agent               AgentExecutor
+	logger              bootstrap.Logger
+	now                 func() time.Time
+	config              *config.Config
+	agentRuntime        string
+	agentModel          *string
+	claimer             string
+	maxTry              int64
+	retryDelay          time.Duration
+	onQueueItemEnqueued func()
 }
 
 type payloadEnvelope struct {
@@ -193,7 +195,7 @@ func New(options Options) *Runner {
 	if now == nil {
 		now = time.Now
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax, retryDelay: defaultRetryDelay}
+	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax, retryDelay: defaultRetryDelay, onQueueItemEnqueued: options.OnQueueItemEnqueued}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -612,7 +614,14 @@ func (r *Runner) buildQueueItem(ctx context.Context, seed queueSeed) (storage.Qu
 	if err := r.repos.Queue.Upsert(ctx, item); err != nil {
 		return storage.QueueItemRecord{}, false, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return item, true, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func (r *Runner) processWarn(ctx context.Context, queueItem storage.QueueItemRecord, payload sweeperPayload) (sweeperPayload, string, string, error) {

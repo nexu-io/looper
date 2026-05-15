@@ -20,7 +20,8 @@
           "pollIntervalSeconds": 45,
           "maxConcurrentRuns": 4,
           "retryMaxAttempts": 7,
-          "retryBaseDelayMs": 1500
+          "retryBaseDelayMs": 1500,
+          "slowLaneWarnThresholdMs": 5000
         },
         "agent": {
           "vendor": "codex",
@@ -110,7 +111,8 @@
         "pollIntervalSeconds": 45,
         "maxConcurrentRuns": 4,
         "retryMaxAttempts": 7,
-        "retryBaseDelayMs": 1500
+        "retryBaseDelayMs": 1500,
+        "slowLaneWarnThresholdMs": 5000
       },
       "agent": {
         "vendor": "codex",

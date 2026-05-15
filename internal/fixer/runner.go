@@ -402,6 +402,7 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnQueueItemEnqueued     func()
 }
 
 type DiscoveryPolicy struct {
@@ -439,6 +440,7 @@ type Runner struct {
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	onQueueItemEnqueued     func()
 }
 
 type DiscoveryInput struct {
@@ -994,6 +996,7 @@ func New(options Options) *Runner {
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
@@ -3602,6 +3605,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 			if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
 				return storage.QueueItemRecord{}, err
 			}
+			r.wakeSchedulerAfterEnqueue()
 			return updated, nil
 		}
 		return *existing, nil
@@ -3621,6 +3625,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 			if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
 				return storage.QueueItemRecord{}, err
 			}
+			r.wakeSchedulerAfterEnqueue()
 			return updated, nil
 		}
 		return *activeForLoop, nil
@@ -3634,7 +3639,14 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return queueItem, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
