@@ -9,7 +9,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
 
-func TestDiscoverySnapshotCachesPerProjectDataAndTickLogin(t *testing.T) {
+func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 	t.Parallel()
 
 	counts := map[string]int{}
@@ -35,7 +35,14 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLogin(t *testing.T) {
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(cmd, "api user --jq .login"):
 			counts["user_login"]++
-			return shell.Result{Stdout: "octo\n"}, nil
+			switch options.CWD {
+			case "/repo-one":
+				return shell.Result{Stdout: "octo\n"}, nil
+			case "/repo-two":
+				return shell.Result{Stdout: "other\n"}, nil
+			default:
+				return shell.Result{}, errors.New("unexpected cwd for user login: " + options.CWD)
+			}
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}
@@ -73,11 +80,19 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLogin(t *testing.T) {
 	if _, err := gateway.ViewPullRequest(projectOneCtx, ViewPullRequestInput{Repo: "acme/looper", PRNumber: 1, CWD: "/repo-one"}); err != nil {
 		t.Fatalf("ViewPullRequest(second) error = %v", err)
 	}
-	if _, err := gateway.GetCurrentUserLogin(projectOneCtx, "/repo-one"); err != nil {
+	login, err := gateway.GetCurrentUserLogin(projectOneCtx, "/repo-one")
+	if err != nil {
 		t.Fatalf("GetCurrentUserLogin(project one) error = %v", err)
 	}
-	if _, err := gateway.GetCurrentUserLogin(projectTwoCtx, "/repo-two"); err != nil {
+	if login != "octo" {
+		t.Fatalf("GetCurrentUserLogin(project one) = %q, want octo", login)
+	}
+	login, err = gateway.GetCurrentUserLogin(projectTwoCtx, "/repo-two")
+	if err != nil {
 		t.Fatalf("GetCurrentUserLogin(project two) error = %v", err)
+	}
+	if login != "other" {
+		t.Fatalf("GetCurrentUserLogin(project two) = %q, want other", login)
 	}
 
 	if got := counts["pr_list"]; got != 1 {
@@ -89,8 +104,8 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLogin(t *testing.T) {
 	if got := counts["pr_view"]; got != 1 {
 		t.Fatalf("pr view calls = %d, want 1", got)
 	}
-	if got := counts["user_login"]; got != 1 {
-		t.Fatalf("user login calls = %d, want 1", got)
+	if got := counts["user_login"]; got != 2 {
+		t.Fatalf("user login calls = %d, want 2", got)
 	}
 }
 

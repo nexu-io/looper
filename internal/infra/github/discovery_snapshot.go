@@ -16,9 +16,8 @@ type DiscoverySnapshotOptions struct {
 type discoverySnapshotContextKey struct{}
 
 type DiscoveryTickState struct {
-	mu           sync.Mutex
-	userLogin    string
-	userLoginSet bool
+	mu         sync.Mutex
+	userLogins map[string]string
 }
 
 type DiscoverySnapshot struct {
@@ -44,7 +43,7 @@ type DiscoverySnapshot struct {
 }
 
 func NewDiscoveryTickState() *DiscoveryTickState {
-	return &DiscoveryTickState{}
+	return &DiscoveryTickState{userLogins: map[string]string{}}
 }
 
 func NewDiscoverySnapshot(gateway *Gateway, tick *DiscoveryTickState, options DiscoverySnapshotOptions) *DiscoverySnapshot {
@@ -200,9 +199,9 @@ func (s *DiscoverySnapshot) getCurrentUserLogin(ctx context.Context, cwd string)
 	if s.tick == nil {
 		return s.gateway.getCurrentUserLoginRaw(ctx, cwd)
 	}
+	cacheKey := strings.TrimSpace(cwd)
 	s.tick.mu.Lock()
-	if s.tick.userLoginSet {
-		login := s.tick.userLogin
+	if login, ok := s.tick.userLogins[cacheKey]; ok {
 		s.tick.mu.Unlock()
 		return login, nil
 	}
@@ -212,8 +211,7 @@ func (s *DiscoverySnapshot) getCurrentUserLogin(ctx context.Context, cwd string)
 		return "", err
 	}
 	s.tick.mu.Lock()
-	s.tick.userLogin = login
-	s.tick.userLoginSet = true
+	s.tick.userLogins[cacheKey] = login
 	s.tick.mu.Unlock()
 	return login, nil
 }
