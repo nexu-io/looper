@@ -860,6 +860,47 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	nowISO := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC).Format(javaScriptISOString)
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+				metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
+				return projects.AddResult{
+					Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				}, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	assertEqual(t, data["name"], "Looper")
+	assertEqual(t, data["repoPath"], "/tmp/repos/looper")
+	assertEqual(t, data["baseBranch"], "main")
+	assertEqual(t, data["archived"], false)
+	assertEqual(t, data["discoveredPullRequests"], float64(0))
+	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	warnings, ok := data["warnings"].([]any)
+	if !ok || len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
 func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

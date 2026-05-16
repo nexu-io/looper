@@ -4849,9 +4849,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	if err := h.refreshWebhookForwarders(); err != nil {
-		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
+	_ = h.refreshWebhookForwarders()
 
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
