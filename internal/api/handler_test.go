@@ -21,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/projects"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
@@ -2963,7 +2964,11 @@ func TestSerializePullRequestListItemUsesProvidedLoopMatches(t *testing.T) {
 
 func TestSerializePullRequestListItemIncludesMergeabilityBlocker(t *testing.T) {
 	h := NewHandler(Context{})
-	payload := `{"detail":{"isDraft":false,"hasConflicts":true}}`
+	detail, err := json.Marshal(githubinfra.PullRequestDetail{IsDraft: false, HasConflicts: true})
+	if err != nil {
+		t.Fatalf("Marshal(PullRequestDetail) error = %v", err)
+	}
+	payload := fmt.Sprintf(`{"detail":%s}`, detail)
 	checks := "SUCCESS"
 	review := "APPROVED"
 

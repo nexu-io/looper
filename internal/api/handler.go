@@ -1907,8 +1907,8 @@ func derivePullRequestActionability(snapshot *storage.PullRequestSnapshotRecord)
 	}
 
 	detail := pullRequestSnapshotDetail(snapshot.PayloadJSON)
-	isDraft := boolPtrIfPresent(detail, "isDraft")
-	hasConflicts := boolPtrIfPresent(detail, "hasConflicts")
+	isDraft := boolPtrIfPresent(detail, "isDraft", "IsDraft")
+	hasConflicts := boolPtrIfPresent(detail, "hasConflicts", "HasConflicts")
 	if hasConflicts == nil && strings.EqualFold(stringFromMap(detail, "mergeStateStatus"), "DIRTY") {
 		hasConflicts = boolPtr(true)
 	}
@@ -1978,12 +1978,14 @@ func reviewPending(state *string) bool {
 	}
 }
 
-func boolPtrIfPresent(values map[string]any, key string) *bool {
-	value, ok := values[key].(bool)
-	if !ok {
-		return nil
+func boolPtrIfPresent(values map[string]any, keys ...string) *bool {
+	for _, key := range keys {
+		value, ok := values[key].(bool)
+		if ok {
+			return boolPtr(value)
+		}
 	}
-	return boolPtr(value)
+	return nil
 }
 
 func stringFromMap(values map[string]any, key string) string {
