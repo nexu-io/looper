@@ -286,6 +286,7 @@ func (m *webhookForwarderManager) commandForRepo(repo string) []string {
 func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwarder *managedWebhookForwarder) {
 	defer close(forwarder.doneCh)
 	backoff := m.backoffBase
+	resetBackoffAfterStart := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -311,6 +312,7 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 				return
 			}
 			backoff = boundedWebhookBackoff(backoff, m.backoffBase, m.backoffMax)
+			resetBackoffAfterStart = true
 			continue
 		}
 		select {
@@ -346,6 +348,10 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 		m.mu.Unlock()
 		if m.logger != nil {
 			m.logger.Info("gh webhook forwarder started", map[string]any{"repo": forwarder.repo, "endpoint": endpoint})
+		}
+		if resetBackoffAfterStart {
+			backoff = m.backoffBase
+			resetBackoffAfterStart = false
 		}
 
 		var readers sync.WaitGroup

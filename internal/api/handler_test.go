@@ -351,6 +351,51 @@ func TestHandlerUnauthorized(t *testing.T) {
 	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
+func TestHandlerWebhookForwardRouteRequiresTokenWhenWebhookDisabled(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	token := "secret-token"
+	cfg.Server.AuthMode = config.AuthModeLocalToken
+	cfg.Server.LocalToken = &token
+
+	triggered := 0
+	req := httptest.NewRequest(http.MethodPost, webhookForwardPath, nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "UNAUTHORIZED")
+	assertEqual(t, errMap["message"], "Authorization token is required")
+	assertEqual(t, triggered, 0)
+}
+
+func TestHandlerWebhookForwardRouteAllowsLoopbackWithoutTokenWhenWebhookEnabled(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	token := "secret-token"
+	cfg.Server.AuthMode = config.AuthModeLocalToken
+	cfg.Server.LocalToken = &token
+	cfg.Webhook.Enabled = true
+
+	triggered := 0
+	req := httptest.NewRequest(http.MethodPost, webhookForwardPath, nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["ok"], true)
+	assertEqual(t, triggered, 1)
+}
+
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

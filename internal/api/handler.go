@@ -523,7 +523,7 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 }
 
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
-	if path == webhookForwardPath && isLoopbackRemoteAddr(r.RemoteAddr) {
+	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		return nil
 	}
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {

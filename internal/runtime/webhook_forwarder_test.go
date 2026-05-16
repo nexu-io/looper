@@ -248,6 +248,65 @@ func TestWebhookForwarderManagerRespawnsAndStopsRemovedRepo(t *testing.T) {
 	}
 }
 
+func TestWebhookForwarderManagerResetsBackoffAfterSuccessfulStart(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Webhook.Enabled = true
+	ghPath := "/resolved/gh"
+	cfg.Tools.GHPath = &ghPath
+
+	var mu sync.Mutex
+	started := []*testStartedForwarder{}
+	startCalls := 0
+	sleepCalls := []time.Duration{}
+	manager := newWebhookForwarderManager(webhookForwarderManagerOptions{
+		Config:      cfg,
+		Logger:      &testLogger{},
+		Now:         func() time.Time { return time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC) },
+		BackoffBase: time.Millisecond,
+		BackoffMax:  4 * time.Millisecond,
+		Sleep: func(ctx context.Context, delay time.Duration) error {
+			mu.Lock()
+			sleepCalls = append(sleepCalls, delay)
+			mu.Unlock()
+			return nil
+		},
+		StartProcess: func(ctx context.Context, command webhookForwarderCommand) (webhookForwarderStartResult, error) {
+			mu.Lock()
+			attempt := startCalls
+			startCalls++
+			mu.Unlock()
+			if attempt < 3 {
+				return webhookForwarderStartResult{}, errors.New("gh unavailable")
+			}
+			startedForwarder := newTestStartedForwarder(command)
+			result := startedForwarder.result()
+			mu.Lock()
+			started = append(started, startedForwarder)
+			mu.Unlock()
+			if attempt == 3 || attempt == 4 {
+				go startedForwarder.exit(errors.New("boom"))
+			}
+			return result, nil
+		},
+	})
+
+	manager.Sync(context.Background(), []storage.ProjectRecord{{ID: "one", MetadataJSON: stringPtr(`{"repo":"acme/alpha"}`)}})
+	waitForWebhookCondition(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(sleepCalls) < 5 {
+			return false
+		}
+		return sleepCalls[0] == time.Millisecond && sleepCalls[1] == 2*time.Millisecond && sleepCalls[2] == 4*time.Millisecond && sleepCalls[3] == time.Millisecond && sleepCalls[4] == 2*time.Millisecond
+	})
+	manager.Stop()
+}
+
 func TestRuntimeStartDegradesWebhookWithoutFailingStartup(t *testing.T) {
 	t.Parallel()
 
