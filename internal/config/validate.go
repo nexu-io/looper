@@ -692,6 +692,14 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 	if config.Dispatch.AssignTo != strings.TrimSpace(config.Dispatch.AssignTo) {
 		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.assignTo", Message: "must not contain leading or trailing whitespace"})
 	}
+	if config.Dependencies.Enabled {
+		if config.Dependencies.APITimeoutSeconds <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiTimeoutSeconds", Message: "must be a positive integer when dependencies are enabled"})
+		}
+		if config.Dependencies.APIRetryAttempts <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiRetryAttempts", Message: "must be a positive integer when dependencies are enabled"})
+		}
+	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},
 		{Path: path + ".triage.disposition.outOfScopeLabel", Value: config.Triage.Disposition.OutOfScopeLabel},

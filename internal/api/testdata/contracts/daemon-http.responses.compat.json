@@ -257,6 +257,11 @@
                   "reTriageOnAuthorReply": true
                 }
               },
+              "dependencies": {
+                "enabled": false,
+                "apiTimeoutSeconds": 10,
+                "apiRetryAttempts": 3
+              },
               "dispatch": {
                 "mode": "human-gated",
                 "humanGate": {

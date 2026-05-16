@@ -425,6 +425,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
 			return
 		}
+		if err := r.validateCoordinatorDependencyGates(ctx, repositories, githubGateway); err != nil {
+			r.startupReadyErr = err
+			return
+		}
 		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
 		if err != nil {
 			r.startupReadyErr = err
@@ -461,6 +465,95 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 	})
 
 	return r.startupReadyErr
+}
+
+func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway) error {
+	if repositories == nil || repositories.Projects == nil || githubGateway == nil {
+		return nil
+	}
+	projectsList, err := repositories.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projectsList {
+		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
+		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
+			continue
+		}
+		repo := strings.TrimSpace(runtimeProjectRepo(project.MetadataJSON))
+		if repo == "" {
+			return fmt.Errorf("coordinator dependency gate enabled but repository metadata unavailable for project %s", project.ID)
+		}
+		issueNumber, err := r.firstDependencyProbeIssue(ctx, githubGateway, repo, project.RepoPath)
+		if err != nil {
+			return err
+		}
+		if issueNumber == 0 {
+			return fmt.Errorf("coordinator dependency gate enabled but no issue available to probe dependencies API on %s", repo)
+		}
+		if err := r.probeDependencyAPI(ctx, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) firstDependencyProbeIssue(ctx context.Context, githubGateway *githubinfra.Gateway, repo, cwd string) (int64, error) {
+	return githubGateway.FindAnyIssueNumber(ctx, repo, cwd)
+}
+
+func (r *Runtime) probeDependencyAPI(ctx context.Context, githubGateway *githubinfra.Gateway, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) error {
+	var lastErr error
+	for attempt := 0; attempt < runtimeMaxDependencyAttempts(depsCfg.APIRetryAttempts); attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, runtimeDependencyTimeout(depsCfg.APITimeoutSeconds))
+		_, err := githubGateway.ListIssueBlockedBy(callCtx, githubinfra.ListIssueBlockedByInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if githubinfra.IsNotFoundError(err) {
+			return fmt.Errorf("coordinator dependency gate enabled but dependencies API unavailable on %s; disable roles.coordinator.dependencies.enabled or upgrade GHES", repo)
+		}
+		if !runtimeShouldRetryDependencyError(err) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func runtimeProjectRepo(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	value, _ := metadata["repo"].(string)
+	return strings.TrimSpace(value)
+}
+
+func runtimeDependencyTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func runtimeMaxDependencyAttempts(attempts int) int {
+	if attempts <= 0 {
+		return 1
+	}
+	return attempts
+}
+
+func runtimeShouldRetryDependencyError(err error) bool {
+	if githubinfra.IsTransientError(err) {
+		return true
+	}
+	message := strings.ToLower(githubinfra.ErrorMessage(err))
+	return strings.Contains(message, "timed out") || strings.Contains(message, "context deadline exceeded")
 }
 
 func (r *Runtime) startSchedulerLoop() {

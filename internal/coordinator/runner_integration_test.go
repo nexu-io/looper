@@ -154,6 +154,67 @@ func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+
+	writeBlockedByState := func(blockerState, blockerStateReason string) {
+		stateReasonField := `"state_reason":null`
+		if blockerStateReason != "" {
+			stateReasonField = `"state_reason":"` + blockerStateReason + `"`
+		}
+		fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":1,"title":"A","body":"done first","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]},{"number":2,"title":"B","body":"blocked","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+			"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"done first","html_url":"https://example.test/issues/1","state":"` + blockerState + `",` + stateReasonField + `,"created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/1/comments":                json.RawMessage(`[[]]`),
+			"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+			"repos/acme/looper/issues/1/dependencies/blocked_by": json.RawMessage(`[[]]`),
+			"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"blocked","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[]]`),
+			"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+			"repos/acme/looper/issues/2/dependencies/blocked_by": json.RawMessage(`[[{"number":1,"repository":{"full_name":"acme/looper"}}]]`),
+		}})
+	}
+
+	coord, repos, cfg, repoPath, now := coordinatorFakeGHFixture(t)
+	_ = coord
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: repoPath, Now: func() time.Time { return now }})
+	runner := New(Options{Repos: repos, GitHub: gateway, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}})
+
+	writeBlockedByState("open", "")
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "demo", Repo: "acme/looper"}); err != nil {
+		logBytes, _ := os.ReadFile(fakeGH.InvocationLog)
+		t.Fatalf("DiscoverIssues() tick1 error = %v\ninvocations:\n%s", err, string(logBytes))
+	}
+	logBytes, err := os.ReadFile(fakeGH.InvocationLog)
+	if err != nil {
+		t.Fatalf("ReadFile(invocation log) error = %v", err)
+	}
+	if strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`) {
+		t.Fatal("blocked issue dispatched before blocker completed")
+	}
+
+	writeBlockedByState("closed", "completed")
+	runner.now = func() time.Time { return now.Add(10 * time.Minute) }
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "demo", Repo: "acme/looper"}); err != nil {
+		logBytes, _ := os.ReadFile(fakeGH.InvocationLog)
+		t.Fatalf("DiscoverIssues() tick2 error = %v\ninvocations:\n%s", err, string(logBytes))
+	}
+	logBytes, err = os.ReadFile(fakeGH.InvocationLog)
+	if err != nil {
+		t.Fatalf("ReadFile(invocation log) error = %v", err)
+	}
+	if !strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`) {
+		t.Fatal("blocked issue did not dispatch after blocker completed")
+	}
+}
+
 func coordinatorFakeGHFixture(t *testing.T) (*storage.SQLiteCoordinator, *storage.Repositories, config.Config, string, time.Time) {
 	t.Helper()
 	coord, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "coordinator.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})

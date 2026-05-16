@@ -3,12 +3,14 @@ package dispatch
 import (
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/coordinator/depgraph"
 )
 
 func TestAutonomousGraceNotElapsedDoesNothing(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-29 * time.Minute)}, autonomousConfig(), now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-29 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp || len(action.TriggerLabels) != 0 {
 		t.Fatalf("action = %#v, want no-op", action)
 	}
@@ -17,9 +19,19 @@ func TestAutonomousGraceNotElapsedDoesNothing(t *testing.T) {
 func TestAutonomousGraceElapsedAppliesTrigger(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" {
 		t.Fatalf("action = %#v, want autonomous planner dispatch", action)
+	}
+}
+
+func TestAutonomousGraceElapsedAppliesTriggerWithSatisfiedBlockedByGraph(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "closed", StateReason: "completed", Reachable: true}}}}})
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" {
+		t.Fatalf("action = %#v, want autonomous planner dispatch with satisfied graph", action)
 	}
 }
 
@@ -28,7 +40,7 @@ func TestAutonomousGraceElapsedAppliesAllPlannerTriggersWhenConfigured(t *testin
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
 	cfg := autonomousConfig()
 	cfg.PlannerTriggerLabels = []string{"looper:plan", "team:planner"}
-	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
 	if len(action.TriggerLabels) != 2 || action.TriggerLabels[0] != "looper:plan" || action.TriggerLabels[1] != "team:planner" {
 		t.Fatalf("action = %#v, want all planner triggers", action)
 	}
@@ -37,7 +49,7 @@ func TestAutonomousGraceElapsedAppliesAllPlannerTriggersWhenConfigured(t *testin
 func TestAutonomousDispatchRemovedDoesNothing(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Labels: []string{"triaged"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
 	}
@@ -46,7 +58,7 @@ func TestAutonomousDispatchRemovedDoesNothing(t *testing.T) {
 func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan, "looper:hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
 	}
@@ -55,9 +67,29 @@ func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 func TestAutonomousTriggerAlreadyPresentVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Labels: []string{"triaged", DispatchPlan, "looper:plan"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:plan"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
+	}
+}
+
+func TestAutonomousUnsatisfiedBlockedByVetoesDispatch(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "open", Reachable: true}}}}})
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
+	if !action.NoOp || len(action.TriggerLabels) != 0 {
+		t.Fatalf("action = %#v, want blocked_by veto", action)
+	}
+}
+
+func TestAutonomousUnreachableBlockedByVetoesDispatch(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, Reachable: false}}}}})
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
+	if !action.NoOp || len(action.TriggerLabels) != 0 {
+		t.Fatalf("action = %#v, want unreachable blocked_by veto", action)
 	}
 }
 

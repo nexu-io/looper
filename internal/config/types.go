@@ -482,11 +482,18 @@ type CoordinatorDispatchConfig struct {
 	AssignTo   string                              `json:"assignTo"`
 }
 
+type CoordinatorDependenciesConfig struct {
+	Enabled           bool `json:"enabled"`
+	APITimeoutSeconds int  `json:"apiTimeoutSeconds"`
+	APIRetryAttempts  int  `json:"apiRetryAttempts"`
+}
+
 type CoordinatorRoleConfig struct {
-	Enabled      bool                      `json:"enabled"`
-	PollInterval string                    `json:"pollInterval"`
-	Triage       CoordinatorTriageConfig   `json:"triage"`
-	Dispatch     CoordinatorDispatchConfig `json:"dispatch"`
+	Enabled      bool                          `json:"enabled"`
+	PollInterval string                        `json:"pollInterval"`
+	Triage       CoordinatorTriageConfig       `json:"triage"`
+	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
+	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
 }
 
 type RoleConfigs struct {
@@ -879,10 +886,17 @@ type PartialCoordinatorDispatchConfig struct {
 }
 
 type PartialCoordinatorRoleConfig struct {
-	Enabled      *bool                             `json:"enabled,omitempty"`
-	PollInterval *string                           `json:"pollInterval,omitempty"`
-	Triage       *PartialCoordinatorTriageConfig   `json:"triage,omitempty"`
-	Dispatch     *PartialCoordinatorDispatchConfig `json:"dispatch,omitempty"`
+	Enabled      *bool                                 `json:"enabled,omitempty"`
+	PollInterval *string                               `json:"pollInterval,omitempty"`
+	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
+	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
+	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
+}
+
+type PartialCoordinatorDependenciesConfig struct {
+	Enabled           *bool `json:"enabled,omitempty"`
+	APITimeoutSeconds *int  `json:"apiTimeoutSeconds,omitempty"`
+	APIRetryAttempts  *int  `json:"apiRetryAttempts,omitempty"`
 }
 
 type PartialRoleConfigs struct {

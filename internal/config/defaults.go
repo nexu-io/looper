@@ -162,6 +162,11 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					AssignTo: "",
 				},
+				Dependencies: CoordinatorDependenciesConfig{
+					Enabled:           false,
+					APITimeoutSeconds: 10,
+					APIRetryAttempts:  3,
+				},
 			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,

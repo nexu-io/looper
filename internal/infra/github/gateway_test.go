@@ -1224,6 +1224,44 @@ func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
 	}
 }
 
+func TestListIssueBlockedByUsesRepositoryURLForCrossRepoBlockers(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api --paginate --slurp repos/acme/looper/issues/12/dependencies/blocked_by" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `[[{"number":34,"repository_url":"https://github.example.com/api/v3/repos/other/repo"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	blockedBy, err := gateway.ListIssueBlockedBy(context.Background(), ListIssueBlockedByInput{Repo: "acme/looper", IssueNumber: 12})
+	if err != nil {
+		t.Fatalf("ListIssueBlockedBy() error = %v", err)
+	}
+	if len(blockedBy) != 1 || blockedBy[0].Number != 34 || blockedBy[0].Repo != "github.example.com/other/repo" {
+		t.Fatalf("ListIssueBlockedBy() = %#v, want hosted cross-repo blocker", blockedBy)
+	}
+}
+
+func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
+	if err != nil {
+		t.Fatalf("FindAnyIssueNumber() error = %v", err)
+	}
+	if issueNumber != 7 {
+		t.Fatalf("FindAnyIssueNumber() = %d, want first non-PR issue", issueNumber)
+	}
+}
+
 func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

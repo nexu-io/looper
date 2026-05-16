@@ -3338,6 +3338,28 @@ func sha256Hex(value string) string {
 	return fmt.Sprintf("%x", sum)
 }
 
+func TestValidateCoordinatorDependenciesRequiresPositiveBoundsWhenEnabled(t *testing.T) {
+	cwd := t.TempDir()
+	cfg, err := DefaultConfig(cwd)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.APITimeoutSeconds = 0
+	cfg.Roles.Coordinator.Dependencies.APIRetryAttempts = 0
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want validation error")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "roles.coordinator.dependencies.apiTimeoutSeconds", "must be a positive integer when dependencies are enabled")
+	assertValidationIssue(t, validationErr, "roles.coordinator.dependencies.apiRetryAttempts", "must be a positive integer when dependencies are enabled")
+}
+
 func mapEnvLookup(values map[string]string) EnvLookupFunc {
 	return func(key string) (string, bool) {
 		value, ok := values[key]

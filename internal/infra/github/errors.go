@@ -71,6 +71,18 @@ func IsPullRequestNotFoundError(err error) bool {
 	return isPullRequestNotFoundMessage(err.Error())
 }
 
+func IsNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		message := strings.ToLower(strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
+		return strings.Contains(message, "http 404") || strings.Contains(message, " 404")
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "404")
+}
+
 func nonEmptyStrings(values ...string) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {

@@ -710,6 +710,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.Dispatch != nil {
 		mergeCoordinatorDispatchConfig(&config.Dispatch, *partial.Dispatch)
 	}
+	if partial.Dependencies != nil {
+		mergeCoordinatorDependenciesConfig(&config.Dependencies, *partial.Dependencies)
+	}
 }
 
 func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {
@@ -769,6 +772,18 @@ func mergeCoordinatorDispatchAutonomousConfig(config *CoordinatorDispatchAutonom
 	}
 	if partial.HoldLabel != nil {
 		config.HoldLabel = *partial.HoldLabel
+	}
+}
+
+func mergeCoordinatorDependenciesConfig(config *CoordinatorDependenciesConfig, partial PartialCoordinatorDependenciesConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.APITimeoutSeconds != nil {
+		config.APITimeoutSeconds = *partial.APITimeoutSeconds
+	}
+	if partial.APIRetryAttempts != nil {
+		config.APIRetryAttempts = *partial.APIRetryAttempts
 	}
 }
 

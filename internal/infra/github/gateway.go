@@ -128,6 +128,19 @@ type RepositoryPermissionInput struct {
 	User string
 	CWD  string
 }
+type ListIssueBlockedByInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type IssueDependency struct {
+	Number int64
+	Repo   string
+}
+type IssueState struct {
+	State       string
+	StateReason string
+}
 type LinkedPullRequestsInput struct {
 	Repo        string
 	IssueNumber int64
@@ -182,6 +195,7 @@ type IssueDetail struct {
 	Body              string
 	URL               string
 	State             string
+	StateReason       string
 	CreatedAt         string
 	UpdatedAt         string
 	ClosedAt          string
@@ -712,6 +726,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		StateReason:       firstNonEmpty(asString(row["state_reason"]), asString(row["stateReason"])),
 		CreatedAt:         firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
@@ -723,6 +738,78 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		CommentCount:      len(commentRows),
 		Comments:          extractCommentInfos(commentRows),
 	}, nil
+}
+
+func (g *Gateway) GetIssueState(ctx context.Context, input ViewIssueInput) (IssueState, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return IssueState{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return IssueState{}, err
+	}
+	return IssueState{State: asString(row["state"]), StateReason: firstNonEmpty(asString(row["state_reason"]), asString(row["stateReason"]))}, nil
+}
+
+func (g *Gateway) ListIssueBlockedBy(ctx context.Context, input ListIssueBlockedByInput) ([]IssueDependency, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueDependency, 0, len(rows))
+	for _, row := range rows {
+		dependency := IssueDependency{Number: asInt64(row["number"]), Repo: dependencyRepo(firstNonNil(row["repository"], row["repo"]), asString(row["repository_url"]), input.Repo)}
+		if dependency.Number <= 0 {
+			continue
+		}
+		out = append(out, dependency)
+	}
+	return out, nil
+}
+
+func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
+	hostname, repoName := splitRepoHostname(repo)
+	for page := 1; page <= 5; page++ {
+		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		result, err := g.runGh(ctx, cwd, "", args...)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := decodeJSONArray(result.Stdout)
+		if err != nil {
+			return 0, err
+		}
+		if len(rows) == 0 {
+			return 0, nil
+		}
+		for _, row := range rows {
+			if row["pull_request"] != nil {
+				continue
+			}
+			if issueNumber := asInt64(row["number"]); issueNumber > 0 {
+				return issueNumber, nil
+			}
+		}
+	}
+	return 0, nil
 }
 
 func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
@@ -2401,6 +2488,26 @@ func validateGitHubRepoSlug(repo string) error {
 		return fmt.Errorf("invalid GitHub repo: %s", repo)
 	}
 	return nil
+}
+
+func dependencyRepo(value any, repositoryURL string, fallback string) string {
+	repository, _ := value.(map[string]any)
+	if fullName := strings.TrimSpace(asString(repository["full_name"])); fullName != "" {
+		return hostQualifiedRepo(fullName, firstNonEmpty(repositoryURL, asString(repository["url"])))
+	}
+	if apiURL := strings.TrimSpace(firstNonEmpty(repositoryURL, asString(repository["url"]))); apiURL != "" {
+		if parsed, err := url.Parse(apiURL); err == nil {
+			trimmed := strings.Trim(parsed.Path, "/")
+			if index := strings.Index(trimmed, "repos/"); index >= 0 {
+				nameWithOwner := strings.TrimPrefix(trimmed[index:], "repos/")
+				if parsed.Hostname() != "" && parsed.Hostname() != "api.github.com" && parsed.Hostname() != "github.com" {
+					return parsed.Hostname() + "/" + nameWithOwner
+				}
+				return nameWithOwner
+			}
+		}
+	}
+	return strings.TrimSpace(fallback)
 }
 
 func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
