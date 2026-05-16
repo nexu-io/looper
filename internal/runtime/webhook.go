@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -508,7 +509,7 @@ func (w *webhookRuntime) currentTime() time.Time {
 }
 
 func webhookBaseURL(cfg config.Config) string {
-	return fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port)
+	return "http://" + net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.Port))
 }
 
 func isLoopbackHost(host string) bool {

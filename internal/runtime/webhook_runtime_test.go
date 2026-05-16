@@ -57,6 +57,23 @@ func TestNewWebhookRuntimeDoesNotDegradeHealthyWebhookMode(t *testing.T) {
 	}
 }
 
+func TestNewWebhookRuntimeBracketsIPv6EndpointURL(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Webhook.Enabled = true
+	cfg.Server.Host = "::1"
+
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(0, 0) })
+	status := rt.Status()
+	if status.EndpointURL != "http://[::1]:17310/webhook/forward" {
+		t.Fatalf("Status().EndpointURL = %q, want %q", status.EndpointURL, "http://[::1]:17310/webhook/forward")
+	}
+}
+
 func TestWebhookRuntimeClearsForwarderDegradedReasonsAfterRecovery(t *testing.T) {
 	t.Parallel()
 
