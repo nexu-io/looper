@@ -4887,6 +4887,9 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
+		runtimeWithWebhook.ReconcileWebhookForwarders()
+	}
 
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),

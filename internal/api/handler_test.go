@@ -860,6 +860,31 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: runtime, ProjectsService: fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	}
+}
+
 func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -4674,6 +4699,17 @@ type testFixture struct {
 	now     time.Time
 	config  config.Config
 	runtime *looperdruntime.Runtime
+}
+
+type webhookReconcileRuntime struct {
+	*looperdruntime.Runtime
+	reconcile func()
+}
+
+func (r webhookReconcileRuntime) ReconcileWebhookForwarders() {
+	if r.reconcile != nil {
+		r.reconcile()
+	}
 }
 
 func newTestFixture(t *testing.T) testFixture {

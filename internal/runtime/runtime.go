@@ -298,6 +298,17 @@ func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.RecordDelivery(eventType, deliveryID)
+		r.TriggerSchedulerTick()
+	}
+}
+
+func (r *Runtime) ReconcileWebhookForwarders() {
+	r.mu.RLock()
+	webhook := r.webhook
+	repositories := r.services.Repositories
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.Reconcile(repositories)
 	}
 }
 

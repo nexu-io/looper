@@ -1503,6 +1503,38 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 	}
 }
 
+func TestRuntimeRecordWebhookDeliveryTriggersSchedulerTick(t *testing.T) {
+	t.Parallel()
+
+	wakeCh := make(chan struct{}, 1)
+	claimWakeCh := make(chan struct{}, 1)
+	rt := &Runtime{
+		schedulerWake:      wakeCh,
+		schedulerClaimWake: claimWakeCh,
+		webhook: &webhookRuntime{
+			now:    func() time.Time { return time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC) },
+			status: WebhookStatus{RecentOutcomes: []WebhookRecentOutcome{}},
+		},
+	}
+
+	rt.RecordWebhookDelivery("pull_request", "delivery-1")
+
+	select {
+	case <-wakeCh:
+	default:
+		t.Fatal("schedulerWake was not triggered")
+	}
+	select {
+	case <-claimWakeCh:
+	default:
+		t.Fatal("schedulerClaimWake was not triggered")
+	}
+	status := rt.webhook.Status()
+	if status.Counters.DeliveriesReceived != 1 {
+		t.Fatalf("Status().Counters.DeliveriesReceived = %d, want 1", status.Counters.DeliveriesReceived)
+	}
+}
+
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()
 

@@ -19,6 +19,8 @@ import (
 
 const webhookListenerPath = "/webhook/forward"
 
+const noConfiguredWebhookReposReason = "no configured GitHub repos are available for webhook forwarding"
+
 var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment"}
 
 type WebhookStatus struct {
@@ -126,6 +128,10 @@ func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 }
 
 func (w *webhookRuntime) Start(repos *storage.Repositories) {
+	w.Reconcile(repos)
+}
+
+func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 	if w == nil || !w.status.Enabled {
 		return
 	}
@@ -146,17 +152,24 @@ func (w *webhookRuntime) Start(repos *storage.Repositories) {
 		}
 		repoSet[repo] = struct{}{}
 	}
-	for repo := range repoSet {
-		w.addForwarder(repo)
-	}
 	if len(repoSet) == 0 {
-		w.addDegradedReason("no configured GitHub repos are available for webhook forwarding")
+		w.addDegradedReason(noConfiguredWebhookReposReason)
 		return
+	}
+	w.clearDegradedReasons(func(reason string) bool {
+		return reason == noConfiguredWebhookReposReason
+	})
+	launchIndexes := []int{}
+	for repo := range repoSet {
+		index, added := w.ensureForwarder(repo)
+		if added {
+			launchIndexes = append(launchIndexes, index)
+		}
 	}
 	if w.ghPath == "" || w.status.Degraded {
 		return
 	}
-	for index := range w.Status().Forwarders {
+	for _, index := range launchIndexes {
 		w.launchForwarder(index)
 	}
 }
@@ -203,14 +216,24 @@ func (w *webhookRuntime) Status() WebhookStatus {
 	return status
 }
 
-func (w *webhookRuntime) addForwarder(repo string) {
+func (w *webhookRuntime) ensureForwarder(repo string) (int, bool) {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return -1, false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for index, state := range w.status.Forwarders {
+		if state.Repo == repo {
+			return index, false
+		}
+	}
 	state := WebhookForwarderState{
 		Repo:    repo,
 		Command: []string{w.ghPath, "webhook", "forward", "--repo", repo, "--events", strings.Join(webhookForwardEvents, ","), "--url", w.status.EndpointURL},
 	}
-	w.mu.Lock()
 	w.status.Forwarders = append(w.status.Forwarders, state)
-	w.mu.Unlock()
+	return len(w.status.Forwarders) - 1, true
 }
 
 func (w *webhookRuntime) launchForwarder(index int) {
