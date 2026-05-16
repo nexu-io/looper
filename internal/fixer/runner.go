@@ -595,7 +595,8 @@ type checkpointRepair struct {
 // checkpoint so resume/retry reuses the same explanation if it still maps to
 // the current fix items snapshot. Fixed decisions must include
 // ThreadCommentsObserved so resolve-comments can verify the live thread still
-// contains exactly the same non-Looper comment IDs before auto-resolving.
+// contains exactly the same target review comment IDs before auto-resolving,
+// excluding only prior Looper fixer replies.
 type replyExplanationEntry struct {
 	FixItemID              string `json:"fixItemId"`
 	ThreadID               string `json:"threadId,omitempty"`
@@ -2495,7 +2496,7 @@ func hashReviewThreadComments(thread ReviewThread) string {
 	}
 	comments := make([]observedThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		if isLooperReviewThreadComment(comment) {
+		if isLooperFixerReplyComment(comment) {
 			continue
 		}
 		id := strings.TrimSpace(comment.ID)
@@ -2544,6 +2545,14 @@ func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
 		return false
 	}
 	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
+}
+
+func isLooperFixerReplyComment(comment ReviewThreadComment) bool {
+	body := strings.TrimSpace(comment.Body)
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
 }
 
 // isBotReviewThreadComment reports whether the comment was authored by a
@@ -4615,7 +4624,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		`  - "threadId": the exact "threadId" of the same fix item`,
 		`  - "action": "fixed" or "declined"`,
 		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		`  - "threadCommentsObserved": sha256 of the JSON array of non-Looper review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. Exclude prior Looper-generated replies.`,
+		`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 		"Before including an entry, re-read the relevant review thread/comment context.",
 		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
 		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",

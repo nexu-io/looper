@@ -1836,6 +1836,47 @@ func TestRunResolveCommentsStepSkipsThreadWhenObservedThreadSnapshotDriftsDuring
 	}
 }
 
+func TestRunResolveCommentsStepResolvesLooperReviewerStampedThread(t *testing.T) {
+	t.Parallel()
+
+	reviewerBody := "please fix\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=reviewer · agent=opencode · model=openai/gpt-5.4 · An autonomous AI dev team for your GitHub repos.</sub>"
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "fix-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     reviewerBody,
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: reviewerBody, Author: "nettee", CreatedAt: "2026-04-11T11:59:00Z", UpdatedAt: "2026-04-11T11:59:00Z"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
+	observedThread := ReviewThread{Comments: []ReviewThreadComment{{ID: "c1", UpdatedAt: "2026-04-11T11:59:00Z"}}}
+	checkPoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "fix-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionFixed), Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(observedThread)}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkPoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want Looper reviewer thread resolved", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want Looper reviewer thread resolved", github.resolveCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "resolved" {
+		t.Fatalf("resolved comments = %#v, want resolved", updated.ResolvedComments)
+	}
+}
+
 func TestRunResolveCommentsStepRequiresObservedThreadSnapshotForFixedDecision(t *testing.T) {
 	t.Parallel()
 
