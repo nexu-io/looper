@@ -2550,6 +2550,47 @@ func TestValidateCoordinatorDependencyGatesSkipsProbeWhenRepoHasNoIssues(t *test
 	}
 }
 
+func TestValidateCoordinatorDependencyGatesSkipsArchivedProjects(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "archived", Name: "Archived", RepoPath: workingDir, Archived: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	blockedByCalls := 0
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "issues?state=all"):
+			t.Fatalf("unexpected issue listing for archived project: %q", args)
+			return shell.Result{}, nil
+		case strings.Contains(args, "dependencies/blocked_by"):
+			blockedByCalls++
+			return shell.Result{Stdout: `[]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+
+	if err := rt.validateCoordinatorDependencyGates(context.Background(), repositories, githubGateway); err != nil {
+		t.Fatalf("validateCoordinatorDependencyGates() error = %v, want nil", err)
+	}
+	if blockedByCalls != 0 {
+		t.Fatalf("dependencies/blocked_by call count = %d, want 0", blockedByCalls)
+	}
+}
+
 func TestFormatJavaScriptISOStringPreservesMilliseconds(t *testing.T) {
 	t.Parallel()
 

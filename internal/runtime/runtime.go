@@ -476,6 +476,9 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		return err
 	}
 	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
 		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue
