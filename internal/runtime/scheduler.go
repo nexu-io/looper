@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/sweeper"
+	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -39,12 +40,14 @@ type coordinatorScheduler interface {
 
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
+	DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*reviewer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*reviewer.ProcessResult, error)
 }
 
 type fixerScheduler interface {
 	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
+	DiscoverPullRequest(context.Context, fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
 }
@@ -103,8 +106,9 @@ type defaultSchedulerTickInput struct {
 }
 
 type defaultSchedulerHandlers struct {
-	tick  RunSchedulerTickFunc
-	claim RunSchedulerTickFunc
+	tick    RunSchedulerTickFunc
+	claim   RunSchedulerTickFunc
+	webhook WebhookForwarder
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -1118,6 +1122,14 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		claim: func(ctx context.Context, services Services) error {
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
+		webhook: webhookforward.New(webhookforward.Options{
+			Repos:    repos,
+			Config:   cfg,
+			Reviewer: reviewerRunner,
+			Fixer:    fixerRunner,
+			Logger:   logger,
+			Now:      now,
+		}),
 	}
 }
 

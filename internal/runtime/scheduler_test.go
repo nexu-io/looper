@@ -1144,6 +1144,10 @@ func (s *enqueueingReviewerScheduler) DiscoverPullRequests(ctx context.Context, 
 	return reviewer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
 }
 
+func (s *enqueueingReviewerScheduler) DiscoverPullRequest(ctx context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	return reviewer.DiscoveryResult{}, nil
+}
+
 type enqueueingFixerScheduler struct {
 	stubFixerScheduler
 	repos *storage.Repositories
@@ -1156,6 +1160,10 @@ func (s *enqueueingFixerScheduler) DiscoverPullRequests(ctx context.Context, inp
 		return fixer.DiscoveryResult{}, err
 	}
 	return fixer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
+}
+
+func (s *enqueueingFixerScheduler) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, nil
 }
 
 type discoveringWorkerScheduler struct {
@@ -1361,6 +1369,10 @@ func (s *stubReviewerScheduler) DiscoverPullRequests(_ context.Context, input re
 	return reviewer.DiscoveryResult{}, s.discoverErr
 }
 
+func (s *stubReviewerScheduler) DiscoverPullRequest(_ context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	return reviewer.DiscoveryResult{}, s.discoverErr
+}
+
 func (s *stubReviewerScheduler) ProcessNext(_ context.Context, claimedBy string) (*reviewer.ProcessResult, error) {
 	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
@@ -1400,6 +1412,10 @@ func (s *stubFixerScheduler) DiscoverPullRequests(_ context.Context, input fixer
 	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
 	s.mu.Unlock()
+	return fixer.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubFixerScheduler) DiscoverPullRequest(_ context.Context, _ fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
 	return fixer.DiscoveryResult{}, s.discoverErr
 }
 

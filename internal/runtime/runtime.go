@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -74,6 +75,12 @@ type Services struct {
 	ActiveExecutions *ActiveExecutionRegistry
 }
 
+type WebhookForwarder interface {
+	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
+	Stats() webhookforward.Stats
+	Close()
+}
+
 type Runtime struct {
 	config config.Config
 	logger bootstrap.Logger
@@ -112,6 +119,7 @@ type Runtime struct {
 	webhookForwarders  *webhookForwarderManager
 	webhookContext     context.Context
 	webhookCancel      context.CancelFunc
+	webhookForwarder   WebhookForwarder
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
 	startupReadyErr    error
@@ -220,6 +228,8 @@ func (r *Runtime) Stop(reason string) {
 
 		r.mu.Lock()
 		r.stopped = true
+		forwarder := r.webhookForwarder
+		r.webhookForwarder = nil
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
@@ -235,6 +245,9 @@ func (r *Runtime) Stop(reason string) {
 		r.services = Services{}
 		r.mu.Unlock()
 
+		if forwarder != nil {
+			forwarder.Close()
+		}
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
@@ -276,6 +289,12 @@ func (r *Runtime) StartedAt() (time.Time, bool) {
 	}
 
 	return *r.startedAt, true
+}
+
+func (r *Runtime) WebhookForwarder() WebhookForwarder {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.webhookForwarder
 }
 
 func (r *Runtime) Config() config.Config {
@@ -347,6 +366,13 @@ func (r *Runtime) start(ctx context.Context) error {
 	started := false
 	defer func() {
 		if !started {
+			r.mu.Lock()
+			forwarder := r.webhookForwarder
+			r.webhookForwarder = nil
+			r.mu.Unlock()
+			if forwarder != nil {
+				forwarder.Close()
+			}
 			_ = coordinator.Close()
 		}
 	}()
@@ -441,6 +467,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.TriggerSchedulerClaim, r.now)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
+		r.webhookForwarder = handlers.webhook
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
