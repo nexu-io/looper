@@ -40,6 +40,10 @@ type Blocker struct {
 	Satisfied        bool
 	RequiresReTriage bool
 	Unreachable      bool
+
+	Number    int64
+	Repo      string
+	Reachable bool
 }
 
 type Cycle []IssueRef
@@ -132,6 +136,26 @@ func (g DependencyGraph) BlockersOf(issue IssueRef) []Blocker {
 	out := make([]Blocker, len(rows))
 	copy(out, rows)
 	return out
+}
+
+func (g *DependencyGraph) Unsatisfied(issueNumber int64) []Blocker {
+	if g == nil || issueNumber <= 0 {
+		return nil
+	}
+	for issue, blockers := range g.blockers {
+		if issue.Number != issueNumber || len(blockers) == 0 {
+			continue
+		}
+		out := make([]Blocker, len(blockers))
+		for index, blocker := range blockers {
+			blocker.Number = blocker.Issue.Number
+			blocker.Repo = blocker.Issue.Repo
+			blocker.Reachable = !blocker.Unreachable
+			out[index] = blocker
+		}
+		return out
+	}
+	return nil
 }
 
 type blockerDisposition struct {

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -76,6 +77,45 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	defaultRetryMax                 = 3
 )
+
+var fixerDiscoveryLocks = newFixerDiscoveryLockSet()
+
+type fixerDiscoveryLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*fixerDiscoveryLockRef
+}
+
+type fixerDiscoveryLockRef struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newFixerDiscoveryLockSet() *fixerDiscoveryLockSet {
+	return &fixerDiscoveryLockSet{locks: map[string]*fixerDiscoveryLockRef{}}
+}
+
+func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
+	s.mu.Lock()
+	ref := s.locks[key]
+	if ref == nil {
+		ref = &fixerDiscoveryLockRef{}
+		s.locks[key] = ref
+	}
+	ref.refs++
+	s.mu.Unlock()
+
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(s.locks, key)
+		}
+		s.mu.Unlock()
+	}()
+	return fn()
+}
 
 type FixItem struct {
 	Type              string   `json:"type"`
@@ -1046,6 +1086,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		appendDiscoveryQueueItem(&result.QueueItems, item)
 	}
 	for _, pr := range openPRs {
+
 		if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
 			result.Skipped++
 			continue
@@ -1062,6 +1103,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	if input.PRNumber <= 0 {
+		return DiscoveryResult{}, fmt.Errorf("prNumber must be positive")
+	}
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
 		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")

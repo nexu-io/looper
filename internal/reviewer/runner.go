@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -95,6 +96,45 @@ const (
 )
 
 var retryAfterPattern = regexp.MustCompile(`(?i)retry-after\s*[:=]\s*(\d+)`)
+
+var reviewerDiscoveryLocks = newDiscoveryLockSet()
+
+type discoveryLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*discoveryLockRef
+}
+
+type discoveryLockRef struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newDiscoveryLockSet() *discoveryLockSet {
+	return &discoveryLockSet{locks: map[string]*discoveryLockRef{}}
+}
+
+func (s *discoveryLockSet) With(key string, fn func() error) error {
+	s.mu.Lock()
+	ref := s.locks[key]
+	if ref == nil {
+		ref = &discoveryLockRef{}
+		s.locks[key] = ref
+	}
+	ref.refs++
+	s.mu.Unlock()
+
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(s.locks, key)
+		}
+		s.mu.Unlock()
+	}()
+	return fn()
+}
 
 type PullRequestSummary struct {
 	Number         int64
@@ -447,7 +487,8 @@ type TargetedDiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	PRNumber  int64
-	Snapshot  *githubinfra.DiscoverySnapshot
+
+	Snapshot *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -700,7 +741,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return pr
 	}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
+
 		return r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, existing, &result)
+
 	}
 	seenEnqueue := func(pr PullRequestSummary) error {
 		key := fmt.Sprintf("%s#%d", input.Repo, pr.Number)
@@ -759,7 +802,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
+
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
 		return DiscoveryResult{}, fmt.Errorf("reviewer repositories are not configured")
 	}
@@ -774,10 +819,12 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	if !policy.AutoDiscovery {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+
 	currentLogin := ""
 	if policy.RequireReviewRequest || !policy.EnableSelfReview {
 		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
@@ -809,6 +856,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		return result, nil
 	}
 	if err := r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, nil, &result); err != nil {
+
 		return DiscoveryResult{}, err
 	}
 	return result, nil
@@ -919,6 +967,7 @@ func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo stri
 		}
 	}
 	return matched, nil
+
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {

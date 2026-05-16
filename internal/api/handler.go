@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,12 +30,14 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 const (
 	requestIDHeaderName        = "x-request-id"
 	apiBasePath                = "/api/v1"
+	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
@@ -121,6 +124,7 @@ type sweeperReplayResponse struct {
 type Context struct {
 	Config               config.Config
 	Runtime              RuntimeState
+	WebhookForwarder     webhookforward.Forwarder
 	ProjectsService      projectService
 	Now                  func() time.Time
 	RecoverySummary      func() any
@@ -130,9 +134,10 @@ type Context struct {
 }
 
 type Handler struct {
-	context         Context
-	now             func() time.Time
-	recoverySummary func() any
+	context          Context
+	now              func() time.Time
+	recoverySummary  func() any
+	webhookForwarder webhookforward.Forwarder
 }
 
 func NewHandler(context Context) *Handler {
@@ -155,21 +160,31 @@ func NewHandler(context Context) *Handler {
 			}
 		}
 	}
+	forwarder := context.WebhookForwarder
+	if forwarder == nil {
+		if runtimeWithForwarder, ok := any(context.Runtime).(interface {
+			WebhookForwarder() looperdruntime.WebhookForwarder
+		}); ok {
+			forwarder = runtimeWithForwarder.WebhookForwarder()
+		}
+	}
 
 	return &Handler{
-		context:         context,
-		now:             now,
-		recoverySummary: recoverySummary,
+		context:          context,
+		now:              now,
+		recoverySummary:  recoverySummary,
+		webhookForwarder: forwarder,
 	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
 	if requestID == "" {
 		requestID = generateRequestID()
 	}
 
-	if err := authorizeRequest(r, h.context.Config); err != nil {
+	if err := authorizeRequest(r, path, h.context.Config); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
@@ -178,9 +193,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := normalizePath(r.URL.Path)
-
 	switch path {
+	case webhookForwardPath:
+		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
+			return
+		}
+		if !isLoopbackRemoteAddr(r.RemoteAddr) {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "webhook forwarding requires a loopback caller"})
+			return
+		}
+		if h.context.TriggerSchedulerTick != nil {
+			h.context.TriggerSchedulerTick()
+		}
+		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, map[string]any{"accepted": true}))
+		return
 	case apiBasePath + "/healthz":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
 			return
@@ -450,6 +476,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.ForwardResult, error) {
+	if r.Method != http.MethodPost {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Unsupported method for /webhook/forward"}
+	}
+	if !isLoopbackRequest(r) {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
+	}
+	if hasForwardingProxyHeaders(r.Header) {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding does not accept proxied loopback requests"}
+	}
+	if h.webhookForwarder == nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	if err != nil {
+		status := http.StatusBadRequest
+		code := pkgapi.ErrorCodeValidationFailed
+		message := err.Error()
+		lower := strings.ToLower(message)
+		if strings.Contains(lower, "not configured") {
+			status = http.StatusInternalServerError
+			code = pkgapi.ErrorCodeInternalError
+		} else if strings.Contains(lower, "queue is full") {
+			status = http.StatusServiceUnavailable
+		}
+		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
+	}
+	return result, nil
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func hasForwardingProxyHeaders(headers http.Header) bool {
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
+		if strings.TrimSpace(headers.Get(name)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 type apiError struct {
 	code    pkgapi.ErrorCode
 	status  int
@@ -508,7 +586,17 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	return false
 }
 
-func authorizeRequest(r *http.Request, cfg config.Config) error {
+func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
+	if path == webhookForwardPath && hasForwardingProxyHeaders(r.Header) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Webhook forwarding does not accept proxied loopback requests",
+		}
+	}
+	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
+		return nil
+	}
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -530,6 +618,23 @@ func authorizeRequest(r *http.Request, cfg config.Config) error {
 	}
 
 	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return false
+	}
+	host := remoteAddr
+	if parsedHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func normalizePath(path string) string {
@@ -612,6 +717,7 @@ type statusResponse struct {
 	Service       statusService       `json:"service"`
 	Storage       statusStorage       `json:"storage"`
 	Scheduler     statusScheduler     `json:"scheduler"`
+	Webhook       statusWebhook       `json:"webhook"`
 	Loops         statusLoops         `json:"loops"`
 	Safety        statusSafety        `json:"safety"`
 	Notifications statusNotifications `json:"notifications"`
@@ -678,6 +784,15 @@ type statusScheduler struct {
 	ActiveRuns     int  `json:"activeRuns"`
 }
 
+type statusWebhook struct {
+	Enabled         bool                                    `json:"enabled"`
+	Healthy         bool                                    `json:"healthy"`
+	Degraded        bool                                    `json:"degraded"`
+	Endpoint        *string                                 `json:"endpoint,omitempty"`
+	DegradedReasons []string                                `json:"degradedReasons,omitempty"`
+	Forwarders      []looperdruntime.WebhookForwarderStatus `json:"forwarders"`
+}
+
 type statusLoopType struct {
 	Queued     int `json:"queued"`
 	Running    int `json:"running"`
@@ -719,6 +834,7 @@ type configResponse struct {
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
+	Webhook       config.WebhookConfig      `json:"webhook"`
 	Agent         config.AgentConfig        `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -761,6 +877,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Storage:       cfg.Storage,
 		Scheduler:     cfg.Scheduler,
+		Webhook:       cfg.Webhook,
 		Agent:         cfg.Agent,
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -810,6 +927,20 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	currentTarget := currentLooperdTarget()
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
+	webhookStatus := statusWebhook{Forwarders: []looperdruntime.WebhookForwarderStatus{}}
+	if runtimeWithWebhooks, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookRuntimeStatus
+	}); ok {
+		runtimeStatus := runtimeWithWebhooks.WebhookStatus()
+		webhookStatus = statusWebhook{
+			Enabled:         runtimeStatus.Enabled,
+			Healthy:         runtimeStatus.Healthy,
+			Degraded:        runtimeStatus.Degraded,
+			Endpoint:        runtimeStatus.Endpoint,
+			DegradedReasons: append([]string{}, runtimeStatus.DegradedReasons...),
+			Forwarders:      append([]looperdruntime.WebhookForwarderStatus{}, runtimeStatus.Forwarders...),
+		}
+	}
 
 	return statusResponse{
 		Service: statusService{
@@ -844,7 +975,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
 		},
-		Loops: loopCounts,
+		Webhook: webhookStatus,
+		Loops:   loopCounts,
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1357,6 +1489,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	_ = h.refreshWebhookForwarders()
 
 	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
 }
@@ -4787,6 +4920,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	_ = h.refreshWebhookForwarders()
 
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
@@ -4796,6 +4930,14 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
+}
+
+func (h *Handler) refreshWebhookForwarders() error {
+	refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error })
+	if !ok {
+		return nil
+	}
+	return refresher.RefreshWebhookForwarders()
 }
 
 func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {

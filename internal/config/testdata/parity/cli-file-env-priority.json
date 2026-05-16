@@ -96,6 +96,10 @@
         "retryBaseDelayMs": 5000,
         "slowLaneWarnThresholdMs": 5000
       },
+      "webhook": {
+        "enabled": false,
+        "fallbackPollIntervalSeconds": 300
+      },
       "agent": {
         "vendor": "opencode",
         "params": {
@@ -197,6 +201,11 @@
               "reTriageOnAuthorReply": true
             }
           },
+          "dependencies": {
+            "enabled": false,
+            "apiTimeoutSeconds": 10,
+            "apiRetryAttempts": 3
+          },
           "dispatch": {
             "mode": "human-gated",
             "humanGate": {
@@ -211,9 +220,6 @@
               "holdLabel": "looper:hold"
             },
             "assignTo": ""
-          },
-          "dependencies": {
-            "enabled": false
           }
         },
         "planner": {

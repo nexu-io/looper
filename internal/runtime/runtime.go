@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -74,6 +75,12 @@ type Services struct {
 	ActiveExecutions *ActiveExecutionRegistry
 }
 
+type WebhookForwarder interface {
+	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
+	Stats() webhookforward.Stats
+	Close()
+}
+
 type Runtime struct {
 	config config.Config
 	logger bootstrap.Logger
@@ -109,6 +116,10 @@ type Runtime struct {
 	recoveryDone       chan struct{}
 	activeExecutions   *ActiveExecutionRegistry
 	githubGateway      *githubinfra.Gateway
+	webhookForwarders  *webhookForwarderManager
+	webhookContext     context.Context
+	webhookCancel      context.CancelFunc
+	webhookForwarder   WebhookForwarder
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
 	startupReadyErr    error
@@ -203,10 +214,22 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		r.stopDeferredReviewerRecovery()
+		r.mu.RLock()
+		webhookCancel := r.webhookCancel
+		webhookForwarders := r.webhookForwarders
+		r.mu.RUnlock()
+		if webhookCancel != nil {
+			webhookCancel()
+		}
+		if webhookForwarders != nil {
+			webhookForwarders.Stop()
+		}
 		r.stopSchedulerLoop()
 
 		r.mu.Lock()
 		r.stopped = true
+		forwarder := r.webhookForwarder
+		r.webhookForwarder = nil
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
@@ -222,6 +245,9 @@ func (r *Runtime) Stop(reason string) {
 		r.services = Services{}
 		r.mu.Unlock()
 
+		if forwarder != nil {
+			forwarder.Close()
+		}
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
@@ -265,6 +291,12 @@ func (r *Runtime) StartedAt() (time.Time, bool) {
 	return *r.startedAt, true
 }
 
+func (r *Runtime) WebhookForwarder() WebhookForwarder {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.webhookForwarder
+}
+
 func (r *Runtime) Config() config.Config {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -277,6 +309,37 @@ func (r *Runtime) RecoverySummary() RecoverySummary {
 	defer r.mu.RUnlock()
 
 	return r.recovery
+}
+
+func (r *Runtime) WebhookStatus() WebhookRuntimeStatus {
+	r.mu.RLock()
+	manager := r.webhookForwarders
+	r.mu.RUnlock()
+	if manager == nil {
+		return WebhookRuntimeStatus{}
+	}
+	return manager.Status()
+}
+
+func (r *Runtime) RefreshWebhookForwarders() error {
+	r.mu.RLock()
+	manager := r.webhookForwarders
+	repositories := r.services.Repositories
+	webhookCtx := r.webhookContext
+	stopped := r.stopped
+	r.mu.RUnlock()
+	if stopped || manager == nil || repositories == nil || repositories.Projects == nil || webhookCtx == nil {
+		return nil
+	}
+	projectsList, err := repositories.Projects.List(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := webhookCtx.Err(); err != nil {
+		return nil
+	}
+	manager.Sync(webhookCtx, projectsList)
+	return nil
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -303,6 +366,13 @@ func (r *Runtime) start(ctx context.Context) error {
 	started := false
 	defer func() {
 		if !started {
+			r.mu.Lock()
+			forwarder := r.webhookForwarder
+			r.webhookForwarder = nil
+			r.mu.Unlock()
+			if forwarder != nil {
+				forwarder.Close()
+			}
 			_ = coordinator.Close()
 		}
 	}()
@@ -358,10 +428,22 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
+	webhookForwarderCtx, webhookCancel := context.WithCancel(context.Background())
+	defer func() {
+		if !started {
+			webhookCancel()
+		}
+	}()
+	webhookForwarders := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: r.config, Logger: r.logger, Now: r.now, StopTimeout: r.shutdownTimeout})
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
 	}
+	projectsList, err := repositories.Projects.List(context.Background())
+	if err != nil {
+		return err
+	}
+	webhookForwarders.Sync(webhookForwarderCtx, projectsList)
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
@@ -385,9 +467,13 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.TriggerSchedulerClaim, r.now)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
+		r.webhookForwarder = handlers.webhook
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
+	r.webhookForwarders = webhookForwarders
+	r.webhookContext = webhookForwarderCtx
+	r.webhookCancel = webhookCancel
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
@@ -423,6 +509,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		if repositories == nil {
 			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
+			return
+		}
+		if err := r.validateCoordinatorDependencyGates(ctx, repositories, githubGateway); err != nil {
+			r.startupReadyErr = err
 			return
 		}
 		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
@@ -463,8 +553,100 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 	return r.startupReadyErr
 }
 
+func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway) error {
+	if repositories == nil || repositories.Projects == nil || githubGateway == nil {
+		return nil
+	}
+	projectsList, err := repositories.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
+		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
+			continue
+		}
+		repo := strings.TrimSpace(runtimeProjectRepo(project.MetadataJSON))
+		if repo == "" {
+			return fmt.Errorf("coordinator dependency gate enabled but repository metadata unavailable for project %s", project.ID)
+		}
+		issueNumber, err := r.firstDependencyProbeIssue(ctx, githubGateway, repo, project.RepoPath)
+		if err != nil {
+			return err
+		}
+		if issueNumber == 0 {
+			continue
+		}
+		if err := r.probeDependencyAPI(ctx, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) firstDependencyProbeIssue(ctx context.Context, githubGateway *githubinfra.Gateway, repo, cwd string) (int64, error) {
+	return githubGateway.FindAnyIssueNumber(ctx, repo, cwd)
+}
+
+func (r *Runtime) probeDependencyAPI(ctx context.Context, githubGateway *githubinfra.Gateway, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) error {
+	var lastErr error
+	for attempt := 0; attempt < runtimeMaxDependencyAttempts(depsCfg.APIRetryAttempts); attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, runtimeDependencyTimeout(depsCfg.APITimeoutSeconds))
+		_, err := githubGateway.ListIssueBlockedBy(callCtx, githubinfra.ListIssueBlockedByInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if githubinfra.IsNotFoundError(err) {
+			return fmt.Errorf("coordinator dependency gate enabled but dependencies API unavailable on %s; disable roles.coordinator.dependencies.enabled or upgrade GHES", repo)
+		}
+		if !runtimeShouldRetryDependencyError(err) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func runtimeProjectRepo(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	value, _ := metadata["repo"].(string)
+	return strings.TrimSpace(value)
+}
+
+func runtimeDependencyTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func runtimeMaxDependencyAttempts(attempts int) int {
+	if attempts <= 0 {
+		return 1
+	}
+	return attempts
+}
+
+func runtimeShouldRetryDependencyError(err error) bool {
+	if githubinfra.IsTransientError(err) {
+		return true
+	}
+	message := strings.ToLower(githubinfra.ErrorMessage(err))
+	return strings.Contains(message, "timed out") || strings.Contains(message, "context deadline exceeded")
+}
+
 func (r *Runtime) startSchedulerLoop() {
-	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
+	pollInterval := r.schedulerPollInterval()
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
@@ -517,6 +699,14 @@ func (r *Runtime) startSchedulerLoop() {
 			}
 		}
 	}()
+}
+
+func (r *Runtime) schedulerPollInterval() time.Duration {
+	pollIntervalSeconds := r.config.Scheduler.PollIntervalSeconds
+	if r.config.Webhook.Enabled {
+		pollIntervalSeconds = r.config.Webhook.FallbackPollIntervalSeconds
+	}
+	return time.Duration(pollIntervalSeconds) * time.Second
 }
 
 func (r *Runtime) stopSchedulerLoop() {

@@ -43,11 +43,19 @@ type IssueSummary struct {
 	Labels []string
 }
 
+type loadedCoordinatorIssue struct {
+	summary       githubinfra.IssueSummary
+	issue         triage.Issue
+	dispatchIssue dispatch.Issue
+}
+
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
+	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
+	GetIssueState(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueState, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
@@ -170,7 +178,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		loaded = append(loaded, issue)
 	}
 
-	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, roleCfg.Dependencies.Enabled)
+	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -209,6 +217,117 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd string, depsCfg config.CoordinatorDependenciesConfig, dispatchCfg dispatch.Config, loaded []loadedCoordinatorIssue, now time.Time) (*depgraph.DependencyGraph, error) {
+	if !depsCfg.Enabled {
+		return nil, nil
+	}
+	candidates := dispatchDependencyCandidates(loaded, dispatchCfg, now)
+	if len(candidates) == 0 {
+		graph := depgraph.Build(nil, depgraph.Snapshot{})
+		return &graph, nil
+	}
+	tracked := make([]depgraph.IssueRef, 0, len(candidates))
+	snapshot := depgraph.Snapshot{
+		BlockedBy:   make(map[depgraph.IssueRef][]depgraph.IssueRef, len(candidates)),
+		Issues:      map[depgraph.IssueRef]depgraph.IssueState{},
+		Unreachable: []depgraph.IssueRef{},
+	}
+	for _, issueNumber := range candidates {
+		issueRef := depgraph.IssueRef{Repo: repo, Number: issueNumber}
+		tracked = append(tracked, issueRef)
+		blockedBy, err := r.listIssueBlockedByWithRetry(ctx, repo, cwd, issueNumber, depsCfg)
+		if err != nil {
+			return nil, err
+		}
+		for _, blocker := range blockedBy {
+			blockerRef, blockerState, reachable := r.loadBlockerState(ctx, cwd, blocker, depsCfg)
+			snapshot.BlockedBy[issueRef] = append(snapshot.BlockedBy[issueRef], blockerRef)
+			if reachable {
+				snapshot.Issues[blockerRef] = blockerState
+				continue
+			}
+			snapshot.Unreachable = append(snapshot.Unreachable, blockerRef)
+		}
+	}
+	graph := depgraph.Build(tracked, snapshot)
+	return &graph, nil
+}
+
+func dispatchDependencyCandidates(loaded []loadedCoordinatorIssue, cfg dispatch.Config, now time.Time) []int64 {
+	set := map[int64]struct{}{}
+	for _, loadedIssue := range loaded {
+		if !dispatch.NeedsDependencyGate(loadedIssue.dispatchIssue, cfg, now) {
+			continue
+		}
+		set[loadedIssue.issue.Number] = struct{}{}
+	}
+	out := make([]int64, 0, len(set))
+	for issueNumber := range set {
+		out = append(out, issueNumber)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+func (r *Runner) listIssueBlockedByWithRetry(ctx context.Context, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) ([]githubinfra.IssueDependency, error) {
+	var lastErr error
+	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
+		blockedBy, err := r.github.ListIssueBlockedBy(callCtx, githubinfra.ListIssueBlockedByInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+		cancel()
+		if err == nil {
+			return blockedBy, nil
+		}
+		lastErr = err
+		if !shouldRetryDependencyError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (r *Runner) loadBlockerState(ctx context.Context, cwd string, blocker githubinfra.IssueDependency, depsCfg config.CoordinatorDependenciesConfig) (depgraph.IssueRef, depgraph.IssueState, bool) {
+	blockerRef := depgraph.IssueRef{Repo: blocker.Repo, Number: blocker.Number}
+	var lastErr error
+	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
+		state, err := r.github.GetIssueState(callCtx, githubinfra.ViewIssueInput{Repo: blocker.Repo, IssueNumber: blocker.Number, CWD: cwd})
+		cancel()
+		if err == nil {
+			return blockerRef, depgraph.IssueState{State: strings.ToLower(strings.TrimSpace(state.State)), StateReason: strings.ToLower(strings.TrimSpace(state.StateReason))}, true
+		}
+		lastErr = err
+		if !shouldRetryDependencyError(err) {
+			break
+		}
+	}
+	_ = lastErr
+	return blockerRef, depgraph.IssueState{}, false
+}
+
+func dependencyTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func maxDependencyAttempts(attempts int) int {
+	if attempts <= 0 {
+		return 1
+	}
+	return attempts
+}
+
+func shouldRetryDependencyError(err error) bool {
+	if githubinfra.IsTransientError(err) {
+		return true
+	}
+	message := strings.ToLower(githubinfra.ErrorMessage(err))
+	return strings.Contains(message, "timed out") || strings.Contains(message, "context deadline exceeded")
 }
 
 func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
@@ -321,9 +440,9 @@ func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd strin
 
 }
 
-func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, enabled bool) (dependencyState, error) {
+func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, depsCfg config.CoordinatorDependenciesConfig) (dependencyState, error) {
 	state := dependencyState{
-		enabled:              enabled,
+		enabled:              depsCfg.Enabled,
 		readySet:             map[depgraph.IssueRef]struct{}{},
 		tracked:              map[depgraph.IssueRef]loadedIssue{},
 		cycleCommentByIssue:  map[int64]string{},
@@ -331,7 +450,7 @@ func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loa
 		parentOrderByIssue:   map[int64]issueOrder{},
 		trackedIssueByNumber: map[int64]depgraph.IssueRef{},
 	}
-	if !enabled {
+	if !depsCfg.Enabled {
 		return state, nil
 	}
 
@@ -353,7 +472,15 @@ func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loa
 		for _, blocker := range blockers {
 			blockerRef := dependencyIssueRef(repo, blocker)
 			snapshot.BlockedBy[ref] = append(snapshot.BlockedBy[ref], blockerRef)
-			snapshot.Issues[blockerRef] = depgraph.IssueState{State: blocker.State, StateReason: blocker.StateReason}
+			stateInfo := depgraph.IssueState{State: strings.ToLower(strings.TrimSpace(blocker.State)), StateReason: strings.ToLower(strings.TrimSpace(blocker.StateReason))}
+			if stateInfo.State == "" {
+				resolvedRef, resolvedState, reachable := r.loadBlockerState(ctx, cwd, githubinfra.IssueDependency{Number: blocker.Number, Repo: blockerRef.Repo}, depsCfg)
+				if reachable {
+					blockerRef = resolvedRef
+					stateInfo = resolvedState
+				}
+			}
+			snapshot.Issues[blockerRef] = stateInfo
 		}
 	}
 	if len(trackedRefs) == 0 {
@@ -445,7 +572,7 @@ func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded [
 		if err != nil {
 			return err
 		}
-		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		action = applyHumanDependencyGate(action, item.issue.Number, deps)
 		if r.hasDispatchWork(action) {
 			if err := r.applyDispatchAction(ctx, repo, cwd, item.issue, action); err != nil {
@@ -466,7 +593,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string
 		if err != nil {
 			return err
 		}
-		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		if !r.hasDispatchWork(action) || strings.TrimSpace(action.FailureCommentBody) != "" {
 			continue
 		}
