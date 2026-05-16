@@ -1418,9 +1418,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	if err := h.refreshWebhookForwarders(); err != nil {
-		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
+	_ = h.refreshWebhookForwarders()
 
 	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
 }

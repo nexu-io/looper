@@ -668,9 +668,11 @@ func startWebhookForwarderProcess(ctx context.Context, command webhookForwarderC
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		closeWebhookForwarderPipes(stdout, nil)
 		return webhookForwarderStartResult{}, err
 	}
 	if err := cmd.Start(); err != nil {
+		closeWebhookForwarderPipes(stdout, stderr)
 		return webhookForwarderStartResult{}, err
 	}
 	return webhookForwarderStartResult{
@@ -678,4 +680,12 @@ func startWebhookForwarderProcess(ctx context.Context, command webhookForwarderC
 		stdout:  stdout,
 		stderr:  stderr,
 	}, nil
+}
+
+func closeWebhookForwarderPipes(closers ...io.Closer) {
+	for _, closer := range closers {
+		if closer != nil {
+			_ = closer.Close()
+		}
+	}
 }

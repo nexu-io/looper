@@ -280,11 +280,33 @@ func TestRuntimeStartDegradesWebhookWithoutFailingStartup(t *testing.T) {
 	}
 }
 
+func TestCloseWebhookForwarderPipesClosesAllNonNilClosers(t *testing.T) {
+	t.Parallel()
+	stdout := &testCloser{}
+	stderr := &testCloser{}
+
+	closeWebhookForwarderPipes(stdout, nil, stderr)
+
+	if stdout.closeCalls != 1 {
+		t.Fatalf("stdout close calls = %d, want 1", stdout.closeCalls)
+	}
+	if stderr.closeCalls != 1 {
+		t.Fatalf("stderr close calls = %d, want 1", stderr.closeCalls)
+	}
+}
+
 type testStartedForwarder struct {
 	command webhookForwarderCommand
 	process *testWebhookForwarderProcess
 	stdoutW *io.PipeWriter
 	stderrW *io.PipeWriter
+}
+
+type testCloser struct{ closeCalls int }
+
+func (c *testCloser) Close() error {
+	c.closeCalls++
+	return nil
 }
 
 func newTestStartedForwarder(command webhookForwarderCommand) *testStartedForwarder {

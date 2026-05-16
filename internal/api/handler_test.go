@@ -932,6 +932,35 @@ func TestHandlerProjectsRemoveRouteReturnsNotFound(t *testing.T) {
 	assertEqual(t, errorMap["message"], "Project not found: missing")
 }
 
+func TestHandlerProjectsRemoveRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	removed := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper"}
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			removeProject: func(context.Context, string) (storage.ProjectRecord, error) {
+				return removed, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_1")
+	assertEqual(t, data["name"], "Looper")
+}
+
 func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
 
@@ -5221,7 +5250,8 @@ func (noopLogger) Error(string, map[string]any) {}
 var _ bootstrap.Logger = noopLogger{}
 
 type fixedRuntimeState struct {
-	services looperdruntime.Services
+	services                 looperdruntime.Services
+	refreshWebhookForwarders func() error
 }
 
 type errorInjectingQuerier struct {
@@ -5252,6 +5282,13 @@ func (s fixedRuntimeState) Services() looperdruntime.Services {
 
 func (s fixedRuntimeState) StartedAt() (time.Time, bool) {
 	return time.Time{}, false
+}
+
+func (s fixedRuntimeState) RefreshWebhookForwarders() error {
+	if s.refreshWebhookForwarders != nil {
+		return s.refreshWebhookForwarders()
+	}
+	return nil
 }
 
 func seedConflictProject(t *testing.T, service *projects.Service) {

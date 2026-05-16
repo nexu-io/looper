@@ -1503,6 +1503,28 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 	}
 }
 
+func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.PollIntervalSeconds = 30
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.FallbackPollIntervalSeconds = 90
+
+	rt := &Runtime{config: cfg}
+	if got := rt.schedulerPollInterval(); got != 90*time.Second {
+		t.Fatalf("schedulerPollInterval() = %s, want 90s", got)
+	}
+
+	rt.config.Webhook.Enabled = false
+	if got := rt.schedulerPollInterval(); got != 30*time.Second {
+		t.Fatalf("schedulerPollInterval() = %s, want 30s when webhook disabled", got)
+	}
+}
+
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()
 

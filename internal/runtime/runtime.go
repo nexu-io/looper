@@ -523,7 +523,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 }
 
 func (r *Runtime) startSchedulerLoop() {
-	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
+	pollInterval := r.schedulerPollInterval()
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
@@ -576,6 +576,14 @@ func (r *Runtime) startSchedulerLoop() {
 			}
 		}
 	}()
+}
+
+func (r *Runtime) schedulerPollInterval() time.Duration {
+	pollIntervalSeconds := r.config.Scheduler.PollIntervalSeconds
+	if r.config.Webhook.Enabled {
+		pollIntervalSeconds = r.config.Webhook.FallbackPollIntervalSeconds
+	}
+	return time.Duration(pollIntervalSeconds) * time.Second
 }
 
 func (r *Runtime) stopSchedulerLoop() {
