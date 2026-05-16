@@ -145,6 +145,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 		w.addDegradedReason(fmt.Sprintf("list configured projects: %v", err))
 		return
 	}
+	w.clearTransientReconcileDegradedReasons()
 	repoSet := map[string]struct{}{}
 	for _, project := range projects {
 		repo := repoFromProjectMetadata(project.MetadataJSON)
@@ -444,6 +445,12 @@ func (w *webhookRuntime) clearForwarderDegradedReasons(repo string) {
 	prefix := fmt.Sprintf("forwarder for %s ", strings.TrimSpace(repo))
 	w.clearDegradedReasons(func(reason string) bool {
 		return strings.HasPrefix(reason, prefix)
+	})
+}
+
+func (w *webhookRuntime) clearTransientReconcileDegradedReasons() {
+	w.clearDegradedReasons(func(reason string) bool {
+		return reason == "project repositories are unavailable" || strings.HasPrefix(reason, "list configured projects: ")
 	})
 }
 

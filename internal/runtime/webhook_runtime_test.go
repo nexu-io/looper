@@ -258,6 +258,87 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	}
 }
 
+func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	startedCh := make(chan struct{})
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() {
+		close(startedCh)
+	}
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+
+	failingDBPath := t.TempDir() + "/failing-runtime.sqlite"
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), failingDBPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	failingRepositories := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("Coordinator.Close() error = %v", err)
+	}
+
+	healthyRepositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"nexu-io/looper"}`
+	if err := healthyRepositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	rt := &webhookRuntime{
+		ghPath: "/usr/bin/gh",
+		status: WebhookStatus{
+			Enabled:     true,
+			EndpointURL: "http://127.0.0.1:7777/webhook/forward",
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.Reconcile(failingRepositories)
+	status := rt.Status()
+	if !status.Degraded {
+		t.Fatal("Status().Degraded = false, want true after temporary project list failure")
+	}
+	if len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "list configured projects") {
+		t.Fatalf("Status().DegradedReasons = %v, want transient list failure reason", status.DegradedReasons)
+	}
+
+	rt.Reconcile(healthyRepositories)
+	select {
+	case <-startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not launch after reconcile recovery")
+	}
+	status = rt.Status()
+	if status.Degraded {
+		t.Fatalf("Status().Degraded = true, want false after reconcile recovery; reasons=%v", status.DegradedReasons)
+	}
+	if len(status.DegradedReasons) != 0 {
+		t.Fatalf("Status().DegradedReasons = %v, want empty after reconcile recovery", status.DegradedReasons)
+	}
+	if len(status.Forwarders) != 1 || status.Forwarders[0].Repo != "nexu-io/looper" {
+		t.Fatalf("Status().Forwarders = %v, want launched forwarder for nexu-io/looper", status.Forwarders)
+	}
+}
+
 func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 	t.Parallel()
 
