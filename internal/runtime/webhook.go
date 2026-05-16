@@ -113,7 +113,7 @@ func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 	if w == nil {
 		return
 	}
-	ackAt := formatJavaScriptISOString(w.now().UTC())
+	ackAt := formatJavaScriptISOString(w.currentTime().UTC())
 	message := strings.TrimSpace(eventType)
 	if strings.TrimSpace(deliveryID) != "" {
 		message = fmt.Sprintf("%s (%s)", message, strings.TrimSpace(deliveryID))
@@ -296,15 +296,23 @@ func (w *webhookRuntime) runForwarder(index int) {
 			}
 		}()
 
-		startedAt := formatJavaScriptISOString(w.now().UTC())
+		startedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		pid := cmd.Process.Pid
 		w.mu.Lock()
 		w.status.Forwarders[index].Running = true
 		w.status.Forwarders[index].PID = &pid
 		w.status.Forwarders[index].LastStartedAt = &startedAt
 		w.status.Forwarders[index].LastError = ""
+		filtered := make([]string, 0, len(w.status.DegradedReasons))
+		prefix := fmt.Sprintf("forwarder for %s ", strings.TrimSpace(state.Repo))
+		for _, reason := range w.status.DegradedReasons {
+			if !strings.HasPrefix(reason, prefix) {
+				filtered = append(filtered, reason)
+			}
+		}
+		w.status.DegradedReasons = filtered
+		w.status.Degraded = len(w.status.DegradedReasons) > 0
 		w.mu.Unlock()
-		w.clearForwarderDegradedReasons(state.Repo)
 
 		var pipes sync.WaitGroup
 		pipes.Add(2)
@@ -313,7 +321,7 @@ func (w *webhookRuntime) runForwarder(index int) {
 		err = cmd.Wait()
 		close(stopKillDone)
 		pipes.Wait()
-		exitedAt := formatJavaScriptISOString(w.now().UTC())
+		exitedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		message := ""
 		if err != nil {
 			message = err.Error()
@@ -408,6 +416,13 @@ func (w *webhookRuntime) sleep(duration time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func (w *webhookRuntime) currentTime() time.Time {
+	if w == nil || w.now == nil {
+		return time.Now()
+	}
+	return w.now()
 }
 
 func webhookBaseURL(cfg config.Config) string {

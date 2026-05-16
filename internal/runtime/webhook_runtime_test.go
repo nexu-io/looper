@@ -229,7 +229,9 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 			}},
 		},
 		stopCh: make(chan struct{}),
+		now:    time.Now,
 	}
+	t.Cleanup(rt.Stop)
 
 	rt.Reconcile(repositories)
 	status := rt.Status()
