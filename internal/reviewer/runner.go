@@ -816,7 +816,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
+		requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
+		if requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -1438,7 +1439,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
 	}
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
+	if requireReviewRequest {
 		if currentLogin == "" {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -2200,7 +2202,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Snapshot.HeadSHA)
+	reviewRequestBypassReason := ""
+	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
+		reviewRequestBypassReason = "follow_up_new_head"
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -2273,7 +2280,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		if reason, ok := rediscoverySignalFromAgentResult(result, !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest); ok {
+		if reason, ok := rediscoverySignalFromAgentResult(result, requireReviewRequest); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
@@ -2337,7 +2344,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
-		if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+		if requireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2409,7 +2417,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest && !markerResult.Found {
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+	if requireReviewRequest && !markerResult.Found {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -3315,6 +3324,32 @@ func isManualReviewerLoop(loop storage.LoopRecord) bool {
 	return manual
 }
 
+func requireReviewRequestForLoop(loop storage.LoopRecord, requireReviewRequest bool, headSHA string) bool {
+	if isManualReviewerLoop(loop) {
+		return false
+	}
+	if !requireReviewRequest {
+		return false
+	}
+	return !reviewerFollowUpHasNewHead(loop, headSHA)
+}
+
+func reviewerFollowUpHasNewHead(loop storage.LoopRecord, headSHA string) bool {
+	if strings.TrimSpace(headSHA) == "" {
+		return false
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
+		return false
+	}
+	loopMeta := reviewerLoopMetadata(meta)
+	if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
+		return false
+	}
+	lastPublishedHeadSHA, ok := stringFromAny(meta["lastPublishedHeadSha"])
+	return ok && lastPublishedHeadSHA != "" && lastPublishedHeadSHA != headSHA
+}
+
 func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {
 	if checkpoint.PendingReview != nil && (startStep == stepReview || startStep == stepPublish) {
 		return false
@@ -3774,7 +3809,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
 	}
-	if isManualReviewerLoop(input.Loop) || !r.discoveryPolicyForProject(input.Project.ID).RequireReviewRequest {
+	if !requireReviewRequestForLoop(input.Loop, r.discoveryPolicyForProject(input.Project.ID).RequireReviewRequest, checkpoint.Snapshot.HeadSHA) {
 		return "", false
 	}
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -4495,7 +4530,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
 	return prompt
 }
 
@@ -4567,7 +4602,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -4627,6 +4662,8 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
+	} else if !requireReviewRequest && reviewRequestBypassReason == "follow_up_new_head" {
+		reviewRequestInstruction = "This is an enabled reviewer follow-up loop for a PR head that differs from the last published review head, so a fresh current-user review request is not required before posting for this follow-up pass."
 	} else if !requireReviewRequest {
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
