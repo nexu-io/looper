@@ -700,6 +700,11 @@ func formatScalar(value any) string {
 			return "-"
 		}
 		return fmt.Sprintf("%d", *typed)
+	case *int:
+		if typed == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%d", *typed)
 	case bool:
 		if typed {
 			return "yes"

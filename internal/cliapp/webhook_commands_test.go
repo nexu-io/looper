@@ -106,6 +106,7 @@ func TestWebhookStatusShowsConfigIntentWithoutDaemonRuntime(t *testing.T) {
 func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
 	t.Parallel()
 
+	pid := 4242
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/webhook/status" {
 			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/webhook/status")
@@ -120,7 +121,7 @@ func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
 			"queue":                       map[string]any{"pending": 1, "capacity": 8, "activeWorkers": 0},
 			"counters":                    map[string]any{"deliveriesReceived": 2, "coalesced": 0, "dropped": 0, "queued": 1, "processed": 0, "failed": 0},
 			"recentOutcomes":              []map[string]any{{"at": "2026-04-20T10:00:00.000Z", "outcome": "degraded", "message": "gh missing"}},
-			"forwarders":                  []map[string]any{{"repo": "acme/looper", "running": false, "restartCount": 1, "lastError": "gh missing", "stdoutTail": []string{"line1"}, "stderrTail": []string{"line2"}}},
+			"forwarders":                  []map[string]any{{"repo": "acme/looper", "running": true, "pid": pid, "restartCount": 1, "lastError": "gh missing", "stdoutTail": []string{"line1"}, "stderrTail": []string{"line2"}}},
 		}))
 	}))
 	defer server.Close()
@@ -136,9 +137,12 @@ func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run(webhook status --verbose) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	for _, needle := range []string{"Webhook runtime", "Forwarder acme/looper", "stdoutTail", "line1", "line2"} {
+	for _, needle := range []string{"Webhook runtime", "Forwarder acme/looper", "stdoutTail", "line1", "line2", "4242"} {
 		if !strings.Contains(stdout, needle) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout, needle)
 		}
+	}
+	if strings.Contains(stdout, "0x") {
+		t.Fatalf("stdout = %q, want pid value instead of pointer address", stdout)
 	}
 }
