@@ -352,10 +352,12 @@ func TestHandlerUnauthorized(t *testing.T) {
 	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
-func TestHandlerWebhookForwardAllowsLoopbackWithoutBearerToken(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing.T) {
 	fixture := newTestFixture(t)
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+	fixture.config.Webhook.Enabled = true
+	triggered := 0
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
 	req.RemoteAddr = "127.0.0.1:1234"
@@ -365,16 +367,16 @@ func TestHandlerWebhookForwardAllowsLoopbackWithoutBearerToken(t *testing.T) {
 
 	h.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", recorder.Code)
 	}
-	if forwarder.calls != 1 {
-		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	data := body["data"].(map[string]any)
-	assertEqual(t, data["status"], "accepted")
-	assertEqual(t, data["workItems"], float64(1))
+	assertEqual(t, data["accepted"], true)
+	assertEqual(t, triggered, 1)
 }
 
 func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
@@ -382,6 +384,7 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	token := "secret-token"
 	fixture.config.Server.AuthMode = config.AuthModeLocalToken
 	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
 

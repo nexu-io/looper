@@ -183,19 +183,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if requestID == "" {
 		requestID = generateRequestID()
 	}
-	if path == "/webhook/forward" {
-		payload, err := h.buildWebhookForwardResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
 
 	if err := authorizeRequest(r, path, h.context.Config); err != nil {
 		var typed apiError
