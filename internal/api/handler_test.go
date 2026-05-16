@@ -491,6 +491,37 @@ func TestHandlerWebhookForwardRecordsAcceptedDelivery(t *testing.T) {
 	assertEqual(t, recorded.deliveryID, "delivery-4")
 }
 
+func TestHandlerWebhookForwardSkipsNonEnqueueingDeliveryRecord(t *testing.T) {
+	fixture := newTestFixture(t)
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "ignored", WorkItems: 0}}
+	recordedCalls := 0
+	runtime := webhookForwardRuntime{
+		Runtime: fixture.runtime,
+		status: func() looperdruntime.WebhookStatus {
+			return looperdruntime.WebhookStatus{Enabled: true}
+		},
+		record: func(string, string) {
+			recordedCalls++
+		},
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-5")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if recordedCalls != 0 {
+		t.Fatalf("RecordWebhookDelivery() calls = %d, want 0", recordedCalls)
+	}
+}
+
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

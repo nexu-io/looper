@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
@@ -1534,6 +1535,59 @@ func TestRuntimeRecordWebhookDeliveryTriggersSchedulerTick(t *testing.T) {
 		t.Fatalf("Status().Counters.DeliveriesReceived = %d, want 1", status.Counters.DeliveriesReceived)
 	}
 }
+
+func TestRuntimeWebhookStatusMergesForwarderStats(t *testing.T) {
+	t.Parallel()
+
+	rt := &Runtime{
+		webhook: &webhookRuntime{status: WebhookStatus{Enabled: true, RecentOutcomes: []WebhookRecentOutcome{{At: "2026-05-16T12:00:00.000Z", Outcome: "acknowledged", Message: "stale"}}}},
+		webhookForwarder: stubRuntimeWebhookForwarder{stats: webhookforward.Stats{
+			DeliveriesReceived:  7,
+			DeliveriesDeduped:   1,
+			DeliveriesIgnored:   2,
+			QueueCapacity:       128,
+			QueueEnqueued:       4,
+			QueueCoalesced:      3,
+			QueueRejected:       1,
+			ExecutionsSucceeded: 5,
+			ExecutionsFailed:    2,
+			InFlight:            2,
+			Queued:              6,
+			RecentOutcomes: []webhookforward.Outcome{{
+				At:         "2026-05-16T12:01:00.000Z",
+				Repo:       "nexu-io/looper",
+				ObjectType: "pull_request",
+				Number:     379,
+				EventType:  "pull_request",
+				Status:     "completed",
+			}},
+		}},
+	}
+
+	status := rt.WebhookStatus()
+	if status.Queue.Pending != 6 || status.Queue.Capacity != 128 || status.Queue.ActiveWorkers != 2 {
+		t.Fatalf("Status().Queue = %#v, want pending=6 capacity=128 activeWorkers=2", status.Queue)
+	}
+	if status.Counters.DeliveriesReceived != 7 || status.Counters.Coalesced != 3 || status.Counters.Dropped != 4 || status.Counters.Queued != 4 || status.Counters.Processed != 5 || status.Counters.Failed != 2 {
+		t.Fatalf("Status().Counters = %#v, want merged forwarder counters", status.Counters)
+	}
+	if len(status.RecentOutcomes) != 1 {
+		t.Fatalf("len(Status().RecentOutcomes) = %d, want 1", len(status.RecentOutcomes))
+	}
+	if status.RecentOutcomes[0].Outcome != "completed" || status.RecentOutcomes[0].Message != "nexu-io/looper · pull_request #379 · pull_request" {
+		t.Fatalf("Status().RecentOutcomes[0] = %#v, want merged forwarder outcome", status.RecentOutcomes[0])
+	}
+}
+
+type stubRuntimeWebhookForwarder struct{ stats webhookforward.Stats }
+
+func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	return webhookforward.ForwardResult{}, nil
+}
+
+func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
+
+func (stubRuntimeWebhookForwarder) Close() {}
 
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()

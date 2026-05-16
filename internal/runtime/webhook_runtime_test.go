@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -356,6 +358,76 @@ func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testi
 	}
 }
 
+func TestWebhookRuntimeReconcileRetriesTransientListFailure(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	startedCh := make(chan struct{}, 1)
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() { startedCh <- struct{}{} }
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+	originalRetryDelay := webhookReconcileRetryDelay
+	webhookReconcileRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { webhookReconcileRetryDelay = originalRetryDelay })
+
+	dbPath := t.TempDir() + "/runtime.sqlite"
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := coordinator.Close(); err != nil {
+			t.Fatalf("Coordinator.Close() error = %v", err)
+		}
+	})
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"nexu-io/looper"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	flaky := &flakyProjectListQuerier{db: coordinator.DB(), failuresRemaining: 1}
+	retryRepositories := storage.NewRepositories(flaky)
+	rt := &webhookRuntime{
+		ghPath:          "/usr/bin/gh",
+		status:          WebhookStatus{Enabled: true, EndpointURL: "http://127.0.0.1:7777/webhook/forward"},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.Start(retryRepositories)
+
+	select {
+	case <-startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not launch after automatic retry")
+	}
+	status := rt.Status()
+	if status.Degraded {
+		t.Fatalf("Status().Degraded = true, want false after automatic retry; reasons=%v", status.DegradedReasons)
+	}
+	if len(status.Forwarders) != 1 || status.Forwarders[0].Repo != "nexu-io/looper" {
+		t.Fatalf("Status().Forwarders = %v, want launched forwarder for nexu-io/looper", status.Forwarders)
+	}
+}
+
 func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 	t.Parallel()
 
@@ -419,6 +491,31 @@ func openWebhookRuntimeTestRepositories(t *testing.T) *storage.Repositories {
 		t.Fatalf("RunPending() error = %v", err)
 	}
 	return storage.NewRepositories(coordinator.DB())
+}
+
+type flakyProjectListQuerier struct {
+	db                *sql.DB
+	mu                sync.Mutex
+	failuresRemaining int
+}
+
+func (q *flakyProjectListQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *flakyProjectListQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	q.mu.Lock()
+	if q.failuresRemaining > 0 && strings.Contains(query, "FROM projects") {
+		q.failuresRemaining--
+		q.mu.Unlock()
+		return nil, context.DeadlineExceeded
+	}
+	q.mu.Unlock()
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *flakyProjectListQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
 }
 
 func TestWebhookRuntimeForwarderHelperProcess(t *testing.T) {

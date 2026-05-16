@@ -65,6 +65,7 @@ type Stats struct {
 	DeliveriesDeduped   int64     `json:"deliveriesDeduped"`
 	DeliveriesIgnored   int64     `json:"deliveriesIgnored"`
 	DeliveriesAccepted  int64     `json:"deliveriesAccepted"`
+	QueueCapacity       int       `json:"queueCapacity"`
 	QueueEnqueued       int64     `json:"queueEnqueued"`
 	QueueCoalesced      int64     `json:"queueCoalesced"`
 	QueueRejected       int64     `json:"queueRejected"`
@@ -290,6 +291,7 @@ func (f *forwarder) Stats() Stats {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	stats := f.stats
+	stats.QueueCapacity = f.queueCapacity
 	stats.InFlight = f.currentInFlight
 	stats.Queued = len(f.queue)
 	stats.KnownCoalescedKeys = len(f.works)

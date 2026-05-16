@@ -22,6 +22,8 @@ const webhookListenerPath = "/webhook/forward"
 
 const noConfiguredWebhookReposReason = "no configured GitHub repos are available for webhook forwarding"
 
+var webhookReconcileRetryDelay = 5 * time.Second
+
 var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment"}
 
 type WebhookStatus struct {
@@ -81,6 +83,7 @@ type webhookRuntime struct {
 	mu              sync.RWMutex
 	wg              sync.WaitGroup
 	stopped         bool
+	reconcileRetry  bool
 }
 
 func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() time.Time) *webhookRuntime {
@@ -144,6 +147,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 	projects, err := repos.Projects.List(context.Background())
 	if err != nil {
 		w.addDegradedReason(fmt.Sprintf("list configured projects: %v", err))
+		w.scheduleReconcileRetry(repos)
 		return
 	}
 	w.clearTransientReconcileDegradedReasons()
@@ -506,6 +510,42 @@ func (w *webhookRuntime) currentTime() time.Time {
 		return time.Now()
 	}
 	return w.now()
+}
+
+func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
+	if w == nil || repos == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.stopped || w.reconcileRetry {
+		w.mu.Unlock()
+		return
+	}
+	w.reconcileRetry = true
+	w.mu.Unlock()
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		timer := time.NewTimer(webhookReconcileRetryDelay)
+		defer timer.Stop()
+		select {
+		case <-w.stopCh:
+			w.mu.Lock()
+			w.reconcileRetry = false
+			w.mu.Unlock()
+			return
+		case <-timer.C:
+		}
+		w.mu.Lock()
+		if w.stopped {
+			w.reconcileRetry = false
+			w.mu.Unlock()
+			return
+		}
+		w.reconcileRetry = false
+		w.mu.Unlock()
+		w.Reconcile(repos)
+	}()
 }
 
 func webhookBaseURL(cfg config.Config) string {

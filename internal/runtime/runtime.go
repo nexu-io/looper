@@ -304,11 +304,27 @@ func (r *Runtime) RecoverySummary() RecoverySummary {
 func (r *Runtime) WebhookStatus() WebhookStatus {
 	r.mu.RLock()
 	webhook := r.webhook
+	forwarder := r.webhookForwarder
 	r.mu.RUnlock()
 	if webhook == nil {
 		return WebhookStatus{}
 	}
-	return webhook.Status()
+	status := webhook.Status()
+	if forwarder == nil {
+		return status
+	}
+	stats := forwarder.Stats()
+	status.Queue.Pending = stats.Queued
+	status.Queue.Capacity = stats.QueueCapacity
+	status.Queue.ActiveWorkers = stats.InFlight
+	status.Counters.DeliveriesReceived = int(stats.DeliveriesReceived)
+	status.Counters.Coalesced = int(stats.QueueCoalesced)
+	status.Counters.Dropped = int(stats.DeliveriesDeduped + stats.DeliveriesIgnored + stats.QueueRejected)
+	status.Counters.Queued = int(stats.QueueEnqueued)
+	status.Counters.Processed = int(stats.ExecutionsSucceeded)
+	status.Counters.Failed = int(stats.ExecutionsFailed)
+	status.RecentOutcomes = webhookRecentOutcomesFromStats(stats.RecentOutcomes)
+	return status
 }
 
 func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
@@ -319,6 +335,42 @@ func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
 		webhook.RecordDelivery(eventType, deliveryID)
 		r.TriggerSchedulerTick()
 	}
+}
+
+func webhookRecentOutcomesFromStats(outcomes []webhookforward.Outcome) []WebhookRecentOutcome {
+	if len(outcomes) == 0 {
+		return []WebhookRecentOutcome{}
+	}
+	recent := make([]WebhookRecentOutcome, 0, len(outcomes))
+	for _, outcome := range outcomes {
+		recent = append(recent, WebhookRecentOutcome{
+			At:      outcome.At,
+			Outcome: outcome.Status,
+			Message: formatWebhookOutcomeMessage(outcome),
+		})
+	}
+	return recent
+}
+
+func formatWebhookOutcomeMessage(outcome webhookforward.Outcome) string {
+	parts := make([]string, 0, 4)
+	if repo := strings.TrimSpace(outcome.Repo); repo != "" {
+		parts = append(parts, repo)
+	}
+	if objectType := strings.TrimSpace(outcome.ObjectType); objectType != "" && outcome.Number > 0 {
+		parts = append(parts, fmt.Sprintf("%s #%d", objectType, outcome.Number))
+	}
+	if eventType := strings.TrimSpace(outcome.EventType); eventType != "" {
+		parts = append(parts, eventType)
+	}
+	message := strings.Join(parts, " · ")
+	if err := strings.TrimSpace(outcome.Error); err != "" {
+		if message == "" {
+			return err
+		}
+		return message + ": " + err
+	}
+	return message
 }
 
 func (r *Runtime) ReconcileWebhookForwarders() {

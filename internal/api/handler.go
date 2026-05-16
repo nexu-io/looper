@@ -527,8 +527,11 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
 	}
-	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) }); ok {
-		runtimeWithWebhook.RecordWebhookDelivery(eventType, deliveryID)
+	if (strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0) && any(h.context.Runtime) != nil {
+		runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) })
+		if ok {
+			runtimeWithWebhook.RecordWebhookDelivery(eventType, deliveryID)
+		}
 	}
 	return result, nil
 }
