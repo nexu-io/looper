@@ -87,6 +87,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
 	}
 
+	if config.Webhook.FallbackPollIntervalSeconds < 60 {
+		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
+	}
+
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI)})
 	}

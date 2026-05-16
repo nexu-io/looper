@@ -92,6 +92,12 @@
             "totalRuns": 1,
             "activeRuns": 1
           },
+          "webhook": {
+            "enabled": false,
+            "healthy": true,
+            "degraded": false,
+            "forwarders": []
+          },
           "loops": {
             "planner": {
               "queued": 0,
@@ -174,6 +180,10 @@
             "retryMaxAttempts": 5,
             "retryBaseDelayMs": 5000,
             "slowLaneWarnThresholdMs": 5000
+          },
+          "webhook": {
+            "enabled": false,
+            "fallbackPollIntervalSeconds": 300
           },
           "agent": {
             "env": {},

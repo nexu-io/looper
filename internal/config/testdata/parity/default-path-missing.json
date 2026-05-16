@@ -36,6 +36,10 @@
         "retryBaseDelayMs": 5000,
         "slowLaneWarnThresholdMs": 5000
       },
+      "webhook": {
+        "enabled": false,
+        "fallbackPollIntervalSeconds": 300
+      },
       "agent": {
         "params": {},
         "env": {},
