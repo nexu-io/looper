@@ -221,6 +221,12 @@ func (w *webhookRuntime) launchForwarder(index int) {
 	}()
 }
 
+func (w *webhookRuntime) isStopped() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.stopped
+}
+
 func (w *webhookRuntime) runForwarder(index int) {
 	backoff := time.Second
 	for {
@@ -232,7 +238,7 @@ func (w *webhookRuntime) runForwarder(index int) {
 		state := w.status.Forwarders[index]
 		w.mu.RUnlock()
 
-		cmd := exec.Command(state.Command[0], state.Command[1:]...)
+		cmd := execCommand(state.Command[0], state.Command[1:]...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			w.recordForwarderError(index, fmt.Sprintf("attach stdout: %v", err), true)
@@ -253,6 +259,19 @@ func (w *webhookRuntime) runForwarder(index int) {
 			}
 			continue
 		}
+		if webhookForwarderStartedHook != nil {
+			webhookForwarderStartedHook()
+		}
+		stopKillDone := make(chan struct{})
+		go func() {
+			select {
+			case <-w.stopCh:
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+			case <-stopKillDone:
+			}
+		}()
 
 		startedAt := formatJavaScriptISOString(w.now().UTC())
 		pid := cmd.Process.Pid
@@ -262,12 +281,14 @@ func (w *webhookRuntime) runForwarder(index int) {
 		w.status.Forwarders[index].LastStartedAt = &startedAt
 		w.status.Forwarders[index].LastError = ""
 		w.mu.Unlock()
+		w.clearForwarderDegradedReasons(state.Repo)
 
 		var pipes sync.WaitGroup
 		pipes.Add(2)
 		go func() { defer pipes.Done(); w.captureTail(index, stdout, true) }()
 		go func() { defer pipes.Done(); w.captureTail(index, stderr, false) }()
 		err = cmd.Wait()
+		close(stopKillDone)
 		pipes.Wait()
 		exitedAt := formatJavaScriptISOString(w.now().UTC())
 		message := ""
@@ -281,7 +302,7 @@ func (w *webhookRuntime) runForwarder(index int) {
 		w.status.Forwarders[index].LastError = message
 		w.status.Forwarders[index].RestartCount++
 		w.mu.Unlock()
-		if message != "" {
+		if message != "" && !w.isStopped() {
 			w.addDegradedReason(fmt.Sprintf("forwarder for %s exited: %s", state.Repo, message))
 		}
 		if !w.sleep(backoff) {
@@ -315,6 +336,13 @@ func (w *webhookRuntime) recordForwarderError(index int, message string, degrade
 	}
 }
 
+func (w *webhookRuntime) clearForwarderDegradedReasons(repo string) {
+	prefix := fmt.Sprintf("forwarder for %s ", strings.TrimSpace(repo))
+	w.clearDegradedReasons(func(reason string) bool {
+		return strings.HasPrefix(reason, prefix)
+	})
+}
+
 func (w *webhookRuntime) addDegradedReason(reason string) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -330,6 +358,22 @@ func (w *webhookRuntime) addDegradedReason(reason string) {
 	}
 	w.status.Degraded = true
 	w.status.DegradedReasons = append(w.status.DegradedReasons, reason)
+}
+
+func (w *webhookRuntime) clearDegradedReasons(match func(string) bool) {
+	if match == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	filtered := make([]string, 0, len(w.status.DegradedReasons))
+	for _, reason := range w.status.DegradedReasons {
+		if !match(reason) {
+			filtered = append(filtered, reason)
+		}
+	}
+	w.status.DegradedReasons = filtered
+	w.status.Degraded = len(w.status.DegradedReasons) > 0
 }
 
 func (w *webhookRuntime) sleep(duration time.Duration) bool {
@@ -369,6 +413,10 @@ func appendTail(lines []string, line string, limit int) []string {
 	}
 	return append([]string{}, lines[len(lines)-limit:]...)
 }
+
+var execCommand = exec.Command
+
+var webhookForwarderStartedHook func()
 
 var osFindProcess = func(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)
