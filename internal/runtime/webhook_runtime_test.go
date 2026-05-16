@@ -116,12 +116,13 @@ func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) 
 			},
 			Forwarders: []WebhookForwarderState{{Repo: "nexu-io/looper", Command: []string{"gh", "webhook", "forward"}}},
 		},
-		stopCh: make(chan struct{}),
-		now:    time.Now,
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"nexu-io/looper": make(chan struct{})},
+		now:             time.Now,
 	}
 	t.Cleanup(rt.Stop)
 
-	rt.launchForwarder(0)
+	rt.launchForwarder("nexu-io/looper")
 	<-startedCh
 
 	deadline := time.After(5 * time.Second)
@@ -174,10 +175,11 @@ func TestWebhookRuntimeStopKillsForwarderStartedBeforePIDPublication(t *testing.
 			Enabled:    true,
 			Forwarders: []WebhookForwarderState{{Repo: "nexu-io/looper", Command: []string{"gh", "webhook", "forward"}}},
 		},
-		stopCh: make(chan struct{}),
-		now:    time.Now,
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"nexu-io/looper": make(chan struct{})},
+		now:             time.Now,
 	}
-	rt.launchForwarder(0)
+	rt.launchForwarder("nexu-io/looper")
 	<-startedCh
 
 	stopDone := make(chan struct{})
@@ -228,8 +230,9 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 				Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "nexu-io/looper", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"},
 			}},
 		},
-		stopCh: make(chan struct{}),
-		now:    time.Now,
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"nexu-io/looper": make(chan struct{})},
+		now:             time.Now,
 	}
 	t.Cleanup(rt.Stop)
 
@@ -252,6 +255,52 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	status = rt.Status()
 	if len(status.Forwarders) != 2 {
 		t.Fatalf("len(Status().Forwarders) after second reconcile = %d, want 2", len(status.Forwarders))
+	}
+}
+
+func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
+	t.Parallel()
+
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"nexu-io/other"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Other", RepoPath: "/tmp/other", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+
+	rt := &webhookRuntime{
+		ghPath: "/usr/bin/gh",
+		status: WebhookStatus{
+			Enabled:     true,
+			EndpointURL: "http://127.0.0.1:7777/webhook/forward",
+			Forwarders: []WebhookForwarderState{
+				{Repo: "nexu-io/looper", Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "nexu-io/looper", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"}},
+				{Repo: "nexu-io/other", Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "nexu-io/other", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"}},
+			},
+			Degraded: true,
+			DegradedReasons: []string{
+				"forwarder for nexu-io/looper exited: exit status 1",
+			},
+		},
+		stopCh: make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{
+			"nexu-io/looper": make(chan struct{}),
+			"nexu-io/other":  make(chan struct{}),
+		},
+		now: time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.Reconcile(repositories)
+	status := rt.Status()
+	if len(status.Forwarders) != 1 {
+		t.Fatalf("len(Status().Forwarders) = %d, want 1 after prune", len(status.Forwarders))
+	}
+	if status.Forwarders[0].Repo != "nexu-io/other" {
+		t.Fatalf("Status().Forwarders[0].Repo = %q, want nexu-io/other", status.Forwarders[0].Repo)
+	}
+	if status.Degraded {
+		t.Fatalf("Status().Degraded = true, want false after pruning stale repo; reasons=%v", status.DegradedReasons)
 	}
 }
 

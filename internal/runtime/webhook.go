@@ -71,14 +71,15 @@ type WebhookForwarderState struct {
 }
 
 type webhookRuntime struct {
-	logger  bootstrap.Logger
-	now     func() time.Time
-	ghPath  string
-	status  WebhookStatus
-	stopCh  chan struct{}
-	mu      sync.RWMutex
-	wg      sync.WaitGroup
-	stopped bool
+	logger          bootstrap.Logger
+	now             func() time.Time
+	ghPath          string
+	status          WebhookStatus
+	stopCh          chan struct{}
+	forwarderStopCh map[string]chan struct{}
+	mu              sync.RWMutex
+	wg              sync.WaitGroup
+	stopped         bool
 }
 
 func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() time.Time) *webhookRuntime {
@@ -96,7 +97,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		RecentOutcomes:              []WebhookRecentOutcome{},
 		Forwarders:                  []WebhookForwarderState{},
 	}
-	rt := &webhookRuntime{logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{})}
+	rt := &webhookRuntime{logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}}
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
@@ -152,6 +153,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 		}
 		repoSet[repo] = struct{}{}
 	}
+	launchRepos := w.reconcileForwarders(repoSet)
 	if len(repoSet) == 0 {
 		w.addDegradedReason(noConfiguredWebhookReposReason)
 		return
@@ -159,18 +161,11 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 	w.clearDegradedReasons(func(reason string) bool {
 		return reason == noConfiguredWebhookReposReason
 	})
-	launchIndexes := []int{}
-	for repo := range repoSet {
-		index, added := w.ensureForwarder(repo)
-		if added {
-			launchIndexes = append(launchIndexes, index)
-		}
-	}
-	if w.ghPath == "" || w.status.Degraded {
+	if w.ghPath == "" || w.Status().Degraded {
 		return
 	}
-	for _, index := range launchIndexes {
-		w.launchForwarder(index)
+	for _, repo := range launchRepos {
+		w.launchForwarder(repo)
 	}
 }
 
@@ -216,31 +211,73 @@ func (w *webhookRuntime) Status() WebhookStatus {
 	return status
 }
 
-func (w *webhookRuntime) ensureForwarder(repo string) (int, bool) {
-	repo = strings.TrimSpace(repo)
-	if repo == "" {
-		return -1, false
+func (w *webhookRuntime) reconcileForwarders(repoSet map[string]struct{}) []string {
+	launchRepos := []string{}
+	type stopRequest struct {
+		repo   string
+		pid    *int
+		stopCh chan struct{}
 	}
+	stops := []stopRequest{}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for index, state := range w.status.Forwarders {
-		if state.Repo == repo {
-			return index, false
+	if w.forwarderStopCh == nil {
+		w.forwarderStopCh = map[string]chan struct{}{}
+	}
+	kept := make([]WebhookForwarderState, 0, len(repoSet))
+	existing := make(map[string]struct{}, len(w.status.Forwarders))
+	for _, state := range w.status.Forwarders {
+		if _, ok := repoSet[state.Repo]; ok {
+			kept = append(kept, state)
+			existing[state.Repo] = struct{}{}
+			continue
+		}
+		stops = append(stops, stopRequest{repo: state.Repo, pid: state.PID, stopCh: w.forwarderStopCh[state.Repo]})
+		delete(w.forwarderStopCh, state.Repo)
+	}
+	for repo := range repoSet {
+		if _, ok := existing[repo]; ok {
+			continue
+		}
+		kept = append(kept, WebhookForwarderState{
+			Repo:    repo,
+			Command: []string{w.ghPath, "webhook", "forward", "--repo", repo, "--events", strings.Join(webhookForwardEvents, ","), "--url", w.status.EndpointURL},
+		})
+		if _, ok := w.forwarderStopCh[repo]; !ok {
+			w.forwarderStopCh[repo] = make(chan struct{})
+		}
+		launchRepos = append(launchRepos, repo)
+	}
+	w.status.Forwarders = kept
+	for _, stop := range stops {
+		if stop.stopCh != nil {
+			close(stop.stopCh)
+		}
+		if stop.pid != nil {
+			if proc, err := osFindProcess(*stop.pid); err == nil {
+				_ = proc.Kill()
+			}
 		}
 	}
-	state := WebhookForwarderState{
-		Repo:    repo,
-		Command: []string{w.ghPath, "webhook", "forward", "--repo", repo, "--events", strings.Join(webhookForwardEvents, ","), "--url", w.status.EndpointURL},
+	for _, stop := range stops {
+		prefix := fmt.Sprintf("forwarder for %s ", strings.TrimSpace(stop.repo))
+		filtered := w.status.DegradedReasons[:0]
+		for _, reason := range w.status.DegradedReasons {
+			if !strings.HasPrefix(reason, prefix) {
+				filtered = append(filtered, reason)
+			}
+		}
+		w.status.DegradedReasons = filtered
 	}
-	w.status.Forwarders = append(w.status.Forwarders, state)
-	return len(w.status.Forwarders) - 1, true
+	w.status.Degraded = len(w.status.DegradedReasons) > 0
+	return launchRepos
 }
 
-func (w *webhookRuntime) launchForwarder(index int) {
+func (w *webhookRuntime) launchForwarder(repo string) {
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
-		w.runForwarder(index)
+		w.runForwarder(repo)
 	}()
 }
 
@@ -250,31 +287,28 @@ func (w *webhookRuntime) isStopped() bool {
 	return w.stopped
 }
 
-func (w *webhookRuntime) runForwarder(index int) {
+func (w *webhookRuntime) runForwarder(repo string) {
 	backoff := time.Second
 	for {
-		w.mu.RLock()
-		if w.stopped {
-			w.mu.RUnlock()
+		state, stopCh, ok := w.forwarderSnapshot(repo)
+		if !ok {
 			return
 		}
-		state := w.status.Forwarders[index]
-		w.mu.RUnlock()
 
 		cmd := execCommand(state.Command[0], state.Command[1:]...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			w.recordForwarderError(index, fmt.Sprintf("attach stdout: %v", err), true)
+			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stdout: %v", err), true)
 			return
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
-			w.recordForwarderError(index, fmt.Sprintf("attach stderr: %v", err), true)
+			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stderr: %v", err), true)
 			return
 		}
 		if err := cmd.Start(); err != nil {
-			w.recordForwarderError(index, err.Error(), true)
-			if !w.sleep(backoff) {
+			w.recordForwarderError(repo, stopCh, err.Error(), true)
+			if !w.sleep(backoff, stopCh) {
 				return
 			}
 			if backoff < 10*time.Second {
@@ -292,32 +326,28 @@ func (w *webhookRuntime) runForwarder(index int) {
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
 				}
+			case <-stopCh:
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
 			case <-stopKillDone:
 			}
 		}()
 
 		startedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		pid := cmd.Process.Pid
-		w.mu.Lock()
-		w.status.Forwarders[index].Running = true
-		w.status.Forwarders[index].PID = &pid
-		w.status.Forwarders[index].LastStartedAt = &startedAt
-		w.status.Forwarders[index].LastError = ""
-		filtered := make([]string, 0, len(w.status.DegradedReasons))
-		prefix := fmt.Sprintf("forwarder for %s ", strings.TrimSpace(state.Repo))
-		for _, reason := range w.status.DegradedReasons {
-			if !strings.HasPrefix(reason, prefix) {
-				filtered = append(filtered, reason)
-			}
-		}
-		w.status.DegradedReasons = filtered
-		w.status.Degraded = len(w.status.DegradedReasons) > 0
-		w.mu.Unlock()
+		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
+			state.Running = true
+			state.PID = &pid
+			state.LastStartedAt = &startedAt
+			state.LastError = ""
+		})
+		w.clearForwarderDegradedReasons(repo)
 
 		var pipes sync.WaitGroup
 		pipes.Add(2)
-		go func() { defer pipes.Done(); w.captureTail(index, stdout, true) }()
-		go func() { defer pipes.Done(); w.captureTail(index, stderr, false) }()
+		go func() { defer pipes.Done(); w.captureTail(repo, stopCh, stdout, true) }()
+		go func() { defer pipes.Done(); w.captureTail(repo, stopCh, stderr, false) }()
 		err = cmd.Wait()
 		close(stopKillDone)
 		pipes.Wait()
@@ -326,17 +356,17 @@ func (w *webhookRuntime) runForwarder(index int) {
 		if err != nil {
 			message = err.Error()
 		}
-		w.mu.Lock()
-		w.status.Forwarders[index].Running = false
-		w.status.Forwarders[index].PID = nil
-		w.status.Forwarders[index].LastExitAt = &exitedAt
-		w.status.Forwarders[index].LastError = message
-		w.status.Forwarders[index].RestartCount++
-		w.mu.Unlock()
-		if message != "" && !w.isStopped() {
+		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
+			state.Running = false
+			state.PID = nil
+			state.LastExitAt = &exitedAt
+			state.LastError = message
+			state.RestartCount++
+		})
+		if message != "" && !w.isStopped() && w.hasForwarder(repo, stopCh) {
 			w.addDegradedReason(fmt.Sprintf("forwarder for %s exited: %s", state.Repo, message))
 		}
-		if !w.sleep(backoff) {
+		if !w.sleep(backoff, stopCh) {
 			return
 		}
 		if backoff < 10*time.Second {
@@ -345,26 +375,69 @@ func (w *webhookRuntime) runForwarder(index int) {
 	}
 }
 
-func (w *webhookRuntime) captureTail(index int, pipe io.ReadCloser, stdout bool) {
+func (w *webhookRuntime) captureTail(repo string, stopCh chan struct{}, pipe io.ReadCloser, stdout bool) {
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
-		w.mu.Lock()
-		if stdout {
-			w.status.Forwarders[index].StdoutTail = appendTail(w.status.Forwarders[index].StdoutTail, scanner.Text(), 20)
-		} else {
-			w.status.Forwarders[index].StderrTail = appendTail(w.status.Forwarders[index].StderrTail, scanner.Text(), 20)
-		}
-		w.mu.Unlock()
+		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
+			if stdout {
+				state.StdoutTail = appendTail(state.StdoutTail, scanner.Text(), 20)
+			} else {
+				state.StderrTail = appendTail(state.StderrTail, scanner.Text(), 20)
+			}
+		})
 	}
 }
 
-func (w *webhookRuntime) recordForwarderError(index int, message string, degraded bool) {
-	w.mu.Lock()
-	w.status.Forwarders[index].LastError = message
-	w.mu.Unlock()
-	if degraded {
-		w.addDegradedReason(fmt.Sprintf("forwarder for %s failed: %s", w.Status().Forwarders[index].Repo, message))
+func (w *webhookRuntime) recordForwarderError(repo string, stopCh chan struct{}, message string, degraded bool) {
+	w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
+		state.LastError = message
+	})
+	if degraded && w.hasForwarder(repo, stopCh) {
+		w.addDegradedReason(fmt.Sprintf("forwarder for %s failed: %s", strings.TrimSpace(repo), message))
 	}
+}
+
+func (w *webhookRuntime) forwarderSnapshot(repo string) (WebhookForwarderState, chan struct{}, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.stopped {
+		return WebhookForwarderState{}, nil, false
+	}
+	for _, state := range w.status.Forwarders {
+		if state.Repo == repo {
+			return state, w.forwarderStopCh[repo], true
+		}
+	}
+	return WebhookForwarderState{}, nil, false
+}
+
+func (w *webhookRuntime) updateForwarder(repo string, stopCh chan struct{}, apply func(*WebhookForwarderState)) {
+	if apply == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for index := range w.status.Forwarders {
+		if w.status.Forwarders[index].Repo == repo && sameStopChannel(w.forwarderStopCh[repo], stopCh) {
+			apply(&w.status.Forwarders[index])
+			return
+		}
+	}
+}
+
+func (w *webhookRuntime) hasForwarder(repo string, stopCh chan struct{}) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for _, state := range w.status.Forwarders {
+		if state.Repo == repo && sameStopChannel(w.forwarderStopCh[repo], stopCh) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStopChannel(current, expected chan struct{}) bool {
+	return current == expected
 }
 
 func (w *webhookRuntime) clearForwarderDegradedReasons(repo string) {
@@ -407,11 +480,13 @@ func (w *webhookRuntime) clearDegradedReasons(match func(string) bool) {
 	w.status.Degraded = len(w.status.DegradedReasons) > 0
 }
 
-func (w *webhookRuntime) sleep(duration time.Duration) bool {
+func (w *webhookRuntime) sleep(duration time.Duration, forwarderStopCh <-chan struct{}) bool {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-w.stopCh:
+		return false
+	case <-forwarderStopCh:
 		return false
 	case <-timer.C:
 		return true
