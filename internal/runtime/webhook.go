@@ -167,12 +167,26 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 	w.clearDegradedReasons(func(reason string) bool {
 		return reason == noConfiguredWebhookReposReason
 	})
-	if w.ghPath == "" || w.Status().Degraded {
+	if w.ghPath == "" || w.hasLaunchBlockingDegradedReason() {
 		return
 	}
 	for _, repo := range launchRepos {
 		w.launchForwarder(repo)
 	}
+}
+
+func (w *webhookRuntime) hasLaunchBlockingDegradedReason() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for _, reason := range w.status.DegradedReasons {
+		if !strings.HasPrefix(reason, "forwarder for ") {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *webhookRuntime) Stop() {

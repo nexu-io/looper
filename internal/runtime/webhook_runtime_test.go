@@ -358,6 +358,85 @@ func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testi
 	}
 }
 
+func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegradation(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	startedCh := make(chan struct{}, 1)
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() { startedCh <- struct{}{} }
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadataOne := `{"repo":"nexu-io/looper"}`
+	metadataTwo := `{"repo":"nexu-io/other"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadataOne, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Other", RepoPath: "/tmp/other", MetadataJSON: &metadataTwo, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+
+	rt := &webhookRuntime{
+		ghPath: "/usr/bin/gh",
+		status: WebhookStatus{
+			Enabled:     true,
+			EndpointURL: "http://127.0.0.1:7777/webhook/forward",
+			Degraded:    true,
+			DegradedReasons: []string{
+				"forwarder for nexu-io/looper exited: exit status 1",
+			},
+			Forwarders: []WebhookForwarderState{{
+				Repo:    "nexu-io/looper",
+				Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "nexu-io/looper", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"},
+			}},
+		},
+		stopCh: make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{
+			"nexu-io/looper": make(chan struct{}),
+		},
+		now: time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.Reconcile(repositories)
+
+	select {
+	case <-startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("new forwarder did not launch while only existing forwarder degradation remained")
+	}
+
+	status := rt.Status()
+	if len(status.Forwarders) != 2 {
+		t.Fatalf("len(Status().Forwarders) = %d, want 2", len(status.Forwarders))
+	}
+	if status.Forwarders[1].Repo != "nexu-io/other" {
+		t.Fatalf("Status().Forwarders[1].Repo = %q, want nexu-io/other", status.Forwarders[1].Repo)
+	}
+	if !status.Forwarders[1].Running {
+		t.Fatal("Status().Forwarders[1].Running = false, want true after launching new repo forwarder")
+	}
+	if !status.Degraded {
+		t.Fatal("Status().Degraded = false, want true while existing forwarder degradation remains")
+	}
+	if len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "forwarder for nexu-io/looper") {
+		t.Fatalf("Status().DegradedReasons = %v, want original forwarder degradation to remain", status.DegradedReasons)
+	}
+}
+
 func TestWebhookRuntimeReconcileRetriesTransientListFailure(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {
