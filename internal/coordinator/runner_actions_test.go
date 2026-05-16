@@ -712,23 +712,25 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 }
 
 type stubCoordinatorGitHub struct {
-	issues         []githubinfra.IssueSummary
-	details        map[int64]githubinfra.IssueDetail
-	comments       map[int64][][]githubinfra.CommentInfo
-	timeline       map[int64][]map[string]any
-	blockedBy      map[int64][]githubinfra.DependencyIssue
-	subIssues      map[int64][]githubinfra.DependencyIssue
-	subIssueErr    map[int64]error
-	blockedByReads int
-	permissionErr  error
-	ops            []string
-	createdBodies  []string
-	updatedBodies  []string
-	commentReads   map[int64]int
-	failAddLabels  map[string]error
-	addedLabels    []githubinfra.IssueLabelsInput
-	removedLabels  []githubinfra.IssueLabelsInput
-	assigned       []githubinfra.IssueAssigneesInput
+	issues              []githubinfra.IssueSummary
+	details             map[int64]githubinfra.IssueDetail
+	comments            map[int64][][]githubinfra.CommentInfo
+	timeline            map[int64][]map[string]any
+	blockedBy           map[int64][]githubinfra.DependencyIssue
+	subIssues           map[int64][]githubinfra.DependencyIssue
+	subIssueErr         map[int64]error
+	blockedByReads      int
+	blockedByIssueReads int
+	permissionErr       error
+	ops                 []string
+	createdBodies       []string
+	updatedBodies       []string
+	commentReads        map[int64]int
+	failAddLabels       map[string]error
+	failBlockedByIssues map[int64][]error
+	addedLabels         []githubinfra.IssueLabelsInput
+	removedLabels       []githubinfra.IssueLabelsInput
+	assigned            []githubinfra.IssueAssigneesInput
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -784,6 +786,12 @@ func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input
 	return "read", nil
 }
 func (s *stubCoordinatorGitHub) ListBlockedByIssues(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error) {
+	s.blockedByIssueReads++
+	if failures := s.failBlockedByIssues[input.IssueNumber]; len(failures) > 0 {
+		err := failures[0]
+		s.failBlockedByIssues[input.IssueNumber] = failures[1:]
+		return nil, err
+	}
 	return append([]githubinfra.DependencyIssue(nil), s.blockedBy[input.IssueNumber]...), nil
 }
 func (s *stubCoordinatorGitHub) ListSubIssues(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error) {
@@ -866,6 +874,29 @@ func TestRunnerAutonomousDispatchBlockedByVetoesSilently(t *testing.T) {
 	if len(fixture.github.ops) != 0 {
 		t.Fatalf("ops = %v, want no autonomous dispatch side effects", fixture.github.ops)
 	}
+}
+
+func TestRunnerBlockedByDependencyReadRetriesTransientErrors(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.APIRetryAttempts = 3
+	fixture.github.failBlockedByIssues = map[int64][]error{1: {errors.New("request timed out"), errors.New("request timed out")}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.details[9] = githubinfra.IssueDetail{Number: 9, State: "open"}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 9, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if fixture.github.blockedByIssueReads != 3 {
+		t.Fatalf("blocked_by issue reads = %d, want 3", fixture.github.blockedByIssueReads)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"create-comment", "react:confused:11"})
 }
 
 func TestRunnerDispatchSkipsDependencyAPIsWhenDisabled(t *testing.T) {

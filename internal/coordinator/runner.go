@@ -288,6 +288,24 @@ func (r *Runner) listIssueBlockedByWithRetry(ctx context.Context, repo, cwd stri
 	return nil, lastErr
 }
 
+func (r *Runner) listBlockedByIssuesWithRetry(ctx context.Context, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) ([]githubinfra.DependencyIssue, error) {
+	var lastErr error
+	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
+		blockedBy, err := r.github.ListBlockedByIssues(callCtx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+		cancel()
+		if err == nil {
+			return blockedBy, nil
+		}
+		lastErr = err
+		if !shouldRetryDependencyError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
 func (r *Runner) loadBlockerState(ctx context.Context, cwd string, blocker githubinfra.IssueDependency, depsCfg config.CoordinatorDependenciesConfig) (depgraph.IssueRef, depgraph.IssueState, bool) {
 	blockerRef := depgraph.IssueRef{Repo: blocker.Repo, Number: blocker.Number}
 	var lastErr error
@@ -465,7 +483,7 @@ func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loa
 		state.tracked[ref] = item
 		state.trackedIssueByNumber[item.issue.Number] = ref
 		snapshot.Issues[ref] = depgraph.IssueState{State: item.detail.State, StateReason: item.detail.StateReason}
-		blockers, err := r.github.ListBlockedByIssues(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: item.issue.Number, CWD: cwd})
+		blockers, err := r.listBlockedByIssuesWithRetry(ctx, repo, cwd, item.issue.Number, depsCfg)
 		if err != nil {
 			return dependencyState{}, err
 		}
