@@ -197,6 +197,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeSchedulerConfig(&config.Scheduler, *partial.Scheduler)
 	}
 
+	if partial.Webhook != nil {
+		mergeWebhookConfig(&config.Webhook, *partial.Webhook)
+	}
+
 	if partial.Agent != nil {
 		mergeAgentConfig(&config.Agent, *partial.Agent)
 	}
@@ -301,6 +305,16 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 
 	if partial.SlowLaneWarnThresholdMS != nil {
 		config.SlowLaneWarnThresholdMS = *partial.SlowLaneWarnThresholdMS
+	}
+}
+
+func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+
+	if partial.FallbackPollIntervalSeconds != nil {
+		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
 	}
 }
 

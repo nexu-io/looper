@@ -142,6 +142,11 @@ type SchedulerConfig struct {
 	SlowLaneWarnThresholdMS int `json:"slowLaneWarnThresholdMs"`
 }
 
+type WebhookConfig struct {
+	Enabled                     bool `json:"enabled"`
+	FallbackPollIntervalSeconds int  `json:"fallbackPollIntervalSeconds"`
+}
+
 type AgentConfig struct {
 	Vendor       *AgentVendor            `json:"vendor,omitempty"`
 	Model        *string                 `json:"model,omitempty"`
@@ -523,6 +528,7 @@ type Config struct {
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
+	Webhook       WebhookConfig      `json:"webhook"`
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
@@ -556,6 +562,11 @@ type PartialSchedulerConfig struct {
 	RetryMaxAttempts        *int `json:"retryMaxAttempts,omitempty"`
 	RetryBaseDelayMS        *int `json:"retryBaseDelayMs,omitempty"`
 	SlowLaneWarnThresholdMS *int `json:"slowLaneWarnThresholdMs,omitempty"`
+}
+
+type PartialWebhookConfig struct {
+	Enabled                     *bool `json:"enabled,omitempty"`
+	FallbackPollIntervalSeconds *int  `json:"fallbackPollIntervalSeconds,omitempty"`
 }
 
 type PartialAgentConfig struct {
@@ -898,6 +909,7 @@ type PartialConfig struct {
 	Server         *PartialServerConfig       `json:"server,omitempty"`
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
+	Webhook        *PartialWebhookConfig      `json:"webhook,omitempty"`
 	Agent          *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging        *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications  *PartialNotificationConfig `json:"notifications,omitempty"`

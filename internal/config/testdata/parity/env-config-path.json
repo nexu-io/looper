@@ -114,6 +114,10 @@
         "retryBaseDelayMs": 1500,
         "slowLaneWarnThresholdMs": 5000
       },
+      "webhook": {
+        "enabled": false,
+        "fallbackPollIntervalSeconds": 300
+      },
       "agent": {
         "vendor": "codex",
         "model": "gpt-5",

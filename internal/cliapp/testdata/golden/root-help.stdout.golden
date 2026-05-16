@@ -6,6 +6,7 @@ Version:
 
 Subcommands:
   status     Show service status
+  webhook    Webhook configuration and status
   bootstrap  Run first-time setup
   version    Show Looper version
   project    Project commands

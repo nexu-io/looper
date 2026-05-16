@@ -1,0 +1,144 @@
+package cliapp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	pkgapi "github.com/nexu-io/looper/pkg/api"
+)
+
+func TestWebhookEnablePersistsConfigAndWarnsWithoutChangingScheduler(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"server":    map[string]any{"host": "0.0.0.0"},
+		"scheduler": map[string]any{"pollIntervalSeconds": 42},
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	missingLookPath := func(string) (string, error) { return "", os.ErrNotExist }
+	app := New(Deps{Stdout: stdout, Stderr: stderr, LookPath: missingLookPath})
+	exitCode := app.Run(context.Background(), []string{"webhook", "enable", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook enable) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Restart looperd") || !strings.Contains(stdout.String(), "Warning:") {
+		t.Fatalf("stdout = %q, want restart instruction and warnings", stdout.String())
+	}
+	var updated map[string]any
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(config) error = %v", err)
+	}
+	if err := json.Unmarshal(raw, &updated); err != nil {
+		t.Fatalf("Unmarshal(config) error = %v", err)
+	}
+	webhook := updated["webhook"].(map[string]any)
+	if got := webhook["enabled"]; got != true {
+		t.Fatalf("webhook.enabled = %v, want true", got)
+	}
+	if got := int(webhook["fallbackPollIntervalSeconds"].(float64)); got != 300 {
+		t.Fatalf("webhook.fallbackPollIntervalSeconds = %d, want 300", got)
+	}
+	scheduler := updated["scheduler"].(map[string]any)
+	if got := int(scheduler["pollIntervalSeconds"].(float64)); got != 42 {
+		t.Fatalf("scheduler.pollIntervalSeconds = %d, want 42", got)
+	}
+}
+
+func TestWebhookDisablePersistsDisabledState(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"webhook": map[string]any{"enabled": true, "fallbackPollIntervalSeconds": 300},
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	exitCode, stdout, stderr := runApp(t, "webhook", "disable", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook disable) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Disabled webhook mode") {
+		t.Fatalf("stdout = %q, want disable confirmation", stdout)
+	}
+	var updated map[string]any
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(config) error = %v", err)
+	}
+	if err := json.Unmarshal(raw, &updated); err != nil {
+		t.Fatalf("Unmarshal(config) error = %v", err)
+	}
+	if got := updated["webhook"].(map[string]any)["enabled"]; got != false {
+		t.Fatalf("webhook.enabled = %v, want false", got)
+	}
+}
+
+func TestWebhookStatusShowsConfigIntentWithoutDaemonRuntime(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"webhook": map[string]any{"enabled": true, "fallbackPollIntervalSeconds": 300},
+		"server":  map[string]any{"baseUrl": "http://127.0.0.1:1", "authMode": "none"},
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	exitCode, stdout, stderr := runApp(t, "webhook", "status", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook status) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Webhook config") || !strings.Contains(stdout, "available : no") {
+		t.Fatalf("stdout = %q, want config section and unavailable runtime", stdout)
+	}
+}
+
+func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/webhook/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/webhook/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_webhook", map[string]any{
+			"enabled":                     true,
+			"listenerPath":                "/webhook/forward",
+			"endpointUrl":                 "http://127.0.0.1:17310/webhook/forward",
+			"fallbackPollIntervalSeconds": 300,
+			"degraded":                    true,
+			"degradedReasons":             []string{"gh missing"},
+			"queue":                       map[string]any{"pending": 1, "capacity": 8, "activeWorkers": 0},
+			"counters":                    map[string]any{"deliveriesReceived": 2, "coalesced": 0, "dropped": 0, "queued": 1, "processed": 0, "failed": 0},
+			"recentOutcomes":              []map[string]any{{"at": "2026-04-20T10:00:00.000Z", "outcome": "degraded", "message": "gh missing"}},
+			"forwarders":                  []map[string]any{{"repo": "acme/looper", "running": false, "restartCount": 1, "lastError": "gh missing", "stdoutTail": []string{"line1"}, "stderrTail": []string{"line2"}}},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"webhook": map[string]any{"enabled": true, "fallbackPollIntervalSeconds": 300},
+		"server":  map[string]any{"baseUrl": server.URL, "authMode": "none"},
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	exitCode, stdout, stderr := runApp(t, "webhook", "status", "--verbose", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook status --verbose) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, needle := range []string{"Webhook runtime", "Forwarder acme/looper", "stdoutTail", "line1", "line2"} {
+		if !strings.Contains(stdout, needle) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout, needle)
+		}
+	}
+}

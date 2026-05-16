@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,6 +39,7 @@ const (
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
+	webhookListenerPath        = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -169,6 +171,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requestID = generateRequestID()
 	}
 
+	path := normalizePath(r.URL.Path)
+	if path == webhookListenerPath {
+		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
+			return
+		}
+		if !isLoopbackRemoteAddr(r.RemoteAddr) {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "webhook forwarding requires a loopback caller"})
+			return
+		}
+		if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+			WebhookStatus() looperdruntime.WebhookStatus
+		}); ok {
+			status := runtimeWithWebhook.WebhookStatus()
+			if !status.Enabled || status.Degraded {
+				h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is degraded; deliveries are not being processed"})
+				return
+			}
+		}
+		if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) }); ok {
+			runtimeWithWebhook.RecordWebhookDelivery(r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery"))
+		}
+		h.writeSuccess(w, requestID, map[string]any{"accepted": true})
+		return
+	}
+
 	if err := authorizeRequest(r, h.context.Config); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
@@ -177,8 +204,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, requestID, typed)
 		return
 	}
-
-	path := normalizePath(r.URL.Path)
 
 	switch path {
 	case apiBasePath + "/healthz":
@@ -213,6 +238,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		return
+	case apiBasePath + "/webhook/status":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+
+		h.writeSuccess(w, requestID, h.buildWebhookStatusResponse())
 		return
 	case apiBasePath + "/events":
 		payload, err := h.buildEventsRouteResponse(r)
@@ -612,6 +644,7 @@ type statusResponse struct {
 	Service       statusService       `json:"service"`
 	Storage       statusStorage       `json:"storage"`
 	Scheduler     statusScheduler     `json:"scheduler"`
+	Webhook       statusWebhook       `json:"webhook"`
 	Loops         statusLoops         `json:"loops"`
 	Safety        statusSafety        `json:"safety"`
 	Notifications statusNotifications `json:"notifications"`
@@ -678,6 +711,16 @@ type statusScheduler struct {
 	ActiveRuns     int  `json:"activeRuns"`
 }
 
+type statusWebhook struct {
+	Enabled                     bool     `json:"enabled"`
+	EndpointURL                 string   `json:"endpointUrl"`
+	FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
+	Degraded                    bool     `json:"degraded"`
+	DegradedReasons             []string `json:"degradedReasons"`
+	ConfiguredForwarders        int      `json:"configuredForwarders"`
+	RunningForwarders           int      `json:"runningForwarders"`
+}
+
 type statusLoopType struct {
 	Queued     int `json:"queued"`
 	Running    int `json:"running"`
@@ -719,6 +762,7 @@ type configResponse struct {
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
+	Webhook       config.WebhookConfig      `json:"webhook"`
 	Agent         config.AgentConfig        `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -761,6 +805,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Storage:       cfg.Storage,
 		Scheduler:     cfg.Scheduler,
+		Webhook:       cfg.Webhook,
 		Agent:         cfg.Agent,
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -779,6 +824,60 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Roles:    cfg.Roles,
 		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
 	}
+}
+
+func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		return runtimeWithWebhook.WebhookStatus()
+	}
+	return looperdruntime.WebhookStatus{
+		Enabled:                     h.context.Config.Webhook.Enabled,
+		FallbackPollIntervalSeconds: h.context.Config.Webhook.FallbackPollIntervalSeconds,
+		ListenerPath:                "/webhook/forward",
+		EndpointURL:                 strings.TrimRight(serverBaseURL(h.context.Config.Server), "/") + "/webhook/forward",
+		DegradedReasons:             []string{},
+		RecentOutcomes:              []looperdruntime.WebhookRecentOutcome{},
+		Forwarders:                  []looperdruntime.WebhookForwarderState{},
+	}
+}
+
+func summarizeWebhookStatus(status looperdruntime.WebhookStatus) statusWebhook {
+	running := 0
+	for _, forwarder := range status.Forwarders {
+		if forwarder.Running {
+			running++
+		}
+	}
+	return statusWebhook{
+		Enabled:                     status.Enabled,
+		EndpointURL:                 status.EndpointURL,
+		FallbackPollIntervalSeconds: status.FallbackPollIntervalSeconds,
+		Degraded:                    status.Degraded,
+		DegradedReasons:             append([]string{}, status.DegradedReasons...),
+		ConfiguredForwarders:        len(status.Forwarders),
+		RunningForwarders:           running,
+	}
+}
+
+func serverBaseURL(cfg config.ServerConfig) string {
+	if cfg.BaseURL != nil && strings.TrimSpace(*cfg.BaseURL) != "" {
+		return strings.TrimSpace(*cfg.BaseURL)
+	}
+	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(remoteAddr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {
@@ -844,7 +943,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
 		},
-		Loops: loopCounts,
+		Webhook: summarizeWebhookStatus(h.buildWebhookStatusResponse()),
+		Loops:   loopCounts,
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,

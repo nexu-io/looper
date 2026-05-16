@@ -28,6 +28,15 @@ type statusOutput struct {
 		QueuedItems  int  `json:"queuedItems"`
 		RunningItems int  `json:"runningItems"`
 	} `json:"scheduler"`
+	Webhook struct {
+		Enabled                     bool     `json:"enabled"`
+		EndpointURL                 string   `json:"endpointUrl"`
+		FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
+		Degraded                    bool     `json:"degraded"`
+		DegradedReasons             []string `json:"degradedReasons"`
+		ConfiguredForwarders        int      `json:"configuredForwarders"`
+		RunningForwarders           int      `json:"runningForwarders"`
+	} `json:"webhook"`
 	Loops struct {
 		Planner  statusLoopSummary `json:"planner"`
 		Reviewer statusLoopSummary `json:"reviewer"`
@@ -207,6 +216,8 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Storage", [][2]any{{"dbPath", data.Storage.DBPath}, {"schemaVersion", data.Storage.SchemaVersion}, {"healthy", data.Storage.Healthy}, {"pendingMigrations", joinOrNone(data.Storage.PendingMigrations)}})
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
+	fmt.Fprintln(w)
+	printSection(w, "Webhook", [][2]any{{"enabled", data.Webhook.Enabled}, {"endpointUrl", data.Webhook.EndpointURL}, {"fallbackPollIntervalSeconds", data.Webhook.FallbackPollIntervalSeconds}, {"degraded", data.Webhook.Degraded}, {"configuredForwarders", data.Webhook.ConfiguredForwarders}, {"runningForwarders", data.Webhook.RunningForwarders}, {"degradedReasons", joinOrNone(data.Webhook.DegradedReasons)}})
 	fmt.Fprintln(w)
 	printTable(w, []string{"type", "queued", "running", "waiting", "paused", "failed", "terminated", "stopped"}, []tableRow{{"type": "planner", "queued": data.Loops.Planner.Queued, "running": data.Loops.Planner.Running, "waiting": data.Loops.Planner.Waiting, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed, "terminated": data.Loops.Planner.Terminated, "stopped": data.Loops.Planner.Stopped}, {"type": "reviewer", "queued": data.Loops.Reviewer.Queued, "running": data.Loops.Reviewer.Running, "waiting": data.Loops.Reviewer.Waiting, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed, "terminated": data.Loops.Reviewer.Terminated, "stopped": data.Loops.Reviewer.Stopped}, {"type": "worker", "queued": data.Loops.Worker.Queued, "running": data.Loops.Worker.Running, "waiting": data.Loops.Worker.Waiting, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed, "terminated": data.Loops.Worker.Terminated, "stopped": data.Loops.Worker.Stopped}, {"type": "fixer", "queued": data.Loops.Fixer.Queued, "running": data.Loops.Fixer.Running, "waiting": data.Loops.Fixer.Waiting, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed, "terminated": data.Loops.Fixer.Terminated, "stopped": data.Loops.Fixer.Stopped}})
 	fmt.Fprintln(w)

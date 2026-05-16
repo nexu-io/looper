@@ -92,6 +92,15 @@
             "totalRuns": 1,
             "activeRuns": 1
           },
+          "webhook": {
+            "enabled": false,
+            "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
+            "fallbackPollIntervalSeconds": 300,
+            "degraded": false,
+            "degradedReasons": [],
+            "configuredForwarders": 0,
+            "runningForwarders": 0
+          },
           "loops": {
             "planner": {
               "queued": 0,
@@ -174,6 +183,10 @@
             "retryMaxAttempts": 5,
             "retryBaseDelayMs": 5000,
             "slowLaneWarnThresholdMs": 5000
+          },
+          "webhook": {
+            "enabled": false,
+            "fallbackPollIntervalSeconds": 300
           },
           "agent": {
             "env": {},

@@ -109,6 +109,7 @@ type Runtime struct {
 	recoveryDone       chan struct{}
 	activeExecutions   *ActiveExecutionRegistry
 	githubGateway      *githubinfra.Gateway
+	webhook            *webhookRuntime
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
 	startupReadyErr    error
@@ -169,6 +170,7 @@ func New(options Options) *Runtime {
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 		activeExecutions:       NewActiveExecutionRegistry(),
+		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
 	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
@@ -204,6 +206,7 @@ func (r *Runtime) Stop(reason string) {
 
 		r.stopDeferredReviewerRecovery()
 		r.stopSchedulerLoop()
+		r.stopWebhookRuntime()
 
 		r.mu.Lock()
 		r.stopped = true
@@ -277,6 +280,34 @@ func (r *Runtime) RecoverySummary() RecoverySummary {
 	defer r.mu.RUnlock()
 
 	return r.recovery
+}
+
+func (r *Runtime) WebhookStatus() WebhookStatus {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook == nil {
+		return WebhookStatus{}
+	}
+	return webhook.Status()
+}
+
+func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.RecordDelivery(eventType, deliveryID)
+	}
+}
+
+func (r *Runtime) stopWebhookRuntime() {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.Stop()
+	}
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -446,6 +477,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if !schedulerDisabled {
 			r.startSchedulerLoop()
 		}
+		if r.webhook != nil {
+			r.webhook.Start(repositories)
+		}
 		r.startDeferredReviewerRecovery(githubGateway)
 
 		if r.logger != nil {
@@ -464,7 +498,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 }
 
 func (r *Runtime) startSchedulerLoop() {
-	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
+	pollInterval := schedulerFullPollInterval(r.config)
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
@@ -517,6 +551,13 @@ func (r *Runtime) startSchedulerLoop() {
 			}
 		}
 	}()
+}
+
+func schedulerFullPollInterval(cfg config.Config) time.Duration {
+	if cfg.Webhook.Enabled {
+		return time.Duration(cfg.Webhook.FallbackPollIntervalSeconds) * time.Second
+	}
+	return time.Duration(cfg.Scheduler.PollIntervalSeconds) * time.Second
 }
 
 func (r *Runtime) stopSchedulerLoop() {

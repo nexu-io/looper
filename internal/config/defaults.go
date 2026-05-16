@@ -71,6 +71,10 @@ func DefaultConfig(cwd string) (Config, error) {
 			RetryBaseDelayMS:        5000,
 			SlowLaneWarnThresholdMS: 5000,
 		},
+		Webhook: WebhookConfig{
+			Enabled:                     false,
+			FallbackPollIntervalSeconds: 300,
+		},
 		Agent: AgentConfig{
 			Params:       map[string]any{},
 			Env:          map[string]string{},
