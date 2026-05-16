@@ -913,6 +913,27 @@ func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	if err := runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	}
+}
+
 func TestHandlerProjectsRemoveRouteDeletesProjectWithEscapedSlashInName(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
