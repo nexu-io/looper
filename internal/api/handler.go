@@ -30,6 +30,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
@@ -123,6 +124,7 @@ type sweeperReplayResponse struct {
 type Context struct {
 	Config               config.Config
 	Runtime              RuntimeState
+	WebhookForwarder     webhookforward.Forwarder
 	ProjectsService      projectService
 	Now                  func() time.Time
 	RecoverySummary      func() any
@@ -132,9 +134,10 @@ type Context struct {
 }
 
 type Handler struct {
-	context         Context
-	now             func() time.Time
-	recoverySummary func() any
+	context          Context
+	now              func() time.Time
+	recoverySummary  func() any
+	webhookForwarder webhookforward.Forwarder
 }
 
 func NewHandler(context Context) *Handler {
@@ -157,21 +160,43 @@ func NewHandler(context Context) *Handler {
 			}
 		}
 	}
+	forwarder := context.WebhookForwarder
+	if forwarder == nil {
+		if runtimeWithForwarder, ok := any(context.Runtime).(interface {
+			WebhookForwarder() looperdruntime.WebhookForwarder
+		}); ok {
+			forwarder = runtimeWithForwarder.WebhookForwarder()
+		}
+	}
 
 	return &Handler{
-		context:         context,
-		now:             now,
-		recoverySummary: recoverySummary,
+		context:          context,
+		now:              now,
+		recoverySummary:  recoverySummary,
+		webhookForwarder: forwarder,
 	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
 	if requestID == "" {
 		requestID = generateRequestID()
 	}
+	if path == "/webhook/forward" {
+		payload, err := h.buildWebhookForwardResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
 
-	path := normalizePath(r.URL.Path)
 	if path == webhookListenerPath {
 		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
 			return
@@ -480,6 +505,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status:  http.StatusNotFound,
 		message: fmt.Sprintf("Unknown route: %s", path),
 	})
+}
+
+func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.ForwardResult, error) {
+	if r.Method != http.MethodPost {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Unsupported method for /webhook/forward"}
+	}
+	if !isLoopbackRequest(r) {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
+	}
+	if hasForwardingProxyHeaders(r.Header) {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding does not accept proxied loopback requests"}
+	}
+	if h.webhookForwarder == nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	if err != nil {
+		status := http.StatusBadRequest
+		code := pkgapi.ErrorCodeValidationFailed
+		message := err.Error()
+		lower := strings.ToLower(message)
+		if strings.Contains(lower, "not configured") {
+			status = http.StatusInternalServerError
+			code = pkgapi.ErrorCodeInternalError
+		} else if strings.Contains(lower, "queue is full") {
+			status = http.StatusServiceUnavailable
+		}
+		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
+	}
+	return result, nil
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func hasForwardingProxyHeaders(headers http.Header) bool {
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
+		if strings.TrimSpace(headers.Get(name)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 type apiError struct {

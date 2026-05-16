@@ -182,6 +182,7 @@ type IssueDetail struct {
 	Body              string
 	URL               string
 	State             string
+	StateReason       string
 	CreatedAt         string
 	UpdatedAt         string
 	ClosedAt          string
@@ -192,6 +193,25 @@ type IssueDetail struct {
 	IsPullRequest     bool
 	CommentCount      int
 	Comments          []CommentInfo
+}
+
+type IssueRepository struct {
+	Name     string
+	FullName string
+	URL      string
+	HTMLURL  string
+}
+
+type DependencyIssue struct {
+	ID            int64
+	Number        int64
+	Title         string
+	URL           string
+	HTMLURL       string
+	RepositoryURL string
+	State         string
+	StateReason   string
+	Repository    IssueRepository
 }
 
 type IssueCommentInput struct {
@@ -712,6 +732,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		StateReason:       asString(row["state_reason"]),
 		CreatedAt:         firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
@@ -723,6 +744,39 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		CommentCount:      len(commentRows),
 		Comments:          extractCommentInfos(commentRows),
 	}, nil
+}
+
+func (g *Gateway) ListBlockedByIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "dependencies/blocked_by")
+}
+
+func (g *Gateway) ListBlockingIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "dependencies/blocking")
+}
+
+func (g *Gateway) ListSubIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "sub_issues")
+}
+
+func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput, suffix string) ([]DependencyIssue, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/%s", repo, input.IssueNumber, suffix), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DependencyIssue, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, extractDependencyIssue(row, input.Repo))
+	}
+	return out, nil
 }
 
 func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
@@ -2566,6 +2620,76 @@ func normalizeReaction(value any) (githubReaction, bool) {
 		return githubReaction{}, false
 	}
 	return githubReaction{ID: id, Content: content, UserLogin: userLogin}, true
+}
+
+func extractDependencyIssue(value map[string]any, defaultRepo string) DependencyIssue {
+	repositoryURL := asString(value["repository_url"])
+	repo := extractIssueRepository(value["repository"])
+	repo = completeIssueRepository(repo, repositoryURL, defaultRepo)
+	return DependencyIssue{
+		ID:            asInt64(value["id"]),
+		Number:        asInt64(value["number"]),
+		Title:         asString(value["title"]),
+		URL:           asString(value["url"]),
+		HTMLURL:       asString(value["html_url"]),
+		RepositoryURL: repositoryURL,
+		State:         asString(value["state"]),
+		StateReason:   asString(value["state_reason"]),
+		Repository:    repo,
+	}
+}
+
+func completeIssueRepository(repo IssueRepository, repositoryURL string, defaultRepo string) IssueRepository {
+	fullName, name := parseRepositoryIdentity(repositoryURL)
+	if fullName == "" {
+		fullName = strings.TrimSpace(defaultRepo)
+		_, fallbackRepo := splitRepoHostname(fullName)
+		_, name = splitRepoOwnerName(fallbackRepo)
+	}
+	if repo.Name == "" {
+		repo.Name = name
+	}
+	if repo.FullName == "" {
+		repo.FullName = fullName
+	}
+	if repo.URL == "" {
+		repo.URL = repositoryURL
+	}
+	return repo
+}
+
+func parseRepositoryIdentity(repositoryURL string) (fullName string, name string) {
+	parsed, err := url.Parse(strings.TrimSpace(repositoryURL))
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	switch {
+	case len(parts) >= 3 && parts[0] == "repos":
+		parts = parts[:3]
+	case len(parts) >= 5 && parts[0] == "api" && parts[1] == "v3" && parts[2] == "repos":
+		parts = parts[2:5]
+	default:
+		return "", ""
+	}
+	fullName = parts[1] + "/" + parts[2]
+	if hostname := strings.TrimSpace(parsed.Hostname()); hostname != "" && hostname != "github.com" && hostname != "api.github.com" {
+		fullName = hostname + "/" + fullName
+	}
+	return fullName, parts[2]
+}
+
+func extractIssueRepository(value any) IssueRepository {
+	row, _ := value.(map[string]any)
+	if row == nil {
+		return IssueRepository{}
+	}
+	return IssueRepository{
+		Name:     asString(row["name"]),
+		FullName: asString(row["full_name"]),
+		URL:      asString(row["url"]),
+		HTMLURL:  asString(row["html_url"]),
+	}
 }
 
 func resolveLabelColor(label string) string {

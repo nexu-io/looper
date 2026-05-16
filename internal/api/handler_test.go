@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
@@ -349,6 +350,56 @@ func TestHandlerUnauthorized(t *testing.T) {
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "UNAUTHORIZED")
 	assertEqual(t, errMap["message"], "Authorization token is required")
+}
+
+func TestHandlerWebhookForwardAllowsLoopbackWithoutBearerToken(t *testing.T) {
+	fixture := newTestFixture(t)
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-1")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["status"], "accepted")
+	assertEqual(t, data["workItems"], float64(1))
+}
+
+func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
+	fixture := newTestFixture(t)
+	token := "secret-token"
+	fixture.config.Server.AuthMode = config.AuthModeLocalToken
+	fixture.config.Server.LocalToken = &token
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "192.168.1.24:1234"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Delivery", "delivery-2")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	}
 }
 
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
@@ -4903,6 +4954,21 @@ func seedStatusLoopCounts(t *testing.T, rt *looperdruntime.Runtime) {
 		}
 	}
 }
+
+type fakeWebhookForwarder struct {
+	result webhookforward.ForwardResult
+	err    error
+	calls  int
+}
+
+func (f *fakeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func (f *fakeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+
+func (f *fakeWebhookForwarder) Close() {}
 
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()

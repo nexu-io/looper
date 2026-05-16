@@ -223,6 +223,65 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestCreatesLoopAndQueue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 {
+		t.Fatalf("result = %#v, want one queue item and one created loop", result)
+	}
+	if len(github.listCalls) != 0 {
+		t.Fatalf("list calls = %#v, want targeted discovery to avoid repo scan", github.listCalls)
+	}
+}
+
+func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", IsDraft: true, HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want skipped targeted discovery with no loop", result)
+	}
+}
+
+func TestDiscoverPullRequestReusesExistingActiveQueueItem(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}, {Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	first, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequest() error = %v", err)
+	}
+	second, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequest() error = %v", err)
+	}
+	if len(first.QueueItems) != 1 || len(second.QueueItems) != 1 || first.QueueItems[0].ID != second.QueueItems[0].ID {
+		t.Fatalf("first=%#v second=%#v, want same active queue item reused", first, second)
+	}
+	queues, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queues) != 1 {
+		t.Fatalf("len(Queue.List()) = %d, want one active queue item", len(queues))
+	}
+}
+
 func TestDiscoverPullRequestsSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
