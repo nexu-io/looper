@@ -197,30 +197,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if path == webhookListenerPath {
-		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
-			return
-		}
-		if !isLoopbackRemoteAddr(r.RemoteAddr) {
-			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "webhook forwarding requires a loopback caller"})
-			return
-		}
-		if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
-			WebhookStatus() looperdruntime.WebhookStatus
-		}); ok {
-			status := runtimeWithWebhook.WebhookStatus()
-			if !status.Enabled || status.Degraded {
-				h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is degraded; deliveries are not being processed"})
-				return
-			}
-		}
-		if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) }); ok {
-			runtimeWithWebhook.RecordWebhookDelivery(r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery"))
-		}
-		h.writeSuccess(w, requestID, map[string]any{"accepted": true})
-		return
-	}
-
 	if err := authorizeRequest(r, h.context.Config); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
@@ -520,11 +496,24 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if h.webhookForwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		status := runtimeWithWebhook.WebhookStatus()
+		if !status.Enabled {
+			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is disabled; deliveries are not being processed"}
+		}
+		if status.Degraded {
+			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is degraded; deliveries are not being processed"}
+		}
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	eventType := r.Header.Get("X-GitHub-Event")
+	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
@@ -537,6 +526,9 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 			status = http.StatusServiceUnavailable
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
+	}
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) }); ok {
+		runtimeWithWebhook.RecordWebhookDelivery(eventType, deliveryID)
 	}
 	return result, nil
 }
