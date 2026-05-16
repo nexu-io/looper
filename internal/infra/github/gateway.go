@@ -2664,10 +2664,18 @@ func parseRepositoryIdentity(repositoryURL string) (fullName string, name string
 		return "", ""
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) < 3 || parts[0] != "repos" {
+	switch {
+	case len(parts) >= 3 && parts[0] == "repos":
+		parts = parts[:3]
+	case len(parts) >= 5 && parts[0] == "api" && parts[1] == "v3" && parts[2] == "repos":
+		parts = parts[2:5]
+	default:
 		return "", ""
 	}
 	fullName = parts[1] + "/" + parts[2]
+	if hostname := strings.TrimSpace(parsed.Hostname()); hostname != "" && hostname != "github.com" && hostname != "api.github.com" {
+		fullName = hostname + "/" + fullName
+	}
 	return fullName, parts[2]
 }
 

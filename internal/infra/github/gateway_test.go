@@ -354,6 +354,19 @@ func TestExtractDependencyIssueFallsBackToRepositoryURL(t *testing.T) {
 	}
 }
 
+func TestExtractDependencyIssueFallsBackToGHESRepositoryURL(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":             int64(12),
+		"number":         int64(34),
+		"title":          "blocked by",
+		"repository_url": "https://github.example.com/api/v3/repos/other/repo",
+	}, "github.example.com/acme/looper")
+	if issue.Repository.Name != "repo" || issue.Repository.FullName != "github.example.com/other/repo" || issue.Repository.URL != "https://github.example.com/api/v3/repos/other/repo" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from GHES repository_url", issue.Repository)
+	}
+}
+
 func TestExtractDependencyIssueFallsBackToRequestedRepo(t *testing.T) {
 	t.Parallel()
 	issue := extractDependencyIssue(map[string]any{
