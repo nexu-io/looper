@@ -162,6 +162,9 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					AssignTo: "",
 				},
+				Dependencies: CoordinatorDependenciesConfig{
+					Enabled: false,
+				},
 			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,

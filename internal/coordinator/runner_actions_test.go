@@ -404,6 +404,259 @@ func TestRunnerDiscoverIssuesPropagatesRepositoryPermissionFailures(t *testing.T
 	}
 }
 
+func TestRunnerCycleDetectionRemovesLabelsAndPostsOneComment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 1, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 1 remove count = %d, want 1", got)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 2, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 2 remove count = %d, want 1", got)
+	}
+	if len(fixture.github.createdBodies) != 2 {
+		t.Fatalf("createdBodies = %d, want 2 cycle comments", len(fixture.github.createdBodies))
+	}
+	for _, body := range fixture.github.createdBodies {
+		if !containsAll(body, cycleCommentMarker, "acme/looper#1 → acme/looper#2 → acme/looper#1") {
+			t.Fatalf("cycle comment body = %q", body)
+		}
+	}
+}
+
+func TestRunnerCycleDetectionIsIdempotent(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	marker1 := stampedCoordinatorBody(fixture.cfg, cycleCommentMarker+"\n\nold")
+	marker2 := stampedCoordinatorBody(fixture.cfg, cycleCommentMarker+"\n\nold")
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{nil, {{ID: 91, Author: "looper", Body: marker1, CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[2] = [][]githubinfra.CommentInfo{nil, {{ID: 92, Author: "looper", Body: marker2, CreatedAt: fixture.now.Format(time.RFC3339)}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() first error = %v", err)
+	}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() second error = %v", err)
+	}
+	if len(fixture.github.createdBodies) != 2 {
+		t.Fatalf("createdBodies = %d, want 2 total across both ticks", len(fixture.github.createdBodies))
+	}
+}
+
+func TestRunnerCycleDetectionUpdatesExistingMarkedComment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 91, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, cycleCommentMarker+"\n\nold"), CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[2] = [][]githubinfra.CommentInfo{{{ID: 92, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, cycleCommentMarker+"\n\nold"), CreatedAt: fixture.now.Format(time.RFC3339)}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.createdBodies) != 0 {
+		t.Fatalf("createdBodies = %d, want 0 when cycle marker already exists", len(fixture.github.createdBodies))
+	}
+	if len(fixture.github.updatedBodies) != 2 {
+		t.Fatalf("updatedBodies = %d, want 2", len(fixture.github.updatedBodies))
+	}
+	for _, body := range fixture.github.updatedBodies {
+		if !containsAll(body, cycleCommentMarker, "acme/looper#1 → acme/looper#2 → acme/looper#1") {
+			t.Fatalf("updated cycle body = %q", body)
+		}
+	}
+}
+
+func TestRunnerClosedNotPlannedBlockerReturnsDependentToRetriage(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "closed", StateReason: "not_planned"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 2, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 2 remove count = %d, want 1", got)
+	}
+	for _, body := range fixture.github.createdBodies {
+		if strings.Contains(body, cycleCommentMarker) {
+			t.Fatalf("unexpected cycle comment for not_planned path: %q", body)
+		}
+	}
+}
+
+func TestRunnerClosedDuplicateBlockerReturnsDependentToRetriage(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "closed", StateReason: "duplicate"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 2, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 2 remove count = %d, want 1", got)
+	}
+}
+
+func TestRunnerTieBreaksAutonomousDispatchByParentSubIssueOrder(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	seedParentIssue(fixture, 10)
+	seedDispatchIssue(fixture, 11)
+	seedDispatchIssue(fixture, 12)
+	seedDispatchIssue(fixture, 13)
+	fixture.github.subIssues[10] = []githubinfra.DependencyIssue{{Number: 12}, {Number: 11}, {Number: 13}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.assigned) != 2 {
+		t.Fatalf("assigned = %d, want 2", len(fixture.github.assigned))
+	}
+	if fixture.github.assigned[0].IssueNumber != 12 || fixture.github.assigned[1].IssueNumber != 11 {
+		t.Fatalf("assigned order = %d,%d, want 12,11", fixture.github.assigned[0].IssueNumber, fixture.github.assigned[1].IssueNumber)
+	}
+	if hasAssignedIssue(fixture.github.assigned, 13) {
+		t.Fatal("issue 13 should wait for next tick")
+	}
+}
+
+func TestRunnerTieBreakFallsBackToAscendingIssueNumber(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	seedDispatchIssue(fixture, 22)
+	seedDispatchIssue(fixture, 21)
+	seedDispatchIssue(fixture, 23)
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if fixture.github.assigned[0].IssueNumber != 21 || fixture.github.assigned[1].IssueNumber != 22 {
+		t.Fatalf("assigned order = %d,%d, want 21,22", fixture.github.assigned[0].IssueNumber, fixture.github.assigned[1].IssueNumber)
+	}
+}
+
+func TestRunnerTieBreakFallsBackWhenSubIssueLookupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	seedParentIssue(fixture, 10)
+	seedDispatchIssue(fixture, 22)
+	seedDispatchIssue(fixture, 21)
+	seedDispatchIssue(fixture, 23)
+	fixture.github.subIssueErr[10] = errors.New("sub issue api unavailable")
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if fixture.github.assigned[0].IssueNumber != 21 || fixture.github.assigned[1].IssueNumber != 22 {
+		t.Fatalf("assigned order = %d,%d, want 21,22", fixture.github.assigned[0].IssueNumber, fixture.github.assigned[1].IssueNumber)
+	}
+}
+
+func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "github.example.com/acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 1, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 1 remove count = %d, want 1", got)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 2, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 2 remove count = %d, want 1", got)
+	}
+}
+
+func TestRunnerReopenedBlockerDoesNothingForInFlightIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan", "looper:plan"})
+	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/plan"})
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if countRemovedIssueOperations(fixture.github.removedLabels, 1, "triaged", "dispatch/plan") != 0 {
+		t.Fatal("in-flight blocker issue should not be reset")
+	}
+	if hasAssignedIssue(fixture.github.assigned, 2) {
+		t.Fatal("dependent should remain blocked while blocker is open")
+	}
+}
+
+func TestRunnerReopenedBlockerHoldsUndispatchedDependent(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	seedDispatchIssue(fixture, 1)
+	seedDispatchIssue(fixture, 2)
+	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if hasAssignedIssue(fixture.github.assigned, 2) {
+		t.Fatal("dependent should remain held by dependency gate")
+	}
+}
+
 type coordinatorFixture struct {
 	runner    *Runner
 	github    *stubCoordinatorGitHub
@@ -435,7 +688,7 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	}
 	cfg.Disclosure.Enabled = true
 	cfg.Disclosure.Channels.IssueComment = true
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, subIssueErr: map[int64]error{}}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}})
 	return coordinatorFixture{runner: runner, github: github, cfg: &cfg, projectID: projectID, now: now, coord: coord}
 }
@@ -463,12 +716,18 @@ type stubCoordinatorGitHub struct {
 	details       map[int64]githubinfra.IssueDetail
 	comments      map[int64][][]githubinfra.CommentInfo
 	timeline      map[int64][]map[string]any
+	blockedBy     map[int64][]githubinfra.DependencyIssue
+	subIssues     map[int64][]githubinfra.DependencyIssue
+	subIssueErr   map[int64]error
 	permissionErr error
 	ops           []string
 	createdBodies []string
 	updatedBodies []string
 	commentReads  map[int64]int
 	failAddLabels map[string]error
+	addedLabels   []githubinfra.IssueLabelsInput
+	removedLabels []githubinfra.IssueLabelsInput
+	assigned      []githubinfra.IssueAssigneesInput
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -510,12 +769,23 @@ func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input
 	}
 	return "read", nil
 }
+func (s *stubCoordinatorGitHub) ListBlockedByIssues(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error) {
+	return append([]githubinfra.DependencyIssue(nil), s.blockedBy[input.IssueNumber]...), nil
+}
+func (s *stubCoordinatorGitHub) ListSubIssues(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error) {
+	if err := s.subIssueErr[input.IssueNumber]; err != nil {
+		return nil, err
+	}
+	return append([]githubinfra.DependencyIssue(nil), s.subIssues[input.IssueNumber]...), nil
+}
 func (s *stubCoordinatorGitHub) AddIssueAssignees(_ context.Context, input githubinfra.IssueAssigneesInput) error {
 	s.ops = append(s.ops, "assign:"+joinLabels(input.Assignees))
+	s.assigned = append(s.assigned, input)
 	return nil
 }
 func (s *stubCoordinatorGitHub) AddIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
 	s.ops = append(s.ops, "add:"+joinLabels(input.Labels))
+	s.addedLabels = append(s.addedLabels, input)
 	if s.failAddLabels != nil {
 		if err, ok := s.failAddLabels[joinLabels(input.Labels)]; ok {
 			return err
@@ -529,6 +799,7 @@ func (s *stubCoordinatorGitHub) AddIssueReaction(_ context.Context, input github
 }
 func (s *stubCoordinatorGitHub) RemoveIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
 	s.ops = append(s.ops, "remove:"+joinLabels(input.Labels))
+	s.removedLabels = append(s.removedLabels, input)
 	return nil
 }
 func (s *stubCoordinatorGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
@@ -544,6 +815,43 @@ func (s *stubCoordinatorGitHub) UpdateIssueComment(_ context.Context, input gith
 
 func joinLabels(labels []string) string {
 	return strings.Join(labels, ",")
+}
+
+func seedParentIssue(fixture coordinatorFixture, issueNumber int64) {
+	fixture.github.issues = append(fixture.github.issues, githubinfra.IssueSummary{Number: issueNumber})
+	fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Parent", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339)}
+}
+
+func seedDispatchIssue(fixture coordinatorFixture, issueNumber int64) {
+	seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/plan"})
+}
+
+func seedDispatchIssueWithLabels(fixture coordinatorFixture, issueNumber int64, labels []string) {
+	fixture.github.issues = append(fixture.github.issues, githubinfra.IssueSummary{Number: issueNumber, Labels: append([]string(nil), labels...)})
+	fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Issue", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: append([]string(nil), labels...), State: "open"}
+	fixture.github.timeline[issueNumber] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+}
+
+func countRemovedIssueOperations(inputs []githubinfra.IssueLabelsInput, issueNumber int64, labels ...string) int {
+	count := 0
+	for _, input := range inputs {
+		if input.IssueNumber != issueNumber {
+			continue
+		}
+		if joinLabels(input.Labels) == joinLabels(labels) {
+			count++
+		}
+	}
+	return count
+}
+
+func hasAssignedIssue(inputs []githubinfra.IssueAssigneesInput, issueNumber int64) bool {
+	for _, input := range inputs {
+		if input.IssueNumber == issueNumber {
+			return true
+		}
+	}
+	return false
 }
 
 func countOperations(ops []string, prefix string) int {

@@ -6,12 +6,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator/depgraph"
 	"github.com/nexu-io/looper/internal/coordinator/dispatch"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
@@ -23,6 +25,7 @@ const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 const triageCommentMarker = "<!-- looper:coordinator:triage -->"
 const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -->"
+const cycleCommentMarker = "<!-- looper:coordinator:cycle -->"
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -48,6 +51,8 @@ type GitHubGateway interface {
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
+	ListBlockedByIssues(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error)
+	ListSubIssues(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error)
 	AddIssueAssignees(context.Context, githubinfra.IssueAssigneesInput) error
 	AddIssueLabels(context.Context, githubinfra.IssueLabelsInput) error
 	AddIssueReaction(context.Context, githubinfra.CreateIssueReactionInput) error
@@ -83,6 +88,28 @@ type Runner struct {
 
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
+}
+
+type loadedIssue struct {
+	summary githubinfra.IssueSummary
+	detail  githubinfra.IssueDetail
+	issue   triage.Issue
+}
+
+type dependencyState struct {
+	enabled              bool
+	graph                depgraph.DependencyGraph
+	readySet             map[depgraph.IssueRef]struct{}
+	tracked              map[depgraph.IssueRef]loadedIssue
+	cycleCommentByIssue  map[int64]string
+	retriageIssueNumbers map[int64]struct{}
+	parentOrderByIssue   map[int64]issueOrder
+	trackedIssueByNumber map[int64]depgraph.IssueRef
+}
+
+type issueOrder struct {
+	parentNumber int64
+	index        int
 }
 
 func New(options Options) *Runner {
@@ -131,47 +158,53 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, config.ProjectRoleConfigs(*r.config, input.ProjectID))
-	processed := 0
+	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
 		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
 			continue
 		}
-		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary.Number)
+		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		dispatchIssue, err := r.dispatchIssue(ctx, input.Repo, project.RepoPath, issue, triageCfg.TriagedLabel, dispatchCfg)
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		dispatchAction := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
-		if r.hasDispatchWork(dispatchAction) {
-			if err := r.applyDispatchAction(ctx, input.Repo, project.RepoPath, issue, dispatchAction); err != nil {
-				return DiscoveryResult{}, err
-			}
-			if strings.TrimSpace(dispatchAction.FailureCommentBody) == "" {
-				continue
-			}
+		loaded = append(loaded, issue)
+	}
+
+	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, roleCfg.Dependencies.Enabled)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
+		return DiscoveryResult{}, err
+	}
+	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, deps); err != nil {
+		return DiscoveryResult{}, err
+	}
+
+	processed := 0
+	for _, loadedIssue := range loaded {
+		if _, skip := deps.retriageIssueNumbers[loadedIssue.issue.Number]; skip {
+			continue
 		}
 		if processed >= triageCfg.MaxPerTick {
 			continue
 		}
-		if !mightNeedCoordinatorAction(summary, triageCfg) {
+		if !mightNeedCoordinatorAction(loadedIssue.summary, triageCfg) {
 			continue
 		}
-		if !triage.ShouldReTriage(issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(issue, triageCfg, r.now().UTC()) {
+		if !triage.ShouldReTriage(loadedIssue.issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(loadedIssue.issue, triageCfg, r.now().UTC()) {
 			continue
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		if decision.NoOp {
 			continue
 		}
-		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, issue, triageCfg, analysisStartedAt, decision); err != nil {
+		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loadedIssue.issue, triageCfg, analysisStartedAt, decision); err != nil {
 			return DiscoveryResult{}, err
 		}
 	}
@@ -288,6 +321,305 @@ func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd strin
 
 }
 
+func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, enabled bool) (dependencyState, error) {
+	state := dependencyState{
+		enabled:              enabled,
+		readySet:             map[depgraph.IssueRef]struct{}{},
+		tracked:              map[depgraph.IssueRef]loadedIssue{},
+		cycleCommentByIssue:  map[int64]string{},
+		retriageIssueNumbers: map[int64]struct{}{},
+		parentOrderByIssue:   map[int64]issueOrder{},
+		trackedIssueByNumber: map[int64]depgraph.IssueRef{},
+	}
+	if !enabled {
+		return state, nil
+	}
+
+	snapshot := depgraph.Snapshot{BlockedBy: map[depgraph.IssueRef][]depgraph.IssueRef{}, Issues: map[depgraph.IssueRef]depgraph.IssueState{}}
+	trackedRefs := make([]depgraph.IssueRef, 0, len(loaded))
+	for _, item := range loaded {
+		if !dependencyTrackedIssue(item.issue, triageCfg.TriagedLabel, dispatchCfg) {
+			continue
+		}
+		ref := depgraph.IssueRef{Repo: normalizeDependencyRepo(repo), Number: item.issue.Number}
+		trackedRefs = append(trackedRefs, ref)
+		state.tracked[ref] = item
+		state.trackedIssueByNumber[item.issue.Number] = ref
+		snapshot.Issues[ref] = depgraph.IssueState{State: item.detail.State, StateReason: item.detail.StateReason}
+		blockers, err := r.github.ListBlockedByIssues(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: item.issue.Number, CWD: cwd})
+		if err != nil {
+			return dependencyState{}, err
+		}
+		for _, blocker := range blockers {
+			blockerRef := dependencyIssueRef(repo, blocker)
+			snapshot.BlockedBy[ref] = append(snapshot.BlockedBy[ref], blockerRef)
+			snapshot.Issues[blockerRef] = depgraph.IssueState{State: blocker.State, StateReason: blocker.StateReason}
+		}
+	}
+	if len(trackedRefs) == 0 {
+		return state, nil
+	}
+
+	state.graph = depgraph.Build(trackedRefs, snapshot)
+	for _, ref := range state.graph.ReadySet() {
+		state.readySet[ref] = struct{}{}
+	}
+	for _, cycle := range state.graph.Cycles() {
+		comment := cycleCommentBody(cycle)
+		for _, ref := range cycle[:len(cycle)-1] {
+			state.cycleCommentByIssue[ref.Number] = comment
+			state.retriageIssueNumbers[ref.Number] = struct{}{}
+		}
+	}
+	for _, ref := range trackedRefs {
+		for _, blocker := range state.graph.BlockersOf(ref) {
+			if blocker.RequiresReTriage {
+				state.retriageIssueNumbers[ref.Number] = struct{}{}
+				break
+			}
+		}
+	}
+	if err := r.populateParentOrdering(ctx, repo, cwd, loaded, &state); err != nil {
+		return dependencyState{}, err
+	}
+	return state, nil
+}
+
+func (r *Runner) populateParentOrdering(ctx context.Context, repo, cwd string, loaded []loadedIssue, deps *dependencyState) error {
+	if deps == nil || len(deps.readySet) < 2 {
+		return nil
+	}
+	readyNumbers := map[int64]struct{}{}
+	for ref := range deps.readySet {
+		readyNumbers[ref.Number] = struct{}{}
+	}
+	for _, item := range loaded {
+		subIssues, err := r.github.ListSubIssues(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: item.issue.Number, CWD: cwd})
+		if err != nil {
+			continue
+		}
+		for index, subIssue := range subIssues {
+			if _, ok := readyNumbers[subIssue.Number]; !ok {
+				continue
+			}
+			deps.parentOrderByIssue[subIssue.Number] = issueOrder{parentNumber: item.issue.Number, index: index}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, triageCfg triage.Config, deps dependencyState) error {
+	refs := make([]depgraph.IssueRef, 0, len(deps.tracked))
+	for ref := range deps.tracked {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		return refs[i].Number < refs[j].Number
+	})
+	for _, ref := range refs {
+		item := deps.tracked[ref]
+		if _, ok := deps.retriageIssueNumbers[ref.Number]; !ok {
+			continue
+		}
+		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, []string{triageCfg.TriagedLabel, "dispatch/*"}); err != nil {
+			return err
+		}
+		if commentBody, ok := deps.cycleCommentByIssue[item.issue.Number]; ok {
+			if err := r.postCycleComment(ctx, repo, cwd, item.issue.Number, commentBody); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+	if dispatchCfg.Mode == dispatch.ModeAutonomous {
+		return r.applyAutonomousDispatches(ctx, repo, cwd, loaded, triageCfg, dispatchCfg, deps)
+	}
+	for _, item := range loaded {
+		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
+			continue
+		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, item.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			return err
+		}
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		action = applyHumanDependencyGate(action, item.issue.Number, deps)
+		if r.hasDispatchWork(action) {
+			if err := r.applyDispatchAction(ctx, repo, cwd, item.issue, action); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+	ready := make([]autonomousDispatchCandidate, 0, len(loaded))
+	for _, item := range loaded {
+		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
+			continue
+		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, item.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			return err
+		}
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		if !r.hasDispatchWork(action) || strings.TrimSpace(action.FailureCommentBody) != "" {
+			continue
+		}
+		if deps.enabled {
+			ref, tracked := deps.trackedIssueByNumber[item.issue.Number]
+			if tracked {
+				if _, ok := deps.readySet[ref]; !ok {
+					continue
+				}
+			}
+		}
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number]})
+	}
+	sortAutonomousDispatchCandidates(ready)
+	budget := r.dispatchBudget()
+	for index, candidate := range ready {
+		if index >= budget {
+			break
+		}
+		if err := r.applyDispatchAction(ctx, repo, cwd, candidate.issue, candidate.action); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type autonomousDispatchCandidate struct {
+	issue  triage.Issue
+	action dispatch.Action
+	order  issueOrder
+}
+
+func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) {
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if left.order.parentNumber != 0 && left.order.parentNumber == right.order.parentNumber && left.order.index != right.order.index {
+			return left.order.index < right.order.index
+		}
+		return left.issue.Number < right.issue.Number
+	})
+}
+
+func (r *Runner) dispatchBudget() int {
+	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
+		return int(^uint(0) >> 1)
+	}
+	return r.config.Scheduler.MaxConcurrentRuns
+}
+
+func applyHumanDependencyGate(action dispatch.Action, issueNumber int64, deps dependencyState) dispatch.Action {
+	if !deps.enabled || action.ReactionCommentID == 0 || len(action.TriggerLabels) == 0 || strings.TrimSpace(action.FailureCommentBody) != "" {
+		return action
+	}
+	ref, ok := deps.trackedIssueByNumber[issueNumber]
+	if !ok {
+		return action
+	}
+	if _, ready := deps.readySet[ref]; ready {
+		return action
+	}
+	action.NoOp = true
+	action.TriggerLabels = nil
+	action.AssignTo = ""
+	action.ReactionContent = dispatch.ReactionFailure
+	action.FailureCommentBody = dependencyFailureCommentBody(deps.graph.BlockersOf(ref))
+	return action
+}
+
+func dependencyFailureCommentBody(blockers []depgraph.Blocker) string {
+	parts := make([]string, 0, len(blockers))
+	for _, blocker := range blockers {
+		state := blocker.State
+		switch {
+		case blocker.Unreachable:
+			state = "unreachable"
+		case strings.TrimSpace(blocker.StateReason) != "":
+			state = blocker.StateReason
+		case strings.TrimSpace(state) == "":
+			state = "blocking"
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", blocker.Issue.String(), state))
+	}
+	if len(parts) == 0 {
+		return "Coordinator can't dispatch until the dependency gate releases."
+	}
+	return "Coordinator can't dispatch until the dependency gate releases. Blocked by: " + strings.Join(parts, ", ") + "."
+}
+
+func cycleCommentBody(cycle depgraph.Cycle) string {
+	parts := make([]string, 0, len(cycle))
+	for _, ref := range cycle {
+		parts = append(parts, ref.String())
+	}
+	return fmt.Sprintf("This Issue is part of a `blocked_by` cycle: %s. Coordinator has returned the cycle members to the re-Triage candidate set. Resolve the cycle by editing the `blocked_by` relationships, then re-Triage will form a fresh Disposition.", strings.Join(parts, " → "))
+}
+
+func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg dispatch.Config) bool {
+	if !hasExactLabel(issue.Labels, triagedLabel) {
+		return false
+	}
+	dispatchLabel, ok := issueDispatchLabel(issue.Labels)
+	if !ok {
+		return false
+	}
+	triggerLabels := configuredTriggerLabels(dispatchLabel, dispatchCfg)
+	if len(triggerLabels) == 0 {
+		return false
+	}
+	return len(removeExistingLabels(triggerLabels, issue.Labels)) > 0
+}
+
+func issueDispatchLabel(labels []string) (string, bool) {
+	match := ""
+	for _, label := range labels {
+		if !strings.HasPrefix(label, "dispatch/") {
+			continue
+		}
+		if match != "" {
+			return "", false
+		}
+		match = label
+	}
+	return match, match != ""
+}
+
+func configuredTriggerLabels(dispatchLabel string, cfg dispatch.Config) []string {
+	switch dispatchLabel {
+	case dispatch.DispatchPlan:
+		return append([]string(nil), cfg.PlannerTriggerLabels...)
+	case dispatch.DispatchImplement:
+		return append([]string(nil), cfg.WorkerTriggerLabels...)
+	default:
+		return nil
+	}
+}
+
+func dependencyIssueRef(defaultRepo string, issue githubinfra.DependencyIssue) depgraph.IssueRef {
+	repo := strings.TrimSpace(issue.Repository.FullName)
+	if repo == "" {
+		repo = defaultRepo
+	}
+	return depgraph.IssueRef{Repo: normalizeDependencyRepo(repo), Number: issue.Number}
+}
+
+func normalizeDependencyRepo(repo string) string {
+	repo = strings.Trim(strings.TrimSpace(repo), "/")
+	parts := strings.Split(repo, "/")
+	if len(parts) >= 3 {
+		return strings.Join(parts[len(parts)-2:], "/")
+	}
+	return repo
+}
+
 func (r *Runner) postOrEditComment(ctx context.Context, repo, cwd string, issue triage.Issue, analysisStartedAt time.Time, body string) (bool, error) {
 	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issue.Number, CWD: cwd})
 	if err != nil {
@@ -339,14 +671,14 @@ func (r *Runner) removeIssueLabels(ctx context.Context, repo, cwd string, issueN
 	return r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issueNumber, Labels: labels, CWD: cwd})
 }
 
-func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, issueNumber int64) (triage.Issue, error) {
-	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, summary githubinfra.IssueSummary) (loadedIssue, error) {
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: summary.Number, CWD: cwd})
 	if err != nil {
-		return triage.Issue{}, err
+		return loadedIssue{}, err
 	}
-	timeline, err := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+	timeline, err := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: summary.Number, CWD: cwd})
 	if err != nil {
-		return triage.Issue{}, err
+		return loadedIssue{}, err
 	}
 	issue := triage.Issue{
 		Number:    detail.Number,
@@ -366,7 +698,7 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, issueNumber in
 	for _, event := range timeline {
 		issue.Timeline = append(issue.Timeline, triage.TimelineEvent{Event: strings.TrimSpace(asString(event["event"])), CreatedAt: firstNonEmpty(asString(event["created_at"]), asString(event["createdAt"])), Label: timelineLabelName(event)})
 	}
-	return issue, nil
+	return loadedIssue{summary: summary, detail: detail, issue: issue}, nil
 }
 
 func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles config.RoleConfigs) dispatch.Config {
@@ -601,8 +933,12 @@ func hasExactLabel(labels []string, want string) bool {
 }
 
 func findMarkerComment(comments []githubinfra.CommentInfo, currentLogin string) *githubinfra.CommentInfo {
+	return findCoordinatorComment(comments, currentLogin, triageCommentMarker)
+}
+
+func findCoordinatorComment(comments []githubinfra.CommentInfo, currentLogin string, marker string) *githubinfra.CommentInfo {
 	for index := range comments {
-		if !strings.Contains(comments[index].Body, triageCommentMarker) {
+		if !strings.Contains(comments[index].Body, marker) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(comments[index].Author), strings.TrimSpace(currentLogin)) {
@@ -613,15 +949,28 @@ func findMarkerComment(comments []githubinfra.CommentInfo, currentLogin string) 
 }
 
 func findDispatchFailureComment(comments []githubinfra.CommentInfo, currentLogin string) *githubinfra.CommentInfo {
-	for index := range comments {
-		if !strings.Contains(comments[index].Body, dispatchFailureCommentMarker) {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(comments[index].Author), strings.TrimSpace(currentLogin)) {
-			return &comments[index]
-		}
+	return findCoordinatorComment(comments, currentLogin, dispatchFailureCommentMarker)
+}
+
+func (r *Runner) postCycleComment(ctx context.Context, repo, cwd string, issueNumber int64, body string) error {
+	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+	if err != nil {
+		return err
 	}
-	return nil
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	if findCoordinatorComment(comments, currentLogin, cycleCommentMarker) != nil {
+		commentBody := cycleCommentMarker + "\n\n" + strings.TrimSpace(body)
+		commentBody = disclosure.FromConfig(*r.config).Markdown(commentBody, "coordinator", disclosure.ChannelIssueComment)
+		existing := findCoordinatorComment(comments, currentLogin, cycleCommentMarker)
+		return r.github.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: repo, CommentID: existing.ID, Body: commentBody, CWD: cwd})
+	}
+	commentBody := cycleCommentMarker + "\n\n" + strings.TrimSpace(body)
+	commentBody = disclosure.FromConfig(*r.config).Markdown(commentBody, "coordinator", disclosure.ChannelIssueComment)
+	_, err = r.github.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: issueNumber, Body: commentBody, CWD: cwd})
+	return err
 }
 
 func knownCommentIDs(comments []triage.Comment) map[int64]struct{} {

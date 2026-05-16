@@ -482,11 +482,16 @@ type CoordinatorDispatchConfig struct {
 	AssignTo   string                              `json:"assignTo"`
 }
 
+type CoordinatorDependenciesConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
 type CoordinatorRoleConfig struct {
-	Enabled      bool                      `json:"enabled"`
-	PollInterval string                    `json:"pollInterval"`
-	Triage       CoordinatorTriageConfig   `json:"triage"`
-	Dispatch     CoordinatorDispatchConfig `json:"dispatch"`
+	Enabled      bool                          `json:"enabled"`
+	PollInterval string                        `json:"pollInterval"`
+	Triage       CoordinatorTriageConfig       `json:"triage"`
+	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
+	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
 }
 
 type RoleConfigs struct {
@@ -878,11 +883,16 @@ type PartialCoordinatorDispatchConfig struct {
 	AssignTo   *string                                     `json:"assignTo,omitempty"`
 }
 
+type PartialCoordinatorDependenciesConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
-	Enabled      *bool                             `json:"enabled,omitempty"`
-	PollInterval *string                           `json:"pollInterval,omitempty"`
-	Triage       *PartialCoordinatorTriageConfig   `json:"triage,omitempty"`
-	Dispatch     *PartialCoordinatorDispatchConfig `json:"dispatch,omitempty"`
+	Enabled      *bool                                 `json:"enabled,omitempty"`
+	PollInterval *string                               `json:"pollInterval,omitempty"`
+	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
+	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
+	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
 }
 
 type PartialRoleConfigs struct {

@@ -211,6 +211,9 @@
               "holdLabel": "looper:hold"
             },
             "assignTo": ""
+          },
+          "dependencies": {
+            "enabled": false
           }
         },
         "planner": {

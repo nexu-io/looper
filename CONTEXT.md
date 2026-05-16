@@ -53,6 +53,15 @@ _Avoid_: queue label, pickup label.
 **Veto signal**:
 A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually.
 
+**Blocker**:
+An Issue listed in another Issue's GitHub-native `blocked_by` set. The Blocker's `state` and `state_reason`, together with `blocked_by` itself, are the named **Authority** for the dependency gate.
+
+**Dependency gate**:
+The **Dispatch** precondition that all **Blockers** be `state==closed AND state_reason==completed`. The gate is blocked when any Blocker is open or closed-not-completed, and released when every Blocker satisfies the condition.
+
+**Ready set**:
+The subset of tracked Issues whose **Dependency gate** is currently released — the Issues that may be **Dispatched** this tick, subject to the existing PRD #334 conditions.
+
 ### Authority and statelessness
 
 **Authority**:
@@ -73,6 +82,7 @@ A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) 
 
 - A **Coordinator** performs **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes
+- A **Coordinator** consults the **Dependency gate** before performing **Dispatch** when `roles.coordinator.dependencies.enabled = true`
 - A **Sweeper** retires Issues and Pull Requests that have aged past their **Trigger label** or have an `out-of-scope` Disposition
 - **Coordinator** and **Sweeper** are both stateless and compose via shared label semantics, not direct calls
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
@@ -94,5 +104,8 @@ A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) 
 > **Dev:** Why two steps?
 > **Domain expert:** Triage produces structured output. Dispatch consumes it. Splitting them gives humans a veto window between the two — they can remove `dispatch/needs-plan` if they disagree.
 >
+> **Dev:** Where do dependencies fit?
+> **Domain expert:** Before **Dispatch**, **Coordinator** consults the **Dependency gate**. If any **Blocker** in `blocked_by` is still open or was closed as anything other than `completed`, the Issue stays out of the **Ready set** until the gate releases.
+>
 > **Dev:** What if a human just types `/plan` instead of waiting?
-> **Domain expert:** Then **Coordinator** dispatches immediately. Human-gated mode is the default; autonomous mode requires the grace window. Either way the **Authority** for dispatch is the durable label on the **Issue**, never an in-memory decision.
+> **Domain expert:** Then **Coordinator** dispatches immediately unless the **Dependency gate** is blocked. Human-gated mode is the default; autonomous mode requires the grace window. Either way the **Authority** for dispatch is the durable label on the **Issue**, never an in-memory decision.
