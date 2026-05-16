@@ -1043,7 +1043,7 @@ func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutd
 
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}}})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 600 * time.Millisecond, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 250 * time.Millisecond, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}

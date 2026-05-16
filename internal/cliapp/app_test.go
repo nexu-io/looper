@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2811,10 +2812,12 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 
 	configPath := writeCLIConfig(t, server.URL, "")
 	ctx, cancel := context.WithCancel(context.Background())
+	cancelErr := make(chan error, 1)
 	go func() {
 		select {
 		case <-snapshotFlushed:
 		case <-time.After(2 * time.Second):
+			cancelErr <- errors.New("timed out waiting for snapshot flush")
 		}
 		time.Sleep(100 * time.Millisecond)
 		cancel()
@@ -2829,6 +2832,11 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Waiting for log output...") {
 		t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want waiting message", stdout)
+	}
+	select {
+	case err := <-cancelErr:
+		t.Fatal(err)
+	default:
 	}
 }
 
