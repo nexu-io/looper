@@ -2198,6 +2198,23 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 				continue
 			}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
+				return checkpoint, err
+			}
+			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
+				message := err.Error()
+				if strings.Contains(strings.ToLower(message), "already") {
+					if replyState == "sent" {
+						declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
+					}
+					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+					continue
+				}
+				mutationFailureCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+				continue
+			}
+			resolvedCount++
 			if replyState == "sent" {
 				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
 			}
@@ -3975,7 +3992,7 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Action == string(replyActionFixed) {
+		if item.Status == "resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
 			return true
 		}
 	}
@@ -5020,7 +5037,7 @@ func upsertResolvedComment(items *[]checkpointResolvedComment, next checkpointRe
 func alreadyResolved(items []checkpointResolvedComment, item FixItem) bool {
 	for _, entry := range items {
 		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
-			return entry.Status == "resolved" || entry.Status == "already_resolved"
+			return entry.Status == "resolved" || entry.Status == "already_resolved" || entry.Status == "agent_declined"
 		}
 	}
 	return false
