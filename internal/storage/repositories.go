@@ -1256,6 +1256,26 @@ type WorktreesRepository struct{ q sqliteQuerier }
 
 type QueueRepository struct{ q sqliteQuerier }
 
+func (r *QueueRepository) CreateOrGetActiveByDedupe(ctx context.Context, record QueueItemRecord) (QueueItemRecord, bool, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		err := r.Upsert(ctx, record)
+		if err == nil {
+			return record, true, nil
+		}
+		if !isQueueActiveDedupeConstraintError(err) {
+			return QueueItemRecord{}, false, err
+		}
+		existing, findErr := r.FindActiveByDedupe(ctx, record.DedupeKey)
+		if findErr != nil {
+			return QueueItemRecord{}, false, findErr
+		}
+		if existing != nil {
+			return *existing, false, nil
+		}
+	}
+	return QueueItemRecord{}, false, fmt.Errorf("upsert queue item: active dedupe conflict for %s", record.DedupeKey)
+}
+
 func (r *QueueRepository) Upsert(ctx context.Context, record QueueItemRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO queue_items (

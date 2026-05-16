@@ -1116,9 +1116,9 @@ func TestResolveWorkerInputRejectsPullRequestIssueTarget(t *testing.T) {
 func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	issueTarget := "issue:acme/looper:27"
-	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
-	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	issueTarget := "issue:acme/looper:28"
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":28,"baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":28,"baseBranch":"main"}`
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
 		ID:           "loop_worker_issue",
 		Seq:          2,
@@ -1145,7 +1145,7 @@ func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
 		TargetType:  "issue",
 		TargetID:    issueTarget,
 		Repo:        stringPtr("acme/looper"),
-		DedupeKey:   "worker:project_1:acme/looper:27",
+		DedupeKey:   "worker:project_1:acme/looper:28",
 		Priority:    1,
 		Status:      "queued",
 		AvailableAt: fixture.nowISO(),
@@ -1181,7 +1181,7 @@ func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
 	if result.Status != "skipped" {
 		t.Fatalf("result = %#v, want skipped", result)
 	}
-	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:27")
+	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:28")
 	if err != nil {
 		t.Fatalf("Locks.Get() error = %v", err)
 	}

@@ -2270,11 +2270,14 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	projectID := project.ID
 	loopID := loop.ID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	r.wakeSchedulerAfterEnqueue()
-	return queueItem, nil
+	if created {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return persisted, nil
 }
 
 func (r *Runner) wakeSchedulerAfterEnqueue() {

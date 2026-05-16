@@ -2989,8 +2989,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 					return storage.LoopRecord{}, findErr
 				}
 				if existingQueue == nil {
-					if upsertQueueErr := transactionRepos.Queue.Upsert(r.Context(), queueRecord); upsertQueueErr != nil {
+					persistedQueue, createdQueue, upsertQueueErr := transactionRepos.Queue.CreateOrGetActiveByDedupe(r.Context(), queueRecord)
+					if upsertQueueErr != nil {
 						return storage.LoopRecord{}, upsertQueueErr
+					}
+					if !createdQueue && persistedQueue.ID != queueRecord.ID {
+						return storage.LoopRecord{}, fmt.Errorf("active loop already exists for dedupe key %s", queueRecord.DedupeKey)
 					}
 				}
 			}

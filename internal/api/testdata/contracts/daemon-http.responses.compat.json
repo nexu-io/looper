@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0012_sweeper_proposal_raw_result",
-              "latestAppliedId": "0012_sweeper_proposal_raw_result",
+              "latestAvailableId": "0013_active_queue_dedupe",
+              "latestAppliedId": "0013_active_queue_dedupe",
               "pendingCount": 0
             }
           }
@@ -79,7 +79,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0012_sweeper_proposal_raw_result",
+            "schemaVersion": "0013_active_queue_dedupe",
             "pendingMigrations": [],
             "healthy": true
           },

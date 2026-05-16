@@ -614,11 +614,15 @@ func (r *Runner) buildQueueItem(ctx context.Context, seed queueSeed) (storage.Qu
 		CreatedAt:   nowISO,
 		UpdatedAt:   nowISO,
 	}
-	if err := r.repos.Queue.Upsert(ctx, item); err != nil {
+	_, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, item)
+	if err != nil {
 		return storage.QueueItemRecord{}, false, err
 	}
-	r.wakeSchedulerAfterEnqueue()
-	return item, true, nil
+	if created {
+		r.wakeSchedulerAfterEnqueue()
+		return item, true, nil
+	}
+	return storage.QueueItemRecord{}, false, nil
 }
 
 func (r *Runner) wakeSchedulerAfterEnqueue() {

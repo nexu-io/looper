@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1116,6 +1118,146 @@ func TestQueueRequeueFailedByIDWithAttemptsPreservesAttemptBudget(t *testing.T) 
 	item, _ := repos.Queue.GetByID(ctx, "failed_attempts")
 	if item == nil || item.Status != "queued" || item.Attempts != 3 || item.LastError != nil || item.LastErrorKind != nil {
 		t.Fatalf("failed_attempts = %#v, want queued with preserved attempts and cleared failure metadata", item)
+	}
+}
+
+func TestQueueCreateOrGetActiveByDedupeAllowsNewActiveAfterInactiveHistory(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_history"
+	loopID := "loop_history"
+	repoName := "acme/looper"
+	prNumber := int64(42)
+	dedupeKey := "reviewer:project_history:loop_history:acme/looper:42"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "failed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_completed", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_failed", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_cancelled", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "cancelled", AvailableAt: now, Attempts: 0, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	created, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, QueueItemRecord{ID: "queue_new", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
+	}
+	if !didCreate || created.ID != "queue_new" {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() = (%#v, %v), want newly created queue_new", created, didCreate)
+	}
+
+	active, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	}
+	if active == nil || active.ID != "queue_new" {
+		t.Fatalf("Queue.FindActiveByDedupe() = %#v, want queue_new", active)
+	}
+}
+
+func TestQueueCreateOrGetActiveByDedupeKeepsOneActiveItemUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		dedupeKey string
+		queueType string
+		priority  int64
+	}{
+		{name: "reviewer", dedupeKey: "reviewer:project_1:loop_1:acme/looper:42", queueType: "reviewer", priority: QueuePriorityReviewer},
+		{name: "fixer", dedupeKey: "fixer:project_1:loop_1:acme/looper:42:head-1:hash-1", queueType: "fixer", priority: QueuePriorityFixer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator := openMigratedCoordinatorForRepositories(t)
+			ctx := context.Background()
+			repos := NewRepositories(coordinator.DB())
+
+			now := "2026-04-11T12:00:00.000Z"
+			projectID := "project_1"
+			loopID := "loop_1"
+			repoName := "acme/looper"
+			prNumber := int64(42)
+			if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: tc.queueType, TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			const attempts = 8
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			results := make(chan QueueItemRecord, attempts)
+			errs := make(chan error, attempts)
+			createdCount := make(chan bool, attempts)
+			for i := 0; i < attempts; i++ {
+				wg.Add(1)
+				go func(index int) {
+					defer wg.Done()
+					<-start
+					item, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, QueueItemRecord{ID: fmt.Sprintf("queue_%d", index), ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: tc.dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+					if err != nil {
+						errs <- err
+						return
+					}
+					createdCount <- didCreate
+					results <- item
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+			close(results)
+			close(createdCount)
+
+			for err := range errs {
+				if err != nil {
+					t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
+				}
+			}
+			winnerID := ""
+			for item := range results {
+				if winnerID == "" {
+					winnerID = item.ID
+					continue
+				}
+				if item.ID != winnerID {
+					t.Fatalf("concurrent item ID = %q, want %q", item.ID, winnerID)
+				}
+			}
+			creates := 0
+			for didCreate := range createdCount {
+				if didCreate {
+					creates++
+				}
+			}
+			if creates != 1 {
+				t.Fatalf("created count = %d, want 1", creates)
+			}
+
+			items, err := repos.Queue.List(ctx)
+			if err != nil {
+				t.Fatalf("Queue.List() error = %v", err)
+			}
+			if len(items) != 1 {
+				t.Fatalf("len(Queue.List()) = %d, want 1", len(items))
+			}
+			if items[0].DedupeKey != tc.dedupeKey || items[0].Status != "queued" {
+				t.Fatalf("Queue.List()[0] = %#v, want queued item for %q", items[0], tc.dedupeKey)
+			}
+		})
 	}
 }
 
