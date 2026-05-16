@@ -98,7 +98,6 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
-	rt.addDegradedReason("targeted webhook processing is not yet enabled; using poll fallback")
 	if !isLoopbackHost(cfg.Server.Host) {
 		rt.addDegradedReason("server.host is not loopback; webhook forwarders require a loopback daemon endpoint")
 	}

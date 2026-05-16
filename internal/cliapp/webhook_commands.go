@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 	"github.com/spf13/cobra"
 )
 
@@ -129,16 +130,15 @@ func (r *commandRuntime) webhookStatus(cmd *cobra.Command, args []string) error 
 		return err
 	}
 	output := webhookStatusOutput{
-		ConfigPath:      loaded.Metadata.ConfigPath,
-		Enabled:         loaded.Config.Webhook.Enabled,
-		FallbackPoll:    loaded.Config.Webhook.FallbackPollIntervalSeconds,
-		RestartRequired: loaded.Config.Webhook.Enabled,
-		Warnings:        webhookWarnings(loaded.Config),
+		ConfigPath:   loaded.Metadata.ConfigPath,
+		Enabled:      loaded.Config.Webhook.Enabled,
+		FallbackPoll: loaded.Config.Webhook.FallbackPollIntervalSeconds,
+		Warnings:     webhookWarnings(loaded.Config),
 	}
 	client := r.apiClientFromLoaded(loaded)
 	payload, err := r.getJSONWithClient(cmd.Context(), client, "/api/v1/webhook/status")
 	if err != nil {
-		if !isDaemonUnreachableError(err) {
+		if !isWebhookRuntimeUnavailableError(err) {
 			return err
 		}
 	} else {
@@ -149,10 +149,21 @@ func (r *commandRuntime) webhookStatus(cmd *cobra.Command, args []string) error 
 		output.RuntimeAvailable = true
 		output.Runtime = &runtimeView
 	}
+	output.RestartRequired = webhookRuntimeRestartRequired(output)
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), output)
 	}
 	return writeHumanWebhookStatus(cmd.OutOrStdout(), output, getBoolFlag(cmd, "verbose"))
+}
+
+func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
+	if output.Runtime == nil {
+		return false
+	}
+	if output.Runtime.Enabled != output.Enabled {
+		return true
+	}
+	return output.Runtime.FallbackPollIntervalSeconds != output.FallbackPoll
 }
 
 func writeHumanWebhookStatus(w io.Writer, data webhookStatusOutput, verbose bool) error {
@@ -207,13 +218,13 @@ func webhookWarnings(cfg config.Config) []string {
 	return warnings
 }
 
-func isDaemonUnreachableError(err error) bool {
+func isWebhookRuntimeUnavailableError(err error) bool {
 	if err == nil {
 		return false
 	}
 	var apiErr *DaemonAPIError
 	if errors.As(err, &apiErr) {
-		return false
+		return apiErr.Code == pkgapi.ErrorCodeRouteNotFound
 	}
 	return strings.Contains(err.Error(), "looperd is not reachable:")
 }
