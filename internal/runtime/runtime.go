@@ -489,7 +489,7 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 			return err
 		}
 		if issueNumber == 0 {
-			return fmt.Errorf("coordinator dependency gate enabled but no issue available to probe dependencies API on %s", repo)
+			continue
 		}
 		if err := r.probeDependencyAPI(ctx, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
 			return err
