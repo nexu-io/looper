@@ -1261,6 +1261,56 @@ func TestQueueCreateOrGetActiveByDedupeKeepsOneActiveItemUnderConcurrency(t *tes
 	}
 }
 
+func TestQueueUpsertActiveByDedupeOrGetExistingReturnsActiveReviewerOrFixer(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		queueType string
+		priority  int64
+	}{
+		{name: "reviewer", queueType: "reviewer", priority: QueuePriorityReviewer},
+		{name: "fixer", queueType: "fixer", priority: QueuePriorityFixer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator := openMigratedCoordinatorForRepositories(t)
+			ctx := context.Background()
+			repos := NewRepositories(coordinator.DB())
+
+			now := "2026-04-11T12:00:00.000Z"
+			projectID := "project_1"
+			loopID := "loop_1"
+			repoName := "acme/looper"
+			prNumber := int64(42)
+			dedupeKey := fmt.Sprintf("%s:project_1:loop_1:acme/looper:42", tc.queueType)
+			if tc.queueType == "fixer" {
+				dedupeKey = "fixer:project_1:loop_1:acme/looper:42:head-1:hash-1"
+			}
+			if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: tc.queueType, TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			existing := QueueItemRecord{ID: "queue_existing", ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
+			if err := repos.Queue.Upsert(ctx, existing); err != nil {
+				t.Fatalf("Queue.Upsert(existing) error = %v", err)
+			}
+
+			persisted, didPersist, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, QueueItemRecord{ID: "queue_racing", ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+			if err != nil {
+				t.Fatalf("Queue.UpsertActiveByDedupeOrGetExisting() error = %v", err)
+			}
+			if didPersist {
+				t.Fatal("Queue.UpsertActiveByDedupeOrGetExisting() persisted = true, want false")
+			}
+			if persisted.ID != existing.ID {
+				t.Fatalf("Queue.UpsertActiveByDedupeOrGetExisting() = %#v, want existing queue item", persisted)
+			}
+		})
+	}
+}
+
 func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	t.Parallel()
 

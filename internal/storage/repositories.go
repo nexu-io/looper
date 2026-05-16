@@ -1258,22 +1258,43 @@ type QueueRepository struct{ q sqliteQuerier }
 
 func (r *QueueRepository) CreateOrGetActiveByDedupe(ctx context.Context, record QueueItemRecord) (QueueItemRecord, bool, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		err := r.Upsert(ctx, record)
+		persisted, didPersist, err := r.UpsertActiveByDedupeOrGetExisting(ctx, record)
 		if err == nil {
-			return record, true, nil
+			return persisted, didPersist, nil
 		}
-		if !isQueueActiveDedupeConstraintError(err) {
+		if !shouldRecoverActiveDedupeConflict(record, err) {
 			return QueueItemRecord{}, false, err
-		}
-		existing, findErr := r.FindActiveByDedupe(ctx, record.DedupeKey)
-		if findErr != nil {
-			return QueueItemRecord{}, false, findErr
-		}
-		if existing != nil {
-			return *existing, false, nil
 		}
 	}
 	return QueueItemRecord{}, false, fmt.Errorf("upsert queue item: active dedupe conflict for %s", record.DedupeKey)
+}
+
+func (r *QueueRepository) UpsertActiveByDedupeOrGetExisting(ctx context.Context, record QueueItemRecord) (QueueItemRecord, bool, error) {
+	err := r.Upsert(ctx, record)
+	if err == nil {
+		return record, true, nil
+	}
+	if !shouldRecoverActiveDedupeConflict(record, err) {
+		return QueueItemRecord{}, false, err
+	}
+	existing, findErr := r.FindActiveByDedupe(ctx, record.DedupeKey)
+	if findErr != nil {
+		return QueueItemRecord{}, false, findErr
+	}
+	if existing != nil {
+		return *existing, false, nil
+	}
+	return QueueItemRecord{}, false, err
+}
+
+func shouldRecoverActiveDedupeConflict(record QueueItemRecord, err error) bool {
+	if !isQueueActiveDedupeConstraintError(err) {
+		return false
+	}
+	if record.DedupeKey == "" {
+		return false
+	}
+	return record.Type == "reviewer" || record.Type == "fixer"
 }
 
 func (r *QueueRepository) Upsert(ctx context.Context, record QueueItemRecord) error {

@@ -1293,14 +1293,16 @@ func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Reposito
 		replacement.LastErrorKind = nil
 		replacement.CreatedAt = nowISO
 		replacement.UpdatedAt = nowISO
-		return repositories.Queue.Upsert(ctx, replacement)
+		_, _, err := repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
+		return err
 	}
 
 	queueRecord, ok, err := buildRecoveryQueueItem(loop, nowISO, maxAttempts)
 	if err != nil || !ok {
 		return err
 	}
-	return repositories.Queue.Upsert(ctx, queueRecord)
+	_, _, err = repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
+	return err
 }
 
 func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool, hasUncertainAgent bool) bool {

@@ -3358,9 +3358,11 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				updated.AvailableAt = availableAt
 				updated.UpdatedAt = r.nowISO()
 				updated.PayloadJSON = &payloadJSON
-				if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+				if err != nil {
 					return storage.QueueItemRecord{}, err
 				}
+				updated = persisted
 				r.wakeSchedulerAfterEnqueue()
 				return updated, nil
 			}

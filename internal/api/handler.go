@@ -3352,7 +3352,7 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
-					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
 				} else {
@@ -3361,7 +3361,7 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
-						if upsertQueueErr := repos.Queue.Upsert(ctx, queueRecord); upsertQueueErr != nil {
+						if _, _, upsertQueueErr := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); upsertQueueErr != nil {
 							return storage.LoopRecord{}, upsertQueueErr
 						}
 					}
@@ -3854,7 +3854,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
-					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
 				} else {
@@ -3863,7 +3863,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
-						if err := repos.Queue.Upsert(ctx, queueRecord); err != nil {
+						if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); err != nil {
 							return storage.LoopRecord{}, err
 						}
 					}
