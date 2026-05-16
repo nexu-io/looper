@@ -37,6 +37,7 @@ import (
 const (
 	requestIDHeaderName        = "x-request-id"
 	apiBasePath                = "/api/v1"
+	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
@@ -183,21 +184,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if requestID == "" {
 		requestID = generateRequestID()
 	}
-	if path == "/webhook/forward" {
-		payload, err := h.buildWebhookForwardResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
 
-	if err := authorizeRequest(r, h.context.Config); err != nil {
+	if err := authorizeRequest(r, path, h.context.Config); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
@@ -207,6 +195,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch path {
+	case webhookForwardPath:
+		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
+			return
+		}
+		if !isLoopbackRemoteAddr(r.RemoteAddr) {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "webhook forwarding requires a loopback caller"})
+			return
+		}
+		if h.context.TriggerSchedulerTick != nil {
+			h.context.TriggerSchedulerTick()
+		}
+		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, map[string]any{"accepted": true}))
+		return
 	case apiBasePath + "/healthz":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
 			return
@@ -612,7 +613,17 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	return false
 }
 
-func authorizeRequest(r *http.Request, cfg config.Config) error {
+func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
+	if path == webhookForwardPath && hasForwardingProxyHeaders(r.Header) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Webhook forwarding does not accept proxied loopback requests",
+		}
+	}
+	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
+		return nil
+	}
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -634,6 +645,23 @@ func authorizeRequest(r *http.Request, cfg config.Config) error {
 	}
 
 	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return false
+	}
+	host := remoteAddr
+	if parsedHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func normalizePath(path string) string {
@@ -938,18 +966,6 @@ func serverBaseURL(cfg config.ServerConfig) string {
 		return strings.TrimSpace(*cfg.BaseURL)
 	}
 	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-}
-
-func isLoopbackRemoteAddr(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
-	if err != nil {
-		host = strings.TrimSpace(remoteAddr)
-	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {
@@ -1529,9 +1545,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
-		runtimeWithWebhook.ReconcileWebhookForwarders()
-	}
+	_ = h.refreshWebhookForwarders()
 
 	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
 }
@@ -4962,9 +4976,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
-		runtimeWithWebhook.ReconcileWebhookForwarders()
-	}
+	_ = h.refreshWebhookForwarders()
 
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
@@ -4974,6 +4986,16 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
+}
+
+func (h *Handler) refreshWebhookForwarders() error {
+	if refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error }); ok {
+		return refresher.RefreshWebhookForwarders()
+	}
+	if refresher, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
+		refresher.ReconcileWebhookForwarders()
+	}
+	return nil
 }
 
 func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {

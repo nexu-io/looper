@@ -6,12 +6,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator/depgraph"
 	"github.com/nexu-io/looper/internal/coordinator/dispatch"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
@@ -40,11 +42,19 @@ type IssueSummary struct {
 	Labels []string
 }
 
+type loadedCoordinatorIssue struct {
+	summary       githubinfra.IssueSummary
+	issue         triage.Issue
+	dispatchIssue dispatch.Issue
+}
+
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
+	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
+	GetIssueState(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueState, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
@@ -131,7 +141,55 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, config.ProjectRoleConfigs(*r.config, input.ProjectID))
-	processed := 0
+	if !roleCfg.Dependencies.Enabled {
+		processed := 0
+		for _, summary := range issues {
+			if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
+				continue
+			}
+			issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary.Number)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			dispatchIssue, err := r.dispatchIssue(ctx, input.Repo, project.RepoPath, issue, triageCfg.TriagedLabel, dispatchCfg)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			dispatchAction := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), nil)
+			if r.hasDispatchWork(dispatchAction) {
+				if err := r.applyDispatchAction(ctx, input.Repo, project.RepoPath, issue, dispatchAction); err != nil {
+					return DiscoveryResult{}, err
+				}
+				if strings.TrimSpace(dispatchAction.FailureCommentBody) == "" {
+					continue
+				}
+			}
+			if processed >= triageCfg.MaxPerTick {
+				continue
+			}
+			if !mightNeedCoordinatorAction(summary, triageCfg) {
+				continue
+			}
+			if !triage.ShouldReTriage(issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(issue, triageCfg, r.now().UTC()) {
+				continue
+			}
+			analysisStartedAt := r.now().UTC()
+			processed++
+			decision, err := r.decide(ctx, project.RepoPath, input.Repo, issue, triageCfg)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			if decision.NoOp {
+				continue
+			}
+			if err := r.applyDecision(ctx, input.Repo, project.RepoPath, issue, triageCfg, analysisStartedAt, decision); err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
+		return DiscoveryResult{Ticked: true}, nil
+	}
+	tickNow := r.now().UTC()
+	loaded := make([]loadedCoordinatorIssue, 0, len(issues))
 	for _, summary := range issues {
 		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
 			continue
@@ -144,9 +202,17 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		dispatchAction := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC())
+		loaded = append(loaded, loadedCoordinatorIssue{summary: summary, issue: issue, dispatchIssue: dispatchIssue})
+	}
+	graph, err := r.buildDispatchDependencyGraph(ctx, input.Repo, project.RepoPath, roleCfg.Dependencies, dispatchCfg, loaded, tickNow)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	processed := 0
+	for _, loadedIssue := range loaded {
+		dispatchAction := dispatch.Decide(loadedIssue.dispatchIssue, dispatchCfg, tickNow, graph)
 		if r.hasDispatchWork(dispatchAction) {
-			if err := r.applyDispatchAction(ctx, input.Repo, project.RepoPath, issue, dispatchAction); err != nil {
+			if err := r.applyDispatchAction(ctx, input.Repo, project.RepoPath, loadedIssue.issue, dispatchAction); err != nil {
 				return DiscoveryResult{}, err
 			}
 			if strings.TrimSpace(dispatchAction.FailureCommentBody) == "" {
@@ -156,26 +222,137 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if processed >= triageCfg.MaxPerTick {
 			continue
 		}
-		if !mightNeedCoordinatorAction(summary, triageCfg) {
+		if !mightNeedCoordinatorAction(loadedIssue.summary, triageCfg) {
 			continue
 		}
-		if !triage.ShouldReTriage(issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(issue, triageCfg, r.now().UTC()) {
+		if !triage.ShouldReTriage(loadedIssue.issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(loadedIssue.issue, triageCfg, r.now().UTC()) {
 			continue
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		if decision.NoOp {
 			continue
 		}
-		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, issue, triageCfg, analysisStartedAt, decision); err != nil {
+		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loadedIssue.issue, triageCfg, analysisStartedAt, decision); err != nil {
 			return DiscoveryResult{}, err
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd string, depsCfg config.CoordinatorDependenciesConfig, dispatchCfg dispatch.Config, loaded []loadedCoordinatorIssue, now time.Time) (*depgraph.DependencyGraph, error) {
+	if !depsCfg.Enabled {
+		return nil, nil
+	}
+	candidates := dispatchDependencyCandidates(loaded, dispatchCfg, now)
+	if len(candidates) == 0 {
+		graph := depgraph.Build(nil, depgraph.Snapshot{})
+		return &graph, nil
+	}
+	tracked := make([]depgraph.IssueRef, 0, len(candidates))
+	snapshot := depgraph.Snapshot{
+		BlockedBy:   make(map[depgraph.IssueRef][]depgraph.IssueRef, len(candidates)),
+		Issues:      map[depgraph.IssueRef]depgraph.IssueState{},
+		Unreachable: []depgraph.IssueRef{},
+	}
+	for _, issueNumber := range candidates {
+		issueRef := depgraph.IssueRef{Repo: repo, Number: issueNumber}
+		tracked = append(tracked, issueRef)
+		blockedBy, err := r.listIssueBlockedByWithRetry(ctx, repo, cwd, issueNumber, depsCfg)
+		if err != nil {
+			return nil, err
+		}
+		for _, blocker := range blockedBy {
+			blockerRef, blockerState, reachable := r.loadBlockerState(ctx, cwd, blocker, depsCfg)
+			snapshot.BlockedBy[issueRef] = append(snapshot.BlockedBy[issueRef], blockerRef)
+			if reachable {
+				snapshot.Issues[blockerRef] = blockerState
+				continue
+			}
+			snapshot.Unreachable = append(snapshot.Unreachable, blockerRef)
+		}
+	}
+	graph := depgraph.Build(tracked, snapshot)
+	return &graph, nil
+}
+
+func dispatchDependencyCandidates(loaded []loadedCoordinatorIssue, cfg dispatch.Config, now time.Time) []int64 {
+	set := map[int64]struct{}{}
+	for _, loadedIssue := range loaded {
+		if !dispatch.NeedsDependencyGate(loadedIssue.dispatchIssue, cfg, now) {
+			continue
+		}
+		set[loadedIssue.issue.Number] = struct{}{}
+	}
+	out := make([]int64, 0, len(set))
+	for issueNumber := range set {
+		out = append(out, issueNumber)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+func (r *Runner) listIssueBlockedByWithRetry(ctx context.Context, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) ([]githubinfra.IssueDependency, error) {
+	var lastErr error
+	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
+		blockedBy, err := r.github.ListIssueBlockedBy(callCtx, githubinfra.ListIssueBlockedByInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+		cancel()
+		if err == nil {
+			return blockedBy, nil
+		}
+		lastErr = err
+		if !shouldRetryDependencyError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (r *Runner) loadBlockerState(ctx context.Context, cwd string, blocker githubinfra.IssueDependency, depsCfg config.CoordinatorDependenciesConfig) (depgraph.IssueRef, depgraph.IssueState, bool) {
+	blockerRef := depgraph.IssueRef{Repo: blocker.Repo, Number: blocker.Number}
+	var lastErr error
+	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
+		state, err := r.github.GetIssueState(callCtx, githubinfra.ViewIssueInput{Repo: blocker.Repo, IssueNumber: blocker.Number, CWD: cwd})
+		cancel()
+		if err == nil {
+			return blockerRef, depgraph.IssueState{State: strings.ToLower(strings.TrimSpace(state.State)), StateReason: strings.ToLower(strings.TrimSpace(state.StateReason))}, true
+		}
+		lastErr = err
+		if !shouldRetryDependencyError(err) {
+			break
+		}
+	}
+	_ = lastErr
+	return blockerRef, depgraph.IssueState{}, false
+}
+
+func dependencyTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func maxDependencyAttempts(attempts int) int {
+	if attempts <= 0 {
+		return 1
+	}
+	return attempts
+}
+
+func shouldRetryDependencyError(err error) bool {
+	if githubinfra.IsTransientError(err) {
+		return true
+	}
+	message := strings.ToLower(githubinfra.ErrorMessage(err))
+	return strings.Contains(message, "timed out") || strings.Contains(message, "context deadline exceeded")
 }
 
 func (r *Runner) hasDispatchWork(action dispatch.Action) bool {

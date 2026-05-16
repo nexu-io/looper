@@ -436,6 +436,7 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	cfg.Disclosure.Enabled = true
 	cfg.Disclosure.Channels.IssueComment = true
 	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}}
+	github.blockedBy = map[int64][]githubinfra.IssueDependency{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}})
 	return coordinatorFixture{runner: runner, github: github, cfg: &cfg, projectID: projectID, now: now, coord: coord}
 }
@@ -459,16 +460,18 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 }
 
 type stubCoordinatorGitHub struct {
-	issues        []githubinfra.IssueSummary
-	details       map[int64]githubinfra.IssueDetail
-	comments      map[int64][][]githubinfra.CommentInfo
-	timeline      map[int64][]map[string]any
-	permissionErr error
-	ops           []string
-	createdBodies []string
-	updatedBodies []string
-	commentReads  map[int64]int
-	failAddLabels map[string]error
+	issues         []githubinfra.IssueSummary
+	details        map[int64]githubinfra.IssueDetail
+	comments       map[int64][][]githubinfra.CommentInfo
+	timeline       map[int64][]map[string]any
+	blockedBy      map[int64][]githubinfra.IssueDependency
+	blockedByReads int
+	permissionErr  error
+	ops            []string
+	createdBodies  []string
+	updatedBodies  []string
+	commentReads   map[int64]int
+	failAddLabels  map[string]error
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -476,6 +479,10 @@ func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.List
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	return s.details[input.IssueNumber], nil
+}
+func (s *stubCoordinatorGitHub) GetIssueState(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueState, error) {
+	detail := s.details[input.IssueNumber]
+	return githubinfra.IssueState{State: detail.State, StateReason: detail.StateReason}, nil
 }
 func (s *stubCoordinatorGitHub) ListIssueComments(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
 	if s.commentReads == nil {
@@ -491,6 +498,10 @@ func (s *stubCoordinatorGitHub) ListIssueComments(_ context.Context, input githu
 	}
 	s.commentReads[input.IssueNumber]++
 	return append([]githubinfra.CommentInfo(nil), batches[reads]...), nil
+}
+func (s *stubCoordinatorGitHub) ListIssueBlockedBy(_ context.Context, input githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error) {
+	s.blockedByReads++
+	return append([]githubinfra.IssueDependency(nil), s.blockedBy[input.IssueNumber]...), nil
 }
 func (s *stubCoordinatorGitHub) GetCurrentUserLogin(context.Context, string) (string, error) {
 	return "looper", nil
@@ -540,6 +551,64 @@ func (s *stubCoordinatorGitHub) UpdateIssueComment(_ context.Context, input gith
 	s.ops = append(s.ops, "update-comment")
 	s.updatedBodies = append(s.updatedBodies, input.Body)
 	return nil
+}
+
+func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.details[9] = githubinfra.IssueDetail{Number: 9, State: "open"}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	fixture.github.blockedBy[1] = []githubinfra.IssueDependency{{Number: 9, Repo: "acme/looper"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"create-comment", "react:confused:11"})
+	if len(fixture.github.createdBodies) != 1 || !containsAll(fixture.github.createdBodies[0], dispatchFailureCommentMarker, "#9", "open") {
+		t.Fatalf("createdBodies = %v, want blocked_by failure comment", fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerAutonomousDispatchBlockedByVetoesSilently(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
+	fixture.github.details[9] = githubinfra.IssueDetail{Number: 9, State: "open"}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	fixture.github.blockedBy[1] = []githubinfra.IssueDependency{{Number: 9, Repo: "acme/looper"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %v, want no autonomous dispatch side effects", fixture.github.ops)
+	}
+}
+
+func TestRunnerDispatchSkipsDependencyAPIsWhenDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if fixture.github.blockedByReads != 0 {
+		t.Fatalf("blocked_by reads = %d, want 0 when dependencies are disabled", fixture.github.blockedByReads)
+	}
 }
 
 func joinLabels(labels []string) string {

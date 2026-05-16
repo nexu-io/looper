@@ -1,8 +1,11 @@
 package dispatch
 
 import (
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/nexu-io/looper/internal/coordinator/depgraph"
 )
 
 const (
@@ -53,14 +56,55 @@ type Action struct {
 	FailureCommentBody string
 }
 
-func Decide(issue Issue, cfg Config, now time.Time) Action {
+func Decide(issue Issue, cfg Config, now time.Time, graph *depgraph.DependencyGraph) Action {
 	if cfg.Mode == ModeAutonomous {
-		return decideAutonomous(issue, cfg, now)
+		return decideAutonomous(issue, cfg, now, graph)
 	}
-	return decideHumanGated(issue, cfg)
+	return decideHumanGated(issue, cfg, graph)
 }
 
-func decideHumanGated(issue Issue, cfg Config) Action {
+func NeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool {
+	if cfg.Mode == ModeAutonomous {
+		return autonomousNeedsDependencyGate(issue, cfg, now)
+	}
+	return humanNeedsDependencyGate(issue, cfg)
+}
+
+func humanNeedsDependencyGate(issue Issue, cfg Config) bool {
+	_, command, ok := latestCommandAttempt(issue.Comments, cfg.SlashCommands, cfg.AllowedUsers)
+	if !ok || !hasLabel(issue.Labels, cfg.TriagedLabel) {
+		return false
+	}
+	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
+	if !ok || dispatchLabel != commandDispatchLabel(command) {
+		return false
+	}
+	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
+	if len(triggerLabels) == 0 {
+		return false
+	}
+	return len(missingLabels(issue.Labels, triggerLabels)) > 0
+}
+
+func autonomousNeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool {
+	if !hasLabel(issue.Labels, cfg.TriagedLabel) {
+		return false
+	}
+	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
+	if !ok {
+		return false
+	}
+	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
+	if len(triggerLabels) == 0 || hasLabel(issue.Labels, strings.TrimSpace(cfg.HoldLabel)) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
+		return false
+	}
+	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
+		return false
+	}
+	return true
+}
+
+func decideHumanGated(issue Issue, cfg Config, graph *depgraph.DependencyGraph) Action {
 	comment, command, ok := latestCommandAttempt(issue.Comments, cfg.SlashCommands, cfg.AllowedUsers)
 	if !ok {
 		return Action{NoOp: true}
@@ -89,6 +133,9 @@ func decideHumanGated(issue Issue, cfg Config) Action {
 		action.ReactionContent = ReactionSuccess
 		return action
 	}
+	if blockers := graph.Unsatisfied(issue.Number); len(blockers) > 0 {
+		return fail(action, dependencyFailureBody(blockers))
+	}
 
 	action.AssignTo = strings.TrimSpace(cfg.AssignTo)
 	action.TriggerLabels = missingLabels
@@ -96,7 +143,7 @@ func decideHumanGated(issue Issue, cfg Config) Action {
 	return action
 }
 
-func decideAutonomous(issue Issue, cfg Config, now time.Time) Action {
+func decideAutonomous(issue Issue, cfg Config, now time.Time, graph *depgraph.DependencyGraph) Action {
 	if !hasLabel(issue.Labels, cfg.TriagedLabel) {
 		return Action{NoOp: true}
 	}
@@ -112,6 +159,9 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time) Action {
 		return Action{NoOp: true}
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
+		return Action{NoOp: true}
+	}
+	if len(graph.Unsatisfied(issue.Number)) > 0 {
 		return Action{NoOp: true}
 	}
 	return Action{AssignTo: strings.TrimSpace(cfg.AssignTo), TriggerLabels: missingLabels(issue.Labels, triggerLabels)}
@@ -260,4 +310,33 @@ func hasLabel(labels []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func dependencyFailureBody(blockers []depgraph.Blocker) string {
+	lines := []string{"Coordinator can't dispatch because blocked_by is still unsatisfied:"}
+	for _, blocker := range blockers {
+		lines = append(lines, fmt.Sprintf("- %s (%s)", blockerReference(blocker), blockerStateReason(blocker)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func blockerReference(blocker depgraph.Blocker) string {
+	repo := strings.TrimSpace(blocker.Repo)
+	if repo != "" {
+		return fmt.Sprintf("%s#%d", repo, blocker.Number)
+	}
+	return fmt.Sprintf("#%d", blocker.Number)
+}
+
+func blockerStateReason(blocker depgraph.Blocker) string {
+	if !blocker.Reachable {
+		return "unreachable"
+	}
+	if reason := strings.TrimSpace(blocker.StateReason); reason != "" {
+		return reason
+	}
+	if state := strings.TrimSpace(blocker.State); state != "" {
+		return state
+	}
+	return "unknown"
 }
