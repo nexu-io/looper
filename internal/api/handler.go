@@ -587,6 +587,13 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 }
 
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
+	if path == webhookForwardPath && hasForwardingProxyHeaders(r.Header) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Webhook forwarding does not accept proxied loopback requests",
+		}
+	}
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		return nil
 	}
