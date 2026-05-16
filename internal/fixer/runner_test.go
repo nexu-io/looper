@@ -5061,6 +5061,18 @@ func TestPublishRoundSummaryCommentUpdatesExistingSummaryFromGraphQLID(t *testin
 	}
 }
 
+func TestHasProgressedCountsAlreadyResolvedComment(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := fixerCheckpoint{
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{Status: "already_resolved"}}},
+	}
+
+	if !hasProgressed(checkpoint) {
+		t.Fatalf("hasProgressed() = false, want already_resolved to count as progress")
+	}
+}
+
 func TestProcessClaimedItemSkipsSummaryWhenNoNewCommits(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

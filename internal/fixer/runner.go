@@ -3992,7 +3992,7 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
+		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
 			return true
 		}
 	}
