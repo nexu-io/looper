@@ -5037,7 +5037,7 @@ func upsertResolvedComment(items *[]checkpointResolvedComment, next checkpointRe
 func alreadyResolved(items []checkpointResolvedComment, item FixItem) bool {
 	for _, entry := range items {
 		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
-			return entry.Status == "resolved" || entry.Status == "already_resolved" || entry.Status == "agent_declined"
+			return entry.Status == "resolved" || entry.Status == "already_resolved"
 		}
 	}
 	return false

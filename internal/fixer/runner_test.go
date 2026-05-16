@@ -1479,11 +1479,51 @@ func TestRunResolveCommentsStepPostsDeclinedReplyAndResolvesThread(t *testing.T)
 	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
 		t.Fatalf("resolved comments = %#v, want agent_declined", updated.ResolvedComments)
 	}
-	if !alreadyResolved(updated.ResolvedComments.Items, fixItems[0]) {
-		t.Fatalf("alreadyResolved() = false, want agent_declined to be terminal after resolve")
-	}
 	if !hasProgressed(updated) {
 		t.Fatalf("hasProgressed() = false, want declined resolution to count as progress")
+	}
+}
+
+func TestRunResolveCommentsStepRechecksLegacyDeclinedThreadState(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments: []map[string]any{{
+			"id":       "c1",
+			"threadId": "t1",
+			"body":     "please fix",
+			"author":   "alice",
+		}},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	runner := New(Options{GitHub: github})
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}}},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Status: "agent_declined", Message: "Out of scope for this PR.", ReplyState: "sent"}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want unresolved legacy declined thread resolved", github.resolveCalls)
+	}
+	if len(github.replyCalls) != 0 {
+		t.Fatalf("reply calls = %#v, want no duplicate declined reply", github.replyCalls)
+	}
+	if updated.ResolvedComments == nil || updated.ResolvedComments.Items[0].Status != "agent_declined" {
+		t.Fatalf("resolved comments = %#v, want agent_declined after re-resolve", updated.ResolvedComments)
 	}
 }
 
