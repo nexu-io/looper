@@ -784,7 +784,7 @@ func (g *Gateway) ListIssueBlockedBy(ctx context.Context, input ListIssueBlocked
 
 func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
 	hostname, repoName := splitRepoHostname(repo)
-	for page := 1; page <= 5; page++ {
+	for page := 1; ; page++ {
 		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
 		if hostname != "" {
 			args = append(args, "--hostname", hostname)
@@ -2513,7 +2513,7 @@ func dependencyRepo(value any, repositoryURL string, fallback string) string {
 func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 	repo := strings.TrimSpace(nameWithOwner)
 	parsed, err := url.Parse(strings.TrimSpace(repoURL))
-	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" {
+	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" || parsed.Hostname() == "api.github.com" {
 		return repo
 	}
 	return parsed.Hostname() + "/" + repo
