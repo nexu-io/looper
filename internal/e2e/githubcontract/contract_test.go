@@ -28,7 +28,7 @@ func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
 	fakeGH := harness.NewFakeGH(t, bins, schema)
 	writeFakeState(t, fakeGH.StatePath, fakeGHState{
 		Routes: map[string]json.RawMessage{
-			"repos/acme/looper/issues/7":          json.RawMessage(`{"number":7,"title":"Issue title","body":"body","html_url":"https://github.com/acme/looper/issues/7","state":"open","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"octocat"}],"labels":[{"name":"bug"}]}`),
+			"repos/acme/looper/issues/7":          json.RawMessage(`{"number":7,"title":"Issue title","body":"body","html_url":"https://github.com/acme/looper/issues/7","state":"open","state_reason":"completed","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"octocat"}],"labels":[{"name":"bug"}]}`),
 			"repos/acme/looper/issues/7/comments": json.RawMessage(`[]`),
 		},
 		GraphQL: map[string]json.RawMessage{
@@ -71,6 +71,9 @@ func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
 	if issue.AuthorAssociation != "COLLABORATOR" {
 		t.Fatalf("issue.AuthorAssociation = %q, want COLLABORATOR", issue.AuthorAssociation)
 	}
+	if issue.StateReason != "completed" {
+		t.Fatalf("issue.StateReason = %q, want completed", issue.StateReason)
+	}
 	if err := gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-1", CWD: root}); err != nil {
 		t.Fatalf("ResolveReviewThread() error = %v", err)
 	}
@@ -81,6 +84,50 @@ func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
 	assertInvocationMissingJSONField(t, invocations, "pr", "list", "authorAssociation")
 	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/7"})
 	assertInvocationContains(t, invocations, []string{"api", "graphql"})
+}
+
+func TestInvariantGatewayDependencyWrappersUseSupportedRoutes(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	writeFakeState(t, fakeGH.StatePath, fakeGHState{
+		Routes: map[string]json.RawMessage{
+			"repos/acme/looper/issues/22/dependencies/blocked_by": json.RawMessage(`[{"id":101,"number":101,"title":"blocked by","url":"https://api.example.test/issues/101","html_url":"https://example.test/issues/101","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]`),
+			"repos/acme/looper/issues/22/dependencies/blocking":   json.RawMessage(`[{"id":102,"number":102,"title":"blocking","url":"https://api.example.test/issues/102","html_url":"https://example.test/issues/102","repository_url":"https://api.example.test/repos/acme/looper","state":"closed","state_reason":"completed","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]`),
+			"repos/acme/looper/issues/22/sub_issues":              json.RawMessage(`[{"id":103,"number":103,"title":"sub issue","url":"https://api.example.test/issues/103","html_url":"https://example.test/issues/103","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]`),
+		},
+	})
+	root := t.TempDir()
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	t.Setenv("HOME", root)
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
+
+	blockedBy, err := gateway.ListBlockedByIssues(context.Background(), githubinfra.ViewIssueInput{Repo: "acme/looper", IssueNumber: 22, CWD: root})
+	if err != nil {
+		t.Fatalf("ListBlockedByIssues() error = %v", err)
+	}
+	blocking, err := gateway.ListBlockingIssues(context.Background(), githubinfra.ViewIssueInput{Repo: "acme/looper", IssueNumber: 22, CWD: root})
+	if err != nil {
+		t.Fatalf("ListBlockingIssues() error = %v", err)
+	}
+	subIssues, err := gateway.ListSubIssues(context.Background(), githubinfra.ViewIssueInput{Repo: "acme/looper", IssueNumber: 22, CWD: root})
+	if err != nil {
+		t.Fatalf("ListSubIssues() error = %v", err)
+	}
+	if len(blockedBy) != 1 || blockedBy[0].Number != 101 || blockedBy[0].Repository.FullName != "acme/looper" {
+		t.Fatalf("blockedBy = %#v, want parsed blocked-by route", blockedBy)
+	}
+	if len(blocking) != 1 || blocking[0].Number != 102 || blocking[0].StateReason != "completed" {
+		t.Fatalf("blocking = %#v, want parsed blocking route", blocking)
+	}
+	if len(subIssues) != 1 || subIssues[0].Number != 103 {
+		t.Fatalf("subIssues = %#v, want parsed sub-issue route", subIssues)
+	}
+	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
+	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/dependencies/blocked_by"})
+	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/dependencies/blocking"})
+	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/sub_issues"})
 }
 
 func TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation(t *testing.T) {

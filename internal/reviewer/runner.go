@@ -443,6 +443,13 @@ type DiscoveryInput struct {
 	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
+type TargetedDiscoveryInput struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
+	Snapshot  *githubinfra.DiscoverySnapshot
+}
+
 type DiscoveryResult struct {
 	QueueItems     []storage.QueueItemRecord
 	CreatedLoopIDs []string
@@ -693,68 +700,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return pr
 	}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
-		loopResult, loopErr := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, existing)
-		if loopErr != nil {
-			return loopErr
-		}
-		if terminalReviewerLoopReason(loopResult.record) == "failed" {
-			recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
-			if recoverErr != nil {
-				return recoverErr
-			}
-			if recovered != nil {
-				loopResult.record = *recovered
-			}
-		}
-		if terminalReviewerLoopReason(loopResult.record) != "" {
-			result.Skipped++
-			return nil
-		}
-		if loopResult.created {
-			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
-		}
-		meta := parseJSONObject(loopResult.record.MetadataJSON)
-		_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
-		if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
-			result.Skipped++
-			return nil
-		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
-			result.Skipped++
-			return nil
-		}
-		if reviewerLastSkipNeedsCurrentLogin(meta, pr) && currentLogin == "" {
-			lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-			if lookupErr != nil {
-				lookupLogin = ""
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
-			result.Skipped++
-			return nil
-		}
-		if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
-			result.Skipped++
-			return nil
-		}
-		availableAt := r.nextReviewAvailableAt(meta)
-		queueItem, queueErr := r.enqueue(ctx, enqueueInput{
-			ProjectID:   project.ID,
-			LoopID:      loopResult.record.ID,
-			Repo:        input.Repo,
-			PRNumber:    pr.Number,
-			HeadSHA:     pr.HeadSHA,
-			AvailableAt: availableAt,
-		})
-		if queueErr != nil {
-			return queueErr
-		}
-		if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
-			return err
-		}
-		result.QueueItems = append(result.QueueItems, queueItem)
-		return nil
+		return r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, existing, &result)
 	}
 	seenEnqueue := func(pr PullRequestSummary) error {
 		key := fmt.Sprintf("%s#%d", input.Repo, pr.Number)
@@ -801,36 +747,178 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !policy.IncludeDrafts && detail.IsDraft {
-			result.Skipped++
-			continue
-		}
-		if normalizePRState(detail.State) != "open" {
-			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
-				return DiscoveryResult{}, err
-			}
-			result.Skipped++
-			continue
-		}
-		if !isManualReviewerLoop(loop) && isSelfAuthoredPR(detail.Author, currentLogin, policy) {
-			result.Skipped++
-			continue
-		}
-		requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
-		if requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
-			result.Skipped++
-			continue
-		}
-		if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
-			result.Skipped++
-			continue
-		}
-		seen[key] = struct{}{}
-		if err := enqueue(summaryFromDetail(detail), &loop); err != nil {
+		queuedBefore := len(result.QueueItems)
+		if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
 			return DiscoveryResult{}, err
+		}
+		if len(result.QueueItems) > queuedBefore {
+			seen[key] = struct{}{}
 		}
 	}
 	return result, nil
+}
+
+func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
+		return DiscoveryResult{}, fmt.Errorf("reviewer repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	currentLogin := ""
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = normalizeLogin(currentLogin)
+	}
+	pr := summaryFromDetail(detail)
+	result := DiscoveryResult{}
+	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if len(existingLoops) > 0 {
+		for _, loop := range existingLoops {
+			queuedBefore := len(result.QueueItems)
+			if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
+				return DiscoveryResult{}, err
+			}
+			if len(result.QueueItems) > queuedBefore {
+				return result, nil
+			}
+		}
+		return result, nil
+	}
+	if !prEligibleForDiscovery(pr, currentLogin, policy) {
+		result.Skipped++
+		return result, nil
+	}
+	if err := r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, nil, &result); err != nil {
+		return DiscoveryResult{}, err
+	}
+	return result, nil
+}
+
+func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, result *DiscoveryResult) error {
+	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
+	if loopErr != nil {
+		return loopErr
+	}
+	if terminalReviewerLoopReason(loopResult.record) == "failed" {
+		recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
+		if recoverErr != nil {
+			return recoverErr
+		}
+		if recovered != nil {
+			loopResult.record = *recovered
+		}
+	}
+	if terminalReviewerLoopReason(loopResult.record) != "" {
+		result.Skipped++
+		return nil
+	}
+	if loopResult.created {
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	meta := parseJSONObject(loopResult.record.MetadataJSON)
+	_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
+	if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
+		result.Skipped++
+		return nil
+	}
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	if reviewerLastSkipNeedsCurrentLogin(meta, pr) && *currentLogin == "" {
+		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if lookupErr != nil {
+			lookupLogin = ""
+		}
+		*currentLogin = normalizeLogin(lookupLogin)
+	}
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
+		result.Skipped++
+		return nil
+	}
+	availableAt := r.nextReviewAvailableAt(meta)
+	queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+		ProjectID:   project.ID,
+		LoopID:      loopResult.record.ID,
+		Repo:        repo,
+		PRNumber:    pr.Number,
+		HeadSHA:     pr.HeadSHA,
+		AvailableAt: availableAt,
+	})
+	if queueErr != nil {
+		return queueErr
+	}
+	if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+		return err
+	}
+	result.QueueItems = append(result.QueueItems, queueItem)
+	return nil
+}
+
+func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, loop storage.LoopRecord, detail PullRequestDetail, result *DiscoveryResult) error {
+	if !policy.IncludeDrafts && detail.IsDraft {
+		result.Skipped++
+		return nil
+	}
+	if normalizePRState(detail.State) != "open" {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return err
+		}
+		result.Skipped++
+		return nil
+	}
+	if !isManualReviewerLoop(loop) && isSelfAuthoredPR(detail.Author, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
+	if requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
+		result.Skipped++
+		return nil
+	}
+	if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		result.Skipped++
+		return nil
+	}
+	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, result)
+}
+
+func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched := []storage.LoopRecord{}
+	for _, loop := range loops {
+		if loop.Type == "reviewer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+			matched = append(matched, loop)
+		}
+	}
+	return matched, nil
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {

@@ -250,21 +250,34 @@ func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd str
 	}
 	candidates := dispatchDependencyCandidates(loaded, dispatchCfg, now)
 	if len(candidates) == 0 {
-		return depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{}}), nil
+		graph := depgraph.Build(nil, depgraph.Snapshot{})
+		return &graph, nil
 	}
-	snapshot := depgraph.Snapshot{Issues: make(map[int64]depgraph.IssueSnapshot, len(candidates))}
+	tracked := make([]depgraph.IssueRef, 0, len(candidates))
+	snapshot := depgraph.Snapshot{
+		BlockedBy:   make(map[depgraph.IssueRef][]depgraph.IssueRef, len(candidates)),
+		Issues:      map[depgraph.IssueRef]depgraph.IssueState{},
+		Unreachable: []depgraph.IssueRef{},
+	}
 	for _, issueNumber := range candidates {
+		issueRef := depgraph.IssueRef{Repo: repo, Number: issueNumber}
+		tracked = append(tracked, issueRef)
 		blockedBy, err := r.listIssueBlockedByWithRetry(ctx, repo, cwd, issueNumber, depsCfg)
 		if err != nil {
 			return nil, err
 		}
-		issueSnapshot := depgraph.IssueSnapshot{Number: issueNumber, BlockedBy: make([]depgraph.BlockerSnapshot, 0, len(blockedBy))}
 		for _, blocker := range blockedBy {
-			issueSnapshot.BlockedBy = append(issueSnapshot.BlockedBy, r.loadBlockerSnapshot(ctx, cwd, blocker, depsCfg))
+			blockerRef, blockerState, reachable := r.loadBlockerState(ctx, cwd, blocker, depsCfg)
+			snapshot.BlockedBy[issueRef] = append(snapshot.BlockedBy[issueRef], blockerRef)
+			if reachable {
+				snapshot.Issues[blockerRef] = blockerState
+				continue
+			}
+			snapshot.Unreachable = append(snapshot.Unreachable, blockerRef)
 		}
-		snapshot.Issues[issueNumber] = issueSnapshot
 	}
-	return depgraph.Build(snapshot), nil
+	graph := depgraph.Build(tracked, snapshot)
+	return &graph, nil
 }
 
 func dispatchDependencyCandidates(loaded []loadedCoordinatorIssue, cfg dispatch.Config, now time.Time) []int64 {
@@ -300,7 +313,8 @@ func (r *Runner) listIssueBlockedByWithRetry(ctx context.Context, repo, cwd stri
 	return nil, lastErr
 }
 
-func (r *Runner) loadBlockerSnapshot(ctx context.Context, cwd string, blocker githubinfra.IssueDependency, depsCfg config.CoordinatorDependenciesConfig) depgraph.BlockerSnapshot {
+func (r *Runner) loadBlockerState(ctx context.Context, cwd string, blocker githubinfra.IssueDependency, depsCfg config.CoordinatorDependenciesConfig) (depgraph.IssueRef, depgraph.IssueState, bool) {
+	blockerRef := depgraph.IssueRef{Repo: blocker.Repo, Number: blocker.Number}
 	var lastErr error
 	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -308,7 +322,7 @@ func (r *Runner) loadBlockerSnapshot(ctx context.Context, cwd string, blocker gi
 		state, err := r.github.GetIssueState(callCtx, githubinfra.ViewIssueInput{Repo: blocker.Repo, IssueNumber: blocker.Number, CWD: cwd})
 		cancel()
 		if err == nil {
-			return depgraph.BlockerSnapshot{Number: blocker.Number, Repo: blocker.Repo, State: strings.ToLower(strings.TrimSpace(state.State)), StateReason: strings.ToLower(strings.TrimSpace(state.StateReason)), Reachable: true}
+			return blockerRef, depgraph.IssueState{State: strings.ToLower(strings.TrimSpace(state.State)), StateReason: strings.ToLower(strings.TrimSpace(state.StateReason))}, true
 		}
 		lastErr = err
 		if !shouldRetryDependencyError(err) {
@@ -316,7 +330,7 @@ func (r *Runner) loadBlockerSnapshot(ctx context.Context, cwd string, blocker gi
 		}
 	}
 	_ = lastErr
-	return depgraph.BlockerSnapshot{Number: blocker.Number, Repo: blocker.Repo, Reachable: false}
+	return blockerRef, depgraph.IssueState{}, false
 }
 
 func dependencyTimeout(seconds int) time.Duration {

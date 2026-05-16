@@ -87,7 +87,7 @@ func TestHumanGatedMissingDispatchFails(t *testing.T) {
 
 func TestHumanGatedBlockedByUnsatisfiedFails(t *testing.T) {
 	t.Parallel()
-	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "open", Reachable: true}}}}})
+	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "open"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{{ID: 49, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), graph)
 	if action.ReactionContent != ReactionFailure || action.FailureCommentBody == "" || !containsAllText(action.FailureCommentBody, "#9", "open") {
 		t.Fatalf("action = %#v, want blocked_by failure comment", action)
@@ -96,7 +96,7 @@ func TestHumanGatedBlockedByUnsatisfiedFails(t *testing.T) {
 
 func TestHumanGatedBlockedBySatisfiedStillDispatches(t *testing.T) {
 	t.Parallel()
-	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "closed", StateReason: "completed", Reachable: true}}}}})
+	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "closed", StateReason: "completed"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{{ID: 50, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), graph)
 	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.ReactionContent != ReactionSuccess {
 		t.Fatalf("action = %#v, want successful dispatch", action)

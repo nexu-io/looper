@@ -28,7 +28,7 @@ func TestAutonomousGraceElapsedAppliesTrigger(t *testing.T) {
 func TestAutonomousGraceElapsedAppliesTriggerWithSatisfiedBlockedByGraph(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "closed", StateReason: "completed", Reachable: true}}}}})
+	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "closed", StateReason: "completed"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
 	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" {
 		t.Fatalf("action = %#v, want autonomous planner dispatch with satisfied graph", action)
@@ -76,7 +76,7 @@ func TestAutonomousTriggerAlreadyPresentVetoesDispatch(t *testing.T) {
 func TestAutonomousUnsatisfiedBlockedByVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, State: "open", Reachable: true}}}}})
+	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "open"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
 	if !action.NoOp || len(action.TriggerLabels) != 0 {
 		t.Fatalf("action = %#v, want blocked_by veto", action)
@@ -86,7 +86,7 @@ func TestAutonomousUnsatisfiedBlockedByVetoesDispatch(t *testing.T) {
 func TestAutonomousUnreachableBlockedByVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	graph := depgraph.Build(depgraph.Snapshot{Issues: map[int64]depgraph.IssueSnapshot{1: {Number: 1, BlockedBy: []depgraph.BlockerSnapshot{{Number: 9, Reachable: false}}}}})
+	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
 	if !action.NoOp || len(action.TriggerLabels) != 0 {
 		t.Fatalf("action = %#v, want unreachable blocked_by veto", action)
@@ -103,4 +103,19 @@ func autonomousConfig() Config {
 		PlannerTriggerLabels: []string{"looper:plan"},
 		WorkerTriggerLabels:  []string{"looper:worker-ready"},
 	}
+}
+
+func dependencyGraph(repo string, issueNumber int64, blocker depgraph.IssueRef, blockerState depgraph.IssueState) *depgraph.DependencyGraph {
+	tracked := []depgraph.IssueRef{{Repo: repo, Number: issueNumber}}
+	snapshot := depgraph.Snapshot{
+		BlockedBy: map[depgraph.IssueRef][]depgraph.IssueRef{{Repo: repo, Number: issueNumber}: {blocker}},
+		Issues:    map[depgraph.IssueRef]depgraph.IssueState{},
+	}
+	if blockerState != (depgraph.IssueState{}) {
+		snapshot.Issues[blocker] = blockerState
+	} else {
+		snapshot.Unreachable = []depgraph.IssueRef{blocker}
+	}
+	graph := depgraph.Build(tracked, snapshot)
+	return &graph
 }
