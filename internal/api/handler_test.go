@@ -352,7 +352,7 @@ func TestHandlerUnauthorized(t *testing.T) {
 	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
-func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
@@ -364,6 +364,7 @@ func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing
 		recorded++
 		assertEqual(t, eventType, "pull_request")
 		assertEqual(t, deliveryID, "delivery-1")
+		triggered++
 	}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
 

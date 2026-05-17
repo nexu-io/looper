@@ -205,9 +205,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
-		if h.context.TriggerSchedulerTick != nil {
-			h.context.TriggerSchedulerTick()
-		}
 		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, payload))
 		return
 	case apiBasePath + "/healthz":
