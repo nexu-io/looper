@@ -183,6 +183,57 @@ func TestWebhookForwarderEventsIncludePush(t *testing.T) {
 	}
 }
 
+func TestClassifyForwarderExitTerminalPatterns(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		stderr  []string
+		pattern string
+	}{
+		{name: "hook already exists", stderr: []string{"Error: error creating webhook: HTTP 422: Validation Failed", "Hook already exists on this repository"}, pattern: "Hook already exists on this repository"},
+		{name: "auth", stderr: []string{"authentication required; run gh auth login"}, pattern: "authentication required"},
+		{name: "forbidden", stderr: []string{"HTTP 403: Resource not accessible by integration"}, pattern: "HTTP 403"},
+		{name: "not found", stderr: []string{"HTTP 404"}, pattern: "HTTP 404"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyForwarderExit(tc.stderr, errors.New("exit status 1"))
+			if got.Class != forwarderExitTerminal || got.MatchedPattern != tc.pattern {
+				t.Fatalf("classifyForwarderExit() = %#v, want terminal %q", got, tc.pattern)
+			}
+		})
+	}
+}
+
+func TestCommandFingerprintCanonicalizesEvents(t *testing.T) {
+	t.Parallel()
+	one, eventsOne := commandFingerprint("/bin/gh", "nexu-io/looper", []string{"Push", "issue_comment"}, "http://127.0.0.1:17310/webhook/forward")
+	two, eventsTwo := commandFingerprint("/bin/gh", "nexu-io/looper", []string{"issue_comment", "push"}, "http://127.0.0.1:17310/webhook/forward")
+	if one != two || eventsOne != "issue_comment,push" || eventsTwo != eventsOne {
+		t.Fatalf("fingerprints/events = %q/%q and %q/%q, want equal canonical", one, eventsOne, two, eventsTwo)
+	}
+	changed, _ := commandFingerprint("/bin/gh", "nexu-io/looper", []string{"issue_comment", "push"}, "http://localhost:17310/webhook/forward")
+	if changed == one {
+		t.Fatal("commandFingerprint endpoint change did not change fingerprint")
+	}
+}
+
+func TestCommandIdentityPartsParsesSplitAndEqualsArgs(t *testing.T) {
+	t.Parallel()
+	gh, endpoint, events := commandIdentityParts([]string{"/bin/gh", "webhook", "forward", "--repo", "nexu-io/looper", "--events", "push,issue_comment", "--url", "http://127.0.0.1:17310/webhook/forward"})
+	if gh != "/bin/gh" || endpoint != "http://127.0.0.1:17310/webhook/forward" || strings.Join(events, ",") != "push,issue_comment" {
+		t.Fatalf("commandIdentityParts(split) = %q %q %v", gh, endpoint, events)
+	}
+	if !argvMatchesWebhookForward([]string{"/bin/gh", "webhook", "forward", "--repo=nexu-io/looper", "--events=issue_comment,push", "--url=http://127.0.0.1:17310/webhook/forward"}, "nexu-io/looper", []string{"push", "issue_comment"}, "http://127.0.0.1:17310/webhook/forward") {
+		t.Fatal("argvMatchesWebhookForward rejected exact command")
+	}
+	if argvMatchesWebhookForward([]string{"/bin/gh", "webhook", "forward", "--repo", "nexu-io/looper-old", "--events", "issue_comment,push", "--url", "http://127.0.0.1:17310/webhook/forward"}, "nexu-io/looper", []string{"push", "issue_comment"}, "http://127.0.0.1:17310/webhook/forward") {
+		t.Fatal("argvMatchesWebhookForward accepted prefix repo mismatch")
+	}
+}
+
 func TestWebhookForwarderManagerRespawnsAndStopsRemovedRepo(t *testing.T) {
 	t.Parallel()
 

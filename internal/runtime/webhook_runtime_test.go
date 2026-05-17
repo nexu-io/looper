@@ -336,8 +336,8 @@ func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testi
 	if !status.Degraded {
 		t.Fatal("Status().Degraded = false, want true after temporary project list failure")
 	}
-	if len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "list configured projects") {
-		t.Fatalf("Status().DegradedReasons = %v, want transient list failure reason", status.DegradedReasons)
+	if len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "webhook forwarder bootstrap is incomplete") {
+		t.Fatalf("Status().DegradedReasons = %v, want transient bootstrap failure reason", status.DegradedReasons)
 	}
 
 	rt.Reconcile(healthyRepositories)
@@ -522,6 +522,112 @@ func TestWebhookRuntimeReconcileRetriesTransientListFailure(t *testing.T) {
 	}
 }
 
+func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	var mu sync.Mutex
+	starts := 0
+	originalCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		mu.Lock()
+		starts++
+		mu.Unlock()
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "LOOPER_HELPER_STDERR_EXIT=Hook already exists on this repository")
+		cmd.Args[0] = name
+		return cmd
+	}
+	t.Cleanup(func() { execCommand = originalCommand })
+
+	rt := &webhookRuntime{
+		ghPath:          "/usr/bin/gh",
+		status:          WebhookStatus{Enabled: true, EndpointURL: "http://127.0.0.1:7777/webhook/forward", FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+	rt.Reconcile(openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper"))
+
+	waitForWebhookCondition(t, 5*time.Second, func() bool {
+		status := rt.Status()
+		return len(status.Forwarders) == 1 && status.Forwarders[0].Latched
+	})
+	status := rt.Status()
+	if !status.Degraded || len(status.DegradedReasons) == 0 || !strings.Contains(status.DegradedReasons[0], "polling fallback") {
+		t.Fatalf("Status().DegradedReasons = %v, want latched polling fallback reason", status.DegradedReasons)
+	}
+	if status.Forwarders[0].RestartCount != 1 || status.Forwarders[0].LatchReason == nil || !strings.Contains(*status.Forwarders[0].LatchReason, "Hook already exists") {
+		t.Fatalf("forwarder status = %#v, want terminal latch with one observed exit", status.Forwarders[0])
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("starts = %d, want no respawn after terminal latch", starts)
+	}
+}
+
+func TestWebhookRuntimeBootstrapAdoptsMatchingForwarderRecord(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper")
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	fingerprint, events := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	record := storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint, Endpoint: endpoint, Events: events, GHPath: ghPath, DaemonID: "old", SpawnedAt: time.Date(2026, time.May, 17, 12, 0, 0, 0, time.UTC).UnixNano(), UpdatedAt: 1}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+	}
+
+	probe := &testProcessProbe{alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
+	rt := &webhookRuntime{
+		ghPath:          ghPath,
+		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           probe,
+		now:             time.Now,
+	}
+	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+
+	rt.Start(repositories)
+	status := rt.Status()
+	if len(status.Forwarders) != 1 || !status.Forwarders[0].Adopted || !status.Forwarders[0].Running || status.Forwarders[0].PID == nil || *status.Forwarders[0].PID != 4242 {
+		t.Fatalf("Status().Forwarders = %#v, want adopted running forwarder", status.Forwarders)
+	}
+	if status.Forwarders[0].Fingerprint != fingerprint {
+		t.Fatalf("Fingerprint = %q, want %q", status.Forwarders[0].Fingerprint, fingerprint)
+	}
+}
+
+func TestWebhookRuntimeBootstrapRejectsStaleFingerprint(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper")
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	_, events := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	record := storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: "stale", Endpoint: endpoint, Events: events, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+	}
+	originalFindProcess := osFindProcess
+	osFindProcess = func(pid int) (*os.Process, error) { return nil, os.ErrNotExist }
+	t.Cleanup(func() { osFindProcess = originalFindProcess })
+	rt := &webhookRuntime{
+		ghPath:          ghPath,
+		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           &testProcessProbe{alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}},
+		now:             time.Now,
+	}
+	rt.Bootstrap(context.Background(), repositories)
+	status := rt.Status()
+	if len(status.Forwarders) != 0 {
+		t.Fatalf("Status().Forwarders = %#v, want stale record rejected", status.Forwarders)
+	}
+}
+
 func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 	t.Parallel()
 
@@ -587,11 +693,34 @@ func openWebhookRuntimeTestRepositories(t *testing.T) *storage.Repositories {
 	return storage.NewRepositories(coordinator.DB())
 }
 
+func openWebhookRuntimeTestRepositoriesWithProject(t *testing.T, repo string) *storage.Repositories {
+	t.Helper()
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"` + repo + `"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	return repositories
+}
+
 type flakyProjectListQuerier struct {
 	db                *sql.DB
 	mu                sync.Mutex
 	failuresRemaining int
 }
+
+type testProcessProbe struct {
+	alive bool
+	start int64
+	exe   string
+	argv  []string
+}
+
+func (p *testProcessProbe) IsAlive(pid int) (bool, error)          { return p.alive, nil }
+func (p *testProcessProbe) StartTime(pid int) (int64, error)       { return p.start, nil }
+func (p *testProcessProbe) Argv(pid int) ([]string, error)         { return append([]string{}, p.argv...), nil }
+func (p *testProcessProbe) ExecutablePath(pid int) (string, error) { return p.exe, nil }
 
 func (q *flakyProjectListQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return q.db.ExecContext(ctx, query, args...)
@@ -615,6 +744,10 @@ func (q *flakyProjectListQuerier) QueryRowContext(ctx context.Context, query str
 func TestWebhookRuntimeForwarderHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
+	}
+	if message := os.Getenv("LOOPER_HELPER_STDERR_EXIT"); message != "" {
+		_, _ = os.Stderr.WriteString(message + "\n")
+		os.Exit(1)
 	}
 	select {}
 }

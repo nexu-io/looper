@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,7 @@ type Runtime struct {
 	activeExecutions   *ActiveExecutionRegistry
 	githubGateway      *githubinfra.Gateway
 	webhook            *webhookRuntime
+	webhookDaemonLock  *daemonLock
 	webhookForwarder   WebhookForwarder
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
@@ -391,9 +393,18 @@ func (r *Runtime) RefreshWebhookForwarders() error {
 func (r *Runtime) stopWebhookRuntime() {
 	r.mu.RLock()
 	webhook := r.webhook
+	lock := r.webhookDaemonLock
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.Stop()
+	}
+	if lock != nil {
+		_ = lock.Release()
+		r.mu.Lock()
+		if r.webhookDaemonLock == lock {
+			r.webhookDaemonLock = nil
+		}
+		r.mu.Unlock()
 	}
 }
 
@@ -410,17 +421,40 @@ func (r *Runtime) start(ctx context.Context) error {
 		backupDir = *r.config.Storage.BackupDir
 	}
 
+	var lock *daemonLock
+	var err error
+	if r.config.Webhook.Enabled {
+		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
+		lock, err = acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
+		if err != nil {
+			if r.logger != nil {
+				holder, _ := os.ReadFile(lockPath)
+				r.logger.Warn("webhook.daemon.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+			}
+			return err
+		}
+		if r.logger != nil {
+			r.logger.Info("webhook.daemon.lock_acquired", map[string]any{"path": lockPath})
+		}
+	}
+
 	coordinator, err := r.openSQLiteCoordinator(ctx, r.config.Storage.DBPath, storage.SQLiteCoordinatorOptions{
 		BackupDir: backupDir,
 		Now:       r.now,
 	})
 	if err != nil {
+		if lock != nil {
+			_ = lock.Release()
+		}
 		return err
 	}
 
 	started := false
 	defer func() {
 		if !started {
+			if lock != nil {
+				_ = lock.Release()
+			}
 			r.mu.Lock()
 			forwarder := r.webhookForwarder
 			r.webhookForwarder = nil
@@ -514,6 +548,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
+	r.webhookDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 

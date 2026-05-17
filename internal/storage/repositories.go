@@ -27,6 +27,7 @@ type Repositories struct {
 	Worktrees            *WorktreesRepository
 	SweeperCases         *SweeperCasesRepository
 	SweeperProposals     *SweeperProposalsRepository
+	WebhookForwarders    *WebhookForwardersRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -43,6 +44,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Worktrees:            &WorktreesRepository{q: q},
 		SweeperCases:         &SweeperCasesRepository{q: q},
 		SweeperProposals:     &SweeperProposalsRepository{q: q},
+		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 	}
 }
 

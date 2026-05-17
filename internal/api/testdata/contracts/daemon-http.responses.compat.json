@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0013_active_queue_dedupe",
-              "latestAppliedId": "0013_active_queue_dedupe",
+              "latestAvailableId": "0014_webhook_forwarders",
+              "latestAppliedId": "0014_webhook_forwarders",
               "pendingCount": 0
             }
           }
@@ -79,7 +79,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0013_active_queue_dedupe",
+            "schemaVersion": "0014_webhook_forwarders",
             "pendingMigrations": [],
             "healthy": true
           },

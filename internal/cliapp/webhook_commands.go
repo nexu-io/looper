@@ -56,6 +56,11 @@ type webhookRuntimeView struct {
 		Repo          string   `json:"repo"`
 		Running       bool     `json:"running"`
 		PID           *int     `json:"pid,omitempty"`
+		Adopted       bool     `json:"adopted"`
+		Latched       bool     `json:"latched"`
+		LatchReason   *string  `json:"latchReason,omitempty"`
+		Fingerprint   string   `json:"fingerprint,omitempty"`
+		SpawnedAt     *string  `json:"spawnedAt,omitempty"`
 		Command       []string `json:"command"`
 		RestartCount  int      `json:"restartCount"`
 		LastStartedAt *string  `json:"lastStartedAt,omitempty"`
@@ -260,14 +265,20 @@ func writeHumanWebhookStatus(w io.Writer, data webhookStatusOutput, verbose bool
 	}
 	rows := make([]tableRow, 0, len(data.Runtime.Forwarders))
 	for _, forwarder := range data.Runtime.Forwarders {
-		rows = append(rows, tableRow{"repo": forwarder.Repo, "running": forwarder.Running, "pid": forwarder.PID, "restarts": forwarder.RestartCount, "lastError": forwarder.LastError})
+		rows = append(rows, tableRow{"repo": forwarder.Repo, "running": forwarder.Running, "pid": forwarder.PID, "adopted": forwarder.Adopted, "latched": forwarder.Latched, "restarts": forwarder.RestartCount, "lastError": forwarder.LastError})
 	}
-	printTable(w, []string{"repo", "running", "pid", "restarts", "lastError"}, rows)
+	printTable(w, []string{"repo", "running", "pid", "adopted", "latched", "restarts", "lastError"}, rows)
 	for _, forwarder := range data.Runtime.Forwarders {
 		if _, err := fmt.Fprintln(w); err != nil {
 			return err
 		}
-		printSection(w, fmt.Sprintf("Forwarder %s", forwarder.Repo), [][2]any{{"command", strings.Join(forwarder.Command, " ")}, {"lastStartedAt", forwarder.LastStartedAt}, {"lastExitAt", forwarder.LastExitAt}, {"stdoutTail", joinOrNone(forwarder.StdoutTail)}, {"stderrTail", joinOrNone(forwarder.StderrTail)}})
+		stdoutTail := joinOrNone(forwarder.StdoutTail)
+		stderrTail := joinOrNone(forwarder.StderrTail)
+		if forwarder.Adopted && len(forwarder.StdoutTail) == 0 && len(forwarder.StderrTail) == 0 {
+			stdoutTail = "(adopted process: stdout/stderr not captured)"
+			stderrTail = "(adopted process: stdout/stderr not captured)"
+		}
+		printSection(w, fmt.Sprintf("Forwarder %s", forwarder.Repo), [][2]any{{"command", strings.Join(forwarder.Command, " ")}, {"adopted", forwarder.Adopted}, {"latched", forwarder.Latched}, {"latchReason", forwarder.LatchReason}, {"fingerprint", forwarder.Fingerprint}, {"spawnedAt", forwarder.SpawnedAt}, {"lastStartedAt", forwarder.LastStartedAt}, {"lastExitAt", forwarder.LastExitAt}, {"stdoutTail", stdoutTail}, {"stderrTail", stderrTail}})
 	}
 	return nil
 }

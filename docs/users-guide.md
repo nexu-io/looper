@@ -449,7 +449,15 @@ looper status
 
 This is separate from GitHub authentication.
 
-## 16. One important clarification
+## 16. Webhook forwarder status
+
+When webhook mode is enabled, `looper webhook status --json` reports each local `gh webhook forward` subprocess.
+
+- `adopted=true` means this daemon boot safely reattached to a forwarder spawned by a previous boot. Adopted processes do not have stdout/stderr tails because the new daemon did not create their pipes.
+- `latched=true` means `gh webhook forward` exited with a terminal error and Looper will not respawn-loop it. `latchReason` contains the matched error and remediation. For `Hook already exists`, delete the conflicting GitHub webhook or fix `gh` authentication, then restart `looperd`.
+- polling remains the correctness fallback while a forwarder is latched or degraded.
+
+## 17. One important clarification
 
 In the current implementation, "automatic triggering" is closer to:
 
