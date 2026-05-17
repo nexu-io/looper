@@ -1785,6 +1785,9 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if !ok {
 		return false, nil
 	}
+	if current.Status == "paused" {
+		return false, nil
+	}
 	availableAt := r.now()
 	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})

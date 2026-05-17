@@ -1564,6 +1564,52 @@ func TestDiscoverPullRequestsPreservesPendingRediscoveryForMidRunReviewComment(t
 	}
 }
 
+func TestSchedulePendingRediscoveryAfterRunPreservesPausedHardHold(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(84)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	projectID := "project_1"
+	metadata := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
+	loop := storage.LoopRecord{ID: "loop_paused_pending_rediscovery", Seq: 98, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), loop, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want paused hard hold to stay pending")
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue != nil {
+		t.Fatalf("activeQueue = %#v, want no queued rediscovery while paused", activeQueue)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" || persisted.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want unchanged paused loop", persisted)
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parsePendingFixerRediscoveryState() = false, want pending rediscovery metadata")
+	}
+	if pending.HeadSHA != "head-84" || pending.FixItemsStateHash != "state-84" || !sameStringSlices(pending.UnresolvedThreadIDs, []string{"t1"}) || pending.RecordedAt != nowISO {
+		t.Fatalf("pending = %#v, want unchanged pending rediscovery metadata", pending)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPendingRediscoveryForMidRunCIFailure(t *testing.T) {
 	t.Parallel()
 
