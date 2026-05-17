@@ -784,7 +784,7 @@ func shouldEmitConfigFileNotices(argv []string) bool {
 func configCommandPath(argv []string) (string, string) {
 	skipNext := false
 	parts := make([]string, 0, 2)
-	for _, arg := range argv {
+	for index, arg := range argv {
 		if skipNext {
 			skipNext = false
 			continue
@@ -799,8 +799,10 @@ func configCommandPath(argv []string) (string, string) {
 			}
 			_, isConfigFlag := configFlagNames[name]
 			_, isConfigBoolFlag := configBoolFlagNames[name]
-			if isConfigFlag && !isConfigBoolFlag && !strings.Contains(arg, "=") {
-				skipNext = true
+			if isConfigFlag && !strings.Contains(arg, "=") {
+				if !isConfigBoolFlag || (index+1 < len(argv) && isConfigBoolLiteral(argv[index+1])) {
+					skipNext = true
+				}
 			}
 			continue
 		}

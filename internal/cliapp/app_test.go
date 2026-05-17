@@ -2230,6 +2230,16 @@ func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	}
 }
 
+func TestConfigCommandPathSkipsExplicitBoolLiteralForConfigFlag(t *testing.T) {
+	command, subcommand := configCommandPath([]string{"config", "--no-custom-instructions", "false", "validate"})
+	if got, want := command, "config"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+	if got, want := subcommand, "validate"; got != want {
+		t.Fatalf("subcommand = %q, want %q", got, want)
+	}
+}
+
 func TestConfigShowSourceSuppressesLegacyDefaultConfigMigrationNote(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
