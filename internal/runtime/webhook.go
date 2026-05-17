@@ -749,6 +749,8 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			state.SpawnedAt = &spawnedAt
 			state.LastStartedAt = &startedAt
 			state.LastError = ""
+			state.StdoutTail = nil
+			state.StderrTail = nil
 		})
 		w.clearForwarderDegradedReasons(repo)
 		if w.logger != nil {

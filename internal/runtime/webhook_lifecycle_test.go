@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,4 +32,20 @@ func TestDaemonLockRejectsSecondHolderAndReacquiresAfterRelease(t *testing.T) {
 		t.Fatalf("third acquireDaemonLock() error = %v", err)
 	}
 	_ = third.Release()
+}
+
+func TestWebhookForwarderLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
+	t.Parallel()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd() error = %v", err)
+	}
+
+	if got, want := webhookForwarderLockPath("looper.sqlite"), filepath.Join(cwd, "looperd.lock"); got != want {
+		t.Fatalf("webhookForwarderLockPath() = %q, want %q", got, want)
+	}
+	if got, want := webhookForwarderLockPath(filepath.Join("state", "looper.sqlite")), filepath.Join(cwd, "state", "looperd.lock"); got != want {
+		t.Fatalf("webhookForwarderLockPath() nested = %q, want %q", got, want)
+	}
 }

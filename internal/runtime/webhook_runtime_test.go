@@ -165,6 +165,57 @@ func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) 
 	}
 }
 
+func TestWebhookRuntimeLaunchForwarderClearsStaleTailsOnRestart(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	startedCh := make(chan struct{})
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() {
+		close(startedCh)
+	}
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+
+	rt := &webhookRuntime{
+		status: WebhookStatus{
+			Enabled: true,
+			Forwarders: []WebhookForwarderState{{
+				Repo:       "nexu-io/looper",
+				Command:    []string{"gh", "webhook", "forward"},
+				StdoutTail: []string{"stale stdout"},
+				StderrTail: []string{"HTTP 404"},
+			}},
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"nexu-io/looper": make(chan struct{})},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.launchForwarder("nexu-io/looper")
+	<-startedCh
+
+	waitForWebhookCondition(t, 5*time.Second, func() bool {
+		status := rt.Status()
+		return len(status.Forwarders) == 1 && status.Forwarders[0].Running
+	})
+	status := rt.Status()
+	if len(status.Forwarders[0].StdoutTail) != 0 || len(status.Forwarders[0].StderrTail) != 0 {
+		t.Fatalf("forwarder tails = stdout:%v stderr:%v, want cleared on restart", status.Forwarders[0].StdoutTail, status.Forwarders[0].StderrTail)
+	}
+}
+
 func TestWebhookRuntimeStopKillsForwarderStartedBeforePIDPublication(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

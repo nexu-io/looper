@@ -89,7 +89,13 @@ func newDaemonID() string {
 }
 
 func webhookForwarderLockPath(cfgStorageDBPath string) string {
-	dir := filepath.Dir(strings.TrimSpace(cfgStorageDBPath))
+	dbPath := strings.TrimSpace(cfgStorageDBPath)
+	if dbPath != "" {
+		if absPath, err := filepath.Abs(dbPath); err == nil {
+			dbPath = absPath
+		}
+	}
+	dir := filepath.Dir(dbPath)
 	if dir == "." || dir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			dir = filepath.Join(home, ".looper")
