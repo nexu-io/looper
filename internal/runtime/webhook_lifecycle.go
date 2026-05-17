@@ -220,7 +220,9 @@ func (defaultProcessProbe) ExecutablePath(pid int) (string, error) {
 }
 
 func psProcessStart(pid int) (int64, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.Output()
 	if err != nil {
 		return 0, err
 	}
@@ -251,11 +253,17 @@ func (p *adoptedForwarderProcess) Wait() error {
 	defer ticker.Stop()
 	for range ticker.C {
 		alive, err := p.probe.IsAlive(p.pid)
-		if err != nil || !alive {
-			return err
+		if err != nil {
+			continue
+		}
+		if !alive {
+			return nil
 		}
 		start, err := p.probe.StartTime(p.pid)
-		if err != nil || start != p.processStart {
+		if err != nil {
+			continue
+		}
+		if start != p.processStart {
 			return fmt.Errorf("adopted process identity changed")
 		}
 	}
