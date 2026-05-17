@@ -28,6 +28,15 @@ type statusOutput struct {
 		QueuedItems  int  `json:"queuedItems"`
 		RunningItems int  `json:"runningItems"`
 	} `json:"scheduler"`
+	Webhook struct {
+		Enabled                     bool     `json:"enabled"`
+		EndpointURL                 string   `json:"endpointUrl"`
+		FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
+		Degraded                    bool     `json:"degraded"`
+		DegradedReasons             []string `json:"degradedReasons"`
+		ConfiguredForwarders        int      `json:"configuredForwarders"`
+		RunningForwarders           int      `json:"runningForwarders"`
+	} `json:"webhook"`
 	Loops struct {
 		Planner  statusLoopSummary `json:"planner"`
 		Reviewer statusLoopSummary `json:"reviewer"`
@@ -99,6 +108,8 @@ type pullRequestOutput struct {
 	ChecksSummary         *string `json:"checksSummary"`
 	UnresolvedThreadCount int64   `json:"unresolvedThreadCount"`
 	ReviewState           *string `json:"reviewState"`
+	Mergeability          *string `json:"mergeability"`
+	BlockingReason        *string `json:"blockingReason"`
 	Reviewer              *string `json:"reviewer"`
 	Fixer                 *string `json:"fixer"`
 	ProjectID             *string `json:"projectId"`
@@ -206,6 +217,8 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
 	fmt.Fprintln(w)
+	printSection(w, "Webhook", [][2]any{{"enabled", data.Webhook.Enabled}, {"endpointUrl", data.Webhook.EndpointURL}, {"fallbackPollIntervalSeconds", data.Webhook.FallbackPollIntervalSeconds}, {"degraded", data.Webhook.Degraded}, {"configuredForwarders", data.Webhook.ConfiguredForwarders}, {"runningForwarders", data.Webhook.RunningForwarders}, {"degradedReasons", joinOrNone(data.Webhook.DegradedReasons)}})
+	fmt.Fprintln(w)
 	printTable(w, []string{"type", "queued", "running", "waiting", "paused", "failed", "terminated", "stopped"}, []tableRow{{"type": "planner", "queued": data.Loops.Planner.Queued, "running": data.Loops.Planner.Running, "waiting": data.Loops.Planner.Waiting, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed, "terminated": data.Loops.Planner.Terminated, "stopped": data.Loops.Planner.Stopped}, {"type": "reviewer", "queued": data.Loops.Reviewer.Queued, "running": data.Loops.Reviewer.Running, "waiting": data.Loops.Reviewer.Waiting, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed, "terminated": data.Loops.Reviewer.Terminated, "stopped": data.Loops.Reviewer.Stopped}, {"type": "worker", "queued": data.Loops.Worker.Queued, "running": data.Loops.Worker.Running, "waiting": data.Loops.Worker.Waiting, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed, "terminated": data.Loops.Worker.Terminated, "stopped": data.Loops.Worker.Stopped}, {"type": "fixer", "queued": data.Loops.Fixer.Queued, "running": data.Loops.Fixer.Running, "waiting": data.Loops.Fixer.Waiting, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed, "terminated": data.Loops.Fixer.Terminated, "stopped": data.Loops.Fixer.Stopped}})
 	fmt.Fprintln(w)
 	printSection(w, "Tools", [][2]any{{"git", data.Tools.Git}, {"gh", data.Tools.GH}, {"osascript", data.Tools.Osascript}})
@@ -283,6 +296,15 @@ func writeHumanLoopPaused(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func writeHumanLoopUnpaused(w io.Writer, payload json.RawMessage) error {
+	var data loopOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode loop response: %w", err)
+	}
+	printSection(w, "Loop unpaused", [][2]any{{"id", data.ID}, {"status", data.Status}})
+	return nil
+}
+
 func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 	var data pullRequestsListOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
@@ -291,9 +313,9 @@ func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
+		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
 	}
-	printTable(w, []string{"pr", "title", "reviewState", "checks", "reviewer", "fixer"}, rows)
+	printTable(w, []string{"pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
 	return nil
 }
 
@@ -674,6 +696,11 @@ func formatScalar(value any) string {
 		}
 		return *typed
 	case *int64:
+		if typed == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%d", *typed)
+	case *int:
 		if typed == nil {
 			return "-"
 		}

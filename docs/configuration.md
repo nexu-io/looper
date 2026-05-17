@@ -130,6 +130,78 @@ All role-specific config lives under `roles.<role>`.
 - discovery policy lives at `roles.<role>.discovery.*`
 - runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
 
+## Coordinator config reference
+
+Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
+
+### Triage settings
+
+Coordinator triage lives under `roles.coordinator.triage.*`:
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.enabled` | Turns Coordinator on for the project or globally | `false` |
+| `roles.coordinator.pollInterval` | Minimum delay between Coordinator ticks for the same project | `"5m"` |
+| `roles.coordinator.triage.triagedLabel` | Durability-commit label written last after comment posting succeeds | `"triaged"` |
+| `roles.coordinator.triage.maxIssueAgeDays` | Bootstrap guard for fresh issues only | `7` |
+| `roles.coordinator.triage.maxPerTick` | Per-tick cap on issues processed for triage | `5` |
+| `roles.coordinator.triage.disposition.outOfScopeLabel` | Label reused for `out-of-scope` | `"wontfix"` |
+| `roles.coordinator.triage.disposition.unclearLabel` | Label used for `unclear` | `"needs-info"` |
+| `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
+
+Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes `triaged` last.
+
+### Dispatch settings
+
+Coordinator dispatch lives under `roles.coordinator.dispatch.*`:
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.dispatch.mode` | Chooses `human-gated` or `autonomous` dispatch | `"human-gated"` |
+| `roles.coordinator.dispatch.assignTo` | Optional GitHub assignee added before the trigger label commit | `""` |
+| `roles.coordinator.dispatch.humanGate.slashCommands` | Accepted start-of-line slash commands | `[`"/plan"`, `"/implement"`]` |
+| `roles.coordinator.dispatch.humanGate.allowedUsers` | Extra users allowed to dispatch even without repo write access | `[]` |
+| `roles.coordinator.dispatch.autonomous.delayMinutes` | Grace window after `triaged` before autonomous dispatch can commit | `30` |
+| `roles.coordinator.dispatch.autonomous.holdLabel` | Global hold / veto label for autonomous dispatch | `"looper:hold"` |
+
+Behavior notes:
+
+- `/plan` maps to the first planner trigger label at `roles.planner.triggers.labels[0]`
+- `/implement` maps to the first worker trigger label at `roles.worker.triggers.labels[0]`
+- autonomous mode uses the existing `dispatch/*` label to choose the same derived trigger labels
+- Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
+- `roles.coordinator.dispatch.autonomous.holdLabel` is also a veto signal, alongside removing `dispatch/*` or manually applying the destination trigger label
+
+Coordinator example:
+
+```toml
+[roles.coordinator]
+enabled = true
+pollInterval = "5m"
+
+[roles.coordinator.triage]
+triagedLabel = "triaged"
+maxIssueAgeDays = 7
+maxPerTick = 5
+
+[roles.coordinator.triage.disposition]
+outOfScopeLabel = "wontfix"
+unclearLabel = "needs-info"
+reTriageOnAuthorReply = true
+
+[roles.coordinator.dispatch]
+mode = "human-gated"
+assignTo = ""
+
+[roles.coordinator.dispatch.humanGate]
+slashCommands = ["/plan", "/implement"]
+allowedUsers = []
+
+[roles.coordinator.dispatch.autonomous]
+delayMinutes = 30
+holdLabel = "looper:hold"
+```
+
 Reviewer is the main migration example:
 
 - legacy top-level `reviewer.*` is compatibility input only
@@ -317,10 +389,36 @@ addSnapshotMode = "async"
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
 
+[roles.coordinator]
+enabled = false
+pollInterval = "5m"
+
+[roles.coordinator.triage]
+triagedLabel = "triaged"
+maxIssueAgeDays = 7
+maxPerTick = 5
+
+[roles.coordinator.triage.disposition]
+outOfScopeLabel = "wontfix"
+unclearLabel = "needs-info"
+reTriageOnAuthorReply = true
+
+[roles.coordinator.dispatch]
+mode = "human-gated"
+assignTo = ""
+
+[roles.coordinator.dispatch.humanGate]
+slashCommands = ["/plan", "/implement"]
+allowedUsers = []
+
+[roles.coordinator.dispatch.autonomous]
+delayMinutes = 30
+holdLabel = "looper:hold"
+
 [roles.planner.discovery]
 autoDiscovery = true
 
-[roles.planner.discovery.triggers]
+[roles.planner.triggers]
 labels = ["looper:plan"]
 labelMode = "all"
 requireAssigneeCurrentUser = true
@@ -371,7 +469,7 @@ labelMode = "all"
 [roles.worker.discovery]
 autoDiscovery = true
 
-[roles.worker.discovery.triggers]
+[roles.worker.triggers]
 labels = ["looper:worker-ready"]
 labelMode = "all"
 requireAssigneeCurrentUser = true
@@ -528,6 +626,117 @@ labels = ["needs-review"]
 ```
 
 ## Environment variables and CLI flags
+
+```json
+{
+  "reviewer": {
+    "reviewEvents": {
+      "clean": "APPROVE",
+      "blocking": "REQUEST_CHANGES"
+    }
+  }
+}
+```
+
+Reviewer behavior matrix:
+
+| Reviewer outcome | `reviewEvents.clean` | `reviewEvents.blocking` | GitHub event |
+|---|---:|---:|---|
+| `clean` | `COMMENT` | any | `COMMENT` |
+| `clean` | `APPROVE` | any | `APPROVE` |
+| `non_blocking` | any | any | `COMMENT` |
+| `blocking` | any | `COMMENT` | `COMMENT` |
+| `blocking` | any | `REQUEST_CHANGES` | `REQUEST_CHANGES` |
+| legacy `actionable` | any | any | `COMMENT` |
+
+One-off reviewer jobs can snapshot the policy into loop metadata so queued work is not affected by later daemon config changes:
+
+```bash
+looper review owner/repo#123 \
+  --clean-review-event APPROVE \
+  --blocking-review-event REQUEST_CHANGES
+```
+
+To restore the previous synchronous `project add` behavior for one command:
+
+```bash
+looper project add --snapshot-mode full /absolute/path/to/repo
+```
+
+To restore it by default for all project additions:
+
+```json
+{
+  "defaults": {
+    "addSnapshotMode": "full"
+  }
+}
+```
+
+### `roles`
+
+The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, worker, and sweeper. It does not block manual commands, direct processing, retries, or already queued work.
+
+Defaults preserve Looper's historical behavior:
+
+- planner discovers open issues labeled `looper:plan` assigned to the current GitHub user
+- worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
+- reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
+- fixer discovers open non-draft PRs authored by the current user that have actionable review items
+- sweeper is opt-in (`autoDiscovery=false`) and dry-run by default; its target model is a case/proposal ledger with deterministic prefiltering, immutable proposal artifacts, and idempotent apply receipts
+
+Common fields:
+
+- `roles.<role>.autoDiscovery`: when `false`, the scheduler skips new discovery for that role only
+- issue roles (`planner`, `worker`): `triggers.labels`, `triggers.labelMode` (`all` or `any`), and `triggers.requireAssigneeCurrentUser`
+- reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.enableSelfReview`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
+- fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
+
+Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+
+Sweeper terminology used in config, logs, and future operator surfaces:
+
+- **case**: the mutable lifecycle record for one issue or pull request
+- **proposal**: an immutable decision artifact for a case
+- **fact bundle**: normalized target + policy snapshot persisted with each proposal
+- **apply receipt**: the apply-side status written back to a proposal
+- **stale proposal**: a proposal rejected at apply time because live state drifted or its schema version is obsolete
+- **marker UUID**: the stable UUID embedded in warning comment markers for retry-safe idempotency
+
+Sweeper-specific config fields:
+
+- `roles.sweeper.autoDiscovery`: when `false`, scheduler discovery does not enqueue new sweeper cases
+- `roles.sweeper.dryRun`: when `true`, the propose/apply pipeline still writes cases, proposals, and apply receipts, but GitHub mutations are skipped
+- `roles.sweeper.triggers.includeIssues` / `includePullRequests`: enable issue or PR discovery
+- `roles.sweeper.triggers.includeDrafts`: include draft PRs in discovery
+- `roles.sweeper.triggers.excludeLabels`: hard exclusion labels removed during deterministic prefilter
+- `roles.sweeper.triggers.excludeAuthors`: GitHub logins excluded before proposing
+- `roles.sweeper.triggers.excludeAuthorAssociations`: author associations excluded before proposing
+- `roles.sweeper.triggers.looperInternalLabels`: labels treated as Looper-owned/policy-relevant for filtering and fingerprinting
+- `roles.sweeper.triggers.reopenCooldownDays`: skip recently reopened targets for this cooldown window
+- `roles.sweeper.triggers.maxPerTick`: soft per-discovery budget before proposal/apply
+- `roles.sweeper.filter.mode`: deterministic prefilter mode used before any agent review; currently `deterministic`
+- `roles.sweeper.proposer.mode`: `agent_apply` for agent-backed canonical proposals on live categories, or `heuristic_fallback` as a break-glass fallback
+- `roles.sweeper.proposer.model`: optional sweeper-specific agent model override
+- `roles.sweeper.proposer.timeoutSeconds`: proposer agent timeout budget per review attempt
+- `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `2`
+- `roles.sweeper.proposer.diagnosticMode`: when `true`, persist fresh heuristic shadow proposals alongside agent-backed reviews for offline comparison
+- `roles.sweeper.proposer.timeoutRateDryRunThreshold`: auto-backpressure threshold from `0..1`; when the observed agent timeout rate meets or exceeds it, the scheduler flips that repo to sweeper dry-run
+- `roles.sweeper.proposer.timeoutRateDryRunMinSamples`: minimum agent proposal sample size required before timeout-rate backpressure can auto-flip a repo
+- `roles.sweeper.lifecycle.pendingLabel`: label used while a case is in warned/pending-close state
+- `roles.sweeper.lifecycle.closedLabel`: label added when sweeper completes a close action
+- `roles.sweeper.lifecycle.keepLabel`: label that suppresses sweeper action and can cancel a pending case
+- `roles.sweeper.limits.maxWarningsPerRepoPerDay`: per-repo warning ceiling enforced from successful applies
+- `roles.sweeper.limits.maxClosesPerRepoPerDay`: per-repo close ceiling enforced from successful applies
+- `roles.sweeper.limits.globalKillSwitch`: stops new sweeper side effects globally
+- `roles.sweeper.categories.*`: enablement, inactivity windows, grace periods, and minimum confidence thresholds per category
+- `roles.sweeper.security.quarantineLabel`: deterministic security-routing label for `route_security`
+- `roles.sweeper.security.notifyAssignees`: assignee logins to notify on security-routing outcomes
+- `roles.sweeper.reporting.durableReportsDir`: optional durable report export directory; the canonical audit store remains the sweeper case/proposal ledger
+
+Sweeper categories currently exposed in config are `stale`, `alreadyFixed`, `superseded`, `unrelated`, and `abandonedPR`. `unrelated` remains report-only/dry-run for now, and `route_security` remains deterministic prefilter-only with dry-run apply until maintainers confirm the operating model; canonical live apply stays focused on higher-confidence maintenance categories while `sweeper_cases` and `sweeper_proposals` remain the source of truth.
+
+For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 
 Canonical environment variables and CLI flags override the config-file layer. Legacy names remain accepted only as compatibility aliases during the migration window.
 

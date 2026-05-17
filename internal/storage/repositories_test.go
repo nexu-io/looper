@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -295,6 +297,330 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 	if worktree.BaseBranch == nil || *worktree.BaseBranch != mainBranch {
 		t.Fatalf("Worktrees.GetByBranch().BaseBranch = %#v, want %q", worktree.BaseBranch, mainBranch)
+	}
+}
+
+func TestRepositoriesRoundTripForSweeperCasesAndProposals(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	updated := "2026-04-11T12:05:00.000Z"
+	projectID := "project_sweeper"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID:        projectID,
+		Name:      "Sweeper Project",
+		RepoPath:  "/tmp/sweeper-project",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	repo := "acme/looper"
+	category := "stale"
+	confidence := int64(87)
+	warningCommentID := int64(101)
+	warningMarkerUUID := "sweeper_marker_1"
+	lastProposalID := "proposal_2"
+	fingerprintJSON := `{"hash":"abc"}`
+	lastHumanActivityAt := "2026-04-10T10:00:00.000Z"
+	warnedAt := "2026-04-12T09:00:00.000Z"
+	closeDueAt := "2026-04-19T09:00:00.000Z"
+	terminalOutcome := "closed"
+	terminalAt := "2026-04-20T09:00:00.000Z"
+
+	if err := repos.SweeperCases.Upsert(ctx, SweeperCaseRecord{
+		ID:                     "case_1",
+		ProjectID:              projectID,
+		Repo:                   repo,
+		TargetType:             "pull_request",
+		TargetNumber:           42,
+		Status:                 "pending",
+		CurrentPhase:           "warn",
+		CurrentCategory:        &category,
+		CurrentConfidenceScore: &confidence,
+		WarningCommentID:       &warningCommentID,
+		WarningMarkerUUID:      &warningMarkerUUID,
+		LastProposalID:         &lastProposalID,
+		LastFingerprintJSON:    &fingerprintJSON,
+		LastHumanActivityAt:    &lastHumanActivityAt,
+		WarnedAt:               &warnedAt,
+		CloseDueAt:             &closeDueAt,
+		TerminalOutcome:        &terminalOutcome,
+		TerminalAt:             &terminalAt,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_1 initial) error = %v", err)
+	}
+
+	if err := repos.SweeperCases.Upsert(ctx, SweeperCaseRecord{
+		ID:           "case_2",
+		ProjectID:    projectID,
+		Repo:         repo,
+		TargetType:   "issue",
+		TargetNumber: 99,
+		Status:       "terminal",
+		CurrentPhase: "terminal",
+		CreatedAt:    now,
+		UpdatedAt:    "2026-04-11T12:01:00.000Z",
+	}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_2) error = %v", err)
+	}
+
+	if err := repos.SweeperCases.Upsert(ctx, SweeperCaseRecord{
+		ID:           "case_3",
+		ProjectID:    projectID,
+		Repo:         repo,
+		TargetType:   "pull_request",
+		TargetNumber: 7,
+		Status:       "quarantined",
+		CurrentPhase: "prefilter",
+		CreatedAt:    now,
+		UpdatedAt:    "2026-04-11T12:02:00.000Z",
+	}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_3) error = %v", err)
+	}
+
+	if err := repos.SweeperCases.Upsert(ctx, SweeperCaseRecord{
+		ID:           "case_4",
+		ProjectID:    projectID,
+		Repo:         repo,
+		TargetType:   "issue",
+		TargetNumber: 8,
+		Status:       "pending",
+		CurrentPhase: "warn",
+		CreatedAt:    now,
+		UpdatedAt:    "2026-04-11T12:02:30.000Z",
+	}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_4) error = %v", err)
+	}
+
+	updatedConfidence := int64(91)
+	if err := repos.SweeperCases.Upsert(ctx, SweeperCaseRecord{
+		ID:                     "case_1",
+		ProjectID:              projectID,
+		Repo:                   repo,
+		TargetType:             "pull_request",
+		TargetNumber:           42,
+		Status:                 "terminal",
+		CurrentPhase:           "terminal",
+		CurrentCategory:        &category,
+		CurrentConfidenceScore: &updatedConfidence,
+		WarningCommentID:       &warningCommentID,
+		WarningMarkerUUID:      &warningMarkerUUID,
+		LastProposalID:         &lastProposalID,
+		LastFingerprintJSON:    &fingerprintJSON,
+		LastHumanActivityAt:    &lastHumanActivityAt,
+		WarnedAt:               &warnedAt,
+		CloseDueAt:             &closeDueAt,
+		TerminalOutcome:        &terminalOutcome,
+		TerminalAt:             &terminalAt,
+		CreatedAt:              now,
+		UpdatedAt:              updated,
+	}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_1 update) error = %v", err)
+	}
+
+	caseByID, err := repos.SweeperCases.GetByID(ctx, "case_1")
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByID() error = %v", err)
+	}
+	if caseByID == nil || caseByID.Status != "terminal" || caseByID.CurrentPhase != "terminal" || caseByID.CurrentConfidenceScore == nil || *caseByID.CurrentConfidenceScore != updatedConfidence {
+		t.Fatalf("SweeperCases.GetByID() = %#v, want updated terminal case", caseByID)
+	}
+
+	caseByTarget, err := repos.SweeperCases.GetByProjectRepoTarget(ctx, projectID, repo, "pull_request", 42)
+	if err != nil {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() error = %v", err)
+	}
+	if caseByTarget == nil || caseByTarget.ID != "case_1" {
+		t.Fatalf("SweeperCases.GetByProjectRepoTarget() = %#v, want case_1", caseByTarget)
+	}
+
+	phaseCases, err := repos.SweeperCases.ListByProjectRepoPhase(ctx, projectID, repo, "terminal")
+	if err != nil {
+		t.Fatalf("SweeperCases.ListByProjectRepoPhase() error = %v", err)
+	}
+	if len(phaseCases) != 2 || phaseCases[0].ID != "case_1" || phaseCases[1].ID != "case_2" {
+		t.Fatalf("SweeperCases.ListByProjectRepoPhase() = %#v, want [case_1 case_2]", phaseCases)
+	}
+
+	statusCases, err := repos.SweeperCases.ListByProjectRepoStatus(ctx, projectID, repo, "quarantined")
+	if err != nil {
+		t.Fatalf("SweeperCases.ListByProjectRepoStatus() error = %v", err)
+	}
+	if len(statusCases) != 1 || statusCases[0].ID != "case_3" {
+		t.Fatalf("SweeperCases.ListByProjectRepoStatus() = %#v, want [case_3]", statusCases)
+	}
+
+	caseList, err := repos.SweeperCases.ListByProjectRepo(ctx, projectID, repo, 2)
+	if err != nil {
+		t.Fatalf("SweeperCases.ListByProjectRepo() error = %v", err)
+	}
+	if len(caseList) != 2 || caseList[0].ID != "case_1" || caseList[1].ID != "case_4" {
+		t.Fatalf("SweeperCases.ListByProjectRepo() = %#v, want [case_1 case_4]", caseList)
+	}
+
+	summary1 := "proposal one"
+	rationale1 := "first rationale"
+	marker1 := "marker_1"
+	validation1 := "passed"
+	applyStatus1 := "pending"
+	if err := repos.SweeperProposals.Insert(ctx, SweeperProposalRecord{
+		ID:               "proposal_1",
+		CaseID:           "case_1",
+		ProjectID:        projectID,
+		Repo:             repo,
+		TargetType:       "pull_request",
+		TargetNumber:     42,
+		SchemaVersion:    1,
+		ProposerKind:     "phase1a",
+		FactBundleJSON:   `{"number":42}`,
+		FingerprintJSON:  `{"hash":"one"}`,
+		ProposalJSON:     `{"decision":"warn"}`,
+		Decision:         "warn",
+		Category:         "stale",
+		ConfidenceScore:  80,
+		Summary:          &summary1,
+		Rationale:        &rationale1,
+		MarkerUUID:       &marker1,
+		ValidationStatus: &validation1,
+		ApplyStatus:      &applyStatus1,
+		CreatedAt:        now,
+	}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(proposal_1) error = %v", err)
+	}
+
+	if err := repos.SweeperProposals.Insert(ctx, SweeperProposalRecord{
+		ID:               "proposal_3",
+		CaseID:           "case_4",
+		ProjectID:        projectID,
+		Repo:             repo,
+		TargetType:       "issue",
+		TargetNumber:     8,
+		SchemaVersion:    1,
+		ProposerKind:     "phase1a",
+		FactBundleJSON:   `{"number":8}`,
+		FingerprintJSON:  `{"hash":"three"}`,
+		ProposalJSON:     `{"decision":"warn"}`,
+		Decision:         "warn",
+		Category:         "stale",
+		ConfidenceScore:  75,
+		ValidationStatus: &validation1,
+		ApplyStatus:      &applyStatus1,
+		CreatedAt:        "2026-04-11T12:00:30.000Z",
+	}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(proposal_3) error = %v", err)
+	}
+
+	summary2 := "proposal two"
+	created2 := "2026-04-11T12:03:00.000Z"
+	if err := repos.SweeperProposals.Insert(ctx, SweeperProposalRecord{
+		ID:              "proposal_2",
+		CaseID:          "case_1",
+		ProjectID:       projectID,
+		Repo:            repo,
+		TargetType:      "pull_request",
+		TargetNumber:    42,
+		SchemaVersion:   1,
+		ProposerKind:    "phase1a",
+		FactBundleJSON:  `{"number":42,"latest":true}`,
+		FingerprintJSON: `{"hash":"two"}`,
+		ProposalJSON:    `{"decision":"close"}`,
+		Decision:        "close",
+		Category:        "abandoned_pr",
+		ConfidenceScore: 95,
+		Summary:         &summary2,
+		CreatedAt:       created2,
+	}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(proposal_2) error = %v", err)
+	}
+
+	proposalByID, err := repos.SweeperProposals.GetByID(ctx, "proposal_1")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID() error = %v", err)
+	}
+	if proposalByID == nil || proposalByID.Decision != "warn" || proposalByID.ApplyStatus == nil || *proposalByID.ApplyStatus != "pending" {
+		t.Fatalf("SweeperProposals.GetByID() = %#v, want proposal_1 with pending apply status", proposalByID)
+	}
+
+	latestProposal, err := repos.SweeperProposals.GetLatestByCaseID(ctx, "case_1")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetLatestByCaseID() error = %v", err)
+	}
+	if latestProposal == nil || latestProposal.ID != "proposal_2" {
+		t.Fatalf("SweeperProposals.GetLatestByCaseID() = %#v, want proposal_2", latestProposal)
+	}
+
+	proposalList, err := repos.SweeperProposals.ListByCaseID(ctx, "case_1")
+	if err != nil {
+		t.Fatalf("SweeperProposals.ListByCaseID() error = %v", err)
+	}
+	if len(proposalList) != 2 || proposalList[0].ID != "proposal_2" || proposalList[1].ID != "proposal_1" {
+		t.Fatalf("SweeperProposals.ListByCaseID() = %#v, want [proposal_2 proposal_1]", proposalList)
+	}
+
+	proposalRepoList, err := repos.SweeperProposals.ListByProjectRepo(ctx, projectID, repo, 2)
+	if err != nil {
+		t.Fatalf("SweeperProposals.ListByProjectRepo() error = %v", err)
+	}
+	if len(proposalRepoList) != 2 || proposalRepoList[0].ID != "proposal_2" || proposalRepoList[1].ID != "proposal_3" {
+		t.Fatalf("SweeperProposals.ListByProjectRepo() = %#v, want [proposal_2 proposal_3]", proposalRepoList)
+	}
+
+	applySummary := "applied successfully"
+	applyError := ""
+	appliedAt := "2026-04-11T12:04:00.000Z"
+	if err := repos.SweeperProposals.UpdateApplyReceipt(ctx, "proposal_2", "applied", &applySummary, &applyError, &appliedAt); err != nil {
+		t.Fatalf("SweeperProposals.UpdateApplyReceipt() error = %v", err)
+	}
+
+	updatedProposal, err := repos.SweeperProposals.GetByID(ctx, "proposal_2")
+	if err != nil {
+		t.Fatalf("SweeperProposals.GetByID(updated) error = %v", err)
+	}
+	if updatedProposal == nil || updatedProposal.ApplyStatus == nil || *updatedProposal.ApplyStatus != "applied" || updatedProposal.ApplySummary == nil || *updatedProposal.ApplySummary != applySummary || updatedProposal.AppliedAt == nil || *updatedProposal.AppliedAt != appliedAt {
+		t.Fatalf("SweeperProposals.GetByID(updated) = %#v, want applied receipt fields", updatedProposal)
+	}
+
+	countAppliedWarn, err := repos.SweeperProposals.CountAppliedByRepoAndDecisionSince(ctx, projectID, repo, "close", "2026-04-11T00:00:00.000Z")
+	if err != nil {
+		t.Fatalf("SweeperProposals.CountAppliedByRepoAndDecisionSince() error = %v", err)
+	}
+	if countAppliedWarn != 0 {
+		t.Fatalf("SweeperProposals.CountAppliedByRepoAndDecisionSince(close) = %d, want 0 because apply status is non-canonical", countAppliedWarn)
+	}
+	if err := repos.SweeperProposals.UpdateApplyReceipt(ctx, "proposal_2", "completed_closed", &applySummary, &applyError, &appliedAt); err != nil {
+		t.Fatalf("SweeperProposals.UpdateApplyReceipt(completed_closed) error = %v", err)
+	}
+	countAppliedClose, err := repos.SweeperProposals.CountAppliedByRepoAndDecisionSince(ctx, projectID, repo, "close", "2026-04-11T00:00:00.000Z")
+	if err != nil {
+		t.Fatalf("SweeperProposals.CountAppliedByRepoAndDecisionSince(close) error = %v", err)
+	}
+	if countAppliedClose != 1 {
+		t.Fatalf("SweeperProposals.CountAppliedByRepoAndDecisionSince(close) = %d, want 1", countAppliedClose)
+	}
+	inflightWarn, err := repos.SweeperProposals.CountInflightByRepoAndDecision(ctx, projectID, repo, "warn")
+	if err != nil {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn) error = %v", err)
+	}
+	if inflightWarn != 1 {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn) = %d, want 1", inflightWarn)
+	}
+	if err := repos.SweeperProposals.UpdateApplyReceipt(ctx, "proposal_3", "failed_retryable", &applySummary, &applyError, nil); err != nil {
+		t.Fatalf("SweeperProposals.UpdateApplyReceipt(failed_retryable) error = %v", err)
+	}
+	inflightWarn, err = repos.SweeperProposals.CountInflightByRepoAndDecision(ctx, projectID, repo, "warn")
+	if err != nil {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn after failed_retryable) error = %v", err)
+	}
+	if inflightWarn != 0 {
+		t.Fatalf("SweeperProposals.CountInflightByRepoAndDecision(warn after failed_retryable) = %d, want 0", inflightWarn)
 	}
 }
 
@@ -795,6 +1121,196 @@ func TestQueueRequeueFailedByIDWithAttemptsPreservesAttemptBudget(t *testing.T) 
 	}
 }
 
+func TestQueueCreateOrGetActiveByDedupeAllowsNewActiveAfterInactiveHistory(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_history"
+	loopID := "loop_history"
+	repoName := "acme/looper"
+	prNumber := int64(42)
+	dedupeKey := "reviewer:project_history:loop_history:acme/looper:42"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "failed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_completed", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_failed", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "failed", AvailableAt: now, Attempts: 3, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_cancelled", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "cancelled", AvailableAt: now, Attempts: 0, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	created, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, QueueItemRecord{ID: "queue_new", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: QueuePriorityReviewer, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
+	}
+	if !didCreate || created.ID != "queue_new" {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() = (%#v, %v), want newly created queue_new", created, didCreate)
+	}
+
+	active, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	}
+	if active == nil || active.ID != "queue_new" {
+		t.Fatalf("Queue.FindActiveByDedupe() = %#v, want queue_new", active)
+	}
+}
+
+func TestQueueCreateOrGetActiveByDedupeKeepsOneActiveItemUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		dedupeKey string
+		queueType string
+		priority  int64
+	}{
+		{name: "reviewer", dedupeKey: "reviewer:project_1:loop_1:acme/looper:42", queueType: "reviewer", priority: QueuePriorityReviewer},
+		{name: "fixer", dedupeKey: "fixer:project_1:loop_1:acme/looper:42:head-1:hash-1", queueType: "fixer", priority: QueuePriorityFixer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator := openMigratedCoordinatorForRepositories(t)
+			ctx := context.Background()
+			repos := NewRepositories(coordinator.DB())
+
+			now := "2026-04-11T12:00:00.000Z"
+			projectID := "project_1"
+			loopID := "loop_1"
+			repoName := "acme/looper"
+			prNumber := int64(42)
+			if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: tc.queueType, TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			const attempts = 8
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			results := make(chan QueueItemRecord, attempts)
+			errs := make(chan error, attempts)
+			createdCount := make(chan bool, attempts)
+			for i := 0; i < attempts; i++ {
+				wg.Add(1)
+				go func(index int) {
+					defer wg.Done()
+					<-start
+					item, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, QueueItemRecord{ID: fmt.Sprintf("queue_%d", index), ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: tc.dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+					if err != nil {
+						errs <- err
+						return
+					}
+					createdCount <- didCreate
+					results <- item
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+			close(results)
+			close(createdCount)
+
+			for err := range errs {
+				if err != nil {
+					t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
+				}
+			}
+			winnerID := ""
+			for item := range results {
+				if winnerID == "" {
+					winnerID = item.ID
+					continue
+				}
+				if item.ID != winnerID {
+					t.Fatalf("concurrent item ID = %q, want %q", item.ID, winnerID)
+				}
+			}
+			creates := 0
+			for didCreate := range createdCount {
+				if didCreate {
+					creates++
+				}
+			}
+			if creates != 1 {
+				t.Fatalf("created count = %d, want 1", creates)
+			}
+
+			items, err := repos.Queue.List(ctx)
+			if err != nil {
+				t.Fatalf("Queue.List() error = %v", err)
+			}
+			if len(items) != 1 {
+				t.Fatalf("len(Queue.List()) = %d, want 1", len(items))
+			}
+			if items[0].DedupeKey != tc.dedupeKey || items[0].Status != "queued" {
+				t.Fatalf("Queue.List()[0] = %#v, want queued item for %q", items[0], tc.dedupeKey)
+			}
+		})
+	}
+}
+
+func TestQueueUpsertActiveByDedupeOrGetExistingReturnsActiveReviewerOrFixer(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		queueType string
+		priority  int64
+	}{
+		{name: "reviewer", queueType: "reviewer", priority: QueuePriorityReviewer},
+		{name: "fixer", queueType: "fixer", priority: QueuePriorityFixer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator := openMigratedCoordinatorForRepositories(t)
+			ctx := context.Background()
+			repos := NewRepositories(coordinator.DB())
+
+			now := "2026-04-11T12:00:00.000Z"
+			projectID := "project_1"
+			loopID := "loop_1"
+			repoName := "acme/looper"
+			prNumber := int64(42)
+			dedupeKey := fmt.Sprintf("%s:project_1:loop_1:acme/looper:42", tc.queueType)
+			if tc.queueType == "fixer" {
+				dedupeKey = "fixer:project_1:loop_1:acme/looper:42:head-1:hash-1"
+			}
+			if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: tc.queueType, TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			existing := QueueItemRecord{ID: "queue_existing", ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}
+			if err := repos.Queue.Upsert(ctx, existing); err != nil {
+				t.Fatalf("Queue.Upsert(existing) error = %v", err)
+			}
+
+			persisted, didPersist, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, QueueItemRecord{ID: "queue_racing", ProjectID: &projectID, LoopID: &loopID, Type: tc.queueType, TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: tc.priority, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now})
+			if err != nil {
+				t.Fatalf("Queue.UpsertActiveByDedupeOrGetExisting() error = %v", err)
+			}
+			if didPersist {
+				t.Fatal("Queue.UpsertActiveByDedupeOrGetExisting() persisted = true, want false")
+			}
+			if persisted.ID != existing.ID {
+				t.Fatalf("Queue.UpsertActiveByDedupeOrGetExisting() = %#v, want existing queue item", persisted)
+			}
+		})
+	}
+}
+
 func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	t.Parallel()
 
@@ -950,14 +1466,14 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	}
 
 	failReason := "needs human"
-	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_fail", FinishedAt: finished, ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: finished}); err != nil {
+	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_fail", Attempts: 4, FinishedAt: finished, ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: finished}); err != nil {
 		t.Fatalf("Queue.Fail() error = %v", err)
 	}
 	gotFailed, err := repos.Queue.GetByID(ctx, "qi_fail")
 	if err != nil {
 		t.Fatalf("Queue.GetByID(qi_fail) error = %v", err)
 	}
-	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason {
+	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason || gotFailed.Attempts != 4 {
 		t.Fatalf("Queue.GetByID(qi_fail) after fail = %#v, want manual_intervention", gotFailed)
 	}
 }

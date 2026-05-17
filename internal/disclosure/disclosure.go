@@ -1,7 +1,6 @@
 package disclosure
 
 import (
-	"fmt"
 	"regexp"
 	"runtime"
 	"strings"
@@ -148,9 +147,6 @@ func (s Stamper) attributes(runner string) []string {
 		if agent := strings.TrimSpace(s.Agent); agent != "" {
 			attrs = append(attrs, "agent="+agent)
 		}
-		if model := safeAttributeValue(s.Model); model != "" {
-			attrs = append(attrs, "model="+model)
-		}
 	}
 	if s.Config.IncludeOS {
 		if osFamily := osFamily(runtime.GOOS); osFamily != "" {
@@ -179,29 +175,4 @@ func safeValue(value string) string {
 		return "0.0.0-dev"
 	}
 	return value
-}
-
-func safeAttributeValue(value string) string {
-	value = strings.Join(strings.Fields(value), " ")
-	if value == "" {
-		return ""
-	}
-
-	var b strings.Builder
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if isSafeAttributeByte(c) {
-			b.WriteByte(c)
-			continue
-		}
-		_, _ = fmt.Fprintf(&b, "%%%02X", c)
-	}
-	return b.String()
-}
-
-func isSafeAttributeByte(c byte) bool {
-	return (c >= 'a' && c <= 'z') ||
-		(c >= 'A' && c <= 'Z') ||
-		(c >= '0' && c <= '9') ||
-		c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '+' || c == '@'
 }

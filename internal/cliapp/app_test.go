@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,6 +156,38 @@ func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 	if got := stdout.String(); !strings.Contains(got, "Fixer started") || !strings.Contains(got, "acme/looper#123") {
 		t.Fatalf("Run([fix 123]) stdout = %q, want fixer summary for %q", got, "acme/looper#123")
+	}
+}
+
+func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/pull-requests"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_prs", map[string]any{"items": []map[string]any{{
+			"repo":           "acme/looper",
+			"prNumber":       42,
+			"title":          "Fix queue visibility",
+			"mergeability":   "blocked",
+			"blockingReason": "checks",
+			"reviewState":    "APPROVED",
+			"checksSummary":  "FAILURE",
+			"reviewer":       "completed",
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "pr", "list", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([pr list]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{"mergeability", "blocker", "blocked", "checks"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
+		}
 	}
 }
 
@@ -3125,6 +3159,8 @@ func TestLogsFollowRejectsJSON(t *testing.T) {
 func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 	t.Parallel()
 
+	snapshotFlushed := make(chan struct{})
+	var flushOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: snapshot\n")
@@ -3132,13 +3168,20 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
+		flushOnce.Do(func() { close(snapshotFlushed) })
 		<-r.Context().Done()
 	}))
 	defer server.Close()
 
 	configPath := writeCLIConfig(t, server.URL, "")
 	ctx, cancel := context.WithCancel(context.Background())
+	cancelErr := make(chan error, 1)
 	go func() {
+		select {
+		case <-snapshotFlushed:
+		case <-time.After(2 * time.Second):
+			cancelErr <- errors.New("timed out waiting for snapshot flush")
+		}
 		time.Sleep(100 * time.Millisecond)
 		cancel()
 	}()
@@ -3152,6 +3195,11 @@ func TestLogsFollowStopsOnContextCancellation(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Waiting for log output...") {
 		t.Fatalf("Run([logs loop_1 --follow]) stdout = %q, want waiting message", stdout)
+	}
+	select {
+	case err := <-cancelErr:
+		t.Fatal(err)
+	default:
 	}
 }
 
@@ -3649,6 +3697,66 @@ func TestLoopPauseAcceptsPositionalAndFlagID(t *testing.T) {
 				t.Fatalf("Run(%v) stdout = %q, want pause success output", args, stdout)
 			}
 		})
+	}
+}
+
+func TestTopLevelPauseAndUnpauseUseLoopSequence(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		wantMethod string
+		wantPath   string
+		wantStatus string
+		wantOutput string
+	}{
+		{name: "pause", args: []string{"pause", "12"}, wantMethod: http.MethodPost, wantPath: "/api/v1/loops/12/pause", wantStatus: "paused", wantOutput: "Loop paused"},
+		{name: "unpause", args: []string{"unpause", "12"}, wantMethod: http.MethodPost, wantPath: "/api/v1/loops/12/start", wantStatus: "running", wantOutput: "Loop unpaused"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Method; got != tc.wantMethod {
+					t.Fatalf("request method = %q, want %q", got, tc.wantMethod)
+				}
+				if got := r.URL.Path; got != tc.wantPath {
+					t.Fatalf("request path = %q, want %q", got, tc.wantPath)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_loop_status", map[string]any{"id": "loop_seq_12", "seq": 12, "status": tc.wantStatus}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			args := append(tc.args, "--config", configPath)
+			exitCode, stdout, stderr := runApp(t, args...)
+			if exitCode != 0 {
+				t.Fatalf("Run(%v) exit code = %d, want 0", args, exitCode)
+			}
+			if stderr != "" {
+				t.Fatalf("Run(%v) stderr = %q, want empty string", args, stderr)
+			}
+			if !strings.Contains(stdout, tc.wantOutput) || !strings.Contains(stdout, tc.wantStatus) {
+				t.Fatalf("Run(%v) stdout = %q, want %q and status %q", args, stdout, tc.wantOutput, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestTopLevelPauseRequiresNumericSequence(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "pause", "loop_123")
+	if exitCode == 0 {
+		t.Fatalf("Run([pause loop_123]) exit code = 0, want non-zero")
+	}
+	if stdout != "" {
+		t.Fatalf("Run([pause loop_123]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "loop sequence number must be numeric") {
+		t.Fatalf("Run([pause loop_123]) stderr = %q, want numeric sequence error", stderr)
 	}
 }
 

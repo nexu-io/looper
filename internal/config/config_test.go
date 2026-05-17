@@ -1566,6 +1566,130 @@ func TestLoadFileSupportsSweeperCustomInstructions(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRoleProjectOverrideAffectsRoleHelpers(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {
+			"coordinator": {
+				"enabled": false,
+				"pollInterval": "5m",
+				"triage": {
+					"triagedLabel": "triaged",
+					"maxIssueAgeDays": 7,
+					"maxPerTick": 5,
+					"disposition": {
+						"outOfScopeLabel": "wontfix",
+						"unclearLabel": "needs-info",
+						"reTriageOnAuthorReply": true
+					}
+				},
+				"dispatch": {
+					"mode": "human-gated",
+					"humanGate": {"slashCommands": ["/plan"], "allowedUsers": []},
+					"autonomous": {"delayMinutes": 30, "holdLabel": "looper:hold"},
+					"assignTo": ""
+				}
+			}
+		},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"roles": {
+				"coordinator": {
+					"enabled": true,
+					"pollInterval": "2m",
+					"triage": {"maxPerTick": 3},
+					"dispatch": {"autonomous": {"holdLabel": "project:hold"}}
+				}
+			}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	globalRoles := ProjectRoleConfigs(loaded.Config, "missing")
+	if globalRoles.Coordinator.Enabled {
+		t.Fatal("global coordinator enabled = true, want false")
+	}
+	if globalRoles.Coordinator.PollInterval != "5m" || globalRoles.Coordinator.Triage.MaxPerTick != 5 {
+		t.Fatalf("global coordinator = %#v, want configured global defaults", globalRoles.Coordinator)
+	}
+
+	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
+	if !projectRoles.Coordinator.Enabled {
+		t.Fatal("project coordinator enabled = false, want true from project override")
+	}
+	if projectRoles.Coordinator.PollInterval != "2m" || projectRoles.Coordinator.Triage.MaxPerTick != 3 || projectRoles.Coordinator.Dispatch.Autonomous.HoldLabel != "project:hold" {
+		t.Fatalf("project coordinator = %#v, want project overrides merged", projectRoles.Coordinator)
+	}
+	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "coordinator") {
+		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(coordinator) = false, want true from project enablement")
+	}
+}
+
+func TestValidateRejectsInvalidCoordinatorConfig(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"roles": {
+			"coordinator": {
+				"enabled": true,
+				"pollInterval": "",
+				"triage": {
+					"triagedLabel": "",
+					"maxIssueAgeDays": 0,
+					"maxPerTick": 0,
+					"disposition": {
+						"outOfScopeLabel": "",
+						"unclearLabel": " needs-info "
+					}
+				},
+				"dispatch": {
+					"mode": "robot",
+					"humanGate": {"slashCommands": [], "allowedUsers": [""]},
+					"autonomous": {"delayMinutes": 0, "holdLabel": ""},
+					"assignTo": " octo "
+				}
+			}
+		},
+		"projects": [{"id": "demo", "name": "Demo", "repoPath": "/repos/demo"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssueForPaths(t, validationErr.Issues, []string{
+		"roles.coordinator.pollInterval",
+		"roles.coordinator.triage.triagedLabel",
+		"roles.coordinator.triage.maxIssueAgeDays",
+		"roles.coordinator.triage.maxPerTick",
+		"roles.coordinator.triage.disposition.outOfScopeLabel",
+		"roles.coordinator.triage.disposition.unclearLabel",
+		"roles.coordinator.dispatch.mode",
+		"roles.coordinator.dispatch.humanGate.slashCommands",
+		"roles.coordinator.dispatch.autonomous.delayMinutes",
+		"roles.coordinator.dispatch.autonomous.holdLabel",
+		"roles.coordinator.dispatch.assignTo",
+	})
+	assertValidationIssueForPathPrefix(t, validationErr.Issues, "roles.coordinator.dispatch.humanGate.allowedUsers")
+}
+
 func TestValidateRejectsInvalidSweeperTriggerThresholdAndAssociationConfig(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -2857,6 +2981,9 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if config.Scheduler.MaxConcurrentRuns != 3 {
 		t.Fatalf("DefaultConfig().Scheduler.MaxConcurrentRuns = %d, want %d", config.Scheduler.MaxConcurrentRuns, 3)
 	}
+	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
+		t.Fatalf("DefaultConfig().Scheduler.SlowLaneWarnThresholdMS = %d, want %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
+	}
 
 	if config.Logging.Level != LogLevelInfo {
 		t.Fatalf("DefaultConfig().Logging.Level = %q, want %q", config.Logging.Level, LogLevelInfo)
@@ -3013,6 +3140,10 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 	if config.Scheduler.MaxConcurrentRuns != 3 {
 		t.Fatalf("Normalize().Scheduler.MaxConcurrentRuns = %d, want default %d", config.Scheduler.MaxConcurrentRuns, 3)
+	}
+
+	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
+		t.Fatalf("Normalize().Scheduler.SlowLaneWarnThresholdMS = %d, want default %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
 	}
 
 	if config.Agent.Vendor == nil || *config.Agent.Vendor != AgentVendorOpenCode {
@@ -3283,9 +3414,63 @@ func TestRepoWorktreeDirectoryNameCanonicalizesSymlinks(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigSetsWebhookDefaults(t *testing.T) {
+	t.Parallel()
+
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if config.Webhook.Enabled {
+		t.Fatal("DefaultConfig().Webhook.Enabled = true, want false")
+	}
+	if config.Webhook.FallbackPollIntervalSeconds != 300 {
+		t.Fatalf("DefaultConfig().Webhook.FallbackPollIntervalSeconds = %d, want 300", config.Webhook.FallbackPollIntervalSeconds)
+	}
+}
+
+func TestValidateRejectsShortWebhookFallbackPollInterval(t *testing.T) {
+	t.Parallel()
+
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	config.Webhook.FallbackPollIntervalSeconds = 59
+
+	validation := Validate(config)
+	validationErr, ok := validation.(*ConfigValidationError)
+	if !ok || validationErr == nil {
+		t.Fatalf("Validate() error = %T %v, want *ConfigValidationError", validation, validation)
+	}
+	assertValidationIssue(t, validationErr, "webhook.fallbackPollIntervalSeconds", "must be an integer >= 60")
+}
+
 func sha256Hex(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", sum)
+}
+
+func TestValidateCoordinatorDependenciesRequiresPositiveBoundsWhenEnabled(t *testing.T) {
+	cwd := t.TempDir()
+	cfg, err := DefaultConfig(cwd)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.APITimeoutSeconds = 0
+	cfg.Roles.Coordinator.Dependencies.APIRetryAttempts = 0
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want validation error")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "roles.coordinator.dependencies.apiTimeoutSeconds", "must be a positive integer when dependencies are enabled")
+	assertValidationIssue(t, validationErr, "roles.coordinator.dependencies.apiRetryAttempts", "must be a positive integer when dependencies are enabled")
 }
 
 func mapEnvLookup(values map[string]string) EnvLookupFunc {

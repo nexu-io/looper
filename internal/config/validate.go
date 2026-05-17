@@ -83,6 +83,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
 	}
 
+	if config.Scheduler.SlowLaneWarnThresholdMS < 1 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
+	}
+
+	if config.Webhook.FallbackPollIntervalSeconds < 60 {
+		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
+	}
+
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI)})
 	}
@@ -185,6 +193,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	validateInstructions(config, &issues)
+	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
@@ -237,6 +246,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Roles != nil && project.Roles.Sweeper != nil {
 			validateSweeperRoleConfig(effectiveProjectRoles.Sweeper, prefix+".roles.sweeper", &issues)
+		}
+		if project.Roles != nil && project.Roles.Coordinator != nil {
+			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
 	}
 
@@ -341,6 +353,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	}
 	if roles.Sweeper != nil {
 		validateProjectRoleInstruction(prefix+".sweeper.instructions", "sweeper", roles.Sweeper.Instructions, maxInstructionBytes, issues)
+	}
+	if roles.Coordinator != nil {
+		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
+		}
 	}
 }
 
@@ -634,6 +651,71 @@ func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, is
 	}
 }
 
+func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(config.PollInterval) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".pollInterval", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(strings.TrimSpace(config.PollInterval)); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path + ".pollInterval", Message: "must be a valid time.Duration string"})
+	} else if duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".pollInterval", Message: "must be greater than 0"})
+	}
+	if config.Triage.MaxIssueAgeDays <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triage.maxIssueAgeDays", Message: "must be a positive integer"})
+	}
+	if config.Triage.MaxPerTick <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triage.maxPerTick", Message: "must be a positive integer"})
+	}
+	if !isNonEmptyTrimmed(config.Triage.TriagedLabel) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triage.triagedLabel", Message: "must be a non-empty string without leading or trailing whitespace"})
+	}
+	if !isNonEmptyTrimmed(config.Triage.Disposition.OutOfScopeLabel) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triage.disposition.outOfScopeLabel", Message: "must be a non-empty string without leading or trailing whitespace"})
+	}
+	if !isNonEmptyTrimmed(config.Triage.Disposition.UnclearLabel) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".triage.disposition.unclearLabel", Message: "must be a non-empty string without leading or trailing whitespace"})
+	}
+	if config.Dispatch.Mode != "human-gated" && config.Dispatch.Mode != "autonomous" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.mode", Message: "must be one of: human-gated, autonomous"})
+	}
+	validateStringList(config.Dispatch.HumanGate.SlashCommands, path+".dispatch.humanGate.slashCommands", issues)
+	validateStringList(config.Dispatch.HumanGate.AllowedUsers, path+".dispatch.humanGate.allowedUsers", issues)
+	if len(config.Dispatch.HumanGate.SlashCommands) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.humanGate.slashCommands", Message: "must contain at least one slash command"})
+	}
+	for _, command := range config.Dispatch.HumanGate.SlashCommands {
+		if command != "/plan" && command != "/implement" {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.humanGate.slashCommands", Message: fmt.Sprintf("contains unsupported slash command: %s", command)})
+		}
+	}
+	if config.Dispatch.Autonomous.DelayMinutes <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.autonomous.delayMinutes", Message: "must be a positive integer"})
+	}
+	if !isNonEmptyTrimmed(config.Dispatch.Autonomous.HoldLabel) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.autonomous.holdLabel", Message: "must be a non-empty string without leading or trailing whitespace"})
+	}
+	if config.Dispatch.AssignTo != strings.TrimSpace(config.Dispatch.AssignTo) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".dispatch.assignTo", Message: "must not contain leading or trailing whitespace"})
+	}
+	if config.Dependencies.Enabled {
+		if config.Dependencies.APITimeoutSeconds <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiTimeoutSeconds", Message: "must be a positive integer when dependencies are enabled"})
+		}
+		if config.Dependencies.APIRetryAttempts <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiRetryAttempts", Message: "must be a positive integer when dependencies are enabled"})
+		}
+	}
+	validateDistinctLabels([]labelPathValue{
+		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},
+		{Path: path + ".triage.disposition.outOfScopeLabel", Value: config.Triage.Disposition.OutOfScopeLabel},
+		{Path: path + ".triage.disposition.unclearLabel", Value: config.Triage.Disposition.UnclearLabel},
+		{Path: path + ".dispatch.autonomous.holdLabel", Value: config.Dispatch.Autonomous.HoldLabel},
+	}, issues)
+}
+
+func isNonEmptyTrimmed(value string) bool {
+	return strings.TrimSpace(value) != "" && value == strings.TrimSpace(value)
+}
+
 func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]ValidationIssue) {
 	validateStringList(config.Triggers.ExcludeLabels, path+".triggers.excludeLabels", issues)
 	validateStringList(config.Triggers.ExcludeAuthors, path+".triggers.excludeAuthors", issues)
@@ -643,6 +725,27 @@ func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]
 
 	if config.Triggers.MaxPerTick <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.maxPerTick", Message: "must be a positive integer"})
+	}
+	if config.Filter.Mode != SweeperFilterModeDeterministic {
+		*issues = append(*issues, ValidationIssue{Path: path + ".filter.mode", Message: fmt.Sprintf("must be %q", SweeperFilterModeDeterministic)})
+	}
+	if config.Proposer.Mode != SweeperProposerModeAgentApply && config.Proposer.Mode != SweeperProposerModeHeuristicFallback {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.mode", Message: fmt.Sprintf("must be one of: %s, %s", SweeperProposerModeAgentApply, SweeperProposerModeHeuristicFallback)})
+	}
+	if config.Proposer.TimeoutSeconds <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutSeconds", Message: "must be a positive integer"})
+	}
+	if config.Proposer.TimeoutRateDryRunThreshold < 0 || config.Proposer.TimeoutRateDryRunThreshold > 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunThreshold", Message: "must be between 0 and 1"})
+	}
+	if config.Proposer.TimeoutRateDryRunMinSamples < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunMinSamples", Message: "must be greater than or equal to 0"})
+	}
+	if config.Proposer.SchemaVersion != 1 && config.Proposer.SchemaVersion != 2 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.schemaVersion", Message: "must be 1 or 2"})
+	}
+	if config.Proposer.Model != nil && strings.TrimSpace(*config.Proposer.Model) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.model", Message: "must be a non-empty string when set"})
 	}
 	if config.Triggers.ReopenCooldownDays <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.reopenCooldownDays", Message: "must be a positive integer"})

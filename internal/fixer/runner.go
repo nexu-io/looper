@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -76,6 +77,45 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	defaultRetryMax                 = 3
 )
+
+var fixerDiscoveryLocks = newFixerDiscoveryLockSet()
+
+type fixerDiscoveryLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*fixerDiscoveryLockRef
+}
+
+type fixerDiscoveryLockRef struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newFixerDiscoveryLockSet() *fixerDiscoveryLockSet {
+	return &fixerDiscoveryLockSet{locks: map[string]*fixerDiscoveryLockRef{}}
+}
+
+func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
+	s.mu.Lock()
+	ref := s.locks[key]
+	if ref == nil {
+		ref = &fixerDiscoveryLockRef{}
+		s.locks[key] = ref
+	}
+	ref.refs++
+	s.mu.Unlock()
+
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(s.locks, key)
+		}
+		s.mu.Unlock()
+	}()
+	return fn()
+}
 
 type FixItem struct {
 	Type              string   `json:"type"`
@@ -402,6 +442,7 @@ type Options struct {
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnQueueItemEnqueued     func()
 }
 
 type DiscoveryPolicy struct {
@@ -439,12 +480,21 @@ type Runner struct {
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	onQueueItemEnqueued     func()
 }
 
 type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Limit     int
+	Snapshot  *githubinfra.DiscoverySnapshot
+}
+
+type TargetedDiscoveryInput struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
+	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -592,7 +642,8 @@ type checkpointRepair struct {
 // checkpoint so resume/retry reuses the same explanation if it still maps to
 // the current fix items snapshot. Fixed decisions must include
 // ThreadCommentsObserved so resolve-comments can verify the live thread still
-// contains exactly the same non-Looper comment IDs before auto-resolving.
+// contains exactly the same target review comment IDs before auto-resolving,
+// excluding only prior Looper fixer replies.
 type replyExplanationEntry struct {
 	FixItemID              string `json:"fixItemId"`
 	ThreadID               string `json:"threadId,omitempty"`
@@ -742,6 +793,7 @@ const maxReplyExplanationLength = 500
 const (
 	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
 	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
+	agentDeclinedThreadWithoutReason      = "Agent declined this thread without a substantive reason"
 	maxDeclinedThreadRecords              = 200
 	zeroProgressPauseReason               = "agent_zero_progress"
 )
@@ -993,10 +1045,12 @@ func New(options Options) *Runner {
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
 		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")
 	}
@@ -1032,15 +1086,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		appendDiscoveryQueueItem(&result.QueueItems, item)
 	}
 	for _, pr := range openPRs {
-		if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
-			result.Skipped++
-			continue
-		}
-		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
-			result.Skipped++
-			continue
-		}
-		if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+
+		if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
 			result.Skipped++
 			continue
 		}
@@ -1048,59 +1095,52 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		allFixItems := collectFixItems(detail)
-		if len(allFixItems) == 0 {
-			if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
-				return DiscoveryResult{}, err
-			}
-			result.Skipped++
-			continue
+		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
+			return DiscoveryResult{}, err
 		}
-		allFixItemsStateHash := hashFixItemsState(allFixItems)
-		fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, pr.Number), detail.HeadSHA, allFixItems)
-		if len(fixItems) == 0 {
-			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
-				return DiscoveryResult{}, err
-			}
-			result.Skipped++
-			continue
-		}
-		fixItemsHash := hashFixItems(fixItems)
-		fixItemsStateHash := allFixItemsStateHash
-		unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
-		if len(unresolvedThreadIDs) == 0 {
-			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
-				return DiscoveryResult{}, err
-			}
-		}
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
+	}
+	return result, nil
+}
+
+func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	if input.PRNumber <= 0 {
+		return DiscoveryResult{}, fmt.Errorf("prNumber must be positive")
+	}
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
+		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	currentUser := ""
+	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
-			result.Skipped++
-			continue
-		}
-		if loopResult.created {
-			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
-		}
-		headSHA := detail.HeadSHA
-		if headSHA == "" {
-			headSHA = "unknown"
-		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{
-			ProjectID:    project.ID,
-			LoopID:       loopResult.record.ID,
-			Repo:         input.Repo,
-			PRNumber:     pr.Number,
-			HeadSHA:      headSHA,
-			FixItemsHash: fixItemsStateHash,
-			AvailableAt:  loopResult.availableAt,
-		})
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		appendDiscoveryQueueItem(&result.QueueItems, queueItem)
+		currentUser = strings.TrimSpace(currentUser)
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
+	result := DiscoveryResult{}
+	if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
+		result.Skipped++
+		return result, nil
+	}
+	if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
+		return DiscoveryResult{}, err
 	}
 	return result, nil
 }
@@ -1169,6 +1209,76 @@ func defaultDiscoveryLimit(limit int) int {
 		return 30
 	}
 	return limit
+}
+
+func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy) bool {
+	if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, repo, pr.Number) {
+		return false
+	}
+	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
+		return false
+	}
+	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+		return false
+	}
+	return true
+}
+
+func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
+	allFixItems := collectFixItems(detail)
+	if len(allFixItems) == 0 {
+		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
+			return err
+		}
+		result.Skipped++
+		return nil
+	}
+	allFixItemsStateHash := hashFixItemsState(allFixItems)
+	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
+	if len(fixItems) == 0 {
+		if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, repo, detail.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
+			return err
+		}
+		result.Skipped++
+		return nil
+	}
+	fixItemsHash := hashFixItems(fixItems)
+	fixItemsStateHash := allFixItemsStateHash
+	unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
+	if len(unresolvedThreadIDs) == 0 {
+		if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, repo, detail.Number); err != nil {
+			return err
+		}
+	}
+	loopResult, err := r.ensureLoopForPullRequest(ctx, project, repo, detail.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
+	if err != nil {
+		return err
+	}
+	if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
+		result.Skipped++
+		return nil
+	}
+	if loopResult.created {
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	headSHA := detail.HeadSHA
+	if headSHA == "" {
+		headSHA = "unknown"
+	}
+	queueItem, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:    project.ID,
+		LoopID:       loopResult.record.ID,
+		Repo:         repo,
+		PRNumber:     detail.Number,
+		HeadSHA:      headSHA,
+		FixItemsHash: fixItemsStateHash,
+		AvailableAt:  loopResult.availableAt,
+	})
+	if err != nil {
+		return err
+	}
+	appendDiscoveryQueueItem(&result.QueueItems, queueItem)
+	return nil
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -2132,14 +2242,14 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// Per-thread drift detection (hasNonLooperCommentSince below) handles
 	// the case where a reviewer added or edited a comment on an existing
 	// thread after the agent recorded its decisions. New threads that
-	// appeared after the snapshot are not present in the agent's payload
-	// and fall through to the contract-violation → synthetic-decline path,
-	// which posts a visible reply without resolving the thread. Both
-	// behaviours are correct without invalidating the entire reply set on
-	// a fix-items hash mismatch — doing so threw away every successful
-	// "fixed" decision whenever a single new thread appeared, which on PRs
-	// receiving a steady stream of bot comments produced an unbreakable
-	// drift loop.
+	// appeared after the snapshot are not present in the agent's payload.
+	// Treat those missing/invalid per-thread decisions as contract
+	// violations, while still honoring any valid "fixed"/"declined"
+	// decisions the agent did provide for other threads. Invalidating the
+	// entire reply set on a fix-items hash mismatch threw away every
+	// successful "fixed" decision whenever a single new thread appeared,
+	// which on PRs receiving a steady stream of bot comments produced an
+	// unbreakable drift loop.
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -2148,12 +2258,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if !ok && item.ThreadID != "" {
 			decision, ok = repliesByThreadID[item.ThreadID]
 		}
+		decisionIssueStatus := ""
+		decisionIssueMessage := ""
 		if !ok {
-			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentMissingThreadDecisionExplanation}
-			contractViolationCount++
+			decisionIssueStatus = "skipped_missing_agent_decision"
+			decisionIssueMessage = agentMissingThreadDecisionExplanation
 		} else if _, validAction := parseReplyAction(decision.Action); !validAction {
-			decision = replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Explanation: agentInvalidThreadDecisionExplanation}
-			contractViolationCount++
+			decisionIssueStatus = "skipped_invalid_agent_decision"
+			decisionIssueMessage = agentInvalidThreadDecisionExplanation
+		} else if normalizeReplyAction(decision.Action) == string(replyActionDeclined) && !hasSubstantiveDeclineExplanation(decision.Explanation) {
+			decisionIssueStatus = "skipped_invalid_agent_decision"
+			decisionIssueMessage = agentDeclinedThreadWithoutReason
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -2166,6 +2281,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if hasNonLooperCommentSince(thread, driftSince) {
 			driftCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_thread_drift", Message: "New human comment was added to this thread after the fixer run started", UpdatedAt: r.nowISO()})
+			continue
+		}
+		if decisionIssueStatus != "" {
+			contractViolationCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: decisionIssueStatus, Message: decisionIssueMessage, UpdatedAt: r.nowISO()})
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -2182,6 +2302,23 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 				continue
 			}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
+				return checkpoint, err
+			}
+			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
+				message := err.Error()
+				if strings.Contains(strings.ToLower(message), "already") {
+					if replyState == "sent" {
+						declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
+					}
+					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+					continue
+				}
+				mutationFailureCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+				continue
+			}
+			resolvedCount++
 			if replyState == "sent" {
 				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
 			}
@@ -2222,6 +2359,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: FailureRetryableAfterResume}
+	}
+	if contractViolationCount > 0 {
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because the fixer response omitted or invalidated thread decisions", contractViolationCount), kind: FailureRetryableAfterResume}
 	}
 	if mutationFailureCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
@@ -2398,9 +2539,9 @@ func normalizeThreadCommentsObserved(raw string) string {
 // after the agent's decision) is detected separately by
 // hasNonLooperCommentSince. We deliberately do not invalidate the whole
 // reply set when the fix-items hash differs from the snapshot the agent
-// saw: new threads simply fall through to the contract-violation path and
-// receive synthetic declines, while previously decided threads continue to
-// be replied/resolved as the agent intended.
+// saw: new threads fall through to the contract-violation retry path,
+// while previously decided threads continue to be replied/resolved as the
+// agent intended.
 func agentResolveReplyExplanationsValid(checkpoint fixerCheckpoint) bool {
 	if checkpoint.Repair == nil || len(checkpoint.Repair.ReplyExplanations) == 0 {
 		return false
@@ -2475,7 +2616,7 @@ func hashReviewThreadComments(thread ReviewThread) string {
 	}
 	comments := make([]observedThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		if isLooperReviewThreadComment(comment) {
+		if isLooperFixerReplyComment(comment) {
 			continue
 		}
 		id := strings.TrimSpace(comment.ID)
@@ -2524,6 +2665,14 @@ func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
 		return false
 	}
 	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
+}
+
+func isLooperFixerReplyComment(comment ReviewThreadComment) bool {
+	body := strings.TrimSpace(comment.Body)
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
 }
 
 // isBotReviewThreadComment reports whether the comment was authored by a
@@ -2584,6 +2733,19 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 		b.WriteString(marker)
 	}
 	return b.String()
+}
+
+func hasSubstantiveDeclineExplanation(explanation string) bool {
+	explanation = strings.TrimSpace(explanation)
+	if explanation == "" {
+		return false
+	}
+	switch explanation {
+	case agentMissingThreadDecisionExplanation, agentInvalidThreadDecisionExplanation, agentDeclinedThreadWithoutReason:
+		return false
+	default:
+		return true
+	}
 }
 
 func fixerReplyMarker(threadID, commitSHA string) string {
@@ -3571,9 +3733,12 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 			updated := *existing
 			updated.AvailableAt = availableAt
 			updated.UpdatedAt = r.nowISO()
-			if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+			persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+			if err != nil {
 				return storage.QueueItemRecord{}, err
 			}
+			updated = persisted
+			r.wakeSchedulerAfterEnqueue()
 			return updated, nil
 		}
 		return *existing, nil
@@ -3590,9 +3755,12 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 			updated.AvailableAt = availableAt
 			updated.PayloadJSON = &payload
 			updated.UpdatedAt = r.nowISO()
-			if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+			persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+			if err != nil {
 				return storage.QueueItemRecord{}, err
 			}
+			updated = persisted
+			r.wakeSchedulerAfterEnqueue()
 			return updated, nil
 		}
 		return *activeForLoop, nil
@@ -3603,10 +3771,20 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	return queueItem, nil
+	if created {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return persisted, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
@@ -3631,7 +3809,7 @@ func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.Q
 			return nil, err
 		}
 	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 	}
@@ -3933,7 +4111,7 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Action == string(replyActionFixed) {
+		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
 			return true
 		}
 	}
@@ -4573,7 +4751,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 		`  - "threadId": the exact "threadId" of the same fix item`,
 		`  - "action": "fixed" or "declined"`,
 		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		`  - "threadCommentsObserved": sha256 of the JSON array of non-Looper review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. Exclude prior Looper-generated replies.`,
+		`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 		"Before including an entry, re-read the relevant review thread/comment context.",
 		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
 		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",

@@ -135,10 +135,16 @@ type StorageConfig struct {
 }
 
 type SchedulerConfig struct {
-	PollIntervalSeconds int `json:"pollIntervalSeconds"`
-	MaxConcurrentRuns   int `json:"maxConcurrentRuns"`
-	RetryMaxAttempts    int `json:"retryMaxAttempts"`
-	RetryBaseDelayMS    int `json:"retryBaseDelayMs"`
+	PollIntervalSeconds     int `json:"pollIntervalSeconds"`
+	MaxConcurrentRuns       int `json:"maxConcurrentRuns"`
+	RetryMaxAttempts        int `json:"retryMaxAttempts"`
+	RetryBaseDelayMS        int `json:"retryBaseDelayMs"`
+	SlowLaneWarnThresholdMS int `json:"slowLaneWarnThresholdMs"`
+}
+
+type WebhookConfig struct {
+	Enabled                     bool `json:"enabled"`
+	FallbackPollIntervalSeconds int  `json:"fallbackPollIntervalSeconds"`
 }
 
 type AgentConfig struct {
@@ -410,10 +416,39 @@ type SweeperCategoriesConfig struct {
 	AbandonedPR  SweeperCategoryConfig `json:"abandonedPR"`
 }
 
+type SweeperProposerMode string
+
+const (
+	SweeperProposerModeAgentApply        SweeperProposerMode = "agent_apply"
+	SweeperProposerModeHeuristicFallback SweeperProposerMode = "heuristic_fallback"
+)
+
+type SweeperFilterMode string
+
+const (
+	SweeperFilterModeDeterministic SweeperFilterMode = "deterministic"
+)
+
+type SweeperProposerConfig struct {
+	Mode                        SweeperProposerMode `json:"mode"`
+	Model                       *string             `json:"model,omitempty"`
+	TimeoutSeconds              int                 `json:"timeoutSeconds"`
+	SchemaVersion               int                 `json:"schemaVersion"`
+	DiagnosticMode              bool                `json:"diagnosticMode"`
+	TimeoutRateDryRunThreshold  float64             `json:"timeoutRateDryRunThreshold"`
+	TimeoutRateDryRunMinSamples int                 `json:"timeoutRateDryRunMinSamples"`
+}
+
+type SweeperFilterConfig struct {
+	Mode SweeperFilterMode `json:"mode"`
+}
+
 type SweeperRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	DryRun        bool                    `json:"dryRun"`
 	Triggers      SweeperTriggersConfig   `json:"triggers"`
+	Filter        SweeperFilterConfig     `json:"filter"`
+	Proposer      SweeperProposerConfig   `json:"proposer"`
 	Lifecycle     SweeperLifecycleConfig  `json:"lifecycle"`
 	Limits        SweeperLimitsConfig     `json:"limits"`
 	Categories    SweeperCategoriesConfig `json:"categories"`
@@ -422,12 +457,57 @@ type SweeperRoleConfig struct {
 	Instructions  string                  `json:"instructions,omitempty"`
 }
 
+type CoordinatorTriageDispositionConfig struct {
+	OutOfScopeLabel       string `json:"outOfScopeLabel"`
+	UnclearLabel          string `json:"unclearLabel"`
+	ReTriageOnAuthorReply bool   `json:"reTriageOnAuthorReply"`
+}
+
+type CoordinatorTriageConfig struct {
+	TriagedLabel    string                             `json:"triagedLabel"`
+	MaxIssueAgeDays int                                `json:"maxIssueAgeDays"`
+	MaxPerTick      int                                `json:"maxPerTick"`
+	Disposition     CoordinatorTriageDispositionConfig `json:"disposition"`
+}
+
+type CoordinatorDispatchHumanGateConfig struct {
+	SlashCommands []string `json:"slashCommands"`
+	AllowedUsers  []string `json:"allowedUsers"`
+}
+
+type CoordinatorDispatchAutonomousConfig struct {
+	DelayMinutes int    `json:"delayMinutes"`
+	HoldLabel    string `json:"holdLabel"`
+}
+
+type CoordinatorDispatchConfig struct {
+	Mode       string                              `json:"mode"`
+	HumanGate  CoordinatorDispatchHumanGateConfig  `json:"humanGate"`
+	Autonomous CoordinatorDispatchAutonomousConfig `json:"autonomous"`
+	AssignTo   string                              `json:"assignTo"`
+}
+
+type CoordinatorDependenciesConfig struct {
+	Enabled           bool `json:"enabled"`
+	APITimeoutSeconds int  `json:"apiTimeoutSeconds"`
+	APIRetryAttempts  int  `json:"apiRetryAttempts"`
+}
+
+type CoordinatorRoleConfig struct {
+	Enabled      bool                          `json:"enabled"`
+	PollInterval string                        `json:"pollInterval"`
+	Triage       CoordinatorTriageConfig       `json:"triage"`
+	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
+	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
+}
+
 type RoleConfigs struct {
-	Planner  PlannerRoleConfig  `json:"planner"`
-	Reviewer ReviewerRoleConfig `json:"reviewer"`
-	Fixer    FixerRoleConfig    `json:"fixer"`
-	Worker   WorkerRoleConfig   `json:"worker"`
-	Sweeper  SweeperRoleConfig  `json:"sweeper"`
+	Planner     PlannerRoleConfig     `json:"planner"`
+	Reviewer    ReviewerRoleConfig    `json:"reviewer"`
+	Fixer       FixerRoleConfig       `json:"fixer"`
+	Worker      WorkerRoleConfig      `json:"worker"`
+	Sweeper     SweeperRoleConfig     `json:"sweeper"`
+	Coordinator CoordinatorRoleConfig `json:"coordinator"`
 }
 
 type ProjectRefConfig struct {
@@ -455,6 +535,7 @@ type Config struct {
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
+	Webhook       WebhookConfig      `json:"webhook"`
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
@@ -483,10 +564,16 @@ type PartialStorageConfig struct {
 }
 
 type PartialSchedulerConfig struct {
-	PollIntervalSeconds *int `json:"pollIntervalSeconds,omitempty"`
-	MaxConcurrentRuns   *int `json:"maxConcurrentRuns,omitempty"`
-	RetryMaxAttempts    *int `json:"retryMaxAttempts,omitempty"`
-	RetryBaseDelayMS    *int `json:"retryBaseDelayMs,omitempty"`
+	PollIntervalSeconds     *int `json:"pollIntervalSeconds,omitempty"`
+	MaxConcurrentRuns       *int `json:"maxConcurrentRuns,omitempty"`
+	RetryMaxAttempts        *int `json:"retryMaxAttempts,omitempty"`
+	RetryBaseDelayMS        *int `json:"retryBaseDelayMs,omitempty"`
+	SlowLaneWarnThresholdMS *int `json:"slowLaneWarnThresholdMs,omitempty"`
+}
+
+type PartialWebhookConfig struct {
+	Enabled                     *bool `json:"enabled,omitempty"`
+	FallbackPollIntervalSeconds *int  `json:"fallbackPollIntervalSeconds,omitempty"`
 }
 
 type PartialAgentConfig struct {
@@ -709,6 +796,20 @@ type PartialSweeperReportingConfig struct {
 	DurableReportsDir *string `json:"durableReportsDir,omitempty"`
 }
 
+type PartialSweeperProposerConfig struct {
+	Mode                        *SweeperProposerMode `json:"mode,omitempty"`
+	Model                       *string              `json:"model,omitempty"`
+	TimeoutSeconds              *int                 `json:"timeoutSeconds,omitempty"`
+	SchemaVersion               *int                 `json:"schemaVersion,omitempty"`
+	DiagnosticMode              *bool                `json:"diagnosticMode,omitempty"`
+	TimeoutRateDryRunThreshold  *float64             `json:"timeoutRateDryRunThreshold,omitempty"`
+	TimeoutRateDryRunMinSamples *int                 `json:"timeoutRateDryRunMinSamples,omitempty"`
+}
+
+type PartialSweeperFilterConfig struct {
+	Mode *SweeperFilterMode `json:"mode,omitempty"`
+}
+
 type PartialSweeperLifecycleConfig struct {
 	PendingLabel *string `json:"pendingLabel,omitempty"`
 	ClosedLabel  *string `json:"closedLabel,omitempty"`
@@ -755,6 +856,8 @@ type PartialSweeperRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	DryRun        *bool                           `json:"dryRun,omitempty"`
 	Triggers      *PartialSweeperTriggersConfig   `json:"triggers,omitempty"`
+	Filter        *PartialSweeperFilterConfig     `json:"filter,omitempty"`
+	Proposer      *PartialSweeperProposerConfig   `json:"proposer,omitempty"`
 	Lifecycle     *PartialSweeperLifecycleConfig  `json:"lifecycle,omitempty"`
 	Limits        *PartialSweeperLimitsConfig     `json:"limits,omitempty"`
 	Categories    *PartialSweeperCategoriesConfig `json:"categories,omitempty"`
@@ -763,18 +866,64 @@ type PartialSweeperRoleConfig struct {
 	Instructions  *string                         `json:"instructions,omitempty"`
 }
 
+type PartialCoordinatorTriageDispositionConfig struct {
+	OutOfScopeLabel       *string `json:"outOfScopeLabel,omitempty"`
+	UnclearLabel          *string `json:"unclearLabel,omitempty"`
+	ReTriageOnAuthorReply *bool   `json:"reTriageOnAuthorReply,omitempty"`
+}
+
+type PartialCoordinatorTriageConfig struct {
+	TriagedLabel    *string                                    `json:"triagedLabel,omitempty"`
+	MaxIssueAgeDays *int                                       `json:"maxIssueAgeDays,omitempty"`
+	MaxPerTick      *int                                       `json:"maxPerTick,omitempty"`
+	Disposition     *PartialCoordinatorTriageDispositionConfig `json:"disposition,omitempty"`
+}
+
+type PartialCoordinatorDispatchHumanGateConfig struct {
+	SlashCommands *[]string `json:"slashCommands,omitempty"`
+	AllowedUsers  *[]string `json:"allowedUsers,omitempty"`
+}
+
+type PartialCoordinatorDispatchAutonomousConfig struct {
+	DelayMinutes *int    `json:"delayMinutes,omitempty"`
+	HoldLabel    *string `json:"holdLabel,omitempty"`
+}
+
+type PartialCoordinatorDispatchConfig struct {
+	Mode       *string                                     `json:"mode,omitempty"`
+	HumanGate  *PartialCoordinatorDispatchHumanGateConfig  `json:"humanGate,omitempty"`
+	Autonomous *PartialCoordinatorDispatchAutonomousConfig `json:"autonomous,omitempty"`
+	AssignTo   *string                                     `json:"assignTo,omitempty"`
+}
+
+type PartialCoordinatorDependenciesConfig struct {
+	Enabled           *bool `json:"enabled,omitempty"`
+	APITimeoutSeconds *int  `json:"apiTimeoutSeconds,omitempty"`
+	APIRetryAttempts  *int  `json:"apiRetryAttempts,omitempty"`
+}
+
+type PartialCoordinatorRoleConfig struct {
+	Enabled      *bool                                 `json:"enabled,omitempty"`
+	PollInterval *string                               `json:"pollInterval,omitempty"`
+	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
+	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
+	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
+}
+
 type PartialRoleConfigs struct {
-	Planner  *PartialPlannerRoleConfig  `json:"planner,omitempty"`
-	Reviewer *PartialReviewerRoleConfig `json:"reviewer,omitempty"`
-	Fixer    *PartialFixerRoleConfig    `json:"fixer,omitempty"`
-	Worker   *PartialWorkerRoleConfig   `json:"worker,omitempty"`
-	Sweeper  *PartialSweeperRoleConfig  `json:"sweeper,omitempty"`
+	Planner     *PartialPlannerRoleConfig     `json:"planner,omitempty"`
+	Reviewer    *PartialReviewerRoleConfig    `json:"reviewer,omitempty"`
+	Fixer       *PartialFixerRoleConfig       `json:"fixer,omitempty"`
+	Worker      *PartialWorkerRoleConfig      `json:"worker,omitempty"`
+	Sweeper     *PartialSweeperRoleConfig     `json:"sweeper,omitempty"`
+	Coordinator *PartialCoordinatorRoleConfig `json:"coordinator,omitempty"`
 }
 
 type PartialConfig struct {
 	Server         *PartialServerConfig       `json:"server,omitempty"`
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
+	Webhook        *PartialWebhookConfig      `json:"webhook,omitempty"`
 	Agent          *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging        *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications  *PartialNotificationConfig `json:"notifications,omitempty"`

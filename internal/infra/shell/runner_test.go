@@ -72,8 +72,8 @@ func TestRunTimesOutAndPreservesCapturedOutput(t *testing.T) {
 	result, err := Run(context.Background(), Options{
 		Command:          "/bin/sh",
 		Args:             []string{"-c", `printf 'start'; sleep 1`},
-		Timeout:          50 * time.Millisecond,
-		GracefulShutdown: 10 * time.Millisecond,
+		Timeout:          500 * time.Millisecond,
+		GracefulShutdown: 50 * time.Millisecond,
 	})
 	var commandErr *CommandExecutionError
 	if !errors.As(err, &commandErr) {

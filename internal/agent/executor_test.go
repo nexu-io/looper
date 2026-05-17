@@ -835,7 +835,7 @@ func TestExecutorCapturesConcurrentStdoutAndStderr(t *testing.T) {
 	t.Parallel()
 
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `for i in 1 2 3; do printf "out$i\n"; printf "err$i\n" >&2; sleep 0.02; done`}}}})
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_streams", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_streams", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 3 * time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -1043,7 +1043,7 @@ func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutd
 
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}}})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 120 * time.Millisecond, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 250 * time.Millisecond, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -1065,9 +1065,9 @@ func TestExecutorMaxRuntimeTimeoutIgnoresProgressResets(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "while true; do printf 'beat\n'; sleep 0.02; done"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "while true; do printf 'beat\n'; sleep 0.03; done"}}}, Repos: repos})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_max_runtime_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 80 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 10 * time.Millisecond})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_max_runtime_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 300 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}

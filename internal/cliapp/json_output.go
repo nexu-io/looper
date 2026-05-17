@@ -180,6 +180,37 @@ func (r *commandRuntime) loopPause(cmd *cobra.Command, args []string) error {
 	}, writeHumanLoopPaused)
 }
 
+func (r *commandRuntime) pauseLoopBySeq(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		seq, err := loopSeqSelector(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(seq)+"/pause", nil)
+	}, writeHumanLoopPaused)
+}
+
+func (r *commandRuntime) unpauseLoopBySeq(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		seq, err := loopSeqSelector(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(seq)+"/start", nil)
+	}, writeHumanLoopUnpaused)
+}
+
+func loopSeqSelector(value string) (string, error) {
+	seq := strings.TrimSpace(value)
+	if seq == "" {
+		return "", fmt.Errorf("loop sequence number is required")
+	}
+	if _, err := strconv.ParseInt(seq, 10, 64); err != nil {
+		return "", fmt.Errorf("loop sequence number must be numeric: %s", value)
+	}
+	return seq, nil
+}
+
 func (r *commandRuntime) pullRequestList(cmd *cobra.Command, args []string) error {
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		return r.getJSON(ctx, "/api/v1/pull-requests")

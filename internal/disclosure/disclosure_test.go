@@ -107,26 +107,29 @@ func TestDisclosureIncludesAgentVendorAndModelSeparately(t *testing.T) {
 	s.Version = "1.2.3"
 
 	footer := s.Markdown("Body", "worker", ChannelPullRequest)
-	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=opencode · model=openai/gpt-5.5 · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer missing linked slogan disclosure: %q", footer)
 	}
 	if !strings.Contains(footer, "agent=opencode") {
 		t.Fatalf("footer missing agent attribute: %q", footer)
 	}
-	if !strings.Contains(footer, "model=openai/gpt-5.5") {
-		t.Fatalf("footer missing model attribute: %q", footer)
+	if strings.Contains(footer, "model=") {
+		t.Fatalf("footer should not expose model attribute: %q", footer)
 	}
 
 	commit := s.CommitMessage("fix: disclose agent", "worker")
-	if !strings.Contains(commit, "Generated-By: looper 1.2.3 (runner=worker, agent=opencode, model=openai/gpt-5.5)") {
-		t.Fatalf("commit trailer missing separate agent and model attributes: %q", commit)
+	if !strings.Contains(commit, "Generated-By: looper 1.2.3 (runner=worker, agent=opencode)") {
+		t.Fatalf("commit trailer missing runner and agent attributes: %q", commit)
+	}
+	if strings.Contains(commit, "model=") {
+		t.Fatalf("commit trailer should not expose model attribute: %q", commit)
 	}
 	if strings.Contains(commit, "agent=openai/gpt-5.5") || strings.Contains(footer, "agent=openai/gpt-5.5") {
 		t.Fatalf("model leaked into agent attribute: footer=%q commit=%q", footer, commit)
 	}
 }
 
-func TestDisclosureSanitizesModelAttribute(t *testing.T) {
+func TestDisclosureIgnoresModelAttribute(t *testing.T) {
 	vendor := config.AgentVendorOpenCode
 	model := " openai/gpt-5.5\nGenerated-By: looper injected, model)</sub> "
 	s := FromConfig(config.Config{
@@ -153,16 +156,16 @@ func TestDisclosureSanitizesModelAttribute(t *testing.T) {
 	if strings.Contains(commit, "\nGenerated-By: looper injected") {
 		t.Fatalf("model included a raw newline trailer: %q", commit)
 	}
-	if !strings.Contains(commit, "model=openai/gpt-5.5%20Generated-By:%20looper%20injected%2C%20model%29%3C/sub%3E") {
-		t.Fatalf("commit trailer missing sanitized model: %q", commit)
+	if strings.Contains(commit, "model=") || strings.Contains(commit, "openai/gpt-5.5") {
+		t.Fatalf("commit trailer should not expose model: %q", commit)
 	}
 
 	footer := s.Markdown("Body", "worker", ChannelPullRequest)
 	if strings.Count(footer, "<sub>") != 1 || strings.Count(footer, "</sub>") != 1 {
 		t.Fatalf("model broke footer markup: %q", footer)
 	}
-	if !strings.Contains(footer, "model=openai/gpt-5.5%20Generated-By:%20looper%20injected%2C%20model%29%3C/sub%3E") {
-		t.Fatalf("footer missing sanitized model attribute: %q", footer)
+	if strings.Contains(footer, "model=") {
+		t.Fatalf("footer should not expose model attribute: %q", footer)
 	}
 	if strings.Contains(footer, "\nGenerated-By: looper injected") || strings.Contains(footer, "model)</sub>") {
 		t.Fatalf("footer included unsanitized model: %q", footer)

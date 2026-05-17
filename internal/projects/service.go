@@ -780,7 +780,8 @@ func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storag
 		CreatedAt:   nowISO,
 		UpdatedAt:   nowISO,
 	}
-	return true, s.Repos.Queue.Upsert(ctx, record)
+	_, _, err = s.Repos.Queue.CreateOrGetActiveByDedupe(ctx, record)
+	return true, err
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

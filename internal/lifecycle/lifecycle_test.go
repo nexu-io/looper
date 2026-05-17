@@ -71,12 +71,12 @@ func TestPromptInstructionDocumentsLifecycleContract(t *testing.T) {
 
 func TestPromptInstructionDocumentsAgentModelWhenConfigured(t *testing.T) {
 	prompt := PromptInstruction("worker", "looper/test", "main", true, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
-	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5", "Generated-By: looper", `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a>`} {
+	for _, want := range []string{"agent=opencode", "Generated-By: looper", `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a>`} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("PromptInstruction missing %q in:\n%s", want, prompt)
 		}
 	}
-	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
+	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "model=openai/gpt-5.5", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Fatalf("PromptInstruction contains %q in:\n%s", unwanted, prompt)
 		}
@@ -89,8 +89,8 @@ func TestPromptInstructionOmitsMissingAgentRuntime(t *testing.T) {
 	if strings.Contains(prompt, "agent=") {
 		t.Fatalf("PromptInstruction should omit agent when runtime is missing:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
-		t.Fatalf("PromptInstruction should still include configured model:\n%s", prompt)
+	if strings.Contains(prompt, "model=") || strings.Contains(prompt, "openai/gpt-5.5") {
+		t.Fatalf("PromptInstruction should not expose configured model:\n%s", prompt)
 	}
 }
 

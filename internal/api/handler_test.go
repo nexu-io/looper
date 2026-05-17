@@ -21,9 +21,11 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/projects"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
@@ -170,6 +172,116 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	}
 }
 
+func TestHandlerSweeperCasesAndStatsRoutes(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedSweeperOperatorData(t, rt, t.TempDir())
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	for _, tc := range []struct {
+		name   string
+		path   string
+		assert func(*testing.T, map[string]any)
+	}{
+		{name: "cases", path: "/api/v1/sweeper/cases?projectId=project_sweeper_api&repo=acme/looper&phase=warn", assert: func(t *testing.T, body map[string]any) {
+			data := body["data"].(map[string]any)
+			items := data["items"].([]any)
+			if len(items) != 1 {
+				t.Fatalf("len(items) = %d, want 1", len(items))
+			}
+			item := items[0].(map[string]any)
+			assertEqual(t, item["id"], "case_api_warn")
+		}},
+		{name: "stats", path: "/api/v1/sweeper/stats?projectId=project_sweeper_api&repo=acme/looper", assert: func(t *testing.T, body map[string]any) {
+			data := body["data"].(map[string]any)
+			assertEqual(t, data["caseCount"], float64(2))
+			assertEqual(t, data["proposalCount"], float64(2))
+			proposers := data["proposalsByProposerKind"].(map[string]any)
+			assertEqual(t, proposers["heuristic_v1"], float64(1))
+			assertEqual(t, proposers["agent_v1"], float64(1))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("x-request-id", "fixture-request-id")
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			tc.assert(t, body)
+		})
+	}
+}
+
+type writeHeaderCountingRecorder struct {
+	http.ResponseWriter
+	count int
+}
+
+func (w *writeHeaderCountingRecorder) WriteHeader(statusCode int) {
+	w.count++
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func TestHandlerSweeperCasesWritesSuccessHeaderOnce(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedSweeperOperatorData(t, rt, t.TempDir())
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sweeper/cases?projectId=project_sweeper_api&repo=acme/looper&phase=warn", nil)
+	req.Header.Set("x-request-id", "fixture-request-id")
+	base := httptest.NewRecorder()
+	recorder := &writeHeaderCountingRecorder{ResponseWriter: base}
+
+	h.ServeHTTP(recorder, req)
+
+	if base.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", base.Code, base.Body.String())
+	}
+	if recorder.count != 1 {
+		t.Fatalf("WriteHeader call count = %d, want 1", recorder.count)
+	}
+}
+
+func TestHandlerSweeperCaseShowAndReplayRoutes(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	repoPath := t.TempDir()
+	seedSweeperOperatorData(t, rt, repoPath)
+	vendor := config.AgentVendor("custom")
+	cfg.Agent.Vendor = &vendor
+	cfg.Agent.Params = map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '{"schemaVersion":2,"decision":"warn","category":"stale","confidenceScore":88,"summary":"api replay warning","rationale":"api replay rationale","markerUUID":"marker-api-replay","evidence":[]}'`}}
+	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time { return time.Date(2026, time.May, 9, 12, 0, 0, 0, time.UTC) }})
+
+	showReq := httptest.NewRequest(http.MethodGet, "/api/v1/sweeper/cases/case_api_warn", nil)
+	showReq.Header.Set("x-request-id", "fixture-request-id")
+	showRecorder := httptest.NewRecorder()
+	h.ServeHTTP(showRecorder, showReq)
+	if showRecorder.Code != http.StatusOK {
+		t.Fatalf("show status = %d, want 200 body=%s", showRecorder.Code, showRecorder.Body.String())
+	}
+	showBody := parseJSONMap(t, showRecorder.Body.Bytes())
+	showData := showBody["data"].(map[string]any)
+	assertEqual(t, showData["case"].(map[string]any)["id"], "case_api_warn")
+	if len(showData["proposals"].([]any)) != 1 {
+		t.Fatalf("show proposals = %#v, want 1 proposal", showData["proposals"])
+	}
+
+	replayReq := httptest.NewRequest(http.MethodPost, "/api/v1/sweeper/cases/case_api_warn/replay", bytes.NewBuffer(nil))
+	replayReq.Header.Set("x-request-id", "fixture-request-id")
+	replayRecorder := httptest.NewRecorder()
+	h.ServeHTTP(replayRecorder, replayReq)
+	if replayRecorder.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 body=%s", replayRecorder.Code, replayRecorder.Body.String())
+	}
+	replayBody := parseJSONMap(t, replayRecorder.Body.Bytes())
+	replayData := replayBody["data"].(map[string]any)
+	assertEqual(t, replayData["caseId"], "case_api_warn")
+	proposal := replayData["proposal"].(map[string]any)
+	assertEqual(t, proposal["proposerKind"], "agent_v1")
+	assertEqual(t, proposal["decision"], "warn")
+	assertEqual(t, replayData["dryRun"], true)
+}
+
 func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	cfg, err := config.DefaultConfig("")
@@ -238,6 +350,129 @@ func TestHandlerUnauthorized(t *testing.T) {
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "UNAUTHORIZED")
 	assertEqual(t, errMap["message"], "Authorization token is required")
+}
+
+func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	triggered := 0
+	recorded := 0
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}, record: func(eventType, deliveryID string) {
+		recorded++
+		assertEqual(t, eventType, "pull_request")
+		assertEqual(t, deliveryID, "delivery-1")
+		triggered++
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-1")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", recorder.Code)
+	}
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["status"], "accepted")
+	assertEqual(t, int(data["workItems"].(float64)), 1)
+	assertEqual(t, triggered, 1)
+	assertEqual(t, recorded, 1)
+}
+
+func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{"another repo forwarder exited"}}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-degraded")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	}
+}
+
+func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
+	fixture := newTestFixture(t)
+	token := "secret-token"
+	fixture.config.Server.AuthMode = config.AuthModeLocalToken
+	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "192.168.1.24:1234"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Delivery", "delivery-2")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	}
+}
+
+func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeaders(t *testing.T) {
+	fixture := newTestFixture(t)
+	token := "secret-token"
+	fixture.config.Server.AuthMode = config.AuthModeLocalToken
+	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Add("X-Forwarded-For", "")
+	req.Header.Add("X-Forwarded-For", "203.0.113.5")
+	req.Header.Set("X-GitHub-Delivery", "delivery-3")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["message"], "Webhook forwarding does not accept proxied loopback requests")
 }
 
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
@@ -749,6 +984,72 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: runtime, ProjectsService: fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	}
+}
+
+func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	nowISO := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC).Format(javaScriptISOString)
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+				metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
+				return projects.AddResult{
+					Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				}, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	assertEqual(t, data["name"], "Looper")
+	assertEqual(t, data["repoPath"], "/tmp/repos/looper")
+	assertEqual(t, data["baseBranch"], "main")
+	assertEqual(t, data["archived"], false)
+	assertEqual(t, data["discoveredPullRequests"], float64(0))
+	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	warnings, ok := data["warnings"].([]any)
+	if !ok || len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
 func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -774,6 +1075,27 @@ func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	}
 	if project != nil {
 		t.Fatalf("project after delete = %#v, want nil", project)
+	}
+}
+
+func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	if err := runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
 	}
 }
 
@@ -819,6 +1141,35 @@ func TestHandlerProjectsRemoveRouteReturnsNotFound(t *testing.T) {
 	errorMap := body["error"].(map[string]any)
 	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
 	assertEqual(t, errorMap["message"], "Project not found: missing")
+}
+
+func TestHandlerProjectsRemoveRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	removed := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper"}
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			removeProject: func(context.Context, string) (storage.ProjectRecord, error) {
+				return removed, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_1")
+	assertEqual(t, data["name"], "Looper")
 }
 
 func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
@@ -2851,6 +3202,40 @@ func TestSerializePullRequestListItemUsesProvidedLoopMatches(t *testing.T) {
 	}
 }
 
+func TestSerializePullRequestListItemIncludesMergeabilityBlocker(t *testing.T) {
+	h := NewHandler(Context{})
+	detail, err := json.Marshal(githubinfra.PullRequestDetail{IsDraft: false, HasConflicts: true})
+	if err != nil {
+		t.Fatalf("Marshal(PullRequestDetail) error = %v", err)
+	}
+	payload := fmt.Sprintf(`{"detail":%s}`, detail)
+	checks := "SUCCESS"
+	review := "APPROVED"
+
+	item := h.serializePullRequestListItem("acme/looper", 42, &storage.PullRequestSnapshotRecord{
+		ID:            "snapshot_1",
+		ProjectID:     "project_1",
+		Repo:          "acme/looper",
+		PRNumber:      42,
+		HeadSHA:       "head-1",
+		PayloadJSON:   &payload,
+		ChecksSummary: &checks,
+		ReviewState:   &review,
+		CapturedAt:    "2026-04-11T12:00:00.000Z",
+		CreatedAt:     "2026-04-11T12:00:00.000Z",
+	}, nil)
+
+	if item.Mergeability == nil || *item.Mergeability != "blocked" {
+		t.Fatalf("Mergeability = %v, want blocked", item.Mergeability)
+	}
+	if item.BlockingReason == nil || *item.BlockingReason != "conflicts" {
+		t.Fatalf("BlockingReason = %v, want conflicts", item.BlockingReason)
+	}
+	if item.HasConflicts == nil || !*item.HasConflicts {
+		t.Fatalf("HasConflicts = %v, want true", item.HasConflicts)
+	}
+}
+
 func TestIsPlannerPullRequestOpenReadsStructMarshaledStateKey(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -4531,6 +4916,43 @@ type testFixture struct {
 	runtime *looperdruntime.Runtime
 }
 
+type webhookReconcileRuntime struct {
+	*looperdruntime.Runtime
+	reconcile func()
+}
+
+func (r webhookReconcileRuntime) ReconcileWebhookForwarders() {
+	if r.reconcile != nil {
+		r.reconcile()
+	}
+}
+
+func (r webhookReconcileRuntime) RefreshWebhookForwarders() error {
+	r.ReconcileWebhookForwarders()
+	return nil
+}
+
+type webhookForwardRuntime struct {
+	*looperdruntime.Runtime
+	status func() looperdruntime.WebhookStatus
+	record func(string, string)
+}
+
+func (r webhookForwardRuntime) WebhookStatus() looperdruntime.WebhookStatus {
+	if r.status != nil {
+		return r.status()
+	}
+	return r.Runtime.WebhookStatus()
+}
+
+func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID string) {
+	if r.record != nil {
+		r.record(eventType, deliveryID)
+		return
+	}
+	r.Runtime.RecordWebhookDelivery(eventType, deliveryID)
+}
+
 func newTestFixture(t *testing.T) testFixture {
 	t.Helper()
 
@@ -4653,6 +5075,37 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 	}
 }
 
+func seedSweeperOperatorData(t *testing.T, rt *looperdruntime.Runtime, repoPath string) {
+	t.Helper()
+	services := rt.Services()
+	nowISO := "2026-05-09T12:00:00.000Z"
+	projectID := "project_sweeper_api"
+	projectMetadata := `{"repo":"acme/looper"}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Sweeper API", RepoPath: repoPath, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	category := "stale"
+	confidence := int64(88)
+	if err := services.Repositories.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_api_warn", ProjectID: projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 41, Status: "pending", CurrentPhase: "warn", CurrentCategory: &category, CurrentConfidenceScore: &confidence, LastProposalID: stringPtr("proposal_api_warn"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_api_warn) error = %v", err)
+	}
+	if err := services.Repositories.SweeperCases.Upsert(context.Background(), storage.SweeperCaseRecord{ID: "case_api_terminal", ProjectID: projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, Status: "terminal", CurrentPhase: "terminal", CreatedAt: nowISO, UpdatedAt: "2026-05-09T12:01:00.000Z"}); err != nil {
+		t.Fatalf("SweeperCases.Upsert(case_api_terminal) error = %v", err)
+	}
+	validation := "passed"
+	summary := "warn summary"
+	rationale := "warn rationale"
+	marker := "marker-api-warn"
+	bundleJSON := `{"repo":"acme/looper","target_type":"issue","number":41,"state":"open","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-10T00:00:00Z","title":"Old issue","body":"stale body","author":"octo","author_association":"CONTRIBUTOR","comment_count":1,"case":{"current_phase":"warn"}}`
+	if err := services.Repositories.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_api_warn", CaseID: "case_api_warn", ProjectID: projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 41, SchemaVersion: 1, ProposerKind: "heuristic_v1", FactBundleJSON: bundleJSON, FingerprintJSON: `{"hash":"api-warn"}`, ProposalJSON: `{"schemaVersion":1,"decision":"warn","category":"stale","confidenceScore":88,"summary":"warn summary","rationale":"warn rationale","markerUUID":"marker-api-warn"}`, Decision: "warn", Category: "stale", ConfidenceScore: 88, Summary: &summary, Rationale: &rationale, MarkerUUID: &marker, ValidationStatus: &validation, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(proposal_api_warn) error = %v", err)
+	}
+	timeoutRaw := `{"status":"timeout","timeoutType":"max_runtime"}`
+	if err := services.Repositories.SweeperProposals.Insert(context.Background(), storage.SweeperProposalRecord{ID: "proposal_api_terminal", CaseID: "case_api_terminal", ProjectID: projectID, Repo: "acme/looper", TargetType: "issue", TargetNumber: 42, SchemaVersion: 1, ProposerKind: "agent_v1", FactBundleJSON: `{"repo":"acme/looper","target_type":"issue","number":42,"state":"open","updated_at":"2026-01-11T00:00:00Z","title":"Another issue","body":"body","author":"octo","case":{"current_phase":"terminal"}}`, FingerprintJSON: `{"hash":"api-terminal"}`, ProposalJSON: `{"schemaVersion":1,"decision":"close","category":"abandoned_pr","confidenceScore":91,"summary":"close summary","rationale":"close rationale"}`, RawResultJSON: &timeoutRaw, Decision: "close", Category: "abandoned_pr", ConfidenceScore: 91, ValidationStatus: &validation, ApplyStatus: stringPtr("completed_closed"), CreatedAt: "2026-05-09T12:01:00.000Z"}); err != nil {
+		t.Fatalf("SweeperProposals.Insert(proposal_api_terminal) error = %v", err)
+	}
+}
+
 func seedStatusLoopCounts(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
 
@@ -4670,6 +5123,21 @@ func seedStatusLoopCounts(t *testing.T, rt *looperdruntime.Runtime) {
 		}
 	}
 }
+
+type fakeWebhookForwarder struct {
+	result webhookforward.ForwardResult
+	err    error
+	calls  int
+}
+
+func (f *fakeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func (f *fakeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+
+func (f *fakeWebhookForwarder) Close() {}
 
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
@@ -5045,7 +5513,8 @@ func (noopLogger) Error(string, map[string]any) {}
 var _ bootstrap.Logger = noopLogger{}
 
 type fixedRuntimeState struct {
-	services looperdruntime.Services
+	services                 looperdruntime.Services
+	refreshWebhookForwarders func() error
 }
 
 type errorInjectingQuerier struct {
@@ -5076,6 +5545,13 @@ func (s fixedRuntimeState) Services() looperdruntime.Services {
 
 func (s fixedRuntimeState) StartedAt() (time.Time, bool) {
 	return time.Time{}, false
+}
+
+func (s fixedRuntimeState) RefreshWebhookForwarders() error {
+	if s.refreshWebhookForwarders != nil {
+		return s.refreshWebhookForwarders()
+	}
+	return nil
 }
 
 func seedConflictProject(t *testing.T, service *projects.Service) {

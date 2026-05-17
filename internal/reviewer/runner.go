@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -95,6 +96,45 @@ const (
 )
 
 var retryAfterPattern = regexp.MustCompile(`(?i)retry-after\s*[:=]\s*(\d+)`)
+
+var reviewerDiscoveryLocks = newDiscoveryLockSet()
+
+type discoveryLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*discoveryLockRef
+}
+
+type discoveryLockRef struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newDiscoveryLockSet() *discoveryLockSet {
+	return &discoveryLockSet{locks: map[string]*discoveryLockRef{}}
+}
+
+func (s *discoveryLockSet) With(key string, fn func() error) error {
+	s.mu.Lock()
+	ref := s.locks[key]
+	if ref == nil {
+		ref = &discoveryLockRef{}
+		s.locks[key] = ref
+	}
+	ref.refs++
+	s.mu.Unlock()
+
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(s.locks, key)
+		}
+		s.mu.Unlock()
+	}()
+	return fn()
+}
 
 type PullRequestSummary struct {
 	Number         int64
@@ -390,6 +430,7 @@ type Options struct {
 	RetryMaxAttempts        int64
 	HeadChangePollInterval  time.Duration
 	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnQueueItemEnqueued     func()
 }
 
 type DiscoveryPolicy struct {
@@ -432,12 +473,22 @@ type Runner struct {
 	retryMaxAttempts        int64
 	headChangePollInterval  time.Duration
 	onAgentExecutionStarted AgentExecutionStartedFunc
+	onQueueItemEnqueued     func()
 }
 
 type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Limit     int
+	Snapshot  *githubinfra.DiscoverySnapshot
+}
+
+type TargetedDiscoveryInput struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
+
+	Snapshot *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -632,10 +683,12 @@ func New(options Options) *Runner {
 		retryMaxAttempts:        retryMax,
 		headChangePollInterval:  headChangePollInterval,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
 		return DiscoveryResult{}, fmt.Errorf("reviewer repositories are not configured")
 	}
@@ -688,68 +741,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return pr
 	}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
-		loopResult, loopErr := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, existing)
-		if loopErr != nil {
-			return loopErr
-		}
-		if terminalReviewerLoopReason(loopResult.record) == "failed" {
-			recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
-			if recoverErr != nil {
-				return recoverErr
-			}
-			if recovered != nil {
-				loopResult.record = *recovered
-			}
-		}
-		if terminalReviewerLoopReason(loopResult.record) != "" {
-			result.Skipped++
-			return nil
-		}
-		if loopResult.created {
-			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
-		}
-		meta := parseJSONObject(loopResult.record.MetadataJSON)
-		_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
-		if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
-			result.Skipped++
-			return nil
-		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
-			result.Skipped++
-			return nil
-		}
-		if reviewerLastSkipNeedsCurrentLogin(meta, pr) && currentLogin == "" {
-			lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-			if lookupErr != nil {
-				lookupLogin = ""
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-		}
-		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin, policy) {
-			result.Skipped++
-			return nil
-		}
-		if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
-			result.Skipped++
-			return nil
-		}
-		availableAt := r.nextReviewAvailableAt(meta)
-		queueItem, queueErr := r.enqueue(ctx, enqueueInput{
-			ProjectID:   project.ID,
-			LoopID:      loopResult.record.ID,
-			Repo:        input.Repo,
-			PRNumber:    pr.Number,
-			HeadSHA:     pr.HeadSHA,
-			AvailableAt: availableAt,
-		})
-		if queueErr != nil {
-			return queueErr
-		}
-		if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
-			return err
-		}
-		result.QueueItems = append(result.QueueItems, queueItem)
-		return nil
+
+		return r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, existing, &result)
+
 	}
 	seenEnqueue := func(pr PullRequestSummary) error {
 		key := fmt.Sprintf("%s#%d", input.Repo, pr.Number)
@@ -796,35 +790,184 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !policy.IncludeDrafts && detail.IsDraft {
-			result.Skipped++
-			continue
-		}
-		if normalizePRState(detail.State) != "open" {
-			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
-				return DiscoveryResult{}, err
-			}
-			result.Skipped++
-			continue
-		}
-		if !isManualReviewerLoop(loop) && isSelfAuthoredPR(detail.Author, currentLogin, policy) {
-			result.Skipped++
-			continue
-		}
-		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
-			result.Skipped++
-			continue
-		}
-		if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
-			result.Skipped++
-			continue
-		}
-		seen[key] = struct{}{}
-		if err := enqueue(summaryFromDetail(detail), &loop); err != nil {
+		queuedBefore := len(result.QueueItems)
+		if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
 			return DiscoveryResult{}, err
+		}
+		if len(result.QueueItems) > queuedBefore {
+			seen[key] = struct{}{}
 		}
 	}
 	return result, nil
+}
+
+func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
+
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
+		return DiscoveryResult{}, fmt.Errorf("reviewer repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+
+	currentLogin := ""
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = normalizeLogin(currentLogin)
+	}
+	pr := summaryFromDetail(detail)
+	result := DiscoveryResult{}
+	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if len(existingLoops) > 0 {
+		for _, loop := range existingLoops {
+			queuedBefore := len(result.QueueItems)
+			if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
+				return DiscoveryResult{}, err
+			}
+			if len(result.QueueItems) > queuedBefore {
+				return result, nil
+			}
+		}
+		return result, nil
+	}
+	if !prEligibleForDiscovery(pr, currentLogin, policy) {
+		result.Skipped++
+		return result, nil
+	}
+	if err := r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, nil, &result); err != nil {
+
+		return DiscoveryResult{}, err
+	}
+	return result, nil
+}
+
+func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, result *DiscoveryResult) error {
+	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
+	if loopErr != nil {
+		return loopErr
+	}
+	if terminalReviewerLoopReason(loopResult.record) == "failed" {
+		recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
+		if recoverErr != nil {
+			return recoverErr
+		}
+		if recovered != nil {
+			loopResult.record = *recovered
+		}
+	}
+	if terminalReviewerLoopReason(loopResult.record) != "" {
+		result.Skipped++
+		return nil
+	}
+	if loopResult.created {
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	meta := parseJSONObject(loopResult.record.MetadataJSON)
+	_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
+	if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
+		result.Skipped++
+		return nil
+	}
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	if reviewerLastSkipNeedsCurrentLogin(meta, pr) && *currentLogin == "" {
+		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if lookupErr != nil {
+			lookupLogin = ""
+		}
+		*currentLogin = normalizeLogin(lookupLogin)
+	}
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
+		result.Skipped++
+		return nil
+	}
+	availableAt := r.nextReviewAvailableAt(meta)
+	queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+		ProjectID:   project.ID,
+		LoopID:      loopResult.record.ID,
+		Repo:        repo,
+		PRNumber:    pr.Number,
+		HeadSHA:     pr.HeadSHA,
+		AvailableAt: availableAt,
+	})
+	if queueErr != nil {
+		return queueErr
+	}
+	if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+		return err
+	}
+	result.QueueItems = append(result.QueueItems, queueItem)
+	return nil
+}
+
+func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, loop storage.LoopRecord, detail PullRequestDetail, result *DiscoveryResult) error {
+	if !policy.IncludeDrafts && detail.IsDraft {
+		result.Skipped++
+		return nil
+	}
+	if normalizePRState(detail.State) != "open" {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return err
+		}
+		result.Skipped++
+		return nil
+	}
+	if !isManualReviewerLoop(loop) && isSelfAuthoredPR(detail.Author, *currentLogin, policy) {
+		result.Skipped++
+		return nil
+	}
+	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
+	if requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
+		result.Skipped++
+		return nil
+	}
+	if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		result.Skipped++
+		return nil
+	}
+	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, result)
+}
+
+func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched := []storage.LoopRecord{}
+	for _, loop := range loops {
+		if loop.Type == "reviewer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+			matched = append(matched, loop)
+		}
+	}
+	return matched, nil
+
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
@@ -1175,7 +1318,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, loopErr
 			}
 			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
-				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, Attempts: failedQueue.Attempts, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
 					return ProcessResult{}, err
 				}
 				failedQueue.Status = "failed"
@@ -1433,7 +1576,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
 	}
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
+	if requireReviewRequest {
 		if currentLogin == "" {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -2195,7 +2339,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Snapshot.HeadSHA)
+	reviewRequestBypassReason := ""
+	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
+		reviewRequestBypassReason = "follow_up_new_head"
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -2268,7 +2417,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		if reason, ok := rediscoverySignalFromAgentResult(result, !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest); ok {
+		if reason, ok := rediscoverySignalFromAgentResult(result, requireReviewRequest); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
@@ -2332,7 +2481,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
-		if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+		if requireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2404,7 +2554,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest && !markerResult.Found {
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+	if requireReviewRequest && !markerResult.Found {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -3310,6 +3461,32 @@ func isManualReviewerLoop(loop storage.LoopRecord) bool {
 	return manual
 }
 
+func requireReviewRequestForLoop(loop storage.LoopRecord, requireReviewRequest bool, headSHA string) bool {
+	if isManualReviewerLoop(loop) {
+		return false
+	}
+	if !requireReviewRequest {
+		return false
+	}
+	return !reviewerFollowUpHasNewHead(loop, headSHA)
+}
+
+func reviewerFollowUpHasNewHead(loop storage.LoopRecord, headSHA string) bool {
+	if strings.TrimSpace(headSHA) == "" {
+		return false
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
+		return false
+	}
+	loopMeta := reviewerLoopMetadata(meta)
+	if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
+		return false
+	}
+	lastPublishedHeadSHA, ok := stringFromAny(meta["lastPublishedHeadSha"])
+	return ok && lastPublishedHeadSHA != "" && lastPublishedHeadSHA != headSHA
+}
+
 func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {
 	if checkpoint.PendingReview != nil && (startStep == stepReview || startStep == stepPublish) {
 		return false
@@ -3353,9 +3530,12 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				updated.AvailableAt = availableAt
 				updated.UpdatedAt = r.nowISO()
 				updated.PayloadJSON = &payloadJSON
-				if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+				if err != nil {
 					return storage.QueueItemRecord{}, err
 				}
+				updated = persisted
+				r.wakeSchedulerAfterEnqueue()
 				return updated, nil
 			}
 		}
@@ -3370,10 +3550,20 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if payloadJSON != "" {
 		queueItem.PayloadJSON = &payloadJSON
 	}
-	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	return queueItem, nil
+	if created {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return persisted, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func isoTimeAfter(candidate, current string) bool {
@@ -3398,7 +3588,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 			return nil, err
 		}
 	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 	}
@@ -3761,7 +3951,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
 	}
-	if isManualReviewerLoop(input.Loop) || !r.discoveryPolicyForProject(input.Project.ID).RequireReviewRequest {
+	if !requireReviewRequestForLoop(input.Loop, r.discoveryPolicyForProject(input.Project.ID).RequireReviewRequest, checkpoint.Snapshot.HeadSHA) {
 		return "", false
 	}
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -4482,7 +4672,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath)
 	return prompt
 }
 
@@ -4554,7 +4744,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -4614,6 +4804,8 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
+	} else if !requireReviewRequest && reviewRequestBypassReason == "follow_up_new_head" {
+		reviewRequestInstruction = "This is an enabled reviewer follow-up loop for a PR head that differs from the last published review head, so a fresh current-user review request is not required before posting for this follow-up pass."
 	} else if !requireReviewRequest {
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}

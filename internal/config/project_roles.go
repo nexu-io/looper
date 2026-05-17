@@ -18,6 +18,8 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	roles := ProjectRoleConfigs(cfg, projectID)
 	switch role {
+	case "coordinator":
+		return roles.Coordinator.Enabled
 	case "planner":
 		return roles.Planner.AutoDiscovery
 	case "reviewer":

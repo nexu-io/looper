@@ -6,6 +6,7 @@ Version:
 
 Subcommands:
   status     Show service status
+  webhook    Webhook configuration and status
   bootstrap  Run first-time setup
   version    Show Looper version
   project    Project commands
@@ -25,6 +26,8 @@ Subcommands:
   ps         Show running loops
   jump       Print shell command for a loop worktree
   logs       Show logs for a loop
+  pause      Pause a loop by sequence number
+  unpause    Resume a paused loop by sequence number
   stop       Stop an active loop
   run        Run commands
 

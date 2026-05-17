@@ -74,7 +74,9 @@ type PullRequestDetail struct {
 	Body              string
 	URL               string
 	State             string
+	CreatedAt         string
 	UpdatedAt         string
+	ClosedAt          string
 	IsDraft           bool
 	ReviewDecision    string
 	Labels            []string
@@ -84,12 +86,88 @@ type PullRequestDetail struct {
 	BaseSHA           string
 	Author            string
 	AuthorAssociation string
+	CommentCount      int
 	ReviewRequests    []string
 	HasConflicts      bool
 	Comments          []map[string]any
-	IssueComments     []map[string]any
+	IssueComments     []CommentInfo
 	Reviews           []map[string]any
 	Checks            []map[string]any
+}
+
+type CommentInfo struct {
+	ID                int64
+	Author            string
+	AuthorAssociation string
+	Body              string
+	CreatedAt         string
+	UpdatedAt         string
+	URL               string
+}
+
+type IssueTimelineInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type IssueReactionInput struct {
+	Repo        string
+	IssueNumber int64
+	CommentID   int64
+	CWD         string
+}
+type CreateIssueReactionInput struct {
+	Repo        string
+	IssueNumber int64
+	CommentID   int64
+	Content     string
+	CWD         string
+}
+type RepositoryPermissionInput struct {
+	Repo string
+	User string
+	CWD  string
+}
+type ListIssueBlockedByInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type IssueDependency struct {
+	Number int64
+	Repo   string
+}
+type IssueState struct {
+	State       string
+	StateReason string
+}
+type LinkedPullRequestsInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type PullRequestReviewStateInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type IssueReaction struct {
+	ID        int64
+	Content   string
+	UserLogin string
+}
+type LinkedPullRequest struct {
+	Number         int64
+	State          string
+	Merged         bool
+	MergedAt       string
+	MergeCommitSHA string
+}
+type PullRequestReviewState struct {
+	RequestedReviewers  []string
+	LatestReviewPerUser map[string]string
+	LastReviewAt        string
 }
 
 type PullRequestHeadAndAuthor struct {
@@ -111,7 +189,43 @@ type IssueSummary struct {
 	IsPullRequest     bool
 }
 
-type IssueDetail = IssueSummary
+type IssueDetail struct {
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	StateReason       string
+	CreatedAt         string
+	UpdatedAt         string
+	ClosedAt          string
+	Author            string
+	AuthorAssociation string
+	Assignees         []string
+	Labels            []string
+	IsPullRequest     bool
+	CommentCount      int
+	Comments          []CommentInfo
+}
+
+type IssueRepository struct {
+	Name     string
+	FullName string
+	URL      string
+	HTMLURL  string
+}
+
+type DependencyIssue struct {
+	ID            int64
+	Number        int64
+	Title         string
+	URL           string
+	HTMLURL       string
+	RepositoryURL string
+	State         string
+	StateReason   string
+	Repository    IssueRepository
+}
 
 type IssueCommentInput struct {
 	Repo        string
@@ -333,6 +447,7 @@ type ReviewThreadComment struct {
 	ID                string
 	Body              string
 	Author            string
+	AuthorAssociation string
 	CreatedAt         string
 	UpdatedAt         string
 	Path              string
@@ -433,6 +548,13 @@ func New(options Options) *Gateway {
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.listOpenPullRequests(ctx, input)
+	}
+	return g.listOpenPullRequestsRaw(ctx, input)
+}
+
+func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
 	labels := prListLabels(input)
 	for _, label := range labels {
@@ -527,6 +649,13 @@ func (g *Gateway) GetPullRequestHeadAndAuthor(ctx context.Context, input ViewPul
 }
 
 func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.listOpenIssues(ctx, input)
+	}
+	return g.listOpenIssuesRaw(ctx, input)
+}
+
+func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
 	args := []string{"issue", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
 	if strings.TrimSpace(input.Assignee) != "" {
 		args = append(args, "--assignee", input.Assignee)
@@ -598,23 +727,224 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 	if err != nil {
 		return IssueDetail{}, err
 	}
+	commentArgs := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		commentArgs = append(commentArgs, "--hostname", hostname)
+	}
+	commentsResult, err := g.runGh(ctx, input.CWD, "", commentArgs...)
+	if err != nil {
+		return IssueDetail{}, err
+	}
+	commentRows, err := decodeJSONArrayOrPages(commentsResult.Stdout)
+	if err != nil {
+		return IssueDetail{}, err
+	}
 	return IssueDetail{
 		Number:            asInt64(row["number"]),
 		Title:             asString(row["title"]),
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		StateReason:       firstNonEmpty(asString(row["state_reason"]), asString(row["stateReason"])),
+		CreatedAt:         firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
+		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
 		Assignees:         extractActorLogins(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
 		IsPullRequest:     row["pull_request"] != nil,
+		CommentCount:      len(commentRows),
+		Comments:          extractCommentInfos(commentRows),
 	}, nil
 }
 
+func (g *Gateway) GetIssueState(ctx context.Context, input ViewIssueInput) (IssueState, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return IssueState{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return IssueState{}, err
+	}
+	return IssueState{State: asString(row["state"]), StateReason: firstNonEmpty(asString(row["state_reason"]), asString(row["stateReason"]))}, nil
+}
+
+func (g *Gateway) ListIssueBlockedBy(ctx context.Context, input ListIssueBlockedByInput) ([]IssueDependency, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueDependency, 0, len(rows))
+	for _, row := range rows {
+		dependency := IssueDependency{Number: asInt64(row["number"]), Repo: dependencyRepo(firstNonNil(row["repository"], row["repo"]), asString(row["repository_url"]), input.Repo)}
+		if dependency.Number <= 0 {
+			continue
+		}
+		out = append(out, dependency)
+	}
+	return out, nil
+}
+
+func (g *Gateway) ListBlockedByIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "dependencies/blocked_by")
+}
+
+func (g *Gateway) ListBlockingIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "dependencies/blocking")
+}
+
+func (g *Gateway) ListSubIssues(ctx context.Context, input ViewIssueInput) ([]DependencyIssue, error) {
+	return g.listDependencyIssues(ctx, input, "sub_issues")
+}
+
+func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput, suffix string) ([]DependencyIssue, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/%s", repo, input.IssueNumber, suffix), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DependencyIssue, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, extractDependencyIssue(row, input.Repo))
+	}
+	return out, nil
+}
+
+func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
+	hostname, repoName := splitRepoHostname(repo)
+	for page := 1; ; page++ {
+		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		result, err := g.runGh(ctx, cwd, "", args...)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := decodeJSONArray(result.Stdout)
+		if err != nil {
+			return 0, err
+		}
+		if len(rows) == 0 {
+			return 0, nil
+		}
+		for _, row := range rows {
+			if row["pull_request"] != nil {
+				continue
+			}
+			if issueNumber := asInt64(row["number"]); issueNumber > 0 {
+				return issueNumber, nil
+			}
+		}
+	}
+}
+
+func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
+func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSONArrayOrPages(result.Stdout)
+}
+
+func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.IssueNumber)
+	if input.CommentID > 0 {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", repo, input.CommentID)
+	}
+	args := []string{"api", "--paginate", "--slurp", endpoint, "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueReaction, 0, len(rows))
+	for _, row := range rows {
+		if reaction, ok := normalizeReaction(row); ok {
+			out = append(out, IssueReaction{ID: reaction.ID, Content: reaction.Content, UserLogin: reaction.UserLogin})
+		}
+	}
+	return out, nil
+}
+
+func (g *Gateway) AddIssueReaction(ctx context.Context, input CreateIssueReactionInput) error {
+	content := strings.TrimSpace(input.Content)
+	if content == "" {
+		return nil
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.IssueNumber)
+	if input.CommentID > 0 {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", repo, input.CommentID)
+	}
+	args := []string{"api", endpoint, "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content=" + content}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/comments", input.Repo, input.IssueNumber), "--method", "POST", "-f", "body="+input.Body)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--method", "POST", "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return IssueCommentResult{}, err
 	}
@@ -626,7 +956,12 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
-	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/comments/%d", input.Repo, input.CommentID), "--method", "PATCH", "-f", "body="+input.Body)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "PATCH", "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
@@ -658,9 +993,13 @@ func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInp
 	if len(assignees) == 0 {
 		return nil
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", input.Repo, input.IssueNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/assignees", repo, input.IssueNumber), "--method", "POST"}
 	for _, assignee := range assignees {
 		args = append(args, "-f", "assignees[]="+assignee)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -673,9 +1012,13 @@ func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) er
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.IssueNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", repo, input.IssueNumber), "--method", "POST"}
 	for _, label := range input.Labels {
 		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -685,8 +1028,13 @@ func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput)
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	hostname, repo := splitRepoHostname(input.Repo)
 	for _, label := range input.Labels {
-		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE")
+		args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", repo, input.IssueNumber, encodeURIComponent(label)), "--method", "DELETE"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		_, err := g.runGh(ctx, input.CWD, "", args...)
 		if err == nil {
 			continue
 		}
@@ -696,6 +1044,26 @@ func (g *Gateway) RemoveIssueLabels(ctx context.Context, input IssueLabelsInput)
 		return err
 	}
 	return nil
+}
+
+func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryPermissionInput) (string, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/collaborators/%s/permission", repo, input.User)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		if shellErr, ok := err.(*shell.CommandExecutionError); ok && strings.Contains(strings.ToLower(shellErr.Result.Stderr), "404") {
+			return "", nil
+		}
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -710,7 +1078,14 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequest(ctx, input)
+	}
+	return g.viewPullRequestRaw(ctx, input)
+}
+
+func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -728,7 +1103,9 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Body:              asString(row["body"]),
 		URL:               asString(row["url"]),
 		State:             asString(row["state"]),
+		CreatedAt:         asString(row["createdAt"]),
 		UpdatedAt:         asString(row["updatedAt"]),
+		ClosedAt:          asString(row["closedAt"]),
 		IsDraft:           asBool(row["isDraft"]),
 		ReviewDecision:    asString(row["reviewDecision"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -738,13 +1115,58 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		BaseSHA:           asString(row["baseRefOid"]),
 		Author:            extractAuthor(row["author"]),
 		AuthorAssociation: asString(row["authorAssociation"]),
+		CommentCount:      len(toObjectSlice(row["comments"])),
 		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
 		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
 		Comments:          threads,
-		IssueComments:     toObjectSlice(row["comments"]),
+		IssueComments:     extractCommentInfos(toObjectSlice(row["comments"])),
 		Reviews:           toObjectSlice(row["reviews"]),
 		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	owner, repoName := splitRepoOwnerName(repo)
+	out := make([]LinkedPullRequest, 0, 20)
+	cursor := ""
+	for {
+		nodes, nextCursor, hasNextPage, err := g.fetchLinkedPullRequestsPage(ctx, input.CWD, hostname, owner, repoName, input.IssueNumber, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, node := range nodes {
+			mergeCommit, _ := node["mergeCommit"].(map[string]any)
+			out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+		}
+		if !hasNextPage || nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+	}
+	return out, nil
+}
+
+func (g *Gateway) ListPullRequestReviewState(ctx context.Context, input PullRequestReviewStateInput) (PullRequestReviewState, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--json", "reviewRequests,reviews")
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	latest := map[string]string{}
+	last := ""
+	for _, review := range toObjectSlice(row["reviews"]) {
+		if user := extractAuthor(review["author"]); user != "" {
+			latest[user] = asString(review["state"])
+		}
+		if at := firstNonEmpty(asString(review["submittedAt"]), asString(review["updatedAt"])); at > last {
+			last = at
+		}
+	}
+	return PullRequestReviewState{RequestedReviewers: extractReviewRequestLogins(row["reviewRequests"]), LatestReviewPerUser: latest, LastReviewAt: last}, nil
 }
 
 func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestInput) error {
@@ -1605,6 +2027,13 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 }
 
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.getCurrentUserLogin(ctx, cwd)
+	}
+	return g.getCurrentUserLoginRaw(ctx, cwd)
+}
+
+func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
@@ -1613,6 +2042,40 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	hostname, _ := splitRepoHostname(repo)
+	args := []string{"api", "user", "--jq", ".login"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			return g.getViewerLogin(ctx, cwd, hostname)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(result.Stdout), nil
+}
+
+func (g *Gateway) getViewerLogin(ctx context.Context, cwd string, hostname string) (string, error) {
+	args := []string{"api", "graphql", "-f", `query=query { viewer { login } }`}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	data, _ := row["data"].(map[string]any)
+	viewer, _ := data["viewer"].(map[string]any)
+	return strings.TrimSpace(asString(viewer["login"])), nil
 }
 
 func isUserLoginUnsupportedForCurrentToken(err error) bool {
@@ -1796,7 +2259,7 @@ func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name st
 		"          id isResolved path line",
 		"          comments(first: 100) {",
 		"            nodes {",
-		"              id body createdAt updatedAt path line url",
+		"              id body createdAt updatedAt path line url authorAssociation",
 		"              author { login }",
 		"              originalCommit { oid }",
 		"              commit { oid }",
@@ -1832,7 +2295,7 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"          path",
 		"          line",
 		"          comments(first: 100) {",
-		"            nodes { id body updatedAt url path line author { login } }",
+		"            nodes { id body updatedAt url path line authorAssociation author { login } }",
 		"            pageInfo { hasNextPage endCursor }",
 		"          }",
 		"        }",
@@ -1859,7 +2322,7 @@ func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, cwd, thread
 		"    ... on PullRequestReviewThread {",
 		"      comments(first: 100, after: $after) {",
 		"        nodes {",
-		"          id body createdAt updatedAt path line url",
+		"          id body createdAt updatedAt path line url authorAssociation",
 		"          author { login }",
 		"          originalCommit { oid }",
 		"          commit { oid }",
@@ -1903,6 +2366,55 @@ func decodeReviewThreadsResponse(stdout string) ([]any, string, bool, error) {
 	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
 }
 
+func (g *Gateway) fetchLinkedPullRequestsPage(ctx context.Context, cwd, hostname, owner, repo string, issueNumber int64, cursor string) ([]map[string]any, string, bool, error) {
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
+		"query($owner: String!, $repo: String!, $number: Int!, $after: String) {",
+		"  repository(owner: $owner, name: $repo) {",
+		"    issue(number: $number) {",
+		"      closedByPullRequestsReferences(first: 20, after: $after) {",
+		"        nodes {",
+		"          number",
+		"          state",
+		"          mergedAt",
+		"          mergeCommit { oid }",
+		"        }",
+		"        pageInfo { hasNextPage endCursor }",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "owner=" + owner, "-F", "repo=" + repo, "-F", fmt.Sprintf("number=%d", issueNumber)}
+	if cursor != "" {
+		args = append(args, "-F", "after="+cursor)
+	}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return nil, "", false, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, "", false, err
+	}
+	data, _ := row["data"].(map[string]any)
+	repository, _ := data["repository"].(map[string]any)
+	issue, _ := repository["issue"].(map[string]any)
+	refs, _ := issue["closedByPullRequestsReferences"].(map[string]any)
+	nodesAny, _ := refs["nodes"].([]any)
+	nodes := make([]map[string]any, 0, len(nodesAny))
+	for _, node := range nodesAny {
+		nodeRow, _ := node.(map[string]any)
+		if nodeRow == nil {
+			continue
+		}
+		nodes = append(nodes, nodeRow)
+	}
+	pageInfo, _ := refs["pageInfo"].(map[string]any)
+	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
+}
+
 func appendReviewThreadComments(dst []ReviewThreadComment, nodes []any) []ReviewThreadComment {
 	for _, commentNode := range nodes {
 		commentRow, _ := commentNode.(map[string]any)
@@ -1910,7 +2422,7 @@ func appendReviewThreadComments(dst []ReviewThreadComment, nodes []any) []Review
 		if commentID == "" {
 			continue
 		}
-		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
+		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), AuthorAssociation: asString(commentRow["authorAssociation"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
 	}
 	return dst
 }
@@ -2029,10 +2541,30 @@ func validateGitHubRepoSlug(repo string) error {
 	return nil
 }
 
+func dependencyRepo(value any, repositoryURL string, fallback string) string {
+	repository, _ := value.(map[string]any)
+	if fullName := strings.TrimSpace(asString(repository["full_name"])); fullName != "" {
+		return hostQualifiedRepo(fullName, firstNonEmpty(repositoryURL, asString(repository["url"])))
+	}
+	if apiURL := strings.TrimSpace(firstNonEmpty(repositoryURL, asString(repository["url"]))); apiURL != "" {
+		if parsed, err := url.Parse(apiURL); err == nil {
+			trimmed := strings.Trim(parsed.Path, "/")
+			if index := strings.Index(trimmed, "repos/"); index >= 0 {
+				nameWithOwner := strings.TrimPrefix(trimmed[index:], "repos/")
+				if parsed.Hostname() != "" && parsed.Hostname() != "api.github.com" && parsed.Hostname() != "github.com" {
+					return parsed.Hostname() + "/" + nameWithOwner
+				}
+				return nameWithOwner
+			}
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
 func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 	repo := strings.TrimSpace(nameWithOwner)
 	parsed, err := url.Parse(strings.TrimSpace(repoURL))
-	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" {
+	if err != nil || parsed.Hostname() == "" || parsed.Hostname() == "github.com" || parsed.Hostname() == "api.github.com" {
 		return repo
 	}
 	return parsed.Hostname() + "/" + repo
@@ -2194,6 +2726,76 @@ func normalizeReaction(value any) (githubReaction, bool) {
 	return githubReaction{ID: id, Content: content, UserLogin: userLogin}, true
 }
 
+func extractDependencyIssue(value map[string]any, defaultRepo string) DependencyIssue {
+	repositoryURL := asString(value["repository_url"])
+	repo := extractIssueRepository(value["repository"])
+	repo = completeIssueRepository(repo, repositoryURL, defaultRepo)
+	return DependencyIssue{
+		ID:            asInt64(value["id"]),
+		Number:        asInt64(value["number"]),
+		Title:         asString(value["title"]),
+		URL:           asString(value["url"]),
+		HTMLURL:       asString(value["html_url"]),
+		RepositoryURL: repositoryURL,
+		State:         asString(value["state"]),
+		StateReason:   asString(value["state_reason"]),
+		Repository:    repo,
+	}
+}
+
+func completeIssueRepository(repo IssueRepository, repositoryURL string, defaultRepo string) IssueRepository {
+	fullName, name := parseRepositoryIdentity(repositoryURL)
+	if fullName == "" {
+		fullName = strings.TrimSpace(defaultRepo)
+		_, fallbackRepo := splitRepoHostname(fullName)
+		_, name = splitRepoOwnerName(fallbackRepo)
+	}
+	if repo.Name == "" {
+		repo.Name = name
+	}
+	if repo.FullName == "" {
+		repo.FullName = fullName
+	}
+	if repo.URL == "" {
+		repo.URL = repositoryURL
+	}
+	return repo
+}
+
+func parseRepositoryIdentity(repositoryURL string) (fullName string, name string) {
+	parsed, err := url.Parse(strings.TrimSpace(repositoryURL))
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	switch {
+	case len(parts) >= 3 && parts[0] == "repos":
+		parts = parts[:3]
+	case len(parts) >= 5 && parts[0] == "api" && parts[1] == "v3" && parts[2] == "repos":
+		parts = parts[2:5]
+	default:
+		return "", ""
+	}
+	fullName = parts[1] + "/" + parts[2]
+	if hostname := strings.TrimSpace(parsed.Hostname()); hostname != "" && hostname != "github.com" && hostname != "api.github.com" {
+		fullName = hostname + "/" + fullName
+	}
+	return fullName, parts[2]
+}
+
+func extractIssueRepository(value any) IssueRepository {
+	row, _ := value.(map[string]any)
+	if row == nil {
+		return IssueRepository{}
+	}
+	return IssueRepository{
+		Name:     asString(row["name"]),
+		FullName: asString(row["full_name"]),
+		URL:      asString(row["url"]),
+		HTMLURL:  asString(row["html_url"]),
+	}
+}
+
 func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
@@ -2306,6 +2908,46 @@ func toObjectSlice(value any) []map[string]any {
 		}
 	}
 	return out
+}
+
+func extractCommentInfos(value any) []CommentInfo {
+	items := toObjectSlice(value)
+	if len(items) == 0 {
+		if rows, ok := value.([]map[string]any); ok {
+			items = append(items, rows...)
+		}
+	}
+	out := make([]CommentInfo, 0, len(items))
+	for _, row := range items {
+		out = append(out, CommentInfo{
+			ID:                asInt64(firstNonNil(row["id"], row["databaseId"])),
+			Author:            extractAuthor(firstNonNil(row["author"], row["user"])),
+			AuthorAssociation: firstNonEmpty(asString(row["authorAssociation"]), asString(row["author_association"])),
+			Body:              asString(row["body"]),
+			CreatedAt:         firstNonEmpty(asString(row["createdAt"]), asString(row["created_at"])),
+			UpdatedAt:         firstNonEmpty(asString(row["updatedAt"]), asString(row["updated_at"])),
+			URL:               firstNonEmpty(asString(row["url"]), asString(row["html_url"])),
+		})
+	}
+	return out
+}
+
+func splitRepoOwnerName(repo string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(repo), "/", 2)
+	if len(parts) != 2 {
+		return strings.TrimSpace(repo), ""
+	}
+	return parts[0], parts[1]
+}
+
+func digNodes(row map[string]any, path ...string) []map[string]any {
+	current := any(row)
+	for _, key := range path {
+		object, _ := current.(map[string]any)
+		current = object[key]
+	}
+	object, _ := current.(map[string]any)
+	return toObjectSlice(object["nodes"])
 }
 
 func extractAuthor(value any) string {

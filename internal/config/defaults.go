@@ -65,10 +65,15 @@ func DefaultConfig(cwd string) (Config, error) {
 			BackupDir: stringPtr(backupDir),
 		},
 		Scheduler: SchedulerConfig{
-			PollIntervalSeconds: 30,
-			MaxConcurrentRuns:   3,
-			RetryMaxAttempts:    5,
-			RetryBaseDelayMS:    5000,
+			PollIntervalSeconds:     30,
+			MaxConcurrentRuns:       3,
+			RetryMaxAttempts:        5,
+			RetryBaseDelayMS:        5000,
+			SlowLaneWarnThresholdMS: 5000,
+		},
+		Webhook: WebhookConfig{
+			Enabled:                     false,
+			FallbackPollIntervalSeconds: 300,
 		},
 		Agent: AgentConfig{
 			Params:       map[string]any{},
@@ -136,6 +141,37 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
+			Coordinator: CoordinatorRoleConfig{
+				Enabled:      false,
+				PollInterval: "5m",
+				Triage: CoordinatorTriageConfig{
+					TriagedLabel:    "triaged",
+					MaxIssueAgeDays: 7,
+					MaxPerTick:      5,
+					Disposition: CoordinatorTriageDispositionConfig{
+						OutOfScopeLabel:       "wontfix",
+						UnclearLabel:          "needs-info",
+						ReTriageOnAuthorReply: true,
+					},
+				},
+				Dispatch: CoordinatorDispatchConfig{
+					Mode: "human-gated",
+					HumanGate: CoordinatorDispatchHumanGateConfig{
+						SlashCommands: []string{"/plan", "/implement"},
+						AllowedUsers:  []string{},
+					},
+					Autonomous: CoordinatorDispatchAutonomousConfig{
+						DelayMinutes: 30,
+						HoldLabel:    "looper:hold",
+					},
+					AssignTo: "",
+				},
+				Dependencies: CoordinatorDependenciesConfig{
+					Enabled:           false,
+					APITimeoutSeconds: 10,
+					APIRetryAttempts:  3,
+				},
+			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
@@ -214,12 +250,21 @@ func DefaultConfig(cwd string) (Config, error) {
 					IncludeIssues:             true,
 					IncludePullRequests:       true,
 					IncludeDrafts:             false,
-					ExcludeLabels:             []string{"pinned", "security", "looper:sweep-keep"},
+					ExcludeLabels:             []string{"pinned", "security", "looper:sweep-keep", "dispatch/*", "needs-info", "looper:hold"},
 					ExcludeAuthors:            []string{},
 					ExcludeAuthorAssociations: []string{"OWNER", "MEMBER", "COLLABORATOR"},
 					LooperInternalLabels:      []string{"looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"},
 					ReopenCooldownDays:        30,
 					MaxPerTick:                10,
+				},
+				Filter: SweeperFilterConfig{Mode: SweeperFilterModeDeterministic},
+				Proposer: SweeperProposerConfig{
+					Mode:                        SweeperProposerModeAgentApply,
+					TimeoutSeconds:              180,
+					SchemaVersion:               2,
+					DiagnosticMode:              false,
+					TimeoutRateDryRunThreshold:  0.5,
+					TimeoutRateDryRunMinSamples: 3,
 				},
 				Lifecycle: SweeperLifecycleConfig{
 					PendingLabel: "looper:sweep-pending",

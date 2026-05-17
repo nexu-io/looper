@@ -93,7 +93,12 @@
         "pollIntervalSeconds": 30,
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": 5,
-        "retryBaseDelayMs": 5000
+        "retryBaseDelayMs": 5000,
+        "slowLaneWarnThresholdMs": 5000
+      },
+      "webhook": {
+        "enabled": false,
+        "fallbackPollIntervalSeconds": 300
       },
       "agent": {
         "vendor": "opencode",
@@ -183,6 +188,40 @@
         "addSnapshotMode": "async"
       },
       "roles": {
+        "coordinator": {
+          "enabled": false,
+          "pollInterval": "5m",
+          "triage": {
+            "triagedLabel": "triaged",
+            "maxIssueAgeDays": 7,
+            "maxPerTick": 5,
+            "disposition": {
+              "outOfScopeLabel": "wontfix",
+              "unclearLabel": "needs-info",
+              "reTriageOnAuthorReply": true
+            }
+          },
+          "dependencies": {
+            "enabled": false,
+            "apiTimeoutSeconds": 10,
+            "apiRetryAttempts": 3
+          },
+          "dispatch": {
+            "mode": "human-gated",
+            "humanGate": {
+              "slashCommands": [
+                "/plan",
+                "/implement"
+              ],
+              "allowedUsers": []
+            },
+            "autonomous": {
+              "delayMinutes": 30,
+              "holdLabel": "looper:hold"
+            },
+            "assignTo": ""
+          }
+        },
         "planner": {
           "autoDiscovery": true,
           "triggers": {
@@ -263,7 +302,10 @@
             "excludeLabels": [
               "pinned",
               "security",
-              "looper:sweep-keep"
+              "looper:sweep-keep",
+              "dispatch/*",
+              "needs-info",
+              "looper:hold"
             ],
             "excludeAuthors": [],
             "excludeAuthorAssociations": [
@@ -279,6 +321,17 @@
             ],
             "reopenCooldownDays": 30,
             "maxPerTick": 10
+          },
+          "filter": {
+            "mode": "deterministic"
+          },
+          "proposer": {
+            "diagnosticMode": false,
+            "mode": "agent_apply",
+            "timeoutRateDryRunMinSamples": 3,
+            "timeoutRateDryRunThreshold": 0.5,
+            "timeoutSeconds": 180,
+            "schemaVersion": 2
           },
           "lifecycle": {
             "pendingLabel": "looper:sweep-pending",

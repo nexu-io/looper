@@ -15,6 +15,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/fixer"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
@@ -38,6 +39,22 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	}
 	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
 		t.Fatalf("result = %#v, want propagated agent result fields", result)
+	}
+}
+
+func TestCommentInfosToObjectsPreservesNestedAuthorLogin(t *testing.T) {
+	t.Parallel()
+
+	comments := commentInfosToObjects([]githubinfra.CommentInfo{{ID: 1, Author: "looper", AuthorAssociation: "MEMBER", Body: "summary", URL: "https://example.test/comment/1"}})
+	if len(comments) != 1 {
+		t.Fatalf("len(comments) = %d, want 1", len(comments))
+	}
+	author, ok := comments[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("author = %#v, want nested map", comments[0]["author"])
+	}
+	if author["login"] != "looper" {
+		t.Fatalf("author login = %#v, want looper", author["login"])
 	}
 }
 
@@ -66,26 +83,32 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 
 	plannerRunner := &stubPlannerScheduler{}
+	coordinatorRunner := &stubCoordinatorScheduler{}
 	reviewerRunner := &stubReviewerScheduler{}
 	fixerRunner := &stubFixerScheduler{}
 	workerRunner := &stubWorkerScheduler{}
 	sweeperRunner := &stubSweeperScheduler{}
 
 	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
-		Repos:             repos,
-		Now:               func() time.Time { return now },
-		MaxConcurrentRuns: 1,
-		Planner:           plannerRunner,
-		Reviewer:          reviewerRunner,
-		Fixer:             fixerRunner,
-		Worker:            workerRunner,
-		Sweeper:           sweeperRunner,
+		Repos:              repos,
+		Now:                func() time.Time { return now },
+		MaxConcurrentRuns:  1,
+		Planner:            plannerRunner,
+		Coordinator:        coordinatorRunner,
+		CoordinatorEnabled: func(string) bool { return true },
+		Reviewer:           reviewerRunner,
+		Fixer:              fixerRunner,
+		Worker:             workerRunner,
+		Sweeper:            sweeperRunner,
 	})
 	if err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
 	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "looper" || plannerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("planner discover calls = %#v, want stored project discovery", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 1 || coordinatorRunner.discoverCalls[0].Repo != "nexu-io/looper" {
+		t.Fatalf("coordinator discover calls = %#v, want stored project repo", coordinatorRunner.discoverCalls)
 	}
 	if len(reviewerRunner.discoverCalls) != 1 || reviewerRunner.discoverCalls[0].Repo != "nexu-io/looper" {
 		t.Fatalf("reviewer discover calls = %#v, want stored project repo", reviewerRunner.discoverCalls)
@@ -150,6 +173,31 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	}
 	if !plannerRunner.checkedClaimedStatus {
 		t.Fatal("planner discovery did not verify claimed queue item status")
+	}
+}
+
+func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinatorDB := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-coordinator-disabled.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinatorDB.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	runner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:              repos,
+		Now:                func() time.Time { return now },
+		Coordinator:        runner,
+		CoordinatorEnabled: func(string) bool { return false },
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(runner.discoverCalls) != 0 {
+		t.Fatalf("coordinator discover calls = %#v, want none when disabled", runner.discoverCalls)
 	}
 }
 
@@ -339,9 +387,126 @@ func TestRunDefaultSchedulerTickDiscoveryWakeIsBounded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
-	if got := atomic.LoadInt32(&wakes); got != 1 {
-		t.Fatalf("scheduler wake requests = %d, want one coalesced wake for repeated enqueue events", got)
+	if got := atomic.LoadInt32(&wakes); got != 3 {
+		t.Fatalf("scheduler wake requests = %d, want one wake per claim phase that picked up discovered work", got)
 	}
+}
+
+func TestIndependentClaimPassClaimsQueuedWorkWhileDiscoveryIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-claim-pump.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	plannerRunner := &blockingPlannerDiscoveryScheduler{started: make(chan struct{}), release: make(chan struct{})}
+	workerRunner := &stubWorkerScheduler{}
+	input := defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       5,
+		ClaimMu:                 &sync.Mutex{},
+		AsyncRunner:             immediateSchedulerRunner{},
+		Planner:                 plannerRunner,
+		Worker:                  workerRunner,
+		SweeperDiscoveryEnabled: boolPtr(false),
+	}
+
+	tickDone := make(chan error, 1)
+	go func() {
+		tickDone <- runDefaultSchedulerTick(context.Background(), input)
+	}()
+
+	select {
+	case <-plannerRunner.started:
+	case <-time.After(time.Second):
+		t.Fatal("planner discovery did not block")
+	}
+
+	for i := 0; i < 5; i++ {
+		item := schedulerTestQueueItem(fmt.Sprintf("queue_worker_claim_pump_%d", i), "worker", nowISO)
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	claimDone := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := runIndependentClaimPass(context.Background(), input); err != nil {
+				claimDone <- err
+				return
+			}
+			if workerRunner.processItemCount() == 5 {
+				claimDone <- nil
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		claimDone <- fmt.Errorf("timed out waiting for independent claim pass to process all items")
+	}()
+
+	select {
+	case err := <-claimDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("independent claim pass did not finish before timeout")
+	}
+
+	close(plannerRunner.release)
+	if err := <-tickDone; err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+}
+
+func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-logs.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	logger := &capturingSchedulerLogger{}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.SlowLaneWarnThresholdMS = 1
+
+	plannerRunner := &sleepingPlannerScheduler{delay: 5 * time.Millisecond}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                    repos,
+		Logger:                   logger,
+		Now:                      func() time.Time { return now },
+		MaxConcurrentRuns:        1,
+		Config:                   &cfg,
+		Planner:                  plannerRunner,
+		ReviewerDiscoveryEnabled: boolPtr(false),
+		FixerDiscoveryEnabled:    boolPtr(false),
+		WorkerDiscoveryEnabled:   boolPtr(false),
+		SweeperDiscoveryEnabled:  boolPtr(false),
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+
+	logger.requireMessage(t, "scheduler tick start")
+	logger.requireMessage(t, "scheduler tick end")
+	logger.requireMessage(t, "scheduler tick summary")
+	logger.requireContextValue(t, "scheduler claim phase", "phase", "pre_discovery")
+	logger.requireContextValue(t, "scheduler claim phase", "phase", "post_planner_discovery")
+	logger.requireContextValue(t, "scheduler lane start", "lane", "planner discovery")
+	logger.requireContextValue(t, "scheduler lane end", "lane", "planner discovery")
+	logger.requireContextValue(t, "scheduler lane slow", "lane", "planner discovery")
 }
 
 func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
@@ -420,6 +585,52 @@ func TestRunScheduledQueueItemsReturnsBeforeClaimedRunsFinish(t *testing.T) {
 	}
 
 	close(runner.release)
+}
+
+func TestRunScheduledQueueItemsRequeuesRetryableSweeperFailure(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-sweeper-retry.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "nexu-io/looper"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_sweeper_warn_retry", ProjectID: &projectID, Type: "sweeper:warn", TargetType: "issue", TargetID: "nexu-io/looper#41", Repo: &repo, DedupeKey: "sweeper:warn:nexu-io/looper#41", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	runner := sweeper.New(sweeper.Options{Repos: repos, GitHub: schedulerTestSweeperGitHub{viewIssueErr: errors.New("temporary github failure")}, Now: func() time.Time { return now }, Config: &cfg})
+	tracker := &schedulerTaskTracker{}
+
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{queueItem}, defaultSchedulerTickInput{Sweeper: runner, AsyncRunner: tracker}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	tracker.Wait()
+
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want retried queue item")
+	}
+	if updated.Status != "queued" || updated.Attempts != 1 || updated.FinishedAt != nil {
+		t.Fatalf("queue item = %#v, want queued retry with incremented attempts", updated)
+	}
+	if updated.AvailableAt == nowISO {
+		t.Fatalf("queue item available_at = %q, want backoff delay after retry", updated.AvailableAt)
+	}
+	assertQueueRetryError(t, updated, "temporary github failure")
 }
 
 func TestClaimAndRunScheduledQueueItemsBackfillsAvailableSlots(t *testing.T) {
@@ -740,6 +951,62 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	}
 }
 
+func TestRunDefaultSchedulerTickAutoFlipsSweeperRepoToDryRunOnTimeoutThreshold(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "sweeper-backpressure.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	projectMetadata := `{"repo":"nexu-io/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Sweeper.DryRun = false
+	cfg.Roles.Sweeper.Proposer.TimeoutRateDryRunThreshold = 0.5
+	cfg.Roles.Sweeper.Proposer.TimeoutRateDryRunMinSamples = 3
+	sweeperRunner := &stubSweeperScheduler{stats: sweeper.RepoStats{ProjectID: "looper", Repo: "nexu-io/looper", AgentProposalCount: 3, AgentTimeoutRate: 2.0 / 3.0, AgentTimeouts: 2}}
+
+	err = runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                    repos,
+		Now:                      func() time.Time { return now },
+		Sweeper:                  sweeperRunner,
+		Config:                   &cfg,
+		SweeperDiscoveryEnabled:  boolPtr(true),
+		PlannerDiscoveryEnabled:  boolPtr(false),
+		ReviewerDiscoveryEnabled: boolPtr(false),
+		FixerDiscoveryEnabled:    boolPtr(false),
+		WorkerDiscoveryEnabled:   boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil || !strings.Contains(*stored.MetadataJSON, `"autoDryRun":true`) {
+		t.Fatalf("project metadata = %#v, want autoDryRun backpressure override", stored)
+	}
+	notification, err := repos.Notifications.GetLatestByDedupe(context.Background(), "in_app", "runtime.sweeper.auto_dry_run:looper:nexu-io/looper")
+	if err != nil {
+		t.Fatalf("Notifications.GetLatestByDedupe() error = %v", err)
+	}
+	if notification == nil || notification.Level != "warning" || !strings.Contains(notification.Body, "agent timeout rate") {
+		t.Fatalf("notification = %#v, want warning backpressure alert", notification)
+	}
+	if len(sweeperRunner.issueDiscoverCalls) != 1 || len(sweeperRunner.pullRequestDiscoverCalls) != 1 || len(sweeperRunner.reconcileDiscoverCalls) != 1 {
+		t.Fatalf("sweeper discovery calls = issues:%#v prs:%#v reconcile:%#v, want discovery to continue under dry-run", sweeperRunner.issueDiscoverCalls, sweeperRunner.pullRequestDiscoverCalls, sweeperRunner.reconcileDiscoverCalls)
+	}
+}
+
 func TestGithubCLIAutoPROpeningAvailableRechecksAuthenticatedCLIWithoutConfiguredPath(t *testing.T) {
 	t.Parallel()
 
@@ -823,6 +1090,12 @@ type stubPlannerScheduler struct {
 	processErr     error
 }
 
+type stubCoordinatorScheduler struct {
+	mu            sync.Mutex
+	discoverCalls []coordinator.DiscoveryInput
+	discoverErr   error
+}
+
 type immediateSchedulerRunner struct{}
 
 func (immediateSchedulerRunner) Go(fn func()) { fn() }
@@ -871,6 +1144,10 @@ func (s *enqueueingReviewerScheduler) DiscoverPullRequests(ctx context.Context, 
 	return reviewer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
 }
 
+func (s *enqueueingReviewerScheduler) DiscoverPullRequest(ctx context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	return reviewer.DiscoveryResult{}, nil
+}
+
 type enqueueingFixerScheduler struct {
 	stubFixerScheduler
 	repos *storage.Repositories
@@ -883,6 +1160,10 @@ func (s *enqueueingFixerScheduler) DiscoverPullRequests(ctx context.Context, inp
 		return fixer.DiscoveryResult{}, err
 	}
 	return fixer.DiscoveryResult{QueueItems: []storage.QueueItemRecord{s.item}}, nil
+}
+
+func (s *enqueueingFixerScheduler) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, nil
 }
 
 type discoveringWorkerScheduler struct {
@@ -920,6 +1201,88 @@ type queueStatusCheckingPlannerScheduler struct {
 	repos                *storage.Repositories
 	queueItemID          string
 	checkedClaimedStatus bool
+}
+
+type blockingPlannerDiscoveryScheduler struct {
+	stubPlannerScheduler
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingPlannerDiscoveryScheduler) DiscoverIssues(ctx context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.stubPlannerScheduler.DiscoverIssues(ctx, input)
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return planner.DiscoveryResult{}, nil
+}
+
+type sleepingPlannerScheduler struct {
+	stubPlannerScheduler
+	delay time.Duration
+}
+
+func (s *sleepingPlannerScheduler) DiscoverIssues(ctx context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
+	s.stubPlannerScheduler.DiscoverIssues(ctx, input)
+	time.Sleep(s.delay)
+	return planner.DiscoveryResult{}, nil
+}
+
+type capturingSchedulerLogger struct {
+	mu      sync.Mutex
+	entries []schedulerLogEntry
+}
+
+type schedulerLogEntry struct {
+	message string
+	context map[string]any
+}
+
+func (l *capturingSchedulerLogger) Debug(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Info(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Warn(message string, context map[string]any) {
+	l.append(message, context)
+}
+func (l *capturingSchedulerLogger) Error(message string, context map[string]any) {
+	l.append(message, context)
+}
+
+func (l *capturingSchedulerLogger) append(message string, context map[string]any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	copyContext := map[string]any{}
+	for key, value := range context {
+		copyContext[key] = value
+	}
+	l.entries = append(l.entries, schedulerLogEntry{message: message, context: copyContext})
+}
+
+func (l *capturingSchedulerLogger) requireMessage(t *testing.T, message string) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if entry.message == message {
+			return
+		}
+	}
+	t.Fatalf("logger messages = %#v, want %q", l.entries, message)
+}
+
+func (l *capturingSchedulerLogger) requireContextValue(t *testing.T, message, key string, want any) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if entry.message == message && entry.context[key] == want {
+			return
+		}
+	}
+	t.Fatalf("logger entries = %#v, want %q with %s=%v", l.entries, message, key, want)
 }
 
 func (s *queueStatusCheckingPlannerScheduler) DiscoverIssues(ctx context.Context, _ planner.DiscoveryInput) (planner.DiscoveryResult, error) {
@@ -983,6 +1346,13 @@ func (s *stubPlannerScheduler) processItemCount() int {
 	return len(s.processedItems)
 }
 
+func (s *stubCoordinatorScheduler) DiscoverIssues(_ context.Context, input coordinator.DiscoveryInput) (coordinator.DiscoveryResult, error) {
+	s.mu.Lock()
+	s.discoverCalls = append(s.discoverCalls, input)
+	s.mu.Unlock()
+	return coordinator.DiscoveryResult{Ticked: true}, s.discoverErr
+}
+
 type stubReviewerScheduler struct {
 	mu             sync.Mutex
 	discoverCalls  []reviewer.DiscoveryInput
@@ -996,6 +1366,10 @@ func (s *stubReviewerScheduler) DiscoverPullRequests(_ context.Context, input re
 	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
 	s.mu.Unlock()
+	return reviewer.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubReviewerScheduler) DiscoverPullRequest(_ context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
 	return reviewer.DiscoveryResult{}, s.discoverErr
 }
 
@@ -1038,6 +1412,10 @@ func (s *stubFixerScheduler) DiscoverPullRequests(_ context.Context, input fixer
 	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
 	s.mu.Unlock()
+	return fixer.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubFixerScheduler) DiscoverPullRequest(_ context.Context, _ fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
 	return fixer.DiscoveryResult{}, s.discoverErr
 }
 
@@ -1122,6 +1500,75 @@ type stubSweeperScheduler struct {
 	processedItems           []string
 	discoverErr              error
 	processErr               error
+	stats                    sweeper.RepoStats
+}
+
+type schedulerTestSweeperGitHub struct {
+	viewIssueErr error
+}
+
+func (s schedulerTestSweeperGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	return githubinfra.IssueDetail{}, s.viewIssueErr
+}
+
+func (s schedulerTestSweeperGitHub) ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return githubinfra.PullRequestDetail{}, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListIssueReactions(context.Context, githubinfra.IssueReactionInput) ([]githubinfra.IssueReaction, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error) {
+	return nil, nil
+}
+
+func (s schedulerTestSweeperGitHub) ListPullRequestReviewState(context.Context, githubinfra.PullRequestReviewStateInput) (githubinfra.PullRequestReviewState, error) {
+	return githubinfra.PullRequestReviewState{}, nil
+}
+
+func (s schedulerTestSweeperGitHub) CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
+	return githubinfra.IssueCommentResult{}, nil
+}
+
+func (s schedulerTestSweeperGitHub) UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error {
+	return nil
+}
+
+func (s schedulerTestSweeperGitHub) CloseIssue(context.Context, githubinfra.CloseIssueInput) error {
+	return nil
+}
+
+func (s schedulerTestSweeperGitHub) ClosePullRequest(context.Context, githubinfra.ClosePullRequestInput) error {
+	return nil
+}
+
+func (s schedulerTestSweeperGitHub) AddIssueLabels(context.Context, githubinfra.IssueLabelsInput) error {
+	return nil
+}
+
+func (s schedulerTestSweeperGitHub) RemoveIssueLabels(context.Context, githubinfra.IssueLabelsInput) error {
+	return nil
 }
 
 func (s *stubSweeperScheduler) DiscoverIssues(_ context.Context, input sweeper.DiscoveryInput) (sweeper.DiscoveryResult, error) {
@@ -1156,6 +1603,10 @@ func (s *stubSweeperScheduler) processItemCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.processedItems)
+}
+
+func (s *stubSweeperScheduler) RepoOperatorStats(_ context.Context, _, _ string, _ int) (sweeper.RepoStats, error) {
+	return s.stats, nil
 }
 
 type parallelWorkerScheduler struct {

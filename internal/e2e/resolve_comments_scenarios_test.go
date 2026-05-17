@@ -302,8 +302,8 @@ func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 		t.Fatalf("run status = %s, want failed no-op resolve path (error=%v checkpoint=%v)", run.Status, run.ErrorMessage, run.CheckpointJSON)
 	}
 	checkpoint := parseJSONObject(t, run.CheckpointJSON)
-	if got, _ := checkpoint["resumePolicy"].(string); got != "manual_intervention" {
-		t.Fatalf("resumePolicy = %q, want manual_intervention", got)
+	if got, _ := checkpoint["resumePolicy"].(string); got != "restart_from_discover" {
+		t.Fatalf("resumePolicy = %q, want restart_from_discover", got)
 	}
 	push, _ := checkpoint["push"].(map[string]any)
 	if push == nil || push["pushed"] != false {
@@ -318,8 +318,8 @@ func TestScenarioResolveCommentsSkipsWhenNoNewCommitLeavesThreadsUnresolved(t *t
 		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
 	}
 	first, _ := items[0].(map[string]any)
-	if first["status"] != "agent_declined" {
-		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
+	if first["status"] != "skipped_missing_agent_decision" {
+		t.Fatalf("resolvedComments item = %#v, want skipped_missing_agent_decision", first)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]
@@ -419,8 +419,8 @@ func TestScenarioResolveCommentsIgnoresStaleNoPushMetadataAndLeavesThreadsUnreso
 		t.Fatalf("resolvedComments.items = %#v, want one skipped item", resolvedComments)
 	}
 	first, _ := items[0].(map[string]any)
-	if first["status"] != "agent_declined" {
-		t.Fatalf("resolvedComments item = %#v, want agent_declined", first)
+	if first["status"] != "skipped_missing_agent_decision" {
+		t.Fatalf("resolvedComments item = %#v, want skipped_missing_agent_decision", first)
 	}
 	state := loadFakeGHStateFile(t, fakeGH.StatePath)
 	pr := state.PullRequests["acme/looper#42"]

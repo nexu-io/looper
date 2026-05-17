@@ -603,6 +603,78 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 	}
 }
 
+func TestMigration0013CancelsDuplicateActiveQueueItemsBeforeUniqueIndex(t *testing.T) {
+	t.Parallel()
+
+	if len(EmbeddedMigrations) < 13 || EmbeddedMigrations[12].ID != "0013_active_queue_dedupe" {
+		t.Fatalf("EmbeddedMigrations[12] = %#v, want 0013_active_queue_dedupe", EmbeddedMigrations[12])
+	}
+
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+	seedRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:12]})
+	if _, err := seedRunner.RunPending(ctx); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+
+	repos := NewRepositories(db)
+	projectID := "project_migration_0013"
+	loopID := "loop_migration_0013"
+	repoName := "acme/looper"
+	prNumber := int64(42)
+	oldAt := "2026-04-17T10:00:00.000Z"
+	newAt := "2026-04-17T11:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: oldAt, UpdatedAt: newAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: oldAt, UpdatedAt: newAt}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_old_running", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: "reviewer:project_migration_0013:loop_migration_0013:acme/looper:42", Priority: QueuePriorityReviewer, Status: "running", AvailableAt: oldAt, Attempts: 1, MaxAttempts: 3, CreatedAt: oldAt, UpdatedAt: oldAt},
+		{ID: "queue_new_running", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: "reviewer:project_migration_0013:loop_migration_0013:acme/looper:42", Priority: QueuePriorityReviewer, Status: "running", AvailableAt: newAt, Attempts: 1, MaxAttempts: 3, CreatedAt: newAt, UpdatedAt: newAt},
+		{ID: "queue_historical", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: "reviewer:project_migration_0013:loop_migration_0013:acme/looper:42", Priority: QueuePriorityReviewer, Status: "completed", AvailableAt: oldAt, Attempts: 1, MaxAttempts: 3, FinishedAt: &oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:13]})
+	result, err := migrationRunner.RunPending(ctx)
+	if err != nil {
+		t.Fatalf("RunPending() applying 0013 error = %v", err)
+	}
+	if !reflect.DeepEqual(result.AppliedIDs, []string{"0013_active_queue_dedupe"}) {
+		t.Fatalf("RunPending().AppliedIDs = %v, want [0013_active_queue_dedupe]", result.AppliedIDs)
+	}
+
+	oldRunning, err := repos.Queue.GetByID(ctx, "queue_old_running")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_old_running) error = %v", err)
+	}
+	if oldRunning == nil || oldRunning.Status != "cancelled" || oldRunning.FinishedAt == nil {
+		t.Fatalf("queue_old_running = %#v, want cancelled with finished_at", oldRunning)
+	}
+	newRunning, err := repos.Queue.GetByID(ctx, "queue_new_running")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_new_running) error = %v", err)
+	}
+	if newRunning == nil || newRunning.Status != "running" {
+		t.Fatalf("queue_new_running = %#v, want remaining running item", newRunning)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "queue_conflict", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: newRunning.DedupeKey, Priority: QueuePriorityReviewer, Status: "queued", AvailableAt: newAt, Attempts: 0, MaxAttempts: 3, CreatedAt: newAt, UpdatedAt: newAt}); err == nil {
+		t.Fatal("Queue.Upsert(active duplicate) error = nil, want unique index failure")
+	}
+	finishedAt := "2026-04-17T12:00:00.000Z"
+	if err := repos.Queue.Complete(ctx, "queue_new_running", finishedAt); err != nil {
+		t.Fatalf("Queue.Complete(queue_new_running) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "queue_after_terminal", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: newRunning.DedupeKey, Priority: QueuePriorityReviewer, Status: "queued", AvailableAt: finishedAt, Attempts: 0, MaxAttempts: 3, CreatedAt: finishedAt, UpdatedAt: finishedAt}); err != nil {
+		t.Fatalf("Queue.Upsert(after terminal) error = %v", err)
+	}
+}
+
 func openTestSQLiteDB(t *testing.T) *sql.DB {
 	t.Helper()
 

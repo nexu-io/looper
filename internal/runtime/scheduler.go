@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -23,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/sweeper"
+	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -32,14 +34,20 @@ type plannerScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
 }
 
+type coordinatorScheduler interface {
+	DiscoverIssues(context.Context, coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error)
+}
+
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
+	DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*reviewer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*reviewer.ProcessResult, error)
 }
 
 type fixerScheduler interface {
 	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
+	DiscoverPullRequest(context.Context, fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
 }
@@ -56,6 +64,10 @@ type sweeperScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*sweeper.ProcessResult, error)
 }
 
+type sweeperOperatorStatsProvider interface {
+	RepoOperatorStats(context.Context, string, string, int) (sweeper.RepoStats, error)
+}
+
 type snapshotScheduler interface {
 	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 }
@@ -70,22 +82,33 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos                    *storage.Repositories
+	GitHubGateway            *githubinfra.Gateway
 	Logger                   bootstrap.Logger
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
+	ClaimMu                  *sync.Mutex
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
+	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
 	Worker                   workerScheduler
 	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
+	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
+	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
 	SweeperDiscoveryEnabled  *bool
+}
+
+type defaultSchedulerHandlers struct {
+	tick    RunSchedulerTickFunc
+	claim   RunSchedulerTickFunc
+	webhook WebhookForwarder
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -279,7 +302,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
-	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: detail.IssueComments, Reviews: detail.Reviews}, nil
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
@@ -355,6 +378,9 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
+type sweeperAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type sweeperAgentExecutionAdapter struct{ execution agent.Execution }
+
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
@@ -397,6 +423,26 @@ func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
+func (a sweeperAgentExecutorAdapter) Start(ctx context.Context, input sweeper.AgentRunInput) (sweeper.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return sweeperAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Wait(ctx context.Context) (sweeper.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return sweeper.AgentResult{}, err
+	}
+	return sweeper.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
+}
+
 type fixerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
@@ -427,7 +473,23 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: detail.IssueComments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"id":                item.ID,
+			"author":            map[string]any{"login": item.Author},
+			"authorAssociation": item.AuthorAssociation,
+			"body":              item.Body,
+			"createdAt":         item.CreatedAt,
+			"updatedAt":         item.UpdatedAt,
+			"url":               item.URL,
+		})
+	}
+	return out
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
@@ -757,17 +819,19 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time) RunSchedulerTickFunc {
+func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
 	if repos == nil || coordinator == nil {
-		return func(context.Context, Services) error {
+		fail := func(context.Context, Services) error {
 			return fmt.Errorf("default scheduler dependencies are not configured")
 		}
+		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	if cfg.Agent.Vendor == nil {
-		return func(context.Context, Services) error { return nil }
+		noop := func(context.Context, Services) error { return nil }
+		return defaultSchedulerHandlers{tick: noop, claim: noop}
 	}
 	notificationGateway := notify.NewGateway(notify.Options{
 		Config:        cfg.Notifications,
@@ -834,6 +898,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 	}
 
 	var plannerRunner plannerScheduler
+	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
@@ -843,6 +908,22 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Config: agent.ExecutorConfig{
 			Vendor:              *cfg.Agent.Vendor,
 			Model:               cfg.Agent.Model,
+			Params:              cfg.Agent.Params,
+			Env:                 cfg.Agent.Env,
+			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+		},
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
+	})
+	sweeperAgentModel := cfg.Roles.Sweeper.Proposer.Model
+	if sweeperAgentModel == nil || strings.TrimSpace(*sweeperAgentModel) == "" {
+		sweeperAgentModel = cfg.Agent.Model
+	}
+	sweeperAgentExecutor := agent.New(agent.ExecutorOptions{
+		Config: agent.ExecutorConfig{
+			Vendor:              *cfg.Agent.Vendor,
+			Model:               sweeperAgentModel,
 			Params:              cfg.Agent.Params,
 			Env:                 cfg.Agent.Env,
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
@@ -878,11 +959,23 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
 			RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
 		},
-		RetryBaseDelay:   retryBaseDelay,
-		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		RetryBaseDelay:      retryBaseDelay,
+		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+		OnQueueItemEnqueued: requestWake,
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
+	})
+	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
+		Repos:  repos,
+		GitHub: githubGateway,
+		Config: &cfg,
+		Logger: logger,
+		Now:    now,
+		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
+			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
+			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
+		),
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
@@ -918,6 +1011,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
 		RetryBaseDelay:          retryBaseDelay,
 		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
+		OnQueueItemEnqueued:     requestWake,
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
@@ -941,14 +1035,15 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
 			LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
 		},
-		Disclosure:         &cfg.Disclosure,
-		AgentRuntime:       agentRuntime,
-		CustomInstructions: &cfg,
-		AgentModel:         cfg.Agent.Model,
-		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:     retryBaseDelay,
-		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
+		Disclosure:          &cfg.Disclosure,
+		AgentRuntime:        agentRuntime,
+		CustomInstructions:  &cfg,
+		AgentModel:          cfg.Agent.Model,
+		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
+		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
+		RetryBaseDelay:      retryBaseDelay,
+		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+		OnQueueItemEnqueued: requestWake,
 		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
@@ -973,44 +1068,68 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
 			RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
 		},
-		Disclosure:         &cfg.Disclosure,
-		AgentRuntime:       agentRuntime,
-		CustomInstructions: &cfg,
-		AgentModel:         cfg.Agent.Model,
-		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:     retryBaseDelay,
-		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
+		Disclosure:          &cfg.Disclosure,
+		AgentRuntime:        agentRuntime,
+		CustomInstructions:  &cfg,
+		AgentModel:          cfg.Agent.Model,
+		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
+		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
+		RetryBaseDelay:      retryBaseDelay,
+		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+		OnQueueItemEnqueued: requestWake,
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
-	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Logger: logger, Now: now, Config: &cfg})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Agent: sweeperAgentExecutorAdapter{executor: sweeperAgentExecutor}, Logger: logger, Now: now, Config: &cfg, AgentRuntime: agentRuntime, AgentModel: sweeperAgentModel, OnQueueItemEnqueued: requestWake})
+	claimMu := &sync.Mutex{}
 
-	return func(ctx context.Context, services Services) error {
+	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
 			runner = asyncRunner()
 		}
-		return runDefaultSchedulerTick(ctx, defaultSchedulerTickInput{
+		return defaultSchedulerTickInput{
 			Repos:                    services.Repositories,
+			GitHubGateway:            githubGateway,
 			Logger:                   logger,
 			Now:                      now,
 			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
+			ClaimMu:                  claimMu,
 			AsyncRunner:              runner,
 			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
+			Coordinator:              coordinatorRunner,
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
 			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
+			Config:                   &cfg,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			SweeperDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "sweeper")),
-		})
+		}
+	}
+
+	return defaultSchedulerHandlers{
+		tick: func(ctx context.Context, services Services) error {
+			return runDefaultSchedulerTick(ctx, inputForServices(services))
+		},
+		claim: func(ctx context.Context, services Services) error {
+			return runIndependentClaimPass(ctx, inputForServices(services))
+		},
+		webhook: webhookforward.New(webhookforward.Options{
+			Repos:    repos,
+			Config:   cfg,
+			Reviewer: reviewerRunner,
+			Fixer:    fixerRunner,
+			Logger:   logger,
+			Now:      now,
+		}),
 	}
 }
 
@@ -1054,10 +1173,27 @@ func githubAuthHostname(repo string) string {
 	return defaultHost
 }
 
-func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) error {
+func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) (retErr error) {
 	if input.Repos == nil || input.Repos.Projects == nil {
 		return nil
 	}
+
+	startedAt := time.Now()
+	claimStats := schedulerClaimStats{}
+	if input.Logger != nil {
+		input.Logger.Debug("scheduler tick start", nil)
+	}
+	defer func() {
+		if input.Logger == nil {
+			return
+		}
+		fields := map[string]any{"durationMs": time.Since(startedAt).Milliseconds(), "claimedCount": claimStats.claimedCount, "availableSlots": claimStats.availableSlots}
+		if retErr != nil {
+			fields["error"] = retErr.Error()
+		}
+		input.Logger.Debug("scheduler tick end", fields)
+		input.Logger.Info("scheduler tick summary", fields)
+	}()
 
 	now := input.Now
 	if now == nil {
@@ -1076,30 +1212,43 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			discoveredRunnableIDs[id] = struct{}{}
 		}
 	}
+	recordClaim := func(claimedCount, availableSlots int, err error) {
+		claimStats.record(claimedCount, availableSlots)
+		appendErr(err)
+	}
 
-	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
-	if err != nil {
-		appendErr(err)
-		availableSlots = 0
-	}
-	if availableSlots > 0 && input.Repos.Queue != nil {
-		_, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
-		appendErr(err)
-	}
+	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 
 	projectsList, err := input.Repos.Projects.List(ctx)
 	if err != nil {
 		appendErr(err)
-		return errors.Join(errs...)
+		retErr = errors.Join(errs...)
+		return retErr
+	}
+	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
+	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
+	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
+		if input.GitHubGateway == nil {
+			return nil
+		}
+		if snapshot, ok := projectSnapshots[projectID]; ok {
+			return snapshot
+		}
+		snapshot := githubinfra.NewDiscoverySnapshot(input.GitHubGateway, tickDiscoveryState, projectDiscoverySnapshotOptions(input, projectID))
+		projectSnapshots[projectID] = snapshot
+		return snapshot
 	}
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+			retErr = errors.Join(append(errs, err)...)
+			return retErr
 		}
 		if project.Archived {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		snapshot := projectSnapshot(project.ID)
 		if repo == "" {
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
@@ -1107,64 +1256,91 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
-			result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			trackRunnableDiscovery(result.QueueItems)
-			appendErr(wrapSchedulerError("planner discovery", project.ID, repo, err))
+			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
+				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				trackRunnableDiscovery(result.QueueItems)
+				return wrapSchedulerError("planner discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_planner_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
 		} else if input.Planner != nil && input.Logger != nil {
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
+		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
+			appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
+				_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
+		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
-			result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			trackRunnableDiscovery(result.QueueItems)
-			appendErr(wrapSchedulerError("reviewer discovery", project.ID, repo, err))
+			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
+				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				trackRunnableDiscovery(result.QueueItems)
+				return wrapSchedulerError("reviewer discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_reviewer_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
 		} else if input.Reviewer != nil && input.Logger != nil {
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			trackRunnableDiscovery(result.QueueItems)
-			appendErr(wrapSchedulerError("fixer discovery", project.ID, repo, err))
+			appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
+				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				trackRunnableDiscovery(result.QueueItems)
+				return wrapSchedulerError("fixer discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
 		} else if input.Fixer != nil && input.Logger != nil {
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			trackRunnableDiscovery(result.QueueItems)
-			appendErr(wrapSchedulerError("worker issue discovery", project.ID, repo, err))
+			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
+				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				trackRunnableDiscovery(result.QueueItems)
+				return wrapSchedulerError("worker issue discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_worker_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 	}
 
-	availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
-	if err != nil {
-		appendErr(err)
-		availableSlots = 0
-	}
-	if availableSlots > 0 && input.Repos.Queue != nil {
-		claimedItems, err := claimAndRunScheduledQueueItems(ctx, availableSlots, input)
-		appendErr(err)
-		requestWakeForClaimedDiscovery(claimedItems, discoveredRunnableIDs, input.RequestSchedulerWake)
-	}
+	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+			retErr = errors.Join(append(errs, err)...)
+			return retErr
 		}
 		if project.Archived {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		snapshot := projectSnapshot(project.ID)
 		if repo == "" {
 			continue
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
-			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, err))
-			_, err = input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			appendErr(wrapSchedulerError("sweeper pull request discovery", project.ID, repo, err))
-			_, err = input.Sweeper.DiscoverReconcile(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
-			appendErr(wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, err))
+			appendErr(applySweeperBackpressure(ctx, input, project, repo))
+			appendErr(runSchedulerLane(input, "sweeper issue discovery", project.ID, repo, func() error {
+				_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				return wrapSchedulerError("sweeper issue discovery", project.ID, repo, err)
+			}))
+			appendErr(runSchedulerLane(input, "sweeper pull request discovery", project.ID, repo, func() error {
+				_, err := input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+				return wrapSchedulerError("sweeper pull request discovery", project.ID, repo, err)
+			}))
+			appendErr(runSchedulerLane(input, "sweeper reconciliation discovery", project.ID, repo, func() error {
+				_, err := input.Sweeper.DiscoverReconcile(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
+				return wrapSchedulerError("sweeper reconciliation discovery", project.ID, repo, err)
+			}))
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_sweeper_discovery", input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
 		} else if input.Sweeper != nil && input.Logger != nil {
 			input.Logger.Debug("sweeper auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
@@ -1173,11 +1349,41 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if len(errs) == 0 {
 		return nil
 	}
-	return errors.Join(errs...)
+	retErr = errors.Join(errs...)
+	return retErr
 }
 
 func discoveryEnabled(value *bool) bool {
 	return value == nil || *value
+}
+
+func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID string) bool {
+	if input.CoordinatorEnabled == nil {
+		return false
+	}
+	return input.CoordinatorEnabled(projectID)
+}
+
+func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
+	prLimit := 30
+	issueLimit := 30
+	if input.Coordinator != nil && coordinatorEnabledForProject(input, projectID) {
+		issueLimit = maxInt(issueLimit, 100)
+	}
+	if input.Config != nil && input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+		roles := config.ProjectRoleConfigs(*input.Config, projectID)
+		sweeperLimit := maxInt(roles.Sweeper.Triggers.MaxPerTick*6, 30)
+		prLimit = maxInt(prLimit, sweeperLimit)
+		issueLimit = maxInt(issueLimit, sweeperLimit)
+	}
+	return githubinfra.DiscoverySnapshotOptions{PullRequestLimit: prLimit, IssueLimit: issueLimit}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now func() time.Time) []string {
@@ -1207,6 +1413,83 @@ func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, disc
 			return
 		}
 	}
+}
+
+type schedulerClaimStats struct {
+	claimedCount   int
+	availableSlots int
+}
+
+func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
+	s.claimedCount += claimedCount
+	s.availableSlots = availableSlots
+}
+
+func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInput) error {
+	_, _, err := executeClaimPhase(ctx, "claim_pump", input, nil, false)
+	return err
+}
+
+func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs map[string]struct{}, alwaysLog bool) (int, int, error) {
+	if input.ClaimMu != nil {
+		input.ClaimMu.Lock()
+		defer input.ClaimMu.Unlock()
+	}
+	start := time.Now()
+	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+	if err != nil {
+		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
+		return 0, 0, err
+	}
+	claimedItems := make([]storage.QueueItemRecord, 0)
+	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
+		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		if err == nil {
+			requestWakeForClaimedDiscovery(claimedItems, discoveredRunnableIDs, input.RequestSchedulerWake)
+		}
+	}
+	claimedCount := len(claimedItems)
+	if alwaysLog || availableSlots > 0 || claimedCount > 0 || err != nil {
+		logClaimPhase(input.Logger, phase, availableSlots, claimedCount, time.Since(start), err)
+	}
+	return claimedCount, availableSlots, err
+}
+
+func logClaimPhase(logger bootstrap.Logger, phase string, availableSlots, claimedCount int, duration time.Duration, err error) {
+	if logger == nil {
+		return
+	}
+	fields := map[string]any{"phase": phase, "availableSlots": availableSlots, "claimedCount": claimedCount, "durationMs": duration.Milliseconds()}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	logger.Debug("scheduler claim phase", fields)
+}
+
+func runSchedulerLane(input defaultSchedulerTickInput, laneName, projectID, repo string, fn func() error) error {
+	start := time.Now()
+	if input.Logger != nil {
+		input.Logger.Debug("scheduler lane start", map[string]any{"lane": laneName, "projectId": projectID, "repo": repo})
+	}
+	err := fn()
+	if input.Logger != nil {
+		fields := map[string]any{"lane": laneName, "projectId": projectID, "repo": repo, "durationMs": time.Since(start).Milliseconds()}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		input.Logger.Debug("scheduler lane end", fields)
+		if threshold := schedulerSlowLaneWarnThreshold(input); threshold > 0 && time.Since(start) >= threshold {
+			input.Logger.Warn("scheduler lane slow", fields)
+		}
+	}
+	return err
+}
+
+func schedulerSlowLaneWarnThreshold(input defaultSchedulerTickInput) time.Duration {
+	if input.Config == nil || input.Config.Scheduler.SlowLaneWarnThresholdMS <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(input.Config.Scheduler.SlowLaneWarnThresholdMS) * time.Millisecond
 }
 
 func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, maxConcurrentRuns int) (int, error) {
@@ -1393,7 +1676,7 @@ func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, in
 	if kind == "retryable_transient" && nextAttempts < item.MaxAttempts {
 		return input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: item.ID, AvailableAt: nowISO, Attempts: nextAttempts, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 	}
-	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
+	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 }
 
 func repoFromProjectMetadata(metadataJSON *string) string {
@@ -1406,6 +1689,92 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 	}
 	repo, _ := metadata["repo"].(string)
 	return strings.TrimSpace(repo)
+}
+
+func applySweeperBackpressure(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord, repo string) error {
+	if input.Config == nil || input.Sweeper == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil
+	}
+	statsProvider, ok := input.Sweeper.(sweeperOperatorStatsProvider)
+	if !ok {
+		return nil
+	}
+	roleCfg := config.ProjectRoleConfigs(*input.Config, project.ID).Sweeper
+	threshold := roleCfg.Proposer.TimeoutRateDryRunThreshold
+	minSamples := roleCfg.Proposer.TimeoutRateDryRunMinSamples
+	if threshold <= 0 {
+		return nil
+	}
+	meta := parseSchedulerProjectMetadata(project.MetadataJSON)
+	if meta.Sweeper.AutoDryRun {
+		return nil
+	}
+	stats, err := statsProvider.RepoOperatorStats(ctx, project.ID, repo, 1000)
+	if err != nil {
+		return fmt.Errorf("compute sweeper backpressure stats: %w", err)
+	}
+	if stats.AgentProposalCount < minSamples || stats.AgentTimeoutRate < threshold {
+		return nil
+	}
+	nowFn := input.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	nowISO := formatJavaScriptISOString(nowFn().UTC())
+	reason := fmt.Sprintf("agent timeout rate %.2f exceeded threshold %.2f across %d agent proposals", stats.AgentTimeoutRate, threshold, stats.AgentProposalCount)
+	updatedMetadata, err := mergeSchedulerProjectMetadata(project.MetadataJSON, map[string]any{"sweeper": map[string]any{"autoDryRun": true, "autoDryRunReason": reason, "autoDryRunSetAt": nowISO}})
+	if err != nil {
+		return fmt.Errorf("update sweeper backpressure metadata: %w", err)
+	}
+	updated := project
+	updated.MetadataJSON = &updatedMetadata
+	updated.UpdatedAt = nowISO
+	if err := input.Repos.Projects.Upsert(ctx, updated); err != nil {
+		return fmt.Errorf("persist sweeper backpressure override: %w", err)
+	}
+	if input.Repos.Notifications != nil {
+		dedupeKey := fmt.Sprintf("runtime.sweeper.auto_dry_run:%s:%s", project.ID, repo)
+		payloadJSON := fmt.Sprintf(`{"repo":%q,"reason":%q}`, repo, reason)
+		_ = input.Repos.Notifications.Upsert(ctx, storage.NotificationRecord{ID: dedupeKey, ProjectID: stringPtr(project.ID), EntityType: stringPtr("project"), EntityID: stringPtr(project.ID), Channel: "in_app", Level: "warning", Title: "Looper Sweeper Auto Dry-Run", Subtitle: stringPtr(repo), Body: reason, Status: "sent", DedupeKey: &dedupeKey, PayloadJSON: &payloadJSON, SentAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO})
+	}
+	if input.Logger != nil {
+		input.Logger.Warn("sweeper auto-enabled dry-run backpressure", map[string]any{"projectId": project.ID, "repo": repo, "reason": reason})
+	}
+	return nil
+}
+
+type schedulerProjectMetadata struct {
+	Sweeper struct {
+		AutoDryRun bool `json:"autoDryRun"`
+	} `json:"sweeper"`
+}
+
+func parseSchedulerProjectMetadata(metadataJSON *string) schedulerProjectMetadata {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return schedulerProjectMetadata{}
+	}
+	var metadata schedulerProjectMetadata
+	if err := json.Unmarshal([]byte(strings.TrimSpace(*metadataJSON)), &metadata); err != nil {
+		return schedulerProjectMetadata{}
+	}
+	return metadata
+}
+
+func mergeSchedulerProjectMetadata(current *string, updates map[string]any) (string, error) {
+	metadata := map[string]any{}
+	if current != nil && strings.TrimSpace(*current) != "" {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(*current)), &metadata); err != nil {
+			return "", err
+		}
+	}
+	for key, value := range updates {
+		metadata[key] = value
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func wrapSchedulerError(action, projectID, repo string, err error) error {

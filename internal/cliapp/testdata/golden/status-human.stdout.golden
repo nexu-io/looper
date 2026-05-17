@@ -15,6 +15,15 @@ Scheduler
   queuedItems  : 2
   runningItems : 1
 
+Webhook
+  enabled                     : no
+  endpointUrl                 : -
+  fallbackPollIntervalSeconds : 0
+  degraded                    : no
+  configuredForwarders        : 0
+  runningForwarders           : 0
+  degradedReasons             : none
+
 type      queued  running  waiting  paused  failed  terminated  stopped
 --------  ------  -------  -------  ------  ------  ----------  -------
 planner   0       0        0        1       0       0           0      

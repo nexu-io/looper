@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how to use `planner`, `reviewer`, `fixer`, and `worker`, and how they interact with GitHub issues and PRs.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with GitHub issues and PRs.
 
 ## 1. Prerequisites
 
@@ -42,6 +42,7 @@ If no project matches the current directory, or multiple projects match, pass `-
 
 | Role | Purpose | Common entrypoint |
 | --- | --- | --- |
+| `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
 | `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
@@ -62,7 +63,93 @@ If no project matches the current directory, or multiple projects match, pass `-
 
 This is the smoothest current Looper workflow.
 
-## 5. Planner: from issue to spec PR
+## 5. Coordinator: proactive triage on fresh issues
+
+Coordinator is Looper's intake role. It is proactive, not trigger-driven: on each poll it scans fresh open issues, runs a shallow repository-aware triage pass, then commits a durable Disposition back to GitHub.
+
+### What Coordinator writes
+
+For each fresh issue inside the configured bootstrap window, Coordinator picks one Disposition:
+
+- `valid`
+- `out-of-scope`
+- `unclear`
+
+It then:
+
+1. clears any prior coordinator-owned labels (`kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, `needs-info`)
+2. applies the new labels for the chosen Disposition
+3. posts or edits a triage comment marked with `<!-- looper:coordinator:triage -->`
+4. applies `triaged` last as the durability commit
+
+The `triaged` label means Coordinator has formed an opinion about the issue. Because that label is written last, the triage action is safe to re-run after a partial failure.
+
+### Current triage outcomes
+
+- `valid` adds one each of `kind/*`, `area/*`, `complexity/*`, and `dispatch/*`
+- `out-of-scope` reuses the existing `wontfix` label and leaves the issue open
+- `unclear` adds `needs-info` and asks the author for clarification
+
+### Re-triage loop for `needs-info`
+
+If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged` and immediately re-runs triage in the same poll. That lets the issue move back through triage without requiring the author to know Looper's label vocabulary.
+
+### Cross-role boundary
+
+Coordinator stays out of issues already under Sweeper lifecycle control. It skips issues carrying:
+
+- `roles.sweeper.lifecycle.pendingLabel`
+- `roles.sweeper.lifecycle.closedLabel`
+- `roles.sweeper.security.quarantineLabel`
+
+Sweeper, in turn, exempts active coordinator-managed issues such as `dispatch/*`, `needs-info`, and `looper:hold`.
+
+### Dispatch after triage
+
+Once an issue is already `triaged` and carries exactly one `dispatch/*` label, Coordinator can hand it off in one of two modes:
+
+- **human-gated** (default)
+- **autonomous**
+
+#### Human-gated slash commands
+
+Coordinator watches issue comments for slash commands at the **start of a line**:
+
+- `/plan` → applies the planner trigger label from `roles.planner.triggers.labels[0]`
+- `/implement` → applies the worker trigger label from `roles.worker.triggers.labels[0]`
+
+The commenter must either:
+
+- have repository permission `write`, `maintain`, or `admin`, or
+- be listed in `roles.coordinator.dispatch.humanGate.allowedUsers`
+
+On success, Coordinator:
+
+1. assigns `roles.coordinator.dispatch.assignTo` when configured
+2. applies the derived trigger label as the durability commit
+3. reacts 👍 on the slash-command comment
+
+If the trigger label is already present, Coordinator treats the command as an idempotent re-issue and still reacts 👍.
+
+If the issue is missing `triaged` or a matching `dispatch/*`, Coordinator reacts with GitHub's `confused` reaction and posts one short failure comment marked with `<!-- looper:coordinator:dispatch-failure -->`.
+
+#### Autonomous mode
+
+When `roles.coordinator.dispatch.mode = "autonomous"`, Coordinator no longer waits for a slash command. Instead it dispatches after the issue has stayed `triaged` for `roles.coordinator.dispatch.autonomous.delayMinutes`.
+
+Autonomous dispatch still derives the trigger label from Planner or Worker config and still writes that trigger label last.
+
+#### Veto signals
+
+Autonomous dispatch stops immediately when any veto signal is present:
+
+- the `dispatch/*` label is gone
+- the global hold label `looper:hold` (or the configured override) is present
+- the destination trigger label is already present because a human dispatched manually
+
+`looper:hold` is the operator-facing global hold contract for Coordinator dispatch.
+
+## 6. Planner: from issue to spec PR
 
 ### Start it manually
 
@@ -101,7 +188,7 @@ Planner will:
 
 If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership.
 
-## 6. Reviewer: review a spec PR or a normal PR
+## 7. Reviewer: review a spec PR or a normal PR
 
 ### One-time review
 
@@ -144,7 +231,7 @@ If reviewer considers the spec review clean, it will:
 - there are no unresolved review threads
 - the review decision is not `CHANGES_REQUESTED`
 
-## 7. Fixer: repair a PR based on review feedback
+## 8. Fixer: repair a PR based on review feedback
 
 The most direct way to use fixer is to start it for a specific PR:
 
@@ -174,7 +261,7 @@ If the PR is still in the spec review phase and the review becomes clean, fixer 
 
 In practice, `reviewer` and `fixer` often alternate until the spec PR is ready for `worker`.
 
-## 8. Worker: do the actual implementation
+## 9. Worker: do the actual implementation
 
 ### Start from an issue
 
@@ -213,12 +300,15 @@ When worker starts against a PR target, it first removes:
 
 That signals the PR has been claimed for implementation.
 
-## 9. How the GitHub label system works
+## 10. How the GitHub label system works
 
 These are the most important labels right now:
 
 | Label | Used on | Meaning |
 | --- | --- | --- |
+| `triaged` | issue | Coordinator finished triage and committed a Disposition |
+| `needs-info` | issue | Coordinator marked the issue `unclear` and is waiting for the author |
+| `dispatch/*` | issue | Coordinator's durable dispatch intent for later hand-off |
 | `looper:plan` | issue | This issue is eligible for planner auto-pickup |
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
@@ -226,7 +316,7 @@ These are the most important labels right now:
 
 Treat these as stage signals, not just descriptive labels.
 
-## 10. How assign and review-request trigger automation
+## 11. How assign and review-request trigger automation
 
 The two most important assignment-related rules are:
 
@@ -250,7 +340,7 @@ Reviewer automatically pays attention to:
 
 The `looper:spec-reviewing` label is a phase marker; automatic review still requires a review request unless the loop was explicitly started locally.
 
-## 11. Common GitHub / PR commands
+## 12. Common GitHub / PR commands
 
 Inspect PRs:
 

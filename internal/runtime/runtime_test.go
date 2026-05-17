@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
@@ -1465,6 +1467,149 @@ func TestRuntimeTriggerSchedulerTickCoalescesWhileTickIsRunning(t *testing.T) {
 	}
 }
 
+func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.PollIntervalSeconds = 3600
+
+	var tickCount int32
+	var claimCount int32
+	rt := &Runtime{
+		config:                cfg,
+		logger:                &testLogger{},
+		runSchedulerTick:      func(context.Context, Services) error { atomic.AddInt32(&tickCount, 1); return nil },
+		defaultSchedulerClaim: func(context.Context, Services) error { atomic.AddInt32(&claimCount, 1); return nil },
+		services:              Services{Repositories: &storage.Repositories{}},
+		shutdownTimeout:       time.Second,
+	}
+
+	rt.startSchedulerLoop()
+	t.Cleanup(func() { rt.stopSchedulerLoop() })
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&claimCount) >= 1 && atomic.LoadInt32(&tickCount) >= 1
+	})
+
+	rt.TriggerSchedulerClaim()
+
+	waitForCondition(t, time.Second, func() bool {
+		return atomic.LoadInt32(&claimCount) >= 2
+	})
+	if got := atomic.LoadInt32(&tickCount); got != 1 {
+		t.Fatalf("scheduler tick count = %d, want claim wake without extra discovery tick", got)
+	}
+}
+
+func TestRuntimeRecordWebhookDeliveryTriggersSchedulerTick(t *testing.T) {
+	t.Parallel()
+
+	wakeCh := make(chan struct{}, 1)
+	claimWakeCh := make(chan struct{}, 1)
+	rt := &Runtime{
+		schedulerWake:      wakeCh,
+		schedulerClaimWake: claimWakeCh,
+		webhook: &webhookRuntime{
+			now:    func() time.Time { return time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC) },
+			status: WebhookStatus{RecentOutcomes: []WebhookRecentOutcome{}},
+		},
+	}
+
+	rt.RecordWebhookDelivery("pull_request", "delivery-1")
+
+	select {
+	case <-wakeCh:
+	default:
+		t.Fatal("schedulerWake was not triggered")
+	}
+	select {
+	case <-claimWakeCh:
+	default:
+		t.Fatal("schedulerClaimWake was not triggered")
+	}
+	status := rt.webhook.Status()
+	if status.Counters.DeliveriesReceived != 1 {
+		t.Fatalf("Status().Counters.DeliveriesReceived = %d, want 1", status.Counters.DeliveriesReceived)
+	}
+}
+
+func TestRuntimeWebhookStatusMergesForwarderStats(t *testing.T) {
+	t.Parallel()
+
+	rt := &Runtime{
+		webhook: &webhookRuntime{status: WebhookStatus{Enabled: true, RecentOutcomes: []WebhookRecentOutcome{{At: "2026-05-16T12:00:00.000Z", Outcome: "acknowledged", Message: "stale"}}}},
+		webhookForwarder: stubRuntimeWebhookForwarder{stats: webhookforward.Stats{
+			DeliveriesReceived:  7,
+			DeliveriesDeduped:   1,
+			DeliveriesIgnored:   2,
+			QueueCapacity:       128,
+			QueueEnqueued:       4,
+			QueueCoalesced:      3,
+			QueueRejected:       1,
+			ExecutionsSucceeded: 5,
+			ExecutionsFailed:    2,
+			InFlight:            2,
+			Queued:              6,
+			RecentOutcomes: []webhookforward.Outcome{{
+				At:         "2026-05-16T12:01:00.000Z",
+				Repo:       "nexu-io/looper",
+				ObjectType: "pull_request",
+				Number:     379,
+				EventType:  "pull_request",
+				Status:     "completed",
+			}},
+		}},
+	}
+
+	status := rt.WebhookStatus()
+	if status.Queue.Pending != 6 || status.Queue.Capacity != 128 || status.Queue.ActiveWorkers != 2 {
+		t.Fatalf("Status().Queue = %#v, want pending=6 capacity=128 activeWorkers=2", status.Queue)
+	}
+	if status.Counters.DeliveriesReceived != 7 || status.Counters.Coalesced != 3 || status.Counters.Dropped != 4 || status.Counters.Queued != 4 || status.Counters.Processed != 5 || status.Counters.Failed != 2 {
+		t.Fatalf("Status().Counters = %#v, want merged forwarder counters", status.Counters)
+	}
+	if len(status.RecentOutcomes) != 1 {
+		t.Fatalf("len(Status().RecentOutcomes) = %d, want 1", len(status.RecentOutcomes))
+	}
+	if status.RecentOutcomes[0].Outcome != "completed" || status.RecentOutcomes[0].Message != "nexu-io/looper · pull_request #379 · pull_request" {
+		t.Fatalf("Status().RecentOutcomes[0] = %#v, want merged forwarder outcome", status.RecentOutcomes[0])
+	}
+}
+
+type stubRuntimeWebhookForwarder struct{ stats webhookforward.Stats }
+
+func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	return webhookforward.ForwardResult{}, nil
+}
+
+func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
+
+func (stubRuntimeWebhookForwarder) Close() {}
+
+func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.PollIntervalSeconds = 30
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.FallbackPollIntervalSeconds = 90
+
+	if got := schedulerFullPollInterval(cfg); got != 90*time.Second {
+		t.Fatalf("schedulerFullPollInterval() = %s, want 90s", got)
+	}
+
+	cfg.Webhook.Enabled = false
+	if got := schedulerFullPollInterval(cfg); got != 30*time.Second {
+		t.Fatalf("schedulerFullPollInterval() = %s, want 30s when webhook disabled", got)
+	}
+}
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()
 
@@ -2391,6 +2536,164 @@ func TestRuntimeStartReturnsErrorAfterStop(t *testing.T) {
 	err = rt.Start(context.Background())
 	if err == nil || err.Error() != "runtime already stopped" {
 		t.Fatalf("Start() after Stop() error = %v, want runtime already stopped", err)
+	}
+}
+
+func TestValidateCoordinatorDependencyGatesFailsClosedWhenAPIUnavailable(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"config"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "demo", Name: "Demo", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1"):
+			return shell.Result{Stdout: `[{"number":7}]`}, nil
+		case strings.Contains(args, "dependencies/blocked_by"):
+			result := shell.Result{ExitCode: 1, Stderr: "gh: HTTP 404: Not Found"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+
+	err = rt.validateCoordinatorDependencyGates(context.Background(), repositories, githubGateway)
+	if err == nil || !strings.Contains(err.Error(), "coordinator dependency gate enabled but dependencies API unavailable on acme/looper") {
+		t.Fatalf("validateCoordinatorDependencyGates() error = %v, want actionable unavailable error", err)
+	}
+}
+
+func TestValidateCoordinatorDependencyGatesAllowsAvailableAPI(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"config"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "demo", Name: "Demo", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1"):
+			return shell.Result{Stdout: `[{"number":7}]`}, nil
+		case strings.Contains(args, "dependencies/blocked_by"):
+			return shell.Result{Stdout: `[]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+
+	if err := rt.validateCoordinatorDependencyGates(context.Background(), repositories, githubGateway); err != nil {
+		t.Fatalf("validateCoordinatorDependencyGates() error = %v, want nil", err)
+	}
+}
+
+func TestValidateCoordinatorDependencyGatesSkipsProbeWhenRepoHasNoIssues(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"config"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "demo", Name: "Demo", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	blockedByCalls := 0
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1"):
+			return shell.Result{Stdout: `[{"number":12,"pull_request":{}}]`}, nil
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=2"):
+			return shell.Result{Stdout: `[]`}, nil
+		case strings.Contains(args, "dependencies/blocked_by"):
+			blockedByCalls++
+			return shell.Result{Stdout: `[]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+
+	if err := rt.validateCoordinatorDependencyGates(context.Background(), repositories, githubGateway); err != nil {
+		t.Fatalf("validateCoordinatorDependencyGates() error = %v, want nil", err)
+	}
+	if blockedByCalls != 0 {
+		t.Fatalf("dependencies/blocked_by call count = %d, want 0", blockedByCalls)
+	}
+}
+
+func TestValidateCoordinatorDependencyGatesSkipsArchivedProjects(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "archived", Name: "Archived", RepoPath: workingDir, Archived: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	blockedByCalls := 0
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "issues?state=all"):
+			t.Fatalf("unexpected issue listing for archived project: %q", args)
+			return shell.Result{}, nil
+		case strings.Contains(args, "dependencies/blocked_by"):
+			blockedByCalls++
+			return shell.Result{Stdout: `[]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+
+	if err := rt.validateCoordinatorDependencyGates(context.Background(), repositories, githubGateway); err != nil {
+		t.Fatalf("validateCoordinatorDependencyGates() error = %v, want nil", err)
+	}
+	if blockedByCalls != 0 {
+		t.Fatalf("dependencies/blocked_by call count = %d, want 0", blockedByCalls)
 	}
 }
 

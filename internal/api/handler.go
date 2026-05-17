@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,22 +21,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/projects"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 const (
 	requestIDHeaderName        = "x-request-id"
 	apiBasePath                = "/api/v1"
+	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
+	webhookListenerPath        = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -46,9 +52,80 @@ type RuntimeState interface {
 	StartedAt() (time.Time, bool)
 }
 
+type sweeperCaseView struct {
+	ID                     string  `json:"id"`
+	ProjectID              string  `json:"projectId"`
+	Repo                   string  `json:"repo"`
+	TargetType             string  `json:"targetType"`
+	TargetNumber           int64   `json:"targetNumber"`
+	Status                 string  `json:"status"`
+	CurrentPhase           string  `json:"currentPhase"`
+	CurrentCategory        *string `json:"currentCategory,omitempty"`
+	CurrentConfidenceScore *int64  `json:"currentConfidenceScore,omitempty"`
+	WarningCommentID       *int64  `json:"warningCommentId,omitempty"`
+	WarningMarkerUUID      *string `json:"warningMarkerUuid,omitempty"`
+	LastProposalID         *string `json:"lastProposalId,omitempty"`
+	LastFingerprintJSON    *string `json:"lastFingerprintJson,omitempty"`
+	LastHumanActivityAt    *string `json:"lastHumanActivityAt,omitempty"`
+	WarnedAt               *string `json:"warnedAt,omitempty"`
+	CloseDueAt             *string `json:"closeDueAt,omitempty"`
+	TerminalOutcome        *string `json:"terminalOutcome,omitempty"`
+	TerminalAt             *string `json:"terminalAt,omitempty"`
+	CreatedAt              string  `json:"createdAt"`
+	UpdatedAt              string  `json:"updatedAt"`
+}
+
+type sweeperProposalView struct {
+	ID               string  `json:"id"`
+	CaseID           string  `json:"caseId"`
+	ProjectID        string  `json:"projectId"`
+	Repo             string  `json:"repo"`
+	TargetType       string  `json:"targetType"`
+	TargetNumber     int64   `json:"targetNumber"`
+	SchemaVersion    int64   `json:"schemaVersion"`
+	ProposerKind     string  `json:"proposerKind"`
+	FactBundleJSON   string  `json:"factBundleJson"`
+	FingerprintJSON  string  `json:"fingerprintJson"`
+	ProposalJSON     string  `json:"proposalJson"`
+	RawResultJSON    *string `json:"rawResultJson,omitempty"`
+	Decision         string  `json:"decision"`
+	Category         string  `json:"category"`
+	ConfidenceScore  int64   `json:"confidenceScore"`
+	Summary          *string `json:"summary,omitempty"`
+	Rationale        *string `json:"rationale,omitempty"`
+	MarkerUUID       *string `json:"markerUuid,omitempty"`
+	ValidationStatus *string `json:"validationStatus,omitempty"`
+	ValidationError  *string `json:"validationError,omitempty"`
+	ApplyStatus      *string `json:"applyStatus,omitempty"`
+	ApplySummary     *string `json:"applySummary,omitempty"`
+	ApplyError       *string `json:"applyError,omitempty"`
+	AppliedAt        *string `json:"appliedAt,omitempty"`
+	CreatedAt        string  `json:"createdAt"`
+}
+
+type sweeperCasesResponse struct {
+	ProjectID string            `json:"projectId"`
+	Repo      string            `json:"repo"`
+	Phase     string            `json:"phase,omitempty"`
+	Status    string            `json:"status,omitempty"`
+	Items     []sweeperCaseView `json:"items"`
+}
+
+type sweeperCaseDetailResponse struct {
+	Case      sweeperCaseView       `json:"case"`
+	Proposals []sweeperProposalView `json:"proposals"`
+}
+
+type sweeperReplayResponse struct {
+	CaseID   string              `json:"caseId"`
+	Proposal sweeperProposalView `json:"proposal"`
+	DryRun   bool                `json:"dryRun"`
+}
+
 type Context struct {
 	Config               config.Config
 	Runtime              RuntimeState
+	WebhookForwarder     webhookforward.Forwarder
 	ProjectsService      projectService
 	Now                  func() time.Time
 	RecoverySummary      func() any
@@ -58,9 +135,10 @@ type Context struct {
 }
 
 type Handler struct {
-	context         Context
-	now             func() time.Time
-	recoverySummary func() any
+	context          Context
+	now              func() time.Time
+	recoverySummary  func() any
+	webhookForwarder webhookforward.Forwarder
 }
 
 func NewHandler(context Context) *Handler {
@@ -83,21 +161,31 @@ func NewHandler(context Context) *Handler {
 			}
 		}
 	}
+	forwarder := context.WebhookForwarder
+	if forwarder == nil {
+		if runtimeWithForwarder, ok := any(context.Runtime).(interface {
+			WebhookForwarder() looperdruntime.WebhookForwarder
+		}); ok {
+			forwarder = runtimeWithForwarder.WebhookForwarder()
+		}
+	}
 
 	return &Handler{
-		context:         context,
-		now:             now,
-		recoverySummary: recoverySummary,
+		context:          context,
+		now:              now,
+		recoverySummary:  recoverySummary,
+		webhookForwarder: forwarder,
 	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
 	if requestID == "" {
 		requestID = generateRequestID()
 	}
 
-	if err := authorizeRequest(r, h.context.Config); err != nil {
+	if err := authorizeRequest(r, path, h.context.Config); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
@@ -106,9 +194,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := normalizePath(r.URL.Path)
-
 	switch path {
+	case webhookForwardPath:
+		payload, err := h.buildWebhookForwardResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, payload))
+		return
 	case apiBasePath + "/healthz":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
 			return
@@ -141,6 +239,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		return
+	case apiBasePath + "/webhook/status":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+
+		h.writeSuccess(w, requestID, h.buildWebhookStatusResponse())
 		return
 	case apiBasePath + "/events":
 		payload, err := h.buildEventsRouteResponse(r)
@@ -246,6 +351,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/sweeper/cases":
+		payload, err := h.buildSweeperCasesResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/sweeper/stats":
+		payload, err := h.buildSweeperStatsResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
 	}
 
 	if strings.HasPrefix(path, apiBasePath+"/loops/") {
@@ -318,6 +447,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(path, apiBasePath+"/sweeper/cases/") {
+		payload, err := h.buildSweeperCaseRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
 	if strings.HasPrefix(path, apiBasePath+"/runs/active/") {
 		payload, err := h.buildActiveRunRouteResponse(r, path)
 		if err != nil {
@@ -338,6 +481,73 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status:  http.StatusNotFound,
 		message: fmt.Sprintf("Unknown route: %s", path),
 	})
+}
+
+func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.ForwardResult, error) {
+	if r.Method != http.MethodPost {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Unsupported method for /webhook/forward"}
+	}
+	if !isLoopbackRequest(r) {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
+	}
+	if h.webhookForwarder == nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
+	}
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		status := runtimeWithWebhook.WebhookStatus()
+		if !status.Enabled {
+			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is disabled; deliveries are not being processed"}
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	eventType := r.Header.Get("X-GitHub-Event")
+	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
+	if err != nil {
+		status := http.StatusBadRequest
+		code := pkgapi.ErrorCodeValidationFailed
+		message := err.Error()
+		lower := strings.ToLower(message)
+		if strings.Contains(lower, "not configured") {
+			status = http.StatusInternalServerError
+			code = pkgapi.ErrorCodeInternalError
+		} else if strings.Contains(lower, "queue is full") {
+			status = http.StatusServiceUnavailable
+		}
+		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
+	}
+	if (strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0) && any(h.context.Runtime) != nil {
+		runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) })
+		if ok {
+			runtimeWithWebhook.RecordWebhookDelivery(eventType, deliveryID)
+		}
+	}
+	return result, nil
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func hasForwardingProxyHeaders(headers http.Header) bool {
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
+		for _, value := range headers.Values(name) {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type apiError struct {
@@ -398,7 +608,17 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	return false
 }
 
-func authorizeRequest(r *http.Request, cfg config.Config) error {
+func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
+	if path == webhookForwardPath && hasForwardingProxyHeaders(r.Header) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Webhook forwarding does not accept proxied loopback requests",
+		}
+	}
+	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
+		return nil
+	}
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -420,6 +640,23 @@ func authorizeRequest(r *http.Request, cfg config.Config) error {
 	}
 
 	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return false
+	}
+	host := remoteAddr
+	if parsedHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func normalizePath(path string) string {
@@ -502,6 +739,7 @@ type statusResponse struct {
 	Service       statusService       `json:"service"`
 	Storage       statusStorage       `json:"storage"`
 	Scheduler     statusScheduler     `json:"scheduler"`
+	Webhook       statusWebhook       `json:"webhook"`
 	Loops         statusLoops         `json:"loops"`
 	Safety        statusSafety        `json:"safety"`
 	Notifications statusNotifications `json:"notifications"`
@@ -568,6 +806,16 @@ type statusScheduler struct {
 	ActiveRuns     int  `json:"activeRuns"`
 }
 
+type statusWebhook struct {
+	Enabled                     bool     `json:"enabled"`
+	EndpointURL                 string   `json:"endpointUrl"`
+	FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
+	Degraded                    bool     `json:"degraded"`
+	DegradedReasons             []string `json:"degradedReasons"`
+	ConfiguredForwarders        int      `json:"configuredForwarders"`
+	RunningForwarders           int      `json:"runningForwarders"`
+}
+
 type statusLoopType struct {
 	Queued     int `json:"queued"`
 	Running    int `json:"running"`
@@ -609,6 +857,7 @@ type configResponse struct {
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
+	Webhook       config.WebhookConfig      `json:"webhook"`
 	Agent         config.AgentConfig        `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -651,6 +900,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Storage:       cfg.Storage,
 		Scheduler:     cfg.Scheduler,
+		Webhook:       cfg.Webhook,
 		Agent:         cfg.Agent,
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -669,6 +919,48 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Roles:    cfg.Roles,
 		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
 	}
+}
+
+func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		return runtimeWithWebhook.WebhookStatus()
+	}
+	return looperdruntime.WebhookStatus{
+		Enabled:                     h.context.Config.Webhook.Enabled,
+		FallbackPollIntervalSeconds: h.context.Config.Webhook.FallbackPollIntervalSeconds,
+		ListenerPath:                "/webhook/forward",
+		EndpointURL:                 strings.TrimRight(serverBaseURL(h.context.Config.Server), "/") + "/webhook/forward",
+		DegradedReasons:             []string{},
+		RecentOutcomes:              []looperdruntime.WebhookRecentOutcome{},
+		Forwarders:                  []looperdruntime.WebhookForwarderState{},
+	}
+}
+
+func summarizeWebhookStatus(status looperdruntime.WebhookStatus) statusWebhook {
+	running := 0
+	for _, forwarder := range status.Forwarders {
+		if forwarder.Running {
+			running++
+		}
+	}
+	return statusWebhook{
+		Enabled:                     status.Enabled,
+		EndpointURL:                 status.EndpointURL,
+		FallbackPollIntervalSeconds: status.FallbackPollIntervalSeconds,
+		Degraded:                    status.Degraded,
+		DegradedReasons:             append([]string{}, status.DegradedReasons...),
+		ConfiguredForwarders:        len(status.Forwarders),
+		RunningForwarders:           running,
+	}
+}
+
+func serverBaseURL(cfg config.ServerConfig) string {
+	if cfg.BaseURL != nil && strings.TrimSpace(*cfg.BaseURL) != "" {
+		return strings.TrimSpace(*cfg.BaseURL)
+	}
+	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
 }
 
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {
@@ -734,7 +1026,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
 		},
-		Loops: loopCounts,
+		Webhook: summarizeWebhookStatus(h.buildWebhookStatusResponse()),
+		Loops:   loopCounts,
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -976,6 +1269,10 @@ type pullRequestResponse struct {
 	ChecksSummary         *string `json:"checksSummary"`
 	UnresolvedThreadCount int64   `json:"unresolvedThreadCount"`
 	ReviewState           *string `json:"reviewState"`
+	Mergeability          *string `json:"mergeability"`
+	BlockingReason        *string `json:"blockingReason"`
+	IsDraft               *bool   `json:"isDraft"`
+	HasConflicts          *bool   `json:"hasConflicts"`
 	CapturedAt            *string `json:"capturedAt"`
 	Reviewer              *string `json:"reviewer"`
 	Fixer                 *string `json:"fixer"`
@@ -1243,6 +1540,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	_ = h.refreshWebhookForwarders()
 
 	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
 }
@@ -1461,6 +1759,218 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 	return h.serializePullRequestListItem(repo, prNumber, snapshot, loopMatches), nil
 }
 
+func (h *Handler) buildSweeperCasesResponse(r *http.Request) (sweeperCasesResponse, error) {
+	if r.Method != http.MethodGet {
+		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", normalizePath(r.URL.Path))}
+	}
+	services := h.context.Runtime.Services()
+	runner, err := h.newSweeperOperatorRunner(services)
+	if err != nil {
+		return sweeperCasesResponse{}, err
+	}
+	query := r.URL.Query()
+	projectID := strings.TrimSpace(query.Get("projectId"))
+	repo := strings.TrimSpace(query.Get("repo"))
+	if projectID == "" || repo == "" {
+		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId and repo are required"}
+	}
+	limit := 100
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		parsed, err := parsePositiveInt64(raw, "limit")
+		if err != nil {
+			return sweeperCasesResponse{}, err
+		}
+		limit = int(parsed)
+	}
+	phase := strings.TrimSpace(query.Get("phase"))
+	status := strings.TrimSpace(query.Get("status"))
+	items, err := runner.ListCases(r.Context(), sweeper.CaseQuery{ProjectID: projectID, Repo: repo, Phase: phase, Status: status, Limit: limit})
+	if err != nil {
+		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	return sweeperCasesResponse{ProjectID: projectID, Repo: repo, Phase: phase, Status: status, Items: serializeSweeperCases(items)}, nil
+}
+
+func (h *Handler) buildSweeperStatsResponse(r *http.Request) (sweeper.RepoStats, error) {
+	if r.Method != http.MethodGet {
+		return sweeper.RepoStats{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", normalizePath(r.URL.Path))}
+	}
+	services := h.context.Runtime.Services()
+	runner, err := h.newSweeperOperatorRunner(services)
+	if err != nil {
+		return sweeper.RepoStats{}, err
+	}
+	query := r.URL.Query()
+	projectID := strings.TrimSpace(query.Get("projectId"))
+	repo := strings.TrimSpace(query.Get("repo"))
+	if projectID == "" || repo == "" {
+		return sweeper.RepoStats{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId and repo are required"}
+	}
+	return runner.RepoOperatorStats(r.Context(), projectID, repo, 1000)
+}
+
+func (h *Handler) buildSweeperCaseRouteResponse(r *http.Request, path string) (any, error) {
+	services := h.context.Runtime.Services()
+	runner, err := h.newSweeperOperatorRunner(services)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/sweeper/cases/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "caseId is required"}
+	}
+	caseID, err := url.PathUnescape(strings.TrimSpace(parts[0]))
+	if err != nil || strings.TrimSpace(caseID) == "" {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "caseId is required"}
+	}
+	if len(parts) == 1 || strings.TrimSpace(parts[1]) == "" {
+		if r.Method != http.MethodGet {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		inspection, err := runner.InspectCase(r.Context(), caseID)
+		if err != nil {
+			return nil, sweeperOperatorAPIError(err, caseID)
+		}
+		return sweeperCaseDetailResponse{Case: serializeSweeperCase(inspection.Case), Proposals: serializeSweeperProposals(inspection.Proposals)}, nil
+	}
+	if strings.TrimSpace(parts[1]) != "replay" || len(parts) > 2 {
+		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+	if r.Method != http.MethodPost {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+	}
+	proposal, err := runner.ReplayCaseProposalDryRun(r.Context(), caseID)
+	if err != nil {
+		return nil, sweeperOperatorAPIError(err, caseID)
+	}
+	return sweeperReplayResponse{CaseID: caseID, Proposal: serializeSweeperProposal(*proposal), DryRun: true}, nil
+}
+
+func sweeperOperatorAPIError(err error, caseID string) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "not found") {
+		return apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Sweeper case not found: %s", caseID)}
+	}
+	if strings.Contains(err.Error(), "not configured") {
+		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusServiceUnavailable, message: err.Error()}
+	}
+	return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+}
+
+func serializeSweeperCases(records []storage.SweeperCaseRecord) []sweeperCaseView {
+	out := make([]sweeperCaseView, 0, len(records))
+	for _, record := range records {
+		out = append(out, serializeSweeperCase(record))
+	}
+	return out
+}
+
+func serializeSweeperCase(record storage.SweeperCaseRecord) sweeperCaseView {
+	return sweeperCaseView{
+		ID:                     record.ID,
+		ProjectID:              record.ProjectID,
+		Repo:                   record.Repo,
+		TargetType:             record.TargetType,
+		TargetNumber:           record.TargetNumber,
+		Status:                 record.Status,
+		CurrentPhase:           record.CurrentPhase,
+		CurrentCategory:        record.CurrentCategory,
+		CurrentConfidenceScore: record.CurrentConfidenceScore,
+		WarningCommentID:       record.WarningCommentID,
+		WarningMarkerUUID:      record.WarningMarkerUUID,
+		LastProposalID:         record.LastProposalID,
+		LastFingerprintJSON:    record.LastFingerprintJSON,
+		LastHumanActivityAt:    record.LastHumanActivityAt,
+		WarnedAt:               record.WarnedAt,
+		CloseDueAt:             record.CloseDueAt,
+		TerminalOutcome:        record.TerminalOutcome,
+		TerminalAt:             record.TerminalAt,
+		CreatedAt:              record.CreatedAt,
+		UpdatedAt:              record.UpdatedAt,
+	}
+}
+
+func serializeSweeperProposals(records []storage.SweeperProposalRecord) []sweeperProposalView {
+	out := make([]sweeperProposalView, 0, len(records))
+	for _, record := range records {
+		out = append(out, serializeSweeperProposal(record))
+	}
+	return out
+}
+
+func serializeSweeperProposal(record storage.SweeperProposalRecord) sweeperProposalView {
+	return sweeperProposalView{
+		ID:               record.ID,
+		CaseID:           record.CaseID,
+		ProjectID:        record.ProjectID,
+		Repo:             record.Repo,
+		TargetType:       record.TargetType,
+		TargetNumber:     record.TargetNumber,
+		SchemaVersion:    record.SchemaVersion,
+		ProposerKind:     record.ProposerKind,
+		FactBundleJSON:   record.FactBundleJSON,
+		FingerprintJSON:  record.FingerprintJSON,
+		ProposalJSON:     record.ProposalJSON,
+		RawResultJSON:    record.RawResultJSON,
+		Decision:         record.Decision,
+		Category:         record.Category,
+		ConfidenceScore:  record.ConfidenceScore,
+		Summary:          record.Summary,
+		Rationale:        record.Rationale,
+		MarkerUUID:       record.MarkerUUID,
+		ValidationStatus: record.ValidationStatus,
+		ValidationError:  record.ValidationError,
+		ApplyStatus:      record.ApplyStatus,
+		ApplySummary:     record.ApplySummary,
+		ApplyError:       record.ApplyError,
+		AppliedAt:        record.AppliedAt,
+		CreatedAt:        record.CreatedAt,
+	}
+}
+
+func (h *Handler) newSweeperOperatorRunner(services looperdruntime.Services) (*sweeper.Runner, error) {
+	if services.Repositories == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "repositories are unavailable"}
+	}
+	var sweeperAgent sweeper.AgentExecutor
+	if h.context.Config.Agent.Vendor != nil {
+		model := h.context.Config.Roles.Sweeper.Proposer.Model
+		if model == nil || strings.TrimSpace(*model) == "" {
+			model = h.context.Config.Agent.Model
+		}
+		configured := agent.New(agent.ExecutorOptions{Config: agent.ExecutorConfig{Vendor: *h.context.Config.Agent.Vendor, Model: model, Params: h.context.Config.Agent.Params, Env: h.context.Config.Agent.Env, NativeResumeEnabled: h.context.Config.Agent.NativeResume.Enabled}, Repos: services.Repositories, LogDir: h.context.Config.Daemon.LogDir, Now: h.now})
+		sweeperAgent = apiSweeperAgentExecutorAdapter{executor: configured}
+	}
+	agentRuntime := ""
+	if h.context.Config.Agent.Vendor != nil {
+		agentRuntime = string(*h.context.Config.Agent.Vendor)
+	}
+	return sweeper.New(sweeper.Options{Repos: services.Repositories, Agent: sweeperAgent, Config: &h.context.Config, AgentRuntime: agentRuntime, AgentModel: h.context.Config.Roles.Sweeper.Proposer.Model}), nil
+}
+
+type apiSweeperAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type apiSweeperAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a apiSweeperAgentExecutorAdapter) Start(ctx context.Context, input sweeper.AgentRunInput) (sweeper.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return apiSweeperAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a apiSweeperAgentExecutionAdapter) Wait(ctx context.Context) (sweeper.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return sweeper.AgentResult{}, err
+	}
+	return sweeper.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+func (a apiSweeperAgentExecutionAdapter) Kill(reason string) error { return a.execution.Kill(reason) }
+
 func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) (pullRequestStatusResponse, error) {
 	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
 	if err != nil {
@@ -1543,6 +2053,7 @@ func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snap
 	if snapshot != nil && snapshot.UnresolvedThreadCount != nil {
 		unresolvedThreadCount = *snapshot.UnresolvedThreadCount
 	}
+	actionability := derivePullRequestActionability(snapshot)
 
 	return pullRequestResponse{
 		Repo:                  repo,
@@ -1557,10 +2068,117 @@ func (h *Handler) serializePullRequestListItem(repo string, prNumber int64, snap
 		ChecksSummary:         snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ChecksSummary }),
 		UnresolvedThreadCount: unresolvedThreadCount,
 		ReviewState:           snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return s.ReviewState }),
+		Mergeability:          stringPtrOrNil(actionability.mergeability),
+		BlockingReason:        stringPtrOrNil(actionability.blockingReason),
+		IsDraft:               actionability.isDraft,
+		HasConflicts:          actionability.hasConflicts,
 		CapturedAt:            snapshotString(snapshot, func(s storage.PullRequestSnapshotRecord) *string { return &s.CapturedAt }),
 		Reviewer:              findLatestLoopStatus(loopMatches, string(domain.LoopTypeReviewer)),
 		Fixer:                 findLatestLoopStatus(loopMatches, string(domain.LoopTypeFixer)),
 	}
+}
+
+type pullRequestActionability struct {
+	mergeability   string
+	blockingReason string
+	isDraft        *bool
+	hasConflicts   *bool
+}
+
+func derivePullRequestActionability(snapshot *storage.PullRequestSnapshotRecord) pullRequestActionability {
+	if snapshot == nil {
+		return pullRequestActionability{mergeability: "unknown", blockingReason: "no snapshot"}
+	}
+
+	detail := pullRequestSnapshotDetail(snapshot.PayloadJSON)
+	isDraft := boolPtrIfPresent(detail, "isDraft", "IsDraft")
+	hasConflicts := boolPtrIfPresent(detail, "hasConflicts", "HasConflicts")
+	if hasConflicts == nil && strings.EqualFold(stringFromMap(detail, "mergeStateStatus"), "DIRTY") {
+		hasConflicts = boolPtr(true)
+	}
+
+	if isDraft != nil && *isDraft {
+		return pullRequestActionability{mergeability: "draft", blockingReason: "draft", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if hasConflicts != nil && *hasConflicts {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "conflicts", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if checksBlockMerge(snapshot.ChecksSummary) {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "checks", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if checksPending(snapshot.ChecksSummary) {
+		return pullRequestActionability{mergeability: "waiting", blockingReason: "checks pending", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if reviewBlocksMerge(snapshot.ReviewState) {
+		return pullRequestActionability{mergeability: "blocked", blockingReason: "review", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	if reviewPending(snapshot.ReviewState) {
+		return pullRequestActionability{mergeability: "waiting", blockingReason: "review pending", isDraft: isDraft, hasConflicts: hasConflicts}
+	}
+	return pullRequestActionability{mergeability: "ready", blockingReason: "", isDraft: isDraft, hasConflicts: hasConflicts}
+}
+
+func pullRequestSnapshotDetail(payload *string) map[string]any {
+	if payload == nil || strings.TrimSpace(*payload) == "" {
+		return nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(*payload), &parsed); err != nil {
+		return nil
+	}
+	detail, _ := parsed["detail"].(map[string]any)
+	return detail
+}
+
+func checksBlockMerge(summary *string) bool {
+	if summary == nil {
+		return false
+	}
+	lower := strings.ToLower(*summary)
+	return strings.Contains(lower, "failure") || strings.Contains(lower, "failed") || strings.Contains(lower, "error") || strings.Contains(lower, "cancel")
+}
+
+func checksPending(summary *string) bool {
+	if summary == nil {
+		return false
+	}
+	lower := strings.ToLower(*summary)
+	return strings.Contains(lower, "pending") || strings.Contains(lower, "queued") || strings.Contains(lower, "in_progress") || strings.Contains(lower, "unknown")
+}
+
+func reviewBlocksMerge(state *string) bool {
+	return state != nil && strings.EqualFold(strings.TrimSpace(*state), "CHANGES_REQUESTED")
+}
+
+func reviewPending(state *string) bool {
+	if state == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(*state)) {
+	case "", "APPROVED":
+		return false
+	default:
+		return true
+	}
+}
+
+func boolPtrIfPresent(values map[string]any, keys ...string) *bool {
+	for _, key := range keys {
+		value, ok := values[key].(bool)
+		if ok {
+			return boolPtr(value)
+		}
+	}
+	return nil
+}
+
+func stringFromMap(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(storage.PullRequestSnapshotRecord) *string) *string {
@@ -2667,8 +3285,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 					return storage.LoopRecord{}, findErr
 				}
 				if existingQueue == nil {
-					if upsertQueueErr := transactionRepos.Queue.Upsert(r.Context(), queueRecord); upsertQueueErr != nil {
+					persistedQueue, createdQueue, upsertQueueErr := transactionRepos.Queue.CreateOrGetActiveByDedupe(r.Context(), queueRecord)
+					if upsertQueueErr != nil {
 						return storage.LoopRecord{}, upsertQueueErr
+					}
+					if !createdQueue && persistedQueue.ID != queueRecord.ID {
+						return storage.LoopRecord{}, fmt.Errorf("active loop already exists for dedupe key %s", queueRecord.DedupeKey)
 					}
 				}
 			}
@@ -3026,7 +3648,7 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
-					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
 				} else {
@@ -3035,7 +3657,7 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
-						if upsertQueueErr := repos.Queue.Upsert(ctx, queueRecord); upsertQueueErr != nil {
+						if _, _, upsertQueueErr := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); upsertQueueErr != nil {
 							return storage.LoopRecord{}, upsertQueueErr
 						}
 					}
@@ -3528,7 +4150,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
-					if err := repos.Queue.Upsert(ctx, replacement); err != nil {
+					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
 				} else {
@@ -3537,7 +4159,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
-						if err := repos.Queue.Upsert(ctx, queueRecord); err != nil {
+						if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); err != nil {
 							return storage.LoopRecord{}, err
 						}
 					}
@@ -4349,6 +4971,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	_ = h.refreshWebhookForwarders()
 
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
@@ -4358,6 +4981,16 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
+}
+
+func (h *Handler) refreshWebhookForwarders() error {
+	if refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error }); ok {
+		return refresher.RefreshWebhookForwarders()
+	}
+	if refresher, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
+		refresher.ReconcileWebhookForwarders()
+	}
+	return nil
 }
 
 func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {

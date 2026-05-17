@@ -107,10 +107,21 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
+			newCommand(commandSpec{
+				use:             "webhook",
+				short:           "Webhook configuration and status",
+				helpSubcommands: []helpSubcommand{{name: "enable", description: "Enable webhook mode"}, {name: "disable", description: "Disable webhook mode"}, {name: "status", description: "Show webhook status"}},
+				helpWhenNoArgs:  true,
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable, localFlags: []flagSpec{boolFlag("install-gh-webhook", "Install the GitHub CLI webhook extension if gh webhook is unavailable")}}),
+					newCommand(commandSpec{use: "disable", short: "Disable webhook mode", runE: runtime.webhookDisable}),
+					newCommand(commandSpec{use: "status", short: "Show webhook status", runE: runtime.webhookStatus, localFlags: []flagSpec{boolFlag("verbose", "Show per-repo forwarder details and log tails")}}),
+				},
+			}),
 			newCommand(commandSpec{
 				use:   "bootstrap",
 				short: "Run first-time setup",
@@ -184,7 +195,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpSubcommands: []helpSubcommand{{name: "preview", description: "Preview assembled prompt order"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "preview", short: "Preview assembled prompt order", runE: runtime.promptPreview, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), stringFlag("role", "role", "Role: planner, worker, reviewer, or fixer")}}),
+					newCommand(commandSpec{use: "preview", short: "Preview assembled prompt order", runE: runtime.promptPreview, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), stringFlag("role", "role", "Role: planner, worker, reviewer, fixer, or sweeper")}}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -424,6 +435,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper logs 12 --follow",
 				},
 			}),
+			newCommand(commandSpec{use: "pause <seq>", short: "Pause a loop by sequence number", args: cobra.ExactArgs(1), runE: runtime.pauseLoopBySeq, exampleLines: []string{"$ looper pause 12"}}),
+			newCommand(commandSpec{use: "unpause <seq>", short: "Resume a paused loop by sequence number", args: cobra.ExactArgs(1), runE: runtime.unpauseLoopBySeq, exampleLines: []string{"$ looper unpause 12"}}),
 			newCommand(commandSpec{use: "stop <id|all>", short: "Stop an active loop or all active loops", args: cobra.ExactArgs(1), runE: runtime.stopLoop, exampleLines: []string{"$ looper stop 12", "$ looper stop all"}}),
 			newCommand(commandSpec{
 				use:             "run",

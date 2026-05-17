@@ -428,6 +428,7 @@ type Options struct {
 	OnAgentExecutionStarted         AgentExecutionStartedFunc
 	OnRunCompleted                  RunCompletedFunc
 	DiscoveryPolicy                 DiscoveryPolicy
+	OnQueueItemEnqueued             func()
 }
 
 type DiscoveryPolicy struct {
@@ -465,6 +466,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onRunCompleted          RunCompletedFunc
 	discoveryPolicy         DiscoveryPolicy
+	onQueueItemEnqueued     func()
 }
 
 type ProcessResult struct {
@@ -481,6 +483,7 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Limit     int
+	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -682,10 +685,12 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onRunCompleted:          options.OnRunCompleted,
 		discoveryPolicy:         policy,
+		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.github == nil {
 		return DiscoveryResult{}, fmt.Errorf("worker discovery is not configured")
 	}
@@ -2265,10 +2270,20 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	projectID := project.ID
 	loopID := loop.ID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
+	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	return queueItem, nil
+	if created {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return persisted, nil
+}
+
+func (r *Runner) wakeSchedulerAfterEnqueue() {
+	if r.onQueueItemEnqueued != nil {
+		r.onQueueItemEnqueued()
+	}
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
@@ -2280,7 +2295,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 			return nil, err
 		}
 	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 	}

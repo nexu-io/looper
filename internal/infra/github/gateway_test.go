@@ -27,7 +27,15 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		case strings.HasPrefix(args, "issue list"):
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","updatedAt":"2026-05-02T12:00:00Z","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
-			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","updated_at":"2026-05-03T12:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","state_reason":"completed","updated_at":"2026-05-03T12:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocked_by -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[[{"id":12,"number":12,"title":"blocked by","url":"https://api.example.test/issues/12","html_url":"https://example.test/issues/12","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocking -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[[{"id":13,"number":13,"title":"blocking","url":"https://api.example.test/issues/13","html_url":"https://example.test/issues/13","repository_url":"https://api.example.test/repos/acme/looper","state":"closed","state_reason":"completed","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/8/sub_issues -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[[{"id":14,"number":14,"title":"sub issue","url":"https://api.example.test/issues/14","html_url":"https://example.test/issues/14","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/8/comments":
+			return shell.Result{Stdout: `[[{"id":91,"body":"First human follow-up","html_url":"https://example.test/issues/8#issuecomment-91","created_at":"2026-05-03T13:00:00Z","updated_at":"2026-05-03T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -35,7 +43,10 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		case args == "api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer":
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","updatedAt":"2026-05-04T12:00:00Z","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			if !strings.Contains(args, "createdAt") || !strings.Contains(args, "closedAt") {
+				t.Fatalf("pr view args = %q, want createdAt and closedAt fields requested", args)
+			}
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","createdAt":"2026-05-03T12:00:00Z","updatedAt":"2026-05-04T12:00:00Z","closedAt":"2026-05-05T12:00:00Z","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.ts b/a.ts\n"}, nil
 		case strings.HasPrefix(args, "api user"):
@@ -88,6 +99,18 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	issueDetail, err := gateway.ViewIssue(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
 	if err != nil {
 		t.Fatalf("ViewIssue() error = %v", err)
+	}
+	blockedBy, err := gateway.ListBlockedByIssues(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListBlockedByIssues() error = %v", err)
+	}
+	blocking, err := gateway.ListBlockingIssues(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListBlockingIssues() error = %v", err)
+	}
+	subIssues, err := gateway.ListSubIssues(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListSubIssues() error = %v", err)
 	}
 	comment, err := gateway.CreateIssueComment(context.Background(), IssueCommentInput{Repo: "acme/looper", IssueNumber: 8, Body: "Looper started"})
 	if err != nil {
@@ -182,14 +205,29 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if issueDetail.State != "open" || issueDetail.IsPullRequest {
 		t.Fatalf("issueDetail = %#v, want open issue not pull request", issueDetail)
 	}
+	if issueDetail.StateReason != "completed" {
+		t.Fatalf("issueDetail.StateReason = %q, want completed", issueDetail.StateReason)
+	}
 	if issueDetail.AuthorAssociation != "COLLABORATOR" {
 		t.Fatalf("issueDetail.AuthorAssociation = %q, want COLLABORATOR", issueDetail.AuthorAssociation)
 	}
 	if issueDetail.UpdatedAt != "2026-05-03T12:00:00Z" {
 		t.Fatalf("issueDetail.UpdatedAt = %q, want parsed updated timestamp", issueDetail.UpdatedAt)
 	}
+	if issueDetail.CommentCount != 1 || len(issueDetail.Comments) != 1 || issueDetail.Comments[0].Body != "First human follow-up" {
+		t.Fatalf("issueDetail comments = %#v / %d, want one parsed issue comment", issueDetail.Comments, issueDetail.CommentCount)
+	}
 	if comment.ID != 91 || comment.URL != "https://example.test/issues/8#issuecomment-91" {
 		t.Fatalf("comment = %#v, want parsed issue comment metadata", comment)
+	}
+	if len(blockedBy) != 1 || blockedBy[0].Number != 12 || blockedBy[0].Repository.FullName != "acme/looper" {
+		t.Fatalf("blockedBy = %#v, want parsed blocked-by issue", blockedBy)
+	}
+	if len(blocking) != 1 || blocking[0].Number != 13 || blocking[0].StateReason != "completed" {
+		t.Fatalf("blocking = %#v, want parsed blocking issue", blocking)
+	}
+	if len(subIssues) != 1 || subIssues[0].Number != 14 {
+		t.Fatalf("subIssues = %#v, want parsed sub-issue", subIssues)
 	}
 	if snapshot.HeadSHA != "abc123" {
 		t.Fatalf("snapshot.HeadSHA = %q, want abc123", snapshot.HeadSHA)
@@ -206,13 +244,16 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if detail.UpdatedAt != "2026-05-04T12:00:00Z" {
 		t.Fatalf("detail.UpdatedAt = %q, want parsed updated timestamp", detail.UpdatedAt)
 	}
+	if detail.CreatedAt != "2026-05-03T12:00:00Z" || detail.ClosedAt != "2026-05-05T12:00:00Z" {
+		t.Fatalf("detail timestamps = (%q, %q), want parsed created/closed timestamps", detail.CreatedAt, detail.ClosedAt)
+	}
 	if !detail.HasConflicts {
 		t.Fatal("detail.HasConflicts = false, want true")
 	}
 	if len(detail.Comments) != 1 || detail.Comments[0]["id"] != "comment-1" || detail.Comments[0]["threadId"] != "thread-1" || detail.Comments[0]["state"] != "UNRESOLVED" || detail.Comments[0]["body"] != "Fix this" {
 		t.Fatalf("detail.Comments = %#v, want normalized review thread", detail.Comments)
 	}
-	if len(detail.IssueComments) != 1 || detail.IssueComments[0]["id"] != "issue-comment-1" || detail.IssueComments[0]["body"] != "conversation notice" {
+	if len(detail.IssueComments) != 1 || detail.IssueComments[0].Body != "conversation notice" {
 		t.Fatalf("detail.IssueComments = %#v, want PR conversation comments", detail.IssueComments)
 	}
 	if login != "reviewer" {
@@ -233,6 +274,10 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"pr list --repo acme/looper --state open --limit 30 --label phase-1",
 		"issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label phase-1",
 		"api repos/acme/looper/issues/8",
+		"api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocked_by -H Accept: application/vnd.github+json",
+		"api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocking -H Accept: application/vnd.github+json",
+		"api --paginate --slurp repos/acme/looper/issues/8/sub_issues -H Accept: application/vnd.github+json",
+		"api --paginate --slurp repos/acme/looper/issues/8/comments",
 		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
 		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
 		"api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer",
@@ -293,6 +338,44 @@ func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
 	}
 	if metadata.HeadSHA != "abc123" || metadata.Author != "octocat" {
 		t.Fatalf("GetPullRequestHeadAndAuthor() = %+v, want head abc123 author octocat", metadata)
+	}
+}
+
+func TestExtractDependencyIssueFallsBackToRepositoryURL(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":             int64(12),
+		"number":         int64(34),
+		"title":          "blocked by",
+		"repository_url": "https://api.github.com/repos/other/repo",
+	}, "acme/looper")
+	if issue.Repository.Name != "repo" || issue.Repository.FullName != "other/repo" || issue.Repository.URL != "https://api.github.com/repos/other/repo" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from repository_url", issue.Repository)
+	}
+}
+
+func TestExtractDependencyIssueFallsBackToGHESRepositoryURL(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":             int64(12),
+		"number":         int64(34),
+		"title":          "blocked by",
+		"repository_url": "https://github.example.com/api/v3/repos/other/repo",
+	}, "github.example.com/acme/looper")
+	if issue.Repository.Name != "repo" || issue.Repository.FullName != "github.example.com/other/repo" || issue.Repository.URL != "https://github.example.com/api/v3/repos/other/repo" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from GHES repository_url", issue.Repository)
+	}
+}
+
+func TestExtractDependencyIssueFallsBackToRequestedRepo(t *testing.T) {
+	t.Parallel()
+	issue := extractDependencyIssue(map[string]any{
+		"id":     int64(12),
+		"number": int64(34),
+		"title":  "blocked by",
+	}, "github.example.com/acme/looper")
+	if issue.Repository.Name != "looper" || issue.Repository.FullName != "github.example.com/acme/looper" {
+		t.Fatalf("issue.Repository = %#v, want repository identity parsed from requested repo", issue.Repository)
 	}
 }
 
@@ -1110,6 +1193,59 @@ func TestGatewayGetCurrentUserLoginReturnsEmptyForIntegrationTokens(t *testing.T
 	}
 }
 
+func TestGatewayGetCurrentUserLoginForRepoPropagatesViewerLookupFailure(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			result := shell.Result{ExitCode: 1, Stderr: "gh: GraphQL request failed"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "acme/looper", "")
+	if err == nil {
+		t.Fatal("GetCurrentUserLoginForRepo() error = nil, want propagated viewer lookup failure")
+	}
+	if login != "" {
+		t.Fatalf("GetCurrentUserLoginForRepo() login = %q, want empty login on failure", login)
+	}
+}
+
+func TestGatewayGetCurrentUserLoginForRepoPropagatesViewerLookupDecodeFailure(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			return shell.Result{Stdout: "{"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "acme/looper", "")
+	if err == nil {
+		t.Fatal("GetCurrentUserLoginForRepo() error = nil, want propagated viewer decode failure")
+	}
+	if login != "" {
+		t.Fatalf("GetCurrentUserLoginForRepo() login = %q, want empty login on failure", login)
+	}
+}
+
 func TestGatewayIsAuthenticatedScopesStatusToHostname(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1139,10 +1275,15 @@ func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/issues/8 --hostname github.example.com" {
+		switch args {
+		case "api repos/acme/looper/issues/8 --hostname github.example.com":
+			return shell.Result{Stdout: `{"number":8,"title":"Issue","body":"Body","state":"open","updated_at":"2026-05-01T00:00:00Z","user":{"login":"octo"},"author_association":"MEMBER","labels":[]}`}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/8/comments --hostname github.example.com":
+			return shell.Result{Stdout: `[]`}, nil
+		default:
 			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
 		}
-		return shell.Result{Stdout: `{"number":8,"title":"Issue","body":"Body","state":"open","updated_at":"2026-05-01T00:00:00Z","user":{"login":"octo"},"author_association":"MEMBER","labels":[]}`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	detail, err := gateway.ViewIssue(context.Background(), ViewIssueInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
@@ -1151,6 +1292,210 @@ func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
 	}
 	if detail.Number != 8 || detail.AuthorAssociation != "MEMBER" {
 		t.Fatalf("ViewIssue() = %#v, want parsed enterprise issue detail", detail)
+	}
+}
+
+func TestListIssueBlockedByUsesRepositoryURLForCrossRepoBlockers(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api --paginate --slurp repos/acme/looper/issues/12/dependencies/blocked_by" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `[[{"number":34,"repository_url":"https://github.example.com/api/v3/repos/other/repo"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	blockedBy, err := gateway.ListIssueBlockedBy(context.Background(), ListIssueBlockedByInput{Repo: "acme/looper", IssueNumber: 12})
+	if err != nil {
+		t.Fatalf("ListIssueBlockedBy() error = %v", err)
+	}
+	if len(blockedBy) != 1 || blockedBy[0].Number != 34 || blockedBy[0].Repo != "github.example.com/other/repo" {
+		t.Fatalf("ListIssueBlockedBy() = %#v, want hosted cross-repo blocker", blockedBy)
+	}
+}
+
+func TestListIssueBlockedByIgnoresPublicGitHubAPIHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api --paginate --slurp repos/acme/looper/issues/12/dependencies/blocked_by" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `[[{"number":34,"repository":{"full_name":"other/repo","url":"https://api.github.com/repos/other/repo"}}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	blockedBy, err := gateway.ListIssueBlockedBy(context.Background(), ListIssueBlockedByInput{Repo: "acme/looper", IssueNumber: 12})
+	if err != nil {
+		t.Fatalf("ListIssueBlockedBy() error = %v", err)
+	}
+	if len(blockedBy) != 1 || blockedBy[0].Number != 34 || blockedBy[0].Repo != "other/repo" {
+		t.Fatalf("ListIssueBlockedBy() = %#v, want unqualified public GitHub repo", blockedBy)
+	}
+}
+
+func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
+	if err != nil {
+		t.Fatalf("FindAnyIssueNumber() error = %v", err)
+	}
+	if issueNumber != 7 {
+		t.Fatalf("FindAnyIssueNumber() = %d, want first non-PR issue", issueNumber)
+	}
+}
+
+func TestFindAnyIssueNumberContinuesPastFivePages(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=1", "api repos/acme/looper/issues?state=all&per_page=100&page=2", "api repos/acme/looper/issues?state=all&per_page=100&page=3", "api repos/acme/looper/issues?state=all&per_page=100&page=4", "api repos/acme/looper/issues?state=all&per_page=100&page=5":
+			return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}]`}, nil
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=6":
+			return shell.Result{Stdout: `[{"number":7}]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
+	if err != nil {
+		t.Fatalf("FindAnyIssueNumber() error = %v", err)
+	}
+	if issueNumber != 7 {
+		t.Fatalf("FindAnyIssueNumber() = %d, want issue discovered after page five", issueNumber)
+	}
+	if len(runner.calls) != 6 {
+		t.Fatalf("FindAnyIssueNumber() calls = %d, want six pages probed", len(runner.calls))
+	}
+}
+
+func TestGatewayListLinkedPullRequestsHandlesHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.Contains(args, "api graphql") || !strings.Contains(args, "-F owner=acme") || !strings.Contains(args, "-F repo=looper") || !strings.Contains(args, "--hostname github.example.com") || strings.Contains(args, "github.example.com/acme") {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":42,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListLinkedPullRequests(context.Background(), LinkedPullRequestsInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListLinkedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergeCommitSHA != "abc123" {
+		t.Fatalf("ListLinkedPullRequests() = %#v, want parsed linked PRs", prs)
+	}
+}
+
+func TestGatewayListLinkedPullRequestsPaginates(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "closedByPullRequestsReferences(first: 20, after: $after)") && strings.Contains(args, "-F after=cursor-1"):
+			return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":22,"state":"CLOSED","mergedAt":"","mergeCommit":{"oid":""}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.Contains(args, "closedByPullRequestsReferences(first: 20, after: $after)"):
+			return shell.Result{Stdout: `{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":21,"state":"MERGED","mergedAt":"2026-05-01T00:00:00Z","mergeCommit":{"oid":"abc123"}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListLinkedPullRequests(context.Background(), LinkedPullRequestsInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListLinkedPullRequests() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("ListLinkedPullRequests() len = %d, want 2", len(prs))
+	}
+	if prs[0].Number != 21 || !prs[0].Merged || prs[0].MergeCommitSHA != "abc123" {
+		t.Fatalf("ListLinkedPullRequests()[0] = %#v, want merged first page result", prs[0])
+	}
+	if prs[1].Number != 22 || prs[1].Merged || prs[1].MergeCommitSHA != "" {
+		t.Fatalf("ListLinkedPullRequests()[1] = %#v, want unmerged second page result", prs[1])
+	}
+}
+
+func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api --paginate --slurp repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[[{"id":1,"event":"closed"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueTimeline() error = %v", err)
+	}
+	if len(rows) != 1 || asInt64(rows[0]["id"]) != 1 || asString(rows[0]["event"]) != "closed" {
+		t.Fatalf("ListIssueTimeline() = %#v, want parsed enterprise timeline", rows)
+	}
+}
+
+func TestGatewayListIssueReactionsScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api --paginate --slurp repos/acme/looper/issues/8/reactions -H Accept: application/vnd.github+json --hostname github.example.com":
+			return shell.Result{Stdout: `[[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]]`}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/comments/91/reactions -H Accept: application/vnd.github+json --hostname github.example.com":
+			return shell.Result{Stdout: `[[{"id":8,"content":"rocket","user":{"login":"octo"}}]]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	reactions, err := gateway.ListIssueReactions(context.Background(), IssueReactionInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueReactions(issue) error = %v", err)
+	}
+	if len(reactions) != 1 || reactions[0].ID != 7 || reactions[0].Content != "eyes" || reactions[0].UserLogin != "reviewer" {
+		t.Fatalf("ListIssueReactions(issue) = %#v, want parsed enterprise issue reactions", reactions)
+	}
+	commentReactions, err := gateway.ListIssueReactions(context.Background(), IssueReactionInput{Repo: "github.example.com/acme/looper", CommentID: 91})
+	if err != nil {
+		t.Fatalf("ListIssueReactions(comment) error = %v", err)
+	}
+	if len(commentReactions) != 1 || commentReactions[0].ID != 8 || commentReactions[0].Content != "rocket" || commentReactions[0].UserLogin != "octo" {
+		t.Fatalf("ListIssueReactions(comment) = %#v, want parsed enterprise comment reactions", commentReactions)
+	}
+}
+
+func TestGatewayAddIssueReactionScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/issues/comments/91/reactions --method POST -H Accept: application/vnd.github+json -f content=+1 --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.AddIssueReaction(context.Background(), CreateIssueReactionInput{Repo: "github.example.com/acme/looper", CommentID: 91, Content: "+1"}); err != nil {
+		t.Fatalf("AddIssueReaction() error = %v", err)
 	}
 }
 
