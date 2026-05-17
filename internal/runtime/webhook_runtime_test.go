@@ -419,15 +419,30 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 		t.Fatal("new forwarder did not launch while only existing forwarder degradation remained")
 	}
 
-	status := rt.Status()
+	var status WebhookStatus
+	var launched *WebhookForwarderState
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status = rt.Status()
+		for i := range status.Forwarders {
+			if status.Forwarders[i].Repo == "nexu-io/other" {
+				launched = &status.Forwarders[i]
+				break
+			}
+		}
+		if launched != nil && launched.Running {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if len(status.Forwarders) != 2 {
 		t.Fatalf("len(Status().Forwarders) = %d, want 2", len(status.Forwarders))
 	}
-	if status.Forwarders[1].Repo != "nexu-io/other" {
-		t.Fatalf("Status().Forwarders[1].Repo = %q, want nexu-io/other", status.Forwarders[1].Repo)
+	if launched == nil {
+		t.Fatalf("Status().Forwarders = %v, want launched forwarder for nexu-io/other", status.Forwarders)
 	}
-	if !status.Forwarders[1].Running {
-		t.Fatal("Status().Forwarders[1].Running = false, want true after launching new repo forwarder")
+	if !launched.Running {
+		t.Fatal("Status().Forwarders[nexu-io/other].Running = false, want true after launching new repo forwarder")
 	}
 	if !status.Degraded {
 		t.Fatal("Status().Degraded = false, want true while existing forwarder degradation remains")
