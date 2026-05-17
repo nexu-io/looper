@@ -64,7 +64,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		subcommands []string
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list    List projects", "add     Add a project", "remove  Remove a project"}},
-		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file"}},
+		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file", "migrate   Migrate config to canonical TOML"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
@@ -94,6 +94,150 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConfigMigrateDryRunPreviewsCanonicalTOMLWithoutWritingDestination(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	fromPath := filepath.Join(homeDir, ".looper", "config.json")
+	toPath := filepath.Join(homeDir, ".looper", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(fromPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	legacy := `{
+		"defaults": {"allowAutoApprove": true, "fixAllPullRequests": true},
+		"reviewer": {"reviewEvents": {"blocking": "REQUEST_CHANGES"}},
+		"roles": {"reviewer": {"autoDiscovery": true, "triggers": {"requireReviewRequest": true}, "specReview": {"includeReviewingLabel": true}}},
+		"projects": [{"id": "project_1", "name": "Repo", "path": "/tmp/repo", "instructions": {"reviewer": "be careful"}, "roles": {"reviewer": {"autoDiscovery": true, "triggers": {"requireReviewRequest": true}}}}],
+		"notifications": {"osascript": {"enabled": false}}
+	}`
+	if err := os.WriteFile(fromPath, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--dry-run", "--from", fromPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --dry-run]) stderr = %q, want empty", stderr)
+	}
+	if _, err := os.Stat(toPath); !os.IsNotExist(err) {
+		t.Fatalf("Stat(%s) err = %v, want not exists", toPath, err)
+	}
+	for _, notWant := range []string{"reviewer =", "allowAutoApprove", "fixAllPullRequests", "[roles.reviewer.specReview]", "path = \"/tmp/repo\"", "instructions = {"} {
+		if strings.Contains(stdout, notWant) {
+			t.Fatalf("dry-run preview unexpectedly contained %q:\n%s", notWant, stdout)
+		}
+	}
+	for _, want := range []string{"Preview migration:", "[roles.reviewer.behavior.reviewEvents]", "clean = 'APPROVE'", "authorFilter = 'any'", "repoPath = '/tmp/repo'", "[projects.roles.reviewer.discovery]"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("dry-run preview missing %q:\n%s", want, stdout)
+		}
+	}
+
+	previewPath := filepath.Join(t.TempDir(), "preview.toml")
+	preview := stdout[strings.Index(stdout, "[roles.reviewer.behavior.reviewEvents]"):]
+	if err := os.WriteFile(previewPath, []byte(preview), 0o644); err != nil {
+		t.Fatalf("WriteFile(preview) error = %v", err)
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: t.TempDir(), ConfigPath: previewPath, LookupEnv: emptyConfigEnvLookup, LookPath: configLookPathForTests()})
+	if err != nil {
+		t.Fatalf("LoadFile(preview) error = %v", err)
+	}
+	if len(loaded.Warnings) != 0 {
+		t.Fatalf("LoadFile(preview).Warnings = %#v, want none", loaded.Warnings)
+	}
+	if len(loaded.Notices) != 0 {
+		t.Fatalf("LoadFile(preview).Notices = %#v, want none", loaded.Notices)
+	}
+}
+
+func TestConfigMigrateWritesDestinationAndPreservesSource(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.toml")
+	beforeSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--from", fromPath, "--to", toPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate]) stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Migrated config:") {
+		t.Fatalf("stdout = %q, want migrated summary", stdout)
+	}
+	afterSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source after) error = %v", err)
+	}
+	if !bytes.Equal(beforeSource, afterSource) {
+		t.Fatal("source config changed during migration")
+	}
+	rawDest, err := os.ReadFile(toPath)
+	if err != nil {
+		t.Fatalf("ReadFile(dest) error = %v", err)
+	}
+	if strings.Contains(string(rawDest), "allowAutoApprove") {
+		t.Fatalf("destination still contained legacy key:\n%s", rawDest)
+	}
+}
+
+func TestConfigMigrateExistingDestinationRequiresForce(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.toml")
+	if err := os.WriteFile(toPath, []byte("existing = true\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(dest) error = %v", err)
+	}
+
+	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--from", fromPath, "--to", toPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "destination already exists") {
+		t.Fatalf("stderr = %q, want destination exists error", stderr)
+	}
+}
+
+func TestConfigMigrateForceCreatesBackup(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.toml")
+	if err := os.WriteFile(toPath, []byte("existing = true\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(dest) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--force", "--json", "--from", fromPath, "--to", toPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --force --json]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --force --json]) stderr = %q, want empty", stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("Unmarshal(stdout) error = %v\nraw=%q", err, stdout)
+	}
+	backupPath, _ := decoded["backupPath"].(string)
+	if backupPath == "" {
+		t.Fatalf("backupPath missing from JSON output: %#v", decoded)
+	}
+	backupRaw, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("ReadFile(backup) error = %v", err)
+	}
+	if string(backupRaw) != "existing = true\n" {
+		t.Fatalf("backup contents = %q, want original destination", backupRaw)
 	}
 }
 
@@ -742,8 +886,8 @@ func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-loop-enabled" is accepted for now; use "--roles-reviewer-behavior-loop-enabled-by-default" instead`) {
-		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want deprecation warning", stderr)
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
 	}
 }
 
@@ -763,8 +907,8 @@ func TestStatusAcceptsReviewerEnableSelfReviewConfigOverrideFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([status --reviewer-enable-self-review=true]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, `warning: deprecated CLI flag "--reviewer-enable-self-review" is accepted for now; use "--roles-reviewer-discovery-triggers-enable-self-review" instead`) {
-		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want deprecation warning", stderr)
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-enable-self-review=true]) stderr = %q, want empty string", stderr)
 	}
 }
 
@@ -2203,7 +2347,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	}
 }
 
-func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
+func TestConfigValidateDoesNotPrintLegacyDefaultConfigMigrationNote(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 	looperHome := filepath.Join(homeDir, ".looper")
@@ -2222,15 +2366,15 @@ func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	if !strings.Contains(stdout, "Config valid: "+legacyDefaultPath) {
 		t.Fatalf("stdout = %q, want config-valid output for %q", stdout, legacyDefaultPath)
 	}
-	if !strings.Contains(stderr, "note: legacy default config file ") || !strings.Contains(stderr, legacyDefaultPath) || !strings.Contains(stderr, filepath.Join(looperHome, "config.toml")) || !strings.Contains(stderr, "docs/configuration.md") {
-		t.Fatalf("stderr = %q, want migration note", stderr)
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty string", stderr)
 	}
 	if _, err := os.Stat(legacyDefaultPath); err != nil {
 		t.Fatalf("os.Stat(%q) error = %v, want legacy config file preserved", legacyDefaultPath, err)
 	}
 }
 
-func TestEmitConfigLoadNoticesPrintsEachNoticeOncePerRuntime(t *testing.T) {
+func TestEmitConfigLoadNoticesIsSilent(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
 	loaded := config.LoadedFileConfig{Notices: []string{"migrate me"}}
@@ -2238,12 +2382,12 @@ func TestEmitConfigLoadNoticesPrintsEachNoticeOncePerRuntime(t *testing.T) {
 	runtime.emitConfigLoadNotices(loaded)
 	runtime.emitConfigLoadNotices(loaded)
 
-	if got := stderr.String(); got != "note: migrate me\n" {
-		t.Fatalf("stderr = %q, want one emitted notice", got)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }
 
-func TestEmitConfigLoadNoticesPrintsWarningsAndDeduplicatesByLevel(t *testing.T) {
+func TestEmitConfigLoadNoticesSuppressesWarningsAndNotices(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	runtime := newCommandRuntime(New(Deps{Stderr: stderr}), nil)
 	loaded := config.LoadedFileConfig{Warnings: []string{"deprecated reviewer path"}, Notices: []string{"legacy default config"}}
@@ -2251,14 +2395,14 @@ func TestEmitConfigLoadNoticesPrintsWarningsAndDeduplicatesByLevel(t *testing.T)
 	runtime.emitConfigLoadNotices(loaded)
 	runtime.emitConfigLoadNotices(loaded)
 
-	if got := stderr.String(); got != "warning: deprecated reviewer path\nnote: legacy default config\n" {
-		t.Fatalf("stderr = %q, want one emitted warning and notice", got)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
 	}
 
 	stderr.Reset()
 	runtime.emitConfigLoadNotices(config.LoadedFileConfig{Warnings: []string{"same text"}, Notices: []string{"same text"}})
-	if got := stderr.String(); got != "warning: same text\nnote: same text\n" {
-		t.Fatalf("stderr = %q, want warning and note tracked separately", got)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }
 
@@ -3854,6 +3998,16 @@ func writeEnvelope(t *testing.T, w http.ResponseWriter, payload any) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		t.Fatalf("encode envelope: %v", err)
 	}
+}
+
+func configLookPathForTests() config.LookPathFunc {
+	return func(name string) (string, error) {
+		return filepath.Join(string(os.PathSeparator), "detected", name), nil
+	}
+}
+
+func emptyConfigEnvLookup(string) (string, bool) {
+	return "", false
 }
 
 func assertJSONContains(t *testing.T, raw string, key string, want any) {

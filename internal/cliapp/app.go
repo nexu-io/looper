@@ -168,7 +168,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "config",
 				short:           "Inspect and edit the active config file",
-				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}},
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}, {name: "migrate", description: "Migrate config to canonical TOML"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper config get roles.reviewer.behavior.reviewEvents.clean",
@@ -185,6 +185,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "lint", short: "Lint the active config file", runE: runtime.configValidate}),
 					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
 					newCommand(commandSpec{use: "edit", short: "Edit the active config file", runE: runtime.configEdit}),
+					newCommand(commandSpec{use: "migrate", short: "Migrate config to canonical TOML", runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path"), stringFlag("to", "path", "Destination config path"), boolFlag("dry-run", "Preview migrated config without writing destination"), boolFlag("force", "Overwrite destination if it already exists")}}),
 				},
 			}),
 			newCommand(commandSpec{

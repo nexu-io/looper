@@ -25,7 +25,7 @@ func removedLegacySurfaceError(kind deprecatedSurfaceKind, legacy string, replac
 }
 
 func legacyDefaultConfigMigrationNote(legacyPath string, canonicalPath string) string {
-	return fmt.Sprintf("legacy default config file %q is still supported for now. TOML is now the preferred default format/path; move this config to %q, keep only one default config file in place, and update any legacy keys to the canonical taxonomy described in docs/configuration.md", legacyPath, canonicalPath)
+	return fmt.Sprintf("legacy default config file %q is still supported for now. TOML is now the preferred default format/path; run `looper config migrate` or move this config to %q, keep only one default config file in place, and update any legacy keys to the canonical taxonomy described in docs/configuration.md", legacyPath, canonicalPath)
 }
 
 func dedupeDeprecationWarnings(surfaces []deprecatedSurface) []string {
