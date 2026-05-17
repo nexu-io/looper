@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -482,11 +483,15 @@ func (r *commandRuntime) prepareMigratedConfigFile(path string, preview string) 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("create config directory: %w", err)
 	}
-	tmpPattern := ".config-*" + filepath.Ext(path)
-	if filepath.Ext(path) == "" {
+	return r.prepareMigratedConfigValidationFile(filepath.Dir(path), filepath.Ext(path), preview)
+}
+
+func (r *commandRuntime) prepareMigratedConfigValidationFile(dir string, ext string, preview string) (string, error) {
+	tmpPattern := ".config-*" + ext
+	if ext == "" {
 		tmpPattern = ".config-*.tmp"
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return "", fmt.Errorf("create temporary config: %w", err)
 	}
@@ -508,7 +513,10 @@ func (r *commandRuntime) prepareMigratedConfigFile(path string, preview string) 
 }
 
 func (r *commandRuntime) preflightMigratedConfigWrite(path string, preview string, overwrites bool) error {
-	tmpPath, err := r.prepareMigratedConfigFile(path, preview)
+	if err := preflightMigratedConfigDirectory(path); err != nil {
+		return err
+	}
+	tmpPath, err := r.prepareMigratedConfigValidationFile(os.TempDir(), filepath.Ext(path), preview)
 	if err != nil {
 		return err
 	}
@@ -526,6 +534,30 @@ func (r *commandRuntime) preflightMigratedConfigWrite(path string, preview strin
 		}
 	}
 	return nil
+}
+
+func preflightMigratedConfigDirectory(path string) error {
+	anchor := filepath.Dir(path)
+	for {
+		info, err := os.Stat(anchor)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("create config directory: %w", syscall.ENOTDIR)
+			}
+			if err := syscall.Access(anchor, 0x2); err != nil {
+				return fmt.Errorf("create config directory: %w", err)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("create config directory: %w", err)
+		}
+		parent := filepath.Dir(anchor)
+		if parent == anchor {
+			return fmt.Errorf("create config directory: no existing parent directory found for %s", path)
+		}
+		anchor = parent
+	}
 }
 
 func pruneEmptyMaps(value any) any {

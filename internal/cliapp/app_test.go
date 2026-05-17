@@ -2480,11 +2480,38 @@ func TestConfigMigrateDryRunFailsWhenDestinationDirectoryCannotBePrepared(t *tes
 	if stdout != "" {
 		t.Fatalf("stdout = %q, want empty", stdout)
 	}
-	if !strings.Contains(stderr, "create temporary config") {
+	if !strings.Contains(stderr, "create config directory") {
 		t.Fatalf("stderr = %q, want destination preparation error", stderr)
 	}
 	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
 		t.Fatalf("os.Stat(%q) error = %v, want destination not created", destPath, err)
+	}
+}
+
+func TestConfigMigrateDryRunDoesNotCreateMissingDestinationDirectories(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	root := t.TempDir()
+	destDir := filepath.Join(root, "nested", "config")
+	destPath := filepath.Join(destDir, "canonical.toml")
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destPath, "--dry-run")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Dry run: would migrate config") || !strings.Contains(stdout, "allowRiskyFixes = true") {
+		t.Fatalf("stdout = %q, want dry-run preview", stdout)
+	}
+	if _, err := os.Stat(destDir); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want dry-run to avoid creating destination directories", destDir, err)
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want dry-run to avoid creating destination file", destPath, err)
 	}
 }
 
