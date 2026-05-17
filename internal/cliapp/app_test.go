@@ -241,6 +241,63 @@ func TestConfigMigrateForceCreatesBackup(t *testing.T) {
 	}
 }
 
+func TestConfigMigrateDanglingSymlinkDestinationRequiresForce(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.toml")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing.toml"), toPath); err != nil {
+		t.Fatalf("Symlink(dest) error = %v", err)
+	}
+
+	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--from", fromPath, "--to", toPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "destination already exists") {
+		t.Fatalf("stderr = %q, want destination exists error", stderr)
+	}
+}
+
+func TestConfigMigrateForceBacksUpDanglingSymlinkDestination(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.toml")
+	linkTarget := filepath.Join(t.TempDir(), "missing.toml")
+	if err := os.Symlink(linkTarget, toPath); err != nil {
+		t.Fatalf("Symlink(dest) error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--force", "--json", "--from", fromPath, "--to", toPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --force --json]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --force --json]) stderr = %q, want empty", stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("Unmarshal(stdout) error = %v\nraw=%q", err, stdout)
+	}
+	backupPath, _ := decoded["backupPath"].(string)
+	if backupPath == "" {
+		t.Fatalf("backupPath missing from JSON output: %#v", decoded)
+	}
+	backupTarget, err := os.Readlink(backupPath)
+	if err != nil {
+		t.Fatalf("Readlink(backup) error = %v", err)
+	}
+	if backupTarget != linkTarget {
+		t.Fatalf("backup symlink target = %q, want %q", backupTarget, linkTarget)
+	}
+	if info, err := os.Lstat(toPath); err != nil {
+		t.Fatalf("Lstat(dest after) error = %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("destination remained symlink after migration")
+	}
+}
+
 func TestConfigMigrateUsesActiveConfigPathFromFlagWhenFromOmitted(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

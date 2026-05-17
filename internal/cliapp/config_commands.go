@@ -555,7 +555,7 @@ func backupConfigFile(path string) error {
 }
 
 func createBackupConfigFile(path string) (string, error) {
-	raw, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
@@ -563,6 +563,24 @@ func createBackupConfigFile(path string) (string, error) {
 		return "", fmt.Errorf("read config for backup: %w", err)
 	}
 	backupPath := fmt.Sprintf("%s.%s.bak", path, time.Now().UTC().Format("20060102150405.000000000"))
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", fmt.Errorf("read config symlink for backup: %w", err)
+		}
+		if err := os.Symlink(target, backupPath); err != nil {
+			return "", fmt.Errorf("write config backup: %w", err)
+		}
+		return backupPath, nil
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read config for backup: %w", err)
+	}
 	if err := os.WriteFile(backupPath, raw, 0o600); err != nil {
 		return "", fmt.Errorf("write config backup: %w", err)
 	}
@@ -654,8 +672,8 @@ func (r *commandRuntime) writeConfigDestination(path string, raw []byte, backupE
 }
 
 func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	_, err := os.Lstat(path)
+	return err == nil
 }
 
 func (r *commandRuntime) warnConfigOverrides(cmd *cobra.Command, field configField) {
