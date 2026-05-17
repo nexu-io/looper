@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -679,6 +680,65 @@ func TestWebhookRuntimeBootstrapRejectsStaleFingerprint(t *testing.T) {
 	}
 }
 
+func TestWebhookRuntimeCleanupForwarderRecordRetainsUnverifiableRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repositories := openWebhookRuntimeTestRepositories(t)
+	record := storage.WebhookForwarderRecord{
+		Repo:         "nexu-io/looper",
+		PID:          4242,
+		ProcessStart: 99,
+		Fingerprint:  "fingerprint",
+		Endpoint:     "http://127.0.0.1:7777/webhook/forward",
+		Events:       strings.Join(webhookForwardEvents, ","),
+		GHPath:       "/usr/bin/gh",
+		DaemonID:     "daemon",
+		SpawnedAt:    1,
+		UpdatedAt:    1,
+	}
+
+	t.Run("probe error keeps row", func(t *testing.T) {
+		if err := repositories.WebhookForwarders.Upsert(ctx, record); err != nil {
+			t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+		}
+
+		rt := &webhookRuntime{
+			forwarderStore: repositories.WebhookForwarders,
+			probe:          &testProcessProbe{aliveErr: errors.New("probe failed")},
+		}
+		rt.cleanupForwarderRecord(ctx, record, "adoption_rejected")
+
+		records, err := repositories.WebhookForwarders.List(ctx)
+		if err != nil {
+			t.Fatalf("WebhookForwarders.List() error = %v", err)
+		}
+		if len(records) != 1 || records[0].Repo != record.Repo {
+			t.Fatalf("WebhookForwarders.List() = %#v, want retained record for %q", records, record.Repo)
+		}
+	})
+
+	t.Run("dead pid deletes row", func(t *testing.T) {
+		if err := repositories.WebhookForwarders.Upsert(ctx, record); err != nil {
+			t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+		}
+
+		rt := &webhookRuntime{
+			forwarderStore: repositories.WebhookForwarders,
+			probe:          &testProcessProbe{alive: false},
+		}
+		rt.cleanupForwarderRecord(ctx, record, "adoption_rejected")
+
+		records, err := repositories.WebhookForwarders.List(ctx)
+		if err != nil {
+			t.Fatalf("WebhookForwarders.List() error = %v", err)
+		}
+		if len(records) != 0 {
+			t.Fatalf("WebhookForwarders.List() = %#v, want row deleted after definitive mismatch", records)
+		}
+	})
+}
+
 func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 	t.Parallel()
 
@@ -762,16 +822,22 @@ type flakyProjectListQuerier struct {
 }
 
 type testProcessProbe struct {
-	alive bool
-	start int64
-	exe   string
-	argv  []string
+	alive    bool
+	aliveErr error
+	start    int64
+	startErr error
+	exe      string
+	exeErr   error
+	argv     []string
+	argvErr  error
 }
 
-func (p *testProcessProbe) IsAlive(pid int) (bool, error)          { return p.alive, nil }
-func (p *testProcessProbe) StartTime(pid int) (int64, error)       { return p.start, nil }
-func (p *testProcessProbe) Argv(pid int) ([]string, error)         { return append([]string{}, p.argv...), nil }
-func (p *testProcessProbe) ExecutablePath(pid int) (string, error) { return p.exe, nil }
+func (p *testProcessProbe) IsAlive(pid int) (bool, error)    { return p.alive, p.aliveErr }
+func (p *testProcessProbe) StartTime(pid int) (int64, error) { return p.start, p.startErr }
+func (p *testProcessProbe) Argv(pid int) ([]string, error) {
+	return append([]string{}, p.argv...), p.argvErr
+}
+func (p *testProcessProbe) ExecutablePath(pid int) (string, error) { return p.exe, p.exeErr }
 
 func (q *flakyProjectListQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return q.db.ExecContext(ctx, query, args...)

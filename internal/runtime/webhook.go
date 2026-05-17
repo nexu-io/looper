@@ -537,63 +537,84 @@ func (w *webhookRuntime) originalProcessState(pid int, processStart int64) (aliv
 func (w *webhookRuntime) cleanupForwarderRecord(ctx context.Context, record storage.WebhookForwarderRecord, reason string) {
 	pid := int(record.PID)
 	verifyReason := ""
+	deleteRow := false
 	probe := w.processProbe()
 	if alive, err := probe.IsAlive(pid); err != nil {
 		verifyReason = "probe_error"
 	} else if !alive {
 		verifyReason = "pid_dead"
-	} else if start, err := probe.StartTime(pid); err != nil || start != record.ProcessStart {
+		deleteRow = true
+	} else if start, err := probe.StartTime(pid); err != nil {
+		verifyReason = "probe_error"
+	} else if start != record.ProcessStart {
 		verifyReason = "process_start_mismatch"
-	} else if exe, err := probe.ExecutablePath(pid); err != nil || exe != record.GHPath {
+		deleteRow = true
+	} else if exe, err := probe.ExecutablePath(pid); err != nil {
+		verifyReason = "probe_error"
+	} else if exe != record.GHPath {
 		verifyReason = "gh_path_mismatch"
-	} else if argv, err := probe.Argv(pid); err != nil || !argvMatchesWebhookForward(argv, record.Repo, strings.Split(record.Events, ","), record.Endpoint) {
+		deleteRow = true
+	} else if argv, err := probe.Argv(pid); err != nil {
+		verifyReason = "probe_error"
+	} else if !argvMatchesWebhookForward(argv, record.Repo, strings.Split(record.Events, ","), record.Endpoint) {
 		verifyReason = "argv_mismatch"
+		deleteRow = true
 	}
 	if verifyReason == "gh_path_mismatch" {
 		if argv, err := probe.Argv(pid); err == nil && len(argv) > 0 && argv[0] == record.GHPath && argvMatchesWebhookForward(argv, record.Repo, strings.Split(record.Events, ","), record.Endpoint) {
 			verifyReason = ""
+			deleteRow = false
 		}
 	}
-	if verifyReason == "" {
-		if proc, err := osFindProcess(pid); err == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-			deadline := time.Now().Add(w.shutdownTimeout())
-			for time.Now().Before(deadline) {
-				alive, same, known := w.originalProcessState(pid, record.ProcessStart)
-				if !known {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-				if !alive || !same {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			if alive, same, known := w.originalProcessState(pid, record.ProcessStart); known && alive && same {
-				_ = proc.Kill()
-			}
-			deleteRow := false
-			for deadline := time.Now().Add(w.shutdownTimeout()); time.Now().Before(deadline); {
-				alive, same, known := w.originalProcessState(pid, record.ProcessStart)
-				if !known {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-				if !alive || !same {
-					deleteRow = true
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			if !deleteRow {
-				return
-			}
-			if w.logger != nil {
-				w.logger.Info("webhook.forwarder.orphan_cleaned", map[string]any{"repo": record.Repo, "pid": pid, "reason": reason})
-			}
+	if verifyReason != "" {
+		if w.logger != nil {
+			w.logger.Warn("webhook.forwarder.orphan_refused", map[string]any{"repo": record.Repo, "pid": pid, "reason": verifyReason})
 		}
-	} else if w.logger != nil {
-		w.logger.Warn("webhook.forwarder.orphan_refused", map[string]any{"repo": record.Repo, "pid": pid, "reason": verifyReason})
+		if !deleteRow {
+			return
+		}
+	} else {
+		proc, err := osFindProcess(pid)
+		if err != nil {
+			if w.logger != nil {
+				w.logger.Warn("webhook.forwarder.orphan_refused", map[string]any{"repo": record.Repo, "pid": pid, "reason": "find_process_error"})
+			}
+			return
+		}
+		_ = proc.Signal(syscall.SIGTERM)
+		deadline := time.Now().Add(w.shutdownTimeout())
+		for time.Now().Before(deadline) {
+			alive, same, known := w.originalProcessState(pid, record.ProcessStart)
+			if !known {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if !alive || !same {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if alive, same, known := w.originalProcessState(pid, record.ProcessStart); known && alive && same {
+			_ = proc.Kill()
+		}
+		for deadline := time.Now().Add(w.shutdownTimeout()); time.Now().Before(deadline); {
+			alive, same, known := w.originalProcessState(pid, record.ProcessStart)
+			if !known {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if !alive || !same {
+				deleteRow = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !deleteRow {
+			return
+		}
+		if w.logger != nil {
+			w.logger.Info("webhook.forwarder.orphan_cleaned", map[string]any{"repo": record.Repo, "pid": pid, "reason": reason})
+		}
 	}
 	if w.forwarderStore != nil {
 		_ = w.forwarderStore.Delete(ctx, record.Repo)
