@@ -2230,6 +2230,38 @@ func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	}
 }
 
+func TestConfigShowSourceSuppressesLegacyDefaultConfigMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source")
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if strings.Contains(stderr, "note: legacy default config file ") {
+		t.Fatalf("stderr = %q, want migration note suppressed", stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	if len(fields) == 0 {
+		t.Fatalf("fields = %#v, want non-empty source map", fields)
+	}
+}
+
 func TestConfigMigrateDryRunCanonicalizesLegacyJSONWithoutWritingDestination(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "legacy.json")
 	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"reviewEvents":{"clean":"COMMENT"}},"defaults":{"allowAutoApprove":true},"projects":[{"id":"repo","name":"Repo","path":"/tmp/repo","instructions":{"reviewer":"check carefully"}}]}`), 0o644); err != nil {

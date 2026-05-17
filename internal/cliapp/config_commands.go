@@ -748,7 +748,7 @@ func (r *commandRuntime) loadConfigForEdit() (config.LoadedFileConfig, error) {
 	if err != nil {
 		return config.LoadedFileConfig{}, err
 	}
-	r.emitConfigLoadNotices(loaded)
+	r.emitConfigLoadNotices(r.filterConfigLoadNoticesForCommand(loaded))
 	return loaded, nil
 }
 
