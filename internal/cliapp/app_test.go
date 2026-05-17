@@ -443,6 +443,32 @@ func TestConfigMigrateUsesActiveConfigPathFromEnvWhenFromOmitted(t *testing.T) {
 	}
 }
 
+func TestConfigMigrateRejectsSameFileAcrossAbsoluteAndRelativePaths(t *testing.T) {
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	fromDir := filepath.Dir(fromPath)
+	fromBase := filepath.Base(fromPath)
+	beforeSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source) error = %v", err)
+	}
+	t.Chdir(fromDir)
+
+	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--force", "--from", fromPath, "--to", fromBase)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate --force]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "source and destination must differ") {
+		t.Fatalf("stderr = %q, want same-file error", stderr)
+	}
+	afterSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source after) error = %v", err)
+	}
+	if !bytes.Equal(beforeSource, afterSource) {
+		t.Fatal("source config changed during rejected migration")
+	}
+}
+
 func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	t.Parallel()
 

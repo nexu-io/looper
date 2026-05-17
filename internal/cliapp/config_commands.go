@@ -310,7 +310,22 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 	if err != nil {
 		return err
 	}
-	if filepath.Clean(fromPath) == filepath.Clean(toPath) {
+	fromCanonical, err := canonicalizeConfigMigrationPath(fromPath)
+	if err != nil {
+		return err
+	}
+	toCanonical, err := canonicalizeConfigMigrationPath(toPath)
+	if err != nil {
+		return err
+	}
+	if fromCanonical == toCanonical {
+		return fmt.Errorf("source and destination must differ")
+	}
+	sameFile, err := pathsReferToSameFile(fromCanonical, toCanonical)
+	if err != nil {
+		return err
+	}
+	if sameFile {
 		return fmt.Errorf("source and destination must differ")
 	}
 
@@ -616,6 +631,40 @@ func resolveConfigMigrationPaths(argv []string, cmd *cobra.Command) (string, str
 		to = strings.TrimSuffix(from, filepath.Ext(from)) + ".toml"
 	}
 	return from, to, nil
+}
+
+func canonicalizeConfigMigrationPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve config migration path %q: %w", path, err)
+	}
+	canonical := filepath.Clean(abs)
+	resolved, err := filepath.EvalSymlinks(canonical)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return canonical, nil
+		}
+		return "", fmt.Errorf("resolve config migration path %q: %w", path, err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func pathsReferToSameFile(pathA string, pathB string) (bool, error) {
+	infoA, err := os.Stat(pathA)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat config migration path %q: %w", pathA, err)
+	}
+	infoB, err := os.Stat(pathB)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat config migration path %q: %w", pathB, err)
+	}
+	return os.SameFile(infoA, infoB), nil
 }
 
 func detectConfigMigrationChanges(original config.PartialConfig, canonical config.PartialConfig) []string {
