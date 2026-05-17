@@ -722,6 +722,59 @@ func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *t
 	}
 }
 
+func TestWebhookRuntimeAdoptedForwarderExitDoesNotRespawnWhenLaunchBlocked(t *testing.T) {
+	startedCh := make(chan struct{}, 1)
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		startedCh <- struct{}{}
+		return exec.Command("/usr/bin/false")
+	}
+	webhookForwarderStartedHook = func() { startedCh <- struct{}{} }
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	fingerprint, events := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	rt := &webhookRuntime{
+		ghPath: ghPath,
+		status: WebhookStatus{
+			Enabled:         true,
+			EndpointURL:     endpoint,
+			Degraded:        true,
+			DegradedReasons: []string{"server.host is not loopback; webhook forwarders require a loopback daemon endpoint"},
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           &testProcessProbe{alive: false},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.adoptForwarder(storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint, Endpoint: endpoint, Events: events, GHPath: ghPath}, []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint})
+
+	waitForWebhookCondition(t, 3*time.Second, func() bool {
+		status := rt.Status()
+		return len(status.Forwarders) == 0
+	})
+
+	select {
+	case <-startedCh:
+		t.Fatal("forwarder respawn started, want launch to remain blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+	status := rt.Status()
+	if len(status.Forwarders) != 0 {
+		t.Fatalf("Status().Forwarders = %#v, want no replacement launch while launch is blocked", status.Forwarders)
+	}
+	if !status.Degraded || len(status.DegradedReasons) != 2 || !strings.Contains(status.DegradedReasons[1], "forwarder for nexu-io/looper exited:") {
+		t.Fatalf("Status() = %#v, want preserved launch blocker plus exit degradation", status)
+	}
+}
+
 func TestWebhookRuntimeStartDoesNotLaunchReplacementWhenBootstrapProbeIsInconclusive(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

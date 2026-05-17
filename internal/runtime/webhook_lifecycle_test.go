@@ -55,11 +55,12 @@ func TestWebhookForwarderLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
 func TestPSProcessStartForcesCLocale(t *testing.T) {
 	dir := t.TempDir()
 	psPath := filepath.Join(dir, "ps")
-	if err := os.WriteFile(psPath, []byte("#!/bin/sh\nif [ \"${LC_ALL}\" = \"C\" ]; then\n  printf 'Mon May 18 12:34:56 2026\\n'\nelse\n  printf 'Lun Mai 18 12:34:56 2026\\n'\nfi\n"), 0o755); err != nil {
+	if err := os.WriteFile(psPath, []byte("#!/bin/sh\nif [ \"${LC_ALL}\" = \"C\" ] && [ \"${TZ}\" = \"UTC\" ]; then\n  printf 'Mon May 18 12:34:56 2026\\n'\nelse\n  printf 'Lun Mai 18 12:34:56 2026\\n'\nfi\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(ps) error = %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("LC_ALL", "fr_FR.UTF-8")
+	t.Setenv("TZ", "America/Los_Angeles")
 
 	got, err := psProcessStart(4242)
 	if err != nil {

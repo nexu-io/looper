@@ -221,7 +221,7 @@ func (defaultProcessProbe) ExecutablePath(pid int) (string, error) {
 
 func psProcessStart(pid int) (int64, error) {
 	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, err
@@ -230,7 +230,7 @@ func psProcessStart(pid int) (int64, error) {
 	if value == "" {
 		return 0, fmt.Errorf("empty process start")
 	}
-	parsed, err := time.Parse("Mon Jan _2 15:04:05 2006", value)
+	parsed, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", value, time.UTC)
 	if err != nil {
 		return 0, err
 	}

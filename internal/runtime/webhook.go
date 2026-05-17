@@ -508,9 +508,13 @@ func (w *webhookRuntime) adoptForwarder(record storage.WebhookForwarderRecord, c
 				state.LastError = message
 			})
 			w.deleteForwarderRecord(record.Repo)
-			if !w.isStopped() && w.replaceForwarderForRespawn(record.Repo) {
+			if !w.isStopped() {
 				w.addDegradedReason(fmt.Sprintf("forwarder for %s exited: %s", record.Repo, message))
-				w.launchForwarder(record.Repo)
+				if w.canLaunchForwarders() && w.replaceForwarderForRespawn(record.Repo) {
+					w.launchForwarder(record.Repo)
+				} else {
+					w.removeForwarder(record.Repo)
+				}
 			}
 		}
 	}()
@@ -676,6 +680,20 @@ func (w *webhookRuntime) replaceForwarderForRespawn(repo string) bool {
 	fingerprint, _ := commandFingerprint(w.ghPath, repo, webhookForwardEvents, w.status.EndpointURL)
 	w.status.Forwarders = append(kept, WebhookForwarderState{Repo: repo, Command: []string{w.ghPath, "webhook", "forward", "--repo", repo, "--events", strings.Join(webhookForwardEvents, ","), "--url", w.status.EndpointURL}, Fingerprint: fingerprint})
 	return true
+}
+
+func (w *webhookRuntime) removeForwarder(repo string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	kept := w.status.Forwarders[:0]
+	for _, state := range w.status.Forwarders {
+		if state.Repo == repo {
+			continue
+		}
+		kept = append(kept, state)
+	}
+	w.status.Forwarders = kept
+	delete(w.forwarderStopCh, repo)
 }
 
 func (w *webhookRuntime) processProbe() processProbe {
