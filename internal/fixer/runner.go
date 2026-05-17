@@ -577,6 +577,13 @@ type rediscoveryDecision struct {
 	NextEligibleAt string
 }
 
+type pendingFixerRediscoveryState struct {
+	HeadSHA             string   `json:"headSha,omitempty"`
+	FixItemsStateHash   string   `json:"fixItemsStateHash,omitempty"`
+	UnresolvedThreadIDs []string `json:"unresolvedThreadIds,omitempty"`
+	RecordedAt          string   `json:"recordedAt,omitempty"`
+}
+
 type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
 	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
@@ -1090,7 +1097,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 
-		if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
+		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy) {
 			result.Skipped++
 			continue
 		}
@@ -1138,7 +1145,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
-	if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
+	if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy) {
 		result.Skipped++
 		return result, nil
 	}
@@ -1214,9 +1221,19 @@ func defaultDiscoveryLimit(limit int) int {
 	return limit
 }
 
-func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy) bool {
-	if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, repo, pr.Number) {
+func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy) bool {
+	if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" {
 		return false
+	}
+	if r.hasActivePRLock(ctx, repo, pr.Number) {
+		loop, err := r.findFixerLoopByPR(ctx, projectID, repo, pr.Number)
+		if err != nil || loop == nil {
+			return false
+		}
+		activeRun, err := r.latestActiveRunningRun(ctx, loop.ID)
+		if err != nil || activeRun == nil {
+			return false
+		}
 	}
 	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
 		return false
@@ -1249,7 +1266,7 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	fixItemsStateHash := allFixItemsStateHash
 	unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
 	if len(unresolvedThreadIDs) == 0 {
-		if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, repo, detail.Number); err != nil {
+		if err := r.clearFixerRetryMetadataForPR(ctx, project.ID, repo, detail.Number); err != nil {
 			return err
 		}
 	}
@@ -1263,6 +1280,9 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	if loopResult.created {
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	if loopResult.pending {
+		return nil
 	}
 	headSHA := detail.HeadSHA
 	if headSHA == "" {
@@ -1321,6 +1341,17 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
 		return nil, err
+	}
+	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (failedQueue == nil || failedQueue.Status != "queued") {
+		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+		if err != nil {
+			return nil, err
+		}
+		if loop != nil {
+			if _, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
@@ -1466,6 +1497,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		if failedQueue == nil || failedQueue.Status != "queued" {
+			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+				return ProcessResult{}, err
+			} else if scheduled {
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			}
+		}
+		if failedQueue == nil || failedQueue.Status != "queued" {
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -1493,6 +1532,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
 		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 			return ProcessResult{}, err
+		}
+		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+			return ProcessResult{}, err
+		} else if scheduled {
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 			updated.Status = "completed"
@@ -1563,6 +1608,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, err
 			}
 			if failedQueue == nil || failedQueue.Status != "queued" {
+				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+					return ProcessResult{}, err
+				} else if scheduled {
+					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+				}
+			}
+			if failedQueue == nil || failedQueue.Status != "queued" {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -1597,6 +1650,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	} else {
+		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+			return ProcessResult{}, err
+		} else if scheduled {
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			status := statusForSkip(checkpoint.SkipReason)
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+		}
 		paused, err := r.recordZeroProgressSuccess(ctx, *loop, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
@@ -1605,6 +1665,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
+	}
+	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+		return ProcessResult{}, err
+	} else if scheduled {
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		status := statusForSkip(checkpoint.SkipReason)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
 	if scheduled, err := r.scheduleFollowupRetryAfterSuccess(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber, checkpoint.SkipReason == ""); err != nil {
 		return ProcessResult{}, err
@@ -1627,6 +1694,49 @@ func statusForSkip(skipReason string) string {
 		return "skipped"
 	}
 	return "success"
+}
+
+func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64) (bool, error) {
+	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(current.MetadataJSON))
+	if !ok {
+		return false, nil
+	}
+	availableAt := r.now()
+	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
+	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
+	if err != nil {
+		return false, err
+	}
+	if queueItem.Status != "queued" {
+		return false, nil
+	}
+	current, err = r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	updatedLoop, err := r.clearPendingFixerRediscoveryIfMatch(ctx, *current, pending)
+	if err != nil {
+		return false, err
+	}
+	updatedLoop, err = r.updateLoop(ctx, updatedLoop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = &availableAtISO
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64, allow bool) (bool, error) {
@@ -3442,6 +3552,7 @@ type loopUpsertResult struct {
 	created     bool
 	skipped     bool
 	availableAt time.Time
+	pending     bool
 }
 
 func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash, fixItemsStateHash string, fixItems []FixItem, unresolvedThreadIDs []string) (loopUpsertResult, error) {
@@ -3486,9 +3597,22 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 			updated := existing
-			if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
+			activeRun, err := r.latestActiveRunningRun(ctx, updated.ID)
+			if err != nil {
+				return loopUpsertResult{}, err
+			}
+			if activeRun != nil {
 				updated.Status = "running"
 				updated.NextRunAt = nil
+				updated, err = r.recordPendingFixerRediscovery(ctx, updated, headSHA, fixItemsStateHash, unresolvedThreadIDs)
+				if err != nil {
+					return loopUpsertResult{}, err
+				}
+				updated.UpdatedAt = nowISO
+				if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+					return loopUpsertResult{}, err
+				}
+				return loopUpsertResult{record: updated, created: false, pending: true}, nil
 			} else {
 				updated.Status = "queued"
 				updated.NextRunAt = &availableAtISO
@@ -3789,16 +3913,24 @@ func (r *Runner) legacyRecoveryTargetBusy(ctx context.Context, loopsList []stora
 }
 
 func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
-	runs, err := r.repos.Runs.ListByLoop(ctx, loopID)
+	activeRun, err := r.latestActiveRunningRun(ctx, loopID)
 	if err != nil {
 		return false, err
 	}
+	return activeRun != nil, nil
+}
+
+func (r *Runner) latestActiveRunningRun(ctx context.Context, loopID string) (*storage.RunRecord, error) {
+	runs, err := r.repos.Runs.ListByLoop(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
 	for _, run := range runs {
 		if run.Status == "running" {
-			return true, nil
+			return &run, nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 type enqueueInput struct {
@@ -3960,10 +4092,22 @@ func (r *Runner) clearFixerFollowupStateForPR(ctx context.Context, projectID, re
 	if err != nil {
 		return err
 	}
+	if cleared, err = r.clearPendingFixerRediscovery(ctx, cleared); err != nil {
+		return err
+	}
 	return r.cancelQueuedFixerItemsForLoop(ctx, cleared.ID)
 }
 
 func (r *Runner) clearFixerFollowupMetadataForPR(ctx context.Context, projectID, repo string, prNumber int64) error {
+	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
+	if err != nil || loop == nil {
+		return err
+	}
+	_, err = r.clearFixerFollowupMetadata(ctx, *loop)
+	return err
+}
+
+func (r *Runner) clearFixerRetryMetadataForPR(ctx context.Context, projectID, repo string, prNumber int64) error {
 	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
 	if err != nil || loop == nil {
 		return err
@@ -4101,6 +4245,65 @@ func (r *Runner) recordFixerFollowupState(ctx context.Context, loop storage.Loop
 		state.NextEligibleAt = eventlog.FormatJavaScriptISOString(now.Add(fixerFollowupBackoffSchedule[attempts-1]).UTC())
 	}
 	return r.persistFixerFollowupState(ctx, loop, state)
+}
+
+func (r *Runner) recordPendingFixerRediscovery(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (storage.LoopRecord, error) {
+	state := pendingFixerRediscoveryState{
+		HeadSHA:             strings.TrimSpace(headSHA),
+		FixItemsStateHash:   strings.TrimSpace(fixItemsStateHash),
+		UnresolvedThreadIDs: canonicalizeStringSlice(unresolvedThreadIDs),
+		RecordedAt:          r.nowISO(),
+	}
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		if current, err := r.repos.Loops.GetByID(ctx, loop.ID); err != nil {
+			return storage.LoopRecord{}, err
+		} else if current != nil {
+			loop = *current
+		}
+	}
+	if pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(loop.MetadataJSON)); ok && pending.HeadSHA == state.HeadSHA && pending.FixItemsStateHash == state.FixItemsStateHash && sameStringSlices(pending.UnresolvedThreadIDs, state.UnresolvedThreadIDs) {
+		return loop, nil
+	}
+	return r.mergeLoopMetadata(ctx, loop, map[string]any{"pendingFixerRediscovery": state})
+}
+
+func (r *Runner) clearPendingFixerRediscovery(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	return r.clearPendingFixerRediscoveryIfMatch(ctx, loop, pendingFixerRediscoveryState{})
+}
+
+func (r *Runner) clearPendingFixerRediscoveryIfMatch(ctx context.Context, loop storage.LoopRecord, expected pendingFixerRediscoveryState) (storage.LoopRecord, error) {
+	apply := func(updated *storage.LoopRecord) error {
+		meta := parseJSONObject(updated.MetadataJSON)
+		if expected.HeadSHA != "" || expected.FixItemsStateHash != "" || len(expected.UnresolvedThreadIDs) > 0 {
+			current, ok := parsePendingFixerRediscoveryState(meta)
+			if !ok || current.HeadSHA != expected.HeadSHA || current.FixItemsStateHash != expected.FixItemsStateHash || !sameStringSlices(current.UnresolvedThreadIDs, expected.UnresolvedThreadIDs) {
+				return nil
+			}
+		}
+		delete(meta, "pendingFixerRediscovery")
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		metadataJSON := string(encoded)
+		updated.MetadataJSON = &metadataJSON
+		return nil
+	}
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		updated := loop
+		if err := apply(&updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return updated, nil
+	}
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
+	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
 }
 
 func (r *Runner) mergeLoopMetadata(ctx context.Context, loop storage.LoopRecord, updates map[string]any) (storage.LoopRecord, error) {
@@ -5996,6 +6199,23 @@ func parseFixerFollowupState(metadata map[string]any) (fixerFollowupState, bool)
 	var state fixerFollowupState
 	if err := json.Unmarshal(encoded, &state); err != nil {
 		return fixerFollowupState{}, false
+	}
+	state.UnresolvedThreadIDs = canonicalizeStringSlice(state.UnresolvedThreadIDs)
+	return state, state.HeadSHA != "" && state.FixItemsStateHash != ""
+}
+
+func parsePendingFixerRediscoveryState(metadata map[string]any) (pendingFixerRediscoveryState, bool) {
+	raw, ok := metadata["pendingFixerRediscovery"]
+	if !ok {
+		return pendingFixerRediscoveryState{}, false
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return pendingFixerRediscoveryState{}, false
+	}
+	var state pendingFixerRediscoveryState
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return pendingFixerRediscoveryState{}, false
 	}
 	state.UnresolvedThreadIDs = canonicalizeStringSlice(state.UnresolvedThreadIDs)
 	return state, state.HeadSHA != "" && state.FixItemsStateHash != ""
