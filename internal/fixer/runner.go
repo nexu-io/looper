@@ -579,6 +579,7 @@ type rediscoveryDecision struct {
 
 type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
+	Pause            *checkpointPause            `json:"pause,omitempty"`
 	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
 	RunStartedRunID  string                      `json:"runStartedRunId,omitempty"`
 	RunPreStartAt    string                      `json:"runPreStartAt,omitempty"`
@@ -598,6 +599,24 @@ type fixerCheckpoint struct {
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
 	SkipReason       string                      `json:"skipReason,omitempty"`
 }
+
+type checkpointPause struct {
+	Reason              string   `json:"reason,omitempty"`
+	Recoverable         bool     `json:"recoverable,omitempty"`
+	HeadSHA             string   `json:"headSha,omitempty"`
+	FixItemsStateHash   string   `json:"fixItemsStateHash,omitempty"`
+	UnresolvedThreadIDs []string `json:"unresolvedThreadIds,omitempty"`
+}
+
+type checkpointPauseReason string
+
+const (
+	checkpointPauseReasonNoopResolveNoNewCommits checkpointPauseReason = "noop_resolve_no_new_commits"
+	checkpointPauseReasonRiskyConflict           checkpointPauseReason = "risky_conflict"
+	checkpointPauseReasonDirtyWorktree           checkpointPauseReason = "dirty_worktree"
+	checkpointPauseReasonAutoPushDisabled        checkpointPauseReason = "auto_push_disabled"
+	checkpointPauseReasonAutoCommitDisabled      checkpointPauseReason = "auto_commit_disabled"
+)
 
 type checkpointDetail struct {
 	State          string           `json:"state,omitempty"`
@@ -1805,6 +1824,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	}
 	if !prepared.Clean {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
 	preparedAt := r.nowISO()
@@ -1833,6 +1853,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		for _, item := range checkpoint.FixItems {
 			if item.Type == "conflict" {
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
 				return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 			}
 		}
@@ -1998,6 +2019,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "auto_push_disabled"}})
 		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Auto push disabled"}
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonAutoPushDisabled, false, "", "", nil)
 		return checkpoint, &loopError{message: fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch), kind: FailureManualIntervention}
 	}
 	if checkpoint.ReconcileCommits == nil {
@@ -3154,6 +3176,7 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	hasVerifiedNoPushHead := verifiedNoPushHead != "" && strings.TrimSpace(detail.HeadSHA) == verifiedNoPushHead
 	if shouldBlockResolveWithoutFix(checkpoint, checkpoint.Recheck.RemainingFixItems, hasVerifiedNoPushHead) {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, strings.TrimSpace(detail.HeadSHA), currentRecheckFixItemsStateHash(checkpoint), unresolvedThreadIDs(suppressDeclinedFixItems(input.Loop.MetadataJSON, strings.TrimSpace(detail.HeadSHA), checkpoint.Recheck.RemainingFixItems)))
 		return checkpoint, &loopError{message: "resolve-comments left review threads unresolved because fixer produced no new commits to push", kind: FailureManualIntervention}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -3188,10 +3211,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		if strings.TrimSpace(derefString(latestRun.ErrorMessage)) == noopResolveManualIntervention {
-			failureSummary = noopResolveManualIntervention
-		}
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
+		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
+		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
@@ -3216,6 +3237,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		initialCheckpoint = resumedCheckpoint
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
+	initialCheckpoint.Pause = nil
 	initialCheckpoint.RunStartedAt = ""
 	initialCheckpoint.RunStartedRunID = ""
 	nowISO := r.nowISO()
@@ -3560,19 +3582,17 @@ func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.L
 	if err != nil {
 		return false, storage.LoopRecord{}, err
 	}
-	if latestRun == nil || latestRun.Status != "failed" || strings.TrimSpace(derefString(latestRun.ErrorMessage)) != noopResolveManualIntervention {
+	if latestRun == nil {
 		return false, loop, nil
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	previousHeadSHA := ""
-	if checkpoint.Detail != nil {
-		previousHeadSHA = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	pause, ok := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
+	if !ok || strings.TrimSpace(pause.Reason) != string(checkpointPauseReasonNoopResolveNoNewCommits) || !pause.Recoverable {
+		return false, loop, nil
 	}
-	previousStateHash := hashFixItemsState(checkpoint.FixItems)
-	if len(checkpoint.FixItems) == 0 {
-		previousStateHash = strings.TrimSpace(checkpoint.FixItemsHash)
-	}
-	previousThreadIDs := unresolvedThreadIDsFromCheckpoint(checkpoint, loop.MetadataJSON, previousHeadSHA)
+	previousHeadSHA := strings.TrimSpace(pause.HeadSHA)
+	previousStateHash := strings.TrimSpace(pause.FixItemsStateHash)
+	previousThreadIDs := canonicalizeStringSlice(pause.UnresolvedThreadIDs)
 	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) && sameStringSlices(previousThreadIDs, unresolvedThreadIDs) {
 		return false, loop, nil
 	}
@@ -3595,18 +3615,16 @@ func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage
 	if err != nil {
 		return false, storage.LoopRecord{}, err
 	}
-	if latestRun == nil || latestRun.Status != "failed" || !strings.Contains(strings.TrimSpace(derefString(latestRun.ErrorMessage)), riskyConflictManualHold) {
+	if latestRun == nil {
 		return false, loop, nil
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	previousHeadSHA := ""
-	if checkpoint.Detail != nil {
-		previousHeadSHA = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	pause, ok := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
+	if !ok || strings.TrimSpace(pause.Reason) != string(checkpointPauseReasonRiskyConflict) || !pause.Recoverable {
+		return false, loop, nil
 	}
-	previousStateHash := hashFixItemsState(checkpoint.FixItems)
-	if len(checkpoint.FixItems) == 0 {
-		previousStateHash = strings.TrimSpace(checkpoint.FixItemsHash)
-	}
+	previousHeadSHA := strings.TrimSpace(pause.HeadSHA)
+	previousStateHash := strings.TrimSpace(pause.FixItemsStateHash)
 	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) {
 		return false, loop, nil
 	}
@@ -4250,6 +4268,7 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	if initial.HasUncommittedChanges {
 		if !r.allowAutoCommit {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonAutoCommitDisabled, false, "", "", nil)
 			return checkpoint, &loopError{message: fmt.Sprintf("Auto commit disabled but fixer worktree has uncommitted changes: %s", firstNonEmpty(strings.Join(initial.ChangedFiles, ", "), "unknown files")), kind: FailureManualIntervention}
 		}
 		if _, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: commitMessage}); err != nil {
@@ -4914,7 +4933,7 @@ func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fix
 	}
 }
 
-func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSummary string) bool {
+func shouldRestartFromDiscover(status string, failedStep FixerStep, pause *checkpointPause, failureSummary string) bool {
 	if status != "failed" && status != "interrupted" {
 		return false
 	}
@@ -4924,10 +4943,10 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 	if failedStep == stepPush {
 		return strings.Contains(strings.ToLower(failureSummary), "remote head changed")
 	}
-	if failedStep == stepRepair && strings.Contains(failureSummary, riskyConflictManualHold) {
+	if failedStep == stepRepair && pauseReasonIs(pause, checkpointPauseReasonRiskyConflict) {
 		return true
 	}
-	if failedStep == stepRecheck && strings.TrimSpace(failureSummary) == noopResolveManualIntervention {
+	if failedStep == stepRecheck && pauseReasonIs(pause, checkpointPauseReasonNoopResolveNoNewCommits) {
 		return true
 	}
 	if failedStep != stepResolveComments {
@@ -5999,6 +6018,83 @@ func parseFixerFollowupState(metadata map[string]any) (fixerFollowupState, bool)
 	}
 	state.UnresolvedThreadIDs = canonicalizeStringSlice(state.UnresolvedThreadIDs)
 	return state, state.HeadSHA != "" && state.FixItemsStateHash != ""
+}
+
+func classifyFixerPause(run *storage.RunRecord, checkpoint fixerCheckpoint, loopMetadataJSON *string) (*checkpointPause, bool) {
+	if run == nil {
+		return nil, false
+	}
+	if pause, ok := normalizedCheckpointPause(checkpoint.Pause); ok {
+		return pause, true
+	}
+	if run.Status != "failed" {
+		return nil, false
+	}
+	failedStep := asFixerStep(derefString(run.CurrentStep))
+	summary := firstNonEmpty(derefString(run.Summary), derefString(run.ErrorMessage))
+	switch failedStep {
+	case stepRepair:
+		if strings.Contains(summary, riskyConflictManualHold) || strings.Contains(derefString(run.ErrorMessage), riskyConflictManualHold) {
+			return newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil), true
+		}
+	case stepRecheck:
+		if strings.TrimSpace(derefString(run.ErrorMessage)) == noopResolveManualIntervention {
+			return newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, detailHeadSHA(checkpoint.Detail), legacyNoopResolveStateHash(checkpoint), unresolvedThreadIDsFromCheckpoint(checkpoint, loopMetadataJSON, detailHeadSHA(checkpoint.Detail))), true
+		}
+	}
+	return nil, false
+}
+
+func newCheckpointPause(reason checkpointPauseReason, recoverable bool, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) *checkpointPause {
+	return &checkpointPause{
+		Reason:              string(reason),
+		Recoverable:         recoverable,
+		HeadSHA:             strings.TrimSpace(headSHA),
+		FixItemsStateHash:   strings.TrimSpace(fixItemsStateHash),
+		UnresolvedThreadIDs: canonicalizeStringSlice(unresolvedThreadIDs),
+	}
+}
+
+func normalizedCheckpointPause(pause *checkpointPause) (*checkpointPause, bool) {
+	if pause == nil || strings.TrimSpace(pause.Reason) == "" {
+		return nil, false
+	}
+	normalized := *pause
+	normalized.Reason = strings.TrimSpace(normalized.Reason)
+	normalized.HeadSHA = strings.TrimSpace(normalized.HeadSHA)
+	normalized.FixItemsStateHash = strings.TrimSpace(normalized.FixItemsStateHash)
+	normalized.UnresolvedThreadIDs = canonicalizeStringSlice(normalized.UnresolvedThreadIDs)
+	return &normalized, true
+}
+
+func pauseReasonIs(pause *checkpointPause, reason checkpointPauseReason) bool {
+	return pause != nil && strings.TrimSpace(pause.Reason) == string(reason)
+}
+
+func currentFixItemsStateHash(checkpoint fixerCheckpoint) string {
+	if len(checkpoint.FixItems) > 0 {
+		return hashFixItemsState(checkpoint.FixItems)
+	}
+	if fixItemsHash := strings.TrimSpace(checkpoint.FixItemsHash); fixItemsHash != "" {
+		return fixItemsHash
+	}
+	return hashFixItemsState(checkpoint.FixItems)
+}
+
+func currentRecheckFixItemsStateHash(checkpoint fixerCheckpoint) string {
+	if checkpoint.Recheck != nil {
+		if hash := hashFixItemsState(checkpoint.Recheck.RemainingFixItems); hash != "" {
+			return hash
+		}
+	}
+	return currentFixItemsStateHash(checkpoint)
+}
+
+func legacyNoopResolveStateHash(checkpoint fixerCheckpoint) string {
+	if hash := currentFixItemsStateHash(checkpoint); hash != "" {
+		return hash
+	}
+	return currentRecheckFixItemsStateHash(checkpoint)
 }
 
 func unresolvedThreadIDs(fixItems []FixItem) []string {
