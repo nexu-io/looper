@@ -960,6 +960,61 @@ func TestNormalizeLayersProduceEquivalentEffectiveConfigAcrossCanonicalLegacyAnd
 	}
 }
 
+func TestCanonicalizePartialForMigrationDoesNotMutateCaller(t *testing.T) {
+	t.Parallel()
+
+	original := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove: boolPtr(true),
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:           "demo",
+			Name:         "Demo",
+			Path:         "/repos/demo",
+			Instructions: map[string]string{"worker": "legacy worker instructions"},
+		}},
+	}
+	wantOriginal := PartialConfig{
+		Defaults: &PartialDefaultsConfig{
+			AllowAutoApprove: boolPtr(true),
+		},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:           "demo",
+			Name:         "Demo",
+			Path:         "/repos/demo",
+			Instructions: map[string]string{"worker": "legacy worker instructions"},
+		}},
+	}
+
+	canonical := CanonicalizePartialForMigration(original)
+
+	if !reflect.DeepEqual(original, wantOriginal) {
+		t.Fatalf("CanonicalizePartialForMigration() mutated caller = %#v, want %#v", original, wantOriginal)
+	}
+	if original.Projects == canonical.Projects {
+		t.Fatal("CanonicalizePartialForMigration() reused original projects slice")
+	}
+	if canonical.Defaults == nil || canonical.Defaults.AllowAutoApprove != nil {
+		t.Fatalf("canonical defaults = %#v, want allowAutoApprove removed", canonical.Defaults)
+	}
+	if canonical.Projects == nil || len(*canonical.Projects) != 1 {
+		t.Fatalf("canonical projects = %#v, want one project", canonical.Projects)
+	}
+	project := (*canonical.Projects)[0]
+	if project.Path != "" || project.RepoPath != "/repos/demo" {
+		t.Fatalf("canonical project paths = %#v, want path migrated to repoPath", project)
+	}
+	if len(project.Instructions) != 0 {
+		t.Fatalf("canonical project instructions = %#v, want cleared legacy instructions", project.Instructions)
+	}
+	if project.Roles == nil || project.Roles.Worker == nil || project.Roles.Worker.Instructions == nil || *project.Roles.Worker.Instructions != "legacy worker instructions" {
+		t.Fatalf("canonical project roles = %#v, want migrated worker instructions", project.Roles)
+	}
+	if original.Defaults == canonical.Defaults {
+		t.Fatal("CanonicalizePartialForMigration() reused original defaults struct")
+	}
+}
+
 func TestNormalizeLayersKeepDeepMergeForObjectsAndArrayReplacementForArrays(t *testing.T) {
 	config, err := Normalize(t.TempDir(),
 		PartialConfig{
