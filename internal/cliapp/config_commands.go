@@ -328,6 +328,9 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 	if sameFile {
 		return fmt.Errorf("source and destination must differ")
 	}
+	if !strings.EqualFold(filepath.Ext(toPath), ".toml") {
+		return fmt.Errorf("destination config must use .toml extension: %s", toPath)
+	}
 
 	partial, present, err := config.ReadPartialConfigFile(fromPath)
 	if err != nil {

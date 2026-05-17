@@ -226,6 +226,21 @@ func TestConfigMigrateRejectsSameFileThroughSymlinkAlias(t *testing.T) {
 	}
 }
 
+func TestConfigMigrateRejectsNonTOMLDestination(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	toPath := filepath.Join(filepath.Dir(fromPath), "config.yaml")
+
+	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--from", fromPath, "--to", toPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "destination config must use .toml extension") {
+		t.Fatalf("stderr = %q, want non-TOML destination error", stderr)
+	}
+}
+
 func configLookPathForTests() config.LookPathFunc {
 	return func(name string) (string, error) {
 		return filepath.Join(string(os.PathSeparator), "detected", name), nil
