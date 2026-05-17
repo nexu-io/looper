@@ -386,13 +386,14 @@ type UpdatePullRequestBodyInput struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo    string
-	CWD     string
-	Limit   int
-	Label   string
-	Labels  []string
-	Author  string
-	Timeout time.Duration
+	Repo        string
+	CWD         string
+	Limit       int
+	Label       string
+	Labels      []string
+	Author      string
+	BaseRefName string
+	Timeout     time.Duration
 }
 
 type ListOpenIssuesInput struct {
@@ -562,6 +563,9 @@ func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPul
 	}
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
+	}
+	if strings.TrimSpace(input.BaseRefName) != "" {
+		args = append(args, "--base", strings.TrimSpace(input.BaseRefName))
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 

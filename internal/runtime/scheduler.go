@@ -48,6 +48,7 @@ type reviewerScheduler interface {
 type fixerScheduler interface {
 	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
 	DiscoverPullRequest(context.Context, fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error)
+	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
 }
@@ -449,13 +450,13 @@ type fixerGitHubAdapter struct {
 }
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
-	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author, Label: input.Label, Labels: input.Labels})
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author, Label: input.Label, Labels: input.Labels, BaseRefName: input.BaseRefName})
 	if err != nil {
 		return nil, err
 	}
 	result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, HeadSHA: pr.HeadSHA, Author: pr.Author})
+		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, BaseRefName: pr.BaseRefName, HeadSHA: pr.HeadSHA, Author: pr.Author})
 	}
 	return result, nil
 }

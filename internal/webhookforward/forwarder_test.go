@@ -101,7 +101,6 @@ func TestForwardRoutesPullRequestLabelChangesToFixerOnly(t *testing.T) {
 	fixerRunner.assertPRCount(t, 42, 1)
 	fixerRunner.assertPRCount(t, 43, 1)
 }
-
 func TestForwardTriggersFixerForFailedCheckWebhookEvents(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
@@ -324,6 +323,49 @@ func TestForwardKeepsFixedSizeRecentOutcomes(t *testing.T) {
 	}
 }
 
+func TestForwardRoutesPushToBaseBranchFixerDiscovery(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: newFakeTargetedRunner(nil), Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "push-1", EventType: "push", Payload: []byte(`{"ref":"refs/heads/main","repository":{"full_name":"acme/looper"}}`)})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("result = %#v, want accepted one work item", result)
+	}
+	fixerRunner.waitForCalls(t, 1)
+	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "main", 1)
+}
+
+func TestForwardPreservesBranchCaseInBaseBranchWorkKeys(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	fixerRunner := newFakeTargetedRunner(make(chan struct{}))
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: newFakeTargetedRunner(nil), Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "push-case-1", EventType: "push", Payload: []byte(`{"ref":"refs/heads/Release","repository":{"full_name":"acme/looper"}}`)}); err != nil {
+		t.Fatalf("Forward(Release) error = %v", err)
+	}
+	fixerRunner.waitForCall(t, 1)
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "push-case-2", EventType: "push", Payload: []byte(`{"ref":"refs/heads/release","repository":{"full_name":"acme/looper"}}`)}); err != nil {
+		t.Fatalf("Forward(release) error = %v", err)
+	}
+
+	close(fixerRunner.block)
+	fixerRunner.waitForCalls(t, 2)
+	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "Release", 1)
+	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "release", 1)
+	stats := forwarder.Stats()
+	if stats.QueueCoalesced != 0 {
+		t.Fatalf("QueueCoalesced = %d, want 0", stats.QueueCoalesced)
+	}
+}
+
 type fakeTargetedRunner struct {
 	mu                   sync.Mutex
 	block                chan struct{}
@@ -337,9 +379,10 @@ type fakeTargetedRunner struct {
 }
 
 type targetedCall struct {
-	ProjectID string
-	Repo      string
-	PRNumber  int64
+	ProjectID  string
+	Repo       string
+	PRNumber   int64
+	BaseBranch string
 }
 
 type temporaryError struct{ message string }
@@ -384,6 +427,17 @@ func (f *fakeTargetedRunner) run(projectID, repo string, prNumber int64) (review
 		return reviewer.DiscoveryResult{}, temporaryError{message: "temporary github failure"}
 	}
 	return reviewer.DiscoveryResult{}, nil
+}
+
+func (f *fakeTargetedRunner) runBaseBranch(projectID, repo, baseBranch string) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, targetedCall{ProjectID: projectID, Repo: repo, BaseBranch: baseBranch})
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	return nil
 }
 
 func (f *fakeTargetedRunner) failOnce(key string) {
@@ -454,6 +508,21 @@ func (f *fakeTargetedRunner) assertPRCount(t *testing.T, prNumber int64, want in
 	}
 	if count != want {
 		t.Fatalf("PR %d call count = %d, want %d", prNumber, count, want)
+	}
+}
+
+func (f *fakeTargetedRunner) assertBaseBranchCount(t *testing.T, projectID, repo, baseBranch string, want int) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, call := range f.calls {
+		if call.ProjectID == projectID && call.Repo == repo && call.BaseBranch == baseBranch {
+			count++
+		}
+	}
+	if count != want {
+		t.Fatalf("base branch %s/%s@%s call count = %d, want %d", projectID, repo, baseBranch, count, want)
 	}
 }
 
@@ -558,4 +627,8 @@ type targetedFixerAdapter struct{ runner *fakeTargetedRunner }
 func (a targetedFixerAdapter) DiscoverPullRequest(_ context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
 	_, err := a.runner.run(input.ProjectID, input.Repo, input.PRNumber)
 	return fixer.DiscoveryResult{}, err
+}
+
+func (a targetedFixerAdapter) DiscoverPullRequestsForBaseBranchUpdate(_ context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, a.runner.runBaseBranch(input.ProjectID, input.Repo, input.BaseRefName)
 }

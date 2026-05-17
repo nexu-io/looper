@@ -748,8 +748,76 @@ func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
 	if err != nil {
 		return config.LoadedFileConfig{}, err
 	}
-	r.emitConfigLoadNotices(loaded)
+	r.emitConfigLoadNotices(r.filterConfigLoadNoticesForCommand(loaded))
 	return loaded, nil
+}
+
+func (r *commandRuntime) filterConfigLoadNoticesForCommand(loaded config.LoadedFileConfig) config.LoadedFileConfig {
+	if shouldEmitConfigFileNotices(r.argv) {
+		return loaded
+	}
+	filtered := loaded
+	filtered.Warnings = filterNonConfigPathWarnings(loaded.Warnings)
+	filtered.Notices = nil
+	return filtered
+}
+
+func filterNonConfigPathWarnings(warnings []string) []string {
+	if len(warnings) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		if strings.HasPrefix(warning, "deprecated config path ") {
+			continue
+		}
+		filtered = append(filtered, warning)
+	}
+	return filtered
+}
+
+func shouldEmitConfigFileNotices(argv []string) bool {
+	command, subcommand := configCommandPath(argv)
+	return command == "config" && (subcommand == "validate" || subcommand == "lint")
+}
+
+func configCommandPath(argv []string) (string, string) {
+	skipNext := false
+	parts := make([]string, 0, 2)
+	for index, arg := range argv {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "--") {
+			name := strings.TrimPrefix(arg, "--")
+			if index := strings.IndexByte(name, '='); index >= 0 {
+				name = name[:index]
+			}
+			_, isConfigFlag := configFlagNames[name]
+			_, isConfigBoolFlag := configBoolFlagNames[name]
+			if isConfigFlag && !strings.Contains(arg, "=") {
+				if !isConfigBoolFlag || (index+1 < len(argv) && isConfigBoolLiteral(argv[index+1])) {
+					skipNext = true
+				}
+			}
+			continue
+		}
+		parts = append(parts, arg)
+		if len(parts) == 2 {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
 }
 
 func (r *commandRuntime) emitConfigLoadNotices(loaded config.LoadedFileConfig) {

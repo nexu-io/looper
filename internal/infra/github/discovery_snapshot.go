@@ -219,9 +219,13 @@ func (s *DiscoverySnapshot) getCurrentUserLogin(ctx context.Context, cwd string)
 func filterPullRequests(prs []PullRequestSummary, input ListOpenPullRequestsInput) []PullRequestSummary {
 	labels := prListLabels(input)
 	author := strings.TrimSpace(input.Author)
+	baseRefName := strings.TrimSpace(input.BaseRefName)
 	filtered := prs[:0]
 	for _, pr := range prs {
 		if author != "" && !strings.EqualFold(strings.TrimSpace(pr.Author), author) {
+			continue
+		}
+		if baseRefName != "" && strings.TrimSpace(pr.BaseRefName) != baseRefName {
 			continue
 		}
 		if len(labels) > 0 && !hasAllLabels(pr.Labels, labels) {
@@ -295,7 +299,7 @@ func snapshotPullRequestDetailKey(input ViewPullRequestInput) string {
 }
 
 func hasPullRequestFilters(input ListOpenPullRequestsInput) bool {
-	return strings.TrimSpace(input.Author) != "" || len(prListLabels(input)) > 0
+	return strings.TrimSpace(input.Author) != "" || strings.TrimSpace(input.BaseRefName) != "" || len(prListLabels(input)) > 0
 }
 
 func hasIssueFilters(input ListOpenIssuesInput) bool {

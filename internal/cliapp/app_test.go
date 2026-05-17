@@ -2230,6 +2230,48 @@ func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	}
 }
 
+func TestConfigCommandPathSkipsExplicitBoolLiteralForConfigFlag(t *testing.T) {
+	command, subcommand := configCommandPath([]string{"config", "--no-custom-instructions", "false", "validate"})
+	if got, want := command, "config"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+	if got, want := subcommand, "validate"; got != want {
+		t.Fatalf("subcommand = %q, want %q", got, want)
+	}
+}
+
+func TestConfigShowSourceSuppressesLegacyDefaultConfigMigrationNote(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	legacyDefaultPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(legacyDefaultPath, []byte(`{"server":{"port":7400}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source")
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if strings.Contains(stderr, "note: legacy default config file ") {
+		t.Fatalf("stderr = %q, want migration note suppressed", stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output: %v", err)
+	}
+	fields, ok := decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	if len(fields) == 0 {
+		t.Fatalf("fields = %#v, want non-empty source map", fields)
+	}
+}
+
 func TestConfigMigrateDryRunCanonicalizesLegacyJSONWithoutWritingDestination(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "legacy.json")
 	if err := os.WriteFile(configPath, []byte(`{"reviewer":{"reviewEvents":{"clean":"COMMENT"}},"defaults":{"allowAutoApprove":true},"projects":[{"id":"repo","name":"Repo","path":"/tmp/repo","instructions":{"reviewer":"check carefully"}}]}`), 0o644); err != nil {
@@ -2696,6 +2738,39 @@ func TestPSWithoutJSONPrintsEmptyMessage(t *testing.T) {
 	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
 	if exitCode != 0 {
 		t.Fatalf("Run([ps]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "No running or queued loops.\n"; got != want {
+		t.Fatalf("Run([ps]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestPSSuppressesConfigFileDeprecationNotices(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{}}))
+	}))
+	defer server.Close()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"server": map[string]any{
+			"baseUrl":  server.URL,
+			"authMode": "none",
+		},
+		"reviewer": map[string]any{"reviewEvents": map[string]any{"clean": "COMMENT"}},
+		"defaults": map[string]any{"allowAutoApprove": true},
+		"roles":    map[string]any{"reviewer": map[string]any{"autoDiscovery": true}},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
 	}
 	if stderr != "" {
 		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)

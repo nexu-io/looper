@@ -27,6 +27,8 @@ var webhookForwarderEvents = []string{
 	"issue_comment",
 	"pull_request_review",
 	"pull_request_review_comment",
+	"push",
+	"check_run",
 }
 
 type WebhookRuntimeStatus struct {

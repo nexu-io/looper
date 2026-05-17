@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -172,6 +173,16 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 	}
 	if got := strings.Join(alpha.Tail, "\n"); !strings.Contains(got, "stdout: hello from stdout") || !strings.Contains(got, "stderr: warning from stderr") {
 		t.Fatalf("alpha tail = %q, want stdout/stderr lines retained", got)
+	}
+}
+
+func TestWebhookForwarderEventsIncludePushAndCheckRun(t *testing.T) {
+	t.Parallel()
+	if !slices.Contains(webhookForwarderEvents, "push") {
+		t.Fatalf("webhookForwarderEvents = %v, want push subscription", webhookForwarderEvents)
+	}
+	if !slices.Contains(webhookForwarderEvents, "check_run") {
+		t.Fatalf("webhookForwarderEvents = %v, want check_run subscription", webhookForwarderEvents)
 	}
 }
 
