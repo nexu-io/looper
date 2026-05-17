@@ -2705,6 +2705,39 @@ func TestPSWithoutJSONPrintsEmptyMessage(t *testing.T) {
 	}
 }
 
+func TestPSSuppressesConfigFileDeprecationNotices(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{}}))
+	}))
+	defer server.Close()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"server": map[string]any{
+			"baseUrl":  server.URL,
+			"authMode": "none",
+		},
+		"reviewer": map[string]any{"reviewEvents": map[string]any{"clean": "COMMENT"}},
+		"defaults": map[string]any{"allowAutoApprove": true},
+		"roles":    map[string]any{"reviewer": map[string]any{"autoDiscovery": true}},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "No running or queued loops.\n"; got != want {
+		t.Fatalf("Run([ps]) stdout = %q, want %q", got, want)
+	}
+}
+
 func TestPSWithoutJSONShowsRunningLoopWithoutRunRow(t *testing.T) {
 	t.Parallel()
 
