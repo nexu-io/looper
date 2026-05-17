@@ -451,9 +451,47 @@ func TestConfigMigrateRejectsSameFileAcrossAbsoluteAndRelativePaths(t *testing.T
 	if err != nil {
 		t.Fatalf("ReadFile(source) error = %v", err)
 	}
-	t.Chdir(fromDir)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatalf("Chdir(restore) error = %v", err)
+		}
+	}()
+	if err := os.Chdir(fromDir); err != nil {
+		t.Fatalf("Chdir(%s) error = %v", fromDir, err)
+	}
 
 	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--force", "--from", fromPath, "--to", fromBase)
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate --force]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "source and destination must differ") {
+		t.Fatalf("stderr = %q, want same-file error", stderr)
+	}
+	afterSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source after) error = %v", err)
+	}
+	if !bytes.Equal(beforeSource, afterSource) {
+		t.Fatal("source config changed during rejected migration")
+	}
+}
+
+func TestConfigMigrateRejectsSameFileThroughSymlinkAlias(t *testing.T) {
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{"notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	aliasPath := filepath.Join(filepath.Dir(fromPath), "config-alias.json")
+	if err := os.Symlink(fromPath, aliasPath); err != nil {
+		t.Fatalf("Symlink(%s, %s) error = %v", fromPath, aliasPath, err)
+	}
+	beforeSource, err := os.ReadFile(fromPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source) error = %v", err)
+	}
+
+	exitCode, _, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--force", "--from", fromPath, "--to", aliasPath)
 	if exitCode == 0 {
 		t.Fatalf("Run([config migrate --force]) exit code = 0, want non-zero")
 	}
