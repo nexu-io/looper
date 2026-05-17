@@ -3572,7 +3572,7 @@ func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.L
 	if len(checkpoint.FixItems) == 0 {
 		previousStateHash = strings.TrimSpace(checkpoint.FixItemsHash)
 	}
-	previousThreadIDs := unresolvedThreadIDsFromCheckpoint(checkpoint)
+	previousThreadIDs := unresolvedThreadIDsFromCheckpoint(checkpoint, loop.MetadataJSON, previousHeadSHA)
 	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) && sameStringSlices(previousThreadIDs, unresolvedThreadIDs) {
 		return false, loop, nil
 	}
@@ -3621,14 +3621,14 @@ func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage
 	return true, updated, nil
 }
 
-func unresolvedThreadIDsFromCheckpoint(checkpoint fixerCheckpoint) []string {
+func unresolvedThreadIDsFromCheckpoint(checkpoint fixerCheckpoint, loopMetadataJSON *string, headSHA string) []string {
 	if checkpoint.Recheck != nil {
-		ids := unresolvedThreadIDs(checkpoint.Recheck.RemainingFixItems)
+		ids := unresolvedThreadIDs(suppressDeclinedFixItems(loopMetadataJSON, headSHA, checkpoint.Recheck.RemainingFixItems))
 		if len(ids) > 0 {
 			return ids
 		}
 	}
-	return unresolvedThreadIDs(checkpoint.FixItems)
+	return unresolvedThreadIDs(suppressDeclinedFixItems(loopMetadataJSON, headSHA, checkpoint.FixItems))
 }
 
 func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentUser string) ([]storage.QueueItemRecord, error) {
