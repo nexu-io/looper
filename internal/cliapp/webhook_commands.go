@@ -1,17 +1,21 @@
 package cliapp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 	"github.com/spf13/cobra"
 )
+
+const ghWebhookExtension = "cli/gh-webhook"
 
 type webhookStatusOutput struct {
 	ConfigPath       string              `json:"configPath"`
@@ -68,6 +72,29 @@ func (r *commandRuntime) webhookEnable(cmd *cobra.Command, args []string) error 
 	if err != nil {
 		return err
 	}
+	ghWebhookInstalled := false
+	ghWebhookWarning := ""
+	ghPath := webhookGHPath(loaded.Config)
+	if ghPath == "" {
+		if resolved, resolveErr := r.lookPath()("gh"); resolveErr == nil {
+			ghPath = strings.TrimSpace(resolved)
+		}
+	}
+	if ghPath != "" {
+		available, checkErr := r.ghWebhookCommandAvailable(cmd.Context(), ghPath)
+		if checkErr != nil {
+			ghWebhookWarning = fmt.Sprintf("could not check gh webhook command: %v", checkErr)
+		} else if !available {
+			if getBoolFlag(cmd, "install-gh-webhook") {
+				if err := r.installGHWebhookExtension(cmd.Context(), ghPath); err != nil {
+					return err
+				}
+				ghWebhookInstalled = true
+			} else {
+				ghWebhookWarning = "gh webhook command is unavailable; install the GitHub CLI extension with: gh extension install cli/gh-webhook, or rerun: looper webhook enable --install-gh-webhook"
+			}
+		}
+	}
 	partial := loaded.Partial
 	if partial.Webhook == nil {
 		partial.Webhook = &config.PartialWebhookConfig{}
@@ -84,8 +111,16 @@ func (r *commandRuntime) webhookEnable(cmd *cobra.Command, args []string) error 
 		return err
 	}
 	warnings := webhookWarnings(updated.Config)
+	if ghWebhookWarning != "" {
+		warnings = append(warnings, ghWebhookWarning)
+	}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), webhookStatusOutput{ConfigPath: updated.Metadata.ConfigPath, Enabled: true, FallbackPoll: updated.Config.Webhook.FallbackPollIntervalSeconds, RestartRequired: true, Warnings: warnings})
+	}
+	if ghWebhookInstalled {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Installed GitHub CLI webhook extension %s\n", ghWebhookExtension); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Enabled webhook mode in %s\n", updated.Metadata.ConfigPath); err != nil {
 		return err
@@ -97,6 +132,36 @@ func (r *commandRuntime) webhookEnable(cmd *cobra.Command, args []string) error 
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Restart looperd to apply webhook changes.")
 	return err
+}
+
+func (r *commandRuntime) ghWebhookCommandAvailable(ctx context.Context, ghPath string) (bool, error) {
+	result, err := r.runCommand(ctx, ghPath, []string{"webhook", "forward", "--help"}, 10*time.Second)
+	if err != nil {
+		return false, err
+	}
+	return result.ExitCode == 0, nil
+}
+
+func (r *commandRuntime) installGHWebhookExtension(ctx context.Context, ghPath string) error {
+	result, err := r.runCommand(ctx, ghPath, []string{"extension", "install", ghWebhookExtension}, 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("install gh webhook extension: %w", err)
+	}
+	if result.ExitCode != 0 {
+		output := strings.TrimSpace(strings.Join([]string{result.Stderr, result.Stdout}, "\n"))
+		if output == "" {
+			output = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return fmt.Errorf("install gh webhook extension: %s", output)
+	}
+	available, err := r.ghWebhookCommandAvailable(ctx, ghPath)
+	if err != nil {
+		return fmt.Errorf("verify gh webhook extension: %w", err)
+	}
+	if !available {
+		return errors.New("install gh webhook extension: gh webhook command is still unavailable after install")
+	}
+	return nil
 }
 
 func (r *commandRuntime) webhookDisable(cmd *cobra.Command, args []string) error {
@@ -216,6 +281,13 @@ func webhookWarnings(cfg config.Config) []string {
 		warnings = append(warnings, "gh could not be resolved; looperd will degrade webhook mode to poll fallback")
 	}
 	return warnings
+}
+
+func webhookGHPath(cfg config.Config) string {
+	if cfg.Tools.GHPath == nil {
+		return ""
+	}
+	return strings.TrimSpace(*cfg.Tools.GHPath)
 }
 
 func isWebhookRuntimeUnavailableError(err error) bool {

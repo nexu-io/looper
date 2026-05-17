@@ -117,7 +117,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpSubcommands: []helpSubcommand{{name: "enable", description: "Enable webhook mode"}, {name: "disable", description: "Disable webhook mode"}, {name: "status", description: "Show webhook status"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable}),
+					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable, localFlags: []flagSpec{boolFlag("install-gh-webhook", "Install the GitHub CLI webhook extension if gh webhook is unavailable")}}),
 					newCommand(commandSpec{use: "disable", short: "Disable webhook mode", runE: runtime.webhookDisable}),
 					newCommand(commandSpec{use: "status", short: "Show webhook status", runE: runtime.webhookStatus, localFlags: []flagSpec{boolFlag("verbose", "Show per-repo forwarder details and log tails")}}),
 				},

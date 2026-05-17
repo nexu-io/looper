@@ -196,17 +196,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch path {
 	case webhookForwardPath:
-		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
-			return
-		}
-		if !isLoopbackRemoteAddr(r.RemoteAddr) {
-			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "webhook forwarding requires a loopback caller"})
+		payload, err := h.buildWebhookForwardResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
 			return
 		}
 		if h.context.TriggerSchedulerTick != nil {
 			h.context.TriggerSchedulerTick()
 		}
-		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, map[string]any{"accepted": true}))
+		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, payload))
 		return
 	case apiBasePath + "/healthz":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
@@ -491,9 +493,6 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if !isLoopbackRequest(r) {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
 	}
-	if hasForwardingProxyHeaders(r.Header) {
-		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding does not accept proxied loopback requests"}
-	}
 	if h.webhookForwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
@@ -503,9 +502,6 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 		status := runtimeWithWebhook.WebhookStatus()
 		if !status.Enabled {
 			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is disabled; deliveries are not being processed"}
-		}
-		if status.Degraded {
-			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is degraded; deliveries are not being processed"}
 		}
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -544,15 +540,6 @@ func isLoopbackRequest(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-func hasForwardingProxyHeaders(headers http.Header) bool {
-	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
-		if strings.TrimSpace(headers.Get(name)) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 type apiError struct {
@@ -614,13 +601,6 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 }
 
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
-	if path == webhookForwardPath && hasForwardingProxyHeaders(r.Header) {
-		return apiError{
-			code:    pkgapi.ErrorCodeUnauthorized,
-			status:  http.StatusForbidden,
-			message: "Webhook forwarding does not accept proxied loopback requests",
-		}
-	}
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		return nil
 	}
