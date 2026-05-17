@@ -241,6 +241,59 @@ func TestConfigMigrateForceCreatesBackup(t *testing.T) {
 	}
 }
 
+func TestConfigMigrateUsesActiveConfigPathFromFlagWhenFromOmitted(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	envPath := writeEditableCLIConfigWithPayload(t, map[string]any{"defaults": map[string]any{"allowAutoApprove": false}, "notifications": map[string]any{"osascript": map[string]any{"enabled": false}}})
+	t.Setenv("LOOPER_CONFIG", envPath)
+
+	rootDir := t.TempDir()
+	fromPath := filepath.Join(rootDir, "custom", "active.json")
+	if err := os.MkdirAll(filepath.Dir(fromPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(fromPath, []byte(`{"notifications":{"osascript":{"enabled":false}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--dry-run", "--config", fromPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run --config]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --dry-run --config]) stderr = %q, want empty", stderr)
+	}
+	want := "Preview migration: " + fromPath + " -> " + strings.TrimSuffix(fromPath, filepath.Ext(fromPath)) + ".toml"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+func TestConfigMigrateUsesActiveConfigPathFromEnvWhenFromOmitted(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	fromPath := filepath.Join(t.TempDir(), "env", "active.json")
+	if err := os.MkdirAll(filepath.Dir(fromPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(fromPath, []byte(`{"notifications":{"osascript":{"enabled":false}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("LOOPER_CONFIG", fromPath)
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--dry-run")
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --dry-run]) stderr = %q, want empty", stderr)
+	}
+	want := "Preview migration: " + fromPath + " -> " + strings.TrimSuffix(fromPath, filepath.Ext(fromPath)) + ".toml"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+}
+
 func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	t.Parallel()
 

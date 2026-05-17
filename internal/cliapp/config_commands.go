@@ -306,7 +306,7 @@ func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error {
-	fromPath, toPath, err := resolveConfigMigrationPaths(cmd)
+	fromPath, toPath, err := resolveConfigMigrationPaths(r.argv, cmd)
 	if err != nil {
 		return err
 	}
@@ -569,17 +569,20 @@ func createBackupConfigFile(path string) (string, error) {
 	return backupPath, nil
 }
 
-func resolveConfigMigrationPaths(cmd *cobra.Command) (string, string, error) {
+func resolveConfigMigrationPaths(argv []string, cmd *cobra.Command) (string, string, error) {
 	from := strings.TrimSpace(cmd.Flag("from").Value.String())
 	to := strings.TrimSpace(cmd.Flag("to").Value.String())
 	if from == "" {
-		looperHome, err := config.DefaultLooperHome()
+		cwd, err := os.Getwd()
 		if err != nil {
-			return "", "", fmt.Errorf("determine default config path: %w", err)
+			return "", "", fmt.Errorf("determine current working directory: %w", err)
 		}
-		from = filepath.Join(looperHome, "config.json")
+		from, err = resolveConfigPathFromArgs(argv, cwd)
+		if err != nil {
+			return "", "", err
+		}
 		if to == "" {
-			to = filepath.Join(looperHome, "config.toml")
+			to = strings.TrimSuffix(from, filepath.Ext(from)) + ".toml"
 		}
 	} else if to == "" {
 		to = strings.TrimSuffix(from, filepath.Ext(from)) + ".toml"
