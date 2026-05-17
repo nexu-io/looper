@@ -416,6 +416,59 @@ func TestLegacyAndCanonicalFixerEnvOverridesProduceEquivalentTargets(t *testing.
 	}
 }
 
+func TestCanonicalizePartialForMigrationRemovesLegacySurfacesAfterNormalization(t *testing.T) {
+	clean := ReviewerReviewEventComment
+	allowAutoApprove := true
+	fixAllPullRequests := true
+	autoDiscovery := true
+	reviewerInstruction := "review this"
+	partial := PartialConfig{
+		LegacyReviewer: &PartialReviewerConfig{ReviewEvents: &PartialReviewerReviewEventsConfig{Clean: &clean}},
+		Defaults:       &PartialDefaultsConfig{AllowAutoApprove: &allowAutoApprove, FixAllPullRequests: &fixAllPullRequests},
+		Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{
+			AutoDiscovery: &autoDiscovery,
+			Instructions:  &reviewerInstruction,
+			Triggers:      &PartialReviewerRoleTriggersConfig{EnableSelfReview: &autoDiscovery},
+		}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID:           "repo",
+			Name:         "Repo",
+			Path:         "/tmp/repo",
+			Instructions: map[string]string{"reviewer": "project reviewer"},
+		}},
+	}
+
+	canonical := CanonicalizePartialForMigration(partial)
+	if canonical.LegacyReviewer != nil {
+		t.Fatalf("LegacyReviewer = %#v, want nil", canonical.LegacyReviewer)
+	}
+	if canonical.Defaults == nil || canonical.Defaults.AllowAutoApprove != nil || canonical.Defaults.FixAllPullRequests != nil {
+		t.Fatalf("Defaults = %#v, want deprecated aliases removed", canonical.Defaults)
+	}
+	if canonical.Roles == nil || canonical.Roles.Reviewer == nil || canonical.Roles.Reviewer.Behavior == nil || canonical.Roles.Reviewer.Behavior.ReviewEvents == nil || canonical.Roles.Reviewer.Behavior.ReviewEvents.Clean == nil || *canonical.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+		t.Fatalf("Reviewer behavior = %#v, want migrated clean review event", canonical.Roles)
+	}
+	if canonical.Roles.Reviewer.AutoDiscovery != nil || canonical.Roles.Reviewer.Triggers != nil || canonical.Roles.Reviewer.SpecReview != nil {
+		t.Fatalf("Reviewer legacy aliases = %#v, want nil", canonical.Roles.Reviewer)
+	}
+	if canonical.Projects == nil || len(*canonical.Projects) != 1 {
+		t.Fatalf("Projects = %#v, want one migrated project", canonical.Projects)
+	}
+	project := (*canonical.Projects)[0]
+	if project.Path != "" || len(project.Instructions) != 0 {
+		t.Fatalf("Project legacy fields = %#v, want cleared", project)
+	}
+	if project.RepoPath != "/tmp/repo" {
+		t.Fatalf("Project RepoPath = %q, want /tmp/repo", project.RepoPath)
+	}
+	if project.Roles == nil || project.Roles.Reviewer == nil || project.Roles.Reviewer.Instructions == nil || *project.Roles.Reviewer.Instructions != "project reviewer" {
+		t.Fatalf("Project reviewer instructions = %#v, want migrated reviewer instruction", project.Roles)
+	}
+	if canonical.Roles == nil || canonical.Roles.Fixer == nil || canonical.Roles.Fixer.Triggers == nil || canonical.Roles.Fixer.Triggers.AuthorFilter == nil || *canonical.Roles.Fixer.Triggers.AuthorFilter != FixerAuthorFilterAny {
+		t.Fatalf("Fixer triggers = %#v, want migrated author filter", canonical.Roles)
+	}
+}
+
 func TestLegacyAndCanonicalReviewerEnvOverridesResolveIdenticallyAndBeatFileConfig(t *testing.T) {
 	cleanFile := `{"roles":{"reviewer":{"behavior":{"reviewEvents":{"clean":"COMMENT"}}}}}`
 	legacyClean := loadConfigFromJSONWithEnvAndArgsFixture(t, cleanFile, map[string]string{"LOOPER_ALLOW_AUTO_APPROVE": "true"}, nil)
@@ -2388,7 +2441,7 @@ func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
 		t.Fatalf("os.MkdirAll() error = %v", err)
 	}
 
-	for _, name := range []string{"config.toml", "config.json"} {
+	for _, name := range []string{"config.toml", "config.yaml"} {
 		if err := os.WriteFile(filepath.Join(looperHome, name), []byte("{}"), 0o644); err != nil {
 			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
 		}
@@ -2399,8 +2452,36 @@ func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
 
-	if got := err.Error(); !strings.Contains(got, "multiple default config files found") || !strings.Contains(got, "config.toml") || !strings.Contains(got, "config.json") {
+	if got := err.Error(); !strings.Contains(got, "multiple default config files found") || !strings.Contains(got, "config.toml") || !strings.Contains(got, "config.yaml") {
 		t.Fatalf("LoadFile() error = %q, want multiple-default-files error", got)
+	}
+}
+
+func TestLoadFilePrefersCanonicalTOMLWhenLegacyJSONAlsoExists(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	looperHome := filepath.Join(homeDir, ".looper")
+	if err := os.MkdirAll(looperHome, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	tomlPath := filepath.Join(looperHome, "config.toml")
+	jsonPath := filepath.Join(looperHome, "config.json")
+	if err := os.WriteFile(tomlPath, []byte("[server]\nport = 7410\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(config.toml) error = %v", err)
+	}
+	if err := os.WriteFile(jsonPath, []byte(`{"server":{"port":7420}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(config.json) error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: t.TempDir(), LookupEnv: emptyEnvLookup})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if loaded.Metadata.ConfigPath != tomlPath {
+		t.Fatalf("LoadFile().Metadata.ConfigPath = %q, want %q", loaded.Metadata.ConfigPath, tomlPath)
+	}
+	if loaded.Config.Server.Port != 7410 {
+		t.Fatalf("LoadFile().Config.Server.Port = %d, want 7410", loaded.Config.Server.Port)
 	}
 }
 

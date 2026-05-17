@@ -19,26 +19,23 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
-	canonical := normalizeLayerPartial(clonePartialConfig(partial))
-	canonical.LegacyReviewer = nil
+	normalized := normalizeLayerPartial(clonePartialConfig(partial))
+	normalized.LegacyReviewer = nil
 
-	if canonical.Defaults != nil {
-		canonical.Defaults.AllowAutoApprove = nil
-		canonical.Defaults.FixAllPullRequests = nil
+	if normalized.Defaults != nil {
+		normalized.Defaults.AllowAutoApprove = nil
+		normalized.Defaults.FixAllPullRequests = nil
 	}
 
-	if canonical.Roles != nil && canonical.Roles.Reviewer != nil {
-		canonical.Roles.Reviewer.AutoDiscovery = nil
-		canonical.Roles.Reviewer.Triggers = nil
-		canonical.Roles.Reviewer.SpecReview = nil
+	if normalized.Roles != nil && normalized.Roles.Reviewer != nil {
+		normalized.Roles.Reviewer.AutoDiscovery = nil
+		normalized.Roles.Reviewer.Triggers = nil
+		normalized.Roles.Reviewer.SpecReview = nil
 	}
 
-	if canonical.Projects != nil {
-		projects := *canonical.Projects
+	if normalized.Projects != nil {
+		projects := *normalized.Projects
 		for i := range projects {
-			if projects[i].RepoPath == "" {
-				projects[i].RepoPath = projects[i].Path
-			}
 			projects[i].Path = ""
 			projects[i].Instructions = nil
 			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
@@ -47,10 +44,10 @@ func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 				projects[i].Roles.Reviewer.SpecReview = nil
 			}
 		}
-		canonical.Projects = &projects
+		normalized.Projects = &projects
 	}
 
-	return canonical
+	return normalized
 }
 
 func normalizeLayerPartial(partial PartialConfig) PartialConfig {

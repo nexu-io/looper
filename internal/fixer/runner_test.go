@@ -467,6 +467,264 @@ func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsResumesPausedNoopResolveLoopWhenFixItemsChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	previousFixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "c1@old"}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "old blocker"}}},
+		FixItems:     []FixItem{previousFixItem},
+		FixItemsHash: hashFixItemsState([]FixItem{previousFixItem}),
+		Push:         &checkpointPush{Pushed: false, SkippedReason: "No new commits to push"},
+		Recheck:      &checkpointRecheck{RemainingFixItems: []FixItem{previousFixItem}},
+	})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_noop_resolve", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_resolve", LoopID: "loop_paused_noop_resolve", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(noopResolveManualIntervention), ErrorMessage: stringPtr(noopResolveManualIntervention), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c2", "threadId": "t2", "body": "new blocker"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one requeued fixer item for changed fix items", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_noop_resolve")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" || persisted.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop after changed fix items", persisted)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *persisted)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Resumed || resumed.StartStep != stepDiscoverPR {
+		t.Fatalf("resumed = %#v, want fresh discover run after changed fix items", resumed)
+	}
+	if resumed.Checkpoint.Detail != nil || len(resumed.Checkpoint.FixItems) != 0 || resumed.Checkpoint.Push != nil || resumed.Checkpoint.Recheck != nil {
+		t.Fatalf("checkpoint = %#v, want stale no-op resolve checkpoint cleared", resumed.Checkpoint)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopForSameFixItems(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	fixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "legacy:t1:c1", Summary: "same blocker"}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "same blocker"}}},
+		FixItems:     []FixItem{fixItem},
+		FixItemsHash: hashFixItemsState([]FixItem{fixItem}),
+		Push:         &checkpointPush{Pushed: false, SkippedReason: "No new commits to push"},
+		Recheck:      &checkpointRecheck{RemainingFixItems: []FixItem{fixItem}},
+	})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_noop_same", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_same", LoopID: "loop_paused_noop_same", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(noopResolveManualIntervention), ErrorMessage: stringPtr(noopResolveManualIntervention), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "same blocker"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want same no-op fingerprint suppressed", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_noop_same")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" || persisted.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want unchanged paused loop", persisted)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopWhenOnlyDeclinedThreadRemains(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	activeFixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "c1@active", Summary: "same blocker"}
+	declinedFixItem := FixItem{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "c2@declined", Summary: "declined blocker"}
+	allFixItems := []FixItem{activeFixItem, declinedFixItem}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "c1@active", "body": "same blocker"}, {"id": "c2", "threadId": "t2", "threadFingerprint": "c2@declined", "body": "declined blocker"}}},
+		FixItems:     allFixItems,
+		FixItemsHash: hashFixItemsState(allFixItems),
+		Push:         &checkpointPush{Pushed: false, SkippedReason: "No new commits to push"},
+		Recheck:      &checkpointRecheck{RemainingFixItems: allFixItems},
+	})
+	metadataJSON := mustMarshalJSON(map[string]any{
+		"declinedThreads": map[string]any{
+			buildDeclinedThreadFingerprint(declinedFixItem, "head-42"): map[string]any{"threadId": declinedFixItem.ThreadID},
+		},
+	})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_noop_declined", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_declined", LoopID: "loop_paused_noop_declined", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(noopResolveManualIntervention), ErrorMessage: stringPtr(noopResolveManualIntervention), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "c1@active", "body": "same blocker"}, {"id": "c2", "threadId": "t2", "threadFingerprint": "c2@declined", "body": "declined blocker"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want declined-only delta suppressed", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_noop_declined")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" || persisted.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want unchanged paused loop", persisted)
+	}
+}
+
+func TestDiscoverPullRequestsResumesPausedRiskyConflictLoopWhenFixItemsChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	previousFixItem := FixItem{Type: "conflict", Files: []string{}}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", HasConflicts: true},
+		FixItems:     []FixItem{previousFixItem},
+		FixItemsHash: hashFixItemsState([]FixItem{previousFixItem}),
+	})
+	message := "Skipped acme/looper#42 because risky conflict fixes require manual intervention"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_risky_conflict", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_conflict", LoopID: "loop_paused_risky_conflict", Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "now fix this comment"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one requeued fixer item after conflict signal changed", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_risky_conflict")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *persisted)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Resumed || resumed.StartStep != stepDiscoverPR {
+		t.Fatalf("resumed = %#v, want fresh discover run after risky-conflict signal changed", resumed)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsPausedRiskyConflictLoopForSameConflict(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	fixItem := FixItem{Type: "conflict", Files: []string{}}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "head-42", HasConflicts: true}, FixItems: []FixItem{fixItem}, FixItemsHash: hashFixItemsState([]FixItem{fixItem})})
+	message := "Skipped acme/looper#42 because risky conflict fixes require manual intervention"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_risky_same", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_same", LoopID: "loop_paused_risky_same", Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}}, viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", HasConflicts: true}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want same risky-conflict fingerprint suppressed", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_paused_risky_same")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" || persisted.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want unchanged paused loop", persisted)
+	}
+}
+
+func TestDiscoverPullRequestsKeepsOtherManualInterventionPausedOnNewSignal(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "old-head"}})
+	message := "Auto push disabled; manual fix push required for branch feature/fix-42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_auto_push", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_auto_push", LoopID: "loop_paused_auto_push", Status: "failed", CurrentStep: stringPtr(string(stepPush)), LastCompletedStep: stringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "new-head"}}, viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "new-head", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "new blocker"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want auto-push hard hold to remain paused", result.QueueItems)
+	}
+}
+
 func TestEnqueueScopesFixerDedupeKeyToLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

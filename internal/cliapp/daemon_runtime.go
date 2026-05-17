@@ -753,7 +753,23 @@ func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
 }
 
 func (r *commandRuntime) emitConfigLoadNotices(loaded config.LoadedFileConfig) {
-	_ = loaded
+	for _, warning := range loaded.Warnings {
+		key := "warning:" + warning
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "warning: %s\n", warning)
+	}
+
+	for _, notice := range loaded.Notices {
+		key := "note:" + notice
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "note: %s\n", notice)
+	}
 }
 
 func (r *commandRuntime) getJSONWithClient(ctx context.Context, client *DaemonAPIClient, path string) (json.RawMessage, error) {

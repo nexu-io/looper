@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
@@ -52,6 +53,95 @@ func TestWebhookEnablePersistsConfigAndWarnsWithoutChangingScheduler(t *testing.
 	scheduler := updated["scheduler"].(map[string]any)
 	if got := int(scheduler["pollIntervalSeconds"].(float64)); got != 42 {
 		t.Fatalf("scheduler.pollIntervalSeconds = %d, want 42", got)
+	}
+}
+
+func TestWebhookEnableWarnsWhenGHWebhookCommandIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		LookPath: func(command string) (string, error) {
+			if command == "gh" {
+				return "/usr/bin/gh", nil
+			}
+			return command, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			if command != "/usr/bin/gh" || strings.Join(args, " ") != "webhook forward --help" {
+				t.Fatalf("RunCommand(%q, %q), want gh webhook forward --help", command, strings.Join(args, " "))
+			}
+			return commandExecutionResult{Stderr: "unknown command \"webhook\" for \"gh\"", ExitCode: 1}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"webhook", "enable", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook enable) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "gh webhook command is unavailable") || !strings.Contains(stdout.String(), "--install-gh-webhook") {
+		t.Fatalf("stdout = %q, want gh webhook install warning", stdout.String())
+	}
+}
+
+func TestWebhookEnableCanInstallGHWebhookExtension(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	commands := []string{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		LookPath: func(command string) (string, error) {
+			if command == "gh" {
+				return "/usr/bin/gh", nil
+			}
+			return command, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			commands = append(commands, command+" "+strings.Join(args, " "))
+			switch len(commands) {
+			case 1:
+				return commandExecutionResult{Stderr: "unknown command \"webhook\" for \"gh\"", ExitCode: 1}, nil
+			case 2:
+				return commandExecutionResult{ExitCode: 0}, nil
+			case 3:
+				return commandExecutionResult{Stdout: "Forward GitHub webhooks", ExitCode: 0}, nil
+			default:
+				t.Fatalf("unexpected RunCommand call %d: %s %q", len(commands), command, args)
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"webhook", "enable", "--install-gh-webhook", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook enable --install-gh-webhook) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	wantCommands := []string{
+		"/usr/bin/gh webhook forward --help",
+		"/usr/bin/gh extension install cli/gh-webhook",
+		"/usr/bin/gh webhook forward --help",
+	}
+	if strings.Join(commands, "\n") != strings.Join(wantCommands, "\n") {
+		t.Fatalf("commands = %q, want %q", commands, wantCommands)
+	}
+	if !strings.Contains(stdout.String(), "Installed GitHub CLI webhook extension cli/gh-webhook") {
+		t.Fatalf("stdout = %q, want install confirmation", stdout.String())
 	}
 }
 

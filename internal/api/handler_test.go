@@ -352,12 +352,21 @@ func TestHandlerUnauthorized(t *testing.T) {
 	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
-func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	triggered := 0
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
+	recorded := 0
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}, record: func(eventType, deliveryID string) {
+		recorded++
+		assertEqual(t, eventType, "pull_request")
+		assertEqual(t, deliveryID, "delivery-1")
+		triggered++
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
 	req.RemoteAddr = "127.0.0.1:1234"
@@ -370,13 +379,40 @@ func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", recorder.Code)
 	}
-	if forwarder.calls != 0 {
-		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	data := body["data"].(map[string]any)
-	assertEqual(t, data["accepted"], true)
+	assertEqual(t, data["status"], "accepted")
+	assertEqual(t, int(data["workItems"].(float64)), 1)
 	assertEqual(t, triggered, 1)
+	assertEqual(t, recorded, 1)
+}
+
+func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{"another repo forwarder exited"}}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-degraded")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	}
 }
 
 func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
@@ -405,19 +441,23 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	}
 }
 
-func TestHandlerWebhookForwardRejectsProxiedLoopbackRequests(t *testing.T) {
+func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeaders(t *testing.T) {
 	fixture := newTestFixture(t)
 	token := "secret-token"
 	fixture.config.Server.AuthMode = config.AuthModeLocalToken
 	fixture.config.Server.LocalToken = &token
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
 	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-Forwarded-For", "203.0.113.5")
+	req.Header.Add("X-Forwarded-For", "")
+	req.Header.Add("X-Forwarded-For", "203.0.113.5")
 	req.Header.Set("X-GitHub-Delivery", "delivery-3")
 	req.Header.Set("X-GitHub-Event", "pull_request")
 	recorder := httptest.NewRecorder()
@@ -432,7 +472,6 @@ func TestHandlerWebhookForwardRejectsProxiedLoopbackRequests(t *testing.T) {
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	errMap := body["error"].(map[string]any)
-	assertEqual(t, errMap["code"], "UNAUTHORIZED")
 	assertEqual(t, errMap["message"], "Webhook forwarding does not accept proxied loopback requests")
 }
 

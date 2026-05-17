@@ -67,6 +67,9 @@ const (
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
 
+	noopResolveManualIntervention = "resolve-comments left review threads unresolved because fixer produced no new commits to push"
+	riskyConflictManualHold       = "risky conflict fixes require manual intervention"
+
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
 	// defaultLegacyMarkerlessRunGrace protects running fixer runs that predate
@@ -3185,6 +3188,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
+		if strings.TrimSpace(derefString(latestRun.ErrorMessage)) == noopResolveManualIntervention {
+			failureSummary = noopResolveManualIntervention
+		}
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
@@ -3450,6 +3456,14 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			if existing.Status == "paused" {
 				if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
 					return loopUpsertResult{}, err
+				} else if resumed {
+					existing = updated
+				} else if resumed, updated, err := r.resumePausedNoopResolveLoop(ctx, existing, headSHA, fixItemsStateHash, unresolvedThreadIDs); err != nil {
+					return loopUpsertResult{}, err
+				} else if resumed {
+					existing = updated
+				} else if resumed, updated, err := r.resumePausedRiskyConflictLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
+					return loopUpsertResult{}, err
 				} else if !resumed {
 					return loopUpsertResult{record: existing, created: false}, nil
 				} else {
@@ -3536,6 +3550,85 @@ func (r *Runner) resumePausedZeroProgressLoop(ctx context.Context, loop storage.
 		return false, storage.LoopRecord{}, err
 	}
 	return true, updated, nil
+}
+
+func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
+	if loop.Status != "paused" || r.repos == nil || r.repos.Runs == nil {
+		return false, loop, nil
+	}
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	if latestRun == nil || latestRun.Status != "failed" || strings.TrimSpace(derefString(latestRun.ErrorMessage)) != noopResolveManualIntervention {
+		return false, loop, nil
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	previousHeadSHA := ""
+	if checkpoint.Detail != nil {
+		previousHeadSHA = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	}
+	previousStateHash := hashFixItemsState(checkpoint.FixItems)
+	if len(checkpoint.FixItems) == 0 {
+		previousStateHash = strings.TrimSpace(checkpoint.FixItemsHash)
+	}
+	previousThreadIDs := unresolvedThreadIDsFromCheckpoint(checkpoint, loop.MetadataJSON, previousHeadSHA)
+	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) && sameStringSlices(previousThreadIDs, unresolvedThreadIDs) {
+		return false, loop, nil
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		nextRunAt := r.nowISO()
+		updated.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	return true, updated, nil
+}
+
+func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string) (bool, storage.LoopRecord, error) {
+	if loop.Status != "paused" || r.repos == nil || r.repos.Runs == nil {
+		return false, loop, nil
+	}
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	if latestRun == nil || latestRun.Status != "failed" || !strings.Contains(strings.TrimSpace(derefString(latestRun.ErrorMessage)), riskyConflictManualHold) {
+		return false, loop, nil
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	previousHeadSHA := ""
+	if checkpoint.Detail != nil {
+		previousHeadSHA = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	}
+	previousStateHash := hashFixItemsState(checkpoint.FixItems)
+	if len(checkpoint.FixItems) == 0 {
+		previousStateHash = strings.TrimSpace(checkpoint.FixItemsHash)
+	}
+	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) {
+		return false, loop, nil
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		nextRunAt := r.nowISO()
+		updated.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	return true, updated, nil
+}
+
+func unresolvedThreadIDsFromCheckpoint(checkpoint fixerCheckpoint, loopMetadataJSON *string, headSHA string) []string {
+	if checkpoint.Recheck != nil {
+		ids := unresolvedThreadIDs(suppressDeclinedFixItems(loopMetadataJSON, headSHA, checkpoint.Recheck.RemainingFixItems))
+		if len(ids) > 0 {
+			return ids
+		}
+	}
+	return unresolvedThreadIDs(suppressDeclinedFixItems(loopMetadataJSON, headSHA, checkpoint.FixItems))
 }
 
 func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentUser string) ([]storage.QueueItemRecord, error) {
@@ -4830,6 +4923,12 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 	}
 	if failedStep == stepPush {
 		return strings.Contains(strings.ToLower(failureSummary), "remote head changed")
+	}
+	if failedStep == stepRepair && strings.Contains(failureSummary, riskyConflictManualHold) {
+		return true
+	}
+	if failedStep == stepRecheck && strings.TrimSpace(failureSummary) == noopResolveManualIntervention {
+		return true
 	}
 	if failedStep != stepResolveComments {
 		return false

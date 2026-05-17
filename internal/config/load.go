@@ -190,6 +190,11 @@ func DiscoverDefaultConfigPath() (string, error) {
 	}
 
 	if len(found) > 1 {
+		canonicalTOMLPath := filepath.Join(looperHome, "config.toml")
+		legacyJSONPath := filepath.Join(looperHome, "config.json")
+		if len(found) == 2 && containsConfigPath(found, canonicalTOMLPath) && containsConfigPath(found, legacyJSONPath) {
+			return canonicalTOMLPath, nil
+		}
 		return "", fmt.Errorf("multiple default config files found: %s; keep only one of %s", strings.Join(found, ", "), strings.Join(candidates, ", "))
 	}
 	if len(found) == 1 {
@@ -197,6 +202,16 @@ func DiscoverDefaultConfigPath() (string, error) {
 	}
 
 	return candidates[0], nil
+}
+
+func containsConfigPath(paths []string, target string) bool {
+	cleanTarget := filepath.Clean(target)
+	for _, path := range paths {
+		if filepath.Clean(path) == cleanTarget {
+			return true
+		}
+	}
+	return false
 }
 
 func validateConfiguredToolPath(path *string, field string) error {

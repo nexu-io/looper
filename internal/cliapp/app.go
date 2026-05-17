@@ -117,7 +117,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpSubcommands: []helpSubcommand{{name: "enable", description: "Enable webhook mode"}, {name: "disable", description: "Disable webhook mode"}, {name: "status", description: "Show webhook status"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable}),
+					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable, localFlags: []flagSpec{boolFlag("install-gh-webhook", "Install the GitHub CLI webhook extension if gh webhook is unavailable")}}),
 					newCommand(commandSpec{use: "disable", short: "Disable webhook mode", runE: runtime.webhookDisable}),
 					newCommand(commandSpec{use: "status", short: "Show webhook status", runE: runtime.webhookStatus, localFlags: []flagSpec{boolFlag("verbose", "Show per-repo forwarder details and log tails")}}),
 				},
@@ -168,7 +168,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "config",
 				short:           "Inspect and edit the active config file",
-				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}, {name: "migrate", description: "Migrate config to canonical TOML"}},
+				helpSubcommands: []helpSubcommand{{name: "get", description: "Get a config value"}, {name: "set", description: "Set a config value"}, {name: "unset", description: "Unset a config value"}, {name: "validate", description: "Validate the active config file"}, {name: "lint", description: "Lint the active config file"}, {name: "show", description: "Show active config"}, {name: "edit", description: "Edit the active config file"}, {name: "migrate", description: "Migrate a config file to canonical format"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper config get roles.reviewer.behavior.reviewEvents.clean",
@@ -176,6 +176,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper config unset roles.reviewer.behavior.reviewEvents.clean",
 					"$ looper config validate",
 					"$ looper config show --source",
+					"$ looper config migrate --dry-run",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "get <key>", short: "Get a config value", args: cobra.ExactArgs(1), runE: runtime.configGet}),
@@ -185,7 +186,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "lint", short: "Lint the active config file", runE: runtime.configValidate}),
 					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
 					newCommand(commandSpec{use: "edit", short: "Edit the active config file", runE: runtime.configEdit}),
-					newCommand(commandSpec{use: "migrate", short: "Migrate config to canonical TOML", runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path"), stringFlag("to", "path", "Destination config path"), boolFlag("dry-run", "Preview migrated config without writing destination"), boolFlag("force", "Overwrite destination if it already exists")}}),
+					newCommand(commandSpec{use: "migrate", short: "Migrate a config file to canonical format", args: cobra.NoArgs, runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path (defaults to ~/.looper/config.json)"), stringFlag("to", "path", "Destination config path (defaults to canonical TOML path)"), boolFlag("dry-run", "Preview the migrated canonical config without writing files"), boolFlag("force", "Overwrite an existing destination after creating a backup")}}),
 				},
 			}),
 			newCommand(commandSpec{
