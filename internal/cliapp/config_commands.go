@@ -320,11 +320,9 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 			"preview":    plan.Preview,
 		}
 		if plan.DryRun {
-			tmpPath, err := r.prepareMigratedConfigFile(plan.To, plan.Preview)
-			if err != nil {
+			if err := r.preflightMigratedConfigWrite(plan.To, plan.Preview, plan.Overwrites); err != nil {
 				return err
 			}
-			defer os.Remove(tmpPath)
 			payload["updated"] = false
 			return writeJSON(cmd.OutOrStdout(), payload)
 		}
@@ -341,11 +339,9 @@ func (r *commandRuntime) configMigrate(cmd *cobra.Command, args []string) error 
 	}
 
 	if plan.DryRun {
-		tmpPath, err := r.prepareMigratedConfigFile(plan.To, plan.Preview)
-		if err != nil {
+		if err := r.preflightMigratedConfigWrite(plan.To, plan.Preview, plan.Overwrites); err != nil {
 			return err
 		}
-		defer os.Remove(tmpPath)
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Dry run: would migrate config %s -> %s\n", plan.From, plan.To); err != nil {
 			return err
 		}
@@ -506,6 +502,27 @@ func (r *commandRuntime) prepareMigratedConfigFile(path string, preview string) 
 		return "", err
 	}
 	return tmpPath, nil
+}
+
+func (r *commandRuntime) preflightMigratedConfigWrite(path string, preview string, overwrites bool) error {
+	tmpPath, err := r.prepareMigratedConfigFile(path, preview)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+	if !overwrites {
+		return nil
+	}
+	backupPath, err := backupConfigFileWithPath(path)
+	if err != nil {
+		return err
+	}
+	if backupPath != "" {
+		if err := os.Remove(backupPath); err != nil {
+			return fmt.Errorf("remove config backup created during dry-run: %w", err)
+		}
+	}
+	return nil
 }
 
 func pruneEmptyMaps(value any) any {
@@ -822,7 +839,7 @@ func backupConfigFile(path string) error {
 	return err
 }
 
-func backupConfigFileWithPath(path string) (string, error) {
+var backupConfigFileWithPath = func(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
