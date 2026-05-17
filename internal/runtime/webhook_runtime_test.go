@@ -680,6 +680,48 @@ func TestWebhookRuntimeBootstrapRejectsStaleFingerprint(t *testing.T) {
 	}
 }
 
+func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper")
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	fingerprint, events := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	record := storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint, Endpoint: endpoint, Events: events, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+	}
+	probe := &testProcessProbe{alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
+	rt := &webhookRuntime{
+		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           probe,
+		now:             time.Now,
+	}
+	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+
+	rt.Bootstrap(context.Background(), repositories)
+	status := rt.Status()
+	if len(status.Forwarders) != 1 || !status.Forwarders[0].Adopted || !status.Forwarders[0].Running {
+		t.Fatalf("Status().Forwarders = %#v, want adopted running forwarder when gh path is unavailable", status.Forwarders)
+	}
+	if status.Forwarders[0].PID == nil || *status.Forwarders[0].PID != 4242 {
+		t.Fatalf("Status().Forwarders = %#v, want adopted pid 4242", status.Forwarders)
+	}
+	if status.Forwarders[0].Fingerprint != fingerprint {
+		t.Fatalf("Fingerprint = %q, want %q", status.Forwarders[0].Fingerprint, fingerprint)
+	}
+	if !rt.bootstrapCompleted() {
+		t.Fatal("bootstrapCompleted() = false, want true")
+	}
+	stored, err := repositories.WebhookForwarders.List(context.Background())
+	if err != nil {
+		t.Fatalf("WebhookForwarders.List() error = %v", err)
+	}
+	if len(stored) != 1 || stored[0].Repo != record.Repo {
+		t.Fatalf("WebhookForwarders.List() = %#v, want retained adopted record", stored)
+	}
+}
+
 func TestWebhookRuntimeCleanupForwarderRecordRetainsUnverifiableRows(t *testing.T) {
 	t.Parallel()
 

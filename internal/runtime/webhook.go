@@ -181,7 +181,7 @@ func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositor
 	}
 	w.clearTransientReconcileDegradedReasons()
 	for _, record := range records {
-		if _, ok := desired[record.Repo]; !ok || !w.canLaunchForwarders() {
+		if _, ok := desired[record.Repo]; !ok {
 			w.cleanupForwarderRecord(ctx, record, "repo_removed")
 			continue
 		}
@@ -423,6 +423,9 @@ func (w *webhookRuntime) adoptionGate(record storage.WebhookForwarderRecord, com
 		return "gh_path_mismatch"
 	}
 	ghPath, endpoint, events := w.ghPath, w.status.EndpointURL, webhookForwardEvents
+	if ghPath == "" {
+		ghPath = record.GHPath
+	}
 	if endpoint != record.Endpoint || endpoint != w.status.EndpointURL {
 		return "endpoint_mismatch"
 	}
