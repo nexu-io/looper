@@ -1166,6 +1166,10 @@ func (s *enqueueingFixerScheduler) DiscoverPullRequest(ctx context.Context, inpu
 	return fixer.DiscoveryResult{}, nil
 }
 
+func (s *enqueueingFixerScheduler) DiscoverPullRequestsForBaseBranchUpdate(_ context.Context, _ fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, nil
+}
+
 type discoveringWorkerScheduler struct {
 	stubWorkerScheduler
 	repos  *storage.Repositories
@@ -1416,6 +1420,10 @@ func (s *stubFixerScheduler) DiscoverPullRequests(_ context.Context, input fixer
 }
 
 func (s *stubFixerScheduler) DiscoverPullRequest(_ context.Context, _ fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, s.discoverErr
+}
+
+func (s *stubFixerScheduler) DiscoverPullRequestsForBaseBranchUpdate(_ context.Context, _ fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
 	return fixer.DiscoveryResult{}, s.discoverErr
 }
 

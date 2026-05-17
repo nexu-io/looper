@@ -1901,6 +1901,23 @@ func TestListOpenPullRequestsPassesAllLabelsToGH(t *testing.T) {
 	}
 }
 
+func TestListOpenPullRequestsPassesBaseRefToGH(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr list --repo acme/looper --state open --limit 30 --base main --json number,title,url,state,updatedAt,isDraft,reviewDecision,labels,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewRequests,reviews,mergeStateStatus" {
+			t.Fatalf("gh args = %q, want base filter", args)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper", BaseRefName: "main"}); err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+}
+
 func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
