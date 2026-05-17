@@ -434,7 +434,10 @@ func (r *commandRuntime) resolveConfigMigrationPlan(cmd *cobra.Command) (configM
 		return configMigrationPlan{}, fmt.Errorf("check source config file at %s: %w", from, statErr)
 	}
 	overwrites := false
-	if info, statErr := os.Stat(to); statErr == nil && !info.IsDir() {
+	if info, statErr := os.Stat(to); statErr == nil {
+		if info.IsDir() {
+			return configMigrationPlan{}, fmt.Errorf("destination config path points to a directory: %s; use --to to choose a file path", to)
+		}
 		overwrites = true
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return configMigrationPlan{}, fmt.Errorf("check destination config file at %s: %w", to, statErr)

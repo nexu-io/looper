@@ -2488,6 +2488,28 @@ func TestConfigMigrateDryRunFailsWhenDestinationDirectoryCannotBePrepared(t *tes
 	}
 }
 
+func TestConfigMigrateDryRunRejectsExistingDestinationDirectory(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(sourcePath, []byte(`{"defaults":{"allowRiskyFixes":true}}`), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(sourcePath) error = %v", err)
+	}
+	destDir := t.TempDir()
+
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "--from", sourcePath, "--to", destDir, "--dry-run")
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate --dry-run --to dir]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "destination config path points to a directory") {
+		t.Fatalf("stderr = %q, want directory-destination guidance", stderr)
+	}
+	if info, err := os.Stat(destDir); err != nil || !info.IsDir() {
+		t.Fatalf("os.Stat(%q) = (%v, %v), want existing directory preserved", destDir, info, err)
+	}
+}
+
 func TestConfigMigrateReportsMissingSourceBeforeOverwriteGuidance(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "missing.json")
 	destPath := filepath.Join(t.TempDir(), "config.toml")
