@@ -649,6 +649,41 @@ func TestGatewayResolveDetachedStartPointPropagatesFetchFailure(t *testing.T) {
 	}
 }
 
+func TestGatewayRetriesFetchWhenRemoteTrackingRefWasUpdatedConcurrently(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	gitPath := writeFakeGit(t, `#!/bin/sh
+count_file="$FAKE_GIT_COUNT"
+count=0
+if [ -f "$count_file" ]; then
+	count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+	cat >&2 <<'EOF'
+From github.com:nexu-io/open-design
+ * branch                main       -> FETCH_HEAD
+error: cannot lock ref 'refs/remotes/origin/main': is at e64f1d8497409e76387cce3afcd5c51406a4174d but expected 6bf865a43beb8149c8f64a0af297c09c313f9a4a
+ ! 6bf865a43..e64f1d849  main       -> origin/main  (unable to update local ref)
+EOF
+	exit 1
+fi
+exit 0
+`)
+	countPath := filepath.Join(t.TempDir(), "git-count")
+	gateway := New(Options{GitPath: gitPath})
+
+	err := gateway.runGit(ctx, t.TempDir(), map[string]string{"FAKE_GIT_COUNT": countPath}, "fetch", "origin", "main")
+	if err != nil {
+		t.Fatalf("runGit(fetch) error = %v, want retry success", err)
+	}
+	if got := stringsTrimSpace(readFile(t, countPath)); got != "2" {
+		t.Fatalf("git attempts = %s, want 2", got)
+	}
+}
+
 func TestGatewayRemoteBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
 	t.Parallel()
 
@@ -897,6 +932,15 @@ func runGitCommand(cwd string, args ...string) (string, error) {
 		return "", fmt.Errorf("%s", message)
 	}
 	return stdout.String(), nil
+}
+
+func writeFakeGit(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	}
+	return path
 }
 
 func stringsTrimSpace(value string) string {

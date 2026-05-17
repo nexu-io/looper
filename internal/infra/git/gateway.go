@@ -24,6 +24,8 @@ var (
 	pushConflictErrorPattern    = regexp.MustCompile(`(?i)stale info|non-fast-forward|failed to push|rejected`)
 )
 
+var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
+
 type CheckoutMode string
 
 const (
@@ -903,6 +905,25 @@ func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string,
 }
 
 func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
+	var result shell.Result
+	var err error
+	for attempt := 0; ; attempt++ {
+		result, err = g.runGitResultOnce(ctx, cwd, env, args...)
+		if err == nil || !isRetryableFetchRefLockRace(args, err) || attempt >= len(fetchRefLockRetryDelays) {
+			return result, err
+		}
+
+		timer := time.NewTimer(fetchRefLockRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return result, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
 	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env})
 	if err == nil {
 		return result, nil
@@ -923,6 +944,14 @@ func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]s
 	}
 
 	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+}
+
+func isRetryableFetchRefLockRace(args []string, err error) bool {
+	if len(args) == 0 || args[0] != "fetch" || err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "cannot lock ref") && strings.Contains(message, " but expected ")
 }
 
 func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
