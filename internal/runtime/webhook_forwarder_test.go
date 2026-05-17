@@ -136,8 +136,9 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 		if item.command.Path != ghPath {
 			t.Fatalf("forwarder gh path = %q, want %q", item.command.Path, ghPath)
 		}
-		if got := strings.Join(item.command.Events, ","); got != strings.Join(webhookForwarderEvents, ",") {
-			t.Fatalf("forwarder events = %q, want %q", got, strings.Join(webhookForwarderEvents, ","))
+		wantEvents := []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "check_run"}
+		if got := strings.Join(item.command.Events, ","); got != strings.Join(wantEvents, ",") {
+			t.Fatalf("forwarder events = %q, want %q", got, strings.Join(wantEvents, ","))
 		}
 		if item.command.URL != "http://127.0.0.1:17310/webhook/forward" {
 			t.Fatalf("forwarder URL = %q, want loopback webhook URL", item.command.URL)

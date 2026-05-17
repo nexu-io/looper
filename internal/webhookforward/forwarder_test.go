@@ -81,6 +81,62 @@ func TestForwardIgnoresUnsupportedAndNonPullRequestIssueComments(t *testing.T) {
 	fixerRunner.assertCallCount(t, 0)
 }
 
+func TestForwardTriggersFixerForFailedCheckWebhookEvents(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	requests := []DeliveryRequest{
+		{DeliveryID: "check-run-1", EventType: "check_run", Payload: checkRunPayload("completed", "failure", "acme/looper", 42)},
+		{DeliveryID: "check-run-2", EventType: "check_run", Payload: checkRunFallbackPayload("completed", "timed_out", "acme/looper", 43)},
+	}
+
+	for _, request := range requests {
+		result, err := forwarder.Forward(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Forward(%s) error = %v", request.EventType, err)
+		}
+		if result.Status != "accepted" {
+			t.Fatalf("Forward(%s) status = %q, want accepted", request.EventType, result.Status)
+		}
+	}
+
+	fixerRunner.waitForCalls(t, 2)
+	fixerRunner.assertPRCount(t, 42, 1)
+	fixerRunner.assertPRCount(t, 43, 1)
+	reviewerRunner.assertCallCount(t, 0)
+}
+
+func TestForwardIgnoresNonPRAndNonFailedCheckWebhookEvents(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	for _, request := range []DeliveryRequest{
+		{DeliveryID: "check-run-no-pr", EventType: "check_run", Payload: []byte(`{"action":"completed","repository":{"full_name":"acme/looper"},"check_run":{"conclusion":"failure","pull_requests":[]}}`)},
+		{DeliveryID: "check-run-success", EventType: "check_run", Payload: checkRunPayload("completed", "success", "acme/looper", 42)},
+		{DeliveryID: "check-run-pending", EventType: "check_run", Payload: checkRunPayload("requested", "", "acme/looper", 42)},
+	} {
+		result, err := forwarder.Forward(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Forward(%s) error = %v", request.DeliveryID, err)
+		}
+		if result.Status != "ignored" {
+			t.Fatalf("Forward(%s) status = %q, want ignored", request.DeliveryID, result.Status)
+		}
+	}
+
+	shortSleep()
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
+
 func TestForwardFansOutToMultipleProjectsForSameRepo(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
@@ -433,6 +489,14 @@ func seedProject(t *testing.T, repos *storage.Repositories, projectID, repo stri
 
 func pullRequestPayload(action, repo string, prNumber int64) []byte {
 	return []byte(`{"action":"` + action + `","repository":{"full_name":"` + repo + `"},"pull_request":{"number":` + itoa(prNumber) + `}}`)
+}
+
+func checkRunPayload(action, conclusion, repo string, prNumber int64) []byte {
+	return []byte(`{"action":"` + action + `","repository":{"full_name":"` + repo + `"},"check_run":{"conclusion":"` + conclusion + `","pull_requests":[{"number":` + itoa(prNumber) + `}]}}`)
+}
+
+func checkRunFallbackPayload(action, conclusion, repo string, prNumber int64) []byte {
+	return []byte(`{"action":"` + action + `","repository":{"full_name":"` + repo + `"},"check_run":{"conclusion":"` + conclusion + `","pull_requests":[],"check_suite":{"pull_requests":[{"number":` + itoa(prNumber) + `}]}}}`)
 }
 
 func itoa(value int64) string {

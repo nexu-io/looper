@@ -135,7 +135,7 @@ type workItem struct {
 type routedDelivery struct {
 	repo       string
 	objectType string
-	number     int64
+	numbers    []int64
 	action     string
 	lanes      map[Lane]struct{}
 }
@@ -161,6 +161,24 @@ type issueCommentEnvelope struct {
 			URL string `json:"url"`
 		} `json:"pull_request"`
 	} `json:"issue"`
+}
+
+type pullRequestRef struct {
+	Number int64 `json:"number"`
+}
+
+type checkRunEnvelope struct {
+	Action     string `json:"action"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	CheckRun struct {
+		Conclusion   string           `json:"conclusion"`
+		PullRequests []pullRequestRef `json:"pull_requests"`
+		CheckSuite   struct {
+			PullRequests []pullRequestRef `json:"pull_requests"`
+		} `json:"check_suite"`
+	} `json:"check_run"`
 }
 
 type forwarder struct {
@@ -331,15 +349,20 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		if len(lanes) == 0 {
 			continue
 		}
-		matched++
-		key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Number: routed.number}
-		candidates = append(candidates, candidate{key: key, lanes: lanes})
-		itemKey := workKeyString(key)
-		item, exists := f.works[itemKey]
-		if exists && (item.running || item.enqueued) {
-			continue
+		for _, number := range routed.numbers {
+			if number <= 0 {
+				continue
+			}
+			matched++
+			key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Number: number}
+			candidates = append(candidates, candidate{key: key, lanes: lanes})
+			itemKey := workKeyString(key)
+			item, exists := f.works[itemKey]
+			if exists && (item.running || item.enqueued) {
+				continue
+			}
+			newQueueEntries++
 		}
-		newQueueEntries++
 	}
 	if newQueueEntries > f.queueCapacity-len(f.queue) {
 		f.stats.QueueRejected++
@@ -555,7 +578,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
 			return routedDelivery{}, false, errors.New("pull_request webhook missing repository or number")
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", number: envelope.PullRequest.Number, action: strings.TrimSpace(envelope.Action), lanes: lanes}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: lanes}, true, nil
 	case "issue_comment":
 		var envelope issueCommentEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -567,7 +590,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.Issue.Number <= 0 {
 			return routedDelivery{}, false, errors.New("issue_comment webhook missing repository or number")
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", number: envelope.Issue.Number, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.Issue.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
 	case "pull_request_review", "pull_request_review_comment":
 		var envelope pullRequestEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -576,9 +599,53 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", number: envelope.PullRequest.Number, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+	case "check_run":
+		var envelope checkRunEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode check_run webhook: %w", err)
+		}
+		if strings.TrimSpace(envelope.Action) != "completed" || !isFailingCheckConclusion(envelope.CheckRun.Conclusion) {
+			return routedDelivery{}, false, nil
+		}
+		numbers := pullRequestNumbers(envelope.CheckRun.PullRequests)
+		if len(numbers) == 0 {
+			numbers = pullRequestNumbers(envelope.CheckRun.CheckSuite.PullRequests)
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" {
+			return routedDelivery{}, false, errors.New("check_run webhook missing repository")
+		}
+		if len(numbers) == 0 {
+			return routedDelivery{}, false, nil
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
 	default:
 		return routedDelivery{}, false, nil
+	}
+}
+
+func pullRequestNumbers(items []pullRequestRef) []int64 {
+	seen := make(map[int64]struct{}, len(items))
+	numbers := make([]int64, 0, len(items))
+	for _, item := range items {
+		if item.Number <= 0 {
+			continue
+		}
+		if _, ok := seen[item.Number]; ok {
+			continue
+		}
+		seen[item.Number] = struct{}{}
+		numbers = append(numbers, item.Number)
+	}
+	return numbers
+}
+
+func isFailingCheckConclusion(conclusion string) bool {
+	switch strings.ToUpper(strings.TrimSpace(conclusion)) {
+	case "FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+		return true
+	default:
+		return false
 	}
 }
 
