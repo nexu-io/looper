@@ -298,6 +298,47 @@ func TestConfigMigrateForceBacksUpDanglingSymlinkDestination(t *testing.T) {
 	}
 }
 
+func TestBackupConfigFileCopiesSymlinkTargetContents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "real-config.toml")
+	if err := os.WriteFile(targetPath, []byte("before = true\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(target) error = %v", err)
+	}
+	configPath := filepath.Join(dir, "config.toml")
+	if err := os.Symlink(targetPath, configPath); err != nil {
+		t.Fatalf("Symlink(config) error = %v", err)
+	}
+
+	if err := backupConfigFile(configPath); err != nil {
+		t.Fatalf("backupConfigFile() error = %v", err)
+	}
+
+	backupPaths, err := filepath.Glob(configPath + ".*.bak")
+	if err != nil {
+		t.Fatalf("Glob(backup) error = %v", err)
+	}
+	if len(backupPaths) != 1 {
+		t.Fatalf("len(backupPaths) = %d, want 1", len(backupPaths))
+	}
+	if info, err := os.Lstat(backupPaths[0]); err != nil {
+		t.Fatalf("Lstat(backup) error = %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("backup remained symlink")
+	}
+	if err := os.WriteFile(targetPath, []byte("after = true\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(target after) error = %v", err)
+	}
+	backupRaw, err := os.ReadFile(backupPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(backup) error = %v", err)
+	}
+	if string(backupRaw) != "before = true\n" {
+		t.Fatalf("backup contents = %q, want original target contents", backupRaw)
+	}
+}
+
 func TestConfigMigrateUsesActiveConfigPathFromFlagWhenFromOmitted(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

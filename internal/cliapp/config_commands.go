@@ -550,8 +550,18 @@ func (r *commandRuntime) validatePartialConfig(partial config.PartialConfig) err
 }
 
 func backupConfigFile(path string) error {
-	_, err := createBackupConfigFile(path)
-	return err
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read config for backup: %w", err)
+	}
+	backupPath := fmt.Sprintf("%s.%s.bak", path, time.Now().UTC().Format("20060102150405.000000000"))
+	if err := os.WriteFile(backupPath, raw, 0o600); err != nil {
+		return fmt.Errorf("write config backup: %w", err)
+	}
+	return nil
 }
 
 func createBackupConfigFile(path string) (string, error) {
