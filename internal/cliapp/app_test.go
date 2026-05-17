@@ -2388,6 +2388,19 @@ func TestConfigMigrateDefaultPathCreatesCanonicalTOMLAndPreservesLegacyJSON(t *t
 	}
 }
 
+func TestConfigMigrateRejectsPositionalArguments(t *testing.T) {
+	exitCode, stdout, stderr := runApp(t, "config", "migrate", "./legacy.json")
+	if exitCode == 0 {
+		t.Fatalf("Run([config migrate ./legacy.json]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "unknown command \"./legacy.json\" for \"looper config migrate\"") {
+		t.Fatalf("stderr = %q, want positional-args rejection", stderr)
+	}
+}
+
 func TestConfigMigrateDefaultPathFailsClearlyWhenCanonicalDefaultAlreadyExists(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

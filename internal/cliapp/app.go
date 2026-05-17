@@ -186,7 +186,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "lint", short: "Lint the active config file", runE: runtime.configValidate}),
 					newCommand(commandSpec{use: "show", short: "Show active config", runE: runtime.configShow, localFlags: []flagSpec{boolFlag("source", "Show config file values with their source layer")}}),
 					newCommand(commandSpec{use: "edit", short: "Edit the active config file", runE: runtime.configEdit}),
-					newCommand(commandSpec{use: "migrate", short: "Migrate a config file to canonical format", runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path (defaults to ~/.looper/config.json)"), stringFlag("to", "path", "Destination config path (defaults to canonical TOML path)"), boolFlag("dry-run", "Preview the migrated canonical config without writing files"), boolFlag("force", "Overwrite an existing destination after creating a backup")}}),
+					newCommand(commandSpec{use: "migrate", short: "Migrate a config file to canonical format", args: cobra.NoArgs, runE: runtime.configMigrate, localFlags: []flagSpec{stringFlag("from", "path", "Source config path (defaults to ~/.looper/config.json)"), stringFlag("to", "path", "Destination config path (defaults to canonical TOML path)"), boolFlag("dry-run", "Preview the migrated canonical config without writing files"), boolFlag("force", "Overwrite an existing destination after creating a backup")}}),
 				},
 			}),
 			newCommand(commandSpec{
