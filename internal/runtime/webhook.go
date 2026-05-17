@@ -180,19 +180,33 @@ func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositor
 		desired[repo] = struct{}{}
 	}
 	w.clearTransientReconcileDegradedReasons()
+	inconclusive := false
 	for _, record := range records {
 		if _, ok := desired[record.Repo]; !ok {
 			w.cleanupForwarderRecord(ctx, record, "repo_removed")
 			continue
 		}
+		if w.forwarderState(record.Repo) != nil {
+			continue
+		}
 		state := WebhookForwarderState{Repo: record.Repo, Command: []string{record.GHPath, "webhook", "forward", "--repo", record.Repo, "--events", record.Events, "--url", record.Endpoint}}
-		if reason := w.adoptionGate(record, state.Command); reason == "" {
+		reason := w.adoptionGate(record, state.Command)
+		if reason == "" {
 			w.adoptForwarder(record, state.Command)
 			continue
-		} else if w.logger != nil {
+		}
+		if w.logger != nil {
 			w.logger.Warn("webhook.forwarder.adoption_rejected", map[string]any{"repo": record.Repo, "pid": record.PID, "reason": reason})
 		}
+		if reason == "probe_error" {
+			inconclusive = true
+			w.addDegradedReason(fmt.Sprintf("webhook forwarder bootstrap is incomplete: adoption probe for %s failed", record.Repo))
+			continue
+		}
 		w.cleanupForwarderRecord(ctx, record, "adoption_rejected")
+	}
+	if inconclusive {
+		return
 	}
 	w.mu.Lock()
 	w.bootstrapDone = true
@@ -315,6 +329,21 @@ func (w *webhookRuntime) Status() WebhookStatus {
 		status.Forwarders[i].StderrTail = append([]string{}, status.Forwarders[i].StderrTail...)
 	}
 	return status
+}
+
+func (w *webhookRuntime) forwarderState(repo string) *WebhookForwarderState {
+	if w == nil {
+		return nil
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for i := range w.status.Forwarders {
+		if w.status.Forwarders[i].Repo == repo {
+			state := w.status.Forwarders[i]
+			return &state
+		}
+	}
+	return nil
 }
 
 func (w *webhookRuntime) reconcileForwarders(repoSet map[string]struct{}) []string {

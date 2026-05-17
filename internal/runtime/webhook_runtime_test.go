@@ -722,6 +722,132 @@ func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *t
 	}
 }
 
+func TestWebhookRuntimeStartDoesNotLaunchReplacementWhenBootstrapProbeIsInconclusive(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	startedCh := make(chan struct{}, 1)
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() { startedCh <- struct{}{} }
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+	})
+	originalRetryDelay := webhookReconcileRetryDelay
+	webhookReconcileRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { webhookReconcileRetryDelay = originalRetryDelay })
+
+	repositories := openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper")
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	fingerprint, events := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	record := storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint, Endpoint: endpoint, Events: events, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
+	}
+
+	rt := &webhookRuntime{
+		ghPath:          ghPath,
+		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           &testProcessProbe{alive: true, startErr: errors.New("probe failed")},
+		now:             time.Now,
+	}
+	t.Cleanup(rt.Stop)
+
+	rt.Start(repositories)
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-startedCh:
+		t.Fatal("forwarder launch started, want bootstrap retry without replacement launch")
+	default:
+	}
+	if rt.bootstrapCompleted() {
+		t.Fatal("bootstrapCompleted() = true, want false after inconclusive adoption probe")
+	}
+	status := rt.Status()
+	if len(status.Forwarders) != 0 {
+		t.Fatalf("Status().Forwarders = %#v, want no replacement launch during inconclusive bootstrap", status.Forwarders)
+	}
+	if !status.Degraded || len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "webhook forwarder bootstrap is incomplete: adoption probe for nexu-io/looper failed") {
+		t.Fatalf("Status() = %#v, want transient bootstrap degradation for inconclusive adoption probe", status)
+	}
+	stored, err := repositories.WebhookForwarders.List(context.Background())
+	if err != nil {
+		t.Fatalf("WebhookForwarders.List() error = %v", err)
+	}
+	if len(stored) != 1 || stored[0].Repo != record.Repo {
+		t.Fatalf("WebhookForwarders.List() = %#v, want retained record during inconclusive bootstrap", stored)
+	}
+}
+
+func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata1 := `{"repo":"nexu-io/looper"}`
+	metadata2 := `{"repo":"nexu-io/other"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Other", RepoPath: "/tmp/other", MetadataJSON: &metadata2, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+
+	ghPath := "/usr/bin/gh"
+	endpoint := "http://127.0.0.1:7777/webhook/forward"
+	fingerprint1, events1 := commandFingerprint(ghPath, "nexu-io/looper", webhookForwardEvents, endpoint)
+	fingerprint2, events2 := commandFingerprint(ghPath, "nexu-io/other", webhookForwardEvents, endpoint)
+	record1 := storage.WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint1, Endpoint: endpoint, Events: events1, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	record2 := storage.WebhookForwarderRecord{Repo: "nexu-io/other", PID: 4343, ProcessStart: 101, Fingerprint: fingerprint2, Endpoint: endpoint, Events: events2, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record1); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert(record1) error = %v", err)
+	}
+	if err := repositories.WebhookForwarders.Upsert(context.Background(), record2); err != nil {
+		t.Fatalf("WebhookForwarders.Upsert(record2) error = %v", err)
+	}
+
+	probe := &multiProcessProbe{probes: map[int]testProcessProbe{
+		4242: {alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events1, "--url", endpoint}},
+		4343: {alive: true, startErr: errors.New("probe failed")},
+	}}
+	rt := &webhookRuntime{
+		ghPath:          ghPath,
+		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		probe:           probe,
+		now:             time.Now,
+	}
+	t.Cleanup(func() { probe.probes[4242] = testProcessProbe{}; rt.Stop() })
+
+	rt.Bootstrap(context.Background(), repositories)
+	rt.Bootstrap(context.Background(), repositories)
+
+	status := rt.Status()
+	if len(status.Forwarders) != 1 {
+		t.Fatalf("Status().Forwarders = %#v, want exactly one adopted forwarder after retry", status.Forwarders)
+	}
+	if !status.Forwarders[0].Adopted || status.Forwarders[0].Repo != record1.Repo {
+		t.Fatalf("Status().Forwarders = %#v, want single adopted forwarder for %q", status.Forwarders, record1.Repo)
+	}
+	if !status.Degraded || len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "webhook forwarder bootstrap is incomplete: adoption probe for nexu-io/other failed") {
+		t.Fatalf("Status() = %#v, want transient bootstrap degradation for inconclusive record", status)
+	}
+	if rt.bootstrapCompleted() {
+		t.Fatal("bootstrapCompleted() = true, want false while probe error remains inconclusive")
+	}
+}
+
 func TestWebhookRuntimeCleanupForwarderRecordRetainsUnverifiableRows(t *testing.T) {
 	t.Parallel()
 
@@ -872,6 +998,27 @@ type testProcessProbe struct {
 	exeErr   error
 	argv     []string
 	argvErr  error
+}
+
+type multiProcessProbe struct {
+	probes map[int]testProcessProbe
+}
+
+func (p *multiProcessProbe) IsAlive(pid int) (bool, error) {
+	probe := p.probes[pid]
+	return probe.alive, probe.aliveErr
+}
+func (p *multiProcessProbe) StartTime(pid int) (int64, error) {
+	probe := p.probes[pid]
+	return probe.start, probe.startErr
+}
+func (p *multiProcessProbe) ExecutablePath(pid int) (string, error) {
+	probe := p.probes[pid]
+	return probe.exe, probe.exeErr
+}
+func (p *multiProcessProbe) Argv(pid int) ([]string, error) {
+	probe := p.probes[pid]
+	return append([]string{}, probe.argv...), probe.argvErr
 }
 
 func (p *testProcessProbe) IsAlive(pid int) (bool, error)    { return p.alive, p.aliveErr }
