@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,7 +127,7 @@ func TestConfigMigrateDryRunPreviewsCanonicalTOMLWithoutWritingDestination(t *te
 	if _, err := os.Stat(toPath); !os.IsNotExist(err) {
 		t.Fatalf("Stat(%s) err = %v, want not exists", toPath, err)
 	}
-	for _, notWant := range []string{"reviewer =", "allowAutoApprove", "fixAllPullRequests", "[roles.reviewer.specReview]", "path = \"/tmp/repo\"", "instructions = {"} {
+	for _, notWant := range []string{"reviewer =", "[roles.reviewer.specReview]", "path = \"/tmp/repo\"", "instructions = {"} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("dry-run preview unexpectedly contained %q:\n%s", notWant, stdout)
 		}
@@ -187,6 +188,56 @@ func TestConfigMigrateWritesDestinationAndPreservesSource(t *testing.T) {
 	}
 	if strings.Contains(string(rawDest), "allowAutoApprove") {
 		t.Fatalf("destination still contained legacy key:\n%s", rawDest)
+	}
+}
+
+func TestConfigMigrateDryRunJSONReportsLegacyChanges(t *testing.T) {
+	t.Parallel()
+
+	fromPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"defaults": map[string]any{"allowAutoApprove": true},
+		"projects": []map[string]any{{
+			"id":   "project_1",
+			"name": "Repo",
+			"path": "/tmp/repo",
+			"instructions": map[string]any{
+				"worker": "legacy worker instructions",
+			},
+		}},
+		"notifications": map[string]any{"osascript": map[string]any{"enabled": false}},
+	})
+
+	exitCode, stdout, stderr := runAppWithLookPath(t, configLookPathForTests(), "config", "migrate", "--dry-run", "--json", "--from", fromPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config migrate --dry-run --json]) exit code = %d; stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([config migrate --dry-run --json]) stderr = %q, want empty", stderr)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("Unmarshal(stdout) error = %v\nraw=%q", err, stdout)
+	}
+	changes, ok := decoded["changes"].([]any)
+	if !ok {
+		t.Fatalf("changes type = %T, want []any", decoded["changes"])
+	}
+	got := make([]string, 0, len(changes))
+	for _, change := range changes {
+		text, ok := change.(string)
+		if !ok {
+			t.Fatalf("change type = %T, want string", change)
+		}
+		got = append(got, text)
+	}
+	for _, want := range []string{
+		"defaults.allowAutoApprove -> roles.reviewer.behavior.reviewEvents.clean",
+		"projects[0].instructions -> projects[0].roles.<role>.instructions",
+	} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("changes = %#v, want %q", got, want)
+		}
 	}
 }
 

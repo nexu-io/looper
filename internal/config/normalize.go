@@ -19,7 +19,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
-	canonical := normalizeLayerPartial(partial)
+	canonical := normalizeLayerPartial(clonePartialConfig(partial))
 	canonical.LegacyReviewer = nil
 
 	if canonical.Defaults != nil {
@@ -1208,6 +1208,69 @@ func cloneStrings(values []string) []string {
 	cloned := make([]string, len(values))
 	copy(cloned, values)
 	return cloned
+}
+
+func clonePartialConfig(partial PartialConfig) PartialConfig {
+	cloned := partial
+	if partial.Defaults != nil {
+		defaults := *partial.Defaults
+		cloned.Defaults = &defaults
+	}
+	if partial.LegacyReviewer != nil {
+		cloned.LegacyReviewer = clonePartialReviewerConfig(partial.LegacyReviewer)
+	}
+	if partial.Roles != nil {
+		cloned.Roles = clonePartialRoleConfigs(partial.Roles)
+	}
+	if partial.Projects != nil {
+		projects := clonePartialProjects(*partial.Projects)
+		cloned.Projects = &projects
+	}
+	return cloned
+}
+
+func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRefConfig {
+	if projects == nil {
+		return nil
+	}
+	cloned := make([]PartialProjectRefConfig, len(projects))
+	for index, project := range projects {
+		cloned[index] = PartialProjectRefConfig{
+			ID:           project.ID,
+			Name:         project.Name,
+			RepoPath:     project.RepoPath,
+			Path:         project.Path,
+			BaseBranch:   cloneStringPtr(project.BaseBranch),
+			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
+			Instructions: cloneStringMap(project.Instructions),
+			Roles:        clonePartialRoleConfigs(project.Roles),
+		}
+	}
+	return cloned
+}
+
+func clonePartialReviewerConfig(config *PartialReviewerConfig) *PartialReviewerConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	if config.Loop != nil {
+		loop := *config.Loop
+		cloned.Loop = &loop
+	}
+	if config.ReviewEvents != nil {
+		reviewEvents := *config.ReviewEvents
+		cloned.ReviewEvents = &reviewEvents
+	}
+	if config.NativeResume != nil {
+		nativeResume := *config.NativeResume
+		cloned.NativeResume = &nativeResume
+	}
+	if config.ThreadResolution != nil {
+		threadResolution := *config.ThreadResolution
+		cloned.ThreadResolution = &threadResolution
+	}
+	return &cloned
 }
 
 func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
