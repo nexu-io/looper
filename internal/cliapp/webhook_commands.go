@@ -392,7 +392,7 @@ func (r *commandRuntime) resolveGHPath(cfg config.Config) (string, error) {
 }
 
 func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo string) ([]webhookHook, error) {
-	result, err := r.runCommand(ctx, ghPath, []string{"api", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
+	result, err := r.runCommand(ctx, ghPath, []string{"api", "--paginate", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("list webhook hooks for %s: %w", repo, err)
 	}
