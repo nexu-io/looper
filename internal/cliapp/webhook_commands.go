@@ -280,21 +280,12 @@ func (r *commandRuntime) webhookCleanup(cmd *cobra.Command, args []string) error
 		_, err := fmt.Fprintf(cmd.OutOrStdout(), "Dry run only. Rerun with: looper webhook cleanup %s --confirm\n", repo)
 		return err
 	}
-	freshHooks, err := r.listWebhookHooks(cmd.Context(), ghPath, repo)
-	if err != nil {
-		return err
-	}
-	freshCandidates := webhookCleanupCandidates(freshHooks)
-	if len(freshCandidates) == 0 {
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "No stale GitHub CLI webhook hooks remain for %s.\n", repo)
-		return err
-	}
-	for _, candidate := range freshCandidates {
+	for _, candidate := range candidates {
 		if err := r.deleteWebhookHook(cmd.Context(), ghPath, repo, candidate.ID); err != nil {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %d GitHub CLI webhook hook(s) for %s.\n", len(freshCandidates), repo)
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %d GitHub CLI webhook hook(s) for %s.\n", len(candidates), repo)
 	return err
 }
 
