@@ -833,10 +833,21 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			w.logger.Info("webhook.forwarder.spawned", map[string]any{"repo": repo, "pid": pid, "fingerprint": fingerprint, "daemon_id": w.daemonID})
 		}
 
-		var pipes sync.WaitGroup
+		var (
+			pipes           sync.WaitGroup
+			stderrTailMu    sync.Mutex
+			localStderrTail []string
+		)
 		pipes.Add(2)
 		go func() { defer pipes.Done(); w.captureTail(repo, stopCh, stdout, true) }()
-		go func() { defer pipes.Done(); w.captureTail(repo, stopCh, stderr, false) }()
+		go func() {
+			defer pipes.Done()
+			w.captureTail(repo, stopCh, stderr, false, func(line string) {
+				stderrTailMu.Lock()
+				defer stderrTailMu.Unlock()
+				localStderrTail = appendTail(localStderrTail, line, webhookForwarderStderrTailLines)
+			})
+		}()
 		err = cmd.Wait()
 		close(stopKillDone)
 		pipes.Wait()
@@ -853,7 +864,9 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			state.RestartCount++
 		})
 		w.deleteForwarderRecord(repo)
-		classification := classifyForwarderExit(w.stderrTail(repo, stopCh), err)
+		stderrTailMu.Lock()
+		classification := classifyForwarderExit(append([]string{}, localStderrTail...), err)
+		stderrTailMu.Unlock()
 		if w.logger != nil {
 			w.logger.Info("webhook.forwarder.exited", map[string]any{"repo": repo, "pid": pid, "exit_class": string(classification.Class), "matched_pattern": classification.MatchedPattern, "wait_err": message})
 		}
@@ -882,14 +895,22 @@ func (w *webhookRuntime) runForwarder(repo string) {
 	}
 }
 
-func (w *webhookRuntime) captureTail(repo string, stopCh chan struct{}, pipe io.ReadCloser, stdout bool) {
+func (w *webhookRuntime) captureTail(repo string, stopCh chan struct{}, pipe io.ReadCloser, stdout bool, onLine ...func(string)) {
+	var recordLine func(string)
+	if len(onLine) > 0 {
+		recordLine = onLine[0]
+	}
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
+		line := scanner.Text()
+		if recordLine != nil {
+			recordLine(line)
+		}
 		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
 			if stdout {
-				state.StdoutTail = appendTail(state.StdoutTail, scanner.Text(), webhookForwarderStdoutTailLines)
+				state.StdoutTail = appendTail(state.StdoutTail, line, webhookForwarderStdoutTailLines)
 			} else {
-				state.StderrTail = appendTail(state.StderrTail, scanner.Text(), webhookForwarderStderrTailLines)
+				state.StderrTail = appendTail(state.StderrTail, line, webhookForwarderStderrTailLines)
 			}
 		})
 	}
