@@ -441,7 +441,7 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	}
 }
 
-func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeaders(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackWithForwardedHeaders(t *testing.T) {
 	fixture := newTestFixture(t)
 	token := "secret-token"
 	fixture.config.Server.AuthMode = config.AuthModeLocalToken
@@ -464,15 +464,14 @@ func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeaders(t *testing.T) 
 
 	h.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403 body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
 	}
-	if forwarder.calls != 0 {
-		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
-	errMap := body["error"].(map[string]any)
-	assertEqual(t, errMap["message"], "Webhook forwarding does not accept proxied loopback requests")
+	assertEqual(t, body["ok"], true)
 }
 
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
