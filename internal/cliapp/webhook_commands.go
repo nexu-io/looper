@@ -485,10 +485,18 @@ func sortedLowercase(values []string) []string {
 func normalizeWebhookRepo(value string) (string, error) {
 	repo := strings.TrimSpace(value)
 	parts := strings.Split(repo, "/")
-	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		return "", errors.New("repo must be in owner/repo form")
+	if len(parts) != 2 && len(parts) != 3 {
+		return "", errors.New("repo must be in owner/repo or host/owner/repo form")
 	}
-	return strings.TrimSpace(parts[0]) + "/" + strings.TrimSpace(parts[1]), nil
+	trimmed := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return "", errors.New("repo must be in owner/repo or host/owner/repo form")
+		}
+		trimmed = append(trimmed, part)
+	}
+	return strings.Join(trimmed, "/"), nil
 }
 
 func webhookGHPath(cfg config.Config) string {
