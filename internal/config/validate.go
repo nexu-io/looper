@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -303,8 +304,9 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 	if config.ListenPort < 1024 || config.ListenPort > 65535 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".listenPort", Message: "must be an integer between 1024 and 65535 when webhook mode is tunnel"})
 	}
-	if !strings.HasPrefix(config.PublicBaseURL, "https://") {
-		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must start with https:// when webhook mode is tunnel"})
+	parsed, err := url.Parse(config.PublicBaseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
 	}
 }
 
