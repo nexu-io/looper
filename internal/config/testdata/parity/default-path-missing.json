@@ -38,7 +38,10 @@
       },
       "webhook": {
         "enabled": false,
-        "fallbackPollIntervalSeconds": 300
+        "fallbackPollIntervalSeconds": 300,
+        "listenPort": 0,
+        "mode": "gh-forward",
+        "publicBaseUrl": ""
       },
       "agent": {
         "params": {},

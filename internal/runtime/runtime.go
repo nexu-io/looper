@@ -182,6 +182,9 @@ func New(options Options) *Runtime {
 		activeExecutions:       NewActiveExecutionRegistry(),
 		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
 	}
+	if rt.webhook != nil {
+		rt.webhook.forwarder = rt.WebhookForwarder
+	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
 	}

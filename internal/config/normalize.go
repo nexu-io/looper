@@ -345,6 +345,18 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 		config.Enabled = *partial.Enabled
 	}
 
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+
+	if partial.ListenPort != nil {
+		config.ListenPort = *partial.ListenPort
+	}
+
+	if partial.PublicBaseURL != nil {
+		config.PublicBaseURL = *partial.PublicBaseURL
+	}
+
 	if partial.FallbackPollIntervalSeconds != nil {
 		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
 	}
@@ -1260,11 +1272,20 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Path:         project.Path,
 			BaseBranch:   cloneStringPtr(project.BaseBranch),
 			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
+			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
+}
+
+func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *PartialProjectWebhookConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
 }
 
 func clonePartialReviewerConfig(config *PartialReviewerConfig) *PartialReviewerConfig {
@@ -1307,6 +1328,9 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			RepoPath: repoPath,
 			Path:     project.Path,
 			Roles:    roles,
+		}
+		if project.Webhook != nil && project.Webhook.Mode != nil {
+			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
 
 		if project.BaseBranch != nil {

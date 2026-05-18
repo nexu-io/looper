@@ -157,9 +157,19 @@ type SchedulerConfig struct {
 }
 
 type WebhookConfig struct {
-	Enabled                     bool `json:"enabled"`
-	FallbackPollIntervalSeconds int  `json:"fallbackPollIntervalSeconds"`
+	Enabled                     bool        `json:"enabled"`
+	Mode                        WebhookMode `json:"mode"`
+	ListenPort                  int         `json:"listenPort"`
+	PublicBaseURL               string      `json:"publicBaseUrl"`
+	FallbackPollIntervalSeconds int         `json:"fallbackPollIntervalSeconds"`
 }
+
+type WebhookMode string
+
+const (
+	WebhookModeGHForward WebhookMode = "gh-forward"
+	WebhookModeTunnel    WebhookMode = "tunnel"
+)
 
 type AgentConfig struct {
 	Vendor       *AgentVendor            `json:"vendor,omitempty"`
@@ -534,24 +544,34 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string              `json:"id"`
-	Name         string              `json:"name"`
-	RepoPath     string              `json:"repoPath"`
-	Path         string              `json:"path,omitempty"`
-	BaseBranch   *string             `json:"baseBranch,omitempty"`
-	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
-	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
+	ID           string               `json:"id"`
+	Name         string               `json:"name"`
+	RepoPath     string               `json:"repoPath"`
+	Path         string               `json:"path,omitempty"`
+	BaseBranch   *string              `json:"baseBranch,omitempty"`
+	WorktreeRoot *string              `json:"worktreeRoot,omitempty"`
+	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
+	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
+}
+
+type ProjectWebhookConfig struct {
+	Mode WebhookMode `json:"mode,omitempty"`
 }
 
 type PartialProjectRefConfig struct {
-	ID           string              `json:"id"`
-	Name         string              `json:"name"`
-	RepoPath     string              `json:"repoPath"`
-	Path         string              `json:"path,omitempty"`
-	BaseBranch   *string             `json:"baseBranch,omitempty"`
-	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
-	Instructions map[string]string   `json:"instructions,omitempty"`
-	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
+	ID           string                       `json:"id"`
+	Name         string                       `json:"name"`
+	RepoPath     string                       `json:"repoPath"`
+	Path         string                       `json:"path,omitempty"`
+	BaseBranch   *string                      `json:"baseBranch,omitempty"`
+	WorktreeRoot *string                      `json:"worktreeRoot,omitempty"`
+	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
+	Instructions map[string]string            `json:"instructions,omitempty"`
+	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+}
+
+type PartialProjectWebhookConfig struct {
+	Mode *WebhookMode `json:"mode,omitempty"`
 }
 
 type Config struct {
@@ -595,8 +615,11 @@ type PartialSchedulerConfig struct {
 }
 
 type PartialWebhookConfig struct {
-	Enabled                     *bool `json:"enabled,omitempty"`
-	FallbackPollIntervalSeconds *int  `json:"fallbackPollIntervalSeconds,omitempty"`
+	Enabled                     *bool        `json:"enabled,omitempty"`
+	Mode                        *WebhookMode `json:"mode,omitempty"`
+	ListenPort                  *int         `json:"listenPort,omitempty"`
+	PublicBaseURL               *string      `json:"publicBaseUrl,omitempty"`
+	FallbackPollIntervalSeconds *int         `json:"fallbackPollIntervalSeconds,omitempty"`
 }
 
 type PartialAgentConfig struct {

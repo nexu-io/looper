@@ -14,7 +14,46 @@ For the default supported macOS install flow:
 
 The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
-Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The webhook forwarder lock uses OS file locking and is not designed for NFS-style shared filesystems.
+Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The webhook forwarder lock uses OS file locking and is not designed for NFS-style shared filesystems. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
+
+## Webhook delivery modes
+
+`webhook.enabled=true` supports two delivery modes:
+
+- `gh-forward` (default): Looper starts `gh webhook forward` against each configured repo and receives deliveries on the daemon API route `/webhook/forward`.
+- `tunnel`: Looper creates an ordinary GitHub repository webhook per repo and expects the user to run a tunnel to `127.0.0.1:<webhook.listenPort>`.
+
+Tunnel-mode example:
+
+```toml
+[webhook]
+enabled = true
+mode = "tunnel"
+listenPort = 8765
+publicBaseUrl = "https://looper.example.com"
+fallbackPollIntervalSeconds = 300
+
+[[projects]]
+id = "looper"
+name = "looper"
+repoPath = "/Users/me/src/looper"
+
+[[projects]]
+id = "private"
+name = "private"
+repoPath = "/Users/me/src/private"
+[projects.webhook]
+mode = "gh-forward"
+```
+
+Rules:
+
+- `webhook.mode` is the global default. A project may override with `projects[].webhook.mode`.
+- `tunnel` requires `webhook.listenPort` between `1024` and `65535` and an HTTPS `webhook.publicBaseUrl`.
+- The tunnel URL for repo `owner/repo` is `{publicBaseUrl}/webhook/owner/repo`.
+- Looper binds only `127.0.0.1:<listenPort>`; it does not run or supervise `cloudflared`, `ngrok`, Tailscale Funnel, or any reverse proxy.
+- Looper stores the remote GitHub hook id in SQLite and the HMAC secret in `secrets/webhook_<owner>_<repo>.key` with mode `0600`.
+- Removing a project or switching it away from `tunnel` marks the local hook record orphaned; it does not delete the GitHub hook automatically.
 
 ## How config loading works
 
