@@ -39,6 +39,7 @@ type WebhookStatus struct {
 	ListenerPath                string                  `json:"listenerPath"`
 	EndpointURL                 string                  `json:"endpointUrl"`
 	TunnelListenerURL           string                  `json:"tunnelListenerUrl,omitempty"`
+	TunnelPublicBaseURL         string                  `json:"tunnelPublicBaseUrl,omitempty"`
 	Degraded                    bool                    `json:"degraded"`
 	DegradedReasons             []string                `json:"degradedReasons"`
 	Queue                       WebhookQueueStatus      `json:"queue"`
@@ -133,6 +134,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		ListenerPath:                webhookListenerPath,
 		EndpointURL:                 endpointURL,
 		TunnelListenerURL:           webhookTunnelListenerURL(cfg),
+		TunnelPublicBaseURL:         strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/"),
 		DegradedReasons:             []string{},
 		Queue:                       WebhookQueueStatus{Capacity: 0},
 		RecentOutcomes:              []WebhookRecentOutcome{},

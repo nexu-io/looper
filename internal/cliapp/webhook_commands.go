@@ -44,6 +44,7 @@ type webhookRuntimeView struct {
 	ListenerPath                string   `json:"listenerPath"`
 	EndpointURL                 string   `json:"endpointUrl"`
 	TunnelListenerURL           string   `json:"tunnelListenerUrl"`
+	TunnelPublicBaseURL         string   `json:"tunnelPublicBaseUrl"`
 	FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
 	Degraded                    bool     `json:"degraded"`
 	DegradedReasons             []string `json:"degradedReasons"`
@@ -473,7 +474,26 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 	if runtimeMode != configMode {
 		return true
 	}
+	if runtimeMode == config.WebhookModeTunnel {
+		if output.Runtime.TunnelListenerURL != webhookStatusTunnelListenerURL(output.ListenPort) {
+			return true
+		}
+		if normalizeWebhookStatusPublicBaseURL(output.Runtime.TunnelPublicBaseURL) != normalizeWebhookStatusPublicBaseURL(output.PublicBaseURL) {
+			return true
+		}
+	}
 	return output.Runtime.FallbackPollIntervalSeconds != output.FallbackPoll
+}
+
+func webhookStatusTunnelListenerURL(listenPort int) string {
+	if listenPort <= 0 {
+		return ""
+	}
+	return "http://" + net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", listenPort))
+}
+
+func normalizeWebhookStatusPublicBaseURL(baseURL string) string {
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
 }
 
 func writeHumanWebhookStatus(w io.Writer, data webhookStatusOutput, verbose bool) error {

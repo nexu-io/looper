@@ -28,6 +28,7 @@ import (
 
 const webhookTunnelDisableLatchThreshold = 3
 const webhookTunnelDisableLatchWindow = 24 * time.Hour
+const maxWebhookTunnelPayloadBytes = 1 << 20
 
 type webhookTunnelGitHubHook struct {
 	ID     int64    `json:"id"`
@@ -375,8 +376,13 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "webhook secret unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookTunnelPayloadBytes))
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}

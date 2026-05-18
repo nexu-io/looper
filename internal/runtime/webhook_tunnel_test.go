@@ -177,6 +177,25 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 		}
 	})
 
+	t.Run("oversized payload rejected before hmac validation", func(t *testing.T) {
+		forwarder.reset()
+		body := bytes.Repeat([]byte("a"), maxWebhookTunnelPayloadBytes+1)
+		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-GitHub-Delivery", "delivery-too-large")
+		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
+		resp := httptest.NewRecorder()
+
+		server.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusRequestEntityTooLarge)
+		}
+		if forwarder.calls != 0 {
+			t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+		}
+	})
+
 	t.Run("repository mismatch rejected", func(t *testing.T) {
 		forwarder.reset()
 		body := []byte(`{"repository":{"full_name":"acme/other"}}`)
