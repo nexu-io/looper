@@ -114,12 +114,13 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "webhook",
 				short:           "Webhook configuration and status",
-				helpSubcommands: []helpSubcommand{{name: "enable", description: "Enable webhook mode"}, {name: "disable", description: "Disable webhook mode"}, {name: "status", description: "Show webhook status"}},
+				helpSubcommands: []helpSubcommand{{name: "enable", description: "Enable webhook mode"}, {name: "disable", description: "Disable webhook mode"}, {name: "status", description: "Show webhook status"}, {name: "cleanup", description: "Inspect or delete stale GitHub CLI webhook hooks"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "enable", short: "Enable webhook mode", runE: runtime.webhookEnable, localFlags: []flagSpec{boolFlag("install-gh-webhook", "Install the GitHub CLI webhook extension if gh webhook is unavailable")}}),
 					newCommand(commandSpec{use: "disable", short: "Disable webhook mode", runE: runtime.webhookDisable}),
 					newCommand(commandSpec{use: "status", short: "Show webhook status", runE: runtime.webhookStatus, localFlags: []flagSpec{boolFlag("verbose", "Show per-repo forwarder details and log tails")}}),
+					newCommand(commandSpec{use: "cleanup <owner/repo>", short: "Inspect or delete stale GitHub CLI webhook hooks", args: cobra.ExactArgs(1), runE: runtime.webhookCleanup, localFlags: []flagSpec{boolFlag("confirm", "Delete matching stale GitHub CLI webhook hooks instead of showing a dry run")}, exampleLines: []string{"$ looper webhook cleanup owner/repo", "$ looper webhook cleanup owner/repo --confirm"}}),
 				},
 			}),
 			newCommand(commandSpec{

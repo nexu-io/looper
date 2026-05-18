@@ -18,6 +18,15 @@ If the project is not registered in Looper yet:
 looper project add /path/to/repo --id myproj --repo owner/repo
 ```
 
+If webhook mode reports `degraded`, inspect stale GitHub CLI forwarder hooks first:
+
+```bash
+looper webhook status
+looper webhook cleanup owner/repo
+# if the dry run shows stale GitHub CLI hooks:
+looper webhook cleanup owner/repo --confirm
+```
+
 Also make sure:
 
 - `looperd` is running

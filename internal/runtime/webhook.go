@@ -27,6 +27,11 @@ var webhookReconcileRetryDelay = 5 * time.Second
 
 var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
 
+const (
+	webhookForwarderStdoutTailLines = 20
+	webhookForwarderStderrTailLines = 40
+)
+
 type WebhookStatus struct {
 	Enabled                     bool                    `json:"enabled"`
 	FallbackPollIntervalSeconds int                     `json:"fallbackPollIntervalSeconds"`
@@ -882,9 +887,9 @@ func (w *webhookRuntime) captureTail(repo string, stopCh chan struct{}, pipe io.
 	for scanner.Scan() {
 		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
 			if stdout {
-				state.StdoutTail = appendTail(state.StdoutTail, scanner.Text(), 20)
+				state.StdoutTail = appendTail(state.StdoutTail, scanner.Text(), webhookForwarderStdoutTailLines)
 			} else {
-				state.StderrTail = appendTail(state.StderrTail, scanner.Text(), 20)
+				state.StderrTail = appendTail(state.StderrTail, scanner.Text(), webhookForwarderStderrTailLines)
 			}
 		})
 	}

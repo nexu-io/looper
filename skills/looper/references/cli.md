@@ -27,6 +27,19 @@ looper status
 looper daemon status
 looper daemon status --json
 looper daemon logs
+looper webhook status
+```
+
+If webhook mode is degraded because `gh webhook forward` left conflicting GitHub CLI hooks behind, inspect them with:
+
+```bash
+looper webhook cleanup owner/repo
+```
+
+That command is dry-run by default. Only after confirming the listed `cli` hooks are stale should you delete them:
+
+```bash
+looper webhook cleanup owner/repo --confirm
 ```
 
 ## Common operations

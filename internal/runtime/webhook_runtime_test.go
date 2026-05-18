@@ -587,7 +587,27 @@ func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) 
 		starts++
 		mu.Unlock()
 		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
-		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "LOOPER_HELPER_STDERR_EXIT=Hook already exists on this repository")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", `LOOPER_HELPER_STDERR_EXIT=Error: error creating webhook: HTTP 422: Validation Failed
+Hook already exists on this repository
+Usage:
+  forward --events=<types> [--url=<url>] [flags]
+
+Examples:
+# create a dev webhook for the 'issue_open' event in the monalisa/smile repo in GitHub running locally, and
+# forward payloads for the triggered event to http://localhost:9999/webhooks
+
+$ gh webhook forward --events=issues --repo=monalisa/smile --url="http://localhost:9999/webhooks"
+$ gh webhook forward --events=issues --org=github --url="http://localhost:9999/webhooks"
+
+
+Flags:
+  -E, --events types         Names of the event types to forward. Use * to forward all events.
+  -H, --github-host string   GitHub host name (default "github.com")
+  -h, --help                 help for forward
+  -O, --org string           Name of the org where the webhook is installed
+  -R, --repo string          Name of the repo where the webhook is installed
+  -S, --secret string        Webhook secret for incoming events
+  -U, --url string           Address of the local server to receive events. If omitted, events will be printed to stdout.`)
 		cmd.Args[0] = name
 		return cmd
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 )
 
 const ghWebhookExtension = "cli/gh-webhook"
+
+const ghWebhookForwarderHookURL = "https://webhook-forwarder.github.com/hook"
 
 type webhookStatusOutput struct {
 	ConfigPath       string              `json:"configPath"`
@@ -69,6 +72,23 @@ type webhookRuntimeView struct {
 		StdoutTail    []string `json:"stdoutTail,omitempty"`
 		StderrTail    []string `json:"stderrTail,omitempty"`
 	} `json:"forwarders"`
+}
+
+type webhookHook struct {
+	ID     int64    `json:"id"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type"`
+	Active bool     `json:"active"`
+	Events []string `json:"events"`
+	Config struct {
+		URL string `json:"url"`
+	} `json:"config"`
+}
+
+type webhookCleanupCandidate struct {
+	ID     int64
+	Events string
+	Active bool
 }
 
 func (r *commandRuntime) webhookEnable(cmd *cobra.Command, args []string) error {
@@ -226,6 +246,58 @@ func (r *commandRuntime) webhookStatus(cmd *cobra.Command, args []string) error 
 	return writeHumanWebhookStatus(cmd.OutOrStdout(), output, getBoolFlag(cmd, "verbose"))
 }
 
+func (r *commandRuntime) webhookCleanup(cmd *cobra.Command, args []string) error {
+	repo, err := normalizeWebhookRepo(args[0])
+	if err != nil {
+		return err
+	}
+	loaded, err := r.loadConfig()
+	if err != nil {
+		return err
+	}
+	ghPath, err := r.resolveGHPath(loaded.Config)
+	if err != nil {
+		return err
+	}
+	hooks, err := r.listWebhookHooks(cmd.Context(), ghPath, repo)
+	if err != nil {
+		return err
+	}
+	candidates := webhookCleanupCandidates(hooks)
+	if len(candidates) == 0 {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "No stale GitHub CLI webhook hooks found for %s.\n", repo)
+		return err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Found %d GitHub CLI webhook hook(s) for %s:\n", len(candidates), repo); err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "- id=%d active=%t events=%s\n", candidate.ID, candidate.Active, candidate.Events); err != nil {
+			return err
+		}
+	}
+	if !getBoolFlag(cmd, "confirm") {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "Dry run only. Rerun with: looper webhook cleanup %s --confirm\n", repo)
+		return err
+	}
+	freshHooks, err := r.listWebhookHooks(cmd.Context(), ghPath, repo)
+	if err != nil {
+		return err
+	}
+	freshCandidates := webhookCleanupCandidates(freshHooks)
+	if len(freshCandidates) == 0 {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "No stale GitHub CLI webhook hooks remain for %s.\n", repo)
+		return err
+	}
+	for _, candidate := range freshCandidates {
+		if err := r.deleteWebhookHook(cmd.Context(), ghPath, repo, candidate.ID); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %d GitHub CLI webhook hook(s) for %s.\n", len(freshCandidates), repo)
+	return err
+}
+
 func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 	if output.Runtime == nil {
 		return false
@@ -257,6 +329,15 @@ func writeHumanWebhookStatus(w io.Writer, data webhookStatusOutput, verbose bool
 		return err
 	}
 	printSection(w, "Counters", [][2]any{{"deliveriesReceived", data.Runtime.Counters.DeliveriesReceived}, {"coalesced", data.Runtime.Counters.Coalesced}, {"dropped", data.Runtime.Counters.Dropped}, {"queued", data.Runtime.Counters.Queued}, {"processed", data.Runtime.Counters.Processed}, {"failed", data.Runtime.Counters.Failed}})
+	if data.Runtime.Degraded {
+		commands := webhookCleanupSuggestions(data.Runtime)
+		if len(commands) > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+			printSection(w, "Cleanup hint", [][2]any{{"staleCliWebhookCleanup", strings.Join(commands, "\n")}, {"note", "Run the dry-run command first; add --confirm to delete matching GitHub CLI webhook hooks."}})
+		}
+	}
 	if !verbose {
 		return nil
 	}
@@ -292,6 +373,119 @@ func webhookWarnings(cfg config.Config) []string {
 		warnings = append(warnings, "gh could not be resolved; looperd will degrade webhook mode to poll fallback")
 	}
 	return warnings
+}
+
+func (r *commandRuntime) resolveGHPath(cfg config.Config) (string, error) {
+	ghPath := webhookGHPath(cfg)
+	if ghPath != "" {
+		return ghPath, nil
+	}
+	resolved, err := r.lookPath()("gh")
+	if err != nil {
+		return "", errors.New("gh is not configured or could not be resolved")
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return "", errors.New("gh is not configured or could not be resolved")
+	}
+	return resolved, nil
+}
+
+func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo string) ([]webhookHook, error) {
+	result, err := r.runCommand(ctx, ghPath, []string{"api", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("list webhook hooks for %s: %w", repo, err)
+	}
+	if result.ExitCode != 0 {
+		output := strings.TrimSpace(strings.Join([]string{result.Stderr, result.Stdout}, "\n"))
+		if output == "" {
+			output = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return nil, fmt.Errorf("list webhook hooks for %s: %s", repo, output)
+	}
+	var hooks []webhookHook
+	if err := json.Unmarshal([]byte(result.Stdout), &hooks); err != nil {
+		return nil, fmt.Errorf("decode webhook hooks for %s: %w", repo, err)
+	}
+	return hooks, nil
+}
+
+func (r *commandRuntime) deleteWebhookHook(ctx context.Context, ghPath, repo string, id int64) error {
+	result, err := r.runCommand(ctx, ghPath, []string{"api", "-X", "DELETE", fmt.Sprintf("repos/%s/hooks/%d", repo, id)}, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("delete webhook hook %d for %s: %w", id, repo, err)
+	}
+	if result.ExitCode != 0 {
+		output := strings.TrimSpace(strings.Join([]string{result.Stderr, result.Stdout}, "\n"))
+		if output == "" {
+			output = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return fmt.Errorf("delete webhook hook %d for %s: %s", id, repo, output)
+	}
+	return nil
+}
+
+func webhookCleanupCandidates(hooks []webhookHook) []webhookCleanupCandidate {
+	candidates := make([]webhookCleanupCandidate, 0, len(hooks))
+	for _, hook := range hooks {
+		if !strings.EqualFold(strings.TrimSpace(hook.Name), "cli") {
+			continue
+		}
+		if strings.TrimSpace(hook.Config.URL) != ghWebhookForwarderHookURL {
+			continue
+		}
+		candidates = append(candidates, webhookCleanupCandidate{ID: hook.ID, Active: hook.Active, Events: strings.Join(sortedLowercase(hook.Events), ",")})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	return candidates
+}
+
+func webhookCleanupSuggestions(runtime *webhookRuntimeView) []string {
+	if runtime == nil {
+		return nil
+	}
+	repos := map[string]struct{}{}
+	for _, forwarder := range runtime.Forwarders {
+		repo := strings.TrimSpace(forwarder.Repo)
+		if repo == "" {
+			continue
+		}
+		if forwarder.Running && !forwarder.Latched && strings.TrimSpace(forwarder.LastError) == "" {
+			continue
+		}
+		repos[repo] = struct{}{}
+	}
+	if len(repos) == 0 {
+		return []string{"looper webhook cleanup <owner/repo>"}
+	}
+	commands := make([]string, 0, len(repos))
+	for repo := range repos {
+		commands = append(commands, fmt.Sprintf("looper webhook cleanup %s", repo))
+	}
+	sort.Strings(commands)
+	return commands
+}
+
+func sortedLowercase(values []string) []string {
+	canon := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.ToLower(strings.TrimSpace(value))
+		if trimmed == "" {
+			continue
+		}
+		canon = append(canon, trimmed)
+	}
+	sort.Strings(canon)
+	return canon
+}
+
+func normalizeWebhookRepo(value string) (string, error) {
+	repo := strings.TrimSpace(value)
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", errors.New("repo must be in owner/repo form")
+	}
+	return strings.TrimSpace(parts[0]) + "/" + strings.TrimSpace(parts[1]), nil
 }
 
 func webhookGHPath(cfg config.Config) string {

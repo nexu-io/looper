@@ -219,6 +219,19 @@ looper status
 looper daemon status --json
 looper daemon logs --startup
 looper config show
+looper webhook status
+```
+
+When webhook mode is degraded, inspect stale GitHub CLI forwarder hooks before restarting the daemon:
+
+```bash
+looper webhook cleanup owner/repo
+```
+
+Only run deletion after the dry run shows stale `cli` hooks and the user confirms:
+
+```bash
+looper webhook cleanup owner/repo --confirm
 ```
 
 ## Safety rules
