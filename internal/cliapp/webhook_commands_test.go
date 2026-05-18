@@ -405,8 +405,12 @@ func TestWebhookCleanupDryRunListsMatchingCLIHooks(t *testing.T) {
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			commands = append(commands, command+" "+strings.Join(args, " "))
 			return commandExecutionResult{Stdout: `[
-				{"id":101,"name":"cli","type":"Repository","active":true,"events":["pull_request","issue_comment"],"config":{"url":"https://webhook-forwarder.github.com/hook"}},
-				{"id":202,"name":"web","type":"Repository","active":true,"events":["push"],"config":{"url":"https://example.com/webhook"}}
+				[
+					{"id":101,"name":"cli","type":"Repository","active":true,"events":["pull_request","issue_comment"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}
+				],
+				[
+					{"id":202,"name":"web","type":"Repository","active":true,"events":["push"],"config":{"url":"https://example.com/webhook"}}
+				]
 			]`, ExitCode: 0}, nil
 		},
 	})
@@ -415,8 +419,8 @@ func TestWebhookCleanupDryRunListsMatchingCLIHooks(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run(webhook cleanup) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if len(commands) != 1 || !strings.HasSuffix(commands[0], " api --paginate repos/acme/looper/hooks") {
-		t.Fatalf("commands = %q, want a single paginated gh api list call", commands)
+	if len(commands) != 1 || !strings.HasSuffix(commands[0], " api --paginate --slurp repos/acme/looper/hooks") {
+		t.Fatalf("commands = %q, want a single paginated+slurped gh api list call", commands)
 	}
 	for _, needle := range []string{"Found 1 GitHub CLI webhook hook(s)", "id=101", "Dry run only.", "looper webhook cleanup acme/looper --confirm"} {
 		if !strings.Contains(stdout.String(), needle) {
@@ -449,9 +453,9 @@ func TestWebhookCleanupConfirmDeletesMatchingCLIHooks(t *testing.T) {
 			commands = append(commands, command+" "+strings.Join(args, " "))
 			switch len(commands) {
 			case 1:
-				return commandExecutionResult{Stdout: `[{"id":101,"name":"cli","type":"Repository","active":true,"events":["push","pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}]`, ExitCode: 0}, nil
+				return commandExecutionResult{Stdout: `[[{"id":101,"name":"cli","type":"Repository","active":true,"events":["push","pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}]]`, ExitCode: 0}, nil
 			case 2:
-				return commandExecutionResult{Stdout: `[{"id":101,"name":"cli","type":"Repository","active":true,"events":["push","pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}]`, ExitCode: 0}, nil
+				return commandExecutionResult{Stdout: `[[{"id":101,"name":"cli","type":"Repository","active":true,"events":["push","pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}]]`, ExitCode: 0}, nil
 			case 3:
 				return commandExecutionResult{ExitCode: 0}, nil
 			default:
@@ -465,8 +469,8 @@ func TestWebhookCleanupConfirmDeletesMatchingCLIHooks(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run(webhook cleanup --confirm) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if len(commands) != 3 || !strings.HasSuffix(commands[0], " api --paginate repos/acme/looper/hooks") || !strings.HasSuffix(commands[1], " api --paginate repos/acme/looper/hooks") || !strings.HasSuffix(commands[2], " api -X DELETE repos/acme/looper/hooks/101") {
-		t.Fatalf("commands = %q, want paginated gh api list, relist, then delete call", commands)
+	if len(commands) != 3 || !strings.HasSuffix(commands[0], " api --paginate --slurp repos/acme/looper/hooks") || !strings.HasSuffix(commands[1], " api --paginate --slurp repos/acme/looper/hooks") || !strings.HasSuffix(commands[2], " api -X DELETE repos/acme/looper/hooks/101") {
+		t.Fatalf("commands = %q, want paginated+slurped gh api list, relist, then delete call", commands)
 	}
 	if !strings.Contains(stdout.String(), "Deleted 1 GitHub CLI webhook hook(s) for acme/looper.") {
 		t.Fatalf("stdout = %q, want delete confirmation", stdout.String())

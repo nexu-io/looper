@@ -392,7 +392,7 @@ func (r *commandRuntime) resolveGHPath(cfg config.Config) (string, error) {
 }
 
 func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo string) ([]webhookHook, error) {
-	result, err := r.runCommand(ctx, ghPath, []string{"api", "--paginate", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
+	result, err := r.runCommand(ctx, ghPath, []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("list webhook hooks for %s: %w", repo, err)
 	}
@@ -403,9 +403,13 @@ func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo stri
 		}
 		return nil, fmt.Errorf("list webhook hooks for %s: %s", repo, output)
 	}
-	var hooks []webhookHook
-	if err := json.Unmarshal([]byte(result.Stdout), &hooks); err != nil {
+	var pages [][]webhookHook
+	if err := json.Unmarshal([]byte(result.Stdout), &pages); err != nil {
 		return nil, fmt.Errorf("decode webhook hooks for %s: %w", repo, err)
+	}
+	hooks := make([]webhookHook, 0)
+	for _, page := range pages {
+		hooks = append(hooks, page...)
 	}
 	return hooks, nil
 }
