@@ -459,11 +459,57 @@ func TestWebhookCleanupDryRunAcceptsHostQualifiedRepo(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run(webhook cleanup host-qualified) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if len(commands) != 1 || !strings.HasSuffix(commands[0], " api --paginate --slurp repos/github.example.com/acme/looper/hooks") {
-		t.Fatalf("commands = %q, want a paginated+slurped gh api list call using the host-qualified repo slug", commands)
+	if len(commands) != 1 || !strings.HasSuffix(commands[0], " api --paginate --slurp repos/acme/looper/hooks --hostname github.example.com") {
+		t.Fatalf("commands = %q, want a paginated+slurped gh api list call using owner/repo plus --hostname", commands)
 	}
 	if !strings.Contains(stdout.String(), "looper webhook cleanup github.example.com/acme/looper --confirm") {
 		t.Fatalf("stdout = %q, want host-qualified cleanup rerun hint", stdout.String())
+	}
+}
+
+func TestWebhookCleanupConfirmUsesHostnameForHostQualifiedRepo(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	commands := []string{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		LookPath: func(command string) (string, error) {
+			if command == "gh" {
+				return "/usr/bin/gh", nil
+			}
+			return command, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			commands = append(commands, command+" "+strings.Join(args, " "))
+			switch len(commands) {
+			case 1:
+				return commandExecutionResult{Stdout: `[[{"id":101,"name":"cli","type":"Repository","active":true,"events":["push","pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}]]`, ExitCode: 0}, nil
+			case 2:
+				return commandExecutionResult{ExitCode: 0}, nil
+			default:
+				t.Fatalf("unexpected RunCommand call %d: %s %q", len(commands), command, args)
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"webhook", "cleanup", "github.example.com/acme/looper", "--confirm", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook cleanup --confirm host-qualified) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if len(commands) != 2 || !strings.HasSuffix(commands[0], " api --paginate --slurp repos/acme/looper/hooks --hostname github.example.com") || !strings.HasSuffix(commands[1], " api -X DELETE repos/acme/looper/hooks/101 --hostname github.example.com") {
+		t.Fatalf("commands = %q, want host-qualified cleanup to split owner/repo from --hostname for list and delete", commands)
+	}
+	if !strings.Contains(stdout.String(), "Deleted 1 GitHub CLI webhook hook(s) for github.example.com/acme/looper.") {
+		t.Fatalf("stdout = %q, want delete confirmation for host-qualified repo", stdout.String())
 	}
 }
 

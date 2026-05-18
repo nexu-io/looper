@@ -383,7 +383,12 @@ func (r *commandRuntime) resolveGHPath(cfg config.Config) (string, error) {
 }
 
 func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo string) ([]webhookHook, error) {
-	result, err := r.runCommand(ctx, ghPath, []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/hooks", repo)}, 15*time.Second)
+	hostname, repoPath := splitWebhookRepoHostname(repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/hooks", repoPath)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := r.runCommand(ctx, ghPath, args, 15*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("list webhook hooks for %s: %w", repo, err)
 	}
@@ -406,7 +411,12 @@ func (r *commandRuntime) listWebhookHooks(ctx context.Context, ghPath, repo stri
 }
 
 func (r *commandRuntime) deleteWebhookHook(ctx context.Context, ghPath, repo string, id int64) error {
-	result, err := r.runCommand(ctx, ghPath, []string{"api", "-X", "DELETE", fmt.Sprintf("repos/%s/hooks/%d", repo, id)}, 15*time.Second)
+	hostname, repoPath := splitWebhookRepoHostname(repo)
+	args := []string{"api", "-X", "DELETE", fmt.Sprintf("repos/%s/hooks/%d", repoPath, id)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := r.runCommand(ctx, ghPath, args, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("delete webhook hook %d for %s: %w", id, repo, err)
 	}
@@ -497,6 +507,14 @@ func normalizeWebhookRepo(value string) (string, error) {
 		trimmed = append(trimmed, part)
 	}
 	return strings.Join(trimmed, "/"), nil
+}
+
+func splitWebhookRepoHostname(repo string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 {
+		return parts[0], parts[1] + "/" + parts[2]
+	}
+	return "", strings.TrimSpace(repo)
 }
 
 func webhookGHPath(cfg config.Config) string {
