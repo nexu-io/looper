@@ -474,3 +474,54 @@ func TestWebhookCleanupConfirmDeletesMatchingCLIHooks(t *testing.T) {
 		t.Fatalf("stdout = %q, want delete confirmation", stdout.String())
 	}
 }
+
+func TestWebhookCleanupConfirmContinuesPastMissingShownHook(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	commands := []string{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		LookPath: func(command string) (string, error) {
+			if command == "gh" {
+				return "/usr/bin/gh", nil
+			}
+			return command, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			commands = append(commands, command+" "+strings.Join(args, " "))
+			switch len(commands) {
+			case 1:
+				return commandExecutionResult{Stdout: `[[
+					{"id":101,"name":"cli","type":"Repository","active":true,"events":["push"],"config":{"url":"https://webhook-forwarder.github.com/hook"}},
+					{"id":202,"name":"cli","type":"Repository","active":true,"events":["pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}}
+				]]`, ExitCode: 0}, nil
+			case 2:
+				return commandExecutionResult{ExitCode: 1, Stderr: "gh: HTTP 404: Not Found (https://api.github.com/repos/acme/looper/hooks/101)"}, nil
+			case 3:
+				return commandExecutionResult{ExitCode: 0}, nil
+			default:
+				t.Fatalf("unexpected RunCommand call %d: %s %q", len(commands), command, args)
+				return commandExecutionResult{}, nil
+			}
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"webhook", "cleanup", "acme/looper", "--confirm", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run(webhook cleanup --confirm) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if len(commands) != 3 || !strings.HasSuffix(commands[1], " api -X DELETE repos/acme/looper/hooks/101") || !strings.HasSuffix(commands[2], " api -X DELETE repos/acme/looper/hooks/202") {
+		t.Fatalf("commands = %q, want cleanup to continue deleting the remaining shown hook ids after a 404", commands)
+	}
+	if !strings.Contains(stdout.String(), "Deleted 2 GitHub CLI webhook hook(s) for acme/looper.") {
+		t.Fatalf("stdout = %q, want delete confirmation after continuing past a missing hook", stdout.String())
+	}
+}

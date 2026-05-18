@@ -412,12 +412,20 @@ func (r *commandRuntime) deleteWebhookHook(ctx context.Context, ghPath, repo str
 	}
 	if result.ExitCode != 0 {
 		output := strings.TrimSpace(strings.Join([]string{result.Stderr, result.Stdout}, "\n"))
+		if webhookHookDeleteNotFound(output) {
+			return nil
+		}
 		if output == "" {
 			output = fmt.Sprintf("exit code %d", result.ExitCode)
 		}
 		return fmt.Errorf("delete webhook hook %d for %s: %s", id, repo, output)
 	}
 	return nil
+}
+
+func webhookHookDeleteNotFound(output string) bool {
+	lower := strings.ToLower(strings.TrimSpace(output))
+	return strings.Contains(lower, "404") && strings.Contains(lower, "not found")
 }
 
 func webhookCleanupCandidates(hooks []webhookHook) []webhookCleanupCandidate {
