@@ -770,6 +770,54 @@ func TestWebhookRotateRefusesURLMismatchBeforePatch(t *testing.T) {
 	}
 }
 
+func TestWebhookRotateFailsWhenExistingSecretCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	configPath, repo := writeWebhookCommandConfigWithRecord(t, storage.WebhookTunnelHookRecord{Repo: "acme/looper", HookID: 42, ManagedURL: "https://example.com/webhook/acme/looper", SecretRef: "webhook_acme_looper.key", CreatedAt: 1, UpdatedAt: 1})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	commands := []string{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		LookPath: func(command string) (string, error) {
+			if command == "gh" {
+				return "/usr/bin/gh", nil
+			}
+			return command, nil
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			commands = append(commands, command+" "+strings.Join(args, " "))
+			if len(commands) != 1 {
+				t.Fatalf("unexpected RunCommand call %d: %s %q", len(commands), command, args)
+			}
+			return commandExecutionResult{Stdout: `{"id":42,"active":true,"events":["pull_request"],"config":{"url":"https://example.com/webhook/acme/looper","content_type":"json","insecure_ssl":"0"}}`, ExitCode: 0}, nil
+		},
+	})
+
+	secretPath := webhookTunnelSecretPathForCLI(filepath.Join(filepath.Dir(configPath), "looper.sqlite"), "webhook_acme_looper.key")
+	if _, err := os.Stat(secretPath); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want not exists", secretPath, err)
+	}
+
+	exitCode := app.Run(context.Background(), []string{"webhook", "rotate", repo, "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run(webhook rotate) exit code = %d, want non-zero", exitCode)
+	}
+	if len(commands) != 1 || !strings.HasSuffix(commands[0], " api repos/acme/looper/hooks/42") {
+		t.Fatalf("commands = %q, want a single GET preflight before the local secret read failure", commands)
+	}
+	if !strings.Contains(stderr.String(), "read existing tunnel webhook secret") {
+		t.Fatalf("stderr = %q, want secret read failure", stderr.String())
+	}
+	if _, err := os.Stat(secretPath); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(%q) error = %v, want secret file to remain missing", secretPath, err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty on failure", stdout.String())
+	}
+}
+
 func TestWebhookDeleteConfirmForgetRemovesLocalRecordWithoutRunningGH(t *testing.T) {
 	t.Parallel()
 

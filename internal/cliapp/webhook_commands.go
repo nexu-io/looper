@@ -427,7 +427,10 @@ func (r *commandRuntime) webhookRotate(cmd *cobra.Command, args []string) error 
 			return err
 		}
 		path := webhookTunnelSecretPathForCLI(cfg.Storage.DBPath, record.SecretRef)
-		oldSecret, _ := os.ReadFile(path)
+		oldSecret, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read existing tunnel webhook secret: %w", err)
+		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
