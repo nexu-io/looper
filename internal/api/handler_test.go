@@ -441,7 +441,7 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	}
 }
 
-func TestHandlerWebhookForwardAcceptsLoopbackWithForwardedHeaders(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackWithForwardedHeadersAndBearerToken(t *testing.T) {
 	fixture := newTestFixture(t)
 	token := "secret-token"
 	fixture.config.Server.AuthMode = config.AuthModeLocalToken
@@ -472,6 +472,38 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithForwardedHeaders(t *testing.T) 
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	assertEqual(t, body["ok"], true)
+}
+
+func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeadersWithoutBearerToken(t *testing.T) {
+	fixture := newTestFixture(t)
+	token := "secret-token"
+	fixture.config.Server.AuthMode = config.AuthModeLocalToken
+	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Add("X-Forwarded-For", "203.0.113.5")
+	req.Header.Set("X-GitHub-Delivery", "delivery-4")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
