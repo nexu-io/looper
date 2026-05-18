@@ -16,6 +16,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -3289,6 +3290,53 @@ func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *t
 	}
 	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, autoMergeRefusedCommentMarker) {
 		t.Fatalf("issueCommentCalls = %#v, want stamped refusal comment", github.issueCommentCalls)
+	}
+}
+
+func TestProcessClaimedItemAutoMergeApprovesWithoutRemoteProbeWhenOutOfScope(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"team:backend"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}},
+	}}})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventApprove) {
+		t.Fatalf("submitReviewCalls = %#v, want one APPROVE review", github.submitReviewCalls)
+	}
+	if github.repositorySettingsCalls != 0 {
+		t.Fatalf("repositorySettingsCalls = %d, want 0", github.repositorySettingsCalls)
+	}
+	if github.branchProtectionCalls != 0 {
+		t.Fatalf("branchProtectionCalls = %d, want 0", github.branchProtectionCalls)
+	}
+	if len(github.enableAutoMergeCalls) != 0 {
+		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
+	}
+	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, autoMergeRefusedCommentMarker) {
+		t.Fatalf("issueCommentCalls = %#v, want stamped refusal comment", github.issueCommentCalls)
+	}
+	if !strings.Contains(github.issueCommentCalls[0].Body, string(automerge.RefusalReasonScope)) {
+		t.Fatalf("issueCommentCalls[0].Body = %q, want scope refusal reason", github.issueCommentCalls[0].Body)
 	}
 }
 
@@ -7184,7 +7232,9 @@ type fakeGitHubGateway struct {
 	reviewMarkerInputs              []VerifyReviewMarkerInput
 	issueDetail                     githubinfra.IssueDetail
 	repositorySettings              githubinfra.RepositorySettings
+	repositorySettingsCalls         int
 	branchProtection                githubinfra.BranchProtection
+	branchProtectionCalls           int
 	viewDraft                       bool
 	viewBody                        string
 	viewDiff                        string
@@ -7297,6 +7347,7 @@ func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewI
 }
 
 func (g *fakeGitHubGateway) GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	g.repositorySettingsCalls++
 	if g.repositorySettings.AllowSquashMerge || g.repositorySettings.AllowMergeCommit || g.repositorySettings.AllowRebaseMerge || g.repositorySettings.AllowAutoMerge {
 		return g.repositorySettings, nil
 	}
@@ -7304,6 +7355,7 @@ func (g *fakeGitHubGateway) GetRepositorySettings(context.Context, githubinfra.R
 }
 
 func (g *fakeGitHubGateway) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	g.branchProtectionCalls++
 	if g.branchProtection.Enabled || g.branchProtection.HasRequiredChecks {
 		return g.branchProtection, nil
 	}

@@ -98,7 +98,7 @@ func criterionTokens(value string) []string {
 }
 
 func tokenOverlap(a []string, b []string) bool {
-	if len(a) == 0 || len(b) == 0 {
+	if len(a) < 2 || len(b) == 0 {
 		return false
 	}
 	set := map[string]struct{}{}
@@ -109,6 +109,7 @@ func tokenOverlap(a []string, b []string) bool {
 	for _, token := range b {
 		if _, ok := set[token]; ok {
 			matches++
+			delete(set, token)
 		}
 	}
 	return matches >= min(2, len(a))

@@ -3059,6 +3059,15 @@ func (r *Runner) verifyAcceptanceCriteria(rawDiff string, extracted []criteria.A
 }
 
 func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail PullRequestDetail, autoMergeCfg config.ReviewerAutoMergeConfig, issueRef linkedIssueReference) (automerge.AutoMergeDecision, error) {
+	decision := automerge.Decide(
+		automerge.PRSnapshot{Labels: append([]string(nil), detail.Labels...), HasTrackedIssueLink: issueRef.Tracked},
+		autoMergeCfg,
+		automerge.BranchProtectionSnapshot{},
+		automerge.RepoSettingsSnapshot{},
+	)
+	if decision.Reason == automerge.RefusalReasonDisabled || decision.Reason == automerge.RefusalReasonScope {
+		return decision, nil
+	}
 	settings, err := r.github.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: input.Repo, CWD: input.Project.RepoPath})
 	if err != nil {
 		return automerge.AutoMergeDecision{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
