@@ -176,10 +176,13 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 	}
 }
 
-func TestWebhookForwarderEventsIncludePush(t *testing.T) {
+func TestWebhookForwarderEventsIncludePushAndCheckRun(t *testing.T) {
 	t.Parallel()
 	if !slices.Contains(webhookForwarderEvents, "push") {
 		t.Fatalf("webhookForwarderEvents = %v, want push subscription", webhookForwarderEvents)
+	}
+	if !slices.Contains(webhookForwarderEvents, "check_run") {
+		t.Fatalf("webhookForwarderEvents = %v, want check_run subscription", webhookForwarderEvents)
 	}
 }
 

@@ -181,6 +181,18 @@ func TestBuildFixerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
 	}
 }
 
+func TestQueueItemRequiresLabelAuthority(t *testing.T) {
+	t.Parallel()
+
+	if queueItemRequiresLabelAuthority(storage.QueueItemRecord{DedupeKey: "fixer:loop_manual"}) {
+		t.Fatal("manual fixer queue should not require auto-discovery label authority")
+	}
+	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint("acme/looper", 42, "head-1", "hash-1")})
+	if !queueItemRequiresLabelAuthority(storage.QueueItemRecord{DedupeKey: buildFixerDedupeKey("project_1", "loop_1", "acme/looper", 42, "head-1", "hash-1"), PayloadJSON: &payload}) {
+		t.Fatal("auto-discovery fixer queue should require label authority")
+	}
+}
+
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -253,6 +265,64 @@ func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
 		t.Fatalf("result = %#v, want skipped targeted discovery with no loop", result)
+	}
+}
+
+func TestDiscoverPullRequestPausesExistingLoopWhenLabelsNoLongerMatch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}, {Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}, {Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{"bug"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug"}, LabelMode: config.LabelModeAll}})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	payloadJSON := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-42", "hash-1")})
+	loop := storage.LoopRecord{ID: "loop_label_gate", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_label_gate", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:label-gate", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	if _, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber}); err != nil {
+		t.Fatalf("first DiscoverPullRequest() error = %v", err)
+	}
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequest() error = %v", err)
+	}
+	if result.Skipped != 1 {
+		t.Fatalf("result = %#v, want skipped targeted discovery", result)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persistedLoop, err)
+	}
+	if persistedLoop.Status != "paused" || persistedLoop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop with no next run", persistedLoop)
+	}
+	persistedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persistedQueue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", persistedQueue, err)
+	}
+	if persistedQueue.Status != "completed" {
+		t.Fatalf("queue = %#v, want completed queued item after label gate removal", persistedQueue)
+	}
+	resumed, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("third DiscoverPullRequest() error = %v", err)
+	}
+	if len(resumed.QueueItems) != 1 {
+		t.Fatalf("resumed = %#v, want one requeued item after labels are restored", resumed)
+	}
+	persistedLoop, err = fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID(after resume) = (%#v, %v), want loop", persistedLoop, err)
+	}
+	if persistedLoop.Status != "queued" || persistedLoop.NextRunAt == nil {
+		t.Fatalf("loop after resume = %#v, want queued loop with next run", persistedLoop)
 	}
 }
 
@@ -957,6 +1027,32 @@ func TestEnqueueScopesFixerDedupeKeyToLoop(t *testing.T) {
 	}
 	if len(items) != 2 {
 		t.Fatalf("len(Queue.List()) = %d, want 2", len(items))
+	}
+}
+
+func TestEnqueueKeepsPendingManualFixerQueueUnchanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopID := "loop_manual"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	manual := storage.QueueItemRecord{ID: "queue_manual", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:loop_manual", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), manual); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	item, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopID, Repo: repo, PRNumber: prNumber, HeadSHA: "head-1", FixItemsHash: "hash-1"})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	if item.ID != manual.ID || item.DedupeKey != manual.DedupeKey || item.PayloadJSON != nil {
+		t.Fatalf("item = %#v, want existing manual queue preserved", item)
 	}
 }
 
@@ -3096,6 +3192,51 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	}
 	if result.Status != "skipped" || !contains(result.Summary, "does not match fixer owner") {
 		t.Fatalf("result = %#v, want skipped foreign PR", result)
+	}
+}
+
+func TestProcessClaimedItemPausesWhenLabelsNoLongerMatchAtRuntime(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}, {Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug"}, LabelMode: config.LabelModeAll}})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	payloadJSON := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-1", "hash-1")})
+	loop := storage.LoopRecord{ID: "loop_runtime_label_gate", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_runtime_label_gate", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey("project_1", loop.ID, repo, prNumber, "head-1", "hash-1"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "labels no longer match") {
+		t.Fatalf("result = %#v, want skipped label-gated run", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want no agent execution when labels mismatch", len(agent.starts))
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persistedLoop, err)
+	}
+	if persistedLoop.Status != "paused" || persistedLoop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after runtime label mismatch", persistedLoop)
+	}
+	persistedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persistedQueue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", persistedQueue, err)
+	}
+	if persistedQueue.Status != "completed" {
+		t.Fatalf("queue = %#v, want completed queue item after runtime label mismatch", persistedQueue)
 	}
 }
 

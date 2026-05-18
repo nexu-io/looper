@@ -827,6 +827,7 @@ const (
 	agentDeclinedThreadWithoutReason      = "Agent declined this thread without a substantive reason"
 	maxDeclinedThreadRecords              = 200
 	zeroProgressPauseReason               = "agent_zero_progress"
+	labelMismatchPauseReason              = "fixer_label_mismatch"
 )
 
 // parseReplyExplanations extracts the optional review_thread_replies array from
@@ -1167,6 +1168,11 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
 	if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
+		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+			if err := r.pauseFixerLoopForLabelMismatch(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
 		result.Skipped++
 		return result, nil
 	}
@@ -1581,6 +1587,31 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
+	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+		return ProcessResult{}, err
+	} else if reason != "" {
+		checkpoint.SkipReason = reason
+		if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
+		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+			return ProcessResult{}, err
+		}
+		pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, *loop)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
+			updated.Status = "paused"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
+	}
 	checkpoint.RunStartedAt = r.nowISO()
 	checkpoint.RunStartedRunID = run.ID
 	checkpoint.RunPreStartAt = ""
@@ -1795,6 +1826,24 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, projectID, 
 		return "", nil
 	}
 	return fmt.Sprintf("Skipped fixer run for %s#%d because PR author %q does not match fixer owner %q", repo, prNumber, strings.TrimSpace(author), strings.TrimSpace(currentUser)), nil
+}
+
+func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+	policy := r.discoveryPolicyForProject(projectID)
+	if !queueItemRequiresLabelAuthority(queueItem) {
+		return "", nil
+	}
+	if len(prQueryLabels(policy.Labels)) == 0 {
+		return "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return "", err
+	}
+	if labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		return "", nil
+	}
+	return fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", repo, prNumber), nil
 }
 
 func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -3538,6 +3587,10 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 					return loopUpsertResult{}, err
 				} else if resumed {
 					existing = updated
+				} else if resumed, updated, err := r.resumePausedLabelMismatchLoop(ctx, existing); err != nil {
+					return loopUpsertResult{}, err
+				} else if resumed {
+					existing = updated
 				} else if resumed, updated, err := r.resumePausedNoopResolveLoop(ctx, existing, headSHA, fixItemsStateHash, unresolvedThreadIDs); err != nil {
 					return loopUpsertResult{}, err
 				} else if resumed {
@@ -3919,6 +3972,9 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	if activeForLoop != nil {
 		if activeForLoop.Status == "queued" {
+			if !queueItemRequiresLabelAuthority(*activeForLoop) {
+				return *activeForLoop, nil
+			}
 			updated := *activeForLoop
 			updated.DedupeKey = dedupeKey
 			updated.AvailableAt = availableAt
@@ -4048,7 +4104,68 @@ func (r *Runner) clearFixerFollowupMetadataForPR(ctx context.Context, projectID,
 	return err
 }
 
+func (r *Runner) pauseFixerLoopForLabelMismatch(ctx context.Context, projectID, repo string, prNumber int64) error {
+	loop, err := r.findFixerLoopByPR(ctx, projectID, repo, prNumber)
+	if err != nil || loop == nil {
+		return err
+	}
+	if loop.Status != "queued" {
+		return nil
+	}
+	activeQueue, err := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue == nil || activeQueue.Status != "queued" || !queueItemRequiresLabelAuthority(*activeQueue) {
+		return nil
+	}
+	updated, err := r.markLoopPausedForLabelMismatch(ctx, *loop)
+	if err != nil {
+		return err
+	}
+	updated, err = r.updateLoop(ctx, updated, func(updated *storage.LoopRecord) {
+		updated.Status = "paused"
+		updated.NextRunAt = nil
+	})
+	if err != nil {
+		return err
+	}
+	return r.completeQueuedFixerItemsForLoop(ctx, updated.ID)
+}
+
+func (r *Runner) markLoopPausedForLabelMismatch(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	return r.mergeLoopMetadata(ctx, loop, map[string]any{"pauseReason": labelMismatchPauseReason})
+}
+
+func (r *Runner) resumePausedLabelMismatchLoop(ctx context.Context, loop storage.LoopRecord) (bool, storage.LoopRecord, error) {
+	if loop.Status != "paused" {
+		return false, loop, nil
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != labelMismatchPauseReason {
+		return false, loop, nil
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		nextRunAt := r.nowISO()
+		updated.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	updated, err = r.clearPauseReasonMetadata(ctx, updated)
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	return true, updated, nil
+}
+
 func (r *Runner) cancelQueuedFixerItemsForLoop(ctx context.Context, loopID string) error {
+	return r.completeQueuedFixerItemsForLoop(ctx, loopID)
+}
+
+func (r *Runner) completeQueuedFixerItemsForLoop(ctx context.Context, loopID string) error {
 	items, err := r.repos.Queue.List(ctx)
 	if err != nil {
 		return err
@@ -4110,6 +4227,35 @@ func (r *Runner) clearZeroProgressMetadata(ctx context.Context, loop storage.Loo
 		metadataJSON := string(encoded)
 		updated.MetadataJSON = &metadataJSON
 		return nil
+	}
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
+	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
+}
+
+func (r *Runner) clearPauseReasonMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	apply := func(updated *storage.LoopRecord) error {
+		meta := parseJSONObject(updated.MetadataJSON)
+		delete(meta, "pauseReason")
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		metadataJSON := string(encoded)
+		updated.MetadataJSON = &metadataJSON
+		return nil
+	}
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		updated := loop
+		if err := apply(&updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return updated, nil
 	}
 	var mutateErr error
 	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
@@ -4561,6 +4707,18 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+func queueItemRequiresLabelAuthority(queueItem storage.QueueItemRecord) bool {
+	if queueItem.PayloadJSON == nil || strings.TrimSpace(*queueItem.PayloadJSON) == "" {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*queueItem.PayloadJSON), &payload); err != nil {
+		return false
+	}
+	fingerprint, _ := stringFromAny(payload["discoveryFingerprint"])
+	return strings.TrimSpace(fingerprint) != ""
 }
 
 func parseDeclinedThreadRecords(metadata map[string]any) map[string]declinedThreadRecord {

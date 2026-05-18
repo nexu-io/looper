@@ -25,7 +25,7 @@ const noConfiguredWebhookReposReason = "no configured GitHub repos are available
 
 var webhookReconcileRetryDelay = 5 * time.Second
 
-var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment"}
+var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
 
 type WebhookStatus struct {
 	Enabled                     bool                    `json:"enabled"`
@@ -812,6 +812,7 @@ func (w *webhookRuntime) runForwarder(repo string) {
 		startedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		fingerprint, _ := commandFingerprint(w.ghPath, repo, webhookForwardEvents, w.status.EndpointURL)
 		spawnedAt := startedAt
+		w.clearForwarderDegradedReasons(repo)
 		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
 			state.Running = true
 			state.PID = &pid
@@ -823,7 +824,6 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			state.StdoutTail = nil
 			state.StderrTail = nil
 		})
-		w.clearForwarderDegradedReasons(repo)
 		if w.logger != nil {
 			w.logger.Info("webhook.forwarder.spawned", map[string]any{"repo": repo, "pid": pid, "fingerprint": fingerprint, "daemon_id": w.daemonID})
 		}
