@@ -499,6 +499,18 @@ func webhookConfigUsesTunnel(cfg config.Config) bool {
 	return false
 }
 
+func webhookConfigNeedsGHForward(cfg config.Config) bool {
+	if cfg.Webhook.Mode == "" || cfg.Webhook.Mode == config.WebhookModeGHForward {
+		return true
+	}
+	for _, project := range cfg.Projects {
+		if project.Webhook.Mode == config.WebhookModeGHForward {
+			return true
+		}
+	}
+	return false
+}
+
 func webhookRuntimeHasActiveTunnelHooks(runtime *webhookRuntimeView) bool {
 	if runtime == nil {
 		return false
@@ -590,7 +602,7 @@ func writeHumanWebhookStatus(w io.Writer, data webhookStatusOutput, verbose bool
 
 func webhookWarnings(cfg config.Config) []string {
 	warnings := make([]string, 0, 2)
-	if cfg.Webhook.Mode != config.WebhookModeTunnel && !isWebhookLoopbackHost(cfg.Server.Host) {
+	if webhookConfigNeedsGHForward(cfg) && !isWebhookLoopbackHost(cfg.Server.Host) {
 		warnings = append(warnings, "server.host is not loopback; looperd will degrade webhook mode to poll fallback")
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {

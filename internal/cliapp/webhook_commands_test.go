@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
@@ -379,6 +380,45 @@ func TestWebhookStatusRestartRequiredTracksTunnelEndpointDriftForMixedModeProjec
 		t.Fatalf("Run(webhook status --json) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
 	assertJSONContains(t, stdout, "restartRequired", true)
+}
+
+func TestWebhookWarningsIncludesLoopbackWarningForMixedModeGHForwardOverrides(t *testing.T) {
+	t.Parallel()
+
+	warnings := webhookWarnings(config.Config{
+		Server:  config.ServerConfig{Host: "0.0.0.0"},
+		Webhook: config.WebhookConfig{Mode: config.WebhookModeTunnel},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "proj-1",
+			Name:     "Looper",
+			RepoPath: t.TempDir(),
+			Webhook:  config.ProjectWebhookConfig{Mode: config.WebhookModeGHForward},
+		}},
+	})
+
+	if len(warnings) == 0 || warnings[0] != "server.host is not loopback; looperd will degrade webhook mode to poll fallback" {
+		t.Fatalf("webhookWarnings() = %v, want loopback warning for mixed-mode gh-forward overrides", warnings)
+	}
+}
+
+func TestWebhookWarningsSkipsLoopbackWarningForPureTunnelConfigs(t *testing.T) {
+	t.Parallel()
+
+	warnings := webhookWarnings(config.Config{
+		Server:  config.ServerConfig{Host: "0.0.0.0"},
+		Webhook: config.WebhookConfig{Mode: config.WebhookModeTunnel},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "proj-1",
+			Name:     "Looper",
+			RepoPath: t.TempDir(),
+		}},
+	})
+
+	for _, warning := range warnings {
+		if warning == "server.host is not loopback; looperd will degrade webhook mode to poll fallback" {
+			t.Fatalf("webhookWarnings() = %v, want no loopback warning when every project uses tunnel", warnings)
+		}
+	}
 }
 
 func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
