@@ -474,7 +474,7 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 	if runtimeMode != configMode {
 		return true
 	}
-	if runtimeMode == config.WebhookModeTunnel {
+	if runtimeMode == config.WebhookModeTunnel || webhookRuntimeHasActiveTunnelHooks(output.Runtime) {
 		if output.Runtime.TunnelListenerURL != webhookStatusTunnelListenerURL(output.ListenPort) {
 			return true
 		}
@@ -483,6 +483,18 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 		}
 	}
 	return output.Runtime.FallbackPollIntervalSeconds != output.FallbackPoll
+}
+
+func webhookRuntimeHasActiveTunnelHooks(runtime *webhookRuntimeView) bool {
+	if runtime == nil {
+		return false
+	}
+	for _, hook := range runtime.TunnelHooks {
+		if !hook.Orphaned {
+			return true
+		}
+	}
+	return false
 }
 
 func webhookStatusTunnelListenerURL(listenPort int) string {
