@@ -2995,7 +2995,7 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 		return nil, err
 	}
 	if decision.Reason == "" {
-		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
+		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
 			return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
@@ -3025,6 +3025,9 @@ func (r *Runner) resolveLinkedIssueForCriteria(ctx context.Context, input stepIn
 	if ref, ok := parseClosingReference(input.Repo, detail.Body); ok {
 		issue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: ref.Repo, IssueNumber: ref.Number, CWD: input.Project.RepoPath})
 		if err != nil {
+			if linkedIssueLookupUnavailable(err) {
+				return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
+			}
 			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if issue.IsPullRequest {
@@ -3034,6 +3037,17 @@ func (r *Runner) resolveLinkedIssueForCriteria(ctx context.Context, input stepIn
 		return ref, issue, true, nil
 	}
 	return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
+}
+
+func linkedIssueLookupUnavailable(err error) bool {
+	if err == nil || githubinfra.IsTransientError(err) {
+		return false
+	}
+	if githubinfra.IsNotFoundError(err) {
+		return true
+	}
+	message := strings.ToLower(githubinfra.ErrorMessage(err))
+	return strings.Contains(message, "resource not accessible") || strings.Contains(message, "http 403") || strings.Contains(message, "http 410")
 }
 
 func (r *Runner) verifyAcceptanceCriteria(rawDiff string, extracted []criteria.AcceptanceCriterion) (criteria.VerificationResult, error) {

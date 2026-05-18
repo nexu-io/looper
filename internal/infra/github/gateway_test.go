@@ -1952,14 +1952,28 @@ func TestGatewayEnableAutoMerge(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr merge 42 --repo acme/looper --auto --squash" {
+		if args != "pr merge 42 --repo acme/looper --auto --squash --match-head-commit abc123" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		return shell.Result{}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash}); err != nil {
+	if err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash, HeadSHA: "abc123"}); err != nil {
 		t.Fatalf("EnableAutoMerge() error = %v", err)
+	}
+}
+
+func TestGatewayEnableAutoMergeRequiresHeadSHA(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh args: %v", options.Args)
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash})
+	if err == nil || err.Error() != "auto-merge head SHA is required" {
+		t.Fatalf("EnableAutoMerge() error = %v, want missing head SHA error", err)
 	}
 }
 

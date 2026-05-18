@@ -74,7 +74,7 @@ func TestReviewerAutoMergeHappyPathWithFakeGH(t *testing.T) {
 	}
 	assertOrderedText(t, string(logBytes),
 		`"argv":["api","repos/acme/looper/pulls/42/reviews","--method","POST","--input","-","--include"]`,
-		`"argv":["pr","merge","42","--repo","acme/looper","--auto","--squash"]`,
+		`"argv":["pr","merge","42","--repo","acme/looper","--auto","--squash","--match-head-commit","abc123"]`,
 	)
 	if !strings.Contains(string(logBytes), criteriaVerificationHeading) {
 		t.Fatalf("invocation log missing criteria verification heading:\n%s", string(logBytes))

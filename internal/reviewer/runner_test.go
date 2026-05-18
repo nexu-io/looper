@@ -3238,6 +3238,9 @@ func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(
 	if len(github.enableAutoMergeCalls) != 1 || github.enableAutoMergeCalls[0].Strategy != config.ReviewerAutoMergeStrategySquash {
 		t.Fatalf("enableAutoMergeCalls = %#v, want one squash auto-merge call", github.enableAutoMergeCalls)
 	}
+	if github.enableAutoMergeCalls[0].HeadSHA != "abc123" {
+		t.Fatalf("enableAutoMergeCalls[0].HeadSHA = %q, want abc123", github.enableAutoMergeCalls[0].HeadSHA)
+	}
 	if !strings.Contains(github.submitReviewCalls[0].Body, criteriaVerificationHeading) || !strings.Contains(github.submitReviewCalls[0].Body, "app.go:1-2") {
 		t.Fatalf("review body = %q, want acceptance criteria evidence", github.submitReviewCalls[0].Body)
 	}
@@ -3328,6 +3331,86 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	}
 	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "dispatch/plan" {
 		t.Fatalf("removed labels = %#v, want triaged + dispatch/plan", got)
+	}
+	if len(github.enableAutoMergeCalls) != 0 {
+		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
+	}
+}
+
+func TestProcessClaimedItemFallsBackWhenLinkedIssueLookupIsUnavailable(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses owner/private#358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetailErr:      &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "HTTP 403: Resource not accessible by integration"}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t)})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventApprove) {
+		t.Fatalf("submitReviewCalls = %#v, want one APPROVE review", github.submitReviewCalls)
+	}
+	if !strings.Contains(github.submitReviewCalls[0].Body, "No explicit acceptance criteria were stated on the linked issue") {
+		t.Fatalf("review body = %q, want non-criteria fallback explanation", github.submitReviewCalls[0].Body)
+	}
+	if len(github.enableAutoMergeCalls) != 0 {
+		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
+	}
+	if len(github.removeIssueLabelCalls) != 0 {
+		t.Fatalf("removeIssueLabelCalls = %#v, want none", github.removeIssueLabelCalls)
+	}
+}
+
+func TestProcessClaimedItemRetriesWhenLinkedIssueLookupIsTransient(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetailErr:      &githubinfra.TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": unexpected EOF`}}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t)})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("result = %#v, want retryable_after_resume failure", result)
+	}
+	if len(github.submitReviewCalls) != 0 {
+		t.Fatalf("submitReviewCalls = %#v, want none", github.submitReviewCalls)
 	}
 	if len(github.enableAutoMergeCalls) != 0 {
 		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
@@ -7108,6 +7191,7 @@ type fakeGitHubGateway struct {
 	viewState                       string
 	viewStateAfterFirstView         string
 	viewErrs                        []error
+	issueDetailErr                  error
 	addReactionErr                  error
 	removeReactionErr               error
 	addLabelErr                     error
@@ -7203,6 +7287,9 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 }
 
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if g.issueDetailErr != nil {
+		return githubinfra.IssueDetail{}, g.issueDetailErr
+	}
 	if g.issueDetail.Number != 0 {
 		return g.issueDetail, nil
 	}

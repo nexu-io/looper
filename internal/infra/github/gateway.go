@@ -300,6 +300,7 @@ type EnableAutoMergeInput struct {
 	Repo     string
 	PRNumber int64
 	Strategy config.ReviewerAutoMergeStrategy
+	HeadSHA  string
 	CWD      string
 }
 
@@ -1279,7 +1280,11 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 	if strategy == "" {
 		return fmt.Errorf("auto-merge strategy is required")
 	}
-	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--auto", "--"+strategy)
+	headSHA := strings.TrimSpace(input.HeadSHA)
+	if headSHA == "" {
+		return fmt.Errorf("auto-merge head SHA is required")
+	}
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--auto", "--"+strategy, "--match-head-commit", headSHA)
 	return err
 }
 
