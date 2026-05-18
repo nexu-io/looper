@@ -7,7 +7,7 @@ description: Use when installing, bootstrapping, configuring, starting, verifyin
 
 Use this skill when an agent needs to install, configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).
 
-This skill now includes the webhook-mode lifecycle: enabling `looper webhook`, installing or validating the GitHub CLI webhook extension, verifying healthy forwarders, diagnosing degraded webhook runtime, cleaning up stale GitHub CLI `cli` hooks with `looper webhook cleanup`, and deciding when a daemon restart is or is not necessary.
+It also covers the full webhook-mode lifecycle — turning it on, installing or validating the `gh webhook` extension, confirming forwarders are healthy, diagnosing a degraded runtime, clearing stale GitHub CLI hooks with `looper webhook cleanup`, and judging when a daemon restart is actually needed.
 
 **When NOT to use this skill:** developing on the Looper codebase itself (Go sources at `cmd/`, `internal/`, `pkg/`). For that, follow `AGENTS.md` and standard Go tooling.
 
