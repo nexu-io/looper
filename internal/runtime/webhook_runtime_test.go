@@ -329,6 +329,42 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	}
 }
 
+func TestWebhookRuntimeReconcilePassesDeadlineToTunnelHookReconcile(t *testing.T) {
+	t.Parallel()
+
+	ctx, repositories, cfg := setupWebhookTunnelTestRepos(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper"}`
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	client := &fakeWebhookTunnelGitHubClient{}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.bootstrapDone = true
+	rt.tunnelClient = client
+	defer rt.stopTunnelServer()
+
+	rt.Reconcile(repositories)
+
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
+	}
+	if !client.createDeadline {
+		t.Fatal("CreateHook context missing deadline, want timeout-bounded reconcile call")
+	}
+	if status := rt.Status(); len(status.TunnelHooks) != 1 || status.TunnelHooks[0].LastError != "" {
+		t.Fatalf("status.TunnelHooks = %#v, want one healthy reconciled hook", status.TunnelHooks)
+	}
+	if _, ok, err := repositories.WebhookTunnelHooks.Get(ctx, "acme/looper"); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	} else if !ok {
+		t.Fatal("WebhookTunnelHooks.Get() found = false, want persisted hook record")
+	}
+	if status := rt.Status(); status.Degraded {
+		t.Fatalf("Status().Degraded = true, want false; reasons=%v", status.DegradedReasons)
+	}
+}
+
 func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

@@ -311,7 +311,9 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet, conflictRepoSet)
+	tunnelCtx, cancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
+	w.reconcileTunnelHooks(tunnelCtx, repos, tunnelRepoSet, conflictRepoSet)
+	cancel()
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
 	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
 		w.addDegradedReason(noConfiguredWebhookReposReason)

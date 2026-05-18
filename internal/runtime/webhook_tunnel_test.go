@@ -455,19 +455,22 @@ func setupWebhookTunnelTestRepos(t *testing.T) (context.Context, *storage.Reposi
 }
 
 type fakeWebhookTunnelGitHubClient struct {
-	getHook      webhookTunnelGitHubHook
-	getFound     bool
-	createHook   webhookTunnelGitHubHook
-	createErr    error
-	updateHook   webhookTunnelGitHubHook
-	updateErr    error
-	deleteErr    error
-	getCalls     int
-	createCalls  int
-	updateCalls  int
-	deleteCalls  int
-	lastUpdate   fakeWebhookTunnelUpdateCall
-	deletedHooks []int64
+	getHook        webhookTunnelGitHubHook
+	getFound       bool
+	createHook     webhookTunnelGitHubHook
+	createErr      error
+	updateHook     webhookTunnelGitHubHook
+	updateErr      error
+	deleteErr      error
+	getDeadline    bool
+	createDeadline bool
+	updateDeadline bool
+	getCalls       int
+	createCalls    int
+	updateCalls    int
+	deleteCalls    int
+	lastUpdate     fakeWebhookTunnelUpdateCall
+	deletedHooks   []int64
 }
 
 type fakeWebhookTunnelUpdateCall struct {
@@ -478,21 +481,24 @@ type fakeWebhookTunnelUpdateCall struct {
 	active bool
 }
 
-func (f *fakeWebhookTunnelGitHubClient) GetHook(context.Context, string, int64) (webhookTunnelGitHubHook, bool, error) {
+func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _ int64) (webhookTunnelGitHubHook, bool, error) {
 	f.getCalls++
+	_, f.getDeadline = ctx.Deadline()
 	return f.getHook, f.getFound, nil
 }
 
-func (f *fakeWebhookTunnelGitHubClient) CreateHook(context.Context, string, string, string, []string) (webhookTunnelGitHubHook, error) {
+func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
 	f.createCalls++
+	_, f.createDeadline = ctx.Deadline()
 	if f.createHook.ID == 0 {
 		f.createHook.ID = 999
 	}
 	return f.createHook, f.createErr
 }
 
-func (f *fakeWebhookTunnelGitHubClient) UpdateHook(_ context.Context, repo string, id int64, url string, secret string, _ []string, active bool) (webhookTunnelGitHubHook, error) {
+func (f *fakeWebhookTunnelGitHubClient) UpdateHook(ctx context.Context, repo string, id int64, url string, secret string, _ []string, active bool) (webhookTunnelGitHubHook, error) {
 	f.updateCalls++
+	_, f.updateDeadline = ctx.Deadline()
 	f.lastUpdate = fakeWebhookTunnelUpdateCall{repo: repo, id: id, url: url, secret: secret, active: active}
 	return f.updateHook, f.updateErr
 }
