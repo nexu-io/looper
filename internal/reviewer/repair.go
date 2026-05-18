@@ -281,6 +281,18 @@ func (r *Repairer) buildPlan(loop storage.LoopRecord, detail PullRequestDetail, 
 		result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "active_local_work", Message: "Local loop has active work; repair will not modify it until it is idle."})
 		return result
 	}
+	canReactivateLocalLoop := repairCanReactivateLocalLoop(loop.Status)
+	terminalDiagnosisAdded := false
+	addReactivationAction := func(action RepairPlannedAction) {
+		if canReactivateLocalLoop {
+			result.Actions = append(result.Actions, action)
+			return
+		}
+		if !terminalDiagnosisAdded {
+			result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "terminal_local_loop", Message: "Local reviewer loop is terminal; repair will not reactivate it."})
+			terminalDiagnosisAdded = true
+		}
+	}
 	if !strings.EqualFold(detail.State, "OPEN") {
 		result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "github_pr_not_open", Message: "GitHub PR is closed or merged while local reviewer state is still live."})
 		if loop.Status != string(domain.LoopStatusTerminated) {
@@ -290,17 +302,26 @@ func (r *Repairer) buildPlan(loop storage.LoopRecord, detail PullRequestDetail, 
 	}
 	if lastPublished != "" && detail.HeadSHA != "" && lastPublished == detail.HeadSHA && currentUserRequested && !currentUserReviewed {
 		result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "stale_local_published_head", Message: "Local state marks the current head as published, but GitHub still requests the current user and has no current-head review by that user."})
-		result.Actions = append(result.Actions, RepairPlannedAction{Code: "clear_local_published_head", Message: "Clear local publish/review suppressors and resnapshot reviewer review-event policy."})
+		addReactivationAction(RepairPlannedAction{Code: "clear_local_published_head", Message: "Clear local publish/review suppressors and resnapshot reviewer review-event policy."})
 	}
 	if staleFilterSkip(lastFilterSkip, detail, currentLogin) {
 		result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "stale_filter_skip", Message: "Local discovery skip metadata no longer matches current GitHub PR state."})
-		result.Actions = append(result.Actions, RepairPlannedAction{Code: "clear_filter_skip", Message: "Clear local lastFilterSkip metadata so discovery can reconsider the PR."})
+		addReactivationAction(RepairPlannedAction{Code: "clear_filter_skip", Message: "Clear local lastFilterSkip metadata so discovery can reconsider the PR."})
 	}
 	if loop.Status == string(domain.LoopStatusFailed) && currentUserRequested && !detail.IsDraft && !detail.HasConflicts {
 		result.Diagnoses = append(result.Diagnoses, RepairDiagnosis{Code: "failed_loop_still_requested", Message: "Local reviewer loop is failed while GitHub still requests current-user review."})
 		result.Actions = append(result.Actions, RepairPlannedAction{Code: "reactivate_failed_loop", Message: "Move the failed loop back to waiting and cancel the latest failed queue item."})
 	}
 	return result
+}
+
+func repairCanReactivateLocalLoop(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusTerminated, domain.LoopStatusStopped:
+		return false
+	default:
+		return true
+	}
 }
 
 func (r *Repairer) effectiveRepairReviewEvents(meta map[string]any) config.ReviewerReviewEventsConfig {
@@ -357,6 +378,9 @@ func (r *Repairer) applyPlan(ctx context.Context, repos *storage.Repositories, l
 	loopMeta := reviewerLoopMetadata(meta)
 
 	for _, action := range plan.Actions {
+		if repairActionReactivatesLocalLoop(action.Code) && !repairCanReactivateLocalLoop(loop.Status) {
+			continue
+		}
 		switch action.Code {
 		case "terminate_local_loop":
 			loop.Status = string(domain.LoopStatusTerminated)
@@ -450,6 +474,15 @@ func (r *Repairer) applyPlan(ctx context.Context, repos *storage.Repositories, l
 		return applied, err
 	}
 	return applied, nil
+}
+
+func repairActionReactivatesLocalLoop(code string) bool {
+	switch code {
+	case "clear_local_published_head", "clear_filter_skip", "reactivate_failed_loop":
+		return true
+	default:
+		return false
+	}
 }
 
 func repairActionCodes(actions []RepairPlannedAction) []string {

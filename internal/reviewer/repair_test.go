@@ -92,6 +92,58 @@ func TestRepairApplyClearsStalePublishedHeadAndResnapshotsPolicy(t *testing.T) {
 	}
 }
 
+func TestRepairDoesNotReactivateTerminatedLoop(t *testing.T) {
+	t.Parallel()
+
+	for _, apply := range []bool{false, true} {
+		apply := apply
+		t.Run(map[bool]string{false: "dry-run", true: "apply"}[apply], func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newRunnerFixture(t)
+			loopID := seedReviewerRepairLoop(t, fixture, string(domain.LoopStatusTerminated), terminatedStaleRepairMetadata())
+			repairer := newTestRepairer(fixture, &fakeGitHubGateway{currentLogin: "octocat", reviewRequests: []string{"octocat"}, viewHeadSHA: "abc123"})
+
+			result, err := repairer.Repair(context.Background(), RepairInput{Repo: "acme/looper", PRNumber: 42, Apply: apply})
+			if err != nil {
+				t.Fatalf("Repair(apply=%v) error = %v", apply, err)
+			}
+			if result.Applied || result.AppliedChanges != 0 {
+				t.Fatalf("Repair(apply=%v) applied=%v changes=%d, want no changes", apply, result.Applied, result.AppliedChanges)
+			}
+			for _, code := range []string{"stale_local_published_head", "stale_filter_skip", "terminal_local_loop"} {
+				if !repairHasDiagnosis(result, code) {
+					t.Fatalf("Repair(apply=%v) diagnoses = %#v, want %s", apply, result.Diagnoses, code)
+				}
+			}
+			for _, code := range []string{"clear_local_published_head", "clear_filter_skip"} {
+				if repairHasAction(result, code) {
+					t.Fatalf("Repair(apply=%v) actions = %#v, did not expect %s", apply, result.Actions, code)
+				}
+			}
+
+			loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if got, want := loop.Status, string(domain.LoopStatusTerminated); got != want {
+				t.Fatalf("loop.Status = %q, want %q", got, want)
+			}
+			meta := parseJSONObject(loop.MetadataJSON)
+			if got, _ := stringFromAny(meta["lastPublishedHeadSha"]); got != "abc123" {
+				t.Fatalf("metadata.lastPublishedHeadSha = %q, want abc123", got)
+			}
+			if _, ok := meta["lastFilterSkip"]; !ok {
+				t.Fatalf("metadata.lastFilterSkip missing after repair: %#v", meta)
+			}
+			loopMeta, _ := meta["loop"].(map[string]any)
+			if got, _ := stringFromAny(loopMeta["status"]); got != string(domain.LoopStatusTerminated) {
+				t.Fatalf("metadata.loop.status = %q, want terminated", got)
+			}
+		})
+	}
+}
+
 func TestRepairDoesNotClearPublishedHeadWhenCurrentHeadWasReviewed(t *testing.T) {
 	t.Parallel()
 
@@ -205,6 +257,24 @@ func stalePublishedRepairMetadata() string {
 		"lastOutputFingerprint": "fingerprint-1",
 		"reviewEvents":          map[string]any{"clean": "COMMENT", "blocking": "COMMENT"},
 		"loop":                  map[string]any{"status": "completed", "lastReviewedHeadSha": "abc123", "lastOutputFingerprint": "fingerprint-1"},
+	})
+}
+
+func terminatedStaleRepairMetadata() string {
+	return mustMarshalJSON(map[string]any{
+		"lastPublishedHeadSha":  "abc123",
+		"lastPublishedAt":       "2026-05-13T06:00:00.000Z",
+		"lastReviewEvent":       "COMMENT",
+		"lastOutputFingerprint": "fingerprint-1",
+		"lastFilterSkip": map[string]any{
+			"kind":       "draft",
+			"reason":     "PR is draft",
+			"headSha":    "abc123",
+			"isDraft":    true,
+			"recordedAt": "2026-05-13T06:00:00.000Z",
+		},
+		"reviewEvents": map[string]any{"clean": "COMMENT", "blocking": "COMMENT"},
+		"loop":         map[string]any{"status": "terminated", "terminationReason": "manual_stop", "lastReviewedHeadSha": "abc123", "lastOutputFingerprint": "fingerprint-1"},
 	})
 }
 
