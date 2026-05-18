@@ -361,14 +361,15 @@ func TestWebhookStatusRestartRequiredTracksTunnelEndpointDriftForMixedModeProjec
 			"counters":                    map[string]any{"deliveriesReceived": 0, "coalesced": 0, "dropped": 0, "queued": 0, "processed": 0, "failed": 0},
 			"recentOutcomes":              []map[string]any{},
 			"forwarders":                  []map[string]any{},
-			"tunnelHooks":                 []map[string]any{{"repo": "acme/looper", "managedUrl": "https://runtime.example.com/base/webhook/tunnel/acme/looper", "orphaned": false}},
+			"tunnelHooks":                 []map[string]any{},
 		}))
 	}))
 	defer server.Close()
 
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
-		"webhook": map[string]any{"enabled": true, "mode": "gh-forward", "listenPort": 9443, "publicBaseUrl": "https://config.example.com/base", "fallbackPollIntervalSeconds": 300},
-		"server":  map[string]any{"baseUrl": server.URL, "authMode": "none"},
+		"webhook":  map[string]any{"enabled": true, "mode": "gh-forward", "listenPort": 9443, "publicBaseUrl": "https://config.example.com/base", "fallbackPollIntervalSeconds": 300},
+		"projects": []map[string]any{{"id": "proj-1", "name": "Looper", "repoPath": t.TempDir(), "webhook": map[string]any{"mode": "tunnel"}}},
+		"server":   map[string]any{"baseUrl": server.URL, "authMode": "none"},
 		"notifications": map[string]any{
 			"osascript": map[string]any{"enabled": false},
 		},

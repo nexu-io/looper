@@ -36,6 +36,7 @@ type webhookStatusOutput struct {
 	Warnings         []string            `json:"warnings"`
 	RuntimeAvailable bool                `json:"runtimeAvailable"`
 	Runtime          *webhookRuntimeView `json:"runtime,omitempty"`
+	configUsesTunnel bool
 }
 
 type webhookRuntimeView struct {
@@ -241,13 +242,14 @@ func (r *commandRuntime) webhookStatus(cmd *cobra.Command, args []string) error 
 		return err
 	}
 	output := webhookStatusOutput{
-		ConfigPath:    loaded.Metadata.ConfigPath,
-		Enabled:       loaded.Config.Webhook.Enabled,
-		Mode:          loaded.Config.Webhook.Mode,
-		ListenPort:    loaded.Config.Webhook.ListenPort,
-		PublicBaseURL: loaded.Config.Webhook.PublicBaseURL,
-		FallbackPoll:  loaded.Config.Webhook.FallbackPollIntervalSeconds,
-		Warnings:      webhookWarnings(loaded.Config),
+		ConfigPath:       loaded.Metadata.ConfigPath,
+		Enabled:          loaded.Config.Webhook.Enabled,
+		Mode:             loaded.Config.Webhook.Mode,
+		ListenPort:       loaded.Config.Webhook.ListenPort,
+		PublicBaseURL:    loaded.Config.Webhook.PublicBaseURL,
+		FallbackPoll:     loaded.Config.Webhook.FallbackPollIntervalSeconds,
+		Warnings:         webhookWarnings(loaded.Config),
+		configUsesTunnel: webhookConfigUsesTunnel(loaded.Config),
 	}
 	client := r.apiClientFromLoaded(loaded)
 	payload, err := r.getJSONWithClient(cmd.Context(), client, "/api/v1/webhook/status")
@@ -474,7 +476,7 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 	if runtimeMode != configMode {
 		return true
 	}
-	if runtimeMode == config.WebhookModeTunnel || webhookRuntimeHasActiveTunnelHooks(output.Runtime) {
+	if output.configUsesTunnel || webhookRuntimeHasActiveTunnelHooks(output.Runtime) {
 		if output.Runtime.TunnelListenerURL != webhookStatusTunnelListenerURL(output.ListenPort) {
 			return true
 		}
@@ -483,6 +485,18 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 		}
 	}
 	return output.Runtime.FallbackPollIntervalSeconds != output.FallbackPoll
+}
+
+func webhookConfigUsesTunnel(cfg config.Config) bool {
+	if cfg.Webhook.Mode == config.WebhookModeTunnel {
+		return true
+	}
+	for _, project := range cfg.Projects {
+		if project.Webhook.Mode == config.WebhookModeTunnel {
+			return true
+		}
+	}
+	return false
 }
 
 func webhookRuntimeHasActiveTunnelHooks(runtime *webhookRuntimeView) bool {
