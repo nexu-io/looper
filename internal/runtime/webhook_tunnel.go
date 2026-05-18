@@ -614,7 +614,11 @@ func readWebhookTunnelSecret(dbPath, ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return "", fmt.Errorf("webhook secret %s is empty", path)
+	}
+	return secret, nil
 }
 
 func webhookTunnelSecretPath(dbPath, ref string) string {
