@@ -26,6 +26,8 @@ Canonical default path:
 ~/.looper/config.toml
 ```
 
+For webhook-mode troubleshooting in this repository, users may also have a JSON config at `~/.looper/config.json`. Respect whichever supported config file Looper is actually loading.
+
 Config source selection precedence is:
 
 1. `--config`
@@ -206,6 +208,10 @@ maxConcurrentRuns = 3
 retryMaxAttempts = 5
 retryBaseDelayMs = 5000
 
+[webhook]
+enabled = false
+fallbackPollIntervalSeconds = 300
+
 [agent]
 vendor = "opencode"
 
@@ -288,6 +294,22 @@ labels = ["needs-review"]
 labelMode = "any"
 requireReviewRequest = false
 ```
+
+## Webhook-related config guidance
+
+When diagnosing or editing webhook mode, pay attention to:
+
+- `webhook.enabled` — turns webhook mode on or off.
+- `webhook.fallbackPollIntervalSeconds` — polling fallback cadence when forwarders are unavailable.
+- `server.host` — must remain loopback for local forwarders.
+- `server.host` and `server.port` — webhook forwarders derive the local listener endpoint from these fields, so `server.host` must stay loopback and `server.port` must match the running daemon.
+- `tools.ghPath` — set explicitly when `looperd` cannot resolve `gh` from its runtime environment.
+
+Targeted checks:
+
+- If `looper webhook status` warns about loopback, inspect `server.host` first.
+- If it warns that `gh` could not be resolved, set `tools.ghPath` explicitly instead of rewriting unrelated config.
+- If webhook mode is degraded but config is correct, prefer `looper webhook cleanup owner/repo` or auth troubleshooting before editing config.
 
 ## Runtime paths
 

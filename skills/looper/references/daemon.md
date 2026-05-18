@@ -73,3 +73,21 @@ looper daemon install --force
 ```
 
 After any repair, re-run read-only checks and only run repair or restart commands after confirming with the user.
+
+## Webhook-mode daemon checks
+
+When the user is troubleshooting webhook mode specifically, add these read-only checks before restarting anything:
+
+```bash
+looper webhook status
+looper webhook status --verbose
+looper daemon status --json
+looper daemon logs
+```
+
+Key daemon/runtime facts for webhook mode:
+
+- `looperd` runs local `gh webhook forward` subprocesses; it does not rely on webhook mode for correctness because polling remains the fallback.
+- Webhook forwarders require a loopback daemon endpoint. Non-loopback `server.host` will degrade webhook mode.
+- If webhook runtime becomes degraded because stale remote GitHub CLI hooks already exist, prefer `looper webhook cleanup owner/repo` before restarting the daemon.
+- Restart is only the next step if status still shows degraded after cleanup or after fixing auth/path/config problems.

@@ -7,6 +7,8 @@ description: Use when installing, bootstrapping, configuring, starting, verifyin
 
 Use this skill when an agent needs to install, configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).
 
+This skill now includes the webhook-mode lifecycle: enabling `looper webhook`, installing or validating the GitHub CLI webhook extension, verifying healthy forwarders, diagnosing degraded webhook runtime, cleaning up stale GitHub CLI `cli` hooks with `looper webhook cleanup`, and deciding when a daemon restart is or is not necessary.
+
 **When NOT to use this skill:** developing on the Looper codebase itself (Go sources at `cmd/`, `internal/`, `pkg/`). For that, follow `AGENTS.md` and standard Go tooling.
 
 ## Looper in one paragraph
@@ -82,7 +84,7 @@ If none are installed, ask the user which one they want to install before contin
 
 After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
 
-Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). **Do not** store agent credentials in `~/.looper/config.json`.
+Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). **Do not** store agent credentials in the Looper config file (commonly `~/.looper/config.toml`, with some existing installs still using `~/.looper/config.json`).
 
 ### Step 2 — Pick the first project to watch
 
@@ -111,9 +113,9 @@ If `looper --version` fails, do not guess a new install location. The installer 
 
 ### Step 4 — Bootstrap config, daemon, and first project
 
-`looper bootstrap` writes `~/.looper/config.json`, installs the managed daemon to `~/.looper/bin/looperd`, optionally registers a project, and starts `looperd`.
+`looper bootstrap` writes the active Looper config file (usually `~/.looper/config.toml`; some existing installs still use `~/.looper/config.json`), installs the managed daemon to `~/.looper/bin/looperd`, optionally registers a project, and starts `looperd`.
 
-**If `~/.looper/config.json` already exists, do NOT pass `--yes`.** Inspect first with `looper config show`, then triage by what is missing or wrong:
+**If a Looper config file already exists (commonly `~/.looper/config.toml` or legacy `~/.looper/config.json`), do NOT pass `--yes`.** Inspect first with `looper config show`, then triage by what is missing or wrong:
 
 | Existing-config state | Action |
 | --- | --- |
@@ -208,7 +210,7 @@ looper logs <id> --follow
 For deeper detail, consult these bundled docs before acting:
 
 - [`references/cli.md`](references/cli.md) — installed `looper` CLI commands, install/uninstall scripts, `looper bootstrap`, `looper project add`, daemon lifecycle, loop inspection.
-- [`references/config.md`](references/config.md) — full `~/.looper/config.json` shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
+- [`references/config.md`](references/config.md) — full Looper config shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
 - [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd integration, log locations, startup-failure triage.
 - [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
 
@@ -236,7 +238,7 @@ looper webhook cleanup owner/repo --confirm
 
 ## Safety rules
 
-- Do not overwrite or rewrite `~/.looper/config.json` without explicit user confirmation. Prefer targeted edits.
+- Do not overwrite or rewrite the Looper config file (`~/.looper/config.toml` on new installs; `~/.looper/config.json` on some existing installs) without explicit user confirmation. Prefer targeted edits.
 - Do not delete runtime artifacts (`~/.looper/looper.sqlite`, `backups/`, `logs/`, `worktrees/`) unless the user explicitly asks and understands the impact.
 - Starting or restarting `looperd` can launch background automation against configured GitHub repositories — confirm intent before doing so.
 - Do not toggle `daemon.mode` (foreground ↔ launchd) without confirming; supervised mode persists across login/reboot.
@@ -247,7 +249,7 @@ looper webhook cleanup owner/repo --confirm
 
 ## Common mistakes
 
-- `cat ~/.looper/config.json` as a first move: use `looper config show` instead and redact secrets.
+- `cat ~/.looper/config.*` as a first move: use `looper config show` instead and redact secrets.
 - Restarting the daemon under pressure: check status/logs first; restart can re-trigger automation.
 - Disabling `notifications.osascript.enabled` silently: confirm the change or set an explicit `tools.osascriptPath`.
 - Rewriting the whole config for one fix: make targeted edits and preserve existing settings.
