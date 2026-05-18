@@ -56,7 +56,7 @@ func TestForwardDedupesDeliveriesWithinTTLAndExpiresAfterAnHour(t *testing.T) {
 	}
 }
 
-func TestForwardIgnoresUnsupportedAndNonPullRequestIssueComments(t *testing.T) {
+func TestForwardIgnoresUnsupportedAndIssueComments(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
 	reviewerRunner := newFakeTargetedRunner(nil)
@@ -67,6 +67,7 @@ func TestForwardIgnoresUnsupportedAndNonPullRequestIssueComments(t *testing.T) {
 	for _, request := range []DeliveryRequest{
 		{DeliveryID: "ignored-1", EventType: "issues", Payload: []byte(`{"action":"opened"}`)},
 		{DeliveryID: "ignored-2", EventType: "issue_comment", Payload: []byte(`{"action":"created","repository":{"full_name":"acme/looper"},"issue":{"number":42}}`)},
+		{DeliveryID: "ignored-3", EventType: "issue_comment", Payload: []byte(`{"action":"created","repository":{"full_name":"acme/looper"},"issue":{"number":42,"pull_request":{"url":"https://api.github.com/repos/acme/looper/pulls/42"}}}`)},
 	} {
 		result, err := forwarder.Forward(context.Background(), request)
 		if err != nil {
@@ -81,6 +82,25 @@ func TestForwardIgnoresUnsupportedAndNonPullRequestIssueComments(t *testing.T) {
 	fixerRunner.assertCallCount(t, 0)
 }
 
+func TestForwardRoutesPullRequestLabelChangesToFixerOnly(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	for i, action := range []string{"labeled", "unlabeled"} {
+		if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "label-" + action, EventType: "pull_request", Payload: pullRequestPayload(action, "acme/looper", int64(42+i))}); err != nil {
+			t.Fatalf("Forward(%s) error = %v", action, err)
+		}
+	}
+
+	fixerRunner.waitForCalls(t, 2)
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertPRCount(t, 42, 1)
+	fixerRunner.assertPRCount(t, 43, 1)
+}
 func TestForwardTriggersFixerForFailedCheckWebhookEvents(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
@@ -261,7 +281,7 @@ func TestForwardPreservesCoalescedWorkWhenRequeueHitsCapacity(t *testing.T) {
 	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "queued-pr2", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 2)}); err != nil {
 		t.Fatalf("Forward(queued-pr2) error = %v", err)
 	}
-	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "coalesced-pr1", EventType: "issue_comment", Payload: []byte(`{"action":"created","repository":{"full_name":"acme/looper"},"issue":{"number":1,"pull_request":{"url":"https://api.github.com/repos/acme/looper/pulls/1"}}}`)}); err != nil {
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "coalesced-pr1", EventType: "pull_request", Payload: pullRequestPayload("labeled", "acme/looper", 1)}); err != nil {
 		t.Fatalf("Forward(coalesced-pr1) error = %v", err)
 	}
 

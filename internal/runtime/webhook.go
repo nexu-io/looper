@@ -24,7 +24,7 @@ const noConfiguredWebhookReposReason = "no configured GitHub repos are available
 
 var webhookReconcileRetryDelay = 5 * time.Second
 
-var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment"}
+var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
 
 type WebhookStatus struct {
 	Enabled                     bool                    `json:"enabled"`
@@ -356,13 +356,13 @@ func (w *webhookRuntime) runForwarder(repo string) {
 
 		startedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		pid := cmd.Process.Pid
+		w.clearForwarderDegradedReasons(repo)
 		w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
 			state.Running = true
 			state.PID = &pid
 			state.LastStartedAt = &startedAt
 			state.LastError = ""
 		})
-		w.clearForwarderDegradedReasons(repo)
 
 		var pipes sync.WaitGroup
 		pipes.Add(2)

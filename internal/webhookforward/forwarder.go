@@ -596,6 +596,8 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		switch strings.TrimSpace(envelope.Action) {
 		case "review_requested":
 			lanes[LaneReviewer] = struct{}{}
+		case "labeled", "unlabeled":
+			lanes[LaneFixer] = struct{}{}
 		case "opened", "reopened", "ready_for_review", "synchronize":
 			lanes[LaneReviewer] = struct{}{}
 			lanes[LaneFixer] = struct{}{}
@@ -611,13 +613,10 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if err := json.Unmarshal(payload, &envelope); err != nil {
 			return routedDelivery{}, false, fmt.Errorf("decode issue_comment webhook: %w", err)
 		}
-		if envelope.Issue.PullRequest == nil {
-			return routedDelivery{}, false, nil
-		}
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.Issue.Number <= 0 {
 			return routedDelivery{}, false, errors.New("issue_comment webhook missing repository or number")
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.Issue.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{}, false, nil
 	case "pull_request_review", "pull_request_review_comment":
 		var envelope pullRequestEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
