@@ -339,6 +339,9 @@ func (w *webhookRuntime) hasLaunchBlockingDegradedReason() bool {
 
 func (w *webhookRuntime) hasLaunchBlockingDegradedReasonLocked() bool {
 	for _, reason := range w.status.DegradedReasons {
+		if strings.HasPrefix(reason, "tunnel hook for ") || strings.HasPrefix(reason, "webhook tunnel ") {
+			continue
+		}
 		if !strings.HasPrefix(reason, "forwarder for ") {
 			return true
 		}

@@ -290,7 +290,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 				return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
 			}
 		}
-		_, err := client.UpdateHook(ctx, repo, record.HookID, url, "", webhookForwardEvents, true)
+		_, err := client.UpdateHook(ctx, repo, record.HookID, url, secret, webhookForwardEvents, true)
 		if err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("update hook by id: %v", err))
 		}

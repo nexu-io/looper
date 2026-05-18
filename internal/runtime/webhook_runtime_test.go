@@ -795,6 +795,25 @@ func TestWebhookRuntimeAdoptedForwarderExitDoesNotRespawnWhenLaunchBlocked(t *te
 	}
 }
 
+func TestWebhookRuntimeTunnelDegradedReasonsDoNotBlockForwarderLaunch(t *testing.T) {
+	t.Parallel()
+
+	rt := &webhookRuntime{ghPath: "/usr/bin/gh", status: WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{
+		"tunnel hook for nexu-io/tunnel degraded: latched; polling fallback continues every 300 seconds",
+		"webhook tunnel hooks require gh to create or reconcile repository webhooks",
+		"forwarder for nexu-io/looper exited: temporary network error",
+	}}}
+
+	if !rt.canLaunchForwarders() {
+		t.Fatal("canLaunchForwarders() = false, want tunnel-only degraded reasons to keep gh-forward launchable")
+	}
+
+	rt.status.DegradedReasons = append(rt.status.DegradedReasons, "server.host is not loopback; webhook forwarders require a loopback daemon endpoint")
+	if rt.canLaunchForwarders() {
+		t.Fatal("canLaunchForwarders() = true, want non-tunnel global degraded reason to block launch")
+	}
+}
+
 func TestWebhookRuntimeStartDoesNotLaunchReplacementWhenBootstrapProbeIsInconclusive(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {
