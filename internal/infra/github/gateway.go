@@ -296,6 +296,13 @@ type ClosePullRequestInput struct {
 	CWD      string
 }
 
+type EnableAutoMergeInput struct {
+	Repo     string
+	PRNumber int64
+	Strategy config.ReviewerAutoMergeStrategy
+	CWD      string
+}
+
 type SubmitReviewInput struct {
 	Repo       string
 	PRNumber   int64
@@ -1264,6 +1271,15 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	if stateErr == nil && (state == "closed" || state == "merged") {
 		return nil
 	}
+	return err
+}
+
+func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInput) error {
+	strategy := strings.TrimSpace(string(input.Strategy))
+	if strategy == "" {
+		return fmt.Errorf("auto-merge strategy is required")
+	}
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--auto", "--"+strategy)
 	return err
 }
 

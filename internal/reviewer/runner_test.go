@@ -16,6 +16,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -3186,6 +3187,150 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanNoopCommentPolicy(
 	}
 	if len(github.addLabelCalls) != 0 {
 		t.Fatalf("addLabelCalls = %#v, want no spec-ready add for COMMENT clean policy", github.addLabelCalls)
+	}
+}
+
+func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add more\n", Labels: []string{"triaged", "dispatch/plan"}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 2}}},
+		"add more":        {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 2, EndLine: 2}}},
+	}}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_auto_merge_pass", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventApprove) {
+		t.Fatalf("submitReviewCalls = %#v, want one APPROVE review", github.submitReviewCalls)
+	}
+	if len(github.enableAutoMergeCalls) != 1 || github.enableAutoMergeCalls[0].Strategy != config.ReviewerAutoMergeStrategySquash {
+		t.Fatalf("enableAutoMergeCalls = %#v, want one squash auto-merge call", github.enableAutoMergeCalls)
+	}
+	if !strings.Contains(github.submitReviewCalls[0].Body, criteriaVerificationHeading) || !strings.Contains(github.submitReviewCalls[0].Body, "app.go:1-2") {
+		t.Fatalf("review body = %q, want acceptance criteria evidence", github.submitReviewCalls[0].Body)
+	}
+	if len(github.removeIssueLabelCalls) != 0 {
+		t.Fatalf("removeIssueLabelCalls = %#v, want none", github.removeIssueLabelCalls)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want no refusal comment", github.issueCommentCalls)
+	}
+}
+
+func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	cfg := reviewerAutoMergeTestConfig(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+		repositorySettings:  githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: false},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: cfg, CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}},
+	}}})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventApprove) {
+		t.Fatalf("submitReviewCalls = %#v, want one APPROVE review", github.submitReviewCalls)
+	}
+	if len(github.enableAutoMergeCalls) != 0 {
+		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
+	}
+	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, autoMergeRefusedCommentMarker) {
+		t.Fatalf("issueCommentCalls = %#v, want stamped refusal comment", github.issueCommentCalls)
+	}
+}
+
+func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", "dispatch/plan", "other"}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}},
+		"add tests":       {Verdict: criteria.VerdictFail, Justification: "no test change in diff"},
+	}}})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventComment) {
+		t.Fatalf("submitReviewCalls = %#v, want one COMMENT review", github.submitReviewCalls)
+	}
+	if !strings.Contains(github.submitReviewCalls[0].Body, criteriaFailCommentMarker) {
+		t.Fatalf("review body = %q, want criteria fail marker", github.submitReviewCalls[0].Body)
+	}
+	if len(github.removeIssueLabelCalls) != 1 {
+		t.Fatalf("removeIssueLabelCalls = %#v, want one issue label removal", github.removeIssueLabelCalls)
+	}
+	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "dispatch/plan" {
+		t.Fatalf("removed labels = %#v, want triaged + dispatch/plan", got)
+	}
+	if len(github.enableAutoMergeCalls) != 0 {
+		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
 	}
 }
 
@@ -6530,7 +6675,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -6543,7 +6688,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -6842,6 +6987,28 @@ func (f *runnerFixture) nowISO() string {
 
 func boolPtr(value bool) *bool { return &value }
 
+type stubCriteriaVerifier struct {
+	responses map[criteria.AcceptanceCriterion]criteria.CriterionAssessment
+}
+
+func (s stubCriteriaVerifier) VerifyCriterion(criterion criteria.AcceptanceCriterion, _ criteria.PRDiff) (criteria.CriterionAssessment, error) {
+	if assessment, ok := s.responses[criterion]; ok {
+		return assessment, nil
+	}
+	return criteria.CriterionAssessment{Verdict: criteria.VerdictUnverifiable, Justification: "missing test verifier response"}, nil
+}
+
+func reviewerAutoMergeTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.AutoMerge.Enabled = true
+	cfg.Roles.Reviewer.AutoMerge.Strategy = config.ReviewerAutoMergeStrategySquash
+	return &cfg
+}
+
 type failedReviewerRecoverySeed struct {
 	ResumePolicy         string
 	QueueErrorKind       string
@@ -6932,7 +7099,12 @@ type fakeGitHubGateway struct {
 	reviewMarkerInlineCommentBodies []string
 	reviewMarkerCalls               int
 	reviewMarkerInputs              []VerifyReviewMarkerInput
+	issueDetail                     githubinfra.IssueDetail
+	repositorySettings              githubinfra.RepositorySettings
+	branchProtection                githubinfra.BranchProtection
 	viewDraft                       bool
+	viewBody                        string
+	viewDiff                        string
 	viewState                       string
 	viewStateAfterFirstView         string
 	viewErrs                        []error
@@ -6946,6 +7118,9 @@ type fakeGitHubGateway struct {
 	viewHeadSHA                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
+	submitReviewCalls               []githubinfra.SubmitReviewInput
+	enableAutoMergeCalls            []githubinfra.EnableAutoMergeInput
+	removeIssueLabelCalls           []githubinfra.IssueLabelsInput
 	captureSnapshotErrs             []error
 	captureSnapshotCalls            int
 	addThreadReplyCalls             []AddReviewThreadReplyInput
@@ -7016,7 +7191,36 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if state == "" {
 		state = "OPEN"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+	body := g.viewBody
+	if body == "" {
+		body = "PR body"
+	}
+	diff := g.viewDiff
+	if diff == "" {
+		diff = "diff --git a/a.ts b/a.ts"
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+}
+
+func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if g.issueDetail.Number != 0 {
+		return g.issueDetail, nil
+	}
+	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "dispatch/plan"}}, nil
+}
+
+func (g *fakeGitHubGateway) GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	if g.repositorySettings.AllowSquashMerge || g.repositorySettings.AllowMergeCommit || g.repositorySettings.AllowRebaseMerge || g.repositorySettings.AllowAutoMerge {
+		return g.repositorySettings, nil
+	}
+	return githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: true}, nil
+}
+
+func (g *fakeGitHubGateway) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if g.branchProtection.Enabled || g.branchProtection.HasRequiredChecks {
+		return g.branchProtection, nil
+	}
+	return githubinfra.BranchProtection{Enabled: true, HasRequiredChecks: true}, nil
 }
 
 func (g *fakeGitHubGateway) GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error) {
@@ -7082,6 +7286,33 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	if g.reviewMarkerErr != nil {
 		return ReviewMarkerResult{}, g.reviewMarkerErr
 	}
+	for i := len(g.reviews) - 1; i >= 0; i-- {
+		row := g.reviews[i]
+		body, _ := row["body"].(string)
+		if !strings.Contains(body, input.Marker) {
+			continue
+		}
+		state, _ := row["state"].(string)
+		event := ReviewEventComment
+		switch state {
+		case "APPROVED":
+			event = ReviewEventApprove
+		case "CHANGES_REQUESTED":
+			event = ReviewEventRequestChanges
+		}
+		if !reviewEventIn(input.AllowedReviewEvents, event) {
+			continue
+		}
+		outcome := "actionable"
+		if strings.Contains(body, "outcome=clean") {
+			outcome = "clean"
+		} else if strings.Contains(body, "outcome=blocking") {
+			outcome = "blocking"
+		} else if strings.Contains(body, "outcome=non_blocking") {
+			outcome = "non_blocking"
+		}
+		return ReviewMarkerResult{Found: true, Outcome: outcome, Event: event, Body: body, InlineCommentBodies: append([]string(nil), g.reviewMarkerInlineCommentBodies...)}, nil
+	}
 	if g.reviewMarkerExactMissing && strings.Contains(input.Marker, " id=") {
 		return ReviewMarkerResult{}, nil
 	}
@@ -7115,6 +7346,26 @@ func (g *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCom
 		return g.issueCommentResult, nil
 	}
 	return IssueCommentResult{ID: int64(len(g.issueCommentCalls)), URL: fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", input.Repo, input.IssueNumber, len(g.issueCommentCalls))}, nil
+}
+
+func (g *fakeGitHubGateway) SubmitReview(_ context.Context, input githubinfra.SubmitReviewInput) error {
+	g.submitReviewCalls = append(g.submitReviewCalls, input)
+	state := "COMMENTED"
+	switch input.Event {
+	case string(ReviewEventApprove):
+		state = "APPROVED"
+	case string(ReviewEventRequestChanges):
+		state = "CHANGES_REQUESTED"
+	}
+	body := input.Body
+	g.reviews = append(g.reviews, map[string]any{"body": body, "state": state, "user": map[string]any{"login": firstNonEmpty(strings.TrimSpace(g.currentLogin), "octocat")}})
+	g.issueComments = append(g.issueComments, map[string]any{"body": body})
+	return nil
+}
+
+func (g *fakeGitHubGateway) EnableAutoMerge(_ context.Context, input githubinfra.EnableAutoMergeInput) error {
+	g.enableAutoMergeCalls = append(g.enableAutoMergeCalls, input)
+	return nil
 }
 
 func cleanApproveReviewBody(author string, outcome string) string {
@@ -7153,6 +7404,11 @@ func (g *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRe
 func (g *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
 	g.removeLabelCalls = append(g.removeLabelCalls, input)
 	return g.removeLabelErr
+}
+
+func (g *fakeGitHubGateway) RemoveIssueLabels(_ context.Context, input githubinfra.IssueLabelsInput) error {
+	g.removeIssueLabelCalls = append(g.removeIssueLabelCalls, input)
+	return nil
 }
 
 func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error) {

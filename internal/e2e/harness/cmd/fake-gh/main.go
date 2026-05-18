@@ -152,6 +152,9 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 			return nil
 		}
 		return emitDefaultJSON(key, fields)
+	case "pr merge":
+		_, _ = fmt.Fprintln(os.Stdout, "{}")
+		return nil
 	case "issue list", "pr list":
 		fields := requestedJSONFields(os.Args[1:])
 		allowed := schemaDoc.JSONFieldAllowlist[key]
@@ -198,6 +201,16 @@ func handleAPI(mode string, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, `{"data":{}}`)
 		return nil
 	}
+	if strings.Contains(route, "/pulls/") && strings.HasSuffix(route, "/reviews") {
+		if handled, err := handlePullRequestReviews(&st, args, stdin, route); handled || err != nil {
+			return err
+		}
+	}
+	if strings.Contains(route, "/pulls/") && strings.Contains(route, "/reviews/") && strings.HasSuffix(route, "/comments") {
+		if handled, err := handlePullRequestReviewComments(st, route); handled || err != nil {
+			return err
+		}
+	}
 	if strings.HasSuffix(route, "/comments") && strings.EqualFold(flagValue(args, "--method"), "POST") {
 		_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"html_url":"https://example.test/issues/comments/1"}`)
 		return nil
@@ -227,16 +240,145 @@ func handleAPI(mode string, st state, stdin string) error {
 	return nil
 }
 
+func handlePullRequestReviews(st *state, args []string, stdin string, route string) (bool, error) {
+	repo, prNumber, ok := parsePullRequestReviewRoute(route)
+	if !ok {
+		return false, nil
+	}
+	method := strings.ToUpper(strings.TrimSpace(flagValue(args, "--method")))
+	if method == "" {
+		method = "GET"
+	}
+	pr, ok := lookupPullRequest(*st, repo, prNumber)
+	if !ok {
+		return false, nil
+	}
+	if method == "POST" {
+		body, event, err := parseReviewCreatePayload(stdin)
+		if err != nil {
+			return true, err
+		}
+		reviewID := fmt.Sprintf("review-%d", len(pr.Reviews)+1)
+		pr.Reviews = append(pr.Reviews, map[string]any{"id": reviewID, "body": body, "state": reviewStateForEvent(event), "user": map[string]any{"login": firstNonEmpty(st.CurrentUserLogin, "looper")}})
+		st.PullRequests[fmt.Sprintf("%s#%d", repo, prNumber)] = pr
+		if err := saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st); err != nil {
+			return true, err
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "{\"id\":%q}\n", reviewID)
+		return true, nil
+	}
+	payload, err := json.Marshal([][]map[string]any{pr.Reviews})
+	if err != nil {
+		return true, err
+	}
+	_, _ = fmt.Fprintln(os.Stdout, string(payload))
+	return true, nil
+}
+
+func handlePullRequestReviewComments(st state, route string) (bool, error) {
+	repo, prNumber, reviewID, ok := parsePullRequestReviewCommentsRoute(route)
+	if !ok {
+		return false, nil
+	}
+	pr, ok := lookupPullRequest(st, repo, prNumber)
+	if !ok {
+		return false, nil
+	}
+	for _, review := range pr.Reviews {
+		if asString(review["id"]) != reviewID {
+			continue
+		}
+		payload, err := json.Marshal([][]map[string]any{{}})
+		if err != nil {
+			return true, err
+		}
+		_, _ = fmt.Fprintln(os.Stdout, string(payload))
+		return true, nil
+	}
+	return false, nil
+}
+
+func parsePullRequestReviewRoute(route string) (string, int64, bool) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.HasSuffix(route, "/reviews") {
+		return "", 0, false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(route, marker), "/reviews")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 4 || parts[2] != "pulls" {
+		return "", 0, false
+	}
+	prNumber, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return parts[0] + "/" + parts[1], prNumber, true
+}
+
+func parsePullRequestReviewCommentsRoute(route string) (string, int64, string, bool) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.Contains(route, "/reviews/") || !strings.HasSuffix(route, "/comments") {
+		return "", 0, "", false
+	}
+	rest := strings.TrimPrefix(route, marker)
+	parts := strings.Split(rest, "/")
+	if len(parts) < 7 || parts[2] != "pulls" || parts[4] != "reviews" {
+		return "", 0, "", false
+	}
+	prNumber, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return "", 0, "", false
+	}
+	return parts[0] + "/" + parts[1], prNumber, parts[5], true
+}
+
+func parseReviewCreatePayload(stdin string) (string, string, error) {
+	var payload struct {
+		Body  string `json:"body"`
+		Event string `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(stdin), &payload); err != nil {
+		return "", "", err
+	}
+	return payload.Body, payload.Event, nil
+}
+
+func reviewStateForEvent(event string) string {
+	switch strings.ToUpper(strings.TrimSpace(event)) {
+	case "APPROVE":
+		return "APPROVED"
+	case "REQUEST_CHANGES":
+		return "CHANGES_REQUESTED"
+	default:
+		return "COMMENTED"
+	}
+}
+
+func asString(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
 func emitResponse(resp response) error {
 	if resp.Stderr != "" {
 		_, _ = os.Stderr.WriteString(resp.Stderr)
 	}
 	if len(resp.Stdout) > 0 {
+		var text string
+		if err := json.Unmarshal(resp.Stdout, &text); err == nil {
+			_, _ = os.Stdout.WriteString(text)
+			if text == "" || text[len(text)-1] != '\n' {
+				_, _ = fmt.Fprintln(os.Stdout)
+			}
+			goto exitCode
+		}
 		_, _ = os.Stdout.Write(resp.Stdout)
 		if resp.Stdout[len(resp.Stdout)-1] != '\n' {
 			_, _ = fmt.Fprintln(os.Stdout)
 		}
 	}
+
+exitCode:
 	if resp.ExitCode != 0 {
 		os.Exit(resp.ExitCode)
 	}
@@ -545,7 +687,7 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 	case "reviewRequests":
 		items := make([]map[string]any, 0, len(pr.ReviewRequests))
 		for _, login := range pr.ReviewRequests {
-			items = append(items, map[string]any{"login": login})
+			items = append(items, map[string]any{"__typename": "ReviewRequest", "requestedReviewer": map[string]any{"__typename": "User", "login": login}})
 		}
 		return items
 	case "comments":

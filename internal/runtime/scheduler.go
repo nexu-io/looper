@@ -306,6 +306,18 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
+func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	return a.gateway.ViewIssue(ctx, input)
+}
+
+func (a reviewerGitHubAdapter) GetRepositorySettings(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	return a.gateway.GetRepositorySettings(ctx, input)
+}
+
+func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	return a.gateway.GetBranchProtection(ctx, input)
+}
+
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
 	return a.gateway.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
@@ -335,6 +347,14 @@ func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input rev
 	return reviewer.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
 }
 
+func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
+	return a.gateway.SubmitReview(ctx, input)
+}
+
+func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
+	return a.gateway.EnableAutoMerge(ctx, input)
+}
+
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
@@ -349,6 +369,10 @@ func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input r
 
 func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input githubinfra.IssueLabelsInput) error {
+	return a.gateway.RemoveIssueLabels(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input reviewer.ListReviewThreadsInput) ([]reviewer.ReviewThread, error) {
