@@ -73,6 +73,11 @@ func (m *Manager) Start(parent context.Context) error {
 	m.mu.Unlock()
 	routed, _ := countProjectModes(m.config)
 	if routed == 0 {
+		_, local := countProjectModes(m.config)
+		m.mu.Lock()
+		m.status.RoutedProjects = routed
+		m.status.LocalProjects = local
+		m.mu.Unlock()
 		close(m.done)
 		return nil
 	}

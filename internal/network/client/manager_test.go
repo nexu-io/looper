@@ -27,6 +27,26 @@ func TestManagerStartWithoutNetworkStateLeavesStatusUnconfigured(t *testing.T) {
 	}
 }
 
+func TestManagerStartWithoutRoutedProjectsPreservesProjectCounts(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "network.json")
+	if err := SaveState(statePath, LocalState{NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-local-1"}, {ID: "demo-local-2"}}}, nil, nil)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer manager.Stop()
+
+	status := manager.Status()
+	if got, want := status.RoutedProjects, 0; got != want {
+		t.Fatalf("Status().RoutedProjects = %d, want %d", got, want)
+	}
+	if got, want := status.LocalProjects, 2; got != want {
+		t.Fatalf("Status().LocalProjects = %d, want %d", got, want)
+	}
+}
+
 func TestManagerReportsIdentityDriftAndRemoteReachability(t *testing.T) {
 	ctx := context.Background()
 	service, err := cloud.Open(ctx, cloud.Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "0.0.0"})

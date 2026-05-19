@@ -284,6 +284,13 @@ func (s *Service) RevalidateLease(ctx context.Context, nodeToken string, req pro
 	if err := s.probeLeaseTarget(ctx, lease, req); err != nil {
 		return err
 	}
+	lease, err = s.currentLease(ctx)
+	if err != nil {
+		return err
+	}
+	if !leaseUsable(lease, s.now().UTC()) || lease.HolderNodeID != nodeID || lease.FencingToken != req.FencingToken {
+		return staleLeaseError(lease)
+	}
 	return nil
 }
 

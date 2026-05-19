@@ -242,7 +242,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if _, err := s.service.NodeStatus(r.Context(), bearerToken(r)); err != nil {
+	nodeToken := bearerToken(r)
+	if _, err := s.service.NodeStatus(r.Context(), nodeToken); err != nil {
 		writeLeaseOrAuthError(w, err)
 		return
 	}
@@ -256,6 +257,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			case <-r.Context().Done():
 				return
 			case event := <-ch:
+				if _, err := s.service.NodeStatus(r.Context(), nodeToken); err != nil {
+					return
+				}
 				payload, _ := json.Marshal(event)
 				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
 				flusher.Flush()

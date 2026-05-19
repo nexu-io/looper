@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -272,6 +273,63 @@ func TestRouterLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
 	}
 }
 
+func TestRouterLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
+	ctx := context.Background()
+	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "1.2.0"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer service.Close()
+
+	joinKey, err := service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey(node1) error = %v", err)
+	}
+	node1, err := service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 401, Login: "worker-1"}})
+	if err != nil {
+		t.Fatalf("Join(node1) error = %v", err)
+	}
+	joinKey, err = service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey(node2) error = %v", err)
+	}
+	node2, err := service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: "worker-2", GitHub: protocol.GitHubIdentity{NumericID: 402, Login: "worker-2"}})
+	if err != nil {
+		t.Fatalf("Join(node2) error = %v", err)
+	}
+	lease, err := service.AcquireLease(ctx, node1.NodeToken, 0)
+	if err != nil {
+		t.Fatalf("AcquireLease() error = %v", err)
+	}
+
+	probed := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	revalidateTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(probed)
+		<-releaseProbe
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer revalidateTarget.Close()
+
+	revalidateErr := make(chan error, 1)
+	go func() {
+		revalidateErr <- service.RevalidateLease(ctx, node1.NodeToken, protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL})
+	}()
+
+	<-probed
+	if _, err := service.HandoffLease(ctx, node1.NodeToken, lease.FencingToken, "worker-2", 0); err != nil {
+		t.Fatalf("HandoffLease() error = %v", err)
+	}
+	close(releaseProbe)
+
+	if err := <-revalidateErr; err == nil || err.Error() != "stale router lease token; current token is 2" {
+		t.Fatalf("RevalidateLease() error = %v, want stale token after probe", err)
+	}
+	if _, err := service.NodeStatus(ctx, node2.NodeToken); err != nil {
+		t.Fatalf("NodeStatus(node2) error = %v", err)
+	}
+}
+
 func TestRouterLeaseRevalidateTimesOutHungTarget(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
@@ -326,6 +384,75 @@ func TestEventsRejectArbitraryBearerToken(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("events status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestEventsStopAfterNodeLeaves(t *testing.T) {
+	ctx := context.Background()
+	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "1.2.0"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer service.Close()
+	joinKey, err := service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey(node1) error = %v", err)
+	}
+	node1, err := service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 401, Login: "worker-1"}})
+	if err != nil {
+		t.Fatalf("Join(node1) error = %v", err)
+	}
+	joinKey, err = service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey(node2) error = %v", err)
+	}
+	node2, err := service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: "worker-2", GitHub: protocol.GitHubIdentity{NumericID: 402, Login: "worker-2"}})
+	if err != nil {
+		t.Fatalf("Join(node2) error = %v", err)
+	}
+
+	handler := NewServer(Config{AdminToken: "admin-token"}, service)
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer "+node1.NodeToken)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.handleEvents(recorder, req)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		service.mu.Lock()
+		subscribed := len(service.subs) == 1
+		service.mu.Unlock()
+		if subscribed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	service.mu.Lock()
+	subscribed := len(service.subs) == 1
+	service.mu.Unlock()
+	if !subscribed {
+		t.Fatal("event handler did not subscribe")
+	}
+
+	if err := service.Leave(ctx, node1.NodeToken); err != nil {
+		t.Fatalf("Leave() error = %v", err)
+	}
+
+	if _, err := service.AcquireLease(ctx, node2.NodeToken, 0); err != nil {
+		t.Fatalf("AcquireLease(node2) error = %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event handler stayed open after node leave")
+	}
+	if body := recorder.Body.String(); body != "" {
+		t.Fatalf("event stream delivered payload after leave: %q", body)
 	}
 }
 
@@ -481,19 +608,27 @@ func getStatus(t *testing.T, baseURL string) protocol.StatusResponse {
 
 func acquireLease(t *testing.T, baseURL, token string) protocol.RouterLease {
 	t.Helper()
+	lease, err := acquireLeaseViaService(baseURL, token)
+	if err != nil {
+		t.Fatalf("acquire lease request error = %v", err)
+	}
+	return lease
+}
+
+func acquireLeaseViaService(baseURL, token string) (protocol.RouterLease, error) {
 	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/router-lease/acquire", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("acquire lease request error = %v", err)
+		return protocol.RouterLease{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("acquire lease status = %d, want 200", resp.StatusCode)
+		return protocol.RouterLease{}, fmt.Errorf("acquire lease status = %d, want 200", resp.StatusCode)
 	}
 	var out protocol.RouterLease
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out
+	return out, nil
 }
 
 func getNodeStatus(t *testing.T, baseURL, token string) protocol.NodeStatusResponse {
