@@ -47,8 +47,8 @@ The act of putting an Issue into a state where Planner or Worker will discover i
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
 **Trigger label**:
-The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`).
-_Avoid_: queue label, pickup label.
+The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`). In a Routed project, Worker still uses the generic `looper:worker-ready` Trigger label as work intent; exact Node targeting is expressed separately by `looper:target:<node_name>`.
+_Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
 A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually.
@@ -78,6 +78,29 @@ The standard `<!-- looper:stamp v=1 -->` HTML comment plus visible footer applie
 **Self-dedup marker**:
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
 
+### Network
+
+**Network**:
+A coordinated set of `looperd` instances that share routing decisions for a configured set of repositories. A Node joins exactly one Network at a time. Hosted by a `loopernet` instance (one Network per `loopernet`).
+
+**Node**:
+A single `looperd` instance enrolled in a Network. Identified by an opaque cloud-issued ID and a human-readable Name (short label-safe string; convention is to use a color, e.g. `red`, `blue`, `cyan`).
+_Avoid_: peer, member, instance, agent.
+
+**Router**:
+A leadership responsibility within a Network, held by exactly one Node at a time via a Lease. Routes Worker/Reviewer work in Routed projects by applying an exact target label (`looper:target:<node_name>`) and maintaining the GitHub-native coarse target (Issue assignee for Worker, PR review request for Reviewer). Distinct from any Role: it does not perform work itself.
+_Avoid_: dispatcher, scheduler, coordinator, balancer.
+
+**Routed project**:
+A project whose `network.mode` is `routed`. In v1, Routed projects support Worker and Reviewer only. Reactive Roles claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
+
+**Target label**:
+A Network-only exact Node target label of the form `looper:target:<node_name>`. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim. Target labels are ignored in local-only projects.
+_Avoid_: trigger label, routed label, worker-ready suffix.
+
+**Lease**:
+The durable Authority for Router leadership. A row in the `loopernet` database with a fencing token, validated at every GitHub side-effect boundary.
+
 ## Relationships
 
 - A **Coordinator** performs **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
@@ -86,6 +109,7 @@ A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) 
 - A **Sweeper** retires Issues and Pull Requests that have aged past their **Trigger label** or have an `out-of-scope` Disposition
 - **Coordinator** and **Sweeper** are both stateless and compose via shared label semantics, not direct calls
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
+- In a **Routed project**, the **Router** does not rewrite Role trigger labels. It applies a **Target label** and preserves/repairs the GitHub-native coarse target. The **Lease** is the gate that authorises Router action; the GitHub issue/PR state remains the work-intent Authority.
 
 ## Flagged ambiguities
 
