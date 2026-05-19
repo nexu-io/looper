@@ -105,6 +105,11 @@ type CommentInfo struct {
 	URL               string
 }
 
+type CurrentUserIdentity struct {
+	Login     string
+	NumericID int64
+}
+
 type IssueTimelineInput struct {
 	Repo        string
 	IssueNumber int64
@@ -2131,6 +2136,25 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 		return snapshot.getCurrentUserLogin(ctx, cwd)
 	}
 	return g.getCurrentUserLoginRaw(ctx, cwd)
+}
+
+func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
+	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
+	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			login, viewErr := g.getViewerLogin(ctx, cwd, "")
+			if viewErr != nil {
+				return CurrentUserIdentity{}, viewErr
+			}
+			return CurrentUserIdentity{Login: login}, nil
+		}
+		return CurrentUserIdentity{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return CurrentUserIdentity{}, err
+	}
+	return CurrentUserIdentity{Login: strings.TrimSpace(asString(row["login"])), NumericID: asInt64(row["id"])}, nil
 }
 
 func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {

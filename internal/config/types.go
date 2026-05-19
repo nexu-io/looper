@@ -264,6 +264,17 @@ type PackageConfig struct {
 	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
 }
 
+type ProjectNetworkMode string
+
+const (
+	ProjectNetworkModeOff    ProjectNetworkMode = "off"
+	ProjectNetworkModeRouted ProjectNetworkMode = "routed"
+)
+
+type ProjectNetworkConfig struct {
+	Mode ProjectNetworkMode `json:"mode"`
+}
+
 type DefaultsConfig struct {
 	BaseBranch         string          `json:"baseBranch"`
 	AllowAutoCommit    bool            `json:"allowAutoCommit"`
@@ -534,24 +545,26 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string              `json:"id"`
-	Name         string              `json:"name"`
-	RepoPath     string              `json:"repoPath"`
-	Path         string              `json:"path,omitempty"`
-	BaseBranch   *string             `json:"baseBranch,omitempty"`
-	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
-	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
+	ID           string                `json:"id"`
+	Name         string                `json:"name"`
+	RepoPath     string                `json:"repoPath"`
+	Path         string                `json:"path,omitempty"`
+	BaseBranch   *string               `json:"baseBranch,omitempty"`
+	WorktreeRoot *string               `json:"worktreeRoot,omitempty"`
+	Network      *ProjectNetworkConfig `json:"network,omitempty"`
+	Roles        *PartialRoleConfigs   `json:"roles,omitempty"`
 }
 
 type PartialProjectRefConfig struct {
-	ID           string              `json:"id"`
-	Name         string              `json:"name"`
-	RepoPath     string              `json:"repoPath"`
-	Path         string              `json:"path,omitempty"`
-	BaseBranch   *string             `json:"baseBranch,omitempty"`
-	WorktreeRoot *string             `json:"worktreeRoot,omitempty"`
-	Instructions map[string]string   `json:"instructions,omitempty"`
-	Roles        *PartialRoleConfigs `json:"roles,omitempty"`
+	ID           string                `json:"id"`
+	Name         string                `json:"name"`
+	RepoPath     string                `json:"repoPath"`
+	Path         string                `json:"path,omitempty"`
+	BaseBranch   *string               `json:"baseBranch,omitempty"`
+	WorktreeRoot *string               `json:"worktreeRoot,omitempty"`
+	Network      *ProjectNetworkConfig `json:"network,omitempty"`
+	Instructions map[string]string     `json:"instructions,omitempty"`
+	Roles        *PartialRoleConfigs   `json:"roles,omitempty"`
 }
 
 type Config struct {
