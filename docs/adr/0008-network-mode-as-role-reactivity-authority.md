@@ -14,7 +14,7 @@ The Authority for a reactive Role to use Network target-label matching is the pe
 
 - Worker claims only when `looper:worker-ready`, a matching exact target label, and the local Node's GitHub assignee are present.
 - Reviewer claims only when a matching exact target label and the local Node's GitHub review request are present.
-- Planner, Fixer, and Coordinator are unsupported for Routed projects in v1 and are rejected at config load.
+- Planner, Fixer, Sweeper, and Coordinator are unsupported for Routed projects in v1 and are rejected at config load.
 
 When a project has `network.mode = off`, `looper:target:*` labels are ignored and legacy single-machine behaviour is preserved.
 
@@ -24,7 +24,7 @@ The setting is a per-project sub-struct mirroring `ProjectWebhookConfig`:
 projects[].network.mode = "off" | "routed"
 ```
 
-The default is `off` (legacy behavior). `looper network join` may flip existing projects to `routed` by default; new projects added later inherit a configurable default. Validation rejects `network.mode = routed` when the daemon is not joined to a Network, and rejects `network.mode = routed` combined with unsupported v1 Roles per ADR-0011.
+The default is `off` (legacy behavior). `looper network join` does not flip existing projects to `routed` automatically; operators must opt a project into `routed` only after configuring it for the v1 Worker/Reviewer-only shape. Validation rejects `network.mode = routed` when the daemon is not joined to a Network, and rejects `network.mode = routed` combined with unsupported v1 Roles.
 
 ## Considered Options
 

@@ -28,6 +28,6 @@ In v1, Routed projects do not run Coordinator. Specifically:
 ## Consequences
 
 - v2 lifts this restriction by introducing the Coordinator Lease as a parallel cloud-side Lease type. The validation rule becomes a soft warning or removed.
-- Operators who want both Network mode and Coordinator triage on a repo in v1 must split the workflow: one Node runs Coordinator with `network.mode = off` for triage; other Nodes can have the project as `network.mode = routed` for execution. This is awkward but possible.
+- Operators cannot safely share the same repository between a local-only Coordinator Node and Routed execution Nodes in v1, because the `network.mode = off` Node ignores target labels and can still claim reactive work. If they experiment with that split workflow anyway, they must isolate the repository from Planner/Worker/Reviewer/Fixer discovery on the Coordinator Node; otherwise the whole project should stay `network.mode = off`.
 - The Coordinator codebase (`internal/coordinator/*`) is not modified by v1 network work. Its existing single-instance assumption (ADR-0001) is preserved verbatim.
 - Documentation must be explicit about this v1 limitation in `docs/users-guide.md` and the network-mode onboarding flow.
