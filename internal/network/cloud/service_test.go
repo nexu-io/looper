@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -109,6 +110,77 @@ func TestDuplicateWarningsIgnoreUnknownGitHubIDs(t *testing.T) {
 		if member.DuplicateWarning {
 			t.Fatalf("member %s duplicate warning = true, want false", member.NodeName)
 		}
+	}
+}
+
+func TestJoinPersistsProvidedTargetLabels(t *testing.T) {
+	server, service := newTestHTTPServer(t)
+	defer server.Close()
+	defer service.Close()
+
+	labels := []string{"linux", "gpu"}
+	body, _ := json.Marshal(protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: createJoinKey(t, server.URL), NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "worker-1"}, TargetLabels: labels})
+	resp, err := http.Post(server.URL+"/v1/join", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("join request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("join status = %d, want 201", resp.StatusCode)
+	}
+
+	status := getStatus(t, server.URL)
+	if got := status.Memberships[0].TargetLabels; len(got) != len(labels) || got[0] != labels[0] || got[1] != labels[1] {
+		t.Fatalf("target labels = %v, want %v", got, labels)
+	}
+}
+
+func TestOpenReturnsEntropyFailure(t *testing.T) {
+	restore := stubRandRead(t, func([]byte) (int, error) { return 0, errors.New("entropy unavailable") })
+	defer restore()
+
+	_, err := Open(context.Background(), Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion})
+	if err == nil || err.Error() != "entropy unavailable" {
+		t.Fatalf("Open() error = %v, want entropy unavailable", err)
+	}
+}
+
+func TestCreateJoinKeyReturnsEntropyFailure(t *testing.T) {
+	ctx := context.Background()
+	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, NetworkID: "net-fixed"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer service.Close()
+
+	restore := stubRandRead(t, func([]byte) (int, error) { return 0, errors.New("entropy unavailable") })
+	defer restore()
+
+	_, err = service.CreateJoinKey(ctx)
+	if err == nil || err.Error() != "entropy unavailable" {
+		t.Fatalf("CreateJoinKey() error = %v, want entropy unavailable", err)
+	}
+}
+
+func TestJoinReturnsEntropyFailure(t *testing.T) {
+	ctx := context.Background()
+	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "1.2.0", NetworkID: "net-fixed"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer service.Close()
+
+	joinKey := "join-fixed"
+	if _, err := service.db.ExecContext(ctx, `INSERT INTO join_keys(join_key, created_at) VALUES(?, ?)`, joinKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert join key error = %v", err)
+	}
+
+	restore := stubRandRead(t, func([]byte) (int, error) { return 0, errors.New("entropy unavailable") })
+	defer restore()
+
+	_, err = service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "worker-1"}})
+	if err == nil || err.Error() != "entropy unavailable" {
+		t.Fatalf("Join() error = %v, want entropy unavailable", err)
 	}
 }
 
@@ -643,4 +715,11 @@ func getNodeStatus(t *testing.T, baseURL, token string) protocol.NodeStatusRespo
 	var out protocol.NodeStatusResponse
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out
+}
+
+func stubRandRead(t *testing.T, fn func([]byte) (int, error)) func() {
+	t.Helper()
+	prev := randRead
+	randRead = fn
+	return func() { randRead = prev }
 }

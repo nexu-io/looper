@@ -19,6 +19,7 @@ import (
 )
 
 var errUnauthorized = errors.New("unauthorized")
+var randRead = rand.Read
 
 const leaseRevalidationProbeTimeout = 2 * time.Second
 
@@ -74,7 +75,11 @@ func (s *Service) ensureNetworkID(ctx context.Context) error {
 	}
 	networkID := s.config.NetworkID
 	if networkID == "" {
-		networkID = "net_" + randomToken(8)
+		token, err := randomToken(8)
+		if err != nil {
+			return err
+		}
+		networkID = "net_" + token
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES('network_id', ?)`, networkID)
 	return err
@@ -87,8 +92,12 @@ func (s *Service) NetworkID(ctx context.Context) (string, error) {
 }
 
 func (s *Service) CreateJoinKey(ctx context.Context) (string, error) {
-	key := "join_" + randomToken(12)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO join_keys(join_key, created_at) VALUES(?, ?)`, key, s.now().UTC().Format(time.RFC3339Nano))
+	token, err := randomToken(12)
+	if err != nil {
+		return "", err
+	}
+	key := "join_" + token
+	_, err = s.db.ExecContext(ctx, `INSERT INTO join_keys(join_key, created_at) VALUES(?, ?)`, key, s.now().UTC().Format(time.RFC3339Nano))
 	return key, err
 }
 
@@ -112,9 +121,20 @@ func (s *Service) Join(ctx context.Context, req protocol.JoinRequest) (protocol.
 	if rows != 1 {
 		return protocol.JoinResponse{}, fmt.Errorf("join key is invalid or already consumed")
 	}
-	nodeID := "node_" + randomToken(8)
-	nodeToken := "node_" + randomToken(16)
-	labelsJSON, _ := json.Marshal([]string{protocol.TargetLabelForNode(req.NodeName)})
+	nodeIDToken, err := randomToken(8)
+	if err != nil {
+		return protocol.JoinResponse{}, err
+	}
+	nodeTokenValue, err := randomToken(16)
+	if err != nil {
+		return protocol.JoinResponse{}, err
+	}
+	nodeID := "node_" + nodeIDToken
+	nodeToken := "node_" + nodeTokenValue
+	labelsJSON, err := json.Marshal(targetLabelsForJoin(req.NodeName, req.TargetLabels))
+	if err != nil {
+		return protocol.JoinResponse{}, err
+	}
 	joinedAt := s.now().UTC().Format(time.RFC3339Nano)
 	result, err = tx.ExecContext(ctx, `UPDATE nodes SET node_token = ?, daemon_version = ?, github_numeric_id = ?, github_login = ?, target_labels = ?, capabilities_json = '{}', joined_at = ?, last_heartbeat_at = NULL, active = 1 WHERE node_name = ? AND active = 0`, nodeToken, req.DaemonVersion, req.GitHub.NumericID, req.GitHub.Login, string(labelsJSON), joinedAt, req.NodeName)
 	if err != nil {
@@ -569,10 +589,19 @@ func ttlDuration(ttlSeconds int) time.Duration {
 	return time.Duration(ttlSeconds) * time.Second
 }
 
-func randomToken(n int) string {
+func targetLabelsForJoin(nodeName string, requested []string) []string {
+	if len(requested) == 0 {
+		return []string{protocol.TargetLabelForNode(nodeName)}
+	}
+	return append([]string(nil), requested...)
+}
+
+func randomToken(n int) (string, error) {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := randRead(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *Service) Subscribe() (<-chan protocol.AuditEnvelope, func()) {
