@@ -71,7 +71,9 @@ func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
 	}
 	if !getBoolFlag(cmd, "no-enroll-projects") {
 		if err := r.updateAllProjectNetworkModes(config.ProjectNetworkModeRouted); err != nil {
-			_ = client.New(state.URL, state.NodeToken, r.httpClient()).Leave(cmd.Context())
+			if leaveErr := client.New(state.URL, state.NodeToken, r.httpClient()).Leave(cmd.Context()); leaveErr != nil {
+				return errors.Join(err, leaveErr)
+			}
 			_ = client.RemoveState(client.DefaultStatePath(homeDir))
 			return err
 		}
