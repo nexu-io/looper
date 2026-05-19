@@ -268,17 +268,6 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if !found {
 		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
 		if err != nil {
-			adopted, adoptedFound, listErr := findWebhookTunnelHookByURL(ctx, client, repo, url)
-			if listErr == nil && adoptedFound {
-				state := w.adoptTunnelHook(ctx, store, repo, adopted, url, secretRef, secret, now, "adopt existing hook after recreate failure")
-				if state.LastError != "" {
-					state.LastError = fmt.Sprintf("recreate missing hook: %v; %s", err, state.LastError)
-				}
-				return state
-			}
-			if listErr != nil {
-				return tunnelStateFromRecord(record, fmt.Sprintf("recreate missing hook: %v; list hooks after recreate failure: %v", err, listErr))
-			}
 			return tunnelStateFromRecord(record, fmt.Sprintf("recreate missing hook: %v", err))
 		}
 		record.HookID = hook.ID

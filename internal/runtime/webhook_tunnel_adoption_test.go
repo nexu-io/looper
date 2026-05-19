@@ -144,7 +144,7 @@ func TestReconcileTunnelHookCreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	}
 }
 
-func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterRecreateError(t *testing.T) {
+func TestReconcileTunnelHookRecreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	t.Parallel()
 
 	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
@@ -171,8 +171,8 @@ func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterRecreateError(t *testin
 
 	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
 
-	if state.LastError != "" {
-		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	if state.LastError != "recreate missing hook: hook already exists" {
+		t.Fatalf("state.LastError = %q, want recreate failure", state.LastError)
 	}
 	if client.getCalls != 1 {
 		t.Fatalf("GetHook calls = %d, want 1", client.getCalls)
@@ -180,25 +180,25 @@ func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterRecreateError(t *testin
 	if client.createCalls != 1 {
 		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
 	}
-	if client.listCalls != 1 {
-		t.Fatalf("ListHooks calls = %d, want 1 recreate adoption lookup", client.listCalls)
+	if client.listCalls != 0 {
+		t.Fatalf("ListHooks calls = %d, want 0", client.listCalls)
 	}
-	if client.updateCalls != 1 {
-		t.Fatalf("UpdateHook calls = %d, want 1", client.updateCalls)
+	if client.updateCalls != 0 {
+		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
 	}
 	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
 	if err != nil {
 		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
 	}
-	if !ok || updated.HookID != 77 {
-		t.Fatalf("record = %#v found=%v, want adopted hook id 77", updated, ok)
+	if !ok || updated.HookID != record.HookID {
+		t.Fatalf("record = %#v found=%v, want original hook record unchanged", updated, ok)
 	}
 	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, updated.SecretRef)
 	if err != nil {
 		t.Fatalf("readWebhookTunnelSecret() error = %v", err)
 	}
-	if client.lastUpdate.secret != secret {
-		t.Fatalf("UpdateHook secret = %q, want persisted local secret %q", client.lastUpdate.secret, secret)
+	if secret != "top-secret" {
+		t.Fatalf("readWebhookTunnelSecret() = %q, want preserved local secret", secret)
 	}
 }
 
