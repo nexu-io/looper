@@ -8,9 +8,9 @@ The current v1 design uses a single cross-role target-label namespace instead: `
 
 ## Decision
 
-In v1, Routed projects do not use Role×Node trigger labels. Exact Node targeting is represented by exactly one `looper:target:<node_name>` label. Worker still uses `looper:worker-ready` as generic work intent. Reviewer uses an existing GitHub review request as work intent and does not introduce `looper:reviewer-ready`.
+In v1, Routed projects do not use Role×Node trigger labels. Exact Node targeting is represented by exactly one `looper:target:<node_name>` label. Worker still uses `looper:worker-ready` as generic work intent. Reviewer uses a GitHub review request as work intent and does not introduce `looper:reviewer-ready`.
 
-Planner, Fixer, and Coordinator are unsupported for Routed projects in v1. Their trigger-label customization remains a local-only concern until those Roles receive explicit Routed semantics.
+Coordinator may create the generic work-intent signals in both local-only and Routed projects. The target label remains separate: it selects the exact Node in Routed projects, while trigger labels and review requests express work intent.
 
 ## Considered Options
 
@@ -23,4 +23,4 @@ Planner, Fixer, and Coordinator are unsupported for Routed projects in v1. Their
 - A repository with N Nodes needs N target labels, not Roles×N trigger labels.
 - Duplicate GitHub identities are allowed because the exact Node target is `looper:target:<node_name>`, not the GitHub account.
 - Local-only projects ignore target labels entirely.
-- v2 may add Routed semantics for Planner/Fixer/Coordinator, but those Roles must consume the same exact target-label Authority or define a new ADR.
+- Future Routed semantics for Planner/Fixer must consume the same exact target-label Authority or define a new ADR.
