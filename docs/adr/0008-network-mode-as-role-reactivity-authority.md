@@ -18,7 +18,7 @@ The Authority for a reactive Role to use Network target-label matching is the pe
 
 When a project has `network.mode = off`, `looper:target:*` labels are ignored and legacy single-machine behaviour is preserved.
 
-The setting is a per-project sub-struct mirroring `ProjectWebhookConfig`:
+The setting extends the canonical per-project `[[projects]]` config object (`internal/config.ProjectRefConfig`) with a `network` sub-struct:
 
 ```
 projects[].network.mode = "off" | "routed"

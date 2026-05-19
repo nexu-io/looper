@@ -14,7 +14,7 @@ The v1 design commits Coordinator decisions to GitHub-native state:
 
 Coordinator's Authority for admitting/assigning work is its current structured decision, committed to GitHub as durable state. For Issue admission, Coordinator applies `looper:worker-ready` and the selected assignee. For PR review assignment, Coordinator creates the selected GitHub review request. In Routed projects, Coordinator also applies `looper:target:<node_name>` as exact Node target.
 
-The **Lease is the gate**, not the admission/assignment Authority. The Network-aware Coordinator may act only while it holds a fresh Lease, validated at every GitHub side-effect boundary (per ADR-0008's revalidation requirement). The Lease authorises Coordinator control-plane activity; it does not by itself justify any specific Issue or PR decision.
+The **Lease is the gate**, not the admission/assignment Authority. The Network-aware Coordinator may act only while it holds a fresh Lease, validated at every GitHub side-effect boundary (per ADR-0011's revalidation requirement). The Lease authorises Coordinator control-plane activity; it does not by itself justify any specific Issue or PR decision.
 
 The **cloud audit log records actions for observability**, not as Authority. Audit log entries are written *after* the rewrite as a side-effect of action; AGENTS.md is explicit that Authority must be the signal that justifies the action, not its receipt.
 
@@ -29,5 +29,5 @@ The **cloud audit log records actions for observability**, not as Authority. Aud
 
 - Coordinator creates work intent when policy says so: `looper:worker-ready` for admitted Issues and review requests for assigned PRs. Humans/external automation may also create those same GitHub-native signals.
 - Humans veto Worker work by removing `looper:worker-ready` or the assignee; they veto Reviewer work by removing the review request; they can also remove a stale or unwanted `looper:target:*` label.
-- The Lease/revalidation mechanism (ADR-0008) is required to prevent stale Coordinator control-plane Nodes from acting under expired authority. Without revalidation, the gate is advisory; with it, the gate is enforced at the side-effect boundary.
+- The Lease/revalidation mechanism (ADR-0011) is required to prevent stale Coordinator control-plane Nodes from acting under expired authority. Without revalidation, the gate is advisory; with it, the gate is enforced at the side-effect boundary.
 - Partial mutation states are expected because GitHub mutations are not atomic. A target label without the required GitHub coarse target is not claimable and must be repaired or removed by reconciliation.
