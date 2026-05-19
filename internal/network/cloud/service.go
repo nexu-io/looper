@@ -20,6 +20,8 @@ import (
 
 var errUnauthorized = errors.New("unauthorized")
 
+const leaseRevalidationProbeTimeout = 2 * time.Second
+
 type Service struct {
 	config  Config
 	db      *sql.DB
@@ -290,12 +292,14 @@ func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.RouterLea
 	if method == "" {
 		method = http.MethodGet
 	}
-	probe, err := http.NewRequestWithContext(ctx, method, strings.TrimSpace(req.URL), nil)
+	probeCtx, cancel := context.WithTimeout(ctx, leaseRevalidationProbeTimeout)
+	defer cancel()
+	probe, err := http.NewRequestWithContext(probeCtx, method, strings.TrimSpace(req.URL), nil)
 	if err != nil {
 		return fmt.Errorf("build revalidation probe: %w", err)
 	}
 	probe.Header.Set("X-Looper-Router-Fencing-Token", fmt.Sprintf("%d", lease.FencingToken))
-	resp, err := http.DefaultClient.Do(probe)
+	resp, err := (&http.Client{Timeout: leaseRevalidationProbeTimeout}).Do(probe)
 	if err != nil {
 		return fmt.Errorf("%w: revalidation probe failed: %v", staleLeaseError(lease), err)
 	}
@@ -429,7 +433,7 @@ func (s *Service) authenticateNode(ctx context.Context, nodeToken string) (strin
 }
 
 func (s *Service) duplicateWarnings(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT github_numeric_id, COUNT(*) FROM nodes WHERE active = 1 GROUP BY github_numeric_id HAVING COUNT(*) > 1 ORDER BY github_numeric_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT github_numeric_id, COUNT(*) FROM nodes WHERE active = 1 AND github_numeric_id > 0 GROUP BY github_numeric_id HAVING COUNT(*) > 1 ORDER BY github_numeric_id`)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -67,6 +68,46 @@ func TestDuplicateGitHubIdentityWarningsAndStatus(t *testing.T) {
 	}
 	if found != 2 {
 		t.Fatalf("duplicate warning memberships = %d, want 2", found)
+	}
+}
+
+func TestDuplicateWarningsIgnoreUnknownGitHubIDs(t *testing.T) {
+	ctx := context.Background()
+	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "1.2.0"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer service.Close()
+
+	for _, nodeName := range []string{"worker-1", "worker-2"} {
+		joinKey, err := service.CreateJoinKey(ctx)
+		if err != nil {
+			t.Fatalf("CreateJoinKey() error = %v", err)
+		}
+		if _, err := service.Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "1.2.3", JoinKey: joinKey, NodeName: nodeName, GitHub: protocol.GitHubIdentity{Login: nodeName}}); err != nil {
+			t.Fatalf("Join(%s) error = %v", nodeName, err)
+		}
+	}
+
+	warnings, err := service.duplicateWarnings(ctx)
+	if err != nil {
+		t.Fatalf("duplicateWarnings() error = %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("duplicateWarnings() = %v, want none for unknown numeric IDs", warnings)
+	}
+
+	status, err := service.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if len(status.Warnings) != 0 {
+		t.Fatalf("Status().Warnings = %v, want none", status.Warnings)
+	}
+	for _, member := range status.Memberships {
+		if member.DuplicateWarning {
+			t.Fatalf("member %s duplicate warning = true, want false", member.NodeName)
+		}
 	}
 }
 
@@ -195,6 +236,47 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("failed revalidate status = %d, want 412", resp.StatusCode)
 	}
+}
+
+func TestRouterLeaseRevalidateTimesOutHungTarget(t *testing.T) {
+	server, service := newTestHTTPServer(t)
+	defer server.Close()
+	defer service.Close()
+	node := joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 401)
+	lease := acquireLease(t, server.URL, node.NodeToken)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-time.After(3 * time.Second)
+	}()
+
+	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: "http://" + listener.Addr().String()})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("revalidate request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("timeout revalidate status = %d, want 412", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed >= 2800*time.Millisecond {
+		t.Fatalf("revalidate elapsed = %v, want bounded timeout before hung target returns", elapsed)
+	}
+	<-acceptDone
 }
 
 func TestEventsRejectArbitraryBearerToken(t *testing.T) {

@@ -115,14 +115,13 @@ func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
 	routed, local := countProjectModes(m.config)
 	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), RouterEligible: routed > 0, RoutedProjects: routed, LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
-	if drift, reason := identityDrift(state.GitHub, current); drift {
-		capabilities.IdentityDrift = true
-		capabilities.DriftReason = reason
-		m.mu.Lock()
-		m.status.IdentityDrift = true
-		m.status.DriftReason = reason
-		m.mu.Unlock()
-	}
+	drift, reason := identityDrift(state.GitHub, current)
+	capabilities.IdentityDrift = drift
+	capabilities.DriftReason = reason
+	m.mu.Lock()
+	m.status.IdentityDrift = drift
+	m.status.DriftReason = reason
+	m.mu.Unlock()
 	api := New(state.URL, state.NodeToken, m.client)
 	hb, err := api.Heartbeat(ctx, protocol.HeartbeatRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: version.Value, NodeName: state.NodeName, GitHub: current, Capabilities: capabilities})
 	if err != nil {

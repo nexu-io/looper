@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,4 +75,68 @@ func TestManagerReportsIdentityDriftAndRemoteReachability(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("manager status did not become cloud-reachable")
+}
+
+func TestManagerClearsIdentityDriftAfterIdentityMatches(t *testing.T) {
+	ctx := context.Background()
+	service, err := cloud.Open(ctx, cloud.Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "0.0.0"})
+	if err != nil {
+		t.Fatalf("cloud.Open() error = %v", err)
+	}
+	defer service.Close()
+	server := cloud.NewServer(cloud.Config{AdminToken: "admin-token"}, service)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	joinKey, err := service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey() error = %v", err)
+	}
+	joinResp, err := New(httpServer.URL, "", httpServer.Client()).Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "0.0.0", JoinKey: joinKey, NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}})
+	if err != nil {
+		t.Fatalf("Join() error = %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), "network.json")
+	if err := SaveState(statePath, LocalState{URL: httpServer.URL, NetworkID: joinResp.NetworkID, NodeID: joinResp.NodeID, NodeName: "worker-1", NodeToken: joinResp.NodeToken, GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+
+	var mu sync.Mutex
+	identity := protocol.GitHubIdentity{NumericID: 202, Login: "current-user"}
+	gh := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return shell.Result{Stdout: fmt.Sprintf(`{"login":%q,"id":%d}`, identity.Login, identity.NumericID)}, nil
+	}})
+	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-routed", Network: &config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}}, nil, gh)
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer manager.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if manager.Status().IdentityDrift {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !manager.Status().IdentityDrift {
+		t.Fatal("Status().IdentityDrift = false, want true before identity recovers")
+	}
+
+	mu.Lock()
+	identity = protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}
+	mu.Unlock()
+
+	deadline = time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		status := manager.Status()
+		if status.CloudReachable && !status.IdentityDrift && status.DriftReason == "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	status := manager.Status()
+	t.Fatalf("final drift status = %v reason=%q, want cleared", status.IdentityDrift, status.DriftReason)
 }
