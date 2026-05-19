@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/api"
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/network/client"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/worker"
@@ -4306,6 +4307,79 @@ func TestNetworkJoinRemovesLocalStateWhenProjectEnrollmentRollbackFails(t *testi
 	err = runtime.networkJoin(cmd, []string{server.URL})
 	if err == nil {
 		t.Fatal("networkJoin() error = nil, want temp config write failure")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "write config temp: permission denied") {
+		t.Fatalf("error = %q, want temp config write failure", err)
+	}
+	if leaveCalls != 1 {
+		t.Fatalf("leave calls = %d, want 1", leaveCalls)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, ".looper", "network.json")); !os.IsNotExist(err) {
+		t.Fatalf("network state file still present: %v", err)
+	}
+}
+
+func TestNetworkLeaveRemovesLocalStateWhenProjectModeUpdateFails(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	configPayload := map[string]any{
+		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir(), "network": map[string]any{"mode": "routed"}}},
+	}
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := client.SaveState(client.DefaultStatePath(homeDir), client.LocalState{URL: "http://127.0.0.1", NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", NodeToken: "node-token"}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	var leaveCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/leave" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		leaveCalls++
+		if got, want := r.Header.Get("Authorization"), "Bearer node-token"; got != want {
+			t.Fatalf("leave auth header = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	if err := client.SaveState(client.DefaultStatePath(homeDir), client.LocalState{URL: server.URL, NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", NodeToken: "node-token"}); err != nil {
+		t.Fatalf("save state with server url: %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		Getwd:   func() (string, error) { return configDir, nil },
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			if strings.HasSuffix(path, ".tmp") {
+				return errors.New("write config temp: permission denied")
+			}
+			return os.WriteFile(path, data, perm)
+		},
+	}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().Bool("json", false, "")
+
+	err = runtime.networkLeave(cmd, nil)
+	if err == nil {
+		t.Fatal("networkLeave() error = nil, want temp config write failure")
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())

@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,6 +98,9 @@ func (r *commandRuntime) networkLeave(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if err := r.updateAllProjectNetworkModes(config.ProjectNetworkModeOff); err != nil {
+		if removeErr := client.RemoveState(path); removeErr != nil && !isNotExist(removeErr) {
+			return errors.Join(err, removeErr)
+		}
 		return err
 	}
 	if err := client.RemoveState(path); err != nil {
