@@ -244,24 +244,8 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
-		if hook, found, err := findWebhookTunnelHookByURL(ctx, client, repo, url); err != nil {
-			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: fmt.Sprintf("list hooks: %v", err)}
-		} else if found {
-			return w.adoptTunnelHook(ctx, store, repo, hook, url, secretRef, secret, now, "adopt existing hook")
-		}
 		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
 		if err != nil {
-			adopted, found, listErr := findWebhookTunnelHookByURL(ctx, client, repo, url)
-			if listErr == nil && found {
-				state := w.adoptTunnelHook(ctx, store, repo, adopted, url, secretRef, secret, now, "adopt existing hook after create failure")
-				if state.LastError != "" {
-					state.LastError = fmt.Sprintf("create hook: %v; %s", err, state.LastError)
-				}
-				return state
-			}
-			if listErr != nil {
-				return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: fmt.Sprintf("create hook: %v; list hooks after create failure: %v", err, listErr)}
-			}
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
 		record = storage.WebhookTunnelHookRecord{Repo: repo, HookID: hook.ID, ManagedURL: url, SecretRef: secretRef, ConsecutiveDisables: 0, CreatedAt: now, UpdatedAt: now}
