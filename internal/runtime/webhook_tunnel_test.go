@@ -410,6 +410,123 @@ func TestReconcileTunnelHookPatchPreservesWebhookSecret(t *testing.T) {
 	}
 }
 
+func TestReconcileTunnelHookAdoptsExistingRemoteHookWithoutCreate(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	url := webhookTunnelManagedURL(cfg, repo)
+	client := &fakeWebhookTunnelGitHubClient{listHooks: []webhookTunnelGitHubHook{{ID: 42, Active: true, Events: webhookForwardEvents}}}
+	client.listHooks[0].Config.URL = url
+	client.listHooks[0].Config.ContentType = "json"
+	client.listHooks[0].Config.InsecureSSL = "0"
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+	rt.tunnelStore = repos.WebhookTunnelHooks
+	server := &webhookTunnelServer{runtime: rt}
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.createCalls != 0 {
+		t.Fatalf("CreateHook calls = %d, want 0", client.createCalls)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want 1", client.updateCalls)
+	}
+	if client.lastUpdate.secret == "" {
+		t.Fatal("UpdateHook secret is empty, want locally managed secret")
+	}
+	if client.listCalls == 0 {
+		t.Fatal("ListHooks calls = 0, want adoption lookup")
+	}
+	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || record.HookID != 42 {
+		t.Fatalf("record = %#v found=%v, want adopted hook id 42", record, ok)
+	}
+	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, record.SecretRef)
+	if err != nil {
+		t.Fatalf("readWebhookTunnelSecret() error = %v", err)
+	}
+	if client.lastUpdate.secret != secret {
+		t.Fatalf("UpdateHook secret = %q, want persisted local secret %q", client.lastUpdate.secret, secret)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", http.NoBody)
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-GitHub-Delivery", "delivery-ping")
+	req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, nil))
+	resp := httptest.NewRecorder()
+
+	server.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterCreateError(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	url := webhookTunnelManagedURL(cfg, repo)
+	client := &fakeWebhookTunnelGitHubClient{createErr: errors.New("create timed out")}
+	client.listHookResponses = [][]webhookTunnelGitHubHook{{}, {{ID: 77, Active: true, Events: webhookForwardEvents}}}
+	client.listHookResponses[1][0].Config.URL = url
+	client.listHookResponses[1][0].Config.ContentType = "json"
+	client.listHookResponses[1][0].Config.InsecureSSL = "0"
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	rt.tunnelStore = repos.WebhookTunnelHooks
+	server := &webhookTunnelServer{runtime: rt}
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want 1", client.updateCalls)
+	}
+	if client.listCalls < 2 {
+		t.Fatalf("ListHooks calls = %d, want pre-create and post-error adoption checks", client.listCalls)
+	}
+	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || record.HookID != 77 {
+		t.Fatalf("record = %#v found=%v, want adopted hook id 77", record, ok)
+	}
+	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, record.SecretRef)
+	if err != nil {
+		t.Fatalf("readWebhookTunnelSecret() error = %v", err)
+	}
+	if client.lastUpdate.secret != secret {
+		t.Fatalf("UpdateHook secret = %q, want persisted local secret %q", client.lastUpdate.secret, secret)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", http.NoBody)
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-GitHub-Delivery", "delivery-ping")
+	req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, nil))
+	resp := httptest.NewRecorder()
+
+	server.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
 func TestReconcileTunnelHooksHostQualifiedRepoReturnsLastErrorWithoutGitHubCall(t *testing.T) {
 	t.Parallel()
 
@@ -455,22 +572,26 @@ func setupWebhookTunnelTestRepos(t *testing.T) (context.Context, *storage.Reposi
 }
 
 type fakeWebhookTunnelGitHubClient struct {
-	getHook        webhookTunnelGitHubHook
-	getFound       bool
-	createHook     webhookTunnelGitHubHook
-	createErr      error
-	updateHook     webhookTunnelGitHubHook
-	updateErr      error
-	deleteErr      error
-	getDeadline    bool
-	createDeadline bool
-	updateDeadline bool
-	getCalls       int
-	createCalls    int
-	updateCalls    int
-	deleteCalls    int
-	lastUpdate     fakeWebhookTunnelUpdateCall
-	deletedHooks   []int64
+	getHook           webhookTunnelGitHubHook
+	getFound          bool
+	listHooks         []webhookTunnelGitHubHook
+	listHookResponses [][]webhookTunnelGitHubHook
+	listErr           error
+	createHook        webhookTunnelGitHubHook
+	createErr         error
+	updateHook        webhookTunnelGitHubHook
+	updateErr         error
+	deleteErr         error
+	getDeadline       bool
+	createDeadline    bool
+	updateDeadline    bool
+	getCalls          int
+	listCalls         int
+	createCalls       int
+	updateCalls       int
+	deleteCalls       int
+	lastUpdate        fakeWebhookTunnelUpdateCall
+	deletedHooks      []int64
 }
 
 type fakeWebhookTunnelUpdateCall struct {
@@ -485,6 +606,15 @@ func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _
 	f.getCalls++
 	_, f.getDeadline = ctx.Deadline()
 	return f.getHook, f.getFound, nil
+}
+
+func (f *fakeWebhookTunnelGitHubClient) ListHooks(ctx context.Context, _ string) ([]webhookTunnelGitHubHook, error) {
+	f.listCalls++
+	_, f.getDeadline = ctx.Deadline()
+	if len(f.listHookResponses) >= f.listCalls {
+		return append([]webhookTunnelGitHubHook(nil), f.listHookResponses[f.listCalls-1]...), f.listErr
+	}
+	return append([]webhookTunnelGitHubHook(nil), f.listHooks...), f.listErr
 }
 
 func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
