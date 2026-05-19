@@ -37,11 +37,13 @@ type webhookStatusOutput struct {
 	RuntimeAvailable bool                `json:"runtimeAvailable"`
 	Runtime          *webhookRuntimeView `json:"runtime,omitempty"`
 	configUsesTunnel bool
+	configTunnelIDs  []string
 }
 
 type webhookRuntimeView struct {
 	Enabled                     bool     `json:"enabled"`
 	Mode                        string   `json:"mode"`
+	ConfiguredTunnelProjectIDs  []string `json:"configuredTunnelProjectIds,omitempty"`
 	ListenerPath                string   `json:"listenerPath"`
 	EndpointURL                 string   `json:"endpointUrl"`
 	TunnelListenerURL           string   `json:"tunnelListenerUrl"`
@@ -250,6 +252,7 @@ func (r *commandRuntime) webhookStatus(cmd *cobra.Command, args []string) error 
 		FallbackPoll:     loaded.Config.Webhook.FallbackPollIntervalSeconds,
 		Warnings:         webhookWarnings(loaded.Config),
 		configUsesTunnel: webhookConfigUsesTunnel(loaded.Config),
+		configTunnelIDs:  webhookConfiguredTunnelProjectIDs(loaded.Config),
 	}
 	client := r.apiClientFromLoaded(loaded)
 	payload, err := r.getJSONWithClient(cmd.Context(), client, "/api/v1/webhook/status")
@@ -479,6 +482,9 @@ func webhookRuntimeRestartRequired(output webhookStatusOutput) bool {
 	if runtimeMode != configMode {
 		return true
 	}
+	if !sameWebhookProjectSet(output.configTunnelIDs, output.Runtime.ConfiguredTunnelProjectIDs) {
+		return true
+	}
 	if output.configUsesTunnel || webhookRuntimeHasActiveTunnelHooks(output.Runtime) {
 		if output.Runtime.TunnelListenerURL != webhookStatusTunnelListenerURL(output.ListenPort) {
 			return true
@@ -524,6 +530,37 @@ func webhookRuntimeHasActiveTunnelHooks(runtime *webhookRuntimeView) bool {
 		}
 	}
 	return false
+}
+
+func webhookConfiguredTunnelProjectIDs(cfg config.Config) []string {
+	ids := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		mode := cfg.Webhook.Mode
+		if project.Webhook.Mode != "" {
+			mode = project.Webhook.Mode
+		}
+		if mode == "" {
+			mode = config.WebhookModeGHForward
+		}
+		if mode != config.WebhookModeTunnel {
+			continue
+		}
+		ids = append(ids, project.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func sameWebhookProjectSet(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func webhookStatusTunnelListenerURL(listenPort int) string {

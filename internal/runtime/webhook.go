@@ -35,6 +35,7 @@ const (
 type WebhookStatus struct {
 	Enabled                     bool                    `json:"enabled"`
 	Mode                        config.WebhookMode      `json:"mode"`
+	ConfiguredTunnelProjectIDs  []string                `json:"configuredTunnelProjectIds,omitempty"`
 	FallbackPollIntervalSeconds int                     `json:"fallbackPollIntervalSeconds"`
 	ListenerPath                string                  `json:"listenerPath"`
 	EndpointURL                 string                  `json:"endpointUrl"`
@@ -130,6 +131,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 	status := WebhookStatus{
 		Enabled:                     cfg.Webhook.Enabled,
 		Mode:                        cfg.Webhook.Mode,
+		ConfiguredTunnelProjectIDs:  configuredTunnelProjectIDs(cfg),
 		FallbackPollIntervalSeconds: cfg.Webhook.FallbackPollIntervalSeconds,
 		ListenerPath:                webhookListenerPath,
 		EndpointURL:                 endpointURL,
@@ -378,6 +380,7 @@ func (w *webhookRuntime) Status() WebhookStatus {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	status := w.status
+	status.ConfiguredTunnelProjectIDs = append([]string{}, w.status.ConfiguredTunnelProjectIDs...)
 	status.DegradedReasons = append([]string{}, w.status.DegradedReasons...)
 	status.RecentOutcomes = append([]WebhookRecentOutcome{}, w.status.RecentOutcomes...)
 	status.Forwarders = append([]WebhookForwarderState{}, w.status.Forwarders...)

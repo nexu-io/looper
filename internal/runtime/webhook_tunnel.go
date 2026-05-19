@@ -604,6 +604,25 @@ func wModeNeedsTunnel(cfg config.Config) bool {
 	return false
 }
 
+func configuredTunnelProjectIDs(cfg config.Config) []string {
+	ids := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		mode := cfg.Webhook.Mode
+		if project.Webhook.Mode != "" {
+			mode = project.Webhook.Mode
+		}
+		if mode == "" {
+			mode = config.WebhookModeGHForward
+		}
+		if mode != config.WebhookModeTunnel {
+			continue
+		}
+		ids = append(ids, project.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func webhookTunnelListenerURL(cfg config.Config) string {
 	if cfg.Webhook.ListenPort <= 0 {
 		return ""
