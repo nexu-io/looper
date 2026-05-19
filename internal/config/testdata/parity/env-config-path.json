@@ -116,7 +116,10 @@
       },
       "webhook": {
         "enabled": false,
-        "fallbackPollIntervalSeconds": 300
+        "fallbackPollIntervalSeconds": 300,
+        "listenPort": 0,
+        "mode": "gh-forward",
+        "publicBaseUrl": ""
       },
       "agent": {
         "vendor": "codex",
@@ -424,6 +427,7 @@
           "name": "Alpha",
           "repoPath": "__TMP__/alpha-repo",
           "baseBranch": "develop",
+          "webhook": {},
           "worktreeRoot": "__TMP__/alpha-worktrees"
         }
       ],

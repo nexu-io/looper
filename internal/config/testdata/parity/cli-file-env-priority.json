@@ -98,7 +98,10 @@
       },
       "webhook": {
         "enabled": false,
-        "fallbackPollIntervalSeconds": 300
+        "fallbackPollIntervalSeconds": 300,
+        "listenPort": 0,
+        "mode": "gh-forward",
+        "publicBaseUrl": ""
       },
       "agent": {
         "vendor": "opencode",
@@ -402,7 +405,8 @@
         {
           "id": "demo",
           "name": "Demo",
-          "repoPath": "__TMP__/repo"
+          "repoPath": "__TMP__/repo",
+          "webhook": {}
         }
       ],
       "instructions": {

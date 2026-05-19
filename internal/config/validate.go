@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {
 		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
+	}
+	if !isValidWebhookMode(config.Webhook.Mode) {
+		issues = append(issues, ValidationIssue{Path: "webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+	}
+	if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, nil) {
+		validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
 	}
 
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
@@ -248,6 +255,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
 		}
+		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
+			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+		}
+		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
+			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
+		}
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
@@ -293,6 +306,24 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]ValidationIssue) {
+	if config.ListenPort < 1024 || config.ListenPort > 65535 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".listenPort", Message: "must be an integer between 1024 and 65535 when webhook mode is tunnel"})
+	}
+	parsed, err := url.Parse(config.PublicBaseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
+	}
+}
+
+func webhookModeRequiresTunnelConfig(config Config, project *ProjectRefConfig) bool {
+	mode := config.Webhook.Mode
+	if project != nil && project.Webhook.Mode != "" {
+		mode = project.Webhook.Mode
+	}
+	return mode == WebhookModeTunnel
 }
 
 func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]ValidationIssue) {
@@ -636,6 +667,19 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 	default:
 		return false
 	}
+}
+
+func isValidWebhookMode(mode WebhookMode) bool {
+	switch mode {
+	case WebhookModeGHForward, WebhookModeTunnel:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidWebhookModeOrEmpty(mode WebhookMode) bool {
+	return mode == "" || isValidWebhookMode(mode)
 }
 
 func isValidLabelMode(mode LabelMode) bool {

@@ -926,9 +926,11 @@ func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
 	}
 	return looperdruntime.WebhookStatus{
 		Enabled:                     h.context.Config.Webhook.Enabled,
+		Mode:                        h.context.Config.Webhook.Mode,
 		FallbackPollIntervalSeconds: h.context.Config.Webhook.FallbackPollIntervalSeconds,
 		ListenerPath:                "/webhook/forward",
 		EndpointURL:                 strings.TrimRight(serverBaseURL(h.context.Config.Server), "/") + "/webhook/forward",
+		TunnelPublicBaseURL:         strings.TrimRight(strings.TrimSpace(h.context.Config.Webhook.PublicBaseURL), "/"),
 		DegradedReasons:             []string{},
 		RecentOutcomes:              []looperdruntime.WebhookRecentOutcome{},
 		Forwarders:                  []looperdruntime.WebhookForwarderState{},

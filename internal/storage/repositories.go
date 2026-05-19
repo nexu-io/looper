@@ -28,6 +28,7 @@ type Repositories struct {
 	SweeperCases         *SweeperCasesRepository
 	SweeperProposals     *SweeperProposalsRepository
 	WebhookForwarders    *WebhookForwardersRepository
+	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -45,6 +46,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		SweeperCases:         &SweeperCasesRepository{q: q},
 		SweeperProposals:     &SweeperProposalsRepository{q: q},
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
+		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 	}
 }
 

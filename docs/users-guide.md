@@ -458,13 +458,41 @@ looper status
 
 This is separate from GitHub authentication.
 
-## 16. Webhook forwarder status
+## 16. Webhook delivery status
 
-When webhook mode is enabled, `looper webhook status --json` reports each local `gh webhook forward` subprocess.
+When webhook mode is enabled, `looper webhook status --json` reports the active delivery mode.
+
+In `gh-forward` mode it reports each local `gh webhook forward` subprocess.
 
 - `adopted=true` means this daemon boot safely reattached to a forwarder spawned by a previous boot. Adopted processes do not have stdout/stderr tails because the new daemon did not create their pipes.
 - `latched=true` means `gh webhook forward` exited with a terminal error and Looper will not respawn-loop it. `latchReason` contains the matched error and remediation. For `Hook already exists`, delete the conflicting GitHub webhook or fix `gh` authentication, then restart `looperd`.
 - polling remains the correctness fallback while a forwarder is latched or degraded.
+
+In `tunnel` mode Looper creates a GitHub repository webhook and listens on `127.0.0.1:<webhook.listenPort>`. You run your own tunnel to that listener:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+Then set `webhook.publicBaseUrl` to the stable HTTPS URL for that tunnel and restart `looperd`. GitHub deliveries go to:
+
+```text
+{publicBaseUrl}/webhook/{owner}/{repo}
+```
+
+Useful tunnel commands:
+
+```bash
+looper webhook status --verbose
+looper webhook rotate owner/repo
+looper webhook list-orphans
+looper webhook delete owner/repo --confirm
+```
+
+- `latched=true` on a tunnel hook means GitHub disabled it repeatedly and Looper stopped re-enabling it; polling fallback continues.
+- `orphaned=true` means the repo was removed from config or switched away from `tunnel`. Looper retained the hook id locally so explicit deletion is still by id.
+- `rotate` changes the per-repo HMAC secret and updates the existing hook by id.
+- `delete --confirm` is the only command that removes a Looper-managed tunnel hook from GitHub.
 
 ## 17. One important clarification
 

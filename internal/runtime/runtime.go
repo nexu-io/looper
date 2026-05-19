@@ -184,6 +184,9 @@ func New(options Options) *Runtime {
 		activeExecutions:       NewActiveExecutionRegistry(),
 		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
 	}
+	if rt.webhook != nil {
+		rt.webhook.forwarder = rt.WebhookForwarder
+	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
 	}
@@ -406,7 +409,9 @@ func (r *Runtime) ReconcileWebhookForwarders() {
 	repositories := r.services.Repositories
 	r.mu.RUnlock()
 	if webhook != nil {
-		webhook.Reconcile(repositories)
+		if err := webhook.Reconcile(repositories); err != nil && r.logger != nil {
+			r.logger.Warn("webhook.reconcile_failed", map[string]any{"error": err.Error()})
+		}
 	}
 }
 
@@ -647,14 +652,17 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			}
 		}
 
+		if r.webhook != nil {
+			if err := r.webhook.Start(repositories); err != nil {
+				r.startupReadyErr = err
+				return
+			}
+		}
 		if schedulerDisabled && r.logger != nil {
 			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
 		}
 		if !schedulerDisabled {
 			r.startSchedulerLoop()
-		}
-		if r.webhook != nil {
-			r.webhook.Start(repositories)
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
 

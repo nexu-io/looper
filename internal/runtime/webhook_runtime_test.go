@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -102,6 +103,37 @@ func TestWebhookRuntimeClearsForwarderDegradedReasonsAfterRecovery(t *testing.T)
 	if len(status.DegradedReasons) != 0 {
 		t.Fatalf("Status().DegradedReasons = %v, want empty", status.DegradedReasons)
 	}
+}
+
+func TestWebhookRuntimeStartFailsWhenTunnelListenerCannotBind(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	cfg.Webhook.ListenPort = listener.Addr().(*net.TCPAddr).Port
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	err = rt.Start(repos)
+	if err == nil || !strings.Contains(err.Error(), "webhook tunnel listener failed") {
+		t.Fatalf("Start() error = %v, want tunnel listener startup failure", err)
+	}
+	status := rt.Status()
+	if !status.Degraded || len(status.DegradedReasons) == 0 || !strings.Contains(status.DegradedReasons[0], "webhook tunnel listener failed") {
+		t.Fatalf("status degraded=%v reasons=%v, want tunnel listener failure", status.Degraded, status.DegradedReasons)
+	}
+	if rt.tunnelServer != nil {
+		t.Fatal("tunnel server started despite bind failure")
+	}
+	defer rt.Stop()
 }
 
 func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) {
@@ -326,6 +358,42 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	status = rt.Status()
 	if len(status.Forwarders) != 2 {
 		t.Fatalf("len(Status().Forwarders) after second reconcile = %d, want 2", len(status.Forwarders))
+	}
+}
+
+func TestWebhookRuntimeReconcilePassesDeadlineToTunnelHookReconcile(t *testing.T) {
+	t.Parallel()
+
+	ctx, repositories, cfg := setupWebhookTunnelTestRepos(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper"}`
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	client := &fakeWebhookTunnelGitHubClient{}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.bootstrapDone = true
+	rt.tunnelClient = client
+	defer rt.stopTunnelServer()
+
+	rt.Reconcile(repositories)
+
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
+	}
+	if !client.createDeadline {
+		t.Fatal("CreateHook context missing deadline, want timeout-bounded reconcile call")
+	}
+	if status := rt.Status(); len(status.TunnelHooks) != 1 || status.TunnelHooks[0].LastError != "" {
+		t.Fatalf("status.TunnelHooks = %#v, want one healthy reconciled hook", status.TunnelHooks)
+	}
+	if _, ok, err := repositories.WebhookTunnelHooks.Get(ctx, "acme/looper"); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	} else if !ok {
+		t.Fatal("WebhookTunnelHooks.Get() found = false, want persisted hook record")
+	}
+	if status := rt.Status(); status.Degraded {
+		t.Fatalf("Status().Degraded = true, want false; reasons=%v", status.DegradedReasons)
 	}
 }
 
@@ -792,6 +860,25 @@ func TestWebhookRuntimeAdoptedForwarderExitDoesNotRespawnWhenLaunchBlocked(t *te
 	}
 	if !status.Degraded || len(status.DegradedReasons) != 2 || !strings.Contains(status.DegradedReasons[1], "forwarder for nexu-io/looper exited:") {
 		t.Fatalf("Status() = %#v, want preserved launch blocker plus exit degradation", status)
+	}
+}
+
+func TestWebhookRuntimeTunnelDegradedReasonsDoNotBlockForwarderLaunch(t *testing.T) {
+	t.Parallel()
+
+	rt := &webhookRuntime{ghPath: "/usr/bin/gh", status: WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{
+		"tunnel hook for nexu-io/tunnel degraded: latched; polling fallback continues every 300 seconds",
+		"webhook tunnel hooks require gh to create or reconcile repository webhooks",
+		"forwarder for nexu-io/looper exited: temporary network error",
+	}}}
+
+	if !rt.canLaunchForwarders() {
+		t.Fatal("canLaunchForwarders() = false, want tunnel-only degraded reasons to keep gh-forward launchable")
+	}
+
+	rt.status.DegradedReasons = append(rt.status.DegradedReasons, "server.host is not loopback; webhook forwarders require a loopback daemon endpoint")
+	if rt.canLaunchForwarders() {
+		t.Fatal("canLaunchForwarders() = true, want non-tunnel global degraded reason to block launch")
 	}
 }
 

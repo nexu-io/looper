@@ -73,6 +73,9 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Webhook: WebhookConfig{
 			Enabled:                     false,
+			Mode:                        WebhookModeGHForward,
+			ListenPort:                  0,
+			PublicBaseURL:               "",
 			FallbackPollIntervalSeconds: 300,
 		},
 		Agent: AgentConfig{
