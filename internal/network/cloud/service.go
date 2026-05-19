@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -277,6 +278,30 @@ func (s *Service) RevalidateLease(ctx context.Context, nodeToken string, req pro
 	}
 	if !leaseUsable(lease, s.now().UTC()) || lease.HolderNodeID != nodeID || lease.FencingToken != req.FencingToken {
 		return staleLeaseError(lease)
+	}
+	if err := s.probeLeaseTarget(ctx, lease, req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.RouterLease, req protocol.RouterLeaseRevalidateRequest) error {
+	method := strings.TrimSpace(req.Method)
+	if method == "" {
+		method = http.MethodGet
+	}
+	probe, err := http.NewRequestWithContext(ctx, method, strings.TrimSpace(req.URL), nil)
+	if err != nil {
+		return fmt.Errorf("build revalidation probe: %w", err)
+	}
+	probe.Header.Set("X-Looper-Router-Fencing-Token", fmt.Sprintf("%d", lease.FencingToken))
+	resp, err := http.DefaultClient.Do(probe)
+	if err != nil {
+		return fmt.Errorf("%w: revalidation probe failed: %v", staleLeaseError(lease), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%w: revalidation probe returned status %d", staleLeaseError(lease), resp.StatusCode)
 	}
 	return nil
 }

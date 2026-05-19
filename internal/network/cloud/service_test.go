@@ -143,6 +143,60 @@ func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
 	}
 }
 
+func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
+	server, service := newTestHTTPServer(t)
+	defer server.Close()
+	defer service.Close()
+	node := joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 401)
+	lease := acquireLease(t, server.URL, node.NodeToken)
+
+	var probeCount int
+	revalidateTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeCount++
+		if got, want := r.Method, http.MethodHead; got != want {
+			t.Fatalf("probe method = %s, want %s", got, want)
+		}
+		if got, want := r.Header.Get("X-Looper-Router-Fencing-Token"), "1"; got != want {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer revalidateTarget.Close()
+
+	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL, Method: http.MethodHead})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("revalidate request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revalidate status = %d, want 200", resp.StatusCode)
+	}
+	if probeCount != 1 {
+		t.Fatalf("probe count = %d, want 1", probeCount)
+	}
+
+	deadTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+	}))
+	deadURL := deadTarget.URL
+	deadTarget.Close()
+	body, _ = json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: deadURL})
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed revalidate request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("failed revalidate status = %d, want 412", resp.StatusCode)
+	}
+}
+
 func TestEventsRejectArbitraryBearerToken(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
