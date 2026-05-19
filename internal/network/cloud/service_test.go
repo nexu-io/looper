@@ -238,6 +238,40 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 	}
 }
 
+func TestRouterLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
+	server, service := newTestHTTPServer(t)
+	defer server.Close()
+	defer service.Close()
+	node := joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 401)
+	lease := acquireLease(t, server.URL, node.NodeToken)
+
+	redirected := false
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirectTarget.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: redirector.URL})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("revalidate request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("redirect revalidate status = %d, want 412", resp.StatusCode)
+	}
+	if redirected {
+		t.Fatal("redirect target was probed, want redirect rejected before follow")
+	}
+}
+
 func TestRouterLeaseRevalidateTimesOutHungTarget(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()

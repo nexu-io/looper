@@ -299,7 +299,9 @@ func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.RouterLea
 		return fmt.Errorf("build revalidation probe: %w", err)
 	}
 	probe.Header.Set("X-Looper-Router-Fencing-Token", fmt.Sprintf("%d", lease.FencingToken))
-	resp, err := (&http.Client{Timeout: leaseRevalidationProbeTimeout}).Do(probe)
+	resp, err := (&http.Client{Timeout: leaseRevalidationProbeTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}).Do(probe)
 	if err != nil {
 		return fmt.Errorf("%w: revalidation probe failed: %v", staleLeaseError(lease), err)
 	}

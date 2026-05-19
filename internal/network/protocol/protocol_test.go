@@ -50,7 +50,7 @@ func TestValidateNodeName(t *testing.T) {
 			t.Fatalf("ValidateNodeName(%q) error = %v", name, err)
 		}
 	}
-	invalid := []string{"", "Worker", "-node", "node-", "node_name", strings.Repeat("a", 33)}
+	invalid := []string{"", " worker-1", "worker-1 ", "Worker", "-node", "node-", "node_name", strings.Repeat("a", 33)}
 	for _, name := range invalid {
 		if err := ValidateNodeName(name); err == nil {
 			t.Fatalf("ValidateNodeName(%q) error = nil, want error", name)

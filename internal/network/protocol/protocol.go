@@ -140,6 +140,9 @@ func ValidateNodeName(value string) error {
 	if trimmed == "" {
 		return fmt.Errorf("node name is required")
 	}
+	if trimmed != value {
+		return fmt.Errorf("node name %q must not include leading or trailing whitespace", value)
+	}
 	if !nodeNamePattern.MatchString(trimmed) {
 		return fmt.Errorf("node name %q must match %s", value, nodeNamePattern.String())
 	}
