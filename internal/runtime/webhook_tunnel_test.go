@@ -527,6 +527,112 @@ func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterCreateError(t *testing.
 	}
 }
 
+func TestReconcileTunnelHookAdoptsExistingRemoteHookAfterRecreateError(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	url := webhookTunnelManagedURL(cfg, repo)
+	record := storage.WebhookTunnelHookRecord{Repo: repo, HookID: 42, ManagedURL: url, SecretRef: webhookTunnelSecretRef(repo), CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	client := &fakeWebhookTunnelGitHubClient{createErr: errors.New("hook already exists")}
+	client.listHookResponses = [][]webhookTunnelGitHubHook{{{ID: 77, Active: true, Events: webhookForwardEvents}}}
+	client.listHookResponses[0][0].Config.URL = url
+	client.listHookResponses[0][0].Config.ContentType = "json"
+	client.listHookResponses[0][0].Config.InsecureSSL = "0"
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.getCalls != 1 {
+		t.Fatalf("GetHook calls = %d, want 1", client.getCalls)
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
+	}
+	if client.listCalls != 1 {
+		t.Fatalf("ListHooks calls = %d, want 1 recreate adoption lookup", client.listCalls)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want 1", client.updateCalls)
+	}
+	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || updated.HookID != 77 {
+		t.Fatalf("record = %#v found=%v, want adopted hook id 77", updated, ok)
+	}
+	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, updated.SecretRef)
+	if err != nil {
+		t.Fatalf("readWebhookTunnelSecret() error = %v", err)
+	}
+	if client.lastUpdate.secret != secret {
+		t.Fatalf("UpdateHook secret = %q, want persisted local secret %q", client.lastUpdate.secret, secret)
+	}
+}
+
+func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	record := storage.WebhookTunnelHookRecord{Repo: repo, HookID: 42, ManagedURL: "https://old.example/webhook/acme/looper", SecretRef: webhookTunnelSecretRef(repo), CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	desiredURL := webhookTunnelManagedURL(cfg, repo)
+	hook := webhookTunnelGitHubHook{ID: 42, Active: true, Events: webhookForwardEvents}
+	hook.Config.URL = desiredURL
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	client := &fakeWebhookTunnelGitHubClient{getHook: hook, getFound: true}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.updateCalls != 0 {
+		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
+	}
+	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("WebhookTunnelHooks.Get() found = false, want true")
+	}
+	if updated.Orphaned {
+		t.Fatalf("updated record = %#v, want non-orphaned", updated)
+	}
+	if updated.ManagedURL != desiredURL {
+		t.Fatalf("updated.ManagedURL = %q, want desired URL %q", updated.ManagedURL, desiredURL)
+	}
+}
+
 func TestReconcileTunnelHooksHostQualifiedRepoReturnsLastErrorWithoutGitHubCall(t *testing.T) {
 	t.Parallel()
 

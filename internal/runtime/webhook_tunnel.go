@@ -284,6 +284,17 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if !found {
 		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
 		if err != nil {
+			adopted, adoptedFound, listErr := findWebhookTunnelHookByURL(ctx, client, repo, url)
+			if listErr == nil && adoptedFound {
+				state := w.adoptTunnelHook(ctx, store, repo, adopted, url, secretRef, secret, now, "adopt existing hook after recreate failure")
+				if state.LastError != "" {
+					state.LastError = fmt.Sprintf("recreate missing hook: %v; %s", err, state.LastError)
+				}
+				return state
+			}
+			if listErr != nil {
+				return tunnelStateFromRecord(record, fmt.Sprintf("recreate missing hook: %v; list hooks after recreate failure: %v", err, listErr))
+			}
 			return tunnelStateFromRecord(record, fmt.Sprintf("recreate missing hook: %v", err))
 		}
 		record.HookID = hook.ID
@@ -301,7 +312,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		}
 		return tunnelStateFromRecord(record, "")
 	}
-	if strings.TrimSpace(hook.Config.URL) != strings.TrimSpace(record.ManagedURL) && strings.TrimSpace(hook.Config.URL) != "" {
+	if strings.TrimSpace(hook.Config.URL) != "" && strings.TrimSpace(hook.Config.URL) != strings.TrimSpace(record.ManagedURL) && strings.TrimSpace(hook.Config.URL) != url {
 		_ = store.MarkOrphaned(ctx, repo, true, now)
 		record.Orphaned = true
 		return tunnelStateFromRecord(record, "remote hook URL drifted; record marked orphaned and not mutated")
@@ -310,6 +321,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if reactivateOrphan {
 		record.Orphaned = false
 	}
+	refreshManagedRecord := strings.TrimSpace(record.ManagedURL) != url || record.SecretRef != secretRef
 	if record.LastDisableAt != nil && w.currentTime().Sub(time.Unix(0, *record.LastDisableAt)) > webhookTunnelDisableLatchWindow {
 		record.ConsecutiveDisables = 0
 		record.LastDisableAt = nil
@@ -340,10 +352,12 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		if err := store.Upsert(ctx, record); err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook update: %v", err))
 		}
-	} else if reactivateOrphan {
+	} else if reactivateOrphan || refreshManagedRecord {
+		record.ManagedURL = url
+		record.SecretRef = secretRef
 		record.UpdatedAt = now
 		if err := store.Upsert(ctx, record); err != nil {
-			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook reactivation: %v", err))
+			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook state: %v", err))
 		}
 	}
 	return tunnelStateFromRecord(record, "")
