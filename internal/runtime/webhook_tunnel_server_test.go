@@ -23,6 +23,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Webhook.PublicBaseURL = "https://example.com/base"
 	dbPath := filepath.Join(tempDir, "looper.sqlite")
 	cfg.Storage.DBPath = dbPath
 	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(tempDir, "backups"))
@@ -69,7 +70,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 
 	t.Run("ping skips forwarder", func(t *testing.T) {
 		forwarder.reset()
-		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", http.NoBody)
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", http.NoBody)
 		req.Header.Set("X-GitHub-Event", "ping")
 		req.Header.Set("X-GitHub-Delivery", "delivery-ping")
 		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, nil))
@@ -88,7 +89,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	t.Run("valid delivery forwards", func(t *testing.T) {
 		forwarder.reset()
 		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
 		req.Header.Set("X-GitHub-Event", "pull_request")
 		req.Header.Set("X-GitHub-Delivery", "delivery-accepted")
 		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
@@ -110,7 +111,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	t.Run("bad hmac rejected", func(t *testing.T) {
 		forwarder.reset()
 		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
 		req.Header.Set("X-GitHub-Event", "pull_request")
 		req.Header.Set("X-GitHub-Delivery", "delivery-bad-hmac")
 		req.Header.Set("X-Hub-Signature-256", testGitHubSignature("wrong-secret", body))
@@ -129,7 +130,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	t.Run("oversized payload rejected before hmac validation", func(t *testing.T) {
 		forwarder.reset()
 		body := bytes.Repeat([]byte("a"), maxWebhookTunnelPayloadBytes+1)
-		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
 		req.Header.Set("X-GitHub-Event", "push")
 		req.Header.Set("X-GitHub-Delivery", "delivery-too-large")
 		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
@@ -148,7 +149,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	t.Run("repository mismatch rejected", func(t *testing.T) {
 		forwarder.reset()
 		body := []byte(`{"repository":{"full_name":"acme/other"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/webhook/acme/looper", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
 		req.Header.Set("X-GitHub-Event", "pull_request")
 		req.Header.Set("X-GitHub-Delivery", "delivery-mismatch")
 		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))

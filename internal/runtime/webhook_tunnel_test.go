@@ -59,6 +59,23 @@ func TestWebhookTunnelManagedURLTrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestWebhookTunnelRequestPathHonorsPublicBaseURLPath(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{}
+	cfg.Webhook.PublicBaseURL = " https://example.com/base// "
+
+	if got, ok := webhookTunnelRequestPath(cfg, "/base/webhook/acme/looper"); !ok || got != "/webhook/acme/looper" {
+		t.Fatalf("webhookTunnelRequestPath() = (%q, %v), want (%q, true)", got, ok, "/webhook/acme/looper")
+	}
+	if got, ok := webhookTunnelRequestPath(cfg, "/webhook/acme/looper"); ok || got != "" {
+		t.Fatalf("webhookTunnelRequestPath() = (%q, %v), want (\"\", false)", got, ok)
+	}
+	if got, ok := webhookTunnelRequestPath(config.Config{}, "/webhook/acme/looper"); !ok || got != "/webhook/acme/looper" {
+		t.Fatalf("webhookTunnelRequestPath() without prefix = (%q, %v), want (%q, true)", got, ok, "/webhook/acme/looper")
+	}
+}
+
 func setupWebhookTunnelTestRepos(t *testing.T) (context.Context, *storage.Repositories, config.Config) {
 	t.Helper()
 

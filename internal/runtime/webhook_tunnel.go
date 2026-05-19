@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -417,7 +418,12 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
-	repo, ok := repoFromWebhookTunnelPath(r.URL.Path)
+	path, ok := webhookTunnelRequestPath(s.runtime.cfg, r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	repo, ok := repoFromWebhookTunnelPath(path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -616,6 +622,26 @@ func webhookTunnelListenerURL(cfg config.Config) string {
 
 func webhookTunnelManagedURL(cfg config.Config, repo string) string {
 	return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/" + strings.Trim(strings.TrimSpace(repo), "/")
+}
+
+func webhookTunnelRequestPath(cfg config.Config, requestPath string) (string, bool) {
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/")
+	if baseURL == "" {
+		return requestPath, true
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", false
+	}
+	basePath := strings.TrimRight(strings.TrimSpace(parsed.Path), "/")
+	if basePath == "" {
+		return requestPath, true
+	}
+	trimmed, ok := strings.CutPrefix(requestPath, basePath)
+	if !ok || trimmed == "" {
+		return "", false
+	}
+	return trimmed, true
 }
 
 func repoFromWebhookTunnelPath(path string) (string, bool) {
