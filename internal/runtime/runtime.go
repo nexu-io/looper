@@ -617,17 +617,17 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.ownershipAcquired = true
 		r.mu.Unlock()
 
-		if schedulerDisabled && r.logger != nil {
-			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
-		}
-		if !schedulerDisabled {
-			r.startSchedulerLoop()
-		}
 		if r.webhook != nil {
 			if err := r.webhook.Start(repositories); err != nil {
 				r.startupReadyErr = err
 				return
 			}
+		}
+		if schedulerDisabled && r.logger != nil {
+			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+		}
+		if !schedulerDisabled {
+			r.startSchedulerLoop()
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
 

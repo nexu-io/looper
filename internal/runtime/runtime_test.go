@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1757,6 +1758,72 @@ func TestRuntimeStopSchedulerLoopKeepsTaskTrackerUntilLoopStops(t *testing.T) {
 	defer rt.mu.RUnlock()
 	if rt.schedulerTasks != nil {
 		t.Fatal("schedulerTasks not cleared after scheduler loop stopped")
+	}
+}
+
+func TestRuntimeStartDoesNotStartSchedulerWhenWebhookStartupFails(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	backupDir := t.TempDir()
+	repoPath := filepath.Join(workingDir, "repo")
+	vendor := config.AgentVendorOpenCode
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Agent.Vendor = &vendor
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = config.WebhookModeTunnel
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: repoPath}}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	cfg.Webhook.ListenPort = listener.Addr().(*net.TCPAddr).Port
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		_ = coordinator.Close()
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+	metadata := `{"repo":"acme/looper","source":"config"}`
+	nowISO := "2026-05-19T12:00:00.000Z"
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		_ = coordinator.Close()
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now: func() time.Time {
+			return time.Date(2026, time.May, 19, 12, 0, 0, 0, time.UTC)
+		},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	defer rt.Stop("test cleanup")
+
+	err = rt.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "webhook tunnel listener failed") {
+		t.Fatalf("Start() error = %v, want tunnel listener startup failure", err)
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.schedulerDone != nil {
+		t.Fatal("scheduler started despite webhook startup failure")
 	}
 }
 
