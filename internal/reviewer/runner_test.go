@@ -1381,7 +1381,7 @@ func TestRunFilterStepRefreshesCurrentLoginBeforeAlreadyReviewedCheck(t *testing
 	}
 }
 
-func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) {
+func TestRunFilterStepSkipsApprovedCurrentHeadWithoutTerminating(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{currentLogin: "octocat"}
@@ -1398,15 +1398,47 @@ func TestRunFilterStepTerminatesApprovedBeforeAlreadyReviewedSkip(t *testing.T) 
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
-	if !strings.Contains(checkpoint.SkipReason, "Terminated reviewer loop for approved pull request") {
-		t.Fatalf("SkipReason = %q, want approved termination", checkpoint.SkipReason)
+	if checkpoint.SkipKind != "already_reviewed_by_current_user" {
+		t.Fatalf("SkipKind = %q, want already_reviewed_by_current_user", checkpoint.SkipKind)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "already reviewed head abc123") {
+		t.Fatalf("SkipReason = %q, want already-reviewed skip", checkpoint.SkipReason)
 	}
 	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || updated == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
 	}
-	if updated.Status != "terminated" {
-		t.Fatalf("loop status = %q, want terminated", updated.Status)
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepAllowsNewHeadAfterCurrentUserApprovedPreviousHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_approved_previous_head", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "def456", ReviewDecision: "APPROVED", ReviewRequests: []string{"octocat"}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip for new head", checkpoint.SkipReason)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	if updated.Status == "terminated" {
+		t.Fatalf("loop status = %q, want not terminated", updated.Status)
 	}
 }
 
@@ -2064,15 +2096,16 @@ func TestDiscoverPullRequestsDoesNotRequeueApprovedReadyOrDraftNonActionablePRs(
 		name   string
 		github *fakeGitHubGateway
 		want   string
+		config config.ReviewerLoopConfig
 	}{
-		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}, reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: "approved"},
-		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready"},
-		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft"},
+		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}, reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: "approved", config: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}},
+		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready", config: testReviewerLoopConfig()},
+		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft", config: testReviewerLoopConfig()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			fixture := newRunnerFixture(t)
-			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: tc.github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: tc.github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: tc.config})
 			repo := "acme/looper"
 
 			first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
@@ -7107,7 +7140,7 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 }
 
 func testReviewerLoopConfig() config.ReviewerLoopConfig {
-	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 }
 
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }

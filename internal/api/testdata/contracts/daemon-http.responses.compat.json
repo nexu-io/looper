@@ -319,7 +319,7 @@
                   "maxWallClockSeconds": 0,
                   "maxConsecutiveFailures": 3,
                   "maxAgentExecutionsPerPR": 25,
-                  "stopOnApproved": true,
+                  "stopOnApproved": false,
                   "stopOnReadyLabel": true,
                   "stopOnIdenticalOutput": true
                 },
