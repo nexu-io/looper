@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -102,6 +103,37 @@ func TestWebhookRuntimeClearsForwarderDegradedReasonsAfterRecovery(t *testing.T)
 	if len(status.DegradedReasons) != 0 {
 		t.Fatalf("Status().DegradedReasons = %v, want empty", status.DegradedReasons)
 	}
+}
+
+func TestWebhookRuntimeStartFailsWhenTunnelListenerCannotBind(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	cfg.Webhook.ListenPort = listener.Addr().(*net.TCPAddr).Port
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	err = rt.Start(repos)
+	if err == nil || !strings.Contains(err.Error(), "webhook tunnel listener failed") {
+		t.Fatalf("Start() error = %v, want tunnel listener startup failure", err)
+	}
+	status := rt.Status()
+	if !status.Degraded || len(status.DegradedReasons) == 0 || !strings.Contains(status.DegradedReasons[0], "webhook tunnel listener failed") {
+		t.Fatalf("status degraded=%v reasons=%v, want tunnel listener failure", status.Degraded, status.DegradedReasons)
+	}
+	if rt.tunnelServer != nil {
+		t.Fatal("tunnel server started despite bind failure")
+	}
+	defer rt.Stop()
 }
 
 func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) {

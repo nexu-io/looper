@@ -175,9 +175,9 @@ func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 	}
 }
 
-func (w *webhookRuntime) Start(repos *storage.Repositories) {
+func (w *webhookRuntime) Start(repos *storage.Repositories) error {
 	w.Bootstrap(context.Background(), repos)
-	w.Reconcile(repos)
+	return w.Reconcile(repos)
 }
 
 func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositories) {
@@ -263,9 +263,9 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 	return w.status.Enabled && w.ghPath != "" && !w.hasLaunchBlockingDegradedReasonLocked()
 }
 
-func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
+func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 	if w == nil || !w.status.Enabled {
-		return
+		return nil
 	}
 	if repos != nil {
 		w.syncForwarderStore(repos.WebhookForwarders)
@@ -274,18 +274,18 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 		w.Bootstrap(context.Background(), repos)
 		if !w.bootstrapCompleted() {
 			w.scheduleReconcileRetry(repos)
-			return
+			return nil
 		}
 	}
 	if repos == nil || repos.Projects == nil {
 		w.addDegradedReason("project repositories are unavailable")
-		return
+		return nil
 	}
 	projects, err := repos.Projects.List(context.Background())
 	if err != nil {
 		w.addDegradedReason(fmt.Sprintf("list configured projects: %v", err))
 		w.scheduleReconcileRetry(repos)
-		return
+		return nil
 	}
 	w.clearTransientReconcileDegradedReasons()
 	forwarderRepoSet := map[string]struct{}{}
@@ -312,21 +312,24 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet)
+	if err := w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet); err != nil {
+		return err
+	}
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
 	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
 		w.addDegradedReason(noConfiguredWebhookReposReason)
-		return
+		return nil
 	}
 	w.clearDegradedReasons(func(reason string) bool {
 		return reason == noConfiguredWebhookReposReason
 	})
 	if len(forwarderRepoSet) == 0 || w.ghPath == "" || w.hasLaunchBlockingDegradedReason() {
-		return
+		return nil
 	}
 	for _, repo := range launchRepos {
 		w.launchForwarder(repo)
 	}
+	return nil
 }
 
 func (w *webhookRuntime) hasLaunchBlockingDegradedReason() bool {

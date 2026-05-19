@@ -384,7 +384,9 @@ func (r *Runtime) ReconcileWebhookForwarders() {
 	repositories := r.services.Repositories
 	r.mu.RUnlock()
 	if webhook != nil {
-		webhook.Reconcile(repositories)
+		if err := webhook.Reconcile(repositories); err != nil && r.logger != nil {
+			r.logger.Warn("webhook.reconcile_failed", map[string]any{"error": err.Error()})
+		}
 	}
 }
 
@@ -622,7 +624,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startSchedulerLoop()
 		}
 		if r.webhook != nil {
-			r.webhook.Start(repositories)
+			if err := r.webhook.Start(repositories); err != nil {
+				r.startupReadyErr = err
+				return
+			}
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
 

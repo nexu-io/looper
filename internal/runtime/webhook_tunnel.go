@@ -170,19 +170,20 @@ func (c ghWebhookTunnelClient) run(ctx context.Context, repo string, args []stri
 	return stdout.Bytes(), nil
 }
 
-func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, repoSet map[string]struct{}) {
+func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, repoSet map[string]struct{}) error {
 	w.setAllowedTunnelRepos(repoSet)
 	if repos == nil || repos.WebhookTunnelHooks == nil {
 		w.addDegradedReason("webhook tunnel hook store is unavailable")
-		return
+		return nil
 	}
 	w.mu.Lock()
 	w.tunnelStore = repos.WebhookTunnelHooks
 	w.mu.Unlock()
 	if len(repoSet) > 0 {
 		if err := w.ensureTunnelServer(); err != nil {
-			w.addDegradedReason(fmt.Sprintf("webhook tunnel listener failed: %v", err))
-			return
+			listenerErr := fmt.Errorf("webhook tunnel listener failed: %w", err)
+			w.addDegradedReason(listenerErr.Error())
+			return listenerErr
 		}
 	} else {
 		w.stopTunnelServer()
@@ -190,13 +191,13 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	w.clearTunnelDegradedReasons()
 	if len(repoSet) > 0 && w.ghPath == "" {
 		w.addDegradedReason("webhook tunnel hooks require gh to create or reconcile repository webhooks")
-		return
+		return nil
 	}
 	store := repos.WebhookTunnelHooks
 	existing, err := store.List(ctx)
 	if err != nil {
 		w.addDegradedReason(fmt.Sprintf("list webhook tunnel hooks: %v", err))
-		return
+		return nil
 	}
 	now := w.currentTime().UnixNano()
 	states := make([]WebhookTunnelState, 0, len(repoSet)+len(existing))
@@ -231,6 +232,7 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	sort.Slice(states, func(i, j int) bool { return states[i].Repo < states[j].Repo })
 	w.setTunnelStates(states)
 	w.updateTunnelDegradedReasons(states)
+	return nil
 }
 
 func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
