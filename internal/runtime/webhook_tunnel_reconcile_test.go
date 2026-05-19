@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -167,6 +168,55 @@ func TestReconcileTunnelHooksDisabledHookAtThresholdLatchesAndDegrades(t *testin
 	}
 	if client.updateCalls != 0 {
 		t.Fatalf("UpdateHook calls = %d, want 0 once latched", client.updateCalls)
+	}
+}
+
+func TestReconcileTunnelHooksDisabledHookAtThresholdReportsPersistFailure(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	cfg, err := config.DefaultConfig(tempDir)
+	if err != nil {
+		t.Fatalf("config.DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(tempDir, "state", "looper.sqlite")
+	cfg.Webhook.PublicBaseURL = "https://example.test"
+	cfg.Webhook.ListenPort = 0
+	ghPath := "/usr/bin/gh"
+	cfg.Tools.GHPath = &ghPath
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(tempDir, "backups"))
+	repos := storage.NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	lastDisableAt := time.Unix(9, 0).UnixNano()
+	record := storage.WebhookTunnelHookRecord{Repo: "acme/looper", HookID: 42, ManagedURL: webhookTunnelManagedURL(cfg, "acme/looper"), SecretRef: webhookTunnelSecretRef("acme/looper"), ConsecutiveDisables: webhookTunnelDisableLatchThreshold - 1, LastDisableAt: &lastDisableAt, CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	client := &fakeWebhookTunnelGitHubClient{getHook: webhookTunnelGitHubHook{ID: 42, Active: false, Events: webhookForwardEvents}, getFound: true}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.ghPath = "/usr/bin/gh"
+	rt.tunnelClient = client
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, record.Repo, record, true, time.Unix(10, 0).UnixNano())
+
+	if !strings.Contains(state.LastError, "persist latch state") {
+		t.Fatalf("state.LastError = %q, want persist latch state failure", state.LastError)
+	}
+	if state.Latched {
+		t.Fatalf("state.Latched = %v, want false when latch persistence fails", state.Latched)
+	}
+	if client.updateCalls != 0 {
+		t.Fatalf("UpdateHook calls = %d, want 0 when latch persistence fails", client.updateCalls)
 	}
 }
 

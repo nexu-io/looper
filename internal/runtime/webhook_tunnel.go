@@ -47,7 +47,6 @@ type webhookTunnelGitHubHook struct {
 
 type webhookTunnelGitHubClient interface {
 	GetHook(ctx context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error)
-	ListHooks(ctx context.Context, repo string) ([]webhookTunnelGitHubHook, error)
 	CreateHook(ctx context.Context, repo string, url string, secret string, events []string) (webhookTunnelGitHubHook, error)
 	UpdateHook(ctx context.Context, repo string, id int64, url string, secret string, events []string, active bool) (webhookTunnelGitHubHook, error)
 	DeleteHook(ctx context.Context, repo string, id int64) error
@@ -68,26 +67,6 @@ func (c ghWebhookTunnelClient) GetHook(ctx context.Context, repo string, id int6
 		return webhookTunnelGitHubHook{}, false, fmt.Errorf("decode hook %s#%d: %w", repo, id, err)
 	}
 	return hook, true, nil
-}
-
-func (c ghWebhookTunnelClient) ListHooks(ctx context.Context, repo string) ([]webhookTunnelGitHubHook, error) {
-	result, err := c.run(ctx, repo, []string{"api", "--paginate", fmt.Sprintf("repos/%s/hooks?per_page=100", splitRepoPath(repo))})
-	if err != nil {
-		return nil, err
-	}
-	var hooks []webhookTunnelGitHubHook
-	decoder := json.NewDecoder(bytes.NewReader(result))
-	for {
-		var page []webhookTunnelGitHubHook
-		if err := decoder.Decode(&page); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, fmt.Errorf("decode hooks for %s: %w", repo, err)
-		}
-		hooks = append(hooks, page...)
-	}
-	return hooks, nil
 }
 
 func (c ghWebhookTunnelClient) CreateHook(ctx context.Context, repo string, url string, secret string, events []string) (webhookTunnelGitHubHook, error) {
@@ -310,7 +289,9 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 			record.LastDisableAt = &last
 			if record.ConsecutiveDisables >= webhookTunnelDisableLatchThreshold {
 				record.UpdatedAt = now
-				_ = store.Upsert(ctx, record)
+				if err := store.Upsert(ctx, record); err != nil {
+					return tunnelStateFromRecord(record, fmt.Sprintf("persist latch state: %v", err))
+				}
 				return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
 			}
 		}
@@ -332,30 +313,6 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		if err := store.Upsert(ctx, record); err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook state: %v", err))
 		}
-	}
-	return tunnelStateFromRecord(record, "")
-}
-
-func findWebhookTunnelHookByURL(ctx context.Context, client webhookTunnelGitHubClient, repo string, url string) (webhookTunnelGitHubHook, bool, error) {
-	hooks, err := client.ListHooks(ctx, repo)
-	if err != nil {
-		return webhookTunnelGitHubHook{}, false, err
-	}
-	for _, hook := range hooks {
-		if hook.Config.URL == url {
-			return hook, true, nil
-		}
-	}
-	return webhookTunnelGitHubHook{}, false, nil
-}
-
-func (w *webhookRuntime) adoptTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, hook webhookTunnelGitHubHook, url string, secretRef string, secret string, now int64, action string) WebhookTunnelState {
-	if _, err := w.tunnelGitHubClient().UpdateHook(ctx, repo, hook.ID, url, secret, webhookForwardEvents, true); err != nil {
-		return WebhookTunnelState{Repo: repo, HookID: &hook.ID, ManagedURL: url, LastError: fmt.Sprintf("%s: update adopted hook %d: %v", action, hook.ID, err)}
-	}
-	record := storage.WebhookTunnelHookRecord{Repo: repo, HookID: hook.ID, ManagedURL: url, SecretRef: secretRef, ConsecutiveDisables: 0, CreatedAt: now, UpdatedAt: now}
-	if err := store.Upsert(ctx, record); err != nil {
-		return WebhookTunnelState{Repo: repo, HookID: &record.HookID, ManagedURL: url, LastError: fmt.Sprintf("%s: persist adopted hook: %v", action, err)}
 	}
 	return tunnelStateFromRecord(record, "")
 }

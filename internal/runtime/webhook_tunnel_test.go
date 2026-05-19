@@ -100,26 +100,22 @@ func setupWebhookTunnelTestRepos(t *testing.T) (context.Context, *storage.Reposi
 }
 
 type fakeWebhookTunnelGitHubClient struct {
-	getHook           webhookTunnelGitHubHook
-	getFound          bool
-	listHooks         []webhookTunnelGitHubHook
-	listHookResponses [][]webhookTunnelGitHubHook
-	listErr           error
-	createHook        webhookTunnelGitHubHook
-	createErr         error
-	updateHook        webhookTunnelGitHubHook
-	updateErr         error
-	deleteErr         error
-	getDeadline       bool
-	createDeadline    bool
-	updateDeadline    bool
-	getCalls          int
-	listCalls         int
-	createCalls       int
-	updateCalls       int
-	deleteCalls       int
-	lastUpdate        fakeWebhookTunnelUpdateCall
-	deletedHooks      []int64
+	getHook        webhookTunnelGitHubHook
+	getFound       bool
+	createHook     webhookTunnelGitHubHook
+	createErr      error
+	updateHook     webhookTunnelGitHubHook
+	updateErr      error
+	deleteErr      error
+	getDeadline    bool
+	createDeadline bool
+	updateDeadline bool
+	getCalls       int
+	createCalls    int
+	updateCalls    int
+	deleteCalls    int
+	lastUpdate     fakeWebhookTunnelUpdateCall
+	deletedHooks   []int64
 }
 
 type fakeWebhookTunnelUpdateCall struct {
@@ -134,15 +130,6 @@ func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _
 	f.getCalls++
 	_, f.getDeadline = ctx.Deadline()
 	return f.getHook, f.getFound, nil
-}
-
-func (f *fakeWebhookTunnelGitHubClient) ListHooks(ctx context.Context, _ string) ([]webhookTunnelGitHubHook, error) {
-	f.listCalls++
-	_, f.getDeadline = ctx.Deadline()
-	if len(f.listHookResponses) >= f.listCalls {
-		return append([]webhookTunnelGitHubHook(nil), f.listHookResponses[f.listCalls-1]...), f.listErr
-	}
-	return append([]webhookTunnelGitHubHook(nil), f.listHooks...), f.listErr
 }
 
 func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {

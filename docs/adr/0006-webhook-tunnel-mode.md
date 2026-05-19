@@ -10,7 +10,9 @@ The motivation is the single-instance limit of `gh webhook forward`: GitHub only
 
 - `looperd` creates the hook via the GitHub REST API and persists `(repo, hook_id, secret)` in local state.
 - All subsequent reads, updates, re-enables, and deletes address the hook by id.
+- The persisted `managed_url`, disable latch counters, and orphaned bit are authority-bearing guard state. They prevent mutating a hook whose URL drifted away from Looper, prevent infinite re-enable loops after repeated GitHub disables, and preserve explicit delete-by-id authority after the repo leaves config. The cost is extra persisted lifecycle state that must remain in sync with remote hook status; a simpler stateless design was rejected because it would have to infer ownership from mutable remote fields.
 - Before any mutating call, `looperd` re-reads the hook by id and verifies that `config.url` still matches the configured `public_base_url` for that repo. This is a drift guard, not ownership proof; matching URL alone never authorizes adopting or deleting a hook.
+- During a `public_base_url` rotation, `looperd` also accepts the last locally persisted managed URL for that same hook id long enough to patch the hook in place to the newly configured URL. This transition still relies on the existing locally created hook id; URL matching alone never grants authority.
 - `looperd` never deletes a remote hook it did not create. There is no inference from URL, name, events, or any other field.
 - If two daemons run with copied or restored tunnel state, they are the same authority identity from Looper's perspective and may race on the same hook. Shared tunnel state across machines is unsupported unless the operator intentionally wants shared control of that hook.
 
@@ -20,9 +22,13 @@ This is a deliberate departure from ADR 0005's local-only authority stance, scop
 
 - Daemon start: for each repo with `mode: tunnel`, ensure the locally recorded hook exists. If a recorded `hook_id` returns `404`, create a replacement and store the new id. If the hook is disabled and still matches the managed URL, re-enable it, subject to a repeated-disable latch: after N consecutive auto-disables within a window, `looperd` stops re-enabling and surfaces `degraded` until the operator intervenes.
 - Daemon stop and crash: the hook is left in place. GitHub will eventually auto-disable a hook that fails persistently; `looperd` re-enables on next start, subject to the latch above.
-- Repo removed from config: the remote hook is left in place, and local state is retained as an orphaned hook record until the operator explicitly deletes the hook by id or explicitly forgets the record. Clearing the local record without deleting the remote hook is the lossy path and is not done automatically.
+- Repo removed from config: the remote hook is left in place, and local state is retained as an orphaned hook record until the operator explicitly deletes the hook by id or explicitly forgets the record. Clearing the local record without deleting the remote hook is the lossy path and is not done automatically. Re-adding that repo to config is an explicit operator action to resume control of the same persisted hook-id authority if the hook still matches the recorded id.
 - Mode change between `gh-forward` and `tunnel`: not migrated automatically. Tunnel hook state is retained as an orphaned record so that explicit deletion remains safe by id; automatic cross-mode cleanup is rejected for the same reason ADR 0005 rejects daemon-driven remote deletion on inference.
 - Manual UI edits: the hook is daemon-managed. A manual disable in the GitHub UI is not respected while the repo is configured in `tunnel` mode and will be re-enabled on next reconcile, subject to the latch. Manual edits to events or content type drift back on next reconcile. To pause delivery, the operator removes the repo from config or switches to `gh-forward`.
+
+## Oracle review
+
+`@oracle` reviewed the authority-bearing hook-id design for this PR after the persisted tunnel-hook record and mutation gates were added. Review outcome: no blockers after removing URL-adoption helpers, requiring latch-state persistence before reporting a durable latch, and documenting the explicit authority for orphan reactivation and managed-URL rotation.
 
 ## Delivery path
 

@@ -53,12 +53,7 @@ func TestReconcileTunnelHookCreatesManagedHookWithoutAdoptingURLMatch(t *testing
 
 	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
 	const repo = "acme/looper"
-	url := webhookTunnelManagedURL(cfg, repo)
 	client := &fakeWebhookTunnelGitHubClient{createHook: webhookTunnelGitHubHook{ID: 91, Active: true, Events: webhookForwardEvents}}
-	client.listHooks = []webhookTunnelGitHubHook{{ID: 42, Active: true, Events: webhookForwardEvents}}
-	client.listHooks[0].Config.URL = url
-	client.listHooks[0].Config.ContentType = "json"
-	client.listHooks[0].Config.InsecureSSL = "0"
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 	rt.tunnelStore = repos.WebhookTunnelHooks
@@ -75,9 +70,6 @@ func TestReconcileTunnelHookCreatesManagedHookWithoutAdoptingURLMatch(t *testing
 	}
 	if client.updateCalls != 0 {
 		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
-	}
-	if client.listCalls != 0 {
-		t.Fatalf("ListHooks calls = %d, want 0", client.listCalls)
 	}
 	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
 	if err != nil {
@@ -111,12 +103,7 @@ func TestReconcileTunnelHookCreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 
 	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
 	const repo = "acme/looper"
-	url := webhookTunnelManagedURL(cfg, repo)
 	client := &fakeWebhookTunnelGitHubClient{createErr: errors.New("create timed out")}
-	client.listHooks = []webhookTunnelGitHubHook{{ID: 77, Active: true, Events: webhookForwardEvents}}
-	client.listHooks[0].Config.URL = url
-	client.listHooks[0].Config.ContentType = "json"
-	client.listHooks[0].Config.InsecureSSL = "0"
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 	rt.tunnelStore = repos.WebhookTunnelHooks
@@ -131,9 +118,6 @@ func TestReconcileTunnelHookCreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	}
 	if client.updateCalls != 0 {
 		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
-	}
-	if client.listCalls != 0 {
-		t.Fatalf("ListHooks calls = %d, want 0", client.listCalls)
 	}
 	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
 	if err != nil {
@@ -162,10 +146,6 @@ func TestReconcileTunnelHookRecreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 	client := &fakeWebhookTunnelGitHubClient{createErr: errors.New("hook already exists")}
-	client.listHookResponses = [][]webhookTunnelGitHubHook{{{ID: 77, Active: true, Events: webhookForwardEvents}}}
-	client.listHookResponses[0][0].Config.URL = url
-	client.listHookResponses[0][0].Config.ContentType = "json"
-	client.listHookResponses[0][0].Config.InsecureSSL = "0"
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
@@ -179,9 +159,6 @@ func TestReconcileTunnelHookRecreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	}
 	if client.createCalls != 1 {
 		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
-	}
-	if client.listCalls != 0 {
-		t.Fatalf("ListHooks calls = %d, want 0", client.listCalls)
 	}
 	if client.updateCalls != 0 {
 		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
