@@ -11,7 +11,7 @@ import (
 
 const (
 	CurrentVersion     = "loopernet/v1"
-	DefaultLeaseName   = "router"
+	DefaultLeaseName   = "coordinator"
 	DefaultLeaseTTL    = 30 * time.Second
 	MinimumDaemonField = "daemonVersion"
 )
@@ -24,13 +24,13 @@ type GitHubIdentity struct {
 }
 
 type NodeCapabilities struct {
-	Roles          []string `json:"roles,omitempty"`
-	RouterEligible bool     `json:"routerEligible"`
-	RoutedProjects int      `json:"routedProjects"`
-	LocalProjects  int      `json:"localProjects"`
-	DynamicLoad    int      `json:"dynamicLoad"`
-	IdentityDrift  bool     `json:"identityDrift"`
-	DriftReason    string   `json:"driftReason,omitempty"`
+	Roles               []string `json:"roles,omitempty"`
+	CoordinatorEligible bool     `json:"coordinatorEligible"`
+	RoutedProjects      int      `json:"routedProjects"`
+	LocalProjects       int      `json:"localProjects"`
+	DynamicLoad         int      `json:"dynamicLoad"`
+	IdentityDrift       bool     `json:"identityDrift"`
+	DriftReason         string   `json:"driftReason,omitempty"`
 }
 
 type AuditEnvelope struct {
@@ -85,50 +85,50 @@ type HeartbeatResponse struct {
 	Warnings   []string  `json:"warnings,omitempty"`
 }
 
-type RouterLease struct {
+type CoordinatorLease struct {
 	Name         string     `json:"name"`
 	HolderNodeID string     `json:"holderNodeId,omitempty"`
 	FencingToken int64      `json:"fencingToken"`
 	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
 }
 
-type RouterLeaseAcquireRequest struct {
+type CoordinatorLeaseAcquireRequest struct {
 	TTLSeconds int `json:"ttlSeconds,omitempty"`
 }
 
-type RouterLeaseRenewRequest struct {
+type CoordinatorLeaseRenewRequest struct {
 	FencingToken int64 `json:"fencingToken"`
 	TTLSeconds   int   `json:"ttlSeconds,omitempty"`
 }
 
-type RouterLeaseHandoffRequest struct {
+type CoordinatorLeaseHandoffRequest struct {
 	FencingToken   int64  `json:"fencingToken"`
 	TargetNodeName string `json:"targetNodeName"`
 	TTLSeconds     int    `json:"ttlSeconds,omitempty"`
 }
 
-type RouterLeaseRevalidateRequest struct {
+type CoordinatorLeaseRevalidateRequest struct {
 	FencingToken int64  `json:"fencingToken"`
 	URL          string `json:"url"`
 	Method       string `json:"method,omitempty"`
 }
 
 type StatusResponse struct {
-	NetworkID   string       `json:"networkId"`
-	Lease       RouterLease  `json:"lease"`
-	Memberships []Membership `json:"memberships"`
-	Warnings    []string     `json:"warnings,omitempty"`
+	NetworkID   string           `json:"networkId"`
+	Lease       CoordinatorLease `json:"lease"`
+	Memberships []Membership     `json:"memberships"`
+	Warnings    []string         `json:"warnings,omitempty"`
 }
 
 type NodeStatusResponse struct {
-	NetworkID           string         `json:"networkId"`
-	Membership          Membership     `json:"membership"`
-	Lease               RouterLease    `json:"lease"`
-	Warnings            []string       `json:"warnings,omitempty"`
-	CloudReachable      bool           `json:"cloudReachable"`
-	CurrentGitHub       GitHubIdentity `json:"currentGithub"`
-	IdentityDrift       bool           `json:"identityDrift"`
-	IdentityDriftReason string         `json:"identityDriftReason,omitempty"`
+	NetworkID           string           `json:"networkId"`
+	Membership          Membership       `json:"membership"`
+	Lease               CoordinatorLease `json:"lease"`
+	Warnings            []string         `json:"warnings,omitempty"`
+	CloudReachable      bool             `json:"cloudReachable"`
+	CurrentGitHub       GitHubIdentity   `json:"currentGithub"`
+	IdentityDrift       bool             `json:"identityDrift"`
+	IdentityDriftReason string           `json:"identityDriftReason,omitempty"`
 }
 
 func TargetLabelForNode(nodeName string) string {

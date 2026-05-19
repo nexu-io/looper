@@ -18,18 +18,18 @@ import (
 )
 
 type networkStatusOutput struct {
-	Configured     bool                    `json:"configured"`
-	Membership     *protocol.Membership    `json:"membership,omitempty"`
-	NodeName       string                  `json:"nodeName,omitempty"`
-	GitHub         protocol.GitHubIdentity `json:"github"`
-	CurrentGitHub  protocol.GitHubIdentity `json:"currentGithub"`
-	Warnings       []string                `json:"warnings,omitempty"`
-	CloudReachable bool                    `json:"cloudReachable"`
-	Lease          *protocol.RouterLease   `json:"lease,omitempty"`
-	RoutedProjects int                     `json:"routedProjects"`
-	LocalProjects  int                     `json:"localProjects"`
-	IdentityDrift  bool                    `json:"identityDrift"`
-	DriftReason    string                  `json:"driftReason,omitempty"`
+	Configured     bool                       `json:"configured"`
+	Membership     *protocol.Membership       `json:"membership,omitempty"`
+	NodeName       string                     `json:"nodeName,omitempty"`
+	GitHub         protocol.GitHubIdentity    `json:"github"`
+	CurrentGitHub  protocol.GitHubIdentity    `json:"currentGithub"`
+	Warnings       []string                   `json:"warnings,omitempty"`
+	CloudReachable bool                       `json:"cloudReachable"`
+	Lease          *protocol.CoordinatorLease `json:"lease,omitempty"`
+	RoutedProjects int                        `json:"routedProjects"`
+	LocalProjects  int                        `json:"localProjects"`
+	IdentityDrift  bool                       `json:"identityDrift"`
+	DriftReason    string                     `json:"driftReason,omitempty"`
 }
 
 func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
@@ -281,11 +281,11 @@ func writeHumanNetworkStatus(w io.Writer, status networkStatusOutput, verbose bo
 	}
 	if status.Lease != nil {
 		fmt.Fprintln(w)
-		printSection(w, "Router lease", [][2]any{{"holderNodeId", status.Lease.HolderNodeID}, {"fencingToken", status.Lease.FencingToken}, {"expiresAt", status.Lease.ExpiresAt}})
+		printSection(w, "Coordinator lease", [][2]any{{"holderNodeId", status.Lease.HolderNodeID}, {"fencingToken", status.Lease.FencingToken}, {"expiresAt", status.Lease.ExpiresAt}})
 	}
 	if verbose && status.Membership != nil {
 		fmt.Fprintln(w)
-		printSection(w, "Membership", [][2]any{{"nodeId", status.Membership.NodeID}, {"nodeName", status.Membership.NodeName}, {"duplicateIdentityWarning", status.Membership.DuplicateWarning}, {"routerEligible", status.Membership.Capabilities.RouterEligible}, {"roles", joinOrNone(status.Membership.Capabilities.Roles)}, {"dynamicLoad", status.Membership.Capabilities.DynamicLoad}, {"lastHeartbeatAt", status.Membership.LastHeartbeatAt}})
+		printSection(w, "Membership", [][2]any{{"nodeId", status.Membership.NodeID}, {"nodeName", status.Membership.NodeName}, {"duplicateIdentityWarning", status.Membership.DuplicateWarning}, {"coordinatorEligible", status.Membership.Capabilities.CoordinatorEligible}, {"roles", joinOrNone(status.Membership.Capabilities.Roles)}, {"dynamicLoad", status.Membership.Capabilities.DynamicLoad}, {"lastHeartbeatAt", status.Membership.LastHeartbeatAt}})
 	}
 	if len(status.Warnings) > 0 {
 		fmt.Fprintln(w)

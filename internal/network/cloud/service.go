@@ -52,7 +52,7 @@ func (s *Service) init(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS join_keys (join_key TEXT PRIMARY KEY, created_at TEXT NOT NULL, consumed_at TEXT, consumed_by_node_id TEXT);`,
 		`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY, node_name TEXT NOT NULL UNIQUE COLLATE NOCASE, node_token TEXT NOT NULL UNIQUE, daemon_version TEXT NOT NULL, github_numeric_id INTEGER NOT NULL, github_login TEXT NOT NULL, target_labels TEXT NOT NULL, capabilities_json TEXT NOT NULL DEFAULT '{}', joined_at TEXT NOT NULL, last_heartbeat_at TEXT, active INTEGER NOT NULL DEFAULT 1);`,
-		`CREATE TABLE IF NOT EXISTS router_leases (name TEXT PRIMARY KEY, holder_node_id TEXT, fencing_token INTEGER NOT NULL, expires_at TEXT);`,
+		`CREATE TABLE IF NOT EXISTS coordinator_leases (name TEXT PRIMARY KEY, holder_node_id TEXT, fencing_token INTEGER NOT NULL, expires_at TEXT);`,
 		`ALTER TABLE nodes ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}'`,
 	}
 	for _, stmt := range stmts {
@@ -194,7 +194,7 @@ func (s *Service) Leave(ctx context.Context, nodeToken string) error {
 		return err
 	}
 	if current.HolderNodeID == nodeID {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO router_leases(name, holder_node_id, fencing_token, expires_at) VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET holder_node_id=excluded.holder_node_id, fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`, protocol.DefaultLeaseName, nil, current.FencingToken+1, nil); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO coordinator_leases(name, holder_node_id, fencing_token, expires_at) VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET holder_node_id=excluded.holder_node_id, fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`, protocol.DefaultLeaseName, nil, current.FencingToken+1, nil); err != nil {
 			return err
 		}
 	}
@@ -207,30 +207,30 @@ func (s *Service) Leave(ctx context.Context, nodeToken string) error {
 	return nil
 }
 
-func (s *Service) AcquireLease(ctx context.Context, nodeToken string, _ int) (protocol.RouterLease, error) {
+func (s *Service) AcquireLease(ctx context.Context, nodeToken string, _ int) (protocol.CoordinatorLease, error) {
 	nodeID, _, err := s.authenticateNode(ctx, nodeToken)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.RouterLease) (protocol.RouterLease, error) {
+	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.CoordinatorLease) (protocol.CoordinatorLease, error) {
 		now := s.now().UTC()
 		if current.HolderNodeID != "" && current.ExpiresAt != nil && current.ExpiresAt.After(now) {
-			return protocol.RouterLease{}, fmt.Errorf("router lease is already held by %s", current.HolderNodeID)
+			return protocol.CoordinatorLease{}, fmt.Errorf("coordinator lease is already held by %s", current.HolderNodeID)
 		}
 		expires := now.Add(s.leaseTTL())
-		lease := protocol.RouterLease{Name: protocol.DefaultLeaseName, HolderNodeID: nodeID, FencingToken: current.FencingToken + 1, ExpiresAt: &expires}
+		lease := protocol.CoordinatorLease{Name: protocol.DefaultLeaseName, HolderNodeID: nodeID, FencingToken: current.FencingToken + 1, ExpiresAt: &expires}
 		return lease, nil
 	})
 }
 
-func (s *Service) RenewLease(ctx context.Context, nodeToken string, fencingToken int64, _ int) (protocol.RouterLease, error) {
+func (s *Service) RenewLease(ctx context.Context, nodeToken string, fencingToken int64, _ int) (protocol.CoordinatorLease, error) {
 	nodeID, _, err := s.authenticateNode(ctx, nodeToken)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.RouterLease) (protocol.RouterLease, error) {
+	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.CoordinatorLease) (protocol.CoordinatorLease, error) {
 		if !leaseUsable(current, s.now().UTC()) || current.HolderNodeID != nodeID || current.FencingToken != fencingToken {
-			return protocol.RouterLease{}, staleLeaseError(current)
+			return protocol.CoordinatorLease{}, staleLeaseError(current)
 		}
 		expires := s.now().UTC().Add(s.leaseTTL())
 		current.ExpiresAt = &expires
@@ -238,38 +238,38 @@ func (s *Service) RenewLease(ctx context.Context, nodeToken string, fencingToken
 	})
 }
 
-func (s *Service) HandoffLease(ctx context.Context, nodeToken string, fencingToken int64, targetNodeName string, _ int) (protocol.RouterLease, error) {
+func (s *Service) HandoffLease(ctx context.Context, nodeToken string, fencingToken int64, targetNodeName string, _ int) (protocol.CoordinatorLease, error) {
 	ownerID, _, err := s.authenticateNode(ctx, nodeToken)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.RouterLease) (protocol.RouterLease, error) {
+	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.CoordinatorLease) (protocol.CoordinatorLease, error) {
 		if !leaseUsable(current, s.now().UTC()) || current.HolderNodeID != ownerID || current.FencingToken != fencingToken {
-			return protocol.RouterLease{}, staleLeaseError(current)
+			return protocol.CoordinatorLease{}, staleLeaseError(current)
 		}
 		var targetNodeID string
 		if err := tx.QueryRowContext(ctx, `SELECT node_id FROM nodes WHERE node_name = ? AND active = 1`, targetNodeName).Scan(&targetNodeID); err != nil {
-			return protocol.RouterLease{}, fmt.Errorf("target node %q not found", targetNodeName)
+			return protocol.CoordinatorLease{}, fmt.Errorf("target node %q not found", targetNodeName)
 		}
 		expires := s.now().UTC().Add(s.leaseTTL())
-		return protocol.RouterLease{Name: protocol.DefaultLeaseName, HolderNodeID: targetNodeID, FencingToken: current.FencingToken + 1, ExpiresAt: &expires}, nil
+		return protocol.CoordinatorLease{Name: protocol.DefaultLeaseName, HolderNodeID: targetNodeID, FencingToken: current.FencingToken + 1, ExpiresAt: &expires}, nil
 	})
 }
 
-func (s *Service) ExpireLease(ctx context.Context, nodeToken string, fencingToken int64) (protocol.RouterLease, error) {
+func (s *Service) ExpireLease(ctx context.Context, nodeToken string, fencingToken int64) (protocol.CoordinatorLease, error) {
 	nodeID, _, err := s.authenticateNode(ctx, nodeToken)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.RouterLease) (protocol.RouterLease, error) {
+	return s.mutateLease(ctx, func(tx *sql.Tx, current protocol.CoordinatorLease) (protocol.CoordinatorLease, error) {
 		if !leaseUsable(current, s.now().UTC()) || current.HolderNodeID != nodeID || current.FencingToken != fencingToken {
-			return protocol.RouterLease{}, staleLeaseError(current)
+			return protocol.CoordinatorLease{}, staleLeaseError(current)
 		}
-		return protocol.RouterLease{Name: protocol.DefaultLeaseName, FencingToken: current.FencingToken + 1}, nil
+		return protocol.CoordinatorLease{Name: protocol.DefaultLeaseName, FencingToken: current.FencingToken + 1}, nil
 	})
 }
 
-func (s *Service) RevalidateLease(ctx context.Context, nodeToken string, req protocol.RouterLeaseRevalidateRequest) error {
+func (s *Service) RevalidateLease(ctx context.Context, nodeToken string, req protocol.CoordinatorLeaseRevalidateRequest) error {
 	nodeID, _, err := s.authenticateNode(ctx, nodeToken)
 	if err != nil {
 		return err
@@ -294,7 +294,7 @@ func (s *Service) RevalidateLease(ctx context.Context, nodeToken string, req pro
 	return nil
 }
 
-func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.RouterLease, req protocol.RouterLeaseRevalidateRequest) error {
+func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.CoordinatorLease, req protocol.CoordinatorLeaseRevalidateRequest) error {
 	method := strings.TrimSpace(req.Method)
 	if method == "" {
 		method = http.MethodGet
@@ -305,7 +305,7 @@ func (s *Service) probeLeaseTarget(ctx context.Context, lease protocol.RouterLea
 	if err != nil {
 		return fmt.Errorf("build revalidation probe: %w", err)
 	}
-	probe.Header.Set("X-Looper-Router-Fencing-Token", fmt.Sprintf("%d", lease.FencingToken))
+	probe.Header.Set("X-Looper-Coordinator-Fencing-Token", fmt.Sprintf("%d", lease.FencingToken))
 	resp, err := (&http.Client{Timeout: leaseRevalidationProbeTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}).Do(probe)
@@ -360,25 +360,25 @@ func (s *Service) NodeStatus(ctx context.Context, nodeToken string) (protocol.No
 	return protocol.NodeStatusResponse{NetworkID: networkID, Membership: member, Lease: lease, Warnings: warnings, CloudReachable: true, CurrentGitHub: member.GitHub, IdentityDrift: member.Capabilities.IdentityDrift, IdentityDriftReason: member.Capabilities.DriftReason}, nil
 }
 
-func (s *Service) currentLease(ctx context.Context) (protocol.RouterLease, error) {
+func (s *Service) currentLease(ctx context.Context) (protocol.CoordinatorLease, error) {
 	var holder sql.NullString
 	var token int64
 	var expires sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT holder_node_id, fencing_token, expires_at FROM router_leases WHERE name = ?`, protocol.DefaultLeaseName).Scan(&holder, &token, &expires)
+	err := s.db.QueryRowContext(ctx, `SELECT holder_node_id, fencing_token, expires_at FROM coordinator_leases WHERE name = ?`, protocol.DefaultLeaseName).Scan(&holder, &token, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return protocol.RouterLease{Name: protocol.DefaultLeaseName}, nil
+		return protocol.CoordinatorLease{Name: protocol.DefaultLeaseName}, nil
 	}
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	lease := protocol.RouterLease{Name: protocol.DefaultLeaseName, FencingToken: token}
+	lease := protocol.CoordinatorLease{Name: protocol.DefaultLeaseName, FencingToken: token}
 	if holder.Valid {
 		lease.HolderNodeID = holder.String
 	}
 	if expires.Valid {
 		t, err := time.Parse(time.RFC3339Nano, expires.String)
 		if err != nil {
-			return protocol.RouterLease{}, err
+			return protocol.CoordinatorLease{}, err
 		}
 		lease.ExpiresAt = &t
 	}
@@ -484,67 +484,67 @@ func warningsForNumericID(warnings []string, numericID int64) []string {
 	return out
 }
 
-func (s *Service) mutateLease(ctx context.Context, mutate func(*sql.Tx, protocol.RouterLease) (protocol.RouterLease, error)) (protocol.RouterLease, error) {
+func (s *Service) mutateLease(ctx context.Context, mutate func(*sql.Tx, protocol.CoordinatorLease) (protocol.CoordinatorLease, error)) (protocol.CoordinatorLease, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	defer tx.Rollback()
 	current, err := s.currentLeaseTx(ctx, tx)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	next, err := mutate(tx, current)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	var expires any
 	if next.ExpiresAt != nil {
 		expires = next.ExpiresAt.UTC().Format(time.RFC3339Nano)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO router_leases(name, holder_node_id, fencing_token, expires_at) VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET holder_node_id=excluded.holder_node_id, fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`, protocol.DefaultLeaseName, nullableString(next.HolderNodeID), next.FencingToken, expires)
+	_, err = tx.ExecContext(ctx, `INSERT INTO coordinator_leases(name, holder_node_id, fencing_token, expires_at) VALUES(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET holder_node_id=excluded.holder_node_id, fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`, protocol.DefaultLeaseName, nullableString(next.HolderNodeID), next.FencingToken, expires)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	s.publish(protocol.AuditEnvelope{Event: "lease.changed", LeaseName: protocol.DefaultLeaseName, LeaseToken: next.FencingToken, NodeID: next.HolderNodeID, OccurredAt: s.now().UTC()})
 	return next, nil
 }
 
-func (s *Service) currentLeaseTx(ctx context.Context, tx *sql.Tx) (protocol.RouterLease, error) {
+func (s *Service) currentLeaseTx(ctx context.Context, tx *sql.Tx) (protocol.CoordinatorLease, error) {
 	var holder sql.NullString
 	var token sql.NullInt64
 	var expires sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT holder_node_id, fencing_token, expires_at FROM router_leases WHERE name = ?`, protocol.DefaultLeaseName).Scan(&holder, &token, &expires)
+	err := tx.QueryRowContext(ctx, `SELECT holder_node_id, fencing_token, expires_at FROM coordinator_leases WHERE name = ?`, protocol.DefaultLeaseName).Scan(&holder, &token, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return protocol.RouterLease{Name: protocol.DefaultLeaseName}, nil
+		return protocol.CoordinatorLease{Name: protocol.DefaultLeaseName}, nil
 	}
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
-	lease := protocol.RouterLease{Name: protocol.DefaultLeaseName, FencingToken: token.Int64}
+	lease := protocol.CoordinatorLease{Name: protocol.DefaultLeaseName, FencingToken: token.Int64}
 	if holder.Valid {
 		lease.HolderNodeID = holder.String
 	}
 	if expires.Valid {
 		t, err := time.Parse(time.RFC3339Nano, expires.String)
 		if err != nil {
-			return protocol.RouterLease{}, err
+			return protocol.CoordinatorLease{}, err
 		}
 		lease.ExpiresAt = &t
 	}
 	return lease, nil
 }
 
-func staleLeaseError(current protocol.RouterLease) error {
-	return fmt.Errorf("stale router lease token; current token is %d", current.FencingToken)
+func staleLeaseError(current protocol.CoordinatorLease) error {
+	return fmt.Errorf("stale coordinator lease token; current token is %d", current.FencingToken)
 }
 
-func leaseUsable(current protocol.RouterLease, now time.Time) bool {
+func leaseUsable(current protocol.CoordinatorLease, now time.Time) bool {
 	return current.ExpiresAt != nil && current.ExpiresAt.After(now)
 }
 

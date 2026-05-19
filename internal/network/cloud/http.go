@@ -29,11 +29,11 @@ func NewServer(cfg Config, service *Service) *Server {
 	mux.HandleFunc("/v1/status", s.nodeOnly(s.handleNodeStatus))
 	mux.HandleFunc("/v1/heartbeat", s.nodeOnly(s.handleHeartbeat))
 	mux.HandleFunc("/v1/leave", s.nodeOnly(s.handleLeave))
-	mux.HandleFunc("/v1/router-lease/acquire", s.nodeOnly(s.handleAcquireLease))
-	mux.HandleFunc("/v1/router-lease/renew", s.nodeOnly(s.handleRenewLease))
-	mux.HandleFunc("/v1/router-lease/handoff", s.nodeOnly(s.handleHandoffLease))
-	mux.HandleFunc("/v1/router-lease/expire", s.nodeOnly(s.handleExpireLease))
-	mux.HandleFunc("/v1/router-lease/revalidate", s.nodeOnly(s.handleRevalidateLease))
+	mux.HandleFunc("/v1/coordinator-lease/acquire", s.nodeOnly(s.handleAcquireLease))
+	mux.HandleFunc("/v1/coordinator-lease/renew", s.nodeOnly(s.handleRenewLease))
+	mux.HandleFunc("/v1/coordinator-lease/handoff", s.nodeOnly(s.handleHandoffLease))
+	mux.HandleFunc("/v1/coordinator-lease/expire", s.nodeOnly(s.handleExpireLease))
+	mux.HandleFunc("/v1/coordinator-lease/revalidate", s.nodeOnly(s.handleRevalidateLease))
 	mux.HandleFunc("/v1/events", s.nodeOnly(s.handleEvents))
 	s.httpServer = &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 30 * time.Second}
 	return s
@@ -151,7 +151,7 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	var req protocol.RouterLeaseAcquireRequest
+	var req protocol.CoordinatorLeaseAcquireRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -169,7 +169,7 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	var req protocol.RouterLeaseRenewRequest
+	var req protocol.CoordinatorLeaseRenewRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -187,7 +187,7 @@ func (s *Server) handleHandoffLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	var req protocol.RouterLeaseHandoffRequest
+	var req protocol.CoordinatorLeaseHandoffRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -225,7 +225,7 @@ func (s *Server) handleRevalidateLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	var req protocol.RouterLeaseRevalidateRequest
+	var req protocol.CoordinatorLeaseRevalidateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -282,7 +282,7 @@ func writeLeaseOrAuthError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	if strings.Contains(err.Error(), "stale router lease token") {
+	if strings.Contains(err.Error(), "stale coordinator lease token") {
 		writeError(w, http.StatusPreconditionFailed, err.Error())
 		return
 	}

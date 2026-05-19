@@ -140,7 +140,7 @@ func TestNetworkIDPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
+func TestCoordinatorLeaseAtomicityAndStaleToken412(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
 	defer service.Close()
@@ -151,8 +151,8 @@ func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
 	if lease1.FencingToken != 1 {
 		t.Fatalf("fencing token = %d, want 1", lease1.FencingToken)
 	}
-	reqBody, _ := json.Marshal(protocol.RouterLeaseAcquireRequest{})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/acquire", bytes.NewReader(reqBody))
+	reqBody, _ := json.Marshal(protocol.CoordinatorLeaseAcquireRequest{})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/acquire", bytes.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer "+node2.NodeToken)
 	resp, _ := http.DefaultClient.Do(req)
 	if resp.StatusCode != http.StatusBadRequest {
@@ -160,7 +160,7 @@ func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
 	}
 
 	revalidateTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Looper-Router-Fencing-Token") != "1" {
+		if r.Header.Get("X-Looper-Coordinator-Fencing-Token") != "1" {
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
@@ -168,16 +168,16 @@ func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
 	}))
 	defer revalidateTarget.Close()
 
-	handoffReq, _ := json.Marshal(protocol.RouterLeaseHandoffRequest{FencingToken: lease1.FencingToken, TargetNodeName: "worker-2"})
-	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/handoff", bytes.NewReader(handoffReq))
+	handoffReq, _ := json.Marshal(protocol.CoordinatorLeaseHandoffRequest{FencingToken: lease1.FencingToken, TargetNodeName: "worker-2"})
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/handoff", bytes.NewReader(handoffReq))
 	req.Header.Set("Authorization", "Bearer "+node1.NodeToken)
 	resp, _ = http.DefaultClient.Do(req)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("handoff status = %d, want 200", resp.StatusCode)
 	}
 
-	revalidateReq, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: 1, URL: revalidateTarget.URL})
-	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(revalidateReq))
+	revalidateReq, _ := json.Marshal(protocol.CoordinatorLeaseRevalidateRequest{FencingToken: 1, URL: revalidateTarget.URL})
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/revalidate", bytes.NewReader(revalidateReq))
 	req.Header.Set("Authorization", "Bearer "+node1.NodeToken)
 	resp, _ = http.DefaultClient.Do(req)
 	if resp.StatusCode != http.StatusPreconditionFailed {
@@ -185,7 +185,7 @@ func TestRouterLeaseAtomicityAndStaleToken412(t *testing.T) {
 	}
 }
 
-func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
+func TestCoordinatorLeaseRevalidateProbesTarget(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
 	defer service.Close()
@@ -198,7 +198,7 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 		if got, want := r.Method, http.MethodHead; got != want {
 			t.Fatalf("probe method = %s, want %s", got, want)
 		}
-		if got, want := r.Header.Get("X-Looper-Router-Fencing-Token"), "1"; got != want {
+		if got, want := r.Header.Get("X-Looper-Coordinator-Fencing-Token"), "1"; got != want {
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
@@ -206,8 +206,8 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 	}))
 	defer revalidateTarget.Close()
 
-	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL, Method: http.MethodHead})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	body, _ := json.Marshal(protocol.CoordinatorLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL, Method: http.MethodHead})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/revalidate", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -226,8 +226,8 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 	}))
 	deadURL := deadTarget.URL
 	deadTarget.Close()
-	body, _ = json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: deadURL})
-	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	body, _ = json.Marshal(protocol.CoordinatorLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: deadURL})
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/revalidate", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -239,7 +239,7 @@ func TestRouterLeaseRevalidateProbesTarget(t *testing.T) {
 	}
 }
 
-func TestRouterLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
+func TestCoordinatorLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
 	defer service.Close()
@@ -257,8 +257,8 @@ func TestRouterLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
 	}))
 	defer redirector.Close()
 
-	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: redirector.URL})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	body, _ := json.Marshal(protocol.CoordinatorLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: redirector.URL})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/revalidate", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -273,7 +273,7 @@ func TestRouterLeaseRevalidateRejectsRedirectTarget(t *testing.T) {
 	}
 }
 
-func TestRouterLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
+func TestCoordinatorLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
 	ctx := context.Background()
 	service, err := Open(ctx, Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "1.2.0"})
 	if err != nil {
@@ -313,7 +313,7 @@ func TestRouterLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
 
 	revalidateErr := make(chan error, 1)
 	go func() {
-		revalidateErr <- service.RevalidateLease(ctx, node1.NodeToken, protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL})
+		revalidateErr <- service.RevalidateLease(ctx, node1.NodeToken, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: revalidateTarget.URL})
 	}()
 
 	<-probed
@@ -322,7 +322,7 @@ func TestRouterLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
 	}
 	close(releaseProbe)
 
-	if err := <-revalidateErr; err == nil || err.Error() != "stale router lease token; current token is 2" {
+	if err := <-revalidateErr; err == nil || err.Error() != "stale coordinator lease token; current token is 2" {
 		t.Fatalf("RevalidateLease() error = %v, want stale token after probe", err)
 	}
 	if _, err := service.NodeStatus(ctx, node2.NodeToken); err != nil {
@@ -330,7 +330,7 @@ func TestRouterLeaseRevalidateRechecksLeaseAfterProbe(t *testing.T) {
 	}
 }
 
-func TestRouterLeaseRevalidateTimesOutHungTarget(t *testing.T) {
+func TestCoordinatorLeaseRevalidateTimesOutHungTarget(t *testing.T) {
 	server, service := newTestHTTPServer(t)
 	defer server.Close()
 	defer service.Close()
@@ -353,8 +353,8 @@ func TestRouterLeaseRevalidateTimesOutHungTarget(t *testing.T) {
 		<-time.After(3 * time.Second)
 	}()
 
-	body, _ := json.Marshal(protocol.RouterLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: "http://" + listener.Addr().String()})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/revalidate", bytes.NewReader(body))
+	body, _ := json.Marshal(protocol.CoordinatorLeaseRevalidateRequest{FencingToken: lease.FencingToken, URL: "http://" + listener.Addr().String()})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/revalidate", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -501,7 +501,7 @@ func TestMalformedAcquireRequestRejectedAndServerTTLWins(t *testing.T) {
 	defer server.Close()
 	defer service.Close()
 	node := joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 401)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/acquire", bytes.NewReader([]byte(`{"ttlSeconds":`)))
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/acquire", bytes.NewReader([]byte(`{"ttlSeconds":`)))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -513,15 +513,15 @@ func TestMalformedAcquireRequestRejectedAndServerTTLWins(t *testing.T) {
 	}
 
 	service.config.LeaseTTLSeconds = 1
-	body, _ := json.Marshal(protocol.RouterLeaseAcquireRequest{TTLSeconds: 999})
-	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/acquire", bytes.NewReader(body))
+	body, _ := json.Marshal(protocol.CoordinatorLeaseAcquireRequest{TTLSeconds: 999})
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/acquire", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("acquire request error = %v", err)
 	}
 	defer resp.Body.Close()
-	var lease protocol.RouterLease
+	var lease protocol.CoordinatorLease
 	_ = json.NewDecoder(resp.Body).Decode(&lease)
 	if lease.ExpiresAt == nil || lease.ExpiresAt.Sub(time.Now().UTC()) > 5*time.Second {
 		t.Fatalf("lease expiry = %v, want server-owned short ttl", lease.ExpiresAt)
@@ -536,8 +536,8 @@ func TestExpiredLeaseCannotBeRenewed(t *testing.T) {
 	node := joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 401)
 	lease := acquireLease(t, server.URL, node.NodeToken)
 	time.Sleep(1100 * time.Millisecond)
-	body, _ := json.Marshal(protocol.RouterLeaseRenewRequest{FencingToken: lease.FencingToken})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/router-lease/renew", bytes.NewReader(body))
+	body, _ := json.Marshal(protocol.CoordinatorLeaseRenewRequest{FencingToken: lease.FencingToken})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/coordinator-lease/renew", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+node.NodeToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -606,7 +606,7 @@ func getStatus(t *testing.T, baseURL string) protocol.StatusResponse {
 	return out
 }
 
-func acquireLease(t *testing.T, baseURL, token string) protocol.RouterLease {
+func acquireLease(t *testing.T, baseURL, token string) protocol.CoordinatorLease {
 	t.Helper()
 	lease, err := acquireLeaseViaService(baseURL, token)
 	if err != nil {
@@ -615,18 +615,18 @@ func acquireLease(t *testing.T, baseURL, token string) protocol.RouterLease {
 	return lease
 }
 
-func acquireLeaseViaService(baseURL, token string) (protocol.RouterLease, error) {
-	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/router-lease/acquire", bytes.NewReader([]byte(`{}`)))
+func acquireLeaseViaService(baseURL, token string) (protocol.CoordinatorLease, error) {
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/coordinator-lease/acquire", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return protocol.RouterLease{}, err
+		return protocol.CoordinatorLease{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return protocol.RouterLease{}, fmt.Errorf("acquire lease status = %d, want 200", resp.StatusCode)
+		return protocol.CoordinatorLease{}, fmt.Errorf("acquire lease status = %d, want 200", resp.StatusCode)
 	}
-	var out protocol.RouterLease
+	var out protocol.CoordinatorLease
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out, nil
 }

@@ -16,21 +16,21 @@ import (
 )
 
 type Status struct {
-	Configured      bool                    `json:"configured"`
-	NetworkID       string                  `json:"networkId,omitempty"`
-	NodeID          string                  `json:"nodeId,omitempty"`
-	NodeName        string                  `json:"nodeName,omitempty"`
-	GitHub          protocol.GitHubIdentity `json:"github"`
-	CurrentGitHub   protocol.GitHubIdentity `json:"currentGithub"`
-	CloudReachable  bool                    `json:"cloudReachable"`
-	Warnings        []string                `json:"warnings,omitempty"`
-	Lease           protocol.RouterLease    `json:"lease"`
-	RoutedProjects  int                     `json:"routedProjects"`
-	LocalProjects   int                     `json:"localProjects"`
-	IdentityDrift   bool                    `json:"identityDrift"`
-	DriftReason     string                  `json:"driftReason,omitempty"`
-	Membership      *protocol.Membership    `json:"membership,omitempty"`
-	LastHeartbeatAt *time.Time              `json:"lastHeartbeatAt,omitempty"`
+	Configured      bool                      `json:"configured"`
+	NetworkID       string                    `json:"networkId,omitempty"`
+	NodeID          string                    `json:"nodeId,omitempty"`
+	NodeName        string                    `json:"nodeName,omitempty"`
+	GitHub          protocol.GitHubIdentity   `json:"github"`
+	CurrentGitHub   protocol.GitHubIdentity   `json:"currentGithub"`
+	CloudReachable  bool                      `json:"cloudReachable"`
+	Warnings        []string                  `json:"warnings,omitempty"`
+	Lease           protocol.CoordinatorLease `json:"lease"`
+	RoutedProjects  int                       `json:"routedProjects"`
+	LocalProjects   int                       `json:"localProjects"`
+	IdentityDrift   bool                      `json:"identityDrift"`
+	DriftReason     string                    `json:"driftReason,omitempty"`
+	Membership      *protocol.Membership      `json:"membership,omitempty"`
+	LastHeartbeatAt *time.Time                `json:"lastHeartbeatAt,omitempty"`
 }
 
 type Manager struct {
@@ -119,7 +119,7 @@ func (m *Manager) Status() Status {
 func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
 	routed, local := countProjectModes(m.config)
-	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), RouterEligible: routed > 0, RoutedProjects: routed, LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
+	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason
@@ -197,6 +197,9 @@ func countProjectModes(cfg config.Config) (routed int, local int) {
 
 func supportedRoles(cfg config.Config) []string {
 	roles := []string{}
+	if cfg.Roles.Coordinator.Enabled {
+		roles = append(roles, "coordinator")
+	}
 	if cfg.Roles.Worker.AutoDiscovery {
 		roles = append(roles, "worker")
 	}
