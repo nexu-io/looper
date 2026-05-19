@@ -123,6 +123,38 @@ func TestValidateRejectsHostlessTunnelPublicBaseURL(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsTunnelPublicBaseURLWithQueryOrFragment(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		baseURL string
+	}{
+		{name: "query", baseURL: "https://hooks.example.test?t=dev"},
+		{name: "fragment", baseURL: "https://hooks.example.test#dev"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Webhook.Enabled = true
+			cfg.Webhook.Mode = WebhookModeTunnel
+			cfg.Webhook.ListenPort = 8443
+			cfg.Webhook.PublicBaseURL = tc.baseURL
+
+			err = Validate(cfg)
+			validationErr, ok := err.(*ConfigValidationError)
+			if !ok {
+				t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+			}
+			if len(validationErr.Issues) != 1 || validationErr.Issues[0].Path != "webhook.publicBaseUrl" {
+				t.Fatalf("Validate() issues = %#v, want webhook publicBaseUrl issue", validationErr.Issues)
+			}
+		})
+	}
+}
+
 func TestNormalizeMergesPartialWebhookTunnelFields(t *testing.T) {
 	t.Parallel()
 	mode := WebhookModeTunnel

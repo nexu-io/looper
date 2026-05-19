@@ -305,7 +305,7 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 		*issues = append(*issues, ValidationIssue{Path: path + ".listenPort", Message: "must be an integer between 1024 and 65535 when webhook mode is tunnel"})
 	}
 	parsed, err := url.Parse(config.PublicBaseURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
 	}
 }
