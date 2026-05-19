@@ -101,26 +101,27 @@ type WebhookForwarderState struct {
 }
 
 type webhookRuntime struct {
-	cfg             config.Config
-	logger          bootstrap.Logger
-	now             func() time.Time
-	ghPath          string
-	status          WebhookStatus
-	stopCh          chan struct{}
-	forwarderStopCh map[string]chan struct{}
-	mu              sync.RWMutex
-	bootstrapMu     sync.Mutex
-	wg              sync.WaitGroup
-	stopped         bool
-	reconcileRetry  bool
-	daemonID        string
-	probe           processProbe
-	forwarderStore  *storage.WebhookForwardersRepository
-	tunnelStore     *storage.WebhookTunnelHooksRepository
-	tunnelClient    webhookTunnelGitHubClient
-	forwarder       func() WebhookForwarder
-	tunnelServer    *webhookTunnelServer
-	bootstrapDone   bool
+	cfg                config.Config
+	logger             bootstrap.Logger
+	now                func() time.Time
+	ghPath             string
+	status             WebhookStatus
+	stopCh             chan struct{}
+	forwarderStopCh    map[string]chan struct{}
+	mu                 sync.RWMutex
+	bootstrapMu        sync.Mutex
+	wg                 sync.WaitGroup
+	stopped            bool
+	reconcileRetry     bool
+	daemonID           string
+	probe              processProbe
+	forwarderStore     *storage.WebhookForwardersRepository
+	tunnelStore        *storage.WebhookTunnelHooksRepository
+	allowedTunnelRepos map[string]struct{}
+	tunnelClient       webhookTunnelGitHubClient
+	forwarder          func() WebhookForwarder
+	tunnelServer       *webhookTunnelServer
+	bootstrapDone      bool
 }
 
 func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() time.Time) *webhookRuntime {
@@ -143,7 +144,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		Forwarders:                  []WebhookForwarderState{},
 		TunnelHooks:                 []WebhookTunnelState{},
 	}
-	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
+	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
@@ -289,7 +290,6 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 	w.clearTransientReconcileDegradedReasons()
 	forwarderRepoSet := map[string]struct{}{}
 	tunnelRepoSet := map[string]struct{}{}
-	conflictRepoSet := map[string]struct{}{}
 	for _, project := range projects {
 		if project.Archived {
 			continue
@@ -309,11 +309,10 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) {
 		if _, ok := tunnelRepoSet[repo]; ok {
 			delete(forwarderRepoSet, repo)
 			delete(tunnelRepoSet, repo)
-			conflictRepoSet[repo] = struct{}{}
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet, conflictRepoSet)
+	w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet)
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
 	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
 		w.addDegradedReason(noConfiguredWebhookReposReason)

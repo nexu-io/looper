@@ -62,6 +62,7 @@ func TestReconcileTunnelHookCreatesManagedHookWithoutAdoptingURLMatch(t *testing
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 	rt.tunnelStore = repos.WebhookTunnelHooks
+	rt.setAllowedTunnelRepos(map[string]struct{}{repo: {}})
 	server := &webhookTunnelServer{runtime: rt}
 
 	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())

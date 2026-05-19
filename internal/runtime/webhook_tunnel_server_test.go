@@ -65,6 +65,7 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 	forwarder := &testTunnelForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(1, 0) })
 	rt.tunnelStore = repos.WebhookTunnelHooks
+	rt.setAllowedTunnelRepos(map[string]struct{}{repoName: {}})
 	rt.forwarder = func() WebhookForwarder { return forwarder }
 	server := &webhookTunnelServer{runtime: rt}
 
@@ -159,6 +160,26 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 
 		if resp.Code != http.StatusBadRequest {
 			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusBadRequest)
+		}
+		if forwarder.calls != 0 {
+			t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+		}
+	})
+
+	t.Run("repo outside desired tunnel set is rejected even if persisted hook remains active", func(t *testing.T) {
+		forwarder.reset()
+		rt.setAllowedTunnelRepos(nil)
+		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", "delivery-blocked")
+		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
+		resp := httptest.NewRecorder()
+
+		server.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusNotFound)
 		}
 		if forwarder.calls != 0 {
 			t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)

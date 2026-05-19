@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -167,4 +168,46 @@ func TestReconcileTunnelHooksDisabledHookAtThresholdLatchesAndDegrades(t *testin
 	if client.updateCalls != 0 {
 		t.Fatalf("UpdateHook calls = %d, want 0 once latched", client.updateCalls)
 	}
+}
+
+func TestWebhookRuntimeReconcileConflictedRepoMarksTunnelHookOrphaned(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "tunnel", Name: "Tunnel", RepoPath: "/tmp/tunnel", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(tunnel) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "forward", Name: "Forward", RepoPath: "/tmp/forward", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(forward) error = %v", err)
+	}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, storage.WebhookTunnelHookRecord{Repo: "acme/looper", HookID: 42, ManagedURL: webhookTunnelManagedURL(cfg, "acme/looper"), SecretRef: webhookTunnelSecretRef("acme/looper"), CreatedAt: 1, UpdatedAt: 1}); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	cfg.Webhook.Mode = config.WebhookModeTunnel
+	cfg.Projects = []config.ProjectRefConfig{{ID: "forward", Webhook: config.ProjectWebhookConfig{Mode: config.WebhookModeGHForward}}}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.bootstrapDone = true
+
+	rt.Reconcile(repos)
+
+	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, "acme/looper")
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || !updated.Orphaned {
+		t.Fatalf("updated record = %#v, want conflicted hook orphaned", updated)
+	}
+	status := rt.Status()
+	if len(status.TunnelHooks) != 1 || !status.TunnelHooks[0].Orphaned {
+		t.Fatalf("status.TunnelHooks = %#v, want orphaned conflicted hook", status.TunnelHooks)
+	}
+	if !status.Degraded || len(status.DegradedReasons) == 0 || !strings.Contains(status.DegradedReasons[0], "webhook mode conflict") {
+		t.Fatalf("status degraded=%v reasons=%v, want conflict degraded reason", status.Degraded, status.DegradedReasons)
+	}
+	if rt.isAllowedTunnelRepo("acme/looper") {
+		t.Fatal("conflicted repo remained authorized for tunnel delivery")
+	}
+	defer rt.stopTunnelServer()
 }

@@ -170,13 +170,8 @@ func (c ghWebhookTunnelClient) run(ctx context.Context, repo string, args []stri
 	return stdout.Bytes(), nil
 }
 
-func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, repoSet map[string]struct{}, preserveSets ...map[string]struct{}) {
-	preserve := map[string]struct{}{}
-	for _, set := range preserveSets {
-		for repo := range set {
-			preserve[repo] = struct{}{}
-		}
-	}
+func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, repoSet map[string]struct{}) {
+	w.setAllowedTunnelRepos(repoSet)
 	if repos == nil || repos.WebhookTunnelHooks == nil {
 		w.addDegradedReason("webhook tunnel hook store is unavailable")
 		return
@@ -207,9 +202,11 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	states := make([]WebhookTunnelState, 0, len(repoSet)+len(existing))
 	for _, record := range existing {
 		_, desired := repoSet[record.Repo]
-		_, shouldPreserve := preserve[record.Repo]
-		if !desired && !shouldPreserve && !record.Orphaned {
-			_ = store.MarkOrphaned(ctx, record.Repo, true, now)
+		if !desired && !record.Orphaned {
+			if err := store.MarkOrphaned(ctx, record.Repo, true, now); err != nil {
+				states = append(states, WebhookTunnelState{Repo: record.Repo, HookID: &record.HookID, ManagedURL: record.ManagedURL, LastError: fmt.Sprintf("mark hook orphaned: %v", err)})
+				continue
+			}
 			record.Orphaned = true
 		}
 		if record.Orphaned && !desired {
@@ -428,6 +425,10 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
+	if !s.runtime.isAllowedTunnelRepo(repo) {
+		http.NotFound(w, r)
+		return
+	}
 	store := s.runtime.currentTunnelStore()
 	if store == nil {
 		http.Error(w, "webhook tunnel store unavailable", http.StatusServiceUnavailable)
@@ -499,6 +500,27 @@ func (w *webhookRuntime) currentTunnelStore() *storage.WebhookTunnelHooksReposit
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.tunnelStore
+}
+
+func (w *webhookRuntime) setAllowedTunnelRepos(repos map[string]struct{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(repos) == 0 {
+		w.allowedTunnelRepos = map[string]struct{}{}
+		return
+	}
+	allowed := make(map[string]struct{}, len(repos))
+	for repo := range repos {
+		allowed[repo] = struct{}{}
+	}
+	w.allowedTunnelRepos = allowed
+}
+
+func (w *webhookRuntime) isAllowedTunnelRepo(repo string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, allowed := w.allowedTunnelRepos[repo]
+	return allowed
 }
 
 func (w *webhookRuntime) tunnelGitHubClient() webhookTunnelGitHubClient {
