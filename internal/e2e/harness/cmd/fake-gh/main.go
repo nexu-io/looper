@@ -239,7 +239,7 @@ func pullRequestMergeMethod(args []string) string {
 }
 
 func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
-	route := fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber)
+	route := fmt.Sprintf("repos/%s/issues/%d", normalizeRouteRepoPath(repo), issueNumber)
 	payload, ok := st.Routes[route]
 	if !ok {
 		return
@@ -255,6 +255,14 @@ func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
 		return
 	}
 	st.Routes[route] = updated
+}
+
+func normalizeRouteRepoPath(repo string) string {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 {
+		return parts[1] + "/" + parts[2]
+	}
+	return strings.TrimSpace(repo)
 }
 
 func handleAPI(mode string, st state, stdin string) error {
