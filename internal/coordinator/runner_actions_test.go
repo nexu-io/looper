@@ -961,6 +961,38 @@ func TestRunnerAutonomousDispatchPreemptionSkipsWorkerWithoutZeroingBudget(t *te
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{2})
 }
 
+func TestRunnerAutonomousDispatchNoOpWorkerAdmissionDoesNotConsumeBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 1
+	fixture.github.issues = []githubinfra.IssueSummary{
+		{Number: 1, Labels: []string{"looper:worker-ready"}},
+		{Number: 2, Labels: []string{"triaged", "dispatch/implement"}},
+	}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Already admitted", Author: "octo", URL: "https://github.com/acme/looper/issues/1", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready"}}
+	fixture.github.details[2] = githubinfra.IssueDetail{Number: 2, Title: "Needs admission", Author: "octo", URL: "https://github.com/acme/looper/issues/2", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}}
+	fixture.github.timeline[2] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{2})
+	if hasAssignedIssue(fixture.github.assigned, 1) {
+		t.Fatalf("assigned issue 1 unexpectedly; assigned = %v", assignedIssueNumbers(fixture.github.assigned))
+	}
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, "looper:worker-ready"); got != 0 {
+		t.Fatalf("issue 1 worker-ready add count = %d, want 0", got)
+	}
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 2, "looper:worker-ready"); got != 1 {
+		t.Fatalf("issue 2 worker-ready add count = %d, want 1", got)
+	}
+}
+
 func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
@@ -1736,6 +1768,19 @@ func seedDispatchIssueWithLabels(fixture coordinatorFixture, issueNumber int64, 
 }
 
 func countRemovedIssueOperations(inputs []githubinfra.IssueLabelsInput, issueNumber int64, labels ...string) int {
+	count := 0
+	for _, input := range inputs {
+		if input.IssueNumber != issueNumber {
+			continue
+		}
+		if joinLabels(input.Labels) == joinLabels(labels) {
+			count++
+		}
+	}
+	return count
+}
+
+func countAddedIssueOperations(inputs []githubinfra.IssueLabelsInput, issueNumber int64, labels ...string) int {
 	count := 0
 	for _, input := range inputs {
 		if input.IssueNumber != issueNumber {

@@ -491,15 +491,17 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	return nil
 }
 
-func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo string, cwd string, issue triage.Issue, action dispatch.Action, dispatchCfg dispatch.Config) error {
+func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo string, cwd string, issue triage.Issue, action dispatch.Action, dispatchCfg dispatch.Config) (bool, error) {
 	if strings.TrimSpace(action.FailureCommentBody) != "" {
 		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, action.FailureCommentBody); err != nil {
-			return err
+			return false, err
 		}
 		if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
-			return r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd})
+			if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
+				return false, err
+			}
 		}
-		return nil
+		return true, nil
 	}
 	if intent := r.workerAdmissionIntent(issue, action, dispatchCfg); intent.Active {
 		if r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted {
@@ -511,24 +513,28 @@ func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo
 
 }
 
-func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) error {
+func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) (bool, error) {
+	mutated := false
 	if strings.TrimSpace(action.AssignTo) != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	labelsToAdd := removeExistingLabels(action.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
 		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
-	return nil
+	return mutated, nil
 }
 
 type workerAdmissionIntent struct {
@@ -550,74 +556,83 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	return workerAdmissionIntent{}
 }
 
-func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) error {
+func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) (bool, error) {
 	localAction := action
 	localAction.TriggerLabels = triggerLabels
 	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction)
 }
 
-func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) error {
+func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) (bool, error) {
+	mutated := false
 	if r.network == nil {
-		return fmt.Errorf("coordinator network admission is not configured")
+		return false, fmt.Errorf("coordinator network admission is not configured")
 	}
 	status, err := r.network.Status(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !r.currentNodeHoldsLease(status) {
-		return nil
+		return false, nil
 	}
 	selected, ok := selectEligibleWorkerNode(status.Memberships, r.now().UTC())
 	if !ok {
 		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, fmt.Sprintf("Coordinator can’t route this implementation Issue right now because no eligible Worker Node is available (`%s`).", noEligibleNodeStatus)); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 		if action.ReactionCommentID != 0 {
-			return r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: dispatch.ReactionFailure, CWD: cwd})
+			if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: dispatch.ReactionFailure, CWD: cwd}); err != nil {
+				return false, err
+			}
 		}
-		return nil
+		return true, nil
 	}
 	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
 		if isStaleCoordinatorLeaseError(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if login := strings.TrimSpace(selected.GitHub.Login); login != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	labelsToAdd := removeExistingLabels(intent.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
 		if isStaleCoordinatorLeaseError(err) {
-			return nil
+			return mutated, nil
 		}
-		return err
+		return false, err
 	}
 	exactTarget := protocol.TargetLabelForNode(selected.NodeName)
 	labelsToRemove := nonExactTargetLabels(issue.Labels, exactTarget)
 	if len(labelsToRemove) > 0 {
 		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToRemove, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	if !hasExactLabel(issue.Labels, exactTarget) {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{exactTarget}, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
 		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
-	return nil
+	return mutated, nil
 }
 
 func (r *Runner) currentNodeHoldsLease(status protocol.NodeStatusResponse) bool {
@@ -847,7 +862,7 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd strin
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		action = applyHumanDependencyGate(action, item.issue.Number, deps)
 		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
-			if err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
+			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
 				return err
 			}
 		}
@@ -895,10 +910,13 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 		if dispatched >= budget {
 			break
 		}
-		if err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg); err != nil {
+		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg)
+		if err != nil {
 			return err
 		}
-		dispatched++
+		if mutated {
+			dispatched++
+		}
 	}
 	return nil
 }
