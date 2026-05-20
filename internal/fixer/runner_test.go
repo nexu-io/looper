@@ -90,6 +90,9 @@ func TestBuildFixerPromptCommentReplyInstructionRequiresVerificationWithoutRemot
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Before including an entry, re-read the relevant review thread/comment context",
+		"The \"id\" MUST be the GraphQL PullRequestReviewComment node ID.",
+		"map REST \"node_id\" to \"id\" and REST \"updated_at\" to \"updatedAt\"",
+		"do not use the REST numeric \"id\"",
 		"only include items you can confidently confirm are actually addressed by the current branch state",
 		"Read-only GitHub fetches are allowed for that verification.",
 		"Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action",
