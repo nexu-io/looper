@@ -392,6 +392,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		return nil, err
 	}
 	if !checkoutMatches {
+		g.tryRemoveWorktree(ctx, input.RepoPath, match.Path)
 		return nil, nil
 	}
 

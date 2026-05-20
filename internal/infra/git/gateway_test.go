@@ -348,6 +348,29 @@ func TestGatewayCreatesSeparateAttachedWorktreeForDetachedBranch(t *testing.T) {
 	}
 }
 
+func TestGatewayRecreatesBranchNamedWorktreeAsDetachedAtSamePath(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	attached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("CreateWorktree(attached) error = %v", err)
+	}
+
+	detached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", CheckoutMode: CheckoutModeDetached})
+	if err != nil {
+		t.Fatalf("CreateWorktree(detached) error = %v", err)
+	}
+	if detached.WorktreePath != attached.WorktreePath {
+		t.Fatalf("detached path = %q, want %q", detached.WorktreePath, attached.WorktreePath)
+	}
+	if got := stringsTrimSpace(runGit(t, detached.WorktreePath, "branch", "--show-current")); got != "" {
+		t.Fatalf("detached branch = %q, want empty", got)
+	}
+}
+
 func TestGatewayRecreatesStoredAttachedWorktreeWhenOnWrongBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
