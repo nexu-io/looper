@@ -52,6 +52,10 @@ func (c *Client) Status(ctx context.Context) (protocol.NodeStatusResponse, error
 	return out, nil
 }
 
+func (c *Client) RevalidateLease(ctx context.Context, req protocol.CoordinatorLeaseRevalidateRequest) error {
+	return c.request(ctx, http.MethodPost, "/v1/coordinator-lease/revalidate", c.nodeToken, req, nil)
+}
+
 func (c *Client) request(ctx context.Context, method, path, token string, body any, out any) error {
 	var reader *bytes.Reader
 	if body == nil {

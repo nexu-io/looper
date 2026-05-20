@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
@@ -147,6 +150,35 @@ type workerRunCompletedNotificationInput struct {
 	FailureKind       worker.QueueFailureKind
 	PullRequestNumber int64
 	PullRequestURL    string
+}
+
+type coordinatorNetworkGateway struct {
+	statePath string
+	client    *http.Client
+}
+
+func (g coordinatorNetworkGateway) Status(ctx context.Context) (protocol.NodeStatusResponse, error) {
+	api, err := g.api()
+	if err != nil {
+		return protocol.NodeStatusResponse{}, err
+	}
+	return api.Status(ctx)
+}
+
+func (g coordinatorNetworkGateway) RevalidateLease(ctx context.Context, req protocol.CoordinatorLeaseRevalidateRequest) error {
+	api, err := g.api()
+	if err != nil {
+		return err
+	}
+	return api.RevalidateLease(ctx, req)
+}
+
+func (g coordinatorNetworkGateway) api() (*networkclient.Client, error) {
+	state, err := networkclient.LoadState(g.statePath)
+	if err != nil {
+		return nil, err
+	}
+	return networkclient.New(state.URL, state.NodeToken, g.client), nil
 }
 
 type plannerGitHubAdapter struct {
@@ -992,11 +1024,12 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
-		Repos:  repos,
-		GitHub: githubGateway,
-		Config: &cfg,
-		Logger: logger,
-		Now:    now,
+		Repos:   repos,
+		GitHub:  githubGateway,
+		Config:  &cfg,
+		Logger:  logger,
+		Now:     now,
+		Network: coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
 		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
@@ -1096,6 +1129,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
 		CustomInstructions:  &cfg,
+		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,

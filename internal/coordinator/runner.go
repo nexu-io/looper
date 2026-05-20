@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -27,6 +29,7 @@ const triageCommentMarker = "<!-- looper:coordinator:triage -->"
 const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -->"
 const cycleCommentMarker = "<!-- looper:coordinator:cycle -->"
 const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
+const noEligibleNodeStatus = "no-eligible-node"
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -79,6 +82,11 @@ type RepositoryInspector interface {
 	Inspect(context.Context, string, triage.Issue) (triage.RepoContext, error)
 }
 
+type NetworkAdmissionGateway interface {
+	Status(context.Context) (protocol.NodeStatusResponse, error)
+	RevalidateLease(context.Context, protocol.CoordinatorLeaseRevalidateRequest) error
+}
+
 type Options struct {
 	Repos      *storage.Repositories
 	GitHub     GitHubGateway
@@ -88,6 +96,7 @@ type Options struct {
 	TriageLLM  triage.LLM
 	Inspector  RepositoryInspector
 	Disclosure *config.DisclosureConfig
+	Network    NetworkAdmissionGateway
 }
 
 type Runner struct {
@@ -99,6 +108,7 @@ type Runner struct {
 	triageLLM  triage.LLM
 	inspector  RepositoryInspector
 	disclosure *config.DisclosureConfig
+	network    NetworkAdmissionGateway
 
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
@@ -146,6 +156,7 @@ func New(options Options) *Runner {
 		triageLLM:         options.TriageLLM,
 		inspector:         inspector,
 		disclosure:        options.Disclosure,
+		network:           options.Network,
 		lastTickByProject: map[string]time.Time{},
 		watchLocks:        map[string]*sync.Mutex{},
 	}
@@ -199,7 +210,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps); err != nil {
+	if err := r.applyDispatches(ctx, input.ProjectID, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -459,7 +470,7 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	return nil
 }
 
-func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) error {
+func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo string, cwd string, issue triage.Issue, action dispatch.Action, dispatchCfg dispatch.Config) error {
 	if strings.TrimSpace(action.FailureCommentBody) != "" {
 		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, action.FailureCommentBody); err != nil {
 			return err
@@ -469,6 +480,17 @@ func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd strin
 		}
 		return nil
 	}
+	if intent := r.workerAdmissionIntent(issue, action, dispatchCfg); intent.Active {
+		if r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted {
+			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent)
+		}
+		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels)
+	}
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action)
+
+}
+
+func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) error {
 	if strings.TrimSpace(action.AssignTo) != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
 			return err
@@ -486,7 +508,181 @@ func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd strin
 		}
 	}
 	return nil
+}
 
+type workerAdmissionIntent struct {
+	Active        bool
+	TriggerLabels []string
+}
+
+func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Action, cfg dispatch.Config) workerAdmissionIntent {
+	desired := append([]string(nil), cfg.WorkerTriggerLabels...)
+	if len(desired) == 0 {
+		return workerAdmissionIntent{}
+	}
+	if len(intersectExactLabels(action.TriggerLabels, desired)) > 0 {
+		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
+	}
+	if len(intersectExactLabels(issue.Labels, desired)) > 0 {
+		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
+	}
+	return workerAdmissionIntent{}
+}
+
+func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) error {
+	localAction := action
+	localAction.TriggerLabels = triggerLabels
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction)
+}
+
+func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) error {
+	if r.network == nil {
+		return fmt.Errorf("coordinator network admission is not configured")
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if !r.currentNodeHoldsLease(status) {
+		return nil
+	}
+	selected, ok := selectEligibleWorkerNode(status.Memberships, r.now().UTC())
+	if !ok {
+		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, fmt.Sprintf("Coordinator can’t route this implementation Issue right now because no eligible Worker Node is available (`%s`).", noEligibleNodeStatus)); err != nil {
+			return err
+		}
+		if action.ReactionCommentID != 0 {
+			return r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: dispatch.ReactionFailure, CWD: cwd})
+		}
+		return nil
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
+		if isStaleCoordinatorLeaseError(err) {
+			return nil
+		}
+		return err
+	}
+	if login := strings.TrimSpace(selected.GitHub.Login); login != "" {
+		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	labelsToAdd := removeExistingLabels(intent.TriggerLabels, issue.Labels)
+	if len(labelsToAdd) > 0 {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
+		if isStaleCoordinatorLeaseError(err) {
+			return nil
+		}
+		return err
+	}
+	exactTarget := protocol.TargetLabelForNode(selected.NodeName)
+	if !hasExactLabel(issue.Labels, exactTarget) {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{exactTarget}, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
+		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runner) currentNodeHoldsLease(status protocol.NodeStatusResponse) bool {
+	if status.Lease.FencingToken == 0 || strings.TrimSpace(status.Lease.HolderNodeID) == "" {
+		return false
+	}
+	if status.Lease.ExpiresAt == nil || !status.Lease.ExpiresAt.After(r.now().UTC()) {
+		return false
+	}
+	return strings.TrimSpace(status.Lease.HolderNodeID) == strings.TrimSpace(status.Membership.NodeID)
+}
+
+func (r *Runner) revalidateCoordinatorLease(ctx context.Context, issueURL string, fencingToken int64) error {
+	if r.network == nil || fencingToken == 0 {
+		return nil
+	}
+	return r.network.RevalidateLease(ctx, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: fencingToken, URL: revalidateProbeURL(issueURL), Method: "GET"})
+}
+
+func selectEligibleWorkerNode(members []protocol.Membership, now time.Time) (protocol.Membership, bool) {
+	eligible := make([]protocol.Membership, 0, len(members))
+	for _, member := range members {
+		if !memberHasRole(member, "worker") || member.DuplicateWarning || member.Capabilities.IdentityDrift {
+			continue
+		}
+		if strings.TrimSpace(member.NodeName) == "" || strings.TrimSpace(member.GitHub.Login) == "" {
+			continue
+		}
+		if member.LastHeartbeatAt == nil || member.LastHeartbeatAt.Before(now.Add(-2*protocol.DefaultLeaseTTL)) {
+			continue
+		}
+		if !hasExactLabel(member.TargetLabels, protocol.TargetLabelForNode(member.NodeName)) {
+			continue
+		}
+		eligible = append(eligible, member)
+	}
+	if len(eligible) == 0 {
+		return protocol.Membership{}, false
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		if eligible[i].Capabilities.DynamicLoad != eligible[j].Capabilities.DynamicLoad {
+			return eligible[i].Capabilities.DynamicLoad < eligible[j].Capabilities.DynamicLoad
+		}
+		return eligible[i].NodeName < eligible[j].NodeName
+	})
+	return eligible[0], true
+}
+
+func memberHasRole(member protocol.Membership, want string) bool {
+	for _, role := range member.Capabilities.Roles {
+		if strings.EqualFold(strings.TrimSpace(role), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+func intersectExactLabels(left []string, right []string) []string {
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	set := map[string]struct{}{}
+	for _, label := range right {
+		set[label] = struct{}{}
+	}
+	out := []string{}
+	for _, label := range left {
+		if _, ok := set[label]; ok {
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
+func revalidateProbeURL(issueURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(issueURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimSpace(issueURL)
+	}
+	parsed.Path = "/"
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func isStaleCoordinatorLeaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "stale coordinator lease token") || strings.Contains(message, "coordinator lease is already held")
 }
 
 func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, depsCfg config.CoordinatorDependenciesConfig) (dependencyState, error) {
@@ -609,9 +805,9 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 	return nil
 }
 
-func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyDispatches(ctx context.Context, projectID string, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
 	if dispatchCfg.Mode == dispatch.ModeAutonomous {
-		return r.applyAutonomousDispatches(ctx, repo, cwd, loaded, triageCfg, dispatchCfg, deps)
+		return r.applyAutonomousDispatches(ctx, projectID, repo, cwd, loaded, triageCfg, dispatchCfg, deps)
 	}
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -623,8 +819,8 @@ func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded [
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		action = applyHumanDependencyGate(action, item.issue.Number, deps)
-		if r.hasDispatchWork(action) {
-			if err := r.applyDispatchAction(ctx, repo, cwd, item.issue, action); err != nil {
+		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
+			if err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
 				return err
 			}
 		}
@@ -632,7 +828,7 @@ func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded [
 	return nil
 }
 
-func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID string, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
 	ready := make([]autonomousDispatchCandidate, 0, len(loaded))
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -643,7 +839,10 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string
 			return err
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
-		if !r.hasDispatchWork(action) || strings.TrimSpace(action.FailureCommentBody) != "" {
+		if strings.TrimSpace(action.FailureCommentBody) != "" {
+			continue
+		}
+		if !r.hasDispatchWork(action) && !r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
 			continue
 		}
 		if deps.enabled {
@@ -662,7 +861,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string
 		if index >= budget {
 			break
 		}
-		if err := r.applyDispatchAction(ctx, repo, cwd, candidate.issue, candidate.action); err != nil {
+		if err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg); err != nil {
 			return err
 		}
 	}
@@ -965,6 +1164,22 @@ func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.
 	}
 	roles := config.ProjectRoleConfigs(*r.config, projectID)
 	return project, roles.Coordinator, roles.Sweeper, nil
+}
+
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.config == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.config.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network != nil && project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
 }
 
 func (r *Runner) shouldRunTick(projectID string) bool {

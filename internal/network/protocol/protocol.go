@@ -123,6 +123,7 @@ type StatusResponse struct {
 type NodeStatusResponse struct {
 	NetworkID           string           `json:"networkId"`
 	Membership          Membership       `json:"membership"`
+	Memberships         []Membership     `json:"memberships,omitempty"`
 	Lease               CoordinatorLease `json:"lease"`
 	Warnings            []string         `json:"warnings,omitempty"`
 	CloudReachable      bool             `json:"cloudReachable"`

@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -73,6 +74,45 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 	if loop == nil || loop.Type != "worker" || loop.TargetType != "issue" || loop.TargetID == nil || *loop.TargetID != "issue:acme/looper:46" {
 		t.Fatalf("loop = %#v, want worker issue loop for issue 46", loop)
 	}
+}
+
+func TestDiscoverIssuesRoutedProjectRequiresCurrentNodeTargetLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Network: &config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
+		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
+		{Number: 47, Title: "Targeted", URL: "https://github.com/acme/looper/issues/47", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-1")}},
+	}}
+	network := &stubWorkerNetwork{status: protocol.NodeStatusResponse{Membership: protocol.Membership{NodeName: "worker-1"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg, Network: network})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].TargetID != "issue:acme/looper:47" {
+		t.Fatalf("QueueItems = %#v, want only targeted routed issue queued", result.QueueItems)
+	}
+}
+
+func TestDiscoverIssuesRoutedProjectFailsWhenNetworkStatusMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Network: &config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-1")}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	_, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err == nil || !strings.Contains(err.Error(), "worker network status is not configured") {
+		t.Fatalf("DiscoverIssues() error = %v, want missing network status error", err)
+	}
+}
+
+type stubWorkerNetwork struct{ status protocol.NodeStatusResponse }
+
+func (s *stubWorkerNetwork) Status(context.Context) (protocol.NodeStatusResponse, error) {
+	return s.status, nil
 }
 
 func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
@@ -3219,6 +3259,7 @@ type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
 	logger      *testLogger
+	cfg         *config.Config
 	current     time.Time
 	now         func() time.Time
 }
@@ -3253,7 +3294,11 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: lockKey, Repo: stringPtr("acme/looper"), DedupeKey: "worker:project_1:acme/looper:27", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	fixture := &runnerFixture{coordinator: coordinator, repos: repos, logger: &testLogger{}, current: now}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	fixture := &runnerFixture{coordinator: coordinator, repos: repos, logger: &testLogger{}, cfg: &cfg, current: now}
 	fixture.now = func() time.Time { return fixture.current }
 	return fixture
 }

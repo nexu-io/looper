@@ -372,12 +372,16 @@ func (s *Service) NodeStatus(ctx context.Context, nodeToken string) (protocol.No
 	if err != nil {
 		return protocol.NodeStatusResponse{}, err
 	}
+	members, err := s.memberships(ctx)
+	if err != nil {
+		return protocol.NodeStatusResponse{}, err
+	}
 	warnings, err := s.duplicateWarnings(ctx)
 	if err != nil {
 		return protocol.NodeStatusResponse{}, err
 	}
 	member.NodeID = nodeID
-	return protocol.NodeStatusResponse{NetworkID: networkID, Membership: member, Lease: lease, Warnings: warnings, CloudReachable: true, CurrentGitHub: member.GitHub, IdentityDrift: member.Capabilities.IdentityDrift, IdentityDriftReason: member.Capabilities.DriftReason}, nil
+	return protocol.NodeStatusResponse{NetworkID: networkID, Membership: member, Memberships: members, Lease: lease, Warnings: warnings, CloudReachable: true, CurrentGitHub: member.GitHub, IdentityDrift: member.Capabilities.IdentityDrift, IdentityDriftReason: member.Capabilities.DriftReason}, nil
 }
 
 func (s *Service) currentLease(ctx context.Context) (protocol.CoordinatorLease, error) {
